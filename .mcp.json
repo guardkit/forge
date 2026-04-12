@@ -2,6 +2,7 @@
   "mcpServers": {
     "graphiti": {
       "type": "stdio",
+      "defer_loading": false,
       "command": "/opt/homebrew/bin/uv",
       "args": [
         "--directory",
