@@ -1,6 +1,7 @@
 # Ship's Computer / Jarvis — Conversation Starter & Gap Analysis
 
 ## For: Sanity check, gap analysis, and onboarding context · April 2026
+## Updated: 12 April 2026 — repo references, capabilities, resolved gaps
 
 ---
 
@@ -10,6 +11,12 @@ This is the single document that explains the entire Ship's Computer / Jarvis pr
 Read it to understand what we're building, why, where all the documentation lives, and
 what gaps still need addressing. It consolidates a long ideation session (April 2026)
 into a structured brief.
+
+**Note (12 April 2026):** The project has evolved significantly since this document was
+first written. The fleet-master-index (v2, 12 April 2026) is now the authoritative
+technical inventory. This document remains useful as a onboarding overview and for the
+gap analysis, but repo references and build sequences should be cross-checked against
+the fleet-master-index.
 
 ---
 
@@ -31,12 +38,16 @@ Each of these is currently a separate manual workflow. Context is lost between s
 Architecture decisions get re-learned. The human is the orchestrator, the context carrier,
 and the bottleneck.
 
-### What Jarvis replaces
+### What the Software Factory replaces
 
-The human-as-orchestrator role. Jarvis is an intent router backed by NATS JetStream that
-dispatches natural language requests to specialist agents, each handling a stage of the
-lifecycle. The human moves from operator to approver — giving direction, reviewing output,
-making decisions at checkpoints.
+The human-as-orchestrator role. The Forge (pipeline orchestrator) coordinates specialist
+agents via NATS JetStream, applying confidence-gated quality gates at each stage. The
+human moves from operator to approver — giving direction, reviewing output when the
+Coach flags concerns, making decisions at checkpoints.
+
+The coordination overhead between planning, knowledge, and build systems ceases to exist
+as a distinct concern. Structured documents *are* the project management. Outcome gates
+replace progress tracking. There are no tickets, no kanban boards, no status reports.
 
 ---
 
@@ -45,17 +56,19 @@ making decisions at checkpoints.
 ### 2.1 Learning Vehicle
 
 The system is a vehicle for learning AI-augmented development hands-on:
-- Fine-tuning small language models (Unsloth QLoRA, Nemotron Nano)
+- Fine-tuning small language models (Unsloth + TRL SFTTrainer on Gemma 4 31B Dense)
 - RAG with knowledge graphs (Graphiti, FalkorDB, ChromaDB)
-- Agent harness design (Claude Agents SDK, LangChain DeepAgents SDK)
-- Adversarial cooperation (Player-Coach, weighted evaluation)
+- Agent harness design (LangChain DeepAgents SDK, unified harness pattern)
+- Adversarial cooperation (Player-Coach, weighted evaluation, detection patterns)
 - Local inference (vLLM on DGX Spark GB10)
 - Multi-agent orchestration (NATS JetStream, CAN bus registration)
+- Training data generation (agentic dataset factory, Player-Coach adversarial loop)
 - Container-based agent deployment (Docker Compose fleet)
 
 The combination of these skills is genuinely rare. The war stories from building are
 the durable asset — 180+ review reports, the FB01-FB28 cascading fix series, the
-NemoClaw saga, the C4 validation discovery.
+NemoClaw saga, the C4 validation discovery, Phase 0/1 FinProxy scores, the first
+fine-tune, domain fidelity regressions.
 
 ### 2.2 YouTube Content
 
@@ -71,22 +84,29 @@ Key content arcs:
 
 ### 2.3 DDD Southwest Talk
 
-Submitted for May 16, 2026, Engine Shed, Bristol. 30-minute session contrasting
-vibe coding with engineering-first software factory methodology. The adversarial
-cooperation pattern and GuardKit pipeline are the centrepiece.
+16 May 2026, Engine Shed, Bristol. "2026: The Year of the Software Factory." Narrative
+arc: Solow Paradox → coordination bottleneck → steam engine trap → context-first
+delivery → outcome gates → the factory runs end-to-end. Five differentiators identified
+via landscape research (Devin, MetaGPT, ChatDev, CrewAI, LangGraph).
 
 ### 2.4 Practical Productivity
 
 Beyond learning and content — this genuinely makes Rich more productive:
 - FinProxy proof point: 14 product docs (310 KB) in one weekend, James approved
+- Phase 0 FinProxy: 0.75 score, 93 seconds, first real specialist agent run
+- Phase 1 FinProxy: 0.93 score, 162 seconds, quality improvement validated
+- nats-core: 97% test coverage, 6 features, GuardKit command sequence produced
+  production-quality library code
 - AutoBuild proof point: 43 tasks, 3 human decisions, 93% defaults accepted
-- Ideation proof point: every Claude Desktop session is a manual version of this
+- Feature spec defaults: Rich accepts ~95% of proposed defaults across 7 specs
+- First fine-tune: Gemma 4 31B, 1,736 examples, loss 2.45→0.50 in 2h 5min
 
 ### 2.5 Durability
 
 Three-layer durability analysis (see big-picture doc):
-- **Permanent:** Methodology, domain knowledge, war stories
-- **2-3+ years:** Architectural patterns (NATS, intent routing, CAN bus, adapters)
+- **Permanent:** Methodology, domain knowledge, war stories, coordination insights
+- **2-3+ years:** Architectural patterns (NATS, intent routing, unified harness,
+  confidence-gated checkpoints, context-first delivery)
 - **12-18 months:** Specific tools and templates (designed to be replaceable)
 
 ---
@@ -96,11 +116,21 @@ Three-layer durability analysis (see big-picture doc):
 ### 3.1 The Full Pipeline
 
 ```
-Ideation Agent → Product Owner Agent → Architect Agent → GuardKit Factory
-(explore)        (document)             (architect)       (implement)
-     ↑                                                        ↓
-     └──────────── General Purpose Agent ─────────────────────┘
-                   (everything else)
+Product idea / raw information
+        ↓
+Ideation Agent (score and rank ideas)
+        ↓
+Product Owner Agent (structured product docs)
+        ↓  ← calls Architect Agent via NATS: "Is this feasible?"
+Architect Agent (conversation starter with C4, ADRs)
+        ↓
+Forge (checkpoint manager — confidence-gated quality gates)
+        ↓
+GuardKit Commands (/system-arch → /system-design → /feature-spec → build)
+        ↓
+Outcome Gate (did the thing work as intended?)
+        ↓
+Deployed software
 
 YouTube Planner ← (content ideas about the above)
 
@@ -118,36 +148,47 @@ All adapters ←─────→│  (nats-core)     │
          (voice)       (text)       (web UI)
 ```
 
-### 3.2 Agent Fleet (8 Agents)
+### 3.2 Agent Fleet
 
-| Agent | Repo | Template | Purpose | Proof Point |
-|-------|------|----------|---------|-------------|
-| **Intent Router** | `jarvis` | Custom | Classify intent, dispatch via CAN bus registration | — |
-| **General Purpose** | `jarvis` | `langchain-deepagents` | Everything else — research, drafts, chores | Every "quick question" in Claude Desktop |
-| **Ideation** | `ideation-agent` | `weighted-evaluation` | Structured brainstorming with scored criteria | Every ideation session in Claude Desktop |
-| **Product Owner** | `product-owner-agent` | `weighted-evaluation` | Raw info → structured product docs | FinProxy: 14 docs, 310 KB, James approved |
-| **Architect** | `architect-agent` | `weighted-evaluation` | Product docs → C4/ADRs → `/system-arch` input | Every conversation starter doc |
-| **GuardKit Factory** | `guardkitfactory` | `orchestrator` | Autonomous software dev pipeline | TASK-REV-F5F5: 43 tasks, 93% auto-accepted |
-| **YouTube Planner** | `youtube-planner` | `weighted-evaluation` | Content planning: idea → filmable script | Twin AI Paradoxes video plan |
-| **GCSE Tutor** | (future) | TBD | Fine-tuned Nemotron Nano via Reachy "Scholar" | Dataset factory: 2,500 targets generated |
+**Specialist Agents** (single codebase: `specialist-agent`, unified harness pattern):
 
-### 3.3 Infrastructure (2 Repos)
+| Role | Model | Fine-Tuned | Purpose |
+|------|-------|-----------|---------|
+| **Architect** | Gemma 4 31B | Yes (architecture books) | Product docs → C4/ADRs → `/system-arch` input |
+| **Product Owner** | Gemma 4 31B | Yes (PM books) | Raw info → structured product docs |
+| **Ideation** | Base model / Claude API | No | Weighted evaluation of ideas |
 
-| Component | Repo | Type | Purpose |
-|-----------|------|------|---------|
-| **nats-core** | `nats-core` | Python library | Message schemas, topic constants, fleet registration, typed NATS client |
-| **NATS Server** | `nats-infrastructure` | Config/ops | Docker Compose deployment, accounts, streams, fleet compose, monitoring |
+**Other Fleet Agents:**
+
+| Agent | Repo | Purpose |
+|-------|------|---------|
+| **Forge** | `forge` | Pipeline orchestrator + checkpoint manager |
+| **Intent Router** | `jarvis` | Classify intent, dispatch via CAN bus |
+| **General Purpose** | `jarvis` | Everything else — research, drafts, chores |
+| **YouTube Planner** | `youtube-planner` | Content planning: idea → filmable script |
+| **GCSE Tutor** | `agentic-dataset-factory` (pipeline) | Fine-tuned multi-subject GCSE tutor |
+
+### 3.3 Infrastructure
+
+| Component | Repo | Status | Purpose |
+|-----------|------|--------|---------|
+| **nats-core** | `nats-core` | ✅ 97% coverage | Message schemas, topic constants, fleet registration, typed NATS client |
+| **NATS Server** | `nats-infrastructure` | ✅ Configured | Docker Compose deployment, accounts, streams, monitoring |
 
 ### 3.4 Key Architectural Patterns
 
-| Pattern | What It Does | Where Documented |
-|---------|-------------|-----------------|
-| **CAN bus registration** | Agents self-announce capabilities; Jarvis builds routing table dynamically | `jarvis-vision.md`, `nats-core ADR-004` |
-| **Weighted evaluation** | Subjective quality → gradable scores via Player-Coach with criteria | All agent vision docs |
-| **Two-model separation** | Reasoning model ≠ implementation model (prevents self-confirmation) | D5, fleet master index |
-| **Adversarial cooperation** | Coach evaluates Player output with calibrated scepticism | Templates, big picture doc |
-| **Provider independence** | Cloud/local switchable via config (no vendor lock-in) | `agent-config.yaml` pattern |
-| **Container lifecycle = agent lifecycle** | Container starts → agent registers; stops → deregisters | `nats-infrastructure` fleet compose |
+| Pattern | What It Does |
+|---------|-------------|
+| **Unified harness** | One codebase, many roles via `specialist-agent serve --role X` |
+| **Three-layer architecture** | Behaviour (fine-tuned) + Knowledge (Graphiti) + Context (project docs) |
+| **CAN bus registration** | Agents self-announce capabilities; Jarvis builds routing table dynamically |
+| **Weighted evaluation** | Subjective quality → gradable scores via Player-Coach with criteria + detection patterns |
+| **Two-model separation** | Player and Coach use different model families (prevents self-confirmation) |
+| **Confidence-gated checkpoints** | Coach score determines auto-approve / flag / hard stop |
+| **Context-first delivery** | No tickets, no kanban — docs are the coordination, outcome gates replace progress tracking |
+| **Provider independence** | Cloud/local/Bedrock switchable via config |
+| **AgentManifest as source of truth** | Both MCP tools and NATS registration derived from one manifest |
+| **Container lifecycle = agent lifecycle** | Container starts → agent registers; stops → deregisters |
 
 ---
 
@@ -157,44 +198,52 @@ All adapters ←─────→│  (nats-core)     │
 
 | Document | Location | What It Covers |
 |----------|----------|---------------|
-| **Big Picture Vision & Durability** | `guardkitfactory/docs/research/ideas/big-picture-vision-and-durability.md` | Why we're building, three goals, durability analysis, containerisation strategy, compounding flywheel |
-| **Fleet Master Index** | `guardkitfactory/docs/research/ideas/fleet-master-index.md` | Technical inventory: all 10 repos, all agents, all templates, 11-phase build sequence, hardware topology, port allocation |
-| **This Document** | `guardkitfactory/docs/research/ideas/conversation-starter-gap-analysis.md` | Sanity check, gap analysis, onboarding |
+| **Big Picture Vision & Durability** | `forge/docs/research/ideas/big-picture-vision-and-durability.md` | Why we're building, three goals, durability analysis, containerisation strategy, compounding flywheel, DDD narrative |
+| **Fleet Master Index** | `forge/docs/research/ideas/fleet-master-index.md` | Technical inventory: all repos, all agents, decisions D1-D38, per-repo build sequence, formalised patterns, hardware topology |
+| **Forge Pipeline Orchestrator Refresh** | `forge/docs/research/ideas/forge-pipeline-orchestrator-refresh.md` | Forge identity, confidence-gated checkpoints, tool inventory, NATS integration, degraded mode |
+| **This Document** | `forge/docs/research/ideas/conversation-starter-gap-analysis.md` | Sanity check, gap analysis, onboarding |
 
-### Agent Vision Documents (one per repo, feeds `/system-arch`)
+### Agent Vision Documents
 
 | Document | Location |
 |----------|----------|
+| Specialist Agent Vision (architect, product owner, ideation) | `specialist-agent/docs/research/ideas/architect-agent-vision.md` |
+| Unified Agent Harness | `specialist-agent/docs/research/ideas/unified-agent-harness-conversation-starter.md` |
+| MCP Deployment Architecture | `specialist-agent/docs/research/ideas/mcp-deployment-architecture.md` |
+| Fine-Tuned Strategy & Three-Layer Architecture | `specialist-agent/docs/research/ideas/fine-tuned-architect-agent-strategy.md` |
+| Landscape Research (Devin, MetaGPT, etc.) | `specialist-agent/docs/research/ideas/landscape-conversation-starter.md` |
 | Jarvis Vision (intent router + CAN bus) | `jarvis/docs/research/ideas/jarvis-vision.md` |
 | General Purpose Agent | `jarvis/docs/research/ideas/general-purpose-agent.md` |
 | Reachy Mini Integration | `jarvis/docs/research/ideas/reachy-mini-integration.md` |
 | NemoClaw Assessment | `jarvis/docs/research/ideas/nemoclaw-assessment.md` |
-| Ideation Agent Vision | `ideation-agent/docs/research/ideas/ideation-agent-vision.md` |
-| Product Owner Agent Vision | `product-owner-agent/docs/research/ideas/product-owner-agent-vision.md` |
-| Architect Agent Vision | `architect-agent/docs/research/ideas/architect-agent-vision.md` |
 | YouTube Planner Vision | `youtube-planner/docs/research/ideas/youtube-planner-vision.md` |
 
-### System Specifications (feed `/feature-spec` or `/feature-plan`)
+### System Specifications
 
-| Document | Location | Slash Command |
-|----------|----------|--------------|
-| nats-core System Spec (6 features, BDD) | `nats-core/docs/design/specs/nats-core-system-spec.md` | `/feature-spec` |
-| nats-core Fleet Registration Addendum | `nats-core/docs/design/specs/nats-core-spec-addendum-fleet-registration.md` | Merge into main spec |
-| nats-infrastructure System Spec (6 features, 26 tasks) | `nats-infrastructure/docs/design/specs/nats-infrastructure-system-spec.md` | `/feature-plan` |
-| nats-infrastructure Fleet Compose Addendum | `nats-infrastructure/docs/design/specs/nats-infrastructure-spec-addendum-fleet-compose.md` | Merge into main spec |
-| Pipeline Orchestrator Conversation Starter | `guardkitfactory/docs/research/pipeline-orchestrator-conversation-starter.md` | `/system-arch` |
-| Pipeline Orchestrator Build Plan | `guardkitfactory/docs/research/pipeline-orchestrator-consolidated-build-plan.md` | Reference |
+| Document | Location | Status |
+|----------|----------|--------|
+| nats-core System Spec (6 features, BDD) | `nats-core/docs/design/specs/nats-core-system-spec.md` | ✅ Implemented, 97% coverage |
+| nats-infrastructure System Spec (6 features) | `nats-infrastructure/docs/design/specs/nats-infrastructure-system-spec.md` | ✅ Configured |
+
+### Phase Build Plans (specialist-agent)
+
+| Document | Location | Coverage |
+|----------|----------|---------|
+| Phase 1C Domain Fidelity | `specialist-agent/docs/research/ideas/phase1c-domain-fidelity-build-plan.md` | Fix 5 regressions |
+| Phase 1B Unified Harness | `specialist-agent/docs/research/ideas/phase1b-unified-harness-build-plan.md` | Role-aware codebase |
+| Phase G Graphiti Runtime | `specialist-agent/docs/research/ideas/phaseG-build-plan.md` | Per-role knowledge compounding |
+| Phase 2 Web Search / DDD | `specialist-agent/docs/research/ideas/phase2-build-plan.md` | External research |
+| Phase 3 NATS / MCP | `specialist-agent/docs/research/ideas/phase3-build-plan.md` | Fleet integration |
+| Phase F Fine-Tuning | `specialist-agent/docs/research/ideas/phaseF-build-plan.md` | Per-role model training |
+| LPA Platform Build Plan | `lpa-platform/docs/buildplan.md` | FinProxy .NET full command sequence |
 
 ### Architecture Decision Records
 
 | ADR | Location | Decision |
 |-----|----------|---------|
-| ADR-001: NATS as Event Bus | `nats-core/docs/design/decisions/` | NATS JetStream over Kafka/Redis |
-| ADR-002: Schema Versioning | `nats-core/docs/design/decisions/` | version field + extra="ignore" + semver |
-| ADR-003: nats-py vs FastStream | `nats-core/docs/design/decisions/` | nats-py for library, FastStream for services |
-| ADR-004: Dynamic Fleet Registration | `nats-core/docs/design/decisions/` | CAN bus pattern via NATS |
-| ADR-001: Standalone Infra Repo | `nats-infrastructure/docs/design/decisions/` | Backbone middleware, not coupled to any consumer |
-| ADR-002: Account Multi-Tenancy | `nats-infrastructure/docs/design/decisions/` | NATS accounts per project |
+| ADR-001 through ADR-004 | `nats-core/docs/design/decisions/` | NATS, schema versioning, nats-py vs FastStream, dynamic fleet registration |
+| ADR-001, ADR-002 | `nats-infrastructure/docs/design/decisions/` | Standalone infra repo, account multi-tenancy |
+| ADR-ARCH-006 through ADR-ARCH-010 | `specialist-agent/docs/decisions/` | Three interface layers, unified harness, role config, repo rename |
 
 ### Templates
 
@@ -203,208 +252,152 @@ All adapters ←─────→│  (nats-core)     │
 | `langchain-deepagents` | Production (built-in) | `guardkit/installer/core/templates/` |
 | `langchain-deepagents-weighted-evaluation` | Production (built-in) | `guardkit/installer/core/templates/` |
 | `langchain-deepagents-orchestrator` | Built (pending review → built-in) | `~/.agentecflow/templates/` |
-| `python-library` | Built (pending review → built-in) | `~/.agentecflow/templates/` |
-| `nats-asyncio-service` | Built (pending review → built-in) | `~/.agentecflow/templates/` |
-
-### Template Specs
-
-| Spec | Location |
-|------|----------|
-| python-library spec | `guardkit/docs/research/dark_factory/template-spec-python-library.md` |
-| nats-asyncio-service spec | `guardkit/docs/research/dark_factory/template-spec-nats-asyncio-service.md` |
-| Template creation session guide | `guardkit/docs/research/dark_factory/template-creation-session.md` |
-
-### YouTube Content Documents
-
-| Document | Location |
-|----------|----------|
-| YouTube Planner conversation starters (×3) | `youtube-planner/docs/research/conversation-starters/` |
-| Channel project briefing | `~/Projects/YouTube Channel/youtube-channel-project-briefing.md` |
-| Feature specs (×5) | `~/Projects/YouTube Channel/feature-01` through `feature-05` |
-| DDD Southwest talk material | `~/Projects/YouTube Channel/ddd-southwest-adversarial-cooperation-talk.md` |
-| Video plans | `~/Projects/YouTube Channel/video-plans/` |
+| `python-library` | Spec ready | `guardkit/docs/research/dark_factory/` |
+| `nats-asyncio-service` | Spec ready | `guardkit/docs/research/dark_factory/` |
+| `dotnet-fastendpoints` | Planned (from lpa-platform exemplar) | — |
 
 ### Proof Points
 
-| Document | Location |
-|----------|----------|
+| Proof Point | Location |
+|------------|----------|
 | FinProxy product docs (14 docs, 310 KB) | `finproxy-docs/` |
-| GCSE dataset factory output | `agentic-dataset-factory/output/` |
+| Phase 0/1 FinProxy architect agent runs | `specialist-agent/` (output + command history) |
+| First fine-tune outputs (GCSE tutor) | GB10: `~/fine-tuning/output/gcse-tutor-gemma4-31b/` |
+| GCSE dataset factory (~2,500 examples) | `agentic-dataset-factory/output/` |
+| nats-core library (97% coverage) | `nats-core/` |
+| Feature spec history (7 specs) | `specialist-agent/feature-spec-FEAT-001-history.md` through `FEAT-007` |
 | AutoBuild review reports | `guardkit/` (various TASK-REV files) |
 
 ---
 
 ## 5. Resolved Decisions (Fleet-Wide, Do NOT Reopen)
 
-| # | Decision | Resolution |
-|---|----------|-----------|
-| D1 | Agent framework | LangChain DeepAgents SDK |
-| D2 | Reasoning model | Gemini 3.1 Pro API or Claude API (configurable) |
-| D3 | Implementation model | Claude Code SDK (cloud) or vLLM on GB10 (local) |
-| D4 | Event bus | NATS JetStream |
-| D5 | Two-model separation | Orchestration model ≠ implementation model |
-| D6 | NemoClaw | Rejected — not production-ready. Revisit Q3-Q4 2026 |
-| D7 | Tool interface stability | Signatures identical across cloud and local modes |
-| D8 | Multi-project | Concurrent pipelines with NATS topic prefix isolation |
-| D9 | Template strategy | Exemplar-first: build → prove → extract template |
-| D10 | ChromaDB over NVIDIA RAG | ChromaDB PersistentClient for vector storage |
-| D11 | nats-core uses nats-py | Library uses nats-py; services use FastStream |
-| D12 | NATS infrastructure standalone | Own repo — backbone middleware |
-| D13 | Account-based multi-tenancy | NATS accounts per project (APPMILLA, FINPROXY) |
-| D14 | Containerisation | Phase 2 — containers for lifecycle, concurrency, fleet scaling |
-| D15 | Agent discovery | Dynamic CAN bus registration via NATS fleet.register |
+See `fleet-master-index.md` (v2, 12 April 2026) for the complete list of 38 resolved
+decisions (D1–D38), organised into four groups:
+
+- **D1–D15:** Infrastructure & Framework
+- **D16–D22:** Agent Architecture
+- **D23–D32:** Unified Harness & Specialisation
+- **D33–D38:** Software Factory & Coordination
+
+Key additions since this document was first written include: unified harness (D23),
+fine-tuning teaches behaviour not facts (D26), three specialist deployments (D29),
+context-first delivery with no kanban/tickets (D33), outcome gates replace progress
+tracking (D34), confidence-gated checkpoints (D35), and Forge as checkpoint manager
+not specialist (D36).
 
 ---
 
-## 6. Build Sequence (11 Phases)
+## 6. Build Sequence
 
-| Phase | What | Status |
-|-------|------|--------|
-| **0** | GuardKit CLI, 3 templates, Graphiti, vLLM, dataset factory, FinProxy docs | Done |
-| **1** | python-library + nats-asyncio-service templates; review task for built-ins | Templates created, review pending |
-| **2** | nats-core library + nats-infrastructure deployment + fleet compose | `guardkit init` done, specs ready |
-| **3** | GuardKit Factory (primary deliverable) | Conversation starter ready |
-| **4** | Jarvis intent router (CAN bus registration, KV-backed routing) | Vision doc ready |
-| **5** | General Purpose Agent (ReAct + broad tools) | Vision doc ready |
-| **6** | Ideation Agent (weighted eval, divergent reasoning) | Vision doc ready |
-| **7** | Product Owner Agent (raw info → structured docs) | Vision doc ready |
-| **8** | Architect Agent (product docs → C4/ADRs → /system-arch) | Vision doc ready |
-| **9** | YouTube Planner (transcript map → research → planning) | Vision doc + 3 starters ready |
-| **10** | Adapters (Telegram, Dashboard, CLI, Reachy Mini) | Designed in jarvis-vision.md |
-| **11** | Template harvest (toolbox pattern from GP Agent) | Future |
+The old 11-phase linear sequence has been replaced by a per-repo phase structure. See
+`fleet-master-index.md` for the full breakdown. Summary:
+
+```
+specialist-agent:  Phase 0 ✅ → 1 ✅ → 1C → 1B → G → 2 → 3 → F
+nats-core:         ✅ Implemented (97% coverage)
+nats-infrastructure: ✅ Configured (ready to run)
+forge:             Blocked on specialist-agent Phase 3 + nats infra
+lpa-platform:      Blocked on dotnet exemplar + template-create
+```
+
+The Forge is the capstone — the last major agent to build because it coordinates
+everything else.
 
 ---
 
 ## 7. Gap Analysis — Known Gaps & Open Questions
 
-### 7.1 Graphiti Integration Strategy (Gap: HIGH)
+**Note (12 April 2026):** Several gaps from the original analysis have been resolved or
+significantly de-risked. Status updated below.
 
-Graphiti is referenced throughout as the knowledge graph for persistent memory, but
-there's no unified spec for how each agent connects to it:
-- Which agents read from Graphiti? Which write?
-- What entity types exist? (ADRs, architectural patterns, project knowledge, ideas, evaluation results)
-- How is Graphiti seeded for new projects?
-- What's the schema evolution strategy for Graphiti entities?
-- Does every agent get its own Graphiti namespace, or is it shared?
-- The Graphiti vector dimension mismatch (768 vs 1024) was under investigation — is it resolved?
+### 7.1 Graphiti Integration Strategy — PARTIALLY RESOLVED
 
-**Action needed:** A Graphiti integration spec, probably as a feature of nats-core or
-a separate shared doc. The Architect Agent vision doc mentions Graphiti most heavily
-but it's a fleet-wide concern.
+**Original gap:** No unified spec for how agents connect to Graphiti.
 
-### 7.2 Monitoring & Observability Dashboard (Gap: MEDIUM)
+**What's resolved:**
+- Per-role knowledge compounding designed (Phase G scope + build plan in specialist-agent)
+- Three-scope model defined: project → role → fleet, via `group_id`
+- Validated limitation documented: Graphiti stores relationships and decisions, not
+  documents (D27)
+- `doc_reader` for content, Graphiti for entities and learned patterns
 
-A dashboard is mentioned in multiple docs (Ship's Computer v1.0, Jarvis vision, fleet
-master index) but no spec exists:
-- What does the dashboard show? Fleet status, agent queues, build progress, approval queue?
-- Is it a React app subscribing to NATS via WebSocket?
-- Does it use the NATS monitoring endpoint (port 8222) or its own data pipeline?
-- Who's the primary user? Rich during development, or James for project oversight?
+**What remains:** Phase G not yet built. Integration tests against live Graphiti +
+specialist-agent needed. Schema evolution strategy still open.
 
-**Action needed:** Dashboard feature spec, probably as an adapter in `nats-infrastructure`
-or a standalone repo.
+### 7.2 Monitoring & Observability Dashboard — OPEN (Gap: MEDIUM)
 
-### 7.3 Error Handling & Dead Letter Queues (Gap: MEDIUM)
+No spec change. Dashboard deferred until agents produce data worth displaying. The
+NATS monitoring endpoint (:8222) provides infrastructure health. Coach scores and
+pipeline events provide application-level observability when the Forge is running.
 
-What happens when things go wrong at the fleet level:
-- Agent fails mid-task — does the task retry? Go to dead letter queue? Alert the human?
-- NATS message processing fails — ack/nak/redelivery strategy not specified per stream
-- Agent crashes during a multi-stage pipeline — how is partial state recovered?
-- Build failures in GuardKit Factory — retry logic, escalation path?
+### 7.3 Error Handling & Dead Letter Queues — PARTIALLY RESOLVED
 
-**Action needed:** Error handling section in nats-core spec or a fleet-wide error
-handling ADR.
+**What's resolved:** nats-core implements `MessageEnvelope` with `correlation_id` for
+tracing related messages. `BuildFailedPayload` has `recoverable` flag. Forge pipeline
+orchestrator refresh (v3) defines degraded mode behaviour.
 
-### 7.4 End-to-End Testing Strategy (Gap: MEDIUM)
+**What remains:** Dead letter queue configuration, retry strategy per stream, partial
+state recovery for multi-stage pipeline failures. These should be addressed when the
+Forge build begins.
 
-Individual agents are testable (TestNatsBroker for services, mocked nats-py for library).
-But multi-agent workflows need integration testing:
-- How do you test "Ideation → Product Owner → Architect → Factory" end-to-end?
-- Is there a fleet-level test harness?
-- Can you replay NATS messages for debugging?
-- How do you test the CAN bus registration lifecycle?
+### 7.4 End-to-End Testing Strategy — OPEN (Gap: MEDIUM)
 
-**Action needed:** Testing strategy doc, possibly in nats-infrastructure alongside
-the fleet compose.
+No spec change. nats-core has 97% unit test coverage with mocked NATS. Integration
+tests against a live NATS server are the weekend task. Multi-agent workflow testing
+remains unaddressed.
 
-### 7.5 GCSE Tutor Integration (Gap: LOW-MEDIUM)
+### 7.5 GCSE Tutor Integration — PARTIALLY RESOLVED
 
-The GCSE Tutor is listed as "future/TBD" in the fleet but it's actually an active
-project with real deliverables:
-- Agentic dataset factory has completed production runs (~2,500 targets)
-- Docling is working on GB10 for both digital and scanned PDFs
-- Multi-subject expansion is planned (maths, science, French, Spanish, history)
-- Reachy Mini "Scholar" is the intended interface
+**What's resolved:**
+- First fine-tune complete (Gemma 4 31B, loss 2.45→0.50)
+- Docling pipeline validated (standard + VLM modes on GB10)
+- Multi-subject expansion planned (Maths, French, Spanish)
+- Decision to deploy to Bedrock first (D30) — validates import pipeline, frees GB10
 
-The gap is: how does the tutor integrate with the Jarvis fleet? Is it a NATS agent
-that registers with the fleet? Or is it a standalone Open WebUI deployment with
-Reachy as a separate interface?
+**What remains:** Fleet integration decision — standalone Open WebUI deployment or
+NATS agent? Reachy Mini "Scholar" interface design. Multi-domain merge script for
+combining training data from multiple subjects.
 
-**Action needed:** GCSE Tutor vision doc in a new repo, or a decision that it stays
-outside the Jarvis fleet.
+### 7.6 API Cost Management — RESOLVED (Gap: LOW)
 
-### 7.6 API Cost Management (Gap: LOW)
+**Resolution:** AWS Bedrock CMI provides serverless hosting at ~$1.50-3.00 per run,
+scales to zero. Local vLLM on GB10 for development. The cost model is now
+well-understood: fine-tuned models on Bedrock for production, API calls (Claude, Gemini)
+for Coach evaluation, local inference for iteration.
 
-Six agents using Gemini 3.1 Pro for weighted evaluation, plus Claude API for content
-generation and implementation. No cost tracking or budget alerting exists:
-- What's the estimated monthly API cost at steady-state?
-- Should there be a cost budget per agent or per project?
-- The local vLLM path eliminates marginal costs but is slower — when to prefer it?
+### 7.7 Migration Path from Current Workflow — RESOLVED
 
-**Action needed:** Cost estimation in the big picture doc or a simple cost tracking
-mechanism in the orchestrator.
+**Resolution:** The migration is already happening incrementally:
+- GuardKit CLI is used daily (Phase 0 already done)
+- specialist-agent Phase 0/1 validated on FinProxy
+- nats-core implemented
+- Each phase adds capability without disrupting current workflow
+- The Forge is the step that replaces the manual pipeline operator role
 
-### 7.7 Migration Path from Current Workflow (Gap: LOW)
+### 7.8 Adapter Priority & Telegram Bot — OPEN (Gap: LOW)
 
-How do we incrementally adopt Jarvis while remaining productive:
-- Phase 2 (NATS) doesn't change daily workflow at all
-- Phase 3 (GuardKit Factory) replaces the manual pipeline operator role
-- Phase 4+ (Jarvis + agents) requires all agents to be containerised and registered
+No change. Deferred until fleet is running.
 
-Is there a "Jarvis lite" that works before the full fleet? Perhaps Jarvis router +
-General Purpose Agent + one specialist, with the rest added incrementally?
+### 7.9 Security: Agent-to-Agent Trust — OPEN (Gap: LOW)
 
-**Action needed:** Migration plan section in the build sequence, or acceptance that
-Phase 4 is the minimum viable Jarvis.
+No change. NATS account-level isolation (APPMILLA vs FINPROXY) handles project
+isolation. Per-agent permissions within an account deferred until fleet is larger.
 
-### 7.8 Adapter Priority & Telegram Bot (Gap: LOW)
+### 7.10 Merge Addendum Specs — RESOLVED
 
-Telegram is listed as "quickest to test" but no spec exists:
-- Bot token setup, command structure, message formatting
-- How does Telegram handle multi-turn conversations? (Different from voice)
-- Does Rich want Telegram primarily for mobile access while away from desk?
-- Is there a Telegram-specific UX consideration?
-
-**Action needed:** Telegram adapter feature spec when Phase 10 approaches.
-
-### 7.9 Security: Agent-to-Agent Trust (Gap: LOW)
-
-NATS accounts handle project isolation (APPMILLA vs FINPROXY). But within the
-APPMILLA account, all agents can publish to all topics. Questions:
-- Can the Product Owner Agent accidentally trigger a build?
-- Should agents have scoped permissions within the account?
-- Is the fleet.register topic protected (could a rogue agent register with confidence 1.0 for everything)?
-
-**Action needed:** Per-agent NATS permissions, probably deferred until fleet is larger.
-
-### 7.10 Merge Addendum Specs (Gap: IMMEDIATE)
-
-Two addendum spec files need merging into their parent specs before `/feature-spec`
-or `/feature-plan` runs:
-- `nats-core-spec-addendum-fleet-registration.md` → merge into `nats-core-system-spec.md`
-- `nats-infrastructure-spec-addendum-fleet-compose.md` → merge into `nats-infrastructure-system-spec.md`
-
-**Action needed:** Merge before next Claude Code session.
+**Resolution:** Addendums merged into parent specs during nats-core implementation.
+Both specs are now complete and implemented.
 
 ---
 
 ## 8. Hardware Topology
 
-| Machine | Role | Ports |
-|---------|------|-------|
-| **Dell DGX Spark GB10 (128GB)** | NATS server, vLLM (3 models), Graphiti (FalkorDB), Docker host, agent execution, Reachy USB | 4222, 8222, 8000, 8001, 8002 |
-| **MacBook Pro M2 Max** | Planning/research, dashboard client, CLI adapter, cloud API calls | — |
-| **Synology DS918+ NAS (32TB)** | FalkorDB persistence, JetStream backup, shared storage | — |
+| Machine | Role | Key Ports |
+|---------|------|-----------|
+| **Dell DGX Spark GB10 (128GB)** | NATS server, vLLM (3 models), FalkorDB, ChromaDB, Docker, fine-tuning, agent execution | 4222, 8222, 8000, 8001, 8002 |
+| **MacBook Pro M2 Max** | Planning/research, Claude Desktop, primary pair-programming | — |
+| **Synology DS918+ NAS (32TB)** | Storage/backup (not compute) | — |
 | **Reachy Mini ×2** (on order) | Scholar (tutoring) + Bridge (Jarvis voice interface) | USB |
 
 Connected via Tailscale mesh VPN.
@@ -418,15 +411,23 @@ Connected via Tailscale mesh VPN.
 - Not a competitor to Cursor/Windsurf — full lifecycle, not just coding
 - Not an enterprise platform — single developer + small team
 - Not using NemoClaw — rejected, revisit Q3-Q4 2026
+- Not a better Jira — the coordination layer ceases to exist, not improves
 
 ---
 
-## 10. Next Actions (Immediate)
+## 10. Next Actions
 
-1. **Merge addendum specs** into parent nats-core and nats-infrastructure specs
-2. **Review task** in GuardKit: add orchestrator + python-library + nats-asyncio-service as built-in templates
-3. **Run `/feature-spec`** on nats-core with merged spec (BDD scenarios for message contracts)
-4. **Run `/feature-plan`** on nats-infrastructure with merged spec (deployment tasks)
-5. **Transfer YouTube conversation starters:** `bash transfer-starters.sh` in youtube-planner repo
-6. **Commit all repos** — 10 repos with vision docs, specs, and decisions ready
-7. **Start building nats-core** — the foundation everything else depends on
+See `fleet-master-index.md` for the current per-repo build sequence and blocking
+dependencies. The immediate path is:
+
+1. Spin up NATS on GB10, run nats-core integration tests (validates messaging backbone)
+2. specialist-agent Phase 1C (domain fidelity fixes)
+3. specialist-agent Phase 1B (unified harness — second role)
+4. specialist-agent Phase 3 (NATS fleet integration)
+5. Forge build (capstone — coordinates everything)
+
+
+---
+
+*Original: April 2026*
+*Updated: 12 April 2026 — repo references, capabilities, resolved gaps, context-first delivery*

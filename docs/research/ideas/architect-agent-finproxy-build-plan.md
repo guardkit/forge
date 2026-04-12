@@ -1,8 +1,38 @@
+# ⚠️ SUPERSEDED — Historical Evidence Only
+
+> **This document has been superseded** by the phase-specific build plans in
+> `specialist-agent/docs/research/ideas/`:
+>
+> - `phase1c-domain-fidelity-build-plan.md`
+> - `phase1b-unified-harness-build-plan.md`
+> - `phaseG-build-plan.md`
+> - `phase2-build-plan.md`
+> - `phase3-build-plan.md`
+> - `phaseF-build-plan.md`
+>
+> And for the FinProxy platform specifically:
+> - `lpa-platform/docs/buildplan.md`
+>
+> **Do not use this document for current planning.** It reflects the state of the
+> project on 4-5 April 2026, before the unified harness decision (ADR-ARCH-008),
+> the repo rename (`architect-agent` → `specialist-agent`, ADR-ARCH-010), and
+> Phase 0/1 validation runs.
+>
+> **Why it is preserved:** This document is evidence of the build approach —
+> how decisions were structured, how phases were planned, how Graphiti integration
+> was designed. The decisions (DA1–DA15) influenced and were carried forward into
+> the fleet-wide decisions (D16–D32) in the fleet-master-index. The Graphiti
+> knowledge scoping table and export design remain valid references.
+>
+> *Superseded: 12 April 2026*
+
+---
+
 # Architect Agent & FinProxy — Build Plan & TODO List
 
 ## For: Tracking all decisions and actions from April 2026 ideation session
 ## Date: 4 April 2026 (updated: 5 April 2026)
-## Status: Active
+## Status: SUPERSEDED — see header above
 
 ---
 
@@ -420,20 +450,20 @@ cd ~/Projects/appmilla_github/architect-agent-mcp
 
 | Document | Location |
 |----------|----------|
-| Gap analysis | `guardkitfactory/docs/research/ideas/conversation-starter-gap-analysis.md` |
-| Fleet master index | `guardkitfactory/docs/research/ideas/fleet-master-index.md` |
-| Big picture vision | `guardkitfactory/docs/research/ideas/big-picture-vision-and-durability.md` |
-| Architect agent vision | `architect-agent/docs/research/ideas/architect-agent-vision.md` |
-| Skills & RAG decisions | `architect-agent/docs/research/ideas/skills-and-knowledge-rag-decisions.md` |
-| Skills & RAG conversation starter | `architect-agent/docs/research/ideas/conversation-starter-skills-and-knowledge-rag.md` |
-| Architecture knowledge library | `architect-agent/docs/research/ideas/architecture-knowledge-library.md` |
-| Book extraction pipeline | `architect-agent/docs/research/ideas/architecture-book-extraction-pipeline.md` |
-| Fine-tuned architect strategy | `architect-agent/docs/research/ideas/fine-tuned-architect-agent-strategy.md` |
-| Three-layer benchmark | `architect-agent/docs/research/ideas/three-layer-architecture-benchmark.md` |
-| Assumption defence & checkpoints | `architect-agent/docs/research/ideas/assumption-defence-and-checkpoints.md` |
-| C4 diagram index | `architect-agent/docs/research/ideas/c4-diagram-index.md` |
-| Critical review | `architect-agent/docs/research/ideas/critical-review-5-april-2026.md` |
-| Phase 0 build plan | `architect-agent/docs/research/ideas/phase-0-build-plan.md` |
+| Gap analysis | `forge/docs/research/ideas/conversation-starter-gap-analysis.md` |
+| Fleet master index | `forge/docs/research/ideas/fleet-master-index.md` |
+| Big picture vision | `forge/docs/research/ideas/big-picture-vision-and-durability.md` |
+| Architect agent vision | `specialist-agent/docs/research/ideas/architect-agent-vision.md` |
+| Skills & RAG decisions | `specialist-agent/docs/research/ideas/skills-and-knowledge-rag-decisions.md` |
+| Skills & RAG conversation starter | `specialist-agent/docs/research/ideas/conversation-starter-skills-and-knowledge-rag.md` |
+| Architecture knowledge library | `specialist-agent/docs/research/ideas/architecture-knowledge-library.md` |
+| Book extraction pipeline | `specialist-agent/docs/research/ideas/architecture-book-extraction-pipeline.md` |
+| Fine-tuned architect strategy | `specialist-agent/docs/research/ideas/fine-tuned-architect-agent-strategy.md` |
+| Three-layer benchmark | `specialist-agent/docs/research/ideas/three-layer-architecture-benchmark.md` |
+| Assumption defence & checkpoints | `specialist-agent/docs/research/ideas/assumption-defence-and-checkpoints.md` |
+| C4 diagram index | `specialist-agent/docs/research/ideas/c4-diagram-index.md` |
+| Critical review | `specialist-agent/docs/research/ideas/critical-review-5-april-2026.md` |
+| Phase 0 build plan | `specialist-agent/docs/research/ideas/phase-0-build-plan.md` |
 | FinProxy foundations | `finproxy-docs/FinProxy-LPA-Foundations-and-AI-Vision.md` |
 | FinProxy architecture | `finproxy-docs/FinProxy-Architecture-Exploration.md` |
 | FinProxy tech stack | `finproxy-docs/FinProxy-Tech-Stack.md` |
@@ -453,3 +483,4 @@ cd ~/Projects/appmilla_github/architect-agent-mcp
 
 *Created: 4 April 2026 | Architect Agent + FinProxy build planning session*
 *Updated: 5 April 2026 | Graphiti decisions: fleet knowledge, export/import, embedding confirmation*
+*SUPERSEDED: 12 April 2026 | See specialist-agent phase build plans and lpa-platform/docs/buildplan.md*
