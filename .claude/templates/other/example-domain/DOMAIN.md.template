@@ -1,0 +1,77 @@
+# Example Domain Configuration
+
+<!-- REPLACE THIS FILE with your own domain configuration.
+     This example shows the expected structure — substitute your
+     domain description, guidelines, criteria, and output format. -->
+
+---
+
+## Domain Description
+
+<!-- Replace with a description of YOUR domain. -->
+
+This is a generic example domain that demonstrates the orchestrator's two-model
+architecture. The reasoning model (orchestrator) decomposes tasks and coordinates
+execution, while the implementation model carries out individual steps.
+
+Replace this entire file with a domain configuration tailored to your use case
+(e.g. code generation, data pipelines, research workflows, document processing).
+
+---
+
+## Orchestration Guidelines
+
+<!-- Replace with instructions for how tasks should be decomposed and executed. -->
+
+The orchestrator should:
+
+1. Analyse the incoming request and decompose it into discrete steps.
+2. Assign each step to the implementation model with clear instructions.
+3. Validate each step's output before proceeding to the next.
+4. Aggregate results into the final deliverable.
+5. Retry failed steps up to `max_retries` before reporting failure.
+
+---
+
+## Quality Criteria
+
+<!-- Replace with the criteria for evaluating task completion. -->
+
+Each completed task is evaluated against the following criteria:
+
+| Criterion       | Description                                              |
+|-----------------|----------------------------------------------------------|
+| Completeness    | All requested steps were executed and their outputs aggregated. |
+| Correctness     | Each step's output meets the stated requirements.        |
+| Efficiency      | No unnecessary steps or redundant model invocations.     |
+| Traceability    | Each step can be traced back to a requirement in the request. |
+
+A task **passes** if every criterion is satisfied.
+
+---
+
+## Output Format
+
+<!-- Replace with the expected output structure for your domain. -->
+
+Each completed task should produce a structured result:
+
+```json
+{
+  "task": "Short description of the original request",
+  "steps": [
+    {
+      "step": 1,
+      "description": "What this step accomplished",
+      "status": "completed"
+    }
+  ],
+  "result": "Final aggregated output or summary",
+  "metadata": {
+    "domain": "example-domain",
+    "completed_at": "ISO-8601 timestamp",
+    "total_steps": 3,
+    "retries": 0
+  }
+}
+```

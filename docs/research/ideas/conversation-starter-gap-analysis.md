@@ -95,7 +95,7 @@ Beyond learning and content — this genuinely makes Rich more productive:
 - FinProxy proof point: 14 product docs (310 KB) in one weekend, James approved
 - Phase 0 FinProxy: 0.75 score, 93 seconds, first real specialist agent run
 - Phase 1 FinProxy: 0.93 score, 162 seconds, quality improvement validated
-- nats-core: 97% test coverage, 6 features, GuardKit command sequence produced
+- nats-core: 98% test coverage, 6 features, GuardKit command sequence produced
   production-quality library code
 - AutoBuild proof point: 43 tasks, 3 human decisions, 93% defaults accepted
 - Feature spec defaults: Rich accepts ~95% of proposed defaults across 7 specs
@@ -172,7 +172,7 @@ All adapters ←─────→│  (nats-core)     │
 
 | Component | Repo | Status | Purpose |
 |-----------|------|--------|---------|
-| **nats-core** | `nats-core` | ✅ 97% coverage | Message schemas, topic constants, fleet registration, typed NATS client |
+| **nats-core** | `nats-core` | ✅ 98% coverage | Message schemas, topic constants, fleet registration, typed NATS client |
 | **NATS Server** | `nats-infrastructure` | ✅ Configured | Docker Compose deployment, accounts, streams, monitoring |
 
 ### 3.4 Key Architectural Patterns
@@ -222,7 +222,7 @@ All adapters ←─────→│  (nats-core)     │
 
 | Document | Location | Status |
 |----------|----------|--------|
-| nats-core System Spec (6 features, BDD) | `nats-core/docs/design/specs/nats-core-system-spec.md` | ✅ Implemented, 97% coverage |
+| nats-core System Spec (6 features, BDD) | `nats-core/docs/design/specs/nats-core-system-spec.md` | ✅ Implemented, 98% coverage |
 | nats-infrastructure System Spec (6 features) | `nats-infrastructure/docs/design/specs/nats-infrastructure-system-spec.md` | ✅ Configured |
 
 ### Phase Build Plans (specialist-agent)
@@ -264,7 +264,7 @@ All adapters ←─────→│  (nats-core)     │
 | Phase 0/1 FinProxy architect agent runs | `specialist-agent/` (output + command history) |
 | First fine-tune outputs (GCSE tutor) | GB10: `~/fine-tuning/output/gcse-tutor-gemma4-31b/` |
 | GCSE dataset factory (~2,500 examples) | `agentic-dataset-factory/output/` |
-| nats-core library (97% coverage) | `nats-core/` |
+| nats-core library (98% coverage) | `nats-core/` |
 | Feature spec history (7 specs) | `specialist-agent/feature-spec-FEAT-001-history.md` through `FEAT-007` |
 | AutoBuild review reports | `guardkit/` (various TASK-REV files) |
 
@@ -295,7 +295,7 @@ The old 11-phase linear sequence has been replaced by a per-repo phase structure
 
 ```
 specialist-agent:  Phase 0 ✅ → 1 ✅ → 1C → 1B → G → 2 → 3 → F
-nats-core:         ✅ Implemented (97% coverage)
+nats-core:         ✅ Implemented (98% coverage)
 nats-infrastructure: ✅ Configured (ready to run)
 forge:             Blocked on specialist-agent Phase 3 + nats infra
 lpa-platform:      Blocked on dotnet exemplar + template-create

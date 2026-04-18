@@ -3,22 +3,14 @@
     "graphiti": {
       "type": "stdio",
       "defer_loading": false,
-      "command": "/opt/homebrew/bin/uv",
+      "command": "/bin/bash",
       "args": [
-        "--directory",
-        "/Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server",
-        "run",
-        "main.py",
-        "--transport",
-        "stdio",
-        "--config",
-        "/Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server/config/config-guardkit.yaml"
+        "-c",
+        "set -a && . /Users/richardwoollcott/Projects/appmilla_github/forge/.env && set +a && export LLM_MODEL=gemini-2.5-pro && exec /opt/homebrew/bin/uv --directory /Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server run main.py --transport stdio --config /Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server/config/config-guardkit.yaml"
       ],
       "env": {
         "CONFIG_PATH": "/Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server/config/config-guardkit.yaml",
-        "OPENAI_API_KEY": "not-needed-vllm-local",
-        "LLM_API_URL": "http://promaxgb10-41b1:8000/v1",
-        "LLM_MODEL": "neuralmagic/Qwen2.5-14B-Instruct-FP8-dynamic",
+        "LLM_MODEL": "gemini-2.5-pro",
         "EMBEDDING_API_URL": "http://promaxgb10-41b1:8001/v1",
         "EMBEDDING_DIM": "1024"
       }

@@ -4,7 +4,7 @@
 ## Status: Exploration — captures how the ecosystem has evolved since March 2026. Aligned with anchor v2.2.
 ## Canonical architecture: [forge-pipeline-architecture.md](../forge-pipeline-architecture.md) v2.2 — this document is a supporting design artefact for the checkpoint protocol and specialist-agent delegation model.
 ## Repo: `guardkit/forge`
-## Related: `specialist-agent` unified harness (Phase 1B), `nats-core` (97% coverage, implemented), `nats-infrastructure` (configured, ready to run), fleet master index
+## Related: `specialist-agent` unified harness (Phase 1B), `nats-core` (98% coverage, implemented), `nats-infrastructure` (configured, ready to run), fleet master index
 
 ---
 
@@ -40,7 +40,7 @@ The `guardkit/product-owner-agent` repo has been deleted. The product owner is n
 
 ### 3. NATS Core Library Is Implemented (97% Test Coverage)
 
-The `nats-core` library is no longer a design contract — it's working code at 97% test coverage across 17 test files. The full implementation includes:
+The `nats-core` library is no longer a design contract — it's working code at 98% test coverage across 17 test files. The full implementation includes:
 
 - **`NATSClient`** — async client wrapping nats-py with typed `MessageEnvelope` construction, project-scoped topic prefixing, and safe JSON deserialisation. Fleet convenience methods: `register_agent()`, `deregister_agent()`, `heartbeat()`, `get_fleet_registry()`, `watch_fleet()`, `call_agent_tool()`.
 - **`NATSKVManifestRegistry`** — JetStream KV-backed implementation of `ManifestRegistry` ABC. `find_by_intent()` and `find_by_tool()` for dynamic agent discovery. `InMemoryManifestRegistry` for testing.
@@ -50,7 +50,7 @@ The `nats-core` library is no longer a design contract — it's working code at 
 - **Event payloads** — full lifecycle coverage:
   - Fleet: `AgentHeartbeatPayload`, `AgentDeregistrationPayload` (registration uses `AgentManifest` directly per DDR-002)
   - Agent: `AgentStatusPayload`, `ApprovalRequestPayload`/`ApprovalResponsePayload` (the checkpoint protocol), `CommandPayload`/`ResultPayload`
-  - Pipeline: `FeaturePlannedPayload`, `FeatureReadyForBuildPayload`, `BuildStartedPayload`/`BuildProgressPayload`/`BuildCompletePayload`/`BuildFailedPayload`
+  - Pipeline: ~~`FeaturePlannedPayload`~~, ~~`FeatureReadyForBuildPayload`~~ *(RETIRED — see correction 12 below; replaced by `StageCompletePayload` and `BuildQueuedPayload`)*, `BuildStartedPayload`/`BuildProgressPayload`/`BuildCompletePayload`/`BuildFailedPayload`
   - Jarvis: `IntentClassifiedPayload`, `DispatchPayload`, `AgentResultPayload`, `NotificationPayload`
 
 **What remains:** Integration tests against a live NATS server. The unit tests mock the NATS connection; the integration tests (`test_client_integration.py`) need a running NATS instance to execute. This is the weekend task.
@@ -388,6 +388,17 @@ The anchor's Stage 1 ("Specification Review") is broader than just product-owner
 
 ### Fleet Agent Tools (via NATS)
 
+**Reply-subject convention (LES1 parity rule).** `call_agent_tool()` publishes
+commands to `agents.command.<agent_id>` and subscribes to
+`agents.result.<agent_id>.<correlation_id>` (or the convention nats-core's
+`NATSClient.call_agent_tool()` sets) for the real reply. The JetStream AGENTS
+stream intercepts `agents.>` and returns `PubAck` within ~3ms — **do not treat
+PubAck as success**. Per specialist-agent LES1 §2 (walkthrough §retest-smoke):
+`nats request` against `agents.>` returned PubAck and exited ~3ms later; the real
+reply arrived separately on `agents.result.<role>`. Operators read PubAck as
+success and the round-trip contract was silently broken for iterations.
+Document publishers/subscribers per role in one table before go-live.
+
 | Tool | Target Agent | NATS Method | Input | Output |
 |------|-------------|-------------|-------|--------|
 | `delegate_product_docs` | product-owner-agent | `call_agent_tool()` | Raw input, product brief | ProductDocument + CoachScore |
@@ -509,21 +520,31 @@ intents:
     confidence: 0.80
 
 tools:
+  # Per specialist-agent LES1 §4 (TASK-MDF-POLR): any tool call whose handler
+  # may exceed 30s MUST be fire-and-forget — return session_id/pipeline_id
+  # immediately, expose _status and _cancel companions. Forge pipeline runs up
+  # to 60 min (`max_task_timeout_seconds: 3600`), far beyond the Claude Desktop
+  # 240s MCP timeout. Tool descriptions are a contract; they must match the
+  # async implementation, not a hope of "I'll tidy this up later."
   - name: forge_greenfield
-    description: "Run full greenfield pipeline from raw input to deployed code"
+    description: "Start a full greenfield pipeline run from raw input. Returns `pipeline_id` immediately (fire-and-forget per LES1 §4 POLR). Poll `forge_status(pipeline_id)` for progress; cancel with `forge_cancel(pipeline_id)`."
     risk_level: mutating
     async_mode: true
   - name: forge_feature
-    description: "Add a feature to an existing project"
+    description: "Start adding a feature to an existing project. Returns `pipeline_id` immediately (fire-and-forget per LES1 §4 POLR). Poll `forge_status(pipeline_id)`; cancel with `forge_cancel(pipeline_id)`."
     risk_level: mutating
     async_mode: true
   - name: forge_review_fix
-    description: "Review and fix issues in existing code"
+    description: "Start a review-and-fix cycle on existing code. Returns `pipeline_id` immediately (fire-and-forget per LES1 §4 POLR). Poll `forge_status(pipeline_id)`; cancel with `forge_cancel(pipeline_id)`."
     risk_level: mutating
     async_mode: true
   - name: forge_status
-    description: "Get current pipeline status for a project"
+    description: "Get current pipeline status for a project (or specific pipeline_id)"
     risk_level: read_only
+    async_mode: false
+  - name: forge_cancel
+    description: "Cancel an in-flight pipeline run by pipeline_id. Companion to the three mutating fire-and-forget tools per LES1 §4 POLR."
+    risk_level: mutating
     async_mode: false
 
 max_concurrent: 1  # sequential builds per ADR-SP-012
@@ -532,6 +553,16 @@ nats_topic: agents.command.forge
 ```
 
 ### AgentConfig (using nats-core schema)
+
+**Provider-resolution rule (LES1 parity).** `reasoning_model` must be resolved
+from `AGENT_MODELS__REASONING_MODEL` (via `AgentConfig`, with the `AGENT_` env
+prefix and `__` nested delimiter) at the lowest layer that instantiates the chat
+model — **not** in each handler, and **not** via hard-coded defaults at the call
+site. Per specialist-agent LES1 §3 (TASK-MDF-PMEV + `command_router.py.
+_default_player_model()` CRMV parity patch in commit `8b9d584`): the same bug
+was fixed twice because handlers re-computed defaults from their own view of the
+environment. Every transport forge adds (NATS, future MCP, CLI) must route
+through the same factory — the factory, not the handler, owns resolution.
 
 ```yaml
 # forge/agent-config.yaml.example
@@ -599,7 +630,7 @@ These aspects of the original conversation starter are unchanged and should be c
 | Checkpoint protocol | Hard human checkpoint after every major stage | **Confidence-gated checkpoints** — Coach score determines auto-approve / flag / hard stop |
 | Checkpoint wire format | Not defined | **nats-core payloads** — `ApprovalRequestPayload`, `ApprovalResponsePayload`, `NotificationPayload` (already implemented) |
 | Agent discovery | Static tool inventory | Dynamic via `NATSKVManifestRegistry.find_by_intent()` / `find_by_tool()` |
-| Pipeline events | Not defined | **nats-core payloads** — `FeaturePlannedPayload` through `BuildCompletePayload` (already implemented) |
+| Pipeline events | Not defined | **nats-core payloads** — `BuildQueuedPayload` through `BuildCompletePayload` per anchor v2.2 §7 (`FeaturePlannedPayload` and `FeatureReadyForBuildPayload` retired — see correction 12) |
 | Product documentation | Not addressed — assumed human provides | Product-owner-agent generates from raw input |
 | Architectural judgment | Forge does it via `/system-arch` | Architect-agent provides conversation starter, Forge feeds it to `/system-arch` |
 | Feasibility checks | Not addressed | Architect-agent provides via `call_agent_tool()` |
@@ -607,7 +638,7 @@ These aspects of the original conversation starter are unchanged and should be c
 | Degraded mode | Not addressed | Automatic fallback if specialist agents unavailable (with forced FLAG FOR REVIEW) |
 | Agent name | "Pipeline Orchestrator" | **Forge** |
 | Core identity | Pipeline orchestrator | **NATS-native pipeline orchestrator** with confidence-gated checkpoints (see anchor v2.2 §2) |
-| NATS messaging layer | "Needed" | **Implemented** — nats-core at 97% coverage, nats-infrastructure configured |
+| NATS messaging layer | "Needed" | **Implemented** — nats-core at 98% coverage, nats-infrastructure configured |
 | `/feature-spec` interaction | Simple tool invocation | Confidence-gated — auto-approves high-scoring specs, flags low-scoring ones |
 | Specialist agent repo | Separate repos (architect-agent, product-owner-agent) | Single repo (`specialist-agent`) with role configs that generate `AgentManifest` |
 | Config schema | Ad-hoc | **`AgentConfig` from nats-core** — shared schema across fleet |
@@ -646,7 +677,7 @@ These aspects of the original conversation starter are unchanged and should be c
 The Forge build depends on:
 
 1. ✅ Phase 0 — GuardKit CLI, AutoBuild, Graphiti (all working)
-2. ✅ nats-core — message contracts, manifest registry, topic registry, client (97% coverage, implemented)
+2. ✅ nats-core — message contracts, manifest registry, topic registry, client (98% coverage, implemented)
 3. ✅ nats-infrastructure — NATS server config, account multi-tenancy, Docker entrypoint (configured, ready to run)
 4. ◻ **Weekend task: spin up NATS on GB10, run nats-core integration tests** — validates the messaging backbone end-to-end
 5. ▶ Specialist-agent Phase 1 — output quality

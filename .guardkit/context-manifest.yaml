@@ -1,0 +1,108 @@
+# Context Manifest — Forge
+#
+# Machine-readable cross-repo dependency map for GuardKit context resolution.
+# Used by the Forge orchestrator to assemble --context flags when running
+# /feature-spec, /feature-plan, and other GuardKit commands.
+#
+# Paths are relative to the sibling repo root (assumes all repos checked out
+# under a common parent directory, e.g. ~/Projects/appmilla_github/).
+#
+# Categories:
+#   architecture  — system-level docs consumed by /system-arch, /system-design
+#   contracts     — interface definitions, payload schemas, API references
+#   specs         — system specs consumed by /feature-spec
+#   decisions     — ADRs that constrain this repo's design
+#   source        — key source files that define integration interfaces
+#
+# Updated: 13 April 2026
+
+repo: forge
+description: >
+  Pipeline orchestrator and checkpoint manager. Coordinates the specialist
+  agent fleet via NATS, invokes GuardKit commands, and manages confidence-gated
+  human engagement checkpoints.
+
+dependencies:
+
+  nats-core:
+    path: ../nats-core
+    relationship: "Forge publishes and subscribes to NATS events using nats-core's typed client and payload schemas"
+    key_docs:
+      - path: docs/design/specs/nats-core-system-spec.md
+        category: specs
+        description: "Payload schemas, topic registry, client API surface"
+
+      - path: docs/design/contracts/agent-manifest-contract.md
+        category: contracts
+        description: "AgentManifest, ToolCapability, IntentCapability — fleet registration interface"
+
+      - path: docs/design/decisions/ADR-001-nats-messaging.md
+        category: decisions
+        description: "Why NATS, JetStream persistence model"
+
+      - path: docs/design/decisions/ADR-004-dynamic-fleet-registration.md
+        category: decisions
+        description: "KV-backed manifest registry, heartbeat, capability announcement"
+
+      - path: src/nats_core/manifest.py
+        category: source
+        description: "AgentManifest Pydantic model — the wire format Forge reads from KV"
+
+      - path: src/nats_core/topics.py
+        category: source
+        description: "Topic namespace constants — Forge must use these, not invent its own"
+
+  specialist-agent:
+    path: ../specialist-agent
+    relationship: "Forge delegates architecture, product-owner, and ideation work to specialist-agent roles via NATS"
+    key_docs:
+      - path: docs/research/ideas/architect-agent-vision.md
+        category: architecture
+        description: "Three roles, three-layer architecture, delegation targets"
+
+      - path: src/specialist_agent/config/architect-role.yaml
+        category: contracts
+        description: "Architect role configuration — capabilities Forge can invoke"
+
+      - path: src/specialist_agent/config/product-owner-role.yaml
+        category: contracts
+        description: "Product Owner role configuration — capabilities Forge can invoke"
+
+      - path: src/specialist_agent/config/ideation-role.yaml
+        category: contracts
+        description: "Ideation role configuration — capabilities Forge can invoke"
+
+  nats-infrastructure:
+    path: ../nats-infrastructure
+    relationship: "Forge runs on the NATS infrastructure deployed by this repo"
+    key_docs:
+      - path: docs/design/decisions/ADR-001-standalone-infra-repo.md
+        category: decisions
+        description: "Why infrastructure is separate from nats-core library"
+
+      - path: docs/design/decisions/ADR-002-account-multi-tenancy.md
+        category: decisions
+        description: "NATS account isolation model — affects Forge's connection config"
+
+  guardkit:
+    path: ../guardkit
+    relationship: "Forge invokes GuardKit slash commands as subprocesses"
+    key_docs:
+      - path: .guardkit/commands/feature-spec.md
+        category: contracts
+        description: "Feature spec command definition — Forge needs to know flags and output contract"
+
+      - path: .guardkit/commands/feature-plan.md
+        category: contracts
+        description: "Feature plan command definition — downstream of feature-spec in pipeline"
+
+internal_docs:
+  description: "Key docs within the forge repo itself (for completeness / Forge self-awareness)"
+  always_include:
+    - docs/architecture/ARCHITECTURE.md
+    - docs/design/DESIGN.md
+    - docs/design/specs/forge-system-spec.md
+  research:
+    - docs/research/ideas/forge-pipeline-orchestrator-refresh.md
+    - docs/research/ideas/fleet-master-index.md
+    - docs/research/ideas/forge-build-plan.md

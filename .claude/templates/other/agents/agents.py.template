@@ -1,0 +1,308 @@
+"""Agent definitions for the DeepAgents orchestrator exemplar.
+
+Provides factory functions for all four agent roles:
+
+- **Orchestrator**: Top-level reasoning agent built via ``create_deep_agent()``.
+- **Implementer**: Sync SubAgent with the four orchestrator tools.
+- **Evaluator**: Sync SubAgent with NO tools (pure assessment).
+- **Builder**: Async SubAgent targeting a remote LangGraph deployment.
+
+Each SubAgent factory accepts a ``model`` string in ``provider:model`` format
+so the entrypoint can configure models from the YAML config file.
+
+Tool-inventory contract (TASK-REV-LES1 HIGH-1):
+    After ``create_deep_agent()`` returns, ``create_orchestrator()`` asserts
+    the *realised* tool inventory of each sync subagent against its allowlist.
+    This catches the TASK-REV-32D2 F2 bug class (DeepAgents'
+    ``SubAgentMiddleware`` injecting middleware tools into subagents declared
+    with ``tools=[]``). The Builder is an ``AsyncSubAgent`` targeting a remote
+    LangGraph deployment — its tool surface is owned by the remote graph and
+    is therefore skipped.
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+from typing import Any
+
+from deepagents import AsyncSubAgent, SubAgent, create_deep_agent
+from langgraph.graph.state import CompiledStateGraph
+
+from lib.factory_guards import ToolLeakageError, assert_tool_inventory
+from prompts import EVALUATOR_SYSTEM_PROMPT, IMPLEMENTER_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT
+from tools import analyse_context, execute_command, plan_pipeline, verify_output
+
+logger = logging.getLogger(__name__)
+
+# The four orchestrator tools shared between the orchestrator and implementer.
+_ORCHESTRATOR_TOOLS = [analyse_context, plan_pipeline, execute_command, verify_output]
+
+# Tool allowlists (TASK-REV-LES1 HIGH-1).
+# These are the *realised* tool inventories each sync subagent is contracted
+# to expose. Asserted post-construction in ``create_orchestrator()``.
+IMPLEMENTER_ALLOWED_TOOLS: set[str] = {
+    "analyse_context",
+    "plan_pipeline",
+    "execute_command",
+    "verify_output",
+}
+EVALUATOR_ALLOWED_TOOLS: set[str] = set()
+
+
+def implementer_subagent(model: str) -> SubAgent:
+    """Build the Implementer SubAgent spec.
+
+    The Implementer is a focused execution agent that receives plans from the
+    Orchestrator and produces concrete outputs.  It has access to the four
+    orchestrator tools for context analysis, planning, execution, and
+    verification.
+
+    Args:
+        model: Model identifier in ``provider:model`` format (e.g.
+            ``"anthropic:claude-haiku-4-5"``).
+
+    Returns:
+        A ``SubAgent`` TypedDict ready to pass to ``create_deep_agent(subagents=...)``.
+    """
+    if not model or not isinstance(model, str):
+        raise ValueError(f"model must be a non-empty string, got: {model!r}")
+
+    today = datetime.date.today().isoformat()
+    prompt = IMPLEMENTER_SYSTEM_PROMPT.format(date=today)
+
+    return SubAgent(
+        name="implementer",
+        description=(
+            "Focused execution agent that implements plans by writing code, "
+            "creating files, and running commands.  Delegates to the orchestrator "
+            "tools for context analysis, pipeline planning, command execution, "
+            "and output verification."
+        ),
+        system_prompt=prompt,
+        model=model,
+        tools=list(_ORCHESTRATOR_TOOLS),
+    )
+
+
+def evaluator_subagent(model: str) -> SubAgent:
+    """Build the Evaluator SubAgent spec.
+
+    The Evaluator is an objective quality-assurance agent that assesses outputs
+    against acceptance criteria and returns structured JSON verdicts.  It has
+    **no tools** — evaluation is purely analytical.
+
+    Args:
+        model: Model identifier in ``provider:model`` format (e.g.
+            ``"anthropic:claude-sonnet-4-6"``).
+
+    Returns:
+        A ``SubAgent`` TypedDict ready to pass to ``create_deep_agent(subagents=...)``.
+    """
+    if not model or not isinstance(model, str):
+        raise ValueError(f"model must be a non-empty string, got: {model!r}")
+
+    today = datetime.date.today().isoformat()
+    prompt = EVALUATOR_SYSTEM_PROMPT.format(date=today)
+
+    return SubAgent(
+        name="evaluator",
+        description=(
+            "Objective quality-assurance agent that reviews completed work "
+            "against acceptance criteria and returns a structured JSON verdict "
+            "with decision, score, issues, and quality assessment.  Has no "
+            "tools — evaluation is purely reasoning-based."
+        ),
+        system_prompt=prompt,
+        model=model,
+        tools=[],
+    )
+
+
+def builder_async_subagent(
+    url: str | None = None,
+    graph_id: str = "builder",
+) -> AsyncSubAgent:
+    """Build the Builder AsyncSubAgent spec.
+
+    The Builder is a non-blocking async subagent that targets a remote
+    LangGraph deployment for long-running build tasks.
+
+    Args:
+        url: Optional URL of the remote LangGraph server.  Omit for ASGI
+            transport (local development).
+        graph_id: The graph name on the remote server.  Defaults to
+            ``"builder"``.
+
+    Returns:
+        An ``AsyncSubAgent`` TypedDict ready to pass to
+        ``create_deep_agent(subagents=...)``.
+    """
+    spec: dict[str, Any] = AsyncSubAgent(
+        name="builder",
+        description=(
+            "Non-blocking async subagent for long-running build and deployment "
+            "tasks.  Connects to a remote LangGraph deployment and returns "
+            "results asynchronously."
+        ),
+        graph_id=graph_id,
+    )
+    if url is not None:
+        spec["url"] = url
+    return spec  # type: ignore[return-value]
+
+
+def _extract_subagent_tools(
+    graph: CompiledStateGraph,
+    subagent_name: str,
+) -> set[str] | None:
+    """Introspect a compiled orchestrator graph for a subagent's tool inventory.
+
+    DeepAgents' ``SubAgentMiddleware`` compiles each ``SubAgent`` spec into a
+    sub-graph node on the parent ``CompiledStateGraph``. This helper walks the
+    graph's ``nodes`` mapping looking for a node that matches ``subagent_name``
+    and exposes a ``.tools`` iterable, then returns the set of tool names.
+
+    The introspection is intentionally duck-typed: it tries ``node.tools`` first
+    and ``node.runnable.tools`` second to cover both the public LangGraph node
+    surface and the wrapped-Pregel layout. Returning ``None`` (rather than
+    raising) signals that the layout could not be resolved — the caller should
+    log a warning and proceed, not silently pass the assertion.
+
+    Args:
+        graph: The ``CompiledStateGraph`` returned from ``create_deep_agent()``.
+        subagent_name: The ``name`` field of the ``SubAgent`` spec.
+
+    Returns:
+        Set of tool names on the resolved subagent node, or ``None`` if no
+        matching node with an iterable ``.tools`` attribute was found.
+    """
+    nodes = getattr(graph, "nodes", None) or {}
+    node = nodes.get(subagent_name)
+    if node is None:
+        return None
+
+    tools = getattr(node, "tools", None)
+    if tools is None:
+        runnable = getattr(node, "runnable", None)
+        if runnable is not None:
+            tools = getattr(runnable, "tools", None)
+
+    if tools is None:
+        return None
+
+    try:
+        return {getattr(t, "name", str(t)) for t in tools}
+    except TypeError:
+        # .tools was present but not iterable.
+        return None
+
+
+def _validate_subagent_tools(
+    graph: CompiledStateGraph,
+    subagent_name: str,
+    expected_tools: set[str],
+) -> None:
+    """Assert a subagent's realised tool inventory matches its allowlist.
+
+    Args:
+        graph: The compiled orchestrator graph.
+        subagent_name: ``SubAgent`` name to locate on ``graph.nodes``.
+        expected_tools: Exact set of tool names the subagent must expose.
+
+    Raises:
+        ToolLeakageError: If the subagent was located and its tool inventory
+            does not match ``expected_tools``.
+
+    If the subagent cannot be located (DeepAgents layout changed, or the
+    subagent is wrapped in a way this helper does not recognise), a warning
+    is logged and the assertion is skipped rather than silently passing. The
+    accompanying test suite patches ``create_deep_agent`` with a
+    ``nodes``-compatible mock so this fallback is not exercised in CI.
+    """
+    actual_tools = _extract_subagent_tools(graph, subagent_name)
+    if actual_tools is None:
+        logger.warning(
+            "Could not introspect subagent %r tool inventory on compiled graph; "
+            "skipping tool-leakage assertion. Check DeepAgents version and the "
+            "graph.nodes layout.",
+            subagent_name,
+        )
+        return
+
+    if actual_tools != expected_tools:
+        unexpected = actual_tools - expected_tools
+        missing = expected_tools - actual_tools
+        parts = []
+        if unexpected:
+            parts.append(f"unexpected={sorted(unexpected)}")
+        if missing:
+            parts.append(f"missing={sorted(missing)}")
+        raise ToolLeakageError(
+            f"Subagent {subagent_name!r}: Tool inventory mismatch: "
+            f"{'; '.join(parts)}. "
+            f"Expected: {sorted(expected_tools)}, "
+            f"Actual: {sorted(actual_tools)}"
+        )
+
+
+def create_orchestrator(
+    reasoning_model: str,
+    implementation_model: str,
+    domain_prompt: str,
+) -> CompiledStateGraph:
+    """Create the top-level Orchestrator agent with its three subagents.
+
+    Assembles the orchestrator by combining the reasoning model, orchestrator
+    tools, system prompt (with domain context injected), and the three
+    subagents (implementer, evaluator, builder).
+
+    Args:
+        reasoning_model: Model identifier for the orchestrator's reasoning
+            (e.g. ``"anthropic:claude-sonnet-4-6"``).
+        implementation_model: Model identifier for the implementer subagent
+            (e.g. ``"anthropic:claude-haiku-4-5"``).
+        domain_prompt: Domain-specific instructions to inject into the
+            orchestrator system prompt via the ``{domain_prompt}`` placeholder.
+
+    Returns:
+        A compiled ``CompiledStateGraph`` representing the orchestrator agent
+        graph, ready to be invoked or served via LangGraph.
+
+    Raises:
+        ValueError: If any model string is empty or not a string.
+    """
+    if not reasoning_model or not isinstance(reasoning_model, str):
+        raise ValueError(f"reasoning_model must be a non-empty string, got: {reasoning_model!r}")
+    if not implementation_model or not isinstance(implementation_model, str):
+        raise ValueError(f"implementation_model must be a non-empty string, got: {implementation_model!r}")
+
+    today = datetime.date.today().isoformat()
+    system_prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(
+        date=today,
+        domain_prompt=domain_prompt,
+    )
+
+    subagents = [
+        implementer_subagent(model=implementation_model),
+        evaluator_subagent(model=reasoning_model),
+        builder_async_subagent(),
+    ]
+
+    graph = create_deep_agent(
+        model=reasoning_model,
+        tools=list(_ORCHESTRATOR_TOOLS),
+        system_prompt=system_prompt,
+        subagents=subagents,
+        memory=["./AGENTS.md"],
+        skills=None,
+        context_schema=None,
+    )
+
+    # Post-construction tool-inventory assertions (TASK-REV-LES1 HIGH-1).
+    # The Builder is an AsyncSubAgent targeting a remote LangGraph deployment;
+    # its tool surface is owned by the remote graph and is therefore skipped.
+    _validate_subagent_tools(graph, "implementer", IMPLEMENTER_ALLOWED_TOOLS)
+    _validate_subagent_tools(graph, "evaluator", EVALUATOR_ALLOWED_TOOLS)
+
+    return graph

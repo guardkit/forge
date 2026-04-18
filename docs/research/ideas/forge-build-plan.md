@@ -32,7 +32,16 @@ All prerequisites must be met before starting Step 1 (`/system-arch`).
 
 - [~] **nats-core library implemented** — shipping at 98% coverage, but v2.2-critical payloads (`BuildQueuedPayload`, `BuildPausedPayload`, `BuildResumedPayload`, `StageCompletePayload`, `StageGatedPayload`) and their topics must be added in Phase 2 (see anchor v2.2 §7 and alignment review Appendix C)
 - [ ] **nats-infrastructure running on GB10** — NATS server up, JetStream enabled,
-      accounts configured, `docker compose up -d` executed and verified
+      accounts configured, `docker compose up -d` executed **and provisioning
+      scripts run**: `provision-streams.sh` (creates AGENTS + PIPELINE + SYSTEM
+      streams per anchor v2.2) and `provision-kv.sh` (creates `agent-registry`,
+      `pipeline-state`, and other KV buckets). `verify-nats.sh` is read-only and
+      does **not** self-heal a fresh volume. Per TASK-MDF-PRVS / TASK-NI-PSBUG
+      (specialist-agent LES1 §7): a fresh-volume NATS without explicit
+      provisioning will accept publishes (PubAck) but not retain or deliver them
+      — exactly the MacBook failure mode. Scripts may require a `set +u`
+      workaround on unset-var-strict shells until the ttl_opts bug is patched
+      upstream.
 - [ ] **nats-core integration tests passing** — tests against live NATS server on GB10,
       validates MessageEnvelope round-trip, KV registry operations, pub/sub lifecycle
 - [ ] **specialist-agent Phase 3 complete** — NATS fleet integration: agents register
@@ -155,6 +164,11 @@ guardkit system-arch \
 - Degraded mode is documented as a structural capability
 - Pipeline event publishing uses nats-core payloads (no new types)
 - State persistence uses NATS KV (not filesystem)
+- **Each ADR produced carries a trailer:** `**Decision facts as of commit:** <sha>`
+  — to be re-verified at each subsequent walkthrough. Per specialist-agent LES1
+  §8 ("Decision records must be revalidated at each major milestone"): overstated
+  parity claims only surface at live retest; the annotation makes decisions
+  temporally scoped.
 
 **⚠️ After this step:** Update `--context` flags in Steps 2-5 below to reference the
 actual files produced. See "Post-Architecture Update Instructions" at the end of this
@@ -330,6 +344,47 @@ forge history --feature FEAT-TEST-001
 # (stop specialist agents, run pipeline, verify forced FLAG FOR REVIEW)
 ```
 
+#### Specialist-agent LES1 Parity Gates (pre-merge required)
+
+Derived from TASK-REV-B8E4 cross-agent lessons (series LES1) and recorded by
+TASK-REV-C3E7. Each gate has a cited evidence pointer back to a specialist-agent
+TASK-MDF-* id. **All four gates must be green on the production image before the
+forge build is declared canonical** — unit-test-only passes are what CMDW failed
+on.
+
+1. **CMDW gate — production-image subscription round-trip.** Build the forge
+   production container, run `forge serve` inside it, publish one real
+   `pipeline.build-queued` message from outside the container, verify the
+   subscribed JetStream pull consumer delivers it to an actual pipeline run. A
+   stale container build that silently fails to subscribe is the exact
+   specialist-agent CMDW failure mode applied to forge. (TASK-MDF-CMDW)
+
+2. **PORT gate — `(specialist_role, forge_stage)` dispatch matrix.** For every
+   `(role ∈ {product-owner, architect}, stage)` pair used in Mode A (per
+   refresh doc §"Revised Pipeline Flow"), execute one end-to-end round-trip via
+   NATS on the production specialist-agent image. Any red pair is a hard stop
+   before declaring forge canonical. This is the PORT lesson applied to the
+   consumer side: specialist-agent's PORT bug meant the PO handlers were never
+   registered, and forge wouldn't detect this until integration time.
+   (TASK-MDF-PORT)
+
+3. **ARFS gate — per-tool handler-completeness matrix.** For each tool in the
+   forge AgentManifest (`forge_greenfield`, `forge_feature`, `forge_review_fix`,
+   `forge_status`, `forge_cancel`), walk the full chain
+   `tool-schema → NATS adapter handler → core API → orchestrator method` and
+   execute one smoke-test round-trip. Any hop with a `TODO`/`NotImplementedError`
+   is a blocker: ARFS proved that unit tests don't catch missing methods when
+   schema + adapter are wired but the orchestrator is not. (TASK-MDF-ARFS)
+
+4. **Canonical-freeze live-verification gate.** Before this build plan is
+   declared canonical, every shell block in this document MUST have been
+   executed verbatim on a clean MacBook + GB10 in a single walkthrough session
+   and logged in `command-history.md`. Annotate any block that required
+   workarounds with `[as of commit <sha>]`. Per LES1 §8: guide copy-paste blocks
+   are code; a CI-passing guide can still fail on a clean machine (cd /tmp
+   workarounds, wrong Python pins, omitted provisioning — all found in the
+   specialist-agent canonical guide at retest time).
+
 > **Note:** Mode-based wrappers (`forge greenfield`, `forge feature`, `forge review-fix`) are optional higher-level wrappers around `forge queue` and may be added later if they earn their place. The canonical CLI surface is `forge queue`.
 
 ### Step 7: First Real Run — FinProxy
@@ -377,12 +432,14 @@ scores, auto-approves or flags as appropriate, invokes GuardKit commands, produc
 | `src/forge/manifest.py` | 002 | Create — Forge AgentManifest (imports from nats-core) |
 | `forge-pipeline-config.yaml.example` | 001 | Create — example config with FinProxy thresholds |
 | `configs/finproxy-pipeline-config.yaml` | 007 | Create — FinProxy-specific pipeline config |
-| `pyproject.toml` | 001 | Create — dependencies: nats-core, pydantic, pydantic-settings |
+| `pyproject.toml` | 001 | Create — core deps: nats-core, pydantic, pydantic-settings. **`[providers]` extra must list every LangChain integration named anywhere in `src/`** (e.g. langchain-anthropic, langchain-openai, langchain-google-genai). Per specialist-agent LES1 §3 (LCOI retest finding): transitive pulls by deepagents do **not** cover every declared provider — each must be explicit. |
 | `tests/` | all | Create — test files per feature |
 | `docs/architecture/ARCHITECTURE.md` | /system-arch | Create |
 | `docs/design/DESIGN.md` | /system-design | Create |
 | `docs/design/specs/forge-system-spec.md` | /system-design | Create |
 | `command-history.md` | all | Create — running log of all commands run |
+| `.env.example` | 001 | Create — template with placeholder, non-real values. **Never ship a real-looking provider key anywhere in committed `.env*` files.** Per specialist-agent LES1 §3 (retest-env): a placeholder like `OPENAI_API_KEY=not_needed` in `.env` silently overrode the operator's shell-env real key via Compose `${VAR}` interpolation, producing HTTP 401 `"Incorrect API key provided: not_needed"`. Pre-merge gate: CI check scanning tracked `.env*` for `[A-Z_]+_API_KEY=[a-zA-Z0-9-]{20,}` fails the build. |
+| `Dockerfile` | (deferred, FEAT-FORGE-009+) | Create when forge containerizes. **When added, `pip install .[providers]` (not `pip install .`) — literal-match to the documented venv install.** Per specialist-agent LES1 §3 (DKRX, commit `8b9d584`): Dockerfile extras ≡ guide extras; any drift is a latent provider-missing bug. Grep check: `pip install .[…]` in Dockerfile must include the same extras the guide prescribes. |
 
 ---
 
@@ -519,6 +576,8 @@ Forge also registers on `fleet.register` as an agent (`agent_id=forge`, intents:
 | Specialist agent not available | Pipeline blocks if required agent is down | Degraded mode: fall back to direct GuardKit commands, force FLAG FOR REVIEW |
 | State machine complexity | 3 modes × multiple stages × checkpoint states | State machine formally defined in /system-design, tested independently in FEAT-FORGE-001 |
 | First-time integration | Everything connects for the first time in FEAT-FORGE-007 | Use small test corpus first, not FinProxy. Debug integration issues before the real run. |
+| Orphan containers from parallel waves | Deleted Conductor worktrees leave Docker containers labelled against a path that no longer exists; subsequent waves hit port conflicts and `docker compose down` becomes a silent no-op | Always tear down with `docker compose down --remove-orphans`. Document the label-inspection flow (`docker ps --filter label=com.docker.compose.project=<name>`) in each wave's cleanup step. Per specialist-agent LES1 §7 (TASK-MDF-ORPH): this pattern cost a walkthrough iteration to diagnose. |
+| CLI credential leakage | `forge status`, `forge history`, `forge queue` may print NATS URLs with embedded credentials, or log KV-registry values containing secrets | CLI outputs must default to redaction. Any value matching `nats://[^@]+@.*` or `*_PASSWORD=.*` renders as `***`; `--verbose` opts in to plaintext with a displayed warning. Per specialist-agent LES1 §2/§7: `nats account info` leaked `RICH_NATS_PASSWORD` into the walkthrough log — the same shape applies to `forge status`. |
 
 ---
 

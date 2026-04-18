@@ -1,0 +1,159 @@
+"""Tests for the subagent tool-inventory assertions in ``{{ProjectName}}.agents``.
+
+Covers TASK-REV-LES1 HIGH-1: ``create_orchestrator()`` must fail loud at
+construction if the Evaluator or Implementer subagent's realised tool
+inventory on the compiled graph does not match its allowlist.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+
+class _FakeTool:
+    """Minimal tool stand-in: matches ``getattr(t, 'name', str(t))``."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeNode:
+    def __init__(self, tools: list[_FakeTool]) -> None:
+        self.tools = tools
+
+
+class _FakeGraph:
+    """Mock compiled graph: ``.nodes[subagent_name]`` → node with ``.tools``."""
+
+    def __init__(self, nodes: dict[str, _FakeNode]) -> None:
+        self.nodes = nodes
+
+
+def _make_graph(
+    *,
+    evaluator_tools: list[_FakeTool] | None = None,
+    implementer_tools: list[_FakeTool] | None = None,
+) -> _FakeGraph:
+    """Build a ``_FakeGraph`` with evaluator + implementer nodes."""
+    if evaluator_tools is None:
+        evaluator_tools = []
+    if implementer_tools is None:
+        implementer_tools = [
+            _FakeTool("analyse_context"),
+            _FakeTool("plan_pipeline"),
+            _FakeTool("execute_command"),
+            _FakeTool("verify_output"),
+        ]
+    return _FakeGraph(
+        nodes={
+            "evaluator": _FakeNode(evaluator_tools),
+            "implementer": _FakeNode(implementer_tools),
+        }
+    )
+
+
+class TestCreateOrchestratorToolInventoryAssertions:
+    """Post-construction tool-inventory assertions (HIGH-1)."""
+
+    def test_passes_when_evaluator_has_zero_tools_and_implementer_has_four(self) -> None:
+        """Happy path: both subagents match their allowlists exactly."""
+        fake_graph = _make_graph()  # defaults: zero evaluator tools, four implementer tools
+
+        with patch("{{ProjectName}}.agents.create_deep_agent", return_value=fake_graph):
+            from {{ProjectName}}.agents import create_orchestrator
+
+            # No exception = assertions passed.
+            result = create_orchestrator(
+                reasoning_model="anthropic:claude-sonnet-4-6",
+                implementation_model="anthropic:claude-haiku-4-5",
+                domain_prompt="test domain",
+            )
+
+        assert result is fake_graph
+
+    def test_raises_when_evaluator_has_injected_extra_tool(self) -> None:
+        """Leakage detection: injected middleware tool triggers ToolLeakageError."""
+        fake_graph = _make_graph(
+            evaluator_tools=[_FakeTool("write_file")],  # leaked middleware tool
+        )
+
+        with patch("{{ProjectName}}.agents.create_deep_agent", return_value=fake_graph):
+            from {{ProjectName}}.agents import ToolLeakageError, create_orchestrator
+
+            with pytest.raises(ToolLeakageError) as exc_info:
+                create_orchestrator(
+                    reasoning_model="anthropic:claude-sonnet-4-6",
+                    implementation_model="anthropic:claude-haiku-4-5",
+                    domain_prompt="test domain",
+                )
+
+        message = str(exc_info.value)
+        assert "evaluator" in message
+        assert "Tool inventory mismatch" in message
+        assert "unexpected=['write_file']" in message
+
+    def test_raises_when_implementer_missing_a_tool(self) -> None:
+        """Missing-tool detection: shrunken inventory triggers ToolLeakageError."""
+        fake_graph = _make_graph(
+            implementer_tools=[
+                _FakeTool("analyse_context"),
+                _FakeTool("plan_pipeline"),
+                # 'execute_command' and 'verify_output' missing
+            ],
+        )
+
+        with patch("{{ProjectName}}.agents.create_deep_agent", return_value=fake_graph):
+            from {{ProjectName}}.agents import ToolLeakageError, create_orchestrator
+
+            with pytest.raises(ToolLeakageError) as exc_info:
+                create_orchestrator(
+                    reasoning_model="anthropic:claude-sonnet-4-6",
+                    implementation_model="anthropic:claude-haiku-4-5",
+                    domain_prompt="test domain",
+                )
+
+        message = str(exc_info.value)
+        assert "implementer" in message
+        assert "missing=['execute_command', 'verify_output']" in message
+
+    def test_skips_assertion_when_subagent_node_absent(self) -> None:
+        """Defensive: if the node layout changes, assertion is skipped, not failed."""
+        fake_graph = _FakeGraph(nodes={})  # neither evaluator nor implementer present
+
+        with patch("{{ProjectName}}.agents.create_deep_agent", return_value=fake_graph):
+            from {{ProjectName}}.agents import create_orchestrator
+
+            # Should not raise; helper warns and returns the graph.
+            result = create_orchestrator(
+                reasoning_model="anthropic:claude-sonnet-4-6",
+                implementation_model="anthropic:claude-haiku-4-5",
+                domain_prompt="test domain",
+            )
+
+        assert result is fake_graph
+
+    def test_raises_when_evaluator_has_multiple_extra_tools(self) -> None:
+        """Full F2 leakage profile: middleware injects write_file + execute + write_todos."""
+        fake_graph = _make_graph(
+            evaluator_tools=[
+                _FakeTool("write_file"),
+                _FakeTool("execute"),
+                _FakeTool("write_todos"),
+            ],
+        )
+
+        with patch("{{ProjectName}}.agents.create_deep_agent", return_value=fake_graph):
+            from {{ProjectName}}.agents import ToolLeakageError, create_orchestrator
+
+            with pytest.raises(ToolLeakageError) as exc_info:
+                create_orchestrator(
+                    reasoning_model="anthropic:claude-sonnet-4-6",
+                    implementation_model="anthropic:claude-haiku-4-5",
+                    domain_prompt="test domain",
+                )
+
+        message = str(exc_info.value)
+        # Sorted diff — match the contract shape.
+        assert "unexpected=['execute', 'write_file', 'write_todos']" in message

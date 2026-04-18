@@ -1,0 +1,180 @@
+"""Orchestrator tools for the DeepAgents orchestrator exemplar.
+
+Provides four tools used by the orchestrator agent: analyse_context, plan_pipeline,
+execute_command, and verify_output. All tools use the @tool(parse_docstring=True)
+decorator from {{ProjectName}}.tools, return strings, and never raise exceptions.
+
+In production these would wrap GuardKit slash commands; here they are simplified
+implementations suitable for the exemplar.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+from {{ProjectName}}.tools import tool
+
+logger = logging.getLogger(__name__)
+
+
+@tool(parse_docstring=True)
+def analyse_context(query: str, domain: str) -> str:
+    """Read and summarise project context for a given query and domain.
+
+    If the query is a path to an existing file, reads and returns its content
+    along with the domain context. Otherwise returns a context summary based
+    on the query and domain provided.
+
+    Args:
+        query: A context query string, or a file path to read for context.
+        domain: The domain to focus the analysis on.
+    """
+    try:
+        query_path = Path(query)
+        if query_path.is_file():
+            content = query_path.read_text(encoding="utf-8")
+            truncated = content[:4000] if len(content) > 4000 else content
+            return (
+                f"Context analysis for domain '{domain}':\n"
+                f"Source: {query}\n"
+                f"Content ({len(content)} chars):\n{truncated}"
+            )
+
+        return (
+            f"Context analysis for domain '{domain}':\n"
+            f"Query: {query}\n"
+            f"Summary: Analysed context for '{query}' within the '{domain}' domain. "
+            f"No file found at query path; treating as a free-text query."
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return f"Error analysing context: {exc}"
+    except Exception as exc:
+        logger.exception("Unexpected error in analyse_context")
+        return f"Error analysing context: {exc}"
+
+
+@tool(parse_docstring=True)
+def plan_pipeline(task: str, context: str) -> str:
+    """Generate a JSON pipeline plan for the given task and context.
+
+    Creates a structured plan with sequential steps derived from the task
+    description and contextual information provided.
+
+    Args:
+        task: Description of the task to plan a pipeline for.
+        context: Contextual information to inform the plan.
+    """
+    try:
+        task_clean = task.strip() if task else "unspecified task"
+        context_clean = context.strip() if context else "no additional context"
+
+        plan = {
+            "task": task_clean,
+            "context": context_clean,
+            "steps": [
+                {"step": 1, "action": "analyse", "description": f"Analyse requirements for: {task_clean}"},
+                {"step": 2, "action": "implement", "description": f"Implement solution using context: {context_clean}"},
+                {"step": 3, "action": "verify", "description": f"Verify output meets criteria for: {task_clean}"},
+            ],
+        }
+        return json.dumps(plan, indent=2)
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": str(exc), "steps": []})
+    except Exception as exc:
+        logger.exception("Unexpected error in plan_pipeline")
+        return json.dumps({"error": str(exc), "steps": []})
+
+
+@tool(parse_docstring=True)
+def execute_command(command: str, arguments: str) -> str:
+    """Simulate execution of a command with the given arguments.
+
+    In the exemplar this returns a simulated execution result. In production
+    this would delegate to GuardKit command execution infrastructure.
+
+    Args:
+        command: The command to execute.
+        arguments: Arguments to pass to the command.
+    """
+    command_clean = command.strip() if command else "noop"
+    args_clean = arguments.strip() if arguments else ""
+
+    full_command = f"{command_clean} {args_clean}".strip()
+
+    return (
+        f"Executed: {full_command}\n"
+        f"Status: success\n"
+        f"Result: Command '{command_clean}' completed with arguments '{args_clean}'."
+    )
+
+
+@tool(parse_docstring=True)
+def verify_output(output_path: str, criteria: str) -> str:
+    """Verify that an output artefact at the given path meets the specified criteria.
+
+    Checks whether the path exists, reads its content when possible, and evaluates
+    basic criteria such as file existence and JSON validity.
+
+    Args:
+        output_path: Path to the output artefact to verify.
+        criteria: Description of the criteria the output should satisfy.
+    """
+    try:
+        path = Path(output_path) if output_path else None
+
+        if path is None or not str(path).strip():
+            return "Verification failed: no output path provided."
+
+        if not path.exists():
+            return f"Verification failed: path not found — {output_path}"
+
+        content = ""
+        if path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as read_err:
+                return f"Verification failed: could not read file — {read_err}"
+
+        criteria_lower = criteria.lower() if criteria else ""
+
+        checks_passed: list[str] = []
+        checks_failed: list[str] = []
+
+        # Check: file/directory existence (always checked)
+        checks_passed.append("path exists")
+
+        # Check: non-empty content
+        if "non-empty" in criteria_lower or "not empty" in criteria_lower:
+            if content.strip():
+                checks_passed.append("file is non-empty")
+            else:
+                checks_failed.append("file is empty")
+
+        # Check: valid JSON
+        if "json" in criteria_lower:
+            try:
+                json.loads(content)
+                checks_passed.append("contains valid JSON")
+            except (json.JSONDecodeError, ValueError):
+                checks_failed.append("does not contain valid JSON")
+
+        if checks_failed:
+            return (
+                f"Verification failed for '{output_path}':\n"
+                f"  Passed: {', '.join(checks_passed)}\n"
+                f"  Failed: {', '.join(checks_failed)}\n"
+                f"  Criteria: {criteria}"
+            )
+
+        return (
+            f"Verification passed for '{output_path}':\n"
+            f"  Checks passed: {', '.join(checks_passed)}\n"
+            f"  Criteria: {criteria}"
+        )
+    except (OSError, ValueError) as exc:
+        return f"Verification error: {exc}"
+    except Exception as exc:
+        logger.exception("Unexpected error in verify_output")
+        return f"Verification error: {exc}"

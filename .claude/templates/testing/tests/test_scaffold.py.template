@@ -1,0 +1,229 @@
+"""Tests for ``{{ProjectName}}/agent.py`` model-resolution scaffold.
+
+Covers:
+    - ``_resolve_model`` precedence: env > yaml > hardcoded default.
+    - Empty-string env vars fall through to the yaml layer
+      (operators who set ``AGENT_MODELS__REASONING_MODEL=`` do not clobber
+      the yaml entry).
+    - ``_build_agent`` wires the resolved values into
+      ``create_orchestrator`` for both ``reasoning_model`` and
+      ``implementation_model``.
+
+Why these tests exist (LES1 §3 PMEV / HIGH-3 in TASK-REV-LES1):
+    The previous scaffold resolved models purely from yaml with hardcoded
+    anthropic defaults. An operator who configured a local provider via
+    shell env would silently fall through to Anthropic if the yaml was
+    malformed. The env-var resolution layer closes that gap; these tests
+    pin the precedence so future refactors cannot silently regress.
+
+Run:
+    pytest tests/test_scaffold.py -v
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def agent_module(monkeypatch):
+    """Import ``{{ProjectName}}.agent`` with ``agents.create_orchestrator`` stubbed.
+
+    ``agent.py`` imports ``from agents import create_orchestrator`` at module
+    load time, which transitively pulls in the DeepAgents / LangChain stack
+    and builds the orchestrator graph. For unit-testing the resolver helpers
+    we only need the module-level functions, so the ``agents`` dependency is
+    replaced with a ``MagicMock`` before the import fires.
+
+    ``AGENT_MODELS__*`` env vars are cleared to give each test a deterministic
+    starting point; individual tests re-set them with ``monkeypatch.setenv``.
+    """
+    stub = MagicMock()
+    stub.create_orchestrator = MagicMock(return_value=object())
+    monkeypatch.setitem(sys.modules, "agents", stub)
+
+    monkeypatch.delenv("AGENT_MODELS__REASONING_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_MODELS__IMPLEMENTATION_MODEL", raising=False)
+
+    # Force re-import so the ``agents`` stub is used for this test's module copy.
+    sys.modules.pop("{{ProjectName}}.agent", None)
+    return importlib.import_module("{{ProjectName}}.agent")
+
+
+# ---------------------------------------------------------------------------
+# 1. _resolve_model precedence
+# ---------------------------------------------------------------------------
+
+
+class TestResolveModelPrecedence:
+    """env > yaml > hardcoded default."""
+
+    def test_env_wins_over_yaml_and_default(self, agent_module, monkeypatch):
+        monkeypatch.setenv(
+            "AGENT_MODELS__REASONING_MODEL", "env-provider:env-model"
+        )
+        result = agent_module._resolve_model(
+            agent_module._ENV_REASONING_MODEL,
+            "yaml-provider:yaml-model",
+            "default-provider:default-model",
+            "reasoning_model",
+        )
+        assert result == "env-provider:env-model"
+
+    def test_yaml_wins_when_env_unset(self, agent_module):
+        result = agent_module._resolve_model(
+            agent_module._ENV_REASONING_MODEL,
+            "yaml-provider:yaml-model",
+            "default-provider:default-model",
+            "reasoning_model",
+        )
+        assert result == "yaml-provider:yaml-model"
+
+    def test_default_when_env_and_yaml_absent(self, agent_module):
+        result = agent_module._resolve_model(
+            agent_module._ENV_REASONING_MODEL,
+            None,
+            "default-provider:default-model",
+            "reasoning_model",
+        )
+        assert result == "default-provider:default-model"
+
+
+# ---------------------------------------------------------------------------
+# 2. Empty-string env edge case
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyEnvFallsThrough:
+    """Empty env var value is treated as "unset", not as an override."""
+
+    def test_empty_env_falls_through_to_yaml(self, agent_module, monkeypatch):
+        monkeypatch.setenv("AGENT_MODELS__REASONING_MODEL", "")
+        result = agent_module._resolve_model(
+            agent_module._ENV_REASONING_MODEL,
+            "yaml-provider:yaml-model",
+            "default-provider:default-model",
+            "reasoning_model",
+        )
+        assert result == "yaml-provider:yaml-model"
+
+    def test_empty_env_and_empty_yaml_falls_through_to_default(
+        self, agent_module, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_MODELS__IMPLEMENTATION_MODEL", "")
+        result = agent_module._resolve_model(
+            agent_module._ENV_IMPLEMENTATION_MODEL,
+            "",
+            "default-provider:default-model",
+            "implementation_model",
+        )
+        assert result == "default-provider:default-model"
+
+
+# ---------------------------------------------------------------------------
+# 3. _build_agent integration (both keys + env var naming)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAgentUsesResolvedModels:
+    """End-to-end: ``_build_agent`` forwards resolved models to ``create_orchestrator``."""
+
+    @staticmethod
+    def _capture_create_orchestrator(
+        module: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        def fake_create_orchestrator(
+            reasoning_model: str,
+            implementation_model: str,
+            domain_prompt: str,
+        ) -> object:
+            captured["reasoning_model"] = reasoning_model
+            captured["implementation_model"] = implementation_model
+            captured["domain_prompt"] = domain_prompt
+            return object()
+
+        monkeypatch.setattr(module, "create_orchestrator", fake_create_orchestrator)
+        return captured
+
+    def test_env_vars_win_for_both_keys(self, agent_module, monkeypatch):
+        monkeypatch.setenv("AGENT_MODELS__REASONING_MODEL", "reasoning-from-env")
+        monkeypatch.setenv(
+            "AGENT_MODELS__IMPLEMENTATION_MODEL", "implementation-from-env"
+        )
+        captured = self._capture_create_orchestrator(agent_module, monkeypatch)
+
+        agent_module._build_agent(
+            {
+                "orchestrator": {
+                    "reasoning_model": "yaml-r",
+                    "implementation_model": "yaml-i",
+                }
+            },
+            "prompt",
+        )
+
+        assert captured["reasoning_model"] == "reasoning-from-env"
+        assert captured["implementation_model"] == "implementation-from-env"
+
+    def test_yaml_used_when_env_missing(self, agent_module, monkeypatch):
+        captured = self._capture_create_orchestrator(agent_module, monkeypatch)
+
+        agent_module._build_agent(
+            {
+                "orchestrator": {
+                    "reasoning_model": "yaml-r",
+                    "implementation_model": "yaml-i",
+                }
+            },
+            "prompt",
+        )
+
+        assert captured["reasoning_model"] == "yaml-r"
+        assert captured["implementation_model"] == "yaml-i"
+
+    def test_defaults_used_when_env_and_yaml_missing(
+        self, agent_module, monkeypatch
+    ):
+        captured = self._capture_create_orchestrator(agent_module, monkeypatch)
+        defaults = agent_module._DEFAULT_CONFIG["orchestrator"]
+
+        agent_module._build_agent({}, "prompt")
+
+        assert captured["reasoning_model"] == defaults["reasoning_model"]
+        assert captured["implementation_model"] == defaults["implementation_model"]
+
+    def test_empty_env_for_one_key_still_uses_env_for_the_other(
+        self, agent_module, monkeypatch
+    ):
+        # Reasoning env is empty → falls through to yaml.
+        # Implementation env is set → wins over yaml.
+        monkeypatch.setenv("AGENT_MODELS__REASONING_MODEL", "")
+        monkeypatch.setenv(
+            "AGENT_MODELS__IMPLEMENTATION_MODEL", "implementation-from-env"
+        )
+        captured = self._capture_create_orchestrator(agent_module, monkeypatch)
+
+        agent_module._build_agent(
+            {
+                "orchestrator": {
+                    "reasoning_model": "yaml-r",
+                    "implementation_model": "yaml-i",
+                }
+            },
+            "prompt",
+        )
+
+        assert captured["reasoning_model"] == "yaml-r"
+        assert captured["implementation_model"] == "implementation-from-env"

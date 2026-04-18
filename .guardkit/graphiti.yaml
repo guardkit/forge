@@ -1,0 +1,100 @@
+# Graphiti Knowledge Graph Configuration
+#
+# This file configures the Graphiti integration for GuardKit.
+# FalkorDB runs on the Synology DS918+ NAS, accessible via Tailscale.
+#
+# LLM Endpoint Switching:
+#   To switch between GB10 and MacBook LLM, toggle the llm_provider/llm_base_url/
+#   llm_model settings below. See docs/reference/graphiti-macbook-offload.md for
+#   full setup instructions and the toggle script.
+#
+# All settings can be overridden via environment variables:
+#   - GRAPHITI_ENABLED: Enable/disable integration
+#   - GRAPH_STORE: Graph backend ('falkordb' or 'neo4j')
+#   - FALKORDB_HOST: FalkorDB host
+#   - FALKORDB_PORT: FalkorDB port
+#   - GRAPHITI_TIMEOUT: Connection timeout in seconds
+#
+# FalkorDB on NAS:
+#   ssh richardwoollcott@whitestocks
+#   cd /volume1/guardkit/docker
+#   sudo docker-compose -f docker-compose.falkordb.yml up -d
+#
+# FalkorDB Browser UI: http://whitestocks:3000
+
+# Project ID for namespace prefixing
+# This ensures knowledge persists across directory moves/renames
+project_id: forge
+
+# Enable Graphiti integration (set to false to disable)
+enabled: true
+
+# Graph database backend
+graph_store: falkordb
+
+# FalkorDB connection (Synology DS918+ NAS via Tailscale)
+falkordb_host: whitestocks
+falkordb_port: 6379
+
+# Connection settings
+timeout: 30.0
+
+# Maximum concurrent episode creation calls during init seeding.
+# Bounds asyncio.gather parallelism to avoid LLM rate limits.
+# Range: 1-10 (1 = sequential, 3 = default)
+max_concurrent_episodes: 3
+
+# LLM provider for Graphiti entity extraction
+# Options: openai (default), vllm, ollama, gemini
+#
+# Gemini 2.5 Pro (paid tier) — moved off local GB10 vLLM to free GPU for fine-tuning.
+# Graphiti only calls the LLM during ingestion/seeding, not queries.
+# Requires GOOGLE_API_KEY env var and `pip install guardkit-py[gemini]`.
+# Paid tier chosen after free-tier 429s during seeding (Wave 2 smoke test, 2026-04-17).
+# See: docs/guides/graphiti-gemini-rollout-setup.md
+#
+# --- Google Gemini (cloud) ---
+llm_provider: gemini
+llm_model: gemini-2.5-pro
+#
+# --- Fallback: GB10 (vLLM, FP8) — uncomment to revert ---
+#llm_provider: vllm
+#llm_base_url: http://promaxgb10-41b1:8000/v1
+#llm_model: neuralmagic/Qwen2.5-14B-Instruct-FP8-dynamic
+#
+# --- Fallback: MacBook Pro M2 Max (Ollama, Q4_K_M) ---
+#llm_provider: ollama
+#llm_base_url: http://richards-macbook-pro.tailebf801.ts.net:8000/v1
+#llm_model: qwen2.5:14b-instruct-q4_K_M
+llm_max_tokens: 4096  # Cap output tokens; prevents 16384 default exceeding 32K context (TASK-REV-84A7)
+
+# Embedding provider for Graphiti vector search
+# Options: openai (default), vllm, ollama
+embedding_provider: vllm
+embedding_base_url: http://promaxgb10-41b1:8001/v1
+
+# Embedding model for semantic search
+# Supported by openai, vllm, and ollama providers
+embedding_model: nomic-embed-text-v1.5
+
+# Explicit embedding vector dimensions.
+# nomic-embed-text-v1.5 supports Matryoshka dimensions: 64, 128, 256, 512, 768 (default), 1024.
+# This FalkorDB was seeded with 1024-dim vectors (Matryoshka enabled via task-transform param).
+# Setting this ensures the Python client and MCP server both use the same dimension,
+# preventing vector search failures from dimension mismatches.
+embedding_dimensions: 1024
+
+# Group IDs for organizing knowledge
+# These create separate namespaces in the knowledge graph.
+# Groups align with the /system-arch, /system-design, /system-plan, /feature-spec
+# pipeline: architecture artefacts, ADRs, and technology decisions are seeded
+# into these namespaces so downstream commands can query them.
+group_ids:
+  - project_architecture    # Bounded contexts, components, cross-cutting concerns, assumptions
+  - architecture_decisions  # ADRs and design rationale
+  - project_decisions       # Technology and infrastructure decisions
+  - command_workflows       # GuardKit command patterns and usage
+
+# Deprecated fields (kept for backwards compatibility)
+host: localhost
+port: 8000

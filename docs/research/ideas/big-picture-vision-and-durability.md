@@ -93,7 +93,7 @@ The war stories are the asset:
   (SOURCE_COLLAPSE, DOMAIN_DILUTION) where the model collapsed distinct domain
   boundaries or diluted source-specific knowledge. The lesson: quality gates must
   check for what the model *removes* as well as what it *adds*.
-- **nats-core at 97% test coverage** — 17 test files, 6 features, implemented in full.
+- **nats-core at 98% test coverage** — 17 test files, 6 features, implemented in full.
   The messaging backbone is working code with typed payloads, not a design contract.
   Proves that the GuardKit command sequence (/system-arch → /system-design →
   /feature-spec × 6 → build) produces production-quality library code.

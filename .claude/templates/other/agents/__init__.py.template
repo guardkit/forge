@@ -1,0 +1,18 @@
+"""Agent definitions package for the DeepAgents orchestrator exemplar.
+
+Exports factory functions for all four agent roles:
+
+- :func:`create_orchestrator` — builds the top-level orchestrator graph.
+- :func:`implementer_subagent` — returns a sync SubAgent spec with tools.
+- :func:`evaluator_subagent` — returns a sync SubAgent spec without tools.
+- :func:`builder_async_subagent` — returns an AsyncSubAgent spec.
+"""
+
+from {{ProjectName}}.{{ProjectName}} import builder_async_subagent, create_orchestrator, evaluator_subagent, implementer_subagent
+
+__all__ = [
+    "create_orchestrator",
+    "implementer_subagent",
+    "evaluator_subagent",
+    "builder_async_subagent",
+]

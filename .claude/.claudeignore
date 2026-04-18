@@ -1,0 +1,20 @@
+# Files to exclude from Claude context
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+bin/
+obj/
+.git/
+.env
+*.log
+coverage/
+*.tmp
+.vs/
+.vscode/settings.json
+.idea/
+*.user
+*.suo

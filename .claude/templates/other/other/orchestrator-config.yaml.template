@@ -1,0 +1,26 @@
+# Orchestrator Configuration
+#
+# Model selection for the two-model orchestrator architecture.
+# The reasoning model plans and coordinates; the implementation model executes.
+#
+# Model format: "provider:model" (compatible with init_chat_model).
+# See docs/reference/model-compatibility.md for tested combinations.
+#
+# Model-identifier resolution precedence (highest to lowest):
+#   1. Environment variable (preferred for per-deployment / per-shell overrides):
+#        AGENT_MODELS__REASONING_MODEL
+#        AGENT_MODELS__IMPLEMENTATION_MODEL
+#      An empty value (e.g. AGENT_MODELS__REASONING_MODEL=) is treated as
+#      "unset" and falls through to the YAML layer; to defer to this file
+#      unset the variable entirely.
+#   2. YAML value below (committed, deployment-wide baseline).
+#   3. Hardcoded fallback in agent.py (_DEFAULT_CONFIG) — last resort.
+#
+# On startup agent.py logs the resolved value and its source at INFO, e.g.:
+#     Resolved reasoning_model=anthropic:claude-sonnet-4-6 (source=env)
+
+orchestrator:
+  reasoning_model: "anthropic:claude-sonnet-4-6"
+  implementation_model: "anthropic:claude-haiku-4-5"
+  domain: "example-domain"
+  max_retries: 3

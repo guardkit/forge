@@ -1,0 +1,123 @@
+{
+  "schema_version": "1.0.0",
+  "name": "langchain-deepagents-orchestrator",
+  "display_name": "LangChain DeepAgents Orchestrator",
+  "description": "Pipeline orchestrator template using DeepAgents two-model architecture (reasoning model orchestrates, implementation model executes) with LangGraph deployment",
+  "version": "1.0.0",
+  "author": "Richard Woollcott",
+  "language": "Python",
+  "language_version": ">=3.11,<4.0",
+  "frameworks": [
+    {
+      "name": "DeepAgents >=0.4.11",
+      "version": null,
+      "purpose": "core"
+    },
+    {
+      "name": "LangChain >=1.2.11",
+      "version": null,
+      "purpose": "core"
+    },
+    {
+      "name": "LangChain-Core >=1.2.18",
+      "version": null,
+      "purpose": "core"
+    },
+    {
+      "name": "LangGraph >=0.2",
+      "version": null,
+      "purpose": "core"
+    },
+    {
+      "name": "LangChain-Community >=0.3",
+      "version": null,
+      "purpose": "core"
+    },
+    {
+      "name": "pytest",
+      "version": null,
+      "purpose": "testing"
+    }
+  ],
+  "architecture": "Two-Model Pipeline Orchestrator",
+  "patterns": [
+    "Two-Model Orchestration",
+    "SubAgent Composition",
+    "Domain Prompt Injection",
+    "Factory Function Agents",
+    "Config-Driven Model Selection",
+    "Defensive Fallback Chain"
+  ],
+  "layers": [
+    "Agents",
+    "Tools",
+    "Prompts",
+    "Config",
+    "Domains",
+    "Infrastructure",
+    "Shared"
+  ],
+  "placeholders": {
+    "ProjectName": {
+      "name": "{{ProjectName}}",
+      "description": "Name of the project/solution",
+      "default_value": null,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+      "required": true
+    },
+    "Namespace": {
+      "name": "{{Namespace}}",
+      "description": "Root namespace for the project",
+      "default_value": null,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)*$",
+      "required": true
+    },
+    "Author": {
+      "name": "{{Author}}",
+      "description": "Project author name",
+      "default_value": null,
+      "pattern": null,
+      "required": false
+    }
+  },
+  "tags": [
+    "config-driven-model-selection",
+    "deepagents",
+    "defensive-fallback-chain",
+    "domain-prompt-injection",
+    "factory-function-agents",
+    "langchain",
+    "langgraph",
+    "orchestrator",
+    "pipeline",
+    "pytest",
+    "python",
+    "subagent-composition",
+    "two-model",
+    "two-model-orchestration",
+    "two-model-pipeline-orchestrator"
+  ],
+  "category": "agent",
+  "complexity": 7,
+  "compatible_with": [
+    "langchain-deepagents"
+  ],
+  "requires": [
+    "deepagents>=0.4.11",
+    "langchain>=1.2.11",
+    "langgraph>=0.2"
+  ],
+  "quality_scores": {
+    "architecture_clarity": 85,
+    "pattern_coverage": 80,
+    "documentation_quality": 75,
+    "placeholder_coverage": 70,
+    "overall": 77.5
+  },
+  "production_ready": false,
+  "learning_resource": true,
+  "reference_implementation": true,
+  "created_at": "2026-03-30T21:09:18.781491",
+  "source_project": "deepagents-orchestrator-exemplar",
+  "confidence_score": 85.0
+}

@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "extends": "~/.agentecflow/templates/langchain-deepagents-orchestrator",
+  "project": {
+    "name": "forge",
+    "template": "langchain-deepagents-orchestrator",
+    "detected_type": "unknown",
+    "created": "2026-04-18T11:45:19Z"
+  },
+  "methodology": {
+    "requirements": "EARS",
+    "testing": "BDD",
+    "documentation": "ADR"
+  },
+  "quality": {
+    "coverage": 80,
+    "complexity": 10,
+    "gates": true
+  },
+  "enabledPlugins": {
+    "langchain-skills@langchain-skills": true
+  }
+}

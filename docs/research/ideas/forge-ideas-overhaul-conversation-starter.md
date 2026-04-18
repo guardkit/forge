@@ -49,7 +49,7 @@ This conversation starter captures everything that's changed, identifies what ea
 | Phase 0 FinProxy run | March 2026 | 0.75 score, 3 iterations, 93s, 1006 tests |
 | Phase 1 FinProxy run | April 2026 | 0.93 score, 2 iterations, 162s |
 | First fine-tune (GCSE tutor) | March 2026 | Gemma 4 31B, 1,736 examples, loss 2.45→0.50, 2h 5min |
-| nats-core library | April 2026 | 97% test coverage, 6 features, all implemented |
+| nats-core library | April 2026 | 98% test coverage, 6 features, all implemented |
 | Docling pipeline | March 2026 | Standard + VLM modes validated on GB10 |
 
 ### New Resolved Decisions (D23+)
@@ -82,7 +82,7 @@ This conversation starter captures everything that's changed, identifies what ea
 - **Build Sequence:** Replace 11-phase sequence with current phase structure:
   ```
   specialist-agent:  Phase 0 ✅ → 1 ✅ → 1C → 1B → G → 2 → 3 → F
-  nats-core:         ✅ Implemented (97% coverage)
+  nats-core:         ✅ Implemented (98% coverage)
   nats-infrastructure: ✅ Configured
   forge:             Blocked on specialist-agent Phase 3 + nats infra
   lpa-platform:      Blocked on dotnet exemplar + template-create
@@ -244,7 +244,7 @@ This conversation starter captures everything that's changed, identifies what ea
 | **Landscape research** | `specialist-agent/docs/research/ideas/landscape-conversation-starter.md` | Devin, MetaGPT, ChatDev positioning, DDD Southwest framing |
 | **Phase 1C scope** | `specialist-agent/docs/research/ideas/phase1c-domain-fidelity-scope.md` | Domain fidelity regressions and fixes |
 | **LPA build plan** | `lpa-platform/docs/buildplan.md` | FinProxy platform command sequence |
-| **nats-core spec** | `nats-core/docs/design/specs/nats-core-system-spec.md` | 6 features, 97% coverage |
+| **nats-core spec** | `nats-core/docs/design/specs/nats-core-system-spec.md` | 6 features, 98% coverage |
 | **This doc** | `forge/docs/research/ideas/forge-ideas-overhaul-conversation-starter.md` | What's changed, what each doc needs |
 
 ---

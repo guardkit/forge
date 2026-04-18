@@ -1,0 +1,14 @@
+"""Orchestrator {{ProjectName}} package.
+
+Exports the four orchestrator {{ProjectName}}: analyse_context, plan_pipeline,
+execute_command, and verify_output.
+"""
+
+from {{ProjectName}}.orchestrator_tools import analyse_context, execute_command, plan_pipeline, verify_output
+
+__all__ = [
+    "analyse_context",
+    "plan_pipeline",
+    "execute_command",
+    "verify_output",
+]

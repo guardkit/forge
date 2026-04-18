@@ -1,0 +1,21 @@
+"""Prompt constants for the deep-agents orchestrator exemplar.
+
+This package exports the system {{ProjectName}} for all three agent roles:
+- **Orchestrator**: Top-level reasoning and coordination.
+- **Implementer**: Focused execution of implementation plans.
+- **Evaluator**: Objective quality assessment with structured verdicts.
+
+All {{ProjectName}} are domain-agnostic.  Domain-specific instructions are injected
+at runtime via placeholders (e.g. ``{domain_prompt}``).
+"""
+
+from {{ProjectName}}.orchestrator_prompts import ORCHESTRATOR_SYSTEM_PROMPT
+from {{ProjectName}}.implementer_prompts import IMPLEMENTER_SYSTEM_PROMPT
+from {{ProjectName}}.evaluator_prompts import EVALUATOR_SYSTEM_PROMPT, EVALUATOR_VERDICT_SCHEMA
+
+__all__ = [
+    "ORCHESTRATOR_SYSTEM_PROMPT",
+    "IMPLEMENTER_SYSTEM_PROMPT",
+    "EVALUATOR_SYSTEM_PROMPT",
+    "EVALUATOR_VERDICT_SCHEMA",
+]

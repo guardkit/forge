@@ -139,11 +139,11 @@ working.
 
 ### PM Tools as Optional Visibility Adapters
 
-The PM Adapter layer (Linear, GitHub Projects) remains in the architecture but is
-repositioned as an **optional visibility adapter** for stakeholders who want a familiar
-interface. It subscribes to pipeline events and projects them into a PM tool view. But
-it is not in the critical path. The pipeline runs with or without it. The adapter is a
-viewport, not a control surface.
+A future PM Adapter layer (Linear, GitHub Projects) is envisioned as an **optional
+visibility adapter** for stakeholders who want a familiar interface. It would subscribe
+to pipeline events and project them into a PM tool view. But it is not part of the
+current architecture and is not in the critical path. The pipeline runs without it. The
+adapter, if built, would be a viewport, not a control surface.
 
 ### Build Trigger Mechanism
 
@@ -167,7 +167,7 @@ guardkit/
 │── INFRASTRUCTURE ──────────────────────────────────────────────────
 │
 ├── nats-core                 ← Shared contract layer (pip-installable library)
-│   │                            STATUS: ✅ Implemented, 97% test coverage, 17 test files
+│   │                            STATUS: ✅ Implemented, 98% test coverage, 17 test files
 │   ├── src/nats_core/
 │   │   ├── client.py             ← NATSClient (async, typed, fleet convenience methods)
 │   │   ├── envelope.py           ← MessageEnvelope + EventType enum (19 event types)
@@ -398,7 +398,7 @@ humans when confidence is low, and recovering from failures.
 
 | Component | Repo | Type | Status | Purpose |
 |-----------|------|------|--------|---------|
-| **nats-core** | `nats-core` | Python library (pip-installable) | ✅ 97% coverage | Message schemas, topic constants, typed NATS client, fleet registration |
+| **nats-core** | `nats-core` | Python library (pip-installable) | ✅ 98% coverage | Message schemas, topic constants, typed NATS client, fleet registration |
 | **NATS Server** | `nats-infrastructure` | Config/ops (Docker Compose) | ✅ Configured | Server deployment, accounts, streams, monitoring |
 
 ---
@@ -559,7 +559,7 @@ See `forge-pipeline-orchestrator-refresh.md` (v3, 11 April 2026) for checkpoint 
 | **First fine-tune (GCSE tutor)** | March 2026 | Gemma 4 31B, 1,736 examples, loss 2.45→0.50, 2h 5min on GB10 | End-to-end fine-tuning pipeline proven — Unsloth + TRL SFTTrainer on DGX Spark hardware |
 | **Agentic dataset factory** | March 2026 | 94.8% acceptance rate, ~2,500 examples production run | Player-Coach adversarial loop generates high-quality training data at scale |
 | **Docling PDF pipeline** | March 2026 | Standard + VLM modes validated on GB10 | PDF ingestion is not an open risk — both digital and scanned paperback paths work |
-| **nats-core library** | April 2026 | 97% test coverage, 17 test files, 6 features implemented | Messaging backbone is working code, not a design contract |
+| **nats-core library** | April 2026 | 98% test coverage, 17 test files, 6 features implemented | Messaging backbone is working code, not a design contract |
 | **FinProxy product docs** | January 2026 | 14 docs, 310 KB, produced in one weekend, approved by James with minimal feedback | Product Owner Agent proof point — manual version of the workflow already proven |
 | **Feature spec defaults acceptance** | April 2026 | Rich accepts defaults ~95% of the time across 7 feature specs | GuardKit prompt calibration validated — provides training signal for future automation |
 
@@ -642,7 +642,7 @@ These apply across all repos. Do NOT reopen.
 | D35 | Confidence-gated checkpoints | Coach score determines human engagement: 🟢 auto-approve (≥ threshold), 🟡 flag for review, 🔴 hard stop (critical detection). Replaces hard human checkpoints at every stage. Uses existing nats-core payloads (`ApprovalRequestPayload`, `ApprovalResponsePayload`, `NotificationPayload`) — no new wire formats. Thresholds configurable per stage and per project. |
 | D36 | Forge is checkpoint manager, not specialist | Delegates domain judgment to specialist agents via NATS `call_agent_tool()`. No Player-Coach loop for Forge itself. Uses strong reasoning model (Claude Sonnet) for orchestration decisions, not fine-tuned domain judgment. Specialist agents return Coach scores — Forge reads them, does not re-evaluate. |
 | D37 | PR review always human | The final gate before merge never auto-approves regardless of Coach score. Every other stage is conditional on Coach confidence. |
-| D38 | `feature_ready_for_build` replaces kanban-triggered events | Emitted by the Forge when the GuardKit command sequence completes — not by a webhook from a PM tool card state change. `ticket_updated` event dropped entirely. PM tools (Linear, GitHub Projects) repositioned as optional visibility adapters that subscribe to pipeline events — they are viewports, not control surfaces. |
+| D38 | Pipeline events replace kanban-triggered events | Build triggers arrive via `pipeline.build-queued` (CLI or Jarvis); stage completion is signalled by `StageCompletePayload` — not by a webhook from a PM tool card state change. The earlier `feature_ready_for_build` intermediate event was itself retired (its function is covered by `StageCompletePayload` for Stage 3 completion and `BuildQueuedPayload` for build readiness). `ticket_updated` event dropped entirely. PM tools (Linear, GitHub Projects) repositioned as optional visibility adapters that subscribe to pipeline events — they are viewports, not control surfaces. |
 | D39 | Context manifests for cross-repo dependency resolution | Each repo that depends on other repos places a `.guardkit/context-manifest.yaml` at its root. The manifest lists dependencies with relative paths, key docs, and per-doc categories (specs, contracts, decisions, source, product, architecture). The Forge reads these to assemble `--context` flags automatically — category filtering by command type (`/system-arch` gets architecture + decisions, `/feature-spec` gets specs + contracts + source). Replaces manual `--context` flag assembly from Claude Desktop sessions. Manifests created for forge (4 deps), lpa-platform (3 deps), specialist-agent (3 deps, phase-tagged). Foundational repos (guardkit, nats-core) don't need manifests — everything depends on them, not the other way round. |
 
 ---
@@ -679,7 +679,7 @@ role) and Phase 3 (agent-to-agent NATS calls) are the demo vehicles for the talk
 ### nats-core
 
 ```
-✅ Implemented — 97% test coverage, 17 test files, 6 features
+✅ Implemented — 98% test coverage, 17 test files, 6 features
    NATSClient, MessageEnvelope, Topics, AgentConfig, AgentManifest,
    NATSKVManifestRegistry, 19 typed event payloads
 
