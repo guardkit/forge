@@ -1,0 +1,40 @@
+[project]
+name = "forge"
+version = "0.1.0"
+description = "Pipeline orchestrator and checkpoint manager for the Software Factory"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Richard Woollcott", email = "rich@appmilla.com" },
+]
+dependencies = [
+    "deepagents>=0.4.11",
+    "langchain>=1.2.11",
+    "langchain-core>=1.2.18",
+    "langgraph>=0.2",
+    "langchain-community>=0.3",
+    "langchain-anthropic>=0.2",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Every LangChain integration this template can be configured to use MUST appear here.
+# See TASK-REV-LES1 / LES1 §3 LCOI — provider swaps happen via orchestrator-config.yaml,
+# so all supported providers must be declarable in one install command.
+providers = [
+    "langchain-openai>=0.2",
+    "langchain-google-genai>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
