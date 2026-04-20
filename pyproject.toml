@@ -8,7 +8,7 @@ authors = [
     { name = "Richard Woollcott", email = "rich@appmilla.com" },
 ]
 dependencies = [
-    "deepagents>=0.4.11",
+    "deepagents>=0.5.3,<0.6",
     "langchain>=1.2.11",
     "langchain-core>=1.2.18",
     "langgraph>=0.2",

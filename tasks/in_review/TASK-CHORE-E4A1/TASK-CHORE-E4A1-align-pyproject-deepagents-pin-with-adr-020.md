@@ -1,9 +1,10 @@
 ---
 id: TASK-CHORE-E4A1
 title: Align `pyproject.toml` `deepagents` pin with ADR-ARCH-020
-status: backlog
+status: in_review
 created: 2026-04-20T00:00:00Z
 updated: 2026-04-20T00:00:00Z
+implemented_in: pyproject.toml (commit to follow)
 priority: medium
 tags: [chore, pin-alignment, pyproject, adr-020, pre-system-design]
 complexity: 1
