@@ -180,6 +180,27 @@ was spawned on 2026-04-20 to carry the revision. `/system-design`
 remains blocked on that revision (i.e. on the revision being merged,
 not on re-running this spike).
 
+### Resolution (TASK-ADR-REVISE-021-E7B3, 2026-04-20)
+
+ADR-ARCH-021 Revision 10 lands **Option C (hybrid)**: near-term, explicit
+rehydration at every `interrupt()` call site via a `resume_value_as(model_cls,
+raw)` helper (home: `forge.adapters.langgraph`, implemented by
+`/system-design`); longer-term, a deferred, non-blocking `TASK-SPIKE-*` will
+test whether registering Pydantic interrupt/resume types via LangGraph's
+`allowed_msgpack_modules` (or equivalent serde hook) restores server-mode
+type fidelity. The helper's `isinstance` short-circuit makes it a no-op if
+that follow-up succeeds, so no call-site churn would be required.
+
+**Server-mode rows still diverge row-for-row** from the direct-invoke table
+above — this verification doc is not being re-run under the revision.
+Instead, the ADR now reflects that divergence as the contract
+(`interrupt()` → `dict`; call sites rehydrate). Parity with the
+direct-invoke rows becomes the success criterion of the deferred Option B
+spike, at which point this section will be superseded by a row-by-row
+re-verification.
+
+`/system-design` is **unblocked** by the revision alone.
+
 ## Environment fingerprint
 
 ```
