@@ -1,9 +1,9 @@
 ---
 id: TASK-SPIKE-D2F7
 title: ASSUM-009 server-mode coverage — `interrupt()` round-trip under `langgraph dev`
-status: backlog
+status: in_review
 created: 2026-04-20T00:00:00Z
-updated: 2026-04-20T00:00:00Z
+updated: 2026-04-20T05:45:00Z
 priority: high
 tags: [spike, verification, langgraph, adr-021, pre-system-design]
 complexity: 4
@@ -121,4 +121,76 @@ server-mode scaffolding as its own commit trail).
 
 ## Implementation Notes
 
-_(Populated at execution time.)_
+Executed 2026-04-20.
+
+**Scaffolding added.**
+- `spikes/deepagents-053/langgraph.json` — spike-local config exposing
+  the C1E9 interrupt graph as `assum009_interrupt`. Kept isolated from
+  the repo-root `langgraph.json` per AC-1 option ("or
+  `spikes/deepagents-053/` if isolation is preferred"), so the existing
+  orchestrator entry is untouched.
+- `spikes/deepagents-053/interrupt_graph.py` — added a single
+  module-level `graph = build_graph().compile()` export (no checkpointer;
+  `langgraph dev` provides its own in-memory one). No duplication of
+  the Pydantic payload definitions.
+- `spikes/deepagents-053/interrupt_server_drive.py` — new driver
+  exercising create-thread → run-to-interrupt → resume-with-typed-decision
+  → fetch-state via `langgraph_sdk.get_sync_client`.
+
+**Environment.**
+- Installed `langgraph-cli[inmem]==0.4.23` (pulls `langgraph-api==0.8.0`,
+  `langgraph-runtime-inmem==0.27.4`). pip flagged some unrelated
+  opentelemetry conflicts; they do not affect the dev server or the SDK.
+- Server booted with `langgraph dev --no-browser --port 2024` from
+  `spikes/deepagents-053/`. Started in ~0.8s; exposed
+  `http://127.0.0.1:2024`.
+- SDK driver used `langgraph-sdk==0.3.12` and reached the server on
+  the first poll.
+
+**Reproducer invocation.**
+- `client.runs.wait(thread_id, assistant_id="assum009_interrupt", input={})`
+  returned a payload with `__interrupt__` populated.
+- `client.threads.get_state(thread_id)` reported `next=['propose']` —
+  pause at the interrupt is real.
+- `client.runs.wait(..., command={"resume": decision.model_dump(mode="json")})`
+  advanced the run to completion. No exception, HTTP 200.
+- `client.threads.get_state(thread_id)` reflected the node's final
+  state with the verdict fields.
+
+**Verdict: FAIL (type fidelity); PASS (control flow).**
+- Node-side `type(resumed).__name__` == `'dict'`, not `'ApprovalDecision'`.
+- `isinstance(resumed, ApprovalDecision)` == `False`.
+- Nested `decided_by`/`decided_at` are unreachable via attribute access
+  on a dict (both came back as `'NoneType'` because the node uses
+  `type(getattr(decision, ..., None)).__name__` — evidence the payload
+  is not the typed object it was in direct-invoke mode).
+- `finalised == True` — the graph did pause, resume, and complete.
+
+**Full verdict rows** are recorded in
+`docs/research/ideas/deepagents-053-verification.md` §"Server-mode
+closeout (TASK-SPIKE-D2F7, 2026-04-20)" as a row-for-row comparison
+against the direct-invoke table from C1E9.
+
+**Follow-through (AC-7 / AC-8).**
+- ADR-ARCH-021 References line updated to flag the FAIL and point at
+  the divergence section; the decision snippet in the ADR body is
+  left as-is (the revision task owns the rewrite, per the C1E9 revision
+  policy).
+- `TASK-ADR-REVISE-021-E7B3` created in backlog with three option paths
+  (A: explicit `.model_validate(...)`; B: register types via
+  `allowed_msgpack_modules`; C: hybrid). `/system-design` explicitly
+  blocked on that task.
+
+**Out-of-scope not pursued (confirming task scope was respected).**
+- No productionisation of `langgraph.json` for the real Forge graph.
+- No ASSUM-008 re-verification.
+- No attempt to fix the msgpack "unregistered type" warning (folded
+  into Option B of the revision task).
+
+**Explicit divergence call-out (AC-5).** Direct `.invoke` preserves
+Pydantic instance identity across resume; `langgraph dev` server mode
+does not. This is not merely an SDK ergonomics issue — the **node
+itself** sees a `dict`. Any code downstream of `interrupt()` that
+treats the return as a Pydantic object must either re-hydrate
+explicitly or depend on serde registration. That divergence is itself
+the finding this task was created to surface.

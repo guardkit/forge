@@ -1,0 +1,6 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "assum009_interrupt": "./interrupt_graph.py:graph"
+    }
+}

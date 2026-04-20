@@ -54,7 +54,11 @@ exercised by DeepAgents' own test suite.
 ## ASSUM-009 — `interrupt()` + typed Pydantic resume round-trip (backs ADR-ARCH-021)
 
 **Verdict (direct `CompiledStateGraph.invoke`, cross-process): PASS.**
-**Verdict (`langgraph dev` server mode): NOT TESTED IN THIS SPIKE — see gap note below.**
+**Verdict (`langgraph dev` server mode): FAIL — typed Pydantic payload
+degrades to `dict` on resume. Interrupt/resume mechanics themselves work
+(graph pauses, resumes, and reaches `finalise`); the failure is strictly
+about **type fidelity** of the value the node observes on `interrupt()`'s
+return. Recorded by TASK-SPIKE-D2F7, 2026-04-20.**
 
 `interrupt_graph.py` pauses a compiled `StateGraph` at `interrupt(payload)`
 with a Pydantic `ApprovalRequest` carrying a nested `Requestor` model, a
@@ -114,6 +118,67 @@ HITL payloads are defined.
 **ADR-ARCH-021 stands as written for direct-invoke mode.** Server-mode
 verification is deferred; ADR-021 should not be treated as fully
 verified until the server-mode gap is closed.
+
+### Server-mode closeout (TASK-SPIKE-D2F7, 2026-04-20)
+
+**Scaffolding.**
+- Installed `langgraph-cli[inmem]==0.4.23` (pulls
+  `langgraph-api==0.8.0`, `langgraph-runtime-inmem==0.27.4`).
+- Added spike-local `spikes/deepagents-053/langgraph.json` exposing the
+  C1E9 interrupt graph as `assum009_interrupt` via a new module-level
+  `graph = build_graph().compile()` export on `interrupt_graph.py` (no
+  checkpointer — the dev server injects in-memory persistence).
+- Booted `langgraph dev --no-browser --port 2024` against that config.
+- Drove via `langgraph-sdk==0.3.12`
+  (`spikes/deepagents-053/interrupt_server_drive.py`):
+  `client.runs.wait(..., input={})` → observe `__interrupt__` →
+  `client.runs.wait(..., command={"resume": decision.model_dump(mode="json")})` →
+  `client.threads.get_state(...)`.
+
+**Verdict rows (compare row-for-row with the direct-invoke table above):**
+
+| Check | Direct `.invoke` | `langgraph dev` server | Required |
+|---|---|---|---|
+| `type(resumed).__name__` (inside node) | `'ApprovalDecision'` | **`'dict'`** | `'ApprovalDecision'` |
+| `isinstance(resumed, ApprovalDecision)` | `True` | **`False`** | `True` |
+| nested `decided_by` type | `'Requestor'` | **`'NoneType'`** (no attr on dict) | `'Requestor'` |
+| `decided_at` type | `'datetime'` | **`'NoneType'`** (no attr on dict) | `'datetime'` |
+| field `.approved` | `True` | `False` (missing attr on dict → `getattr` default) | survives |
+| graph completed past interrupt | `True` | `True` | `True` |
+
+**Divergence finding.** The `interrupt()` **control-flow** primitive is
+fully functional under `langgraph dev`: the run pauses at the interrupt
+(state reports `next=['propose']`), `Command(resume=...)` over HTTP
+advances past it, and the graph reaches `finalise`. What does **not**
+survive the server round-trip is Pydantic **type fidelity** — both the
+interrupt payload surfaced to the SDK caller and the resume value
+received by the node are plain `dict`s, not Pydantic instances. This is
+consistent with the warning observed in direct mode
+(`Deserializing unregistered type __main__.ApprovalRequest from
+checkpoint ... Add to allowed_msgpack_modules to silence:
+[('__main__', 'ApprovalRequest')]`) — under `langgraph dev` there is an
+additional HTTP/JSON serialization layer that does not carry the
+Pydantic type information across the wire, and without
+`allowed_msgpack_modules` registration the server-side reconstruction
+has no hook to rehydrate the type either.
+
+**Impact on ADR-ARCH-021.** The ADR's decision snippet assumes that when
+`response = interrupt(...)` returns, `response` is a typed
+`ApprovalResponsePayload` instance and can be passed directly to
+`handle_approval_response(response, build_id)`. Under the canonical
+Forge deployment mode (`langgraph dev` / LangGraph server) this is
+false: `response` is a `dict`. Any code that relies on attribute access
+or isinstance checks will break. The ADR must be revised to mandate
+either (a) explicit re-hydration inside the node
+(`ApprovalResponsePayload.model_validate(response)`), or (b) registering
+the interrupt/resume Pydantic types via `allowed_msgpack_modules` /
+serde hook and re-verifying that round-trips intact under server mode.
+
+**Verdict.** ADR-ARCH-021 **cannot be treated as fully verified** in
+its current form. `TASK-ADR-REVISE-021-server-mode-interrupt-hydration`
+was spawned on 2026-04-20 to carry the revision. `/system-design`
+remains blocked on that revision (i.e. on the revision being merged,
+not on re-running this spike).
 
 ## Environment fingerprint
 

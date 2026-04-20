@@ -129,6 +129,13 @@ def compiled_with_checkpointer(checkpointer):
     return build_graph().compile(checkpointer=checkpointer)
 
 
+# Server-mode export. `langgraph dev` injects its own checkpointer, so the
+# graph is compiled without one. Referenced from `spikes/deepagents-053/
+# langgraph.json` by TASK-SPIKE-D2F7 to close the server-mode coverage gap
+# on ASSUM-009. Reuses the same Pydantic payload types as direct-invoke mode.
+graph = build_graph().compile()
+
+
 # ---- Entry point: run-until-interrupt ------------------------------------
 
 

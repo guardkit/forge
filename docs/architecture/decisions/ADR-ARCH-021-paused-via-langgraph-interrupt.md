@@ -54,4 +54,4 @@ PAUSED survives process restart via the SQLite + JetStream path (ADR-SP-013 cras
 
 ## References
 
-- [deepagents 0.5.3 primitives verification](../../research/ideas/deepagents-053-verification.md) — ASSUM-009 typed `interrupt()` round-trip confirmed for direct `CompiledStateGraph.invoke`; `langgraph dev` server-mode coverage deferred (TASK-SPIKE-C1E9, 2026-04-20).
+- [deepagents 0.5.3 primitives verification](../../research/ideas/deepagents-053-verification.md) — ASSUM-009 typed `interrupt()` round-trip confirmed for direct `CompiledStateGraph.invoke` (TASK-SPIKE-C1E9). **Under `langgraph dev` server mode (Forge's canonical deployment per this ADR) the resumed value arrives as a `dict`, not a Pydantic instance — FAIL on type fidelity, PASS on control-flow.** See §"Server-mode closeout (TASK-SPIKE-D2F7, 2026-04-20)". The decision snippet above (which passes `response` directly into `handle_approval_response`) is therefore **incorrect as written** for server-mode deployment; revision tracked in `TASK-ADR-REVISE-021-E7B3`. `/system-design` is blocked on that revision.
