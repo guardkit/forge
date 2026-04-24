@@ -1,19 +1,8 @@
 {
   "mcpServers": {
     "graphiti": {
-      "type": "stdio",
-      "defer_loading": false,
-      "command": "/bin/bash",
-      "args": [
-        "-c",
-        "set -a && . /Users/richardwoollcott/Projects/appmilla_github/forge/.env && set +a && export LLM_MODEL=gemini-2.5-pro && exec /opt/homebrew/bin/uv --directory /Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server run main.py --transport stdio --config /Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server/config/config-guardkit.yaml"
-      ],
-      "env": {
-        "CONFIG_PATH": "/Users/richardwoollcott/Projects/appmilla_github/graphiti/mcp_server/config/config-guardkit.yaml",
-        "LLM_MODEL": "gemini-2.5-pro",
-        "EMBEDDING_API_URL": "http://promaxgb10-41b1:8001/v1",
-        "EMBEDDING_DIM": "1024"
-      }
+      "type": "http",
+      "url": "http://promaxgb10-41b1:8004/mcp/"
     }
   }
 }
