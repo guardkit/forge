@@ -2309,3 +2309,16 @@ Wave 3 cannot start until FEAT-FORGE-001 provides: builds table with uq_builds_f
 
 
 GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-FORGE-002 --verbose --max-turns 30
+
+
+
+
+
+
+
+
+
+
+
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-FORGE-002 --verbose --max-turns 30
