@@ -2070,6 +2070,44 @@ The only documentary gap I noticed: docs/history/system-design-history.md (opene
 
 please update /Users/richardwoollcott/Projects/appmilla_github/forge/docs/research/ideas/forge-build-plan.md with the status
 
+/feature-spec FEAT-FORGE-001 \
+  --context forge/docs/design/models/DM-build-lifecycle.md \
+  --context forge/docs/design/contracts/API-sqlite-schema.md \
+  --context forge/docs/design/contracts/API-cli.md \
+  --context forge/docs/design/decisions/DDR-003-sqlite-schema-layout-wal.md
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: Pipeline State Machine and Configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files written:
+  features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration.feature
+  features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_assumptions.yaml
+  features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md
+
+Scenarios: 35 total
+  @key-example: 6    @boundary: 6
+  @negative: 11      @edge-case: 16
+  @smoke: 3          @regression: 0
+
+Assumptions: 6 total
+  high: 0
+  medium: 4 (Coach review recommended — ASSUM-001, 003, 004, 006)
+  low: 2 (human review required — ASSUM-002 turn-budget ceiling, ASSUM-005 cancel-operator audit)
+
+REVIEW REQUIRED: 2 low-confidence assumptions need verification
+  See: features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_assumptions.yaml
+
+Deferred: 0 groups
+
+Next steps:
+  Review: features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration.feature
+  Pass to /feature-plan:
+    /feature-plan "Pipeline State Machine and Configuration" \
+      --context features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 
 
