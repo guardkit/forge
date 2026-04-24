@@ -2108,24 +2108,106 @@ Next steps:
       --context features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+please update the /Users/richardwoollcott/Projects/appmilla_github/forge/docs/research/ideas/forge-build-plan.md with the status and ensure the feature plan command in the build plan correlates to that in your last response
 
 
+Updated docs/research/ideas/forge-build-plan.md:
+
+Top status line → /feature-spec 🟡 1 / 8 (FEAT-FORGE-001 ✅).
+Progress-log table → Step 3 row now reports 1/8 in progress with artefact path and assumption counts.
+Step 3 heading → IN PROGRESS (1 / 8) with a "Completed" list pointing to features/pipeline-state-machine-and-configuration/ and the two low-confidence assumptions flagged for review.
+Step 3 FEAT-FORGE-001 command block → marked ✅ COMPLETE (2026-04-24) and annotated with its output directory.
+Step 4 rewritten so every /feature-plan invocation takes the matching {slug}_summary.md as --context. The FEAT-FORGE-001 line now exactly mirrors the "Next steps" command I emitted in the feature-spec completion summary; the other seven features use <feat-forge-NNN-slug> placeholders with a note that the slug is kebab-case of the feature name (not the ID) and resolves when each /feature-spec completes.
+whats the next step?
+Two choices, depending on whether you want to resolve open items first or keep momentum on the spec pass.
+
+Option 1 — Clear the low-confidence assumptions on FEAT-FORGE-001 first (recommended before /feature-plan runs against it):
+
+ASSUM-002 — is there a real maximum max_turns? Or should the upper-bound boundary scenarios be dropped?
+ASSUM-005 — single-operator or audit-distinct cancel-vs-originate identity? If single-operator, the cancel-audit scenario can be removed or simplified.
+Both are in features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_assumptions.yaml.
+
+Option 2 — Continue the spec pass with the next feature in Step 3:
 
 
+/feature-spec FEAT-FORGE-002 \
+  --context forge/docs/design/contracts/API-nats-pipeline-events.md \
+  --context forge/docs/design/contracts/API-nats-fleet-lifecycle.md \
+  --context forge/docs/design/models/DM-discovery.md \
+  --context nats-core/docs/design/specs/nats-core-system-spec.md \
+  --context nats-core/docs/design/contracts/agent-manifest-contract.md
+My recommendation: resolve the two low-confidence assumptions now (cheap — two quick answers) then move on to FEAT-FORGE-002. Leaving them unresolved means /feature-plan FEAT-FORGE-001 will inherit the ambiguity into tasks.
+
+let's work on Option 1 — Clear the low-confidence assumptions on FEAT-FORGE-001 first (
+Grep "max_turns|max-turns|turn.?budget|turn.?limit" (glob: docs/**/*.md)
+31 lines of output
+Grep "originating_user|operator|audit.*(cancel|user)|responder" (glob: docs/design/**/*.md)
+31 lines of output
+Two questions — each takes one decision.
+
+ASSUM-002 — upper bound on reasoning-turn budget?
+
+The context states max_turns default of 5 (forge.yaml and Build.max_turns) but no ceiling. The data model DM-build-lifecycle.md:40 types it as int with default 5 — no max. Choices:
+
+(a) Keep 20 as an arbitrary-but-generous ceiling. Rationale: "anything higher is almost certainly a mistake; the stage timeout will kill it anyway."
+(b) Pick a different number (e.g. 10, 50). Say the value.
+(c) Remove the upper-bound entirely. I drop the | 20 | row from the accept-boundary Examples and lose the notion of a max. max_turns is then only bounded below by ≥ 1. Lowest-risk option — the lower bound is the only one that's a genuine safety requirement.
+(d) Defer. Hold the scenario until forge.yaml schema validation is specified explicitly.
+ASSUM-005 — distinct cancelling-operator vs originating-operator identity?
+
+The data model already separates these: originating_user on the build record DM-build-lifecycle.md:28, responder on the approval resolution DM-build-lifecycle.md:148. The scenario tests that both are preserved when they differ. Choices:
+
+(a) Confirm as-is. Keep the scenario; update confidence to medium (the schema supports it, just wasn't stated as a requirement).
+(b) Single-operator mode — remove the scenario. Rationale: "Forge is solo-use; if I cancel my own build there's no distinct identity to preserve." Drop Group E scenario 2; keep path-traversal.
+(c) Simplify. Keep the scenario but drop the "different operator" framing — just assert the cancel reason and responder are recorded. No identity comparison.
+My suggestion: (c) for ASSUM-002 (lose the arbitrary ceiling) and (a) for ASSUM-005 (the schema already encodes the distinction; promote to medium). But your call.
+
+accept your reccomendations
+Applying recommendations: drop the 20-turn ceiling (ASSUM-002 removed), promote cancel-operator audit to medium (ASSUM-005).
+
+Revisions applied across the four files.
+
+Changes
+
+.feature — dropped the | 20 | row from the accept-boundary Scenario Outline and retitled it "at or above the minimum are accepted"; removed the ASSUM-002 comment; upgraded the ASSUM-005 comment to medium with schema-grounded basis.
+_assumptions.yaml — review_required: false; ASSUM-002 moved to a retired_assumptions: block with reason; ASSUM-005 confidence medium with basis citing Build.originating_user and the approval responder field.
+_summary.md — 34 scenarios, 5 assumptions (all medium, all confirmed); "Review required: No"; retired-assumptions section added.
+forge-build-plan.md — Step 3 progress row and completion block now show 34 scenarios, 5 medium assumptions, 0 open — "Ready for /feature-plan".
+Next step: FEAT-FORGE-002 /feature-spec (command in docs/research/ideas/forge-build-plan.md Step 3) when you're ready.
 
 
+/feature-spec FEAT-FORGE-002 \
+  --context forge/docs/design/contracts/API-nats-pipeline-events.md \
+  --context forge/docs/design/contracts/API-nats-fleet-lifecycle.md \
+  --context forge/docs/design/models/DM-discovery.md \
+  --context nats-core/docs/design/specs/nats-core-system-spec.md \
+  --context nats-core/docs/design/contracts/agent-manifest-contract.md
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: NATS Fleet Integration (FEAT-FORGE-002)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files written:
+
+features/nats-fleet-integration/nats-fleet-integration.feature
+features/nats-fleet-integration/nats-fleet-integration_assumptions.yaml
+features/nats-fleet-integration/nats-fleet-integration_summary.md
+Scenarios: 33 total
+
+@key-example: 7 @boundary: 5
+@negative: 8 @edge-case: 15
+@smoke: 3 @regression: 0
+@security: 2 @concurrency: 2 @data-integrity: 2 @integration: 2
+Assumptions: 5 total — 5 high / 0 medium / 0 low (no REVIEW REQUIRED flag)
+
+Deferred: None
+
+Next step:
 
 
-
-
-
-
-
-
-
-
+/feature-plan "NATS Fleet Integration" \
+  --context features/nats-fleet-integration/nats-fleet-integration_summary.md
 
 
 
@@ -2179,3 +2261,51 @@ spikes
 src
 tasks
 tests
+
+
+
+
+/feature-plan "NATS Fleet Integration" \
+  --context features/nats-fleet-integration/nats-fleet-integration_summary.md
+
+Feature Planning Complete — FEAT-FORGE-002 NATS Fleet Integration
+Created
+
+tasks/backlog/nats-fleet-integration/
+├── README.md
+├── IMPLEMENTATION-GUIDE.md           # Data flow + sequence + dependency + §4 Contracts diagrams
+├── TASK-NFI-001-extend-forge-config-fleet-pipeline-sections.md
+├── TASK-NFI-002-define-forge-manifest-constant.md
+├── TASK-NFI-003-implement-discovery-domain.md
+├── TASK-NFI-004-fleet-publisher.md
+├── TASK-NFI-005-fleet-watcher.md
+├── TASK-NFI-006-pipeline-publisher.md
+├── TASK-NFI-007-pipeline-consumer.md
+├── TASK-NFI-008-wire-state-machine-lifecycle-emission.md
+├── TASK-NFI-009-reconcile-on-boot-crash-recovery.md
+├── TASK-NFI-010-contract-and-seam-tests.md
+└── TASK-NFI-011-bdd-scenario-pytest-wiring.md
+
+.guardkit/features/FEAT-FORGE-002.yaml        # AutoBuild-ready, 11 tasks, 5 waves
+.claude/reviews/TASK-REV-NF20-review-report.md # Full decision review
+tasks/backlog/TASK-REV-NF20-plan-nats-fleet-integration.md  # Parent review task
+BDD Wiring
+33 scenarios tagged with @task:TASK-NFI-xxx — R2 oracle will run them per-task during /task-work Phase 4.
+All matches above the 0.6 confidence threshold; 0 below threshold.
+Pre-flight Results
+AC-quality linter: 0 unverifiable acceptance criteria
+R3 smoke-gate nudge: fired (5 waves, no smoke_gates: in YAML — consider adding before /feature-build)
+guardkit feature validate: subcommand not available in this installation; pre-flight skipped (non-blocking)
+Next Steps
+
+# Wave 1 (parallel — can start immediately)
+/task-work TASK-NFI-001    # config schema
+/task-work TASK-NFI-002    # FORGE_MANIFEST
+
+# Or run the full feature autonomously
+/feature-build FEAT-FORGE-002
+Dependency Gate ⚠️
+Wave 3 cannot start until FEAT-FORGE-001 provides: builds table with uq_builds_feature_correlation unique index, BuildStatus enum, state-machine transition hooks, and the existing ForgeConfig loader. Waves 1–2 can proceed independently today.
+
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-FORGE-002 --verbose --max-turns 30
