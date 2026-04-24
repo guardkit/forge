@@ -1,6 +1,6 @@
 # Forge Build Plan — Pipeline Orchestrator & Checkpoint Manager
 
-## Status: `/system-arch` ✅ done · `/system-design` ✅ done · **Ready for `/feature-spec` × 8** (blocked on specialist-agent Phase 3 + NATS infra running)
+## Status: `/system-arch` ✅ done · `/system-design` ✅ done · `/feature-spec` 🟡 **1 / 8 complete** (FEAT-FORGE-001 ✅ · 7 remaining; later steps blocked on specialist-agent Phase 3 + NATS infra running)
 ## Repo: `guardkit/forge`
 ## Agent ID: `forge`
 ## Target: Post specialist-agent Phase 3 completion
@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|
 | 1 | `/system-arch` | ✅ complete | 2026-04-18 | `9f41e22` (seeded by later refinements) | `docs/architecture/ARCHITECTURE.md`, `system-context.md`, `container.md`, `domain-model.md`, `assumptions.yaml`, **31 ADRs** (`ADR-ARCH-001`..`031`) |
 | 2 | `/system-design` | ✅ complete | 2026-04-23 | `b40365c` | `docs/design/` — **9 API contracts + 5 data models + 6 DDRs + 2 C4 L3 diagrams**; 20 artefacts seeded into Graphiti (`project_design` + `architecture_decisions`) |
-| 3 | `/feature-spec × 8` | ◻ pending | — | — | — |
+| 3 | `/feature-spec × 8` | 🟡 in progress (1 / 8) | 2026-04-24 (FEAT-FORGE-001) | — | FEAT-FORGE-001 ✅ → `features/pipeline-state-machine-and-configuration/` (34 scenarios, 5 assumptions all confirmed medium — ASSUM-002 retired, ASSUM-005 promoted post-revision) |
 | 4 | `/feature-plan × 8` | ◻ pending | — | — | — |
 | 5 | `autobuild × 8` (Waves 1–6) | ◻ pending | — | — | — |
 | 6 | Validation | ◻ pending | — | — | — |
@@ -257,10 +257,17 @@ Two C4 L3 diagrams ([`forge/docs/design/diagrams/`](../../design/diagrams/)):
 
 **Sibling task created in `nats-core`:** [`TASK-NCFA-003`](../../../../nats-core/tasks/backlog/forge-v2-alignment/TASK-NCFA-003-add-forge-system-design-pipeline-payloads.md) — shipped same-day as `nats-core 0.2.0`.
 
-### Step 3: /feature-spec × 8 — ◻ READY TO START
+### Step 3: /feature-spec × 8 — 🟡 IN PROGRESS (1 / 8)
 
 Produces BDD feature specifications for each feature. Run sequentially — later features
 reference earlier ones.
+
+**Completed:**
+- ✅ **FEAT-FORGE-001** — Pipeline State Machine & Configuration (2026-04-24; revised 2026-04-24)
+  - Artefacts: `features/pipeline-state-machine-and-configuration/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 34 (6 @key-example · 6 @boundary · 11 @negative · 16 @edge-case · 3 @smoke)
+  - Assumptions: 5 resolved — 5 medium, 0 low, 0 open. Ready for `/feature-plan`.
+    - Post-review revisions: ASSUM-002 (arbitrary turn-budget ceiling) retired; ASSUM-005 (cancel-operator audit) promoted low → medium on schema grounds.
 
 > **Context-flag resolution (post-`/system-design`):** placeholders from the original
 > build plan resolve as follows. `DESIGN.md` / `forge-system-spec.md` were not produced
@@ -270,7 +277,8 @@ reference earlier ones.
 > `.guardkit/context-manifest.yaml` is populated.
 
 ```bash
-# FEAT-FORGE-001: Pipeline State Machine & Configuration
+# FEAT-FORGE-001: Pipeline State Machine & Configuration  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/pipeline-state-machine-and-configuration/
 guardkit feature-spec FEAT-FORGE-001 \
   --context forge/docs/design/models/DM-build-lifecycle.md \
   --context forge/docs/design/contracts/API-sqlite-schema.md \
@@ -338,19 +346,51 @@ spec session (following Pattern 3 from the fleet-master-index).
 ### Step 4: /feature-plan × 8
 
 Produces task breakdowns for each feature. Run sequentially — dependencies must be
-respected.
+respected. Each invocation takes the matching `/feature-spec` summary as `--context`
+so the plan is grounded in the curated scenarios and resolved assumptions (see
+`installer/core/commands/feature-plan.md` §"Step 11: Link BDD scenarios to tasks").
 
 ```bash
 # Run in dependency order:
-guardkit feature-plan FEAT-FORGE-001  # no deps
-guardkit feature-plan FEAT-FORGE-002  # depends on 001
-guardkit feature-plan FEAT-FORGE-005  # depends on 001 (can parallel with 002)
-guardkit feature-plan FEAT-FORGE-003  # depends on 002
-guardkit feature-plan FEAT-FORGE-004  # depends on 003
-guardkit feature-plan FEAT-FORGE-006  # depends on 001, 002
-guardkit feature-plan FEAT-FORGE-007  # depends on 003, 004, 005, 006
-guardkit feature-plan FEAT-FORGE-008  # depends on 007
+
+# FEAT-FORGE-001: Pipeline State Machine & Configuration (no deps)
+guardkit feature-plan "Pipeline State Machine and Configuration" \
+  --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md
+
+# FEAT-FORGE-002: NATS Fleet Integration (depends on 001)
+guardkit feature-plan FEAT-FORGE-002 \
+  --context forge/features/<feat-forge-002-slug>/<feat-forge-002-slug>_summary.md
+
+# FEAT-FORGE-005: GuardKit Command Invocation Engine (depends on 001 — can parallel with 002)
+guardkit feature-plan FEAT-FORGE-005 \
+  --context forge/features/<feat-forge-005-slug>/<feat-forge-005-slug>_summary.md
+
+# FEAT-FORGE-003: Specialist Agent Delegation (depends on 002)
+guardkit feature-plan FEAT-FORGE-003 \
+  --context forge/features/<feat-forge-003-slug>/<feat-forge-003-slug>_summary.md
+
+# FEAT-FORGE-004: Confidence-Gated Checkpoint Protocol (depends on 003)
+guardkit feature-plan FEAT-FORGE-004 \
+  --context forge/features/<feat-forge-004-slug>/<feat-forge-004-slug>_summary.md
+
+# FEAT-FORGE-006: Infrastructure Coordination (depends on 001, 002)
+guardkit feature-plan FEAT-FORGE-006 \
+  --context forge/features/<feat-forge-006-slug>/<feat-forge-006-slug>_summary.md
+
+# FEAT-FORGE-007: Mode A Greenfield End-to-End (depends on 003, 004, 005, 006)
+guardkit feature-plan FEAT-FORGE-007 \
+  --context forge/features/<feat-forge-007-slug>/<feat-forge-007-slug>_summary.md
+
+# FEAT-FORGE-008: Mode B Feature & Mode C Review-Fix (depends on 007)
+guardkit feature-plan FEAT-FORGE-008 \
+  --context forge/features/<feat-forge-008-slug>/<feat-forge-008-slug>_summary.md
 ```
+
+> **Note on slugs:** `/feature-spec` writes output under a kebab-cased slug of the
+> feature **name**, not the `FEAT-FORGE-NNN` ID. The FEAT-FORGE-001 slug resolved
+> to `pipeline-state-machine-and-configuration`. The placeholders above resolve
+> as each `/feature-spec` completes — replace them with the real slugs at that
+> point.
 
 **Validation:**
 - Task wave structure respects feature dependencies

@@ -3,9 +3,10 @@
 **Feature ID**: FEAT-FORGE-001
 **Stack**: python
 **Generated**: 2026-04-23T20:00:00Z
-**Scenarios**: 35 total (3 smoke, 0 regression)
-**Assumptions**: 6 total (0 high / 4 medium / 2 low confidence)
-**Review required**: Yes (2 low-confidence assumptions)
+**Revised**: 2026-04-24 — ASSUM-002 retired; ASSUM-005 promoted to medium
+**Scenarios**: 34 total (3 smoke, 0 regression)
+**Assumptions**: 5 total (0 high / 5 medium / 0 low confidence)
+**Review required**: No — all open assumptions confirmed and grounded
 
 ## Scope
 
@@ -27,9 +28,8 @@ only as capability observations, not implementation steps.
 | Smoke (@smoke) | 3 |
 | Regression (@regression) | 0 |
 
-Note: several scenarios carry multiple tags — e.g. boundary + negative for the
-"outside the permitted range" pair, edge-case + negative for the security and
-integration-boundary refusals. Group totals do not sum to 35.
+Note: several scenarios carry multiple tags (e.g. boundary + negative, edge-case
++ negative). Group totals do not sum to 34.
 
 ## Group Layout
 
@@ -46,30 +46,23 @@ integration-boundary refusals. Group totals do not sum to 35.
 
 ## Deferred Items
 
-None. All four initial groups and all four expansion groups were accepted
-without deferral.
+None.
 
-## Open Assumptions (low confidence)
+## Assumptions (all medium confidence, all confirmed)
 
-Two low-confidence assumptions that need human verification before this
-specification is treated as authoritative:
+- **ASSUM-001** — minimum reasoning-turn budget is 1
+- **ASSUM-003** — feature_id rejects path-traversal sequences
+- **ASSUM-004** — sequential-queue scope is per-project
+- **ASSUM-005** — cancelling operator recorded distinctly from originating_user (schema-grounded)
+- **ASSUM-006** — build row remains visible as pending pickup after publish failure
 
-- **ASSUM-002** — Maximum reasoning-turn budget of 20 used in boundary Examples.
-  No ceiling is stated anywhere. Options: keep 20 as an illustrative upper
-  bound, raise or lower it, or remove the upper-bound boundary and treat the
-  value as unbounded.
+### Retired Assumptions
 
-- **ASSUM-005** — Cancelling operator recorded distinctly from originating
-  operator. Implied by the "synthetic ApprovalResponsePayload(responder=…)"
-  wording in API-cli §6.2 but not stated explicitly. If the intent is
-  single-operator only, this scenario can be simplified or removed.
-
-## Medium-Confidence Assumptions (Coach-review recommended)
-
-- ASSUM-001 — minimum reasoning-turn budget is 1
-- ASSUM-003 — feature_id rejects path-traversal sequences
-- ASSUM-004 — sequential-queue scope is per-project
-- ASSUM-006 — build row remains visible after publish failure
+- **ASSUM-002** (retired 2026-04-24) — the upper-bound reasoning-turn-budget ceiling
+  of 20 was an arbitrary choice with no basis in the CLI contract or forge.yaml
+  schema. The accept-boundary Scenario Outline no longer tests a ceiling; the
+  minimum (1) and default (5) are the only positive-side boundary values. The
+  reject-boundary scenario still covers zero / negative values.
 
 ## Integration with /feature-plan
 

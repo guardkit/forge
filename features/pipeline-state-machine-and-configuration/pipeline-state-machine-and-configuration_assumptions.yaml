@@ -4,8 +4,15 @@
 feature: "Pipeline State Machine and Configuration"
 feature_id: "FEAT-FORGE-001"
 generated: "2026-04-23T20:00:00Z"
+revised:   "2026-04-24"
 stack: "python"
-review_required: true
+review_required: false
+
+# Revision history
+# ----------------
+# 2026-04-24 — ASSUM-002 retired (no upper bound on reasoning-turn budget).
+#              ASSUM-005 promoted from low → medium (data model already carries
+#              originating_user and responder as distinct fields).
 
 assumptions:
   - id: "ASSUM-001"
@@ -13,13 +20,6 @@ assumptions:
     assumption: "The minimum reasoning-turn budget is 1"
     confidence: medium
     basis: "Domain convention — a zero-turn budget cannot perform any reasoning. Not stated explicitly in the forge.yaml schema or CLI contract."
-    human_response: "confirmed"
-
-  - id: "ASSUM-002"
-    scenario: "Reasoning-turn budget overrides are accepted within the permitted range"
-    assumption: "The maximum reasoning-turn budget used for boundary examples is 20"
-    confidence: low
-    basis: "Chosen as an illustrative upper bound; no ceiling is stated anywhere in the context files."
     human_response: "confirmed"
 
   - id: "ASSUM-003"
@@ -38,9 +38,9 @@ assumptions:
 
   - id: "ASSUM-005"
     scenario: "Cancelling a build records the cancelling operator even when different from the originator"
-    assumption: "The cancelling operator is recorded distinctly from the originating operator; originating_user is preserved unchanged; responder and reason are captured on the resolution record"
-    confidence: low
-    basis: "API-cli §6.2 describes cancellation as a synthetic ApprovalResponsePayload(responder=\"rich\", reason=\"cli cancel\"). The responder is captured in details_json.approval.response. Whether the originating_user field is preserved separately is implied but not stated explicitly."
+    assumption: "The cancelling operator is recorded distinctly from the originating operator; originating_user is preserved unchanged on the build record; responder and reason are captured on the approval-response resolution that cancellation is modelled as"
+    confidence: medium
+    basis: "Data model explicitly carries both fields as distinct columns: Build.originating_user (DM-build-lifecycle §1) and the responder field on the approval response (details_json.approval.response in DM-build-lifecycle §3). API-cli §6.2 describes cancellation as a synthetic ApprovalResponsePayload carrying a responder, confirming the schema supports the distinction even when not stated as an explicit requirement."
     human_response: "confirmed"
 
   - id: "ASSUM-006"
@@ -49,3 +49,8 @@ assumptions:
     confidence: medium
     basis: "API-cli §3.3 step 4 is explicit that the row is written before publishing. What happens if step 5 (publish) then fails is not stated. Alternatives considered: roll back the row; mark the row as publish-failed; keep as QUEUED."
     human_response: "confirmed"
+
+retired_assumptions:
+  - id: "ASSUM-002"
+    retired: "2026-04-24"
+    reason: "No upper bound on reasoning-turn budget is enforced. The accept-boundary Scenario Outline no longer tests an arbitrary ceiling; the default (5) and the minimum (1) are the only positive-side boundary values."
