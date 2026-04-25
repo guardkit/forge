@@ -6,6 +6,7 @@ layout (see ``forge.config.models``).
 """
 
 from .models import (
+    ApprovalConfig,
     FilesystemPermissions,
     FleetConfig,
     ForgeConfig,
@@ -14,6 +15,7 @@ from .models import (
 )
 
 __all__ = [
+    "ApprovalConfig",
     "FilesystemPermissions",
     "FleetConfig",
     "ForgeConfig",

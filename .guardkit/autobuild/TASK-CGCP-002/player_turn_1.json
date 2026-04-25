@@ -1,0 +1,143 @@
+{
+  "task_id": "TASK-CGCP-002",
+  "turn": 1,
+  "files_modified": [
+    "src/forge/config/models.py",
+    "src/forge/config/__init__.py",
+    "tests/test_forge_config.py"
+  ],
+  "files_created": [
+    "tests/test_approval_config.py"
+  ],
+  "tests_written": [
+    "tests/test_approval_config.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "42 tests passed in tests/test_approval_config.py + tests/test_forge_config.py (19 new approval tests + 23 existing forge_config tests, including the updated full round-trip test that now covers the new approval section). Ruff lint check + ruff format check both clean across all four touched files.",
+  "implementation_notes": "Added ApprovalConfig (Pydantic v2, extra='forbid') in src/forge/config/models.py with two int fields default_wait_seconds (default 300, ge=0) and max_wait_seconds (default 3600, ge=0), plus a model_validator(mode='after') that rejects default_wait_seconds > max_wait_seconds. Wired approval: ApprovalConfig = Field(default_factory=ApprovalConfig) onto ForgeConfig (mirrors the existing fleet/pipeline default_factory pattern). Added module-level constants DEFAULT_APPROVAL_WAIT_SECONDS / DEFAULT_APPROVAL_MAX_WAIT_SECONDS anchored to ASSUM-001/ASSUM-002 of the CGCP assumptions manifest. Documented the ASSUM-003 deferral inline on ApprovalConfig's docstring (ceiling fallback semantics \u2014 cancel/escalate/fail-open \u2014 explicitly out of scope; deferred to forge-pipeline-config). Updated module docstring to add the no-nats_core/nats-py/langgraph import boundary statement. Re-exported ApprovalConfig from forge.config.__init__. Module continues to import only pathlib, typing, and pydantic. Updated the pre-existing tests/test_forge_config.py round-trip test fixture to include the new approval section so it still passes after ForgeConfig grew the new field. Ruff format also normalised some pre-existing long lines in that test file as part of meeting AC-010.",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006",
+    "AC-007",
+    "AC-008",
+    "AC-009",
+    "AC-010"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "[ ] `ApprovalConfig` Pydantic v2 model defined with two non-negative integer fields:",
+      "status": "complete",
+      "evidence": "ApprovalConfig added to src/forge/config/models.py as a pydantic.BaseModel(extra='forbid') subclass declaring two int fields with ge=0. Verified by tests/test_approval_config.py::TestApprovalConfigShape (test_model_defines_default_wait_seconds, test_model_defines_max_wait_seconds, test_default_wait_seconds_is_int_typed, test_max_wait_seconds_is_int_typed) and AC-004 negative-rejection tests.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`default_wait_seconds: int = 300`  (ASSUM-001)",
+      "status": "complete",
+      "evidence": "default_wait_seconds: int = Field(default=DEFAULT_APPROVAL_WAIT_SECONDS, ge=0, ...) where DEFAULT_APPROVAL_WAIT_SECONDS = 300. Verified by tests/test_approval_config.py::TestApprovalConfigShape::test_default_wait_seconds_default_is_300.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`max_wait_seconds: int = 3600`  (ASSUM-002)",
+      "status": "complete",
+      "evidence": "max_wait_seconds: int = Field(default=DEFAULT_APPROVAL_MAX_WAIT_SECONDS, ge=0, ...) where DEFAULT_APPROVAL_MAX_WAIT_SECONDS = 3600. Verified by tests/test_approval_config.py::TestApprovalConfigShape::test_max_wait_seconds_default_is_3600.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "[ ] Validators reject negative values",
+      "status": "complete",
+      "evidence": "Both int fields use Field(ge=0, ...). Negative values raise pydantic.ValidationError. Verified by tests/test_approval_config.py::TestNegativeValuesRejected (test_negative_default_wait_rejected, test_negative_max_wait_rejected) plus the boundary test test_zero_default_wait_accepted confirming ge=0 (not gt=0).",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "[ ] Validator rejects `default_wait_seconds > max_wait_seconds`",
+      "status": "complete",
+      "evidence": "Added @model_validator(mode='after') _validate_default_not_above_max on ApprovalConfig that raises ValueError naming both fields when default_wait_seconds > max_wait_seconds. Verified by tests/test_approval_config.py::TestDefaultNotAboveMax (test_default_above_max_raises, test_default_equal_to_max_accepted, test_canonical_defaults_are_consistent).",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "[ ] `ForgeConfig` has an `approval: ApprovalConfig = Field(default_factory=ApprovalConfig)` field",
+      "status": "complete",
+      "evidence": "ForgeConfig.approval declared as `approval: ApprovalConfig = Field(default_factory=ApprovalConfig)` alongside existing fleet/pipeline default-factory fields. Verified by tests/test_approval_config.py::TestForgeConfigWiresApproval (test_forge_config_has_approval_field, test_minimal_yaml_gets_default_approval, test_default_factory_isolates_instances).",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "[ ] `forge.yaml` round-trips through `ForgeConfig.model_validate(...)` with new section",
+      "status": "complete",
+      "evidence": "Added two new round-trip tests covering the approval section: test_roundtrip_preserves_approval_section (approval-only) and test_full_roundtrip_with_all_sections (fleet + pipeline + approval + permissions). Both write a YAML file via yaml.safe_dump, reload via yaml.safe_load + ForgeConfig.model_validate, and assert model_dump(mode='json') equals the original. Also updated the pre-existing tests/test_forge_config.py::TestYamlRoundTrip::test_roundtrip_preserves_all_fields fixture to include the approval section so the existing full round-trip continues to pass.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py",
+        "tests/test_forge_config.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "[ ] Inline comment documents that ASSUM-003 (ceiling fallback semantics) is deferred to `forge-pipeline-config`",
+      "status": "complete",
+      "evidence": "ApprovalConfig docstring contains a dedicated 'Note (ASSUM-003 deferral)' paragraph stating that the terminal behaviour at max_wait_seconds (cancel / escalate / fail-open) is explicitly out of scope and deferred to forge-pipeline-config; max_wait_seconds field description repeats the deferral pointer. Verified by tests/test_approval_config.py::TestAssum003DeferralDocumented::test_docstring_mentions_assum_003_deferral.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "[ ] Module imports nothing from `nats_core`, `nats-py`, or `langgraph`",
+      "status": "complete",
+      "evidence": "src/forge/config/models.py imports only `pathlib.Path`, `typing.Any`, and `pydantic` (BaseModel, ConfigDict, Field, field_validator, model_validator). Module docstring records the boundary rule explicitly. Verified by tests/test_approval_config.py::TestNoForbiddenImports::test_module_source_does_not_import_forbidden_packages, which scans the module source for any `import` / `from` statement targeting nats_core, nats_py, nats-py, or langgraph.",
+      "test_file": "tests/test_approval_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "[ ] All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran `ruff check` and `ruff format --check` on all four touched files (src/forge/config/models.py, src/forge/config/__init__.py, tests/test_approval_config.py, tests/test_forge_config.py). Both commands report zero errors / 'All checks passed!' / '4 files already formatted'.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py",
+        "tests/test_approval_config.py",
+        "tests/test_forge_config.py"
+      ]
+    }
+  ],
+  "success": true
+}

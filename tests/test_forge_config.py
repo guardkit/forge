@@ -93,7 +93,10 @@ class TestDefaultsMatchAssumptions:
         expected = list(DEFAULT_APPROVED_ORIGINATORS)
         assert PipelineConfig().approved_originators == expected
         # default_factory must hand out a fresh list to each instance
-        assert PipelineConfig().approved_originators is not PipelineConfig().approved_originators
+        assert (
+            PipelineConfig().approved_originators
+            is not PipelineConfig().approved_originators
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +170,9 @@ class TestAllowlistRejectsRelativePaths:
             )
 
     def test_absolute_path_accepted(self) -> None:
-        cfg = FilesystemPermissions.model_validate({"allowlist": ["/srv/forge", "/var/builds"]})
+        cfg = FilesystemPermissions.model_validate(
+            {"allowlist": ["/srv/forge", "/var/builds"]}
+        )
         assert cfg.allowlist == [Path("/srv/forge"), Path("/var/builds")]
 
 
@@ -191,6 +196,10 @@ class TestYamlRoundTrip:
                 "progress_interval_seconds": 90,
                 "build_queue_subject": "pipeline.build-queued.team-a",
                 "approved_originators": ["terminal", "slack"],
+            },
+            "approval": {
+                "default_wait_seconds": 300,
+                "max_wait_seconds": 3600,
             },
             "permissions": {
                 "filesystem": {
@@ -233,9 +242,12 @@ class TestMissingAllowlistMessage:
 
         errors = exc_info.value.errors()
         assert any(
-            err["type"] == "missing" and err["loc"] == ("permissions", "filesystem", "allowlist")
+            err["type"] == "missing"
+            and err["loc"] == ("permissions", "filesystem", "allowlist")
             for err in errors
-        ), f"Expected a 'missing' error on permissions.filesystem.allowlist; got {errors!r}"
+        ), (
+            f"Expected a 'missing' error on permissions.filesystem.allowlist; got {errors!r}"
+        )
 
     def test_missing_filesystem_block_error_is_clear(self) -> None:
         with pytest.raises(ValidationError) as exc_info:

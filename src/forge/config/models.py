@@ -10,8 +10,22 @@ manifest (see ``features/nats-fleet-integration/nats-fleet-integration_assumptio
 - ASSUM-004: ``FleetConfig.intent_min_confidence`` = 0.7
 - ASSUM-005: ``PipelineConfig.progress_interval_seconds`` = 60
 
-Downstream consumers (TASK-NFI-004/005/007) import these models from
-``forge.config`` and must not duplicate any of the defaults.
+This module is also the declarative producer for the
+Confidence-Gated Checkpoint Protocol feature (FEAT-FORGE-004) — see the
+``ApprovalConfig`` model below, whose defaults are anchored to that
+feature's assumptions manifest
+(``features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol_assumptions.yaml``):
+
+- ASSUM-001 (CGCP): ``ApprovalConfig.default_wait_seconds`` = 300
+- ASSUM-002 (CGCP): ``ApprovalConfig.max_wait_seconds`` = 3600
+
+Downstream consumers (TASK-NFI-004/005/007, TASK-CGCP-006/007/010) import
+these models from ``forge.config`` and must not duplicate any of the
+defaults.
+
+Per the project boundary rules for ``forge.config.models``, this module
+must not import from ``nats_core``, ``nats-py``, or ``langgraph``: it is a
+pure declarative schema layer.
 """
 
 from __future__ import annotations
@@ -19,7 +33,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Default values (anchored to ASSUM-001..005)
@@ -56,6 +70,17 @@ DEFAULT_APPROVED_ORIGINATORS: tuple[str, ...] = (
     "dashboard",
     "cli-wrapper",
 )
+
+#: ASSUM-001 (CGCP / FEAT-FORGE-004) — initial wait time published on an
+#: approval request when the caller does not specify one (seconds). Anchored
+#: to ``API-nats-approval-protocol §3.1`` (``timeout_seconds`` default = 300).
+DEFAULT_APPROVAL_WAIT_SECONDS = 300
+
+#: ASSUM-002 (CGCP / FEAT-FORGE-004) — ceiling on the *total* approval wait
+#: a paused build may accumulate by refreshing its wait. Anchored to
+#: ``API-nats-approval-protocol §7`` ("refresh up to
+#: forge.yaml.approval.max_wait_seconds ≈ 3600").
+DEFAULT_APPROVAL_MAX_WAIT_SECONDS = 3600
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +145,64 @@ class PipelineConfig(BaseModel):
             "events from any other originator are rejected."
         ),
     )
+
+
+class ApprovalConfig(BaseModel):
+    """Configuration for the approval / pause-resume protocol (FEAT-FORGE-004).
+
+    Defaults are pinned to ASSUM-001 / ASSUM-002 of the
+    Confidence-Gated Checkpoint Protocol assumptions manifest. Operators may
+    override either field in ``forge.yaml`` but the defaults must continue to
+    match the assumptions manifest so this in-memory schema stays the
+    canonical source of truth for both the publisher (TASK-CGCP-006) and the
+    state machine (TASK-CGCP-010).
+
+    Note (ASSUM-003 deferral): The terminal behaviour applied when an
+    approval pause reaches ``max_wait_seconds`` without a response —
+    cancel / escalate / fail-open — is **explicitly out of scope** for this
+    model and is deferred to the ``forge-pipeline-config`` feature. Do not
+    add a ceiling-fallback field here; that decision belongs with the
+    state-machine configuration, not with the wait-time settings.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_wait_seconds: int = Field(
+        default=DEFAULT_APPROVAL_WAIT_SECONDS,
+        ge=0,
+        description=(
+            "ASSUM-001 (CGCP) — initial wait time published on an approval "
+            "request when the caller does not specify one. Must be "
+            "non-negative and not exceed ``max_wait_seconds``."
+        ),
+    )
+    max_wait_seconds: int = Field(
+        default=DEFAULT_APPROVAL_MAX_WAIT_SECONDS,
+        ge=0,
+        description=(
+            "ASSUM-002 (CGCP) — ceiling on the *total* approval wait a "
+            "paused build may accumulate by refreshing. Behaviour at the "
+            "ceiling (ASSUM-003) is deferred to ``forge-pipeline-config``."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_default_not_above_max(self) -> ApprovalConfig:
+        """Reject configurations where ``default_wait_seconds`` exceeds
+        ``max_wait_seconds``.
+
+        A default initial wait that is already larger than the configured
+        ceiling can never refresh meaningfully — the very first publish would
+        already be over budget. We surface this at config-load time rather
+        than letting the publisher (TASK-CGCP-006) discover it at runtime.
+        """
+        if self.default_wait_seconds > self.max_wait_seconds:
+            raise ValueError(
+                "approval.default_wait_seconds "
+                f"({self.default_wait_seconds}) must not exceed "
+                f"approval.max_wait_seconds ({self.max_wait_seconds})"
+            )
+        return self
 
 
 class FilesystemPermissions(BaseModel):
@@ -187,6 +270,7 @@ class ForgeConfig(BaseModel):
 
     fleet: FleetConfig = Field(default_factory=FleetConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -197,6 +281,8 @@ class ForgeConfig(BaseModel):
 
 
 __all__ = [
+    "DEFAULT_APPROVAL_MAX_WAIT_SECONDS",
+    "DEFAULT_APPROVAL_WAIT_SECONDS",
     "DEFAULT_APPROVED_ORIGINATORS",
     "DEFAULT_BUILD_QUEUE_SUBJECT",
     "DEFAULT_CACHE_TTL_SECONDS",
@@ -204,6 +290,7 @@ __all__ = [
     "DEFAULT_INTENT_MIN_CONFIDENCE",
     "DEFAULT_PROGRESS_INTERVAL_SECONDS",
     "DEFAULT_STALE_HEARTBEAT_SECONDS",
+    "ApprovalConfig",
     "FilesystemPermissions",
     "FleetConfig",
     "ForgeConfig",
