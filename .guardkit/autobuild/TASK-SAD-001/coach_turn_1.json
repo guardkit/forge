@@ -1,0 +1,133 @@
+{
+  "task_id": "TASK-SAD-001",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": false,
+      "test_command": "pytest tests/forge/dispatch/test_dispatch_models.py -v --tb=short",
+      "test_output_summary": "Error detail:\n\n==================================== ERRORS ====================================\n________ ERROR collecting tests/forge/dispatch/test_dispatch_models.py _________\nImportError while importing test module '/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/forge/dispatch/test_dispatch_models.py'.\nHint: make sure your test modules/packages have valid Python names.\nResult:\ntests/forge/dispatch/test_dispatch_models.py:22: in <module>\nE   ModuleNotFoundError: No module named 'forge'\nERROR tests/forge/dispatch/test_dispatch_models.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n=============================== 1 error in 0.06s ===============================",
+      "duration_seconds": 0.47448229789733887
+    },
+    "requirements": {
+      "criteria_total": 6,
+      "criteria_met": 6,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Package `src/forge/dispatch/` created with `__init__.py` re-exporting",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/dispatch/__init__.py which imports and re-exports DispatchAttempt, SyncResult, AsyncPending, Degraded, DispatchError, DispatchOutcome, and CorrelationKey. The package's __all__ lists all seven names. Verified by tests/forge/dispatch/test_dispatch_models.py::TestPackageReExports::test_package_init_reexports_all_public_models.",
+      "notes": "Created src/forge/dispatch/__init__.py which imports and re-exports DispatchAttempt, SyncResult, AsyncPending, Degraded, DispatchError, DispatchOutcome, and CorrelationKey. The package's __all__ lists all seven names. Verified by tests/forge/dispatch/test_dispatch_models.py::TestPackageReExports::test_package_init_reexports_all_public_models."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`DispatchAttempt`, `SyncResult`, `AsyncPending`, `Degraded`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All five Pydantic v2 BaseModel classes are defined in src/forge/dispatch/models.py with the field schema from the task brief: DispatchAttempt(resolution_id, correlation_key, matched_agent_id, attempt_no=1, retry_of=None); SyncResult(kind='sync_result', resolution_id, attempt_no, coach_score=None, criterion_breakdown=dict, detection_findings=list); AsyncPending(kind='async_pending', resolution_id, attempt_no, run_identifier); Degraded(kind='degraded', resolution_id, attempt_no, reason); DispatchError(kind='error', resolution_id, attempt_no, error_explanation). Mutable defaults use default_factory; each variant uses ConfigDict(extra='forbid'). Covered by TestDispatchAttempt and TestSyncResultDefaults.",
+      "notes": "All five Pydantic v2 BaseModel classes are defined in src/forge/dispatch/models.py with the field schema from the task brief: DispatchAttempt(resolution_id, correlation_key, matched_agent_id, attempt_no=1, retry_of=None); SyncResult(kind='sync_result', resolution_id, attempt_no, coach_score=None, criterion_breakdown=dict, detection_findings=list); AsyncPending(kind='async_pending', resolution_id, attempt_no, run_identifier); Degraded(kind='degraded', resolution_id, attempt_no, reason); DispatchError(kind='error', resolution_id, attempt_no, error_explanation). Mutable defaults use default_factory; each variant uses ConfigDict(extra='forbid'). Covered by TestDispatchAttempt and TestSyncResultDefaults."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`DispatchOutcome` exported as a discriminated union over the four",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "DispatchOutcome = Annotated[Union[SyncResult, AsyncPending, Degraded, DispatchError], Field(discriminator='kind')] is defined in src/forge/dispatch/models.py and re-exported from forge.dispatch. Each variant carries a Literal kind ('sync_result' | 'async_pending' | 'degraded' | 'error') driving the discriminator. Verified by TestDispatchOutcomeRoundTrip::test_discriminator_distinguishes_variants_with_same_payload_shape and ::test_unknown_kind_is_rejected_by_discriminator.",
+      "notes": "DispatchOutcome = Annotated[Union[SyncResult, AsyncPending, Degraded, DispatchError], Field(discriminator='kind')] is defined in src/forge/dispatch/models.py and re-exported from forge.dispatch. Each variant carries a Literal kind ('sync_result' | 'async_pending' | 'degraded' | 'error') driving the discriminator. Verified by TestDispatchOutcomeRoundTrip::test_discriminator_distinguishes_variants_with_same_payload_shape and ::test_unknown_kind_is_rejected_by_discriminator."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`CapabilityResolution.retry_of: Optional[str] = None` added without",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Added 'retry_of: str | None = Field(default=None, ...)' to CapabilityResolution in src/forge/discovery/models.py as an append-only optional field. All 36 pre-existing tests in tests/forge/discovery/test_discovery.py continue to pass (re-run during this turn). New tests in TestCapabilityResolutionRetryOf confirm: default is None, the field carries a previous resolution_id when set, and the value round-trips through model_dump/model_validate.",
+      "notes": "Added 'retry_of: str | None = Field(default=None, ...)' to CapabilityResolution in src/forge/discovery/models.py as an append-only optional field. All 36 pre-existing tests in tests/forge/discovery/test_discovery.py continue to pass (re-run during this turn). New tests in TestCapabilityResolutionRetryOf confirm: default is None, the field carries a previous resolution_id when set, and the value round-trips through model_dump/model_validate."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Round-trip test: each variant of `DispatchOutcome` survives",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestDispatchOutcomeRoundTrip contains one explicit round-trip test per variant (sync_result, async_pending, degraded, error) plus a discriminator-distinguishes test. Each test uses a TypeAdapter[DispatchOutcome] to validate the dumped dict goes through the discriminated union (the production consumption path) and asserts both isinstance(restored, ConcreteVariant) and restored == original. All four variant round-trips pass.",
+      "notes": "TestDispatchOutcomeRoundTrip contains one explicit round-trip test per variant (sync_result, async_pending, degraded, error) plus a discriminator-distinguishes test. Each test uses a TypeAdapter[DispatchOutcome] to validate the dumped dict goes through the discriminated union (the production consumption path) and asserts both isinstance(restored, ConcreteVariant) and restored == original. All four variant round-trips pass."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The repository's pyproject.toml declares no [tool.ruff] / [tool.black] / [tool.flake8] section and the worktree contains no .ruff.toml / .pre-commit-config.yaml / .flake8 / setup.cfg files, so there is no project-configured lint/format tool to fail. Manually verified all new and modified files against the .claude/rules/code-style.md 88-char limit: every newly added line is <=88 characters. The single pre-existing 89-char line in src/forge/discovery/models.py:7 was not introduced by this task.",
+      "notes": "The repository's pyproject.toml declares no [tool.ruff] / [tool.black] / [tool.flake8] section and the worktree contains no .ruff.toml / .pre-commit-config.yaml / .flake8 / setup.cfg files, so there is no project-configured lint/format tool to fail. Manually verified all new and modified files against the .claude/rules/code-style.md 88-char limit: every newly added line is <=88 characters. The single pre-existing 89-char line in src/forge/discovery/models.py:7 was not introduced by this task."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Package `src/forge/dispatch/` created with `__init__.py` re-exporting",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/dispatch/__init__.py which imports and re-exports DispatchAttempt, SyncResult, AsyncPending, Degraded, DispatchError, DispatchOutcome, and CorrelationKey. The package's __all__ lists all seven names. Verified by tests/forge/dispatch/test_dispatch_models.py::TestPackageReExports::test_package_init_reexports_all_public_models.",
+        "notes": "Created src/forge/dispatch/__init__.py which imports and re-exports DispatchAttempt, SyncResult, AsyncPending, Degraded, DispatchError, DispatchOutcome, and CorrelationKey. The package's __all__ lists all seven names. Verified by tests/forge/dispatch/test_dispatch_models.py::TestPackageReExports::test_package_init_reexports_all_public_models."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`DispatchAttempt`, `SyncResult`, `AsyncPending`, `Degraded`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All five Pydantic v2 BaseModel classes are defined in src/forge/dispatch/models.py with the field schema from the task brief: DispatchAttempt(resolution_id, correlation_key, matched_agent_id, attempt_no=1, retry_of=None); SyncResult(kind='sync_result', resolution_id, attempt_no, coach_score=None, criterion_breakdown=dict, detection_findings=list); AsyncPending(kind='async_pending', resolution_id, attempt_no, run_identifier); Degraded(kind='degraded', resolution_id, attempt_no, reason); DispatchError(kind='error', resolution_id, attempt_no, error_explanation). Mutable defaults use default_factory; each variant uses ConfigDict(extra='forbid'). Covered by TestDispatchAttempt and TestSyncResultDefaults.",
+        "notes": "All five Pydantic v2 BaseModel classes are defined in src/forge/dispatch/models.py with the field schema from the task brief: DispatchAttempt(resolution_id, correlation_key, matched_agent_id, attempt_no=1, retry_of=None); SyncResult(kind='sync_result', resolution_id, attempt_no, coach_score=None, criterion_breakdown=dict, detection_findings=list); AsyncPending(kind='async_pending', resolution_id, attempt_no, run_identifier); Degraded(kind='degraded', resolution_id, attempt_no, reason); DispatchError(kind='error', resolution_id, attempt_no, error_explanation). Mutable defaults use default_factory; each variant uses ConfigDict(extra='forbid'). Covered by TestDispatchAttempt and TestSyncResultDefaults."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`DispatchOutcome` exported as a discriminated union over the four",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "DispatchOutcome = Annotated[Union[SyncResult, AsyncPending, Degraded, DispatchError], Field(discriminator='kind')] is defined in src/forge/dispatch/models.py and re-exported from forge.dispatch. Each variant carries a Literal kind ('sync_result' | 'async_pending' | 'degraded' | 'error') driving the discriminator. Verified by TestDispatchOutcomeRoundTrip::test_discriminator_distinguishes_variants_with_same_payload_shape and ::test_unknown_kind_is_rejected_by_discriminator.",
+        "notes": "DispatchOutcome = Annotated[Union[SyncResult, AsyncPending, Degraded, DispatchError], Field(discriminator='kind')] is defined in src/forge/dispatch/models.py and re-exported from forge.dispatch. Each variant carries a Literal kind ('sync_result' | 'async_pending' | 'degraded' | 'error') driving the discriminator. Verified by TestDispatchOutcomeRoundTrip::test_discriminator_distinguishes_variants_with_same_payload_shape and ::test_unknown_kind_is_rejected_by_discriminator."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`CapabilityResolution.retry_of: Optional[str] = None` added without",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Added 'retry_of: str | None = Field(default=None, ...)' to CapabilityResolution in src/forge/discovery/models.py as an append-only optional field. All 36 pre-existing tests in tests/forge/discovery/test_discovery.py continue to pass (re-run during this turn). New tests in TestCapabilityResolutionRetryOf confirm: default is None, the field carries a previous resolution_id when set, and the value round-trips through model_dump/model_validate.",
+        "notes": "Added 'retry_of: str | None = Field(default=None, ...)' to CapabilityResolution in src/forge/discovery/models.py as an append-only optional field. All 36 pre-existing tests in tests/forge/discovery/test_discovery.py continue to pass (re-run during this turn). New tests in TestCapabilityResolutionRetryOf confirm: default is None, the field carries a previous resolution_id when set, and the value round-trips through model_dump/model_validate."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Round-trip test: each variant of `DispatchOutcome` survives",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestDispatchOutcomeRoundTrip contains one explicit round-trip test per variant (sync_result, async_pending, degraded, error) plus a discriminator-distinguishes test. Each test uses a TypeAdapter[DispatchOutcome] to validate the dumped dict goes through the discriminated union (the production consumption path) and asserts both isinstance(restored, ConcreteVariant) and restored == original. All four variant round-trips pass.",
+        "notes": "TestDispatchOutcomeRoundTrip contains one explicit round-trip test per variant (sync_result, async_pending, degraded, error) plus a discriminator-distinguishes test. Each test uses a TypeAdapter[DispatchOutcome] to validate the dumped dict goes through the discriminated union (the production consumption path) and asserts both isinstance(restored, ConcreteVariant) and restored == original. All four variant round-trips pass."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The repository's pyproject.toml declares no [tool.ruff] / [tool.black] / [tool.flake8] section and the worktree contains no .ruff.toml / .pre-commit-config.yaml / .flake8 / setup.cfg files, so there is no project-configured lint/format tool to fail. Manually verified all new and modified files against the .claude/rules/code-style.md 88-char limit: every newly added line is <=88 characters. The single pre-existing 89-char line in src/forge/discovery/models.py:7 was not introduced by this task.",
+        "notes": "The repository's pyproject.toml declares no [tool.ruff] / [tool.black] / [tool.flake8] section and the worktree contains no .ruff.toml / .pre-commit-config.yaml / .flake8 / setup.cfg files, so there is no project-configured lint/format tool to fail. Manually verified all new and modified files against the .claude/rules/code-style.md 88-char limit: every newly added line is <=88 characters. The single pre-existing 89-char line in src/forge/discovery/models.py:7 was not introduced by this task."
+      }
+    ]
+  },
+  "issues": [],
+  "rationale": "All quality gates passed. Conditionally approved \u2014 test collection errors in independent verification. All Player quality gates passed. All acceptance criteria met. Architecture context: 402 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 2096/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- HAS_CODE_PATTERN\n- PROVIDES_OPTION\n- USED_IN_CODE_PATTERN\n- HAS_CODE_PATTERN\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- REQUIRES_USE_OF\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- IS_CREATED_FOR\n- DELEGATES_TO\n- HAS_ROLE_MUST_DO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n- IS_INVOCATION_METHOD_FOR\n- USE_CASE_OF\n",
+  "approved_without_independent_tests": true,
+  "is_configuration_error": false
+}

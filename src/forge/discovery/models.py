@@ -149,6 +149,15 @@ class CapabilityResolution(BaseModel):
         description="True once the ResultPayload has been linked back",
     )
 
+    # Append-only field added by TASK-SAD-001. Records the resolution_id of
+    # the previous attempt when this resolution is a retry; ``None`` for the
+    # initial attempt. Optional and defaulted so existing FEAT-FORGE-002
+    # callers continue to construct CapabilityResolution unchanged.
+    retry_of: str | None = Field(
+        default=None,
+        description="resolution_id of the previous attempt, or None on the first try",
+    )
+
     @model_validator(mode="after")
     def _check_unresolved_invariant(self) -> CapabilityResolution:
         """Enforce DM-discovery §7: matched_agent_id ⇔ match_source.
