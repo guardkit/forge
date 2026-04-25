@@ -1,0 +1,165 @@
+{
+  "task_id": "TASK-NFI-002",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/fleet/test_manifest.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/fleet/test_manifest.py::TestForgeManifestSecretFree::test_no_secret_substrings[token] PASSED [ 88%]\ntests/forge/fleet/test_manifest.py::TestForgeManifestSecretFree::test_no_secret_substrings[password] PASSED [ 92%]\ntests/forge/fleet/test_manifest.py::TestForgeManifestSecretFree::test_no_secret_substrings[secret] PASSED [ 96%]\ntests/forge/fleet/test_manifest.py::TestForgeManifestSecretFree::test_no_secret_substrings[credential] PASSED [100%]\n============================== 26 passed in 0.11s ==============================",
+      "duration_seconds": 0.5469465255737305
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`src/forge/fleet/manifest.py` exports a module-level `FORGE_MANIFEST` constant",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/fleet/manifest.py defining FORGE_MANIFEST: AgentManifest = AgentManifest(...) at module level and listing it in __all__. TestForgeManifestExport::test_module_exports_constant asserts hasattr(manifest_module, 'FORGE_MANIFEST').",
+      "notes": "Created src/forge/fleet/manifest.py defining FORGE_MANIFEST: AgentManifest = AgentManifest(...) at module level and listing it in __all__. TestForgeManifestExport::test_module_exports_constant asserts hasattr(manifest_module, 'FORGE_MANIFEST')."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Type is `nats_core.manifest.AgentManifest` (imported, not redeclared)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "manifest.py imports AgentManifest, IntentCapability, ToolCapability directly from nats_core.manifest with no local subclass or rebinding. TestForgeManifestType asserts isinstance(FORGE_MANIFEST, AgentManifest) AND type(FORGE_MANIFEST) is AgentManifest (the class object identity must match the one exported by nats_core).",
+      "notes": "manifest.py imports AgentManifest, IntentCapability, ToolCapability directly from nats_core.manifest with no local subclass or rebinding. TestForgeManifestType asserts isinstance(FORGE_MANIFEST, AgentManifest) AND type(FORGE_MANIFEST) is AgentManifest (the class object identity must match the one exported by nats_core)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`agent_id == \"forge\"`, `trust_tier == \"core\"`, `max_concurrent == 1`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FORGE_MANIFEST sets agent_id='forge', trust_tier='core', max_concurrent=1 verbatim. TestForgeManifestIdentity has one test per field plus a supplemental test asserting name='Forge', template='deepagents-pipeline-orchestrator', version='0.1.0', status='ready'.",
+      "notes": "FORGE_MANIFEST sets agent_id='forge', trust_tier='core', max_concurrent=1 verbatim. TestForgeManifestIdentity has one test per field plus a supplemental test asserting name='Forge', template='deepagents-pipeline-orchestrator', version='0.1.0', status='ready'."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Three `IntentCapability` entries (build.* / pipeline.* / feature.*) match \u00a72.1 verbatim",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "manifest.py declares exactly three IntentCapability entries with patterns build.* (signals=['build','develop','implement','create','make','ship'], confidence=0.90), pipeline.* (signals=['pipeline','stages','progress','status','deploy'], confidence=0.85), and feature.* (signals=['feature','add feature','new capability','requirement'], confidence=0.80) \u2014 each with the descriptions copied verbatim from \u00a72.1. TestForgeManifestIntents has one test per intent verifying pattern, signals list, confidence (pytest.approx), and description string.",
+      "notes": "manifest.py declares exactly three IntentCapability entries with patterns build.* (signals=['build','develop','implement','create','make','ship'], confidence=0.90), pipeline.* (signals=['pipeline','stages','progress','status','deploy'], confidence=0.85), and feature.* (signals=['feature','add feature','new capability','requirement'], confidence=0.80) \u2014 each with the descriptions copied verbatim from \u00a72.1. TestForgeManifestIntents has one test per intent verifying pattern, signals list, confidence (pytest.approx), and description string."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Five `ToolCapability` entries (forge_greenfield, forge_feature, forge_review_fix, forge_status, forge_cancel) match \u00a72.1 verbatim",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "manifest.py declares exactly five ToolCapability entries with names forge_greenfield (mutating, async, requires_approval=False, parameters require repo+feature_yaml_path with branch default 'main'), forge_feature (mutating, async, repo+feature_id), forge_review_fix (mutating, async, repo+subject), forge_status (read_only, optional pipeline_id), forge_cancel (mutating, pipeline_id required, optional reason). All returns strings copied verbatim. TestForgeManifestTools has test_five_tools, test_tool_names (set comparison), and one test per tool comparing parameters dict, returns string, risk_level, async_mode, requires_approval, and description.",
+      "notes": "manifest.py declares exactly five ToolCapability entries with names forge_greenfield (mutating, async, requires_approval=False, parameters require repo+feature_yaml_path with branch default 'main'), forge_feature (mutating, async, repo+feature_id), forge_review_fix (mutating, async, repo+subject), forge_status (read_only, optional pipeline_id), forge_cancel (mutating, pipeline_id required, optional reason). All returns strings copied verbatim. TestForgeManifestTools has test_five_tools, test_tool_names (set comparison), and one test per tool comparing parameters dict, returns string, risk_level, async_mode, requires_approval, and description."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`required_permissions` matches \u00a72.1 verbatim",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FORGE_MANIFEST.required_permissions is set to ['graphiti:read','graphiti:write','filesystem:read','filesystem:write','shell:execute','nats:publish','nats:subscribe','network:github.com'] in declaration order matching \u00a72.1. TestForgeManifestPermissions::test_required_permissions asserts equality with the full list (order-sensitive).",
+      "notes": "FORGE_MANIFEST.required_permissions is set to ['graphiti:read','graphiti:write','filesystem:read','filesystem:write','shell:execute','nats:publish','nats:subscribe','network:github.com'] in declaration order matching \u00a72.1. TestForgeManifestPermissions::test_required_permissions asserts equality with the full list (order-sensitive)."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Secret-free**: `FORGE_MANIFEST.model_dump_json()` contains none of `\"api_key\"`, `\"token\"`, `\"password\"`, `\"secret\"`, `\"credential\"` (case-insensitive) \u2014 asserted by unit test",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestForgeManifestSecretFree::test_no_secret_substrings is parametrised over the five forbidden needles ['api_key','token','password','secret','credential'] and asserts re.search(needle, FORGE_MANIFEST.model_dump_json(), flags=re.IGNORECASE) is None. All five parametrised cases pass against the current manifest.",
+      "notes": "TestForgeManifestSecretFree::test_no_secret_substrings is parametrised over the five forbidden needles ['api_key','token','password','secret','credential'] and asserts re.search(needle, FORGE_MANIFEST.model_dump_json(), flags=re.IGNORECASE) is None. All five parametrised cases pass against the current manifest."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Import path `from forge.fleet.manifest import FORGE_MANIFEST` resolves",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "src/forge/fleet/__init__.py and src/forge/fleet/manifest.py exist; package is discoverable via the existing setuptools src layout (where=['src']). TestForgeManifestExport::test_import_path_resolves directly imports `from forge.fleet.manifest import FORGE_MANIFEST` and a supplemental test_package_reexport imports from the package root. Both pass under pytest.",
+      "notes": "src/forge/fleet/__init__.py and src/forge/fleet/manifest.py exist; package is discoverable via the existing setuptools src layout (where=['src']). TestForgeManifestExport::test_import_path_resolves directly imports `from forge.fleet.manifest import FORGE_MANIFEST` and a supplemental test_package_reexport imports from the package root. Both pass under pytest."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`src/forge/fleet/manifest.py` exports a module-level `FORGE_MANIFEST` constant",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/fleet/manifest.py defining FORGE_MANIFEST: AgentManifest = AgentManifest(...) at module level and listing it in __all__. TestForgeManifestExport::test_module_exports_constant asserts hasattr(manifest_module, 'FORGE_MANIFEST').",
+        "notes": "Created src/forge/fleet/manifest.py defining FORGE_MANIFEST: AgentManifest = AgentManifest(...) at module level and listing it in __all__. TestForgeManifestExport::test_module_exports_constant asserts hasattr(manifest_module, 'FORGE_MANIFEST')."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Type is `nats_core.manifest.AgentManifest` (imported, not redeclared)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "manifest.py imports AgentManifest, IntentCapability, ToolCapability directly from nats_core.manifest with no local subclass or rebinding. TestForgeManifestType asserts isinstance(FORGE_MANIFEST, AgentManifest) AND type(FORGE_MANIFEST) is AgentManifest (the class object identity must match the one exported by nats_core).",
+        "notes": "manifest.py imports AgentManifest, IntentCapability, ToolCapability directly from nats_core.manifest with no local subclass or rebinding. TestForgeManifestType asserts isinstance(FORGE_MANIFEST, AgentManifest) AND type(FORGE_MANIFEST) is AgentManifest (the class object identity must match the one exported by nats_core)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`agent_id == \"forge\"`, `trust_tier == \"core\"`, `max_concurrent == 1`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FORGE_MANIFEST sets agent_id='forge', trust_tier='core', max_concurrent=1 verbatim. TestForgeManifestIdentity has one test per field plus a supplemental test asserting name='Forge', template='deepagents-pipeline-orchestrator', version='0.1.0', status='ready'.",
+        "notes": "FORGE_MANIFEST sets agent_id='forge', trust_tier='core', max_concurrent=1 verbatim. TestForgeManifestIdentity has one test per field plus a supplemental test asserting name='Forge', template='deepagents-pipeline-orchestrator', version='0.1.0', status='ready'."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Three `IntentCapability` entries (build.* / pipeline.* / feature.*) match \u00a72.1 verbatim",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "manifest.py declares exactly three IntentCapability entries with patterns build.* (signals=['build','develop','implement','create','make','ship'], confidence=0.90), pipeline.* (signals=['pipeline','stages','progress','status','deploy'], confidence=0.85), and feature.* (signals=['feature','add feature','new capability','requirement'], confidence=0.80) \u2014 each with the descriptions copied verbatim from \u00a72.1. TestForgeManifestIntents has one test per intent verifying pattern, signals list, confidence (pytest.approx), and description string.",
+        "notes": "manifest.py declares exactly three IntentCapability entries with patterns build.* (signals=['build','develop','implement','create','make','ship'], confidence=0.90), pipeline.* (signals=['pipeline','stages','progress','status','deploy'], confidence=0.85), and feature.* (signals=['feature','add feature','new capability','requirement'], confidence=0.80) \u2014 each with the descriptions copied verbatim from \u00a72.1. TestForgeManifestIntents has one test per intent verifying pattern, signals list, confidence (pytest.approx), and description string."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Five `ToolCapability` entries (forge_greenfield, forge_feature, forge_review_fix, forge_status, forge_cancel) match \u00a72.1 verbatim",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "manifest.py declares exactly five ToolCapability entries with names forge_greenfield (mutating, async, requires_approval=False, parameters require repo+feature_yaml_path with branch default 'main'), forge_feature (mutating, async, repo+feature_id), forge_review_fix (mutating, async, repo+subject), forge_status (read_only, optional pipeline_id), forge_cancel (mutating, pipeline_id required, optional reason). All returns strings copied verbatim. TestForgeManifestTools has test_five_tools, test_tool_names (set comparison), and one test per tool comparing parameters dict, returns string, risk_level, async_mode, requires_approval, and description.",
+        "notes": "manifest.py declares exactly five ToolCapability entries with names forge_greenfield (mutating, async, requires_approval=False, parameters require repo+feature_yaml_path with branch default 'main'), forge_feature (mutating, async, repo+feature_id), forge_review_fix (mutating, async, repo+subject), forge_status (read_only, optional pipeline_id), forge_cancel (mutating, pipeline_id required, optional reason). All returns strings copied verbatim. TestForgeManifestTools has test_five_tools, test_tool_names (set comparison), and one test per tool comparing parameters dict, returns string, risk_level, async_mode, requires_approval, and description."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`required_permissions` matches \u00a72.1 verbatim",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FORGE_MANIFEST.required_permissions is set to ['graphiti:read','graphiti:write','filesystem:read','filesystem:write','shell:execute','nats:publish','nats:subscribe','network:github.com'] in declaration order matching \u00a72.1. TestForgeManifestPermissions::test_required_permissions asserts equality with the full list (order-sensitive).",
+        "notes": "FORGE_MANIFEST.required_permissions is set to ['graphiti:read','graphiti:write','filesystem:read','filesystem:write','shell:execute','nats:publish','nats:subscribe','network:github.com'] in declaration order matching \u00a72.1. TestForgeManifestPermissions::test_required_permissions asserts equality with the full list (order-sensitive)."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Secret-free**: `FORGE_MANIFEST.model_dump_json()` contains none of `\"api_key\"`, `\"token\"`, `\"password\"`, `\"secret\"`, `\"credential\"` (case-insensitive) \u2014 asserted by unit test",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestForgeManifestSecretFree::test_no_secret_substrings is parametrised over the five forbidden needles ['api_key','token','password','secret','credential'] and asserts re.search(needle, FORGE_MANIFEST.model_dump_json(), flags=re.IGNORECASE) is None. All five parametrised cases pass against the current manifest.",
+        "notes": "TestForgeManifestSecretFree::test_no_secret_substrings is parametrised over the five forbidden needles ['api_key','token','password','secret','credential'] and asserts re.search(needle, FORGE_MANIFEST.model_dump_json(), flags=re.IGNORECASE) is None. All five parametrised cases pass against the current manifest."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Import path `from forge.fleet.manifest import FORGE_MANIFEST` resolves",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "src/forge/fleet/__init__.py and src/forge/fleet/manifest.py exist; package is discoverable via the existing setuptools src layout (where=['src']). TestForgeManifestExport::test_import_path_resolves directly imports `from forge.fleet.manifest import FORGE_MANIFEST` and a supplemental test_package_reexport imports from the package root. Both pass under pytest.",
+        "notes": "src/forge/fleet/__init__.py and src/forge/fleet/manifest.py exist; package is discoverable via the existing setuptools src layout (where=['src']). TestForgeManifestExport::test_import_path_resolves directly imports `from forge.fleet.manifest import FORGE_MANIFEST` and a supplemental test_package_reexport imports from the package root. Both pass under pytest."
+      }
+    ]
+  },
+  "issues": [],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 412 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 2047/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- IS_USED_FOR\n- DEFINED_BY_CODE_PATTERN\n- HAS_CODE_PATTERN\n- IS_USED_AS_FIELD_TYPE_IN\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- CREATES\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- INTERACTS_WITH\n- DELEGATES_TO\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO_TASK\n- HAS_IMPLEMENTATION_MODE\n- RESULT_LOCATION_PATTERN\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
