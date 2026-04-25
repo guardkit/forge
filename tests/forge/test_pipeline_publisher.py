@@ -56,9 +56,7 @@ def _now_iso() -> str:
 
 
 def _build_started() -> BuildStartedPayload:
-    return BuildStartedPayload(
-        feature_id=FEATURE_ID, build_id=BUILD_ID, wave_total=3
-    )
+    return BuildStartedPayload(feature_id=FEATURE_ID, build_id=BUILD_ID, wave_total=3)
 
 
 def _build_progress() -> BuildProgressPayload:
@@ -332,9 +330,7 @@ class TestSubjectBuilder:
             ("build-cancelled", "pipeline.build-cancelled.FEAT-A1B2"),
         ],
     )
-    def test_subject_format_for_each_event(
-        self, event: str, expected: str
-    ) -> None:
+    def test_subject_format_for_each_event(self, event: str, expected: str) -> None:
         assert PipelinePublisher._subject_for(event, FEATURE_ID) == expected
 
 
@@ -380,7 +376,9 @@ class TestFireAndForget:
         nats_client: AsyncMock,
     ) -> None:
         # Simulate a NATS PubAck-like return value.
-        nats_client.publish = AsyncMock(return_value=MagicMock(stream="PIPELINE", seq=1))
+        nats_client.publish = AsyncMock(
+            return_value=MagicMock(stream="PIPELINE", seq=1)
+        )
         result = await publisher.publish_build_started(_build_started())
         assert result is None
 
@@ -395,10 +393,7 @@ class TestFireAndForget:
         with caplog.at_level(logging.DEBUG, logger=pp_module.__name__):
             await publisher.publish_build_started(_build_started())
         # Some log record from the publisher mentions ACK-123 OR the subject.
-        relevant = [
-            rec for rec in caplog.records
-            if rec.name == pp_module.__name__
-        ]
+        relevant = [rec for rec in caplog.records if rec.name == pp_module.__name__]
         assert relevant, "publisher emitted no log records"
 
 
