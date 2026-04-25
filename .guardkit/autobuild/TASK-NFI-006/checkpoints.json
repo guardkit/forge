@@ -1,0 +1,24 @@
+{
+  "task_id": "TASK-NFI-006",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "1d01f7ee2a71ca7f2383c635994d7fb8d3496d3c",
+      "timestamp": "2026-04-25T14:13:17.938832",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false
+    },
+    {
+      "turn": 2,
+      "commit_hash": "dc68fd3273d94f6eb2d8ad06386a69c755d19ea7",
+      "timestamp": "2026-04-25T14:19:57.003388",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 2 complete (tests: pass)",
+      "from_prior_run": false
+    }
+  ],
+  "last_updated": "2026-04-25T14:19:57.003424"
+}

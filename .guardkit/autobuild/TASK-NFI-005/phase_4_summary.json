@@ -1,0 +1,7 @@
+{
+  "tests_run": 236,
+  "tests_failed": 0,
+  "coverage_pct": 79.0,
+  "output_summary": "pytest: 236 passed, 0 failed; fleet_watcher.py module coverage 79% (113 stmts, 24 missed)",
+  "quality_gates_passed": true
+}

@@ -1,0 +1,7 @@
+{
+  "tests_run": 282,
+  "tests_failed": 0,
+  "coverage_pct": 86.0,
+  "output_summary": "pytest: 282 passed (23 contract/seam in test_contract_and_seam.py), 0 failed; src/forge line coverage 86%.",
+  "quality_gates_passed": true
+}

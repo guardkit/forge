@@ -1,0 +1,7 @@
+{
+  "tests_run": 252,
+  "tests_failed": 0,
+  "coverage_pct": 94.0,
+  "output_summary": "pytest: 252 passed, 0 failed; pipeline_consumer.py 94% coverage (216 stmts, 13 missed); 43 dedicated tests for TASK-NFI-009.",
+  "quality_gates_passed": true
+}

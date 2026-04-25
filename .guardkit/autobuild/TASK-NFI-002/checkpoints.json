@@ -1,0 +1,15 @@
+{
+  "task_id": "TASK-NFI-002",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "8690001c24d4368f3d1b743b8e78bfe15626d64a",
+      "timestamp": "2026-04-25T14:02:19.252616",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false
+    }
+  ],
+  "last_updated": "2026-04-25T14:02:19.252710"
+}

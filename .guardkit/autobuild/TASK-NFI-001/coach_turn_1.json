@@ -1,0 +1,149 @@
+{
+  "task_id": "TASK-NFI-001",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/test_forge_config.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/test_forge_config.py::TestYamlRoundTrip::test_roundtrip_preserves_all_fields PASSED [ 86%]\ntests/test_forge_config.py::TestYamlRoundTrip::test_roundtrip_with_defaults PASSED [ 91%]\ntests/test_forge_config.py::TestMissingAllowlistMessage::test_missing_allowlist_error_mentions_allowlist PASSED [ 95%]\ntests/test_forge_config.py::TestMissingAllowlistMessage::test_missing_filesystem_block_error_is_clear PASSED [100%]\n============================== 23 passed in 0.02s ==============================",
+      "duration_seconds": 0.3839282989501953
+    },
+    "requirements": {
+      "criteria_total": 7,
+      "criteria_met": 7,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`FleetConfig`, `PipelineConfig`, `PermissionsConfig`, `FilesystemPermissions`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All four models (plus ForgeConfig) defined in src/forge/config/models.py and re-exported from src/forge/config/__init__.py. TestModelsExist asserts each class exposes the expected fields via Pydantic model_fields.",
+      "notes": "All four models (plus ForgeConfig) defined in src/forge/config/models.py and re-exported from src/forge/config/__init__.py. TestModelsExist asserts each class exposes the expected fields via Pydantic model_fields."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Defaults match ASSUM-001..005 exactly (30/90/30/0.7/60)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Defaults are pinned to the ASSUM-001..005 values via module constants DEFAULT_HEARTBEAT_INTERVAL_SECONDS=30, DEFAULT_STALE_HEARTBEAT_SECONDS=90, DEFAULT_CACHE_TTL_SECONDS=30, DEFAULT_INTENT_MIN_CONFIDENCE=0.7, DEFAULT_PROGRESS_INTERVAL_SECONDS=60. TestDefaultsMatchAssumptions has one test per assumption verifying both the constant and a fresh FleetConfig()/PipelineConfig() instance.",
+      "notes": "Defaults are pinned to the ASSUM-001..005 values via module constants DEFAULT_HEARTBEAT_INTERVAL_SECONDS=30, DEFAULT_STALE_HEARTBEAT_SECONDS=90, DEFAULT_CACHE_TTL_SECONDS=30, DEFAULT_INTENT_MIN_CONFIDENCE=0.7, DEFAULT_PROGRESS_INTERVAL_SECONDS=60. TestDefaultsMatchAssumptions has one test per assumption verifying both the constant and a fresh FleetConfig()/PipelineConfig() instance."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`ForgeConfig.fleet` and `ForgeConfig.pipeline` are optional with defaults",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ForgeConfig declares fleet=Field(default_factory=FleetConfig) and pipeline=Field(default_factory=PipelineConfig). TestForgeConfigOptionalSections.test_minimal_yaml_only_needs_permissions validates that {'permissions': {'filesystem': {'allowlist': ['/srv/forge']}}} is sufficient and the resulting fleet/pipeline carry the assumption defaults. A second test confirms default_factory hands out independent lists per instance.",
+      "notes": "ForgeConfig declares fleet=Field(default_factory=FleetConfig) and pipeline=Field(default_factory=PipelineConfig). TestForgeConfigOptionalSections.test_minimal_yaml_only_needs_permissions validates that {'permissions': {'filesystem': {'allowlist': ['/srv/forge']}}} is sufficient and the resulting fleet/pipeline carry the assumption defaults. A second test confirms default_factory hands out independent lists per instance."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`ForgeConfig.permissions.filesystem.allowlist` is required (no default \u2014 must be explicit)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FilesystemPermissions.allowlist uses Field(...) (no default), PermissionsConfig.filesystem uses Field(...) (no default), and ForgeConfig.permissions uses Field(...) (no default). TestAllowlistIsRequired exercises is_required() on the field plus three model_validate calls that each raise ValidationError when the allowlist or any wrapping block is omitted.",
+      "notes": "FilesystemPermissions.allowlist uses Field(...) (no default), PermissionsConfig.filesystem uses Field(...) (no default), and ForgeConfig.permissions uses Field(...) (no default). TestAllowlistIsRequired exercises is_required() on the field plus three model_validate calls that each raise ValidationError when the allowlist or any wrapping block is omitted."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`FilesystemPermissions.allowlist` rejects relative paths (Pydantic validator)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "@field_validator('allowlist') method _validate_absolute scans the list with Path.is_absolute() and raises ValueError listing the offending entries. TestAllowlistRejectsRelativePaths covers a single relative path, a mixed absolute/relative list, and a happy-path absolute-only list (positive control).",
+      "notes": "@field_validator('allowlist') method _validate_absolute scans the list with Path.is_absolute() and raises ValueError listing the offending entries. TestAllowlistRejectsRelativePaths covers a single relative path, a mixed absolute/relative list, and a happy-path absolute-only list (positive control)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Round-trip test: YAML \u2192 `ForgeConfig.model_validate` \u2192 back to dict preserves field values",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestYamlRoundTrip.test_roundtrip_preserves_all_fields writes a fully-populated dict to a YAML file via tmp_path, loads it with yaml.safe_load, validates with ForgeConfig.model_validate, then asserts model_dump(mode='json') equals the original dict (mode='json' so Path becomes str). A second test re-validates the dumped form to ensure round-trip stability for default-only configs.",
+      "notes": "TestYamlRoundTrip.test_roundtrip_preserves_all_fields writes a fully-populated dict to a YAML file via tmp_path, loads it with yaml.safe_load, validates with ForgeConfig.model_validate, then asserts model_dump(mode='json') equals the original dict (mode='json' so Path becomes str). A second test re-validates the dumped form to ensure round-trip stability for default-only configs."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Missing `permissions.filesystem.allowlist` raises `ValidationError` with a clear message",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestMissingAllowlistMessage.test_missing_allowlist_error_mentions_allowlist asserts the ValidationError contains an entry with type='missing' and loc=('permissions','filesystem','allowlist') \u2014 Pydantic's structured error pinpoints the missing field by path. A second test does the same for an entirely missing 'filesystem' block.",
+      "notes": "TestMissingAllowlistMessage.test_missing_allowlist_error_mentions_allowlist asserts the ValidationError contains an entry with type='missing' and loc=('permissions','filesystem','allowlist') \u2014 Pydantic's structured error pinpoints the missing field by path. A second test does the same for an entirely missing 'filesystem' block."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`FleetConfig`, `PipelineConfig`, `PermissionsConfig`, `FilesystemPermissions`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All four models (plus ForgeConfig) defined in src/forge/config/models.py and re-exported from src/forge/config/__init__.py. TestModelsExist asserts each class exposes the expected fields via Pydantic model_fields.",
+        "notes": "All four models (plus ForgeConfig) defined in src/forge/config/models.py and re-exported from src/forge/config/__init__.py. TestModelsExist asserts each class exposes the expected fields via Pydantic model_fields."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Defaults match ASSUM-001..005 exactly (30/90/30/0.7/60)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Defaults are pinned to the ASSUM-001..005 values via module constants DEFAULT_HEARTBEAT_INTERVAL_SECONDS=30, DEFAULT_STALE_HEARTBEAT_SECONDS=90, DEFAULT_CACHE_TTL_SECONDS=30, DEFAULT_INTENT_MIN_CONFIDENCE=0.7, DEFAULT_PROGRESS_INTERVAL_SECONDS=60. TestDefaultsMatchAssumptions has one test per assumption verifying both the constant and a fresh FleetConfig()/PipelineConfig() instance.",
+        "notes": "Defaults are pinned to the ASSUM-001..005 values via module constants DEFAULT_HEARTBEAT_INTERVAL_SECONDS=30, DEFAULT_STALE_HEARTBEAT_SECONDS=90, DEFAULT_CACHE_TTL_SECONDS=30, DEFAULT_INTENT_MIN_CONFIDENCE=0.7, DEFAULT_PROGRESS_INTERVAL_SECONDS=60. TestDefaultsMatchAssumptions has one test per assumption verifying both the constant and a fresh FleetConfig()/PipelineConfig() instance."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`ForgeConfig.fleet` and `ForgeConfig.pipeline` are optional with defaults",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ForgeConfig declares fleet=Field(default_factory=FleetConfig) and pipeline=Field(default_factory=PipelineConfig). TestForgeConfigOptionalSections.test_minimal_yaml_only_needs_permissions validates that {'permissions': {'filesystem': {'allowlist': ['/srv/forge']}}} is sufficient and the resulting fleet/pipeline carry the assumption defaults. A second test confirms default_factory hands out independent lists per instance.",
+        "notes": "ForgeConfig declares fleet=Field(default_factory=FleetConfig) and pipeline=Field(default_factory=PipelineConfig). TestForgeConfigOptionalSections.test_minimal_yaml_only_needs_permissions validates that {'permissions': {'filesystem': {'allowlist': ['/srv/forge']}}} is sufficient and the resulting fleet/pipeline carry the assumption defaults. A second test confirms default_factory hands out independent lists per instance."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`ForgeConfig.permissions.filesystem.allowlist` is required (no default \u2014 must be explicit)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FilesystemPermissions.allowlist uses Field(...) (no default), PermissionsConfig.filesystem uses Field(...) (no default), and ForgeConfig.permissions uses Field(...) (no default). TestAllowlistIsRequired exercises is_required() on the field plus three model_validate calls that each raise ValidationError when the allowlist or any wrapping block is omitted.",
+        "notes": "FilesystemPermissions.allowlist uses Field(...) (no default), PermissionsConfig.filesystem uses Field(...) (no default), and ForgeConfig.permissions uses Field(...) (no default). TestAllowlistIsRequired exercises is_required() on the field plus three model_validate calls that each raise ValidationError when the allowlist or any wrapping block is omitted."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`FilesystemPermissions.allowlist` rejects relative paths (Pydantic validator)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "@field_validator('allowlist') method _validate_absolute scans the list with Path.is_absolute() and raises ValueError listing the offending entries. TestAllowlistRejectsRelativePaths covers a single relative path, a mixed absolute/relative list, and a happy-path absolute-only list (positive control).",
+        "notes": "@field_validator('allowlist') method _validate_absolute scans the list with Path.is_absolute() and raises ValueError listing the offending entries. TestAllowlistRejectsRelativePaths covers a single relative path, a mixed absolute/relative list, and a happy-path absolute-only list (positive control)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Round-trip test: YAML \u2192 `ForgeConfig.model_validate` \u2192 back to dict preserves field values",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestYamlRoundTrip.test_roundtrip_preserves_all_fields writes a fully-populated dict to a YAML file via tmp_path, loads it with yaml.safe_load, validates with ForgeConfig.model_validate, then asserts model_dump(mode='json') equals the original dict (mode='json' so Path becomes str). A second test re-validates the dumped form to ensure round-trip stability for default-only configs.",
+        "notes": "TestYamlRoundTrip.test_roundtrip_preserves_all_fields writes a fully-populated dict to a YAML file via tmp_path, loads it with yaml.safe_load, validates with ForgeConfig.model_validate, then asserts model_dump(mode='json') equals the original dict (mode='json' so Path becomes str). A second test re-validates the dumped form to ensure round-trip stability for default-only configs."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Missing `permissions.filesystem.allowlist` raises `ValidationError` with a clear message",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestMissingAllowlistMessage.test_missing_allowlist_error_mentions_allowlist asserts the ValidationError contains an entry with type='missing' and loc=('permissions','filesystem','allowlist') \u2014 Pydantic's structured error pinpoints the missing field by path. A second test does the same for an entirely missing 'filesystem' block.",
+        "notes": "TestMissingAllowlistMessage.test_missing_allowlist_error_mentions_allowlist asserts the ValidationError contains an entry with type='missing' and loc=('permissions','filesystem','allowlist') \u2014 Pydantic's structured error pinpoints the missing field by path. A second test does the same for an entirely missing 'filesystem' block."
+      }
+    ]
+  },
+  "issues": [],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 407 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1993/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- HAS_FIELD\n- USES_TYPE_HINT\n- HAS_FIELD_WITH_LIST_TYPE\n- HAS_FILED_TYPE\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- PATH_SHOULD_USE\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- MUST_CONSULT_BEFORE_MODIFYING\n- DELEGATE_TO_TASK_WORK\n- DELEGATES_TO\n- IS_CREATED_FOR\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n- ASSOCIATED_WITH_PROJECT\n- APPLIES_TO\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

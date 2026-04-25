@@ -1,0 +1,136 @@
+{
+  "task_id": "TASK-NFI-009",
+  "turn": 1,
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/pipeline_consumer.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_pipeline_consumer.py",
+    "src/forge/adapters/nats/pipeline_consumer.py",
+    "tasks/backlog/TASK-NFI-009-reconcile-on-boot-crash-recovery.md",
+    "tests/forge/test_pipeline_consumer.py"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-NFI-009-implementation-plan.md",
+    ".guardkit/autobuild/TASK-NFI-008/checkpoints.json",
+    ".guardkit/autobuild/TASK-NFI-009/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-009/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-009/turn_context.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/.guardkit/autobuild/TASK-NFI-009/player_turn_1.json",
+    "tasks/design_approved/TASK-NFI-009-reconcile-on-boot-crash-recovery.md"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_pipeline_consumer.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006",
+    "AC-007",
+    "AC-008",
+    "AC-009"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 54,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 43,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "reconcile_on_boot runs exactly once at startup before normal message flow resumes",
+      "status": "complete",
+      "evidence": "Implemented `async def reconcile_on_boot(deps: ReconcileDeps) -> ReconcileReport` in src/forge/adapters/nats/pipeline_consumer.py. The function is the dedicated boot entry point: it drains every redelivered build-queued message via `deps.fetch_redeliveries`, then runs the SQLite paused scan, and returns a ReconcileReport. Caller invokes it once before the normal fetch loop is started; tests TestReconcileLifecycle.test_returns_report_with_no_redeliveries_and_no_paused and test_drains_until_fetch_returns_empty verify the lifecycle.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Terminal-state redelivery \u2192 ack called, no new build started (idempotency)",
+      "status": "complete",
+      "evidence": "Branch 1 of `_reconcile_one_redelivery`: when `deps.read_build_state` returns a value in TERMINAL_BUILD_STATES (COMPLETE / FAILED / CANCELLED / SKIPPED), the function awaits `msg.ack()`, increments `report.acked_terminal`, and returns without dispatching a new build or calling `mark_interrupted_and_reset`. TestReconcileTerminalStates is parametrised over all four terminal states and asserts ack-once + dispatch-not-called.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "INTERRUPTED-marked rows transition to PREPARING on restart (retry-from-scratch)",
+      "status": "complete",
+      "evidence": "Branch 2 of `_reconcile_one_redelivery`: when state is in RESTART_FROM_PREPARING_STATES (RUNNING, FINALISING, PREPARING), the function awaits `deps.mark_interrupted_and_reset(feature_id, correlation_id)` (an atomic INTERRUPTED\u2192PREPARING write) and then redispatches the build via `deps.consumer_deps.dispatch_build` with a deferred ack callback. TestReconcileInFlightStates is parametrised over IN_FLIGHT_BUILD_STATES + a separate test for PREPARING; both assert mark_interrupted_and_reset.assert_awaited_once_with and dispatch_build.assert_awaited_once.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Paused builds re-emit BuildPausedPayload with the ORIGINAL correlation_id (Group D @edge-case)",
+      "status": "complete",
+      "evidence": "Branch 3 of `_reconcile_one_redelivery`: looks up the original PausedBuildSnapshot from `paused_by_key`, then awaits `deps.publish_build_paused(snap.build_paused_payload)`. Because the snapshot stores the original BuildPausedPayload, the correlation_id field is preserved verbatim. Verified by TestReconcilePausedRedelivery.test_paused_redelivery_reemits_build_paused_with_original_correlation_id which asserts sent_payload.correlation_id == 'corr-001'.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Paused builds re-emit ApprovalRequestPayload \u2014 first response wins semantics from ADR-ARCH-021 honoured",
+      "status": "complete",
+      "evidence": "Same Branch 3 of `_reconcile_one_redelivery`: after publishing BuildPaused, awaits `deps.publish_approval_request(snap.approval_request_payload, snap.approval_subject)`. The ApprovalRequestPayload.request_id is preserved from the original (e.g. req-corr-001) \u2014 ADR-ARCH-021 first-response-wins is honoured because duplicate requests with the same request_id are treated as the same logical request. Verified by TestReconcilePausedRedelivery.test_paused_redelivery_reemits_approval_request_on_original_subject (asserts request_id and approval_subject are preserved).",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Unknown (feature_id, correlation_id) \u2192 fresh build (no duplicate detection fires)",
+      "status": "complete",
+      "evidence": "Branch 4 of `_reconcile_one_redelivery`: when `read_build_state` returns None, the function increments `report.fresh_builds` and delegates to the standard `handle_message(msg, deps.consumer_deps)` path. No reconcile-side ack-and-skip fires; the build flows through the normal validation path which only acks if the payload is malformed or the build is genuinely complete. Verified by TestReconcileUnknownBuild.test_unknown_redelivery_is_dispatched_as_fresh.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Scenario test: A redelivered build-queued message for a completed build is acknowledged idempotently (Group E @data-integrity) passes",
+      "status": "complete",
+      "evidence": "TestReconcileTerminalStates.test_terminal_state_is_acked_and_no_build_dispatched is parametrised over TERMINAL_BUILD_STATES = {COMPLETE, FAILED, CANCELLED, SKIPPED}. The COMPLETE case is the literal Group E scenario: redelivered build-queued for a COMPLETE build \u2192 msg.ack awaited exactly once, dispatch_build never called, mark_interrupted_and_reset never called, publish_build_paused never called. report.acked_terminal == 1.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Unit tests cover all four rule branches with mocked SQLite reader",
+      "status": "complete",
+      "evidence": "Mocked SQLite reader is the `read_build_state` AsyncMock built in `reconcile_factory`; it returns values from a per-test `state_by_key` dict. Each branch has dedicated tests: TestReconcileTerminalStates (branch 1, parametrised x4), TestReconcileInFlightStates (branch 2, parametrised x2 + a separate PREPARING test), TestReconcilePausedRedelivery (branch 3, two tests for build-paused and approval-request) and TestReconcileUnknownBuild (branch 4). TestReconcilePausedScan adds the SQLite belt-and-braces scan, and TestReconcileAllBranches.test_one_call_handles_terminal_running_paused_and_unknown exercises all four rule branches in a single reconcile_on_boot call.",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran `ruff check src/forge/adapters/nats/pipeline_consumer.py tests/forge/test_pipeline_consumer.py` \u2014 output: 'All checks passed!'. Removed a pre-existing unused `from nats.aio.msg import Msg` import that ruff flagged once the module was modified; otherwise the new code adheres to the existing module's typing/docstring/dataclass conventions (frozen+slots dataclasses for deps, Awaitable[None] return types, snake_case naming, 88-char line length).",
+      "test_file": "tests/forge/test_pipeline_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_consumer.py"
+      ]
+    }
+  ]
+}

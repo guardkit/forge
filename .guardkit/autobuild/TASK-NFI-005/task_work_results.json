@@ -1,0 +1,191 @@
+{
+  "task_id": "TASK-NFI-005",
+  "timestamp": "2026-04-25T14:30:24.505381",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 24,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".guardkit/autobuild/TASK-NFI-006/checkpoints.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/fleet_watcher.py",
+    "src/forge/adapters/nats/__init__.py",
+    "tasks/backlog/TASK-NFI-004-fleet-publisher.md",
+    "tasks/backlog/TASK-NFI-005-fleet-watcher.md",
+    "tasks/backlog/TASK-NFI-008-wire-state-machine-lifecycle-emission.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-NFI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-NFI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-NFI-008-implementation-plan.md",
+    ".guardkit/autobuild/TASK-NFI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-008/turn_context.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/.guardkit/autobuild/TASK-NFI-005/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/fleet_watcher.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/adapters/test_fleet_watcher.py",
+    "src/forge/adapters/nats/fleet_publisher.py",
+    "src/forge/adapters/nats/fleet_watcher.py",
+    "src/forge/pipeline.py",
+    "tasks/design_approved/TASK-NFI-004-fleet-publisher.md",
+    "tasks/design_approved/TASK-NFI-005-fleet-watcher.md",
+    "tasks/design_approved/TASK-NFI-008-wire-state-machine-lifecycle-emission.md",
+    "tests/forge/adapters/__init__.py",
+    "tests/forge/adapters/test_fleet_watcher.py",
+    "tests/forge/test_fleet_publisher.py",
+    "tests/forge/test_pipeline_lifecycle.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/adapters/test_fleet_watcher.py"
+  ],
+  "summary": "24 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 59,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Three event types dispatched correctly to FleetEventSink methods",
+      "status": "complete",
+      "evidence": "FleetWatcher.on_fleet_change routes manifest!=None to sink.upsert_agent and manifest=None to sink.remove_agent. FleetWatcher.on_heartbeat validates the AgentHeartbeatPayload and routes to sink.update_heartbeat(agent_id, hb, status_changed). Verified by TestThreeEventTypesDispatched (4 tests, including a direct AsyncMock(spec=FleetEventSink) assertion that each named method is awaited with the correct arguments).",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Events failing AgentManifest.model_validate / AgentHeartbeatPayload.model_validate are logged (WARN) and dropped; subsequent valid events still processed",
+      "status": "complete",
+      "evidence": "on_heartbeat catches ValidationError/ValueError/TypeError around AgentHeartbeatPayload.model_validate, logs at WARN with the envelope source, and returns without invoking the sink. on_fleet_change catches all non-CancelledError exceptions per dispatch and logs them. Verified by TestMalformedEventsAreLoggedAndDropped (3 tests including a 'bad-then-good' sequence that confirms a malformed heartbeat does not poison subsequent valid heartbeats).",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "status_changed flag computed correctly (compares previous heartbeat status to new one)",
+      "status": "complete",
+      "evidence": "FleetWatcher._previous_status reads the cache snapshot via the injected SnapshotReader and falls back to an in-memory mirror. status_changed is computed as `prev_status != hb.status` and forwarded as the third positional argument to sink.update_heartbeat. Verified by TestStatusChangedFlag (3 tests covering first-heartbeat-after-register, repeated same-status, and the cache-view path that observes a stale_sweeper-induced flip).",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Re-registration with newer manifest version supersedes (idempotency \u2014 no duplicate cache entries)",
+      "status": "complete",
+      "evidence": "on_fleet_change calls sink.upsert_agent unconditionally for non-None manifests. DiscoveryCache.upsert_agent replaces the entry by agent_id, so a v0.1.0 \u2192 v0.2.0 re-register leaves exactly one entry with the newer version. Verified by TestReRegistrationIdempotency.test_reregister_replaces_manifest_no_duplicates (asserts len(snapshot)==1 and version==0.2.0 after two registers for the same agent_id).",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "stale_sweeper marks degraded agents whose last_heartbeat_at age exceeds stale_heartbeat_seconds (uses injected Clock)",
+      "status": "complete",
+      "evidence": "run_one_sweep iterates the snapshot, computes age = clock.now() - entry.last_heartbeat_at, and synthesises an AgentHeartbeatPayload(status='degraded') passed to sink.update_heartbeat with status_changed=True when age > threshold. Already-degraded agents are skipped (idempotency). stale_sweeper wraps run_one_sweep in a cancellable loop. Verified by TestStaleSweeper (5 tests: marks-stale, skips-fresh, skips-already-degraded, loop-cancellable, uses-injected-clock).",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Racing register+deregister test (asyncio.gather) \u2014 final cache state consistent with one-event-wins semantics",
+      "status": "complete",
+      "evidence": "FleetWatcher delegates all mutation to FleetEventSink (DiscoveryCache), which serialises every write through a single asyncio.Lock \u2014 exactly the architectural invariant the AC requires. TestRacingRegisterDeregister.test_concurrent_register_and_deregister_are_consistent fires both events via asyncio.gather and asserts the final snapshot is either {} or {agent_id: entry} but never a torn read.",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "watch survives transient nats_client errors via reconnect loop; test with a nats_client mock that raises once then recovers",
+      "status": "complete",
+      "evidence": "FleetWatcher.run wraps the (subscribe, watch_fleet) calls in `while True` with an asyncio.sleep(reconnect_backoff_seconds) on any non-CancelledError. CancelledError propagates so callers control shutdown. Verified by TestReconnectLoop with a FakeNATSClient that raises RuntimeError on the first watch_fleet call: the test asserts watch_fleet_calls >= 2 and that subscribe was re-invoked, plus a separate test asserting the WARN log was emitted.",
+      "test_file": "tests/forge/adapters/test_fleet_watcher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "ruff check src/forge/adapters/nats/fleet_watcher.py tests/forge/adapters/test_fleet_watcher.py \u2192 'All checks passed!'. mypy src/forge/adapters/nats/fleet_watcher.py \u2192 'Success: no issues found in 1 source file'. Both files use Black-compatible 88-col formatting, snake_case names, full type hints, and Google-style docstrings consistent with the rest of forge.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/nats/fleet_watcher.py",
+        "tests/forge/adapters/test_fleet_watcher.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 38.08365591499023
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 268.0612755600014
+    }
+  ]
+}

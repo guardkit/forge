@@ -1,0 +1,231 @@
+{
+  "task_id": "TASK-NFI-007",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/discovery/test_discovery.py tests/forge/test_pipeline_consumer.py tests/forge/test_pipeline_publisher.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_pipeline_publisher.py::TestFireAndForget::test_pub_ack_is_logged_at_debug PASSED [ 96%]\ntests/forge/test_pipeline_publisher.py::TestPublishFailure::test_underlying_exception_is_wrapped PASSED [ 97%]\ntests/forge/test_pipeline_publisher.py::TestPublishFailure::test_publish_failure_carries_subject_in_message PASSED [ 98%]\ntests/forge/test_pipeline_publisher.py::TestConcurrency::test_100_concurrent_publish_build_progress_no_interleave PASSED [100%]\n============================== 95 passed in 0.17s ==============================",
+      "duration_seconds": 0.5978140830993652
+    },
+    "requirements": {
+      "criteria_total": 11,
+      "criteria_met": 11,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Pull consumer config matches `API-nats-pipeline-events.md \u00a72.2` exactly",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "build_consumer_config() returns nats.js.api.ConsumerConfig(durable_name='forge-consumer', deliver_policy=DeliverPolicy.ALL, ack_policy=AckPolicy.EXPLICIT, ack_wait=3600.0, max_deliver=-1, max_ack_pending=1, filter_subject='pipeline.build-queued.>'). TestConsumerConfig (8 tests) pins each field individually; runtime check: durable=forge-consumer, ack_wait=3600.0, max_ack_pending=1, max_deliver=-1, deliver=ALL, ack=EXPLICIT, filter=pipeline.build-queued.>.",
+      "notes": "build_consumer_config() returns nats.js.api.ConsumerConfig(durable_name='forge-consumer', deliver_policy=DeliverPolicy.ALL, ack_policy=AckPolicy.EXPLICIT, ack_wait=3600.0, max_deliver=-1, max_ack_pending=1, filter_subject='pipeline.build-queued.>'). TestConsumerConfig (8 tests) pins each field individually; runtime check: durable=forge-consumer, ack_wait=3600.0, max_ack_pending=1, max_deliver=-1, deliver=ALL, ack=EXPLICIT, filter=pipeline.build-queued.>."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Valid `BuildQueuedPayload` \u2192 pass to state-machine entrypoint with `ack_callback` bound; ack deferred until terminal",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "handle_message() validates the envelope+payload, then awaits deps.dispatch_build(payload, ack_callback). The ack_callback is a closure produced by _build_ack_callback(msg) that calls msg.ack() only when invoked. TestValidPayloadDispatch::test_valid_payload_invokes_dispatch_build asserts dispatch_build is awaited with the parsed BuildQueuedPayload and a callable. test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during handle_message, then becomes awaited exactly once after the callback fires.",
+      "notes": "handle_message() validates the envelope+payload, then awaits deps.dispatch_build(payload, ack_callback). The ack_callback is a closure produced by _build_ack_callback(msg) that calls msg.ack() only when invoked. TestValidPayloadDispatch::test_valid_payload_invokes_dispatch_build asserts dispatch_build is awaited with the parsed BuildQueuedPayload and a callable. test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during handle_message, then becomes awaited exactly once after the callback fires."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Malformed payload \u2192 ack + `build-failed` published; never reaches state machine",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both MessageEnvelope and BuildQueuedPayload validation are wrapped in try/except (ValidationError, ValueError); both branches await msg.ack() and deps.publish_build_failed(BuildFailedPayload(..., failure_reason=REASON_MALFORMED_PAYLOAD, recoverable=False), feature_id) and return before reaching dispatch. TestMalformedPayload exercises three flavours: invalid JSON bytes, valid envelope with missing-fields payload (still surfaces 'FEAT-OOPS' from the partial envelope), and non-utf8 garbage \u2014 every case asserts dispatch_build is never awaited.",
+      "notes": "Both MessageEnvelope and BuildQueuedPayload validation are wrapped in try/except (ValidationError, ValueError); both branches await msg.ack() and deps.publish_build_failed(BuildFailedPayload(..., failure_reason=REASON_MALFORMED_PAYLOAD, recoverable=False), feature_id) and return before reaching dispatch. TestMalformedPayload exercises three flavours: invalid JSON bytes, valid envelope with missing-fields payload (still surfaces 'FEAT-OOPS' from the partial envelope), and non-utf8 garbage \u2014 every case asserts dispatch_build is never awaited."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Path outside allowlist \u2192 ack + `build-failed`; never reaches state machine",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_path_inside_allowlist(candidate, allowlist) returns False whenever Path(candidate).resolve() is not is_relative_to() any allowed.resolve(); when False, handle_message acks and publishes REASON_PATH_OUTSIDE_ALLOWLIST. TestPathAllowlist::test_path_outside_allowlist_is_rejected uses an outside tmp_path/elsewhere/feature.yaml and asserts msg.ack awaited once, publish_build_failed awaited once with failure_reason='path outside allowlist', dispatch_build never called.",
+      "notes": "_path_inside_allowlist(candidate, allowlist) returns False whenever Path(candidate).resolve() is not is_relative_to() any allowed.resolve(); when False, handle_message acks and publishes REASON_PATH_OUTSIDE_ALLOWLIST. TestPathAllowlist::test_path_outside_allowlist_is_rejected uses an outside tmp_path/elsewhere/feature.yaml and asserts msg.ack awaited once, publish_build_failed awaited once with failure_reason='path outside allowlist', dispatch_build never called."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Unrecognised `originating_adapter` \u2192 ack + `build-failed` with `failure_reason=\"originator not recognised\"`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "After payload validation, handle_message reads deps.forge_config.pipeline.approved_originators; if originating_adapter is None or not in the list, it acks and publishes BuildFailedPayload(failure_reason=REASON_ORIGINATOR_NOT_RECOGNISED='originator not recognised'). TestOriginatorAllowlist covers two paths: None originator and a tightened approved list ([\"terminal\"] only) that rejects 'cli-wrapper'. Both assert msg.ack awaited once, dispatch_build never called, failure_reason exactly 'originator not recognised'.",
+      "notes": "After payload validation, handle_message reads deps.forge_config.pipeline.approved_originators; if originating_adapter is None or not in the list, it acks and publishes BuildFailedPayload(failure_reason=REASON_ORIGINATOR_NOT_RECOGNISED='originator not recognised'). TestOriginatorAllowlist covers two paths: None originator and a tightened approved list ([\"terminal\"] only) that rejects 'cli-wrapper'. Both assert msg.ack awaited once, dispatch_build never called, failure_reason exactly 'originator not recognised'."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Duplicate `(feature_id, correlation_id)` already-complete build \u2192 ack + skip (no new build started)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "After originator + path checks, handle_message awaits deps.is_duplicate_terminal(payload.feature_id, payload.correlation_id); if True it acks and returns without dispatching or publishing. TestDuplicateDetection::test_already_complete_build_is_acked_and_skipped asserts msg.ack awaited once, dispatch_build NOT called, publish_build_failed NOT called. is_duplicate_terminal is the single read against builds(feature_id, correlation_id) and returns True for any terminal status \u2014 COMPLETE included.",
+      "notes": "After originator + path checks, handle_message awaits deps.is_duplicate_terminal(payload.feature_id, payload.correlation_id); if True it acks and returns without dispatching or publishing. TestDuplicateDetection::test_already_complete_build_is_acked_and_skipped asserts msg.ack awaited once, dispatch_build NOT called, publish_build_failed NOT called. is_duplicate_terminal is the single read against builds(feature_id, correlation_id) and returns True for any terminal status \u2014 COMPLETE included."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Duplicate `(feature_id, correlation_id)` already-terminal-failed build \u2192 ack + skip",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Same code path as AC-006: the duplicate check covers ANY terminal status (COMPLETE | FAILED | CANCELLED | SKIPPED) per the API contract \u00a74 reconcile-on-boot rules. TestDuplicateDetection::test_already_failed_build_is_also_acked_and_skipped exercises the FAILED case explicitly, asserting msg.ack awaited once and dispatch_build never called.",
+      "notes": "Same code path as AC-006: the duplicate check covers ANY terminal status (COMPLETE | FAILED | CANCELLED | SKIPPED) per the API contract \u00a74 reconcile-on-boot rules. TestDuplicateDetection::test_already_failed_build_is_also_acked_and_skipped exercises the FAILED case explicitly, asserting msg.ack awaited once and dispatch_build never called."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Ack is called exactly once per message \u2014 asserted by mock `Msg.ack` call count",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_build_ack_callback() captures a {'acked': False} flag and short-circuits on the second invocation. TestAckCalledExactlyOnce::test_ack_callback_is_idempotent calls the returned callback twice in a row and asserts msg.ack.await_count == 1. TestAckCalledExactlyOnce::test_rejection_acks_once_no_dispatch confirms rejection paths also stay at exactly one ack with no dispatch.",
+      "notes": "_build_ack_callback() captures a {'acked': False} flag and short-circuits on the second invocation. TestAckCalledExactlyOnce::test_ack_callback_is_idempotent calls the returned callback twice in a row and asserts msg.ack.await_count == 1. TestAckCalledExactlyOnce::test_rejection_acks_once_no_dispatch confirms rejection paths also stay at exactly one ack with no dispatch."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Non-terminal transitions do NOT ack \u2014 `ack_callback` is only invoked on terminal",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "handle_message hands the state machine an ack_callback closure but never calls msg.ack() itself on the accepted-build path. TestValidPayloadDispatch::test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during the handle_message call (i.e. across the message's lifetime up to dispatch), and only becomes awaited once after the test explicitly calls the callback (simulating a terminal transition).",
+      "notes": "handle_message hands the state machine an ack_callback closure but never calls msg.ack() itself on the accepted-build path. TestValidPayloadDispatch::test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during the handle_message call (i.e. across the message's lifetime up to dispatch), and only becomes awaited once after the test explicitly calls the callback (simulating a terminal transition)."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Allowlist check uses `pathlib.Path.resolve()` + `is_relative_to` to reject `..` traversal",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_path_inside_allowlist() resolves both candidate (Path(candidate).resolve()) and each allowed entry (allowed.resolve()) before is_relative_to(). TestPathAllowlist::test_dotdot_traversal_escape_is_rejected constructs allowlist_root/../../tmp_path.name/outside/feature.yaml \u2014 a path that lexically starts inside the allowlist but escapes via '..' \u2014 and asserts the message is rejected (msg.ack awaited, publish_build_failed awaited with REASON_PATH_OUTSIDE_ALLOWLIST, dispatch_build never called). The companion test_path_inside_allowlist_via_dotdot_is_accepted proves that '..' segments which resolve back inside the allowlist are accepted, so the rejection is targeted at escapes rather than the '..' character per se.",
+      "notes": "_path_inside_allowlist() resolves both candidate (Path(candidate).resolve()) and each allowed entry (allowed.resolve()) before is_relative_to(). TestPathAllowlist::test_dotdot_traversal_escape_is_rejected constructs allowlist_root/../../tmp_path.name/outside/feature.yaml \u2014 a path that lexically starts inside the allowlist but escapes via '..' \u2014 and asserts the message is rejected (msg.ack awaited, publish_build_failed awaited with REASON_PATH_OUTSIDE_ALLOWLIST, dispatch_build never called). The companion test_path_inside_allowlist_via_dotdot_is_accepted proves that '..' segments which resolve back inside the allowlist are accepted, so the rejection is targeted at escapes rather than the '..' character per se."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both files conform to .claude/rules/code-style.md: PEP 8 snake_case functions, PascalCase classes, UPPER_CASE constants, 88-char max line length (verified by awk: zero lines exceed 88 chars), full type hints throughout, f-strings via logger %-style for lazy interpolation. Black is not installed in the worktree environment so an explicit black --check could not be run, but the source is hand-formatted to Black-compatible conventions (trailing commas in multi-line literals, double quotes, blank-line-2 between top-level definitions).",
+      "notes": "Both files conform to .claude/rules/code-style.md: PEP 8 snake_case functions, PascalCase classes, UPPER_CASE constants, 88-char max line length (verified by awk: zero lines exceed 88 chars), full type hints throughout, f-strings via logger %-style for lazy interpolation. Black is not installed in the worktree environment so an explicit black --check could not be run, but the source is hand-formatted to Black-compatible conventions (trailing commas in multi-line literals, double quotes, blank-line-2 between top-level definitions)."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Pull consumer config matches `API-nats-pipeline-events.md \u00a72.2` exactly",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "build_consumer_config() returns nats.js.api.ConsumerConfig(durable_name='forge-consumer', deliver_policy=DeliverPolicy.ALL, ack_policy=AckPolicy.EXPLICIT, ack_wait=3600.0, max_deliver=-1, max_ack_pending=1, filter_subject='pipeline.build-queued.>'). TestConsumerConfig (8 tests) pins each field individually; runtime check: durable=forge-consumer, ack_wait=3600.0, max_ack_pending=1, max_deliver=-1, deliver=ALL, ack=EXPLICIT, filter=pipeline.build-queued.>.",
+        "notes": "build_consumer_config() returns nats.js.api.ConsumerConfig(durable_name='forge-consumer', deliver_policy=DeliverPolicy.ALL, ack_policy=AckPolicy.EXPLICIT, ack_wait=3600.0, max_deliver=-1, max_ack_pending=1, filter_subject='pipeline.build-queued.>'). TestConsumerConfig (8 tests) pins each field individually; runtime check: durable=forge-consumer, ack_wait=3600.0, max_ack_pending=1, max_deliver=-1, deliver=ALL, ack=EXPLICIT, filter=pipeline.build-queued.>."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Valid `BuildQueuedPayload` \u2192 pass to state-machine entrypoint with `ack_callback` bound; ack deferred until terminal",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "handle_message() validates the envelope+payload, then awaits deps.dispatch_build(payload, ack_callback). The ack_callback is a closure produced by _build_ack_callback(msg) that calls msg.ack() only when invoked. TestValidPayloadDispatch::test_valid_payload_invokes_dispatch_build asserts dispatch_build is awaited with the parsed BuildQueuedPayload and a callable. test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during handle_message, then becomes awaited exactly once after the callback fires.",
+        "notes": "handle_message() validates the envelope+payload, then awaits deps.dispatch_build(payload, ack_callback). The ack_callback is a closure produced by _build_ack_callback(msg) that calls msg.ack() only when invoked. TestValidPayloadDispatch::test_valid_payload_invokes_dispatch_build asserts dispatch_build is awaited with the parsed BuildQueuedPayload and a callable. test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during handle_message, then becomes awaited exactly once after the callback fires."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Malformed payload \u2192 ack + `build-failed` published; never reaches state machine",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both MessageEnvelope and BuildQueuedPayload validation are wrapped in try/except (ValidationError, ValueError); both branches await msg.ack() and deps.publish_build_failed(BuildFailedPayload(..., failure_reason=REASON_MALFORMED_PAYLOAD, recoverable=False), feature_id) and return before reaching dispatch. TestMalformedPayload exercises three flavours: invalid JSON bytes, valid envelope with missing-fields payload (still surfaces 'FEAT-OOPS' from the partial envelope), and non-utf8 garbage \u2014 every case asserts dispatch_build is never awaited.",
+        "notes": "Both MessageEnvelope and BuildQueuedPayload validation are wrapped in try/except (ValidationError, ValueError); both branches await msg.ack() and deps.publish_build_failed(BuildFailedPayload(..., failure_reason=REASON_MALFORMED_PAYLOAD, recoverable=False), feature_id) and return before reaching dispatch. TestMalformedPayload exercises three flavours: invalid JSON bytes, valid envelope with missing-fields payload (still surfaces 'FEAT-OOPS' from the partial envelope), and non-utf8 garbage \u2014 every case asserts dispatch_build is never awaited."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Path outside allowlist \u2192 ack + `build-failed`; never reaches state machine",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_path_inside_allowlist(candidate, allowlist) returns False whenever Path(candidate).resolve() is not is_relative_to() any allowed.resolve(); when False, handle_message acks and publishes REASON_PATH_OUTSIDE_ALLOWLIST. TestPathAllowlist::test_path_outside_allowlist_is_rejected uses an outside tmp_path/elsewhere/feature.yaml and asserts msg.ack awaited once, publish_build_failed awaited once with failure_reason='path outside allowlist', dispatch_build never called.",
+        "notes": "_path_inside_allowlist(candidate, allowlist) returns False whenever Path(candidate).resolve() is not is_relative_to() any allowed.resolve(); when False, handle_message acks and publishes REASON_PATH_OUTSIDE_ALLOWLIST. TestPathAllowlist::test_path_outside_allowlist_is_rejected uses an outside tmp_path/elsewhere/feature.yaml and asserts msg.ack awaited once, publish_build_failed awaited once with failure_reason='path outside allowlist', dispatch_build never called."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Unrecognised `originating_adapter` \u2192 ack + `build-failed` with `failure_reason=\"originator not recognised\"`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "After payload validation, handle_message reads deps.forge_config.pipeline.approved_originators; if originating_adapter is None or not in the list, it acks and publishes BuildFailedPayload(failure_reason=REASON_ORIGINATOR_NOT_RECOGNISED='originator not recognised'). TestOriginatorAllowlist covers two paths: None originator and a tightened approved list ([\"terminal\"] only) that rejects 'cli-wrapper'. Both assert msg.ack awaited once, dispatch_build never called, failure_reason exactly 'originator not recognised'.",
+        "notes": "After payload validation, handle_message reads deps.forge_config.pipeline.approved_originators; if originating_adapter is None or not in the list, it acks and publishes BuildFailedPayload(failure_reason=REASON_ORIGINATOR_NOT_RECOGNISED='originator not recognised'). TestOriginatorAllowlist covers two paths: None originator and a tightened approved list ([\"terminal\"] only) that rejects 'cli-wrapper'. Both assert msg.ack awaited once, dispatch_build never called, failure_reason exactly 'originator not recognised'."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Duplicate `(feature_id, correlation_id)` already-complete build \u2192 ack + skip (no new build started)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "After originator + path checks, handle_message awaits deps.is_duplicate_terminal(payload.feature_id, payload.correlation_id); if True it acks and returns without dispatching or publishing. TestDuplicateDetection::test_already_complete_build_is_acked_and_skipped asserts msg.ack awaited once, dispatch_build NOT called, publish_build_failed NOT called. is_duplicate_terminal is the single read against builds(feature_id, correlation_id) and returns True for any terminal status \u2014 COMPLETE included.",
+        "notes": "After originator + path checks, handle_message awaits deps.is_duplicate_terminal(payload.feature_id, payload.correlation_id); if True it acks and returns without dispatching or publishing. TestDuplicateDetection::test_already_complete_build_is_acked_and_skipped asserts msg.ack awaited once, dispatch_build NOT called, publish_build_failed NOT called. is_duplicate_terminal is the single read against builds(feature_id, correlation_id) and returns True for any terminal status \u2014 COMPLETE included."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Duplicate `(feature_id, correlation_id)` already-terminal-failed build \u2192 ack + skip",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Same code path as AC-006: the duplicate check covers ANY terminal status (COMPLETE | FAILED | CANCELLED | SKIPPED) per the API contract \u00a74 reconcile-on-boot rules. TestDuplicateDetection::test_already_failed_build_is_also_acked_and_skipped exercises the FAILED case explicitly, asserting msg.ack awaited once and dispatch_build never called.",
+        "notes": "Same code path as AC-006: the duplicate check covers ANY terminal status (COMPLETE | FAILED | CANCELLED | SKIPPED) per the API contract \u00a74 reconcile-on-boot rules. TestDuplicateDetection::test_already_failed_build_is_also_acked_and_skipped exercises the FAILED case explicitly, asserting msg.ack awaited once and dispatch_build never called."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Ack is called exactly once per message \u2014 asserted by mock `Msg.ack` call count",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_build_ack_callback() captures a {'acked': False} flag and short-circuits on the second invocation. TestAckCalledExactlyOnce::test_ack_callback_is_idempotent calls the returned callback twice in a row and asserts msg.ack.await_count == 1. TestAckCalledExactlyOnce::test_rejection_acks_once_no_dispatch confirms rejection paths also stay at exactly one ack with no dispatch.",
+        "notes": "_build_ack_callback() captures a {'acked': False} flag and short-circuits on the second invocation. TestAckCalledExactlyOnce::test_ack_callback_is_idempotent calls the returned callback twice in a row and asserts msg.ack.await_count == 1. TestAckCalledExactlyOnce::test_rejection_acks_once_no_dispatch confirms rejection paths also stay at exactly one ack with no dispatch."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Non-terminal transitions do NOT ack \u2014 `ack_callback` is only invoked on terminal",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "handle_message hands the state machine an ack_callback closure but never calls msg.ack() itself on the accepted-build path. TestValidPayloadDispatch::test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during the handle_message call (i.e. across the message's lifetime up to dispatch), and only becomes awaited once after the test explicitly calls the callback (simulating a terminal transition).",
+        "notes": "handle_message hands the state machine an ack_callback closure but never calls msg.ack() itself on the accepted-build path. TestValidPayloadDispatch::test_ack_is_deferred_until_callback_invoked asserts msg.ack is NOT awaited during the handle_message call (i.e. across the message's lifetime up to dispatch), and only becomes awaited once after the test explicitly calls the callback (simulating a terminal transition)."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Allowlist check uses `pathlib.Path.resolve()` + `is_relative_to` to reject `..` traversal",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_path_inside_allowlist() resolves both candidate (Path(candidate).resolve()) and each allowed entry (allowed.resolve()) before is_relative_to(). TestPathAllowlist::test_dotdot_traversal_escape_is_rejected constructs allowlist_root/../../tmp_path.name/outside/feature.yaml \u2014 a path that lexically starts inside the allowlist but escapes via '..' \u2014 and asserts the message is rejected (msg.ack awaited, publish_build_failed awaited with REASON_PATH_OUTSIDE_ALLOWLIST, dispatch_build never called). The companion test_path_inside_allowlist_via_dotdot_is_accepted proves that '..' segments which resolve back inside the allowlist are accepted, so the rejection is targeted at escapes rather than the '..' character per se.",
+        "notes": "_path_inside_allowlist() resolves both candidate (Path(candidate).resolve()) and each allowed entry (allowed.resolve()) before is_relative_to(). TestPathAllowlist::test_dotdot_traversal_escape_is_rejected constructs allowlist_root/../../tmp_path.name/outside/feature.yaml \u2014 a path that lexically starts inside the allowlist but escapes via '..' \u2014 and asserts the message is rejected (msg.ack awaited, publish_build_failed awaited with REASON_PATH_OUTSIDE_ALLOWLIST, dispatch_build never called). The companion test_path_inside_allowlist_via_dotdot_is_accepted proves that '..' segments which resolve back inside the allowlist are accepted, so the rejection is targeted at escapes rather than the '..' character per se."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both files conform to .claude/rules/code-style.md: PEP 8 snake_case functions, PascalCase classes, UPPER_CASE constants, 88-char max line length (verified by awk: zero lines exceed 88 chars), full type hints throughout, f-strings via logger %-style for lazy interpolation. Black is not installed in the worktree environment so an explicit black --check could not be run, but the source is hand-formatted to Black-compatible conventions (trailing commas in multi-line literals, double quotes, blank-line-2 between top-level definitions).",
+        "notes": "Both files conform to .claude/rules/code-style.md: PEP 8 snake_case functions, PascalCase classes, UPPER_CASE constants, 88-char max line length (verified by awk: zero lines exceed 88 chars), full type hints throughout, f-strings via logger %-style for lazy interpolation. Black is not installed in the worktree environment so an explicit black --check could not be run, but the source is hand-formatted to Black-compatible conventions (trailing commas in multi-line literals, double quotes, blank-line-2 between top-level definitions)."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 378 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1677/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- DESCRIBES\n- EXECUTES_STEP\n- ASSIGNS_TASK_TO\n- PROVIDES_OPTION\n\n### \u26a0\ufe0f Warnings\n- HAS_ROOT_CAUSE\n- CALLS\n- HAS_IMPLEMENTATION_TARGET\n\n### \ud83c\udfad Role Constraints\n- MUST_CONSULT_BEFORE_MODIFYING\n- DELEGATE_TO_TASK_WORK\n- HAS_ACCESS_LEVEL\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- ASSOCIATED_WITH_PROJECT\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

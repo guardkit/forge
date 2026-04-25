@@ -1,0 +1,106 @@
+{
+  "task_id": "TASK-NFI-001",
+  "turn": 1,
+  "files_modified": [],
+  "files_created": [
+    "src/forge/config/__init__.py",
+    "src/forge/config/models.py",
+    "tests/__init__.py",
+    "tests/test_forge_config.py"
+  ],
+  "tests_written": [
+    "tests/test_forge_config.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "23 tests passed in 0.06s. Each ACxxx criterion has a dedicated test class (TestModelsExist, TestDefaultsMatchAssumptions, TestForgeConfigOptionalSections, TestAllowlistIsRequired, TestAllowlistRejectsRelativePaths, TestYamlRoundTrip, TestMissingAllowlistMessage) so the criterion-to-verifier mapping is explicit.",
+  "implementation_notes": "Created src/forge/config/ as a Pydantic v2 model package with a re-export __init__.py shim (per system-prompt-template-specialist re-export pattern). models.py defines five models: FleetConfig (heartbeat 30s / stale 90s / cache 30s / intent 0.7 \u2014 ASSUM-001..004), PipelineConfig (progress 60s \u2014 ASSUM-005, build_queue_subject 'pipeline.build-queued.>', approved_originators populated by default_factory to avoid shared mutable state), FilesystemPermissions (required allowlist: list[Path] with a @field_validator rejecting non-absolute paths), PermissionsConfig (required filesystem block), and ForgeConfig (fleet/pipeline default via default_factory, permissions required). All defaults are exposed as module-level DEFAULT_* constants so downstream tasks (TASK-NFI-004/005/007) cannot drift. extra='forbid' is set on every model so a typo in forge.yaml fails loudly at load time rather than silently being ignored. No YAML loader was added \u2014 task spec explicitly says forge.config.loader handles that.",
+  "concerns": [
+    "forge.config.loader does not yet exist in this worktree; TASK-NFI-001 scope explicitly excludes it but consumer tasks may need it before they can wire ForgeConfig in. Out-of-scope here."
+  ],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006",
+    "AC-007"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "[ ] `FleetConfig`, `PipelineConfig`, `PermissionsConfig`, `FilesystemPermissions`",
+      "status": "complete",
+      "evidence": "All four models (plus ForgeConfig) defined in src/forge/config/models.py and re-exported from src/forge/config/__init__.py. TestModelsExist asserts each class exposes the expected fields via Pydantic model_fields.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "[ ] Defaults match ASSUM-001..005 exactly (30/90/30/0.7/60)",
+      "status": "complete",
+      "evidence": "Defaults are pinned to the ASSUM-001..005 values via module constants DEFAULT_HEARTBEAT_INTERVAL_SECONDS=30, DEFAULT_STALE_HEARTBEAT_SECONDS=90, DEFAULT_CACHE_TTL_SECONDS=30, DEFAULT_INTENT_MIN_CONFIDENCE=0.7, DEFAULT_PROGRESS_INTERVAL_SECONDS=60. TestDefaultsMatchAssumptions has one test per assumption verifying both the constant and a fresh FleetConfig()/PipelineConfig() instance.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "[ ] `ForgeConfig.fleet` and `ForgeConfig.pipeline` are optional with defaults",
+      "status": "complete",
+      "evidence": "ForgeConfig declares fleet=Field(default_factory=FleetConfig) and pipeline=Field(default_factory=PipelineConfig). TestForgeConfigOptionalSections.test_minimal_yaml_only_needs_permissions validates that {'permissions': {'filesystem': {'allowlist': ['/srv/forge']}}} is sufficient and the resulting fleet/pipeline carry the assumption defaults. A second test confirms default_factory hands out independent lists per instance.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "[ ] `ForgeConfig.permissions.filesystem.allowlist` is required (no default \u2014 must be explicit)",
+      "status": "complete",
+      "evidence": "FilesystemPermissions.allowlist uses Field(...) (no default), PermissionsConfig.filesystem uses Field(...) (no default), and ForgeConfig.permissions uses Field(...) (no default). TestAllowlistIsRequired exercises is_required() on the field plus three model_validate calls that each raise ValidationError when the allowlist or any wrapping block is omitted.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "[ ] `FilesystemPermissions.allowlist` rejects relative paths (Pydantic validator)",
+      "status": "complete",
+      "evidence": "@field_validator('allowlist') method _validate_absolute scans the list with Path.is_absolute() and raises ValueError listing the offending entries. TestAllowlistRejectsRelativePaths covers a single relative path, a mixed absolute/relative list, and a happy-path absolute-only list (positive control).",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "[ ] Round-trip test: YAML \u2192 `ForgeConfig.model_validate` \u2192 back to dict preserves field values",
+      "status": "complete",
+      "evidence": "TestYamlRoundTrip.test_roundtrip_preserves_all_fields writes a fully-populated dict to a YAML file via tmp_path, loads it with yaml.safe_load, validates with ForgeConfig.model_validate, then asserts model_dump(mode='json') equals the original dict (mode='json' so Path becomes str). A second test re-validates the dumped form to ensure round-trip stability for default-only configs.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "[ ] Missing `permissions.filesystem.allowlist` raises `ValidationError` with a clear message",
+      "status": "complete",
+      "evidence": "TestMissingAllowlistMessage.test_missing_allowlist_error_mentions_allowlist asserts the ValidationError contains an entry with type='missing' and loc=('permissions','filesystem','allowlist') \u2014 Pydantic's structured error pinpoints the missing field by path. A second test does the same for an entirely missing 'filesystem' block.",
+      "test_file": "tests/test_forge_config.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    }
+  ],
+  "success": true
+}

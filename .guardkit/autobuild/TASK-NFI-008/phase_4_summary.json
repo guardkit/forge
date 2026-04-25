@@ -1,0 +1,7 @@
+{
+  "tests_run": 236,
+  "tests_failed": 0,
+  "coverage_pct": 84.8,
+  "output_summary": "236 passed, 0 failed; line coverage 84.8% (pytest 9.0.2, coverage 7.13.4); pipeline.py at 97%, pipeline_publisher.py at 96%.",
+  "quality_gates_passed": true
+}

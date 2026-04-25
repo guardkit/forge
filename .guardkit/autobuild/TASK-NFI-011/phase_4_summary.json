@@ -1,0 +1,7 @@
+{
+  "tests_run": 282,
+  "tests_failed": 0,
+  "coverage_pct": 86.0,
+  "output_summary": "pytest 9.0.2: 282 passed, 0 failed, 11 warnings; coverage 86% on src/forge (BDD: 7 priority scenarios green).",
+  "quality_gates_passed": true
+}

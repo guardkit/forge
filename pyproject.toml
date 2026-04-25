@@ -31,6 +31,7 @@ providers = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-bdd>=8.1,<9",
 ]
 
 [build-system]
@@ -39,3 +40,26 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# pytest-bdd: feature files live alongside the source-of-truth Gherkin
+# under ``features/``. Scenarios are wired to step functions in
+# ``tests/bdd/``. See TASK-NFI-011.
+bdd_features_base_dir = "features"
+markers = [
+    # Scenario-priority tags mirrored from the .feature files. CI uses these
+    # to gate which subset of the BDD suite must pass per pipeline stage:
+    #   * ``smoke``        — full suite on every PR (3 scenarios for FEAT-FORGE-002)
+    #   * ``key_example``  — full suite on merge to main (7 scenarios)
+    #   * remaining tags   — opportunistically run; explicitly @skip when
+    #                        the owning subtask is not yet complete.
+    "smoke: @smoke scenarios — must pass on every PR",
+    "key_example: @key-example scenarios — must pass on merge to main",
+    "boundary: @boundary scenarios — boundary-condition coverage",
+    "negative: @negative scenarios — negative-path coverage",
+    "edge_case: @edge-case scenarios — edge-case coverage",
+    "security: @security scenarios — security-property coverage",
+    "concurrency: @concurrency scenarios — concurrent-event coverage",
+    "data_integrity: @data-integrity scenarios — data-integrity coverage",
+    "integration: @integration scenarios — integration-boundary coverage",
+]

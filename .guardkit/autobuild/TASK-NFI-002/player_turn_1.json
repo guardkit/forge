@@ -1,0 +1,118 @@
+{
+  "task_id": "TASK-NFI-002",
+  "turn": 1,
+  "files_modified": [],
+  "files_created": [
+    "src/forge/fleet/__init__.py",
+    "src/forge/fleet/manifest.py",
+    "tests/__init__.py",
+    "tests/forge/__init__.py",
+    "tests/forge/fleet/__init__.py",
+    "tests/forge/fleet/test_manifest.py"
+  ],
+  "tests_written": [
+    "tests/forge/fleet/test_manifest.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "26/26 tests passed in 0.11s. Verified: module export and import path resolution; AgentManifest type identity; agent_id/trust_tier/max_concurrent/name/template/version anchors; three IntentCapability entries (build.* / pipeline.* / feature.*) with exact signals/confidence/description; five ToolCapability entries (forge_greenfield/feature/review_fix/status/cancel) with exact parameters/returns/risk_level/async_mode/requires_approval; required_permissions list verbatim; secret-free model_dump_json scan for api_key/token/password/secret/credential (case-insensitive).",
+  "implementation_notes": "Created src/forge/fleet/ package with manifest.py exporting FORGE_MANIFEST as a module-level nats_core.manifest.AgentManifest constant. Contents copied verbatim from docs/design/contracts/API-nats-fleet-lifecycle.md \u00a72.1: agent_id='forge', name='Forge', version='0.1.0', template='deepagents-pipeline-orchestrator', trust_tier='core', status='ready', max_concurrent=1, three intents (build.*/pipeline.*/feature.*), five tools (forge_greenfield/feature/review_fix/status/cancel), and the eight required_permissions. Pure declarative \u2014 no runtime I/O, no env reads, no secrets. Also added a package-level re-export from forge.fleet so 'from forge.fleet import FORGE_MANIFEST' works in addition to the canonical 'from forge.fleet.manifest import FORGE_MANIFEST' import path. Comprehensive pytest suite (26 tests, 7 test classes, one per acceptance criterion plus supplementals) validates every field shape and the secret-free assertion via re.search with re.IGNORECASE.",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006",
+    "AC-007",
+    "AC-008"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "[ ] `src/forge/fleet/manifest.py` exports a module-level `FORGE_MANIFEST` constant",
+      "status": "complete",
+      "evidence": "Created src/forge/fleet/manifest.py defining FORGE_MANIFEST: AgentManifest = AgentManifest(...) at module level and listing it in __all__. TestForgeManifestExport::test_module_exports_constant asserts hasattr(manifest_module, 'FORGE_MANIFEST').",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py",
+        "src/forge/fleet/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "[ ] Type is `nats_core.manifest.AgentManifest` (imported, not redeclared)",
+      "status": "complete",
+      "evidence": "manifest.py imports AgentManifest, IntentCapability, ToolCapability directly from nats_core.manifest with no local subclass or rebinding. TestForgeManifestType asserts isinstance(FORGE_MANIFEST, AgentManifest) AND type(FORGE_MANIFEST) is AgentManifest (the class object identity must match the one exported by nats_core).",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "[ ] `agent_id == \"forge\"`, `trust_tier == \"core\"`, `max_concurrent == 1`",
+      "status": "complete",
+      "evidence": "FORGE_MANIFEST sets agent_id='forge', trust_tier='core', max_concurrent=1 verbatim. TestForgeManifestIdentity has one test per field plus a supplemental test asserting name='Forge', template='deepagents-pipeline-orchestrator', version='0.1.0', status='ready'.",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "[ ] Three `IntentCapability` entries (build.* / pipeline.* / feature.*) match \u00a72.1 verbatim",
+      "status": "complete",
+      "evidence": "manifest.py declares exactly three IntentCapability entries with patterns build.* (signals=['build','develop','implement','create','make','ship'], confidence=0.90), pipeline.* (signals=['pipeline','stages','progress','status','deploy'], confidence=0.85), and feature.* (signals=['feature','add feature','new capability','requirement'], confidence=0.80) \u2014 each with the descriptions copied verbatim from \u00a72.1. TestForgeManifestIntents has one test per intent verifying pattern, signals list, confidence (pytest.approx), and description string.",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "[ ] Five `ToolCapability` entries (forge_greenfield, forge_feature, forge_review_fix, forge_status, forge_cancel) match \u00a72.1 verbatim",
+      "status": "complete",
+      "evidence": "manifest.py declares exactly five ToolCapability entries with names forge_greenfield (mutating, async, requires_approval=False, parameters require repo+feature_yaml_path with branch default 'main'), forge_feature (mutating, async, repo+feature_id), forge_review_fix (mutating, async, repo+subject), forge_status (read_only, optional pipeline_id), forge_cancel (mutating, pipeline_id required, optional reason). All returns strings copied verbatim. TestForgeManifestTools has test_five_tools, test_tool_names (set comparison), and one test per tool comparing parameters dict, returns string, risk_level, async_mode, requires_approval, and description.",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "[ ] `required_permissions` matches \u00a72.1 verbatim",
+      "status": "complete",
+      "evidence": "FORGE_MANIFEST.required_permissions is set to ['graphiti:read','graphiti:write','filesystem:read','filesystem:write','shell:execute','nats:publish','nats:subscribe','network:github.com'] in declaration order matching \u00a72.1. TestForgeManifestPermissions::test_required_permissions asserts equality with the full list (order-sensitive).",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "[ ] **Secret-free**: `FORGE_MANIFEST.model_dump_json()` contains none of `\"api_key\"`, `\"token\"`, `\"password\"`, `\"secret\"`, `\"credential\"` (case-insensitive) \u2014 asserted by unit test",
+      "status": "complete",
+      "evidence": "TestForgeManifestSecretFree::test_no_secret_substrings is parametrised over the five forbidden needles ['api_key','token','password','secret','credential'] and asserts re.search(needle, FORGE_MANIFEST.model_dump_json(), flags=re.IGNORECASE) is None. All five parametrised cases pass against the current manifest.",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "[ ] Import path `from forge.fleet.manifest import FORGE_MANIFEST` resolves",
+      "status": "complete",
+      "evidence": "src/forge/fleet/__init__.py and src/forge/fleet/manifest.py exist; package is discoverable via the existing setuptools src layout (where=['src']). TestForgeManifestExport::test_import_path_resolves directly imports `from forge.fleet.manifest import FORGE_MANIFEST` and a supplemental test_package_reexport imports from the package root. Both pass under pytest.",
+      "test_file": "tests/forge/fleet/test_manifest.py",
+      "implementation_files": [
+        "src/forge/fleet/manifest.py",
+        "src/forge/fleet/__init__.py"
+      ]
+    }
+  ],
+  "success": true
+}

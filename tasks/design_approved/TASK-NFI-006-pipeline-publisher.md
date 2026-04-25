@@ -1,80 +1,80 @@
 ---
-id: TASK-NFI-006
-title: Implement pipeline_publisher (8 lifecycle publisher methods)
-task_type: feature
-status: blocked
-priority: high
-created: 2026-04-24 00:00:00+00:00
-updated: 2026-04-24 00:00:00+00:00
-parent_review: TASK-REV-NF20
-feature_id: FEAT-FORGE-002
-wave: 3
-implementation_mode: task-work
+autobuild_state:
+  base_branch: main
+  current_turn: 3
+  last_updated: '2026-04-25T12:50:51.104638'
+  max_turns: 30
+  started_at: '2026-04-25T12:25:32.063274'
+  turns:
+  - coach_success: true
+    decision: feedback
+    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
+      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
+      re-emitting the report:
+
+      - Phase 3: `python-api-specialist` (Implementation)'
+    player_success: true
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    timestamp: '2026-04-25T12:25:32.063274'
+    turn: 1
+  - coach_success: true
+    decision: feedback
+    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
+      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
+      re-emitting the report:
+
+      - Phase 3: `python-api-specialist` (Implementation)'
+    player_success: true
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    timestamp: '2026-04-25T12:36:44.630290'
+    turn: 2
+  - coach_success: true
+    decision: feedback
+    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
+      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
+      re-emitting the report:
+
+      - Phase 3: `python-api-specialist` (Implementation)'
+    player_success: true
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    timestamp: '2026-04-25T12:42:26.384594'
+    turn: 3
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
 complexity: 5
+consumer_context:
+- consumes: ForgeConfig.pipeline
+  driver: pyyaml + pydantic
+  format_note: PipelineConfig.progress_interval_seconds (int, default 60) drives progress-publish
+    cadence; used by state-machine caller, not this module, but read here for subject-name
+    building
+  framework: Pydantic v2 BaseModel
+  task: TASK-NFI-001
+created: 2026-04-24 00:00:00+00:00
 dependencies:
 - TASK-NFI-001
+feature_id: FEAT-FORGE-002
+id: TASK-NFI-006
+implementation_mode: task-work
+parent_review: TASK-REV-NF20
+priority: high
+status: design_approved
 tags:
 - nats
 - adapter
 - publisher
 - pipeline
 - lifecycle-events
-consumer_context:
-- task: TASK-NFI-001
-  consumes: ForgeConfig.pipeline
-  framework: Pydantic v2 BaseModel
-  driver: pyyaml + pydantic
-  format_note: PipelineConfig.progress_interval_seconds (int, default 60) drives progress-publish
-    cadence; used by state-machine caller, not this module, but read here for subject-name
-    building
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
-autobuild_state:
-  current_turn: 3
-  max_turns: 30
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
-  base_branch: main
-  started_at: '2026-04-25T12:25:32.063274'
-  last_updated: '2026-04-25T12:50:51.104638'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
-      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
-      re-emitting the report:
-
-      - Phase 3: `python-api-specialist` (Implementation)'
-    timestamp: '2026-04-25T12:25:32.063274'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: feedback
-    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
-      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
-      re-emitting the report:
-
-      - Phase 3: `python-api-specialist` (Implementation)'
-    timestamp: '2026-04-25T12:36:44.630290'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 3
-    decision: feedback
-    feedback: '- Task-work produced a report with 2 of 3 required agent invocations.
-      Missing phases: 3 (Implementation). Invoke these agents via the Task tool before
-      re-emitting the report:
-
-      - Phase 3: `python-api-specialist` (Implementation)'
-    timestamp: '2026-04-25T12:42:26.384594'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
+  status: pending
+title: Implement pipeline_publisher (8 lifecycle publisher methods)
+updated: 2026-04-24 00:00:00+00:00
+wave: 3
 ---
 
 # Task: Implement pipeline_publisher (8 lifecycle publisher methods)

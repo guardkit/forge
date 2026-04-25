@@ -1,0 +1,183 @@
+{
+  "task_id": "TASK-NFI-005",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/test_fleet_watcher.py tests/forge/test_fleet_publisher.py tests/forge/test_pipeline_lifecycle.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_fleet_publisher.py:617\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_fleet_publisher.py:617: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\ntests/forge/test_fleet_publisher.py:631\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_fleet_publisher.py:631: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 92 passed, 4 warnings in 0.21s ========================",
+      "duration_seconds": 0.6419632434844971
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Three event types dispatched correctly to `FleetEventSink` methods",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FleetWatcher.on_fleet_change routes manifest!=None to sink.upsert_agent and manifest=None to sink.remove_agent. FleetWatcher.on_heartbeat validates the AgentHeartbeatPayload and routes to sink.update_heartbeat(agent_id, hb, status_changed). Verified by TestThreeEventTypesDispatched (4 tests, including a direct AsyncMock(spec=FleetEventSink) assertion that each named method is awaited with the correct arguments).",
+      "notes": "FleetWatcher.on_fleet_change routes manifest!=None to sink.upsert_agent and manifest=None to sink.remove_agent. FleetWatcher.on_heartbeat validates the AgentHeartbeatPayload and routes to sink.update_heartbeat(agent_id, hb, status_changed). Verified by TestThreeEventTypesDispatched (4 tests, including a direct AsyncMock(spec=FleetEventSink) assertion that each named method is awaited with the correct arguments)."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Events failing `AgentManifest.model_validate` / `AgentHeartbeatPayload.model_validate` are logged (WARN) and dropped; subsequent valid events still processed",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "on_heartbeat catches ValidationError/ValueError/TypeError around AgentHeartbeatPayload.model_validate, logs at WARN with the envelope source, and returns without invoking the sink. on_fleet_change catches all non-CancelledError exceptions per dispatch and logs them. Verified by TestMalformedEventsAreLoggedAndDropped (3 tests including a 'bad-then-good' sequence that confirms a malformed heartbeat does not poison subsequent valid heartbeats).",
+      "notes": "on_heartbeat catches ValidationError/ValueError/TypeError around AgentHeartbeatPayload.model_validate, logs at WARN with the envelope source, and returns without invoking the sink. on_fleet_change catches all non-CancelledError exceptions per dispatch and logs them. Verified by TestMalformedEventsAreLoggedAndDropped (3 tests including a 'bad-then-good' sequence that confirms a malformed heartbeat does not poison subsequent valid heartbeats)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`status_changed` flag computed correctly (compares previous heartbeat status to new one)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FleetWatcher._previous_status reads the cache snapshot via the injected SnapshotReader and falls back to an in-memory mirror. status_changed is computed as `prev_status != hb.status` and forwarded as the third positional argument to sink.update_heartbeat. Verified by TestStatusChangedFlag (3 tests covering first-heartbeat-after-register, repeated same-status, and the cache-view path that observes a stale_sweeper-induced flip).",
+      "notes": "FleetWatcher._previous_status reads the cache snapshot via the injected SnapshotReader and falls back to an in-memory mirror. status_changed is computed as `prev_status != hb.status` and forwarded as the third positional argument to sink.update_heartbeat. Verified by TestStatusChangedFlag (3 tests covering first-heartbeat-after-register, repeated same-status, and the cache-view path that observes a stale_sweeper-induced flip)."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Re-registration with newer manifest version supersedes (idempotency \u2014 no duplicate cache entries)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "on_fleet_change calls sink.upsert_agent unconditionally for non-None manifests. DiscoveryCache.upsert_agent replaces the entry by agent_id, so a v0.1.0 \u2192 v0.2.0 re-register leaves exactly one entry with the newer version. Verified by TestReRegistrationIdempotency.test_reregister_replaces_manifest_no_duplicates (asserts len(snapshot)==1 and version==0.2.0 after two registers for the same agent_id).",
+      "notes": "on_fleet_change calls sink.upsert_agent unconditionally for non-None manifests. DiscoveryCache.upsert_agent replaces the entry by agent_id, so a v0.1.0 \u2192 v0.2.0 re-register leaves exactly one entry with the newer version. Verified by TestReRegistrationIdempotency.test_reregister_replaces_manifest_no_duplicates (asserts len(snapshot)==1 and version==0.2.0 after two registers for the same agent_id)."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`stale_sweeper` marks degraded agents whose `last_heartbeat_at` age exceeds `stale_heartbeat_seconds` (uses injected Clock)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "run_one_sweep iterates the snapshot, computes age = clock.now() - entry.last_heartbeat_at, and synthesises an AgentHeartbeatPayload(status='degraded') passed to sink.update_heartbeat with status_changed=True when age > threshold. Already-degraded agents are skipped (idempotency). stale_sweeper wraps run_one_sweep in a cancellable loop. Verified by TestStaleSweeper (5 tests: marks-stale, skips-fresh, skips-already-degraded, loop-cancellable, uses-injected-clock).",
+      "notes": "run_one_sweep iterates the snapshot, computes age = clock.now() - entry.last_heartbeat_at, and synthesises an AgentHeartbeatPayload(status='degraded') passed to sink.update_heartbeat with status_changed=True when age > threshold. Already-degraded agents are skipped (idempotency). stale_sweeper wraps run_one_sweep in a cancellable loop. Verified by TestStaleSweeper (5 tests: marks-stale, skips-fresh, skips-already-degraded, loop-cancellable, uses-injected-clock)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Racing register+deregister test (asyncio.gather) \u2014 final cache state consistent with one-event-wins semantics",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FleetWatcher delegates all mutation to FleetEventSink (DiscoveryCache), which serialises every write through a single asyncio.Lock \u2014 exactly the architectural invariant the AC requires. TestRacingRegisterDeregister.test_concurrent_register_and_deregister_are_consistent fires both events via asyncio.gather and asserts the final snapshot is either {} or {agent_id: entry} but never a torn read.",
+      "notes": "FleetWatcher delegates all mutation to FleetEventSink (DiscoveryCache), which serialises every write through a single asyncio.Lock \u2014 exactly the architectural invariant the AC requires. TestRacingRegisterDeregister.test_concurrent_register_and_deregister_are_consistent fires both events via asyncio.gather and asserts the final snapshot is either {} or {agent_id: entry} but never a torn read."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "`watch` survives transient `nats_client` errors via reconnect loop; test with a `nats_client` mock that raises once then recovers",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "FleetWatcher.run wraps the (subscribe, watch_fleet) calls in `while True` with an asyncio.sleep(reconnect_backoff_seconds) on any non-CancelledError. CancelledError propagates so callers control shutdown. Verified by TestReconnectLoop with a FakeNATSClient that raises RuntimeError on the first watch_fleet call: the test asserts watch_fleet_calls >= 2 and that subscribe was re-invoked, plus a separate test asserting the WARN log was emitted.",
+      "notes": "FleetWatcher.run wraps the (subscribe, watch_fleet) calls in `while True` with an asyncio.sleep(reconnect_backoff_seconds) on any non-CancelledError. CancelledError propagates so callers control shutdown. Verified by TestReconnectLoop with a FakeNATSClient that raises RuntimeError on the first watch_fleet call: the test asserts watch_fleet_calls >= 2 and that subscribe was re-invoked, plus a separate test asserting the WARN log was emitted."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ruff check src/forge/adapters/nats/fleet_watcher.py tests/forge/adapters/test_fleet_watcher.py \u2192 'All checks passed!'. mypy src/forge/adapters/nats/fleet_watcher.py \u2192 'Success: no issues found in 1 source file'. Both files use Black-compatible 88-col formatting, snake_case names, full type hints, and Google-style docstrings consistent with the rest of forge.",
+      "notes": "ruff check src/forge/adapters/nats/fleet_watcher.py tests/forge/adapters/test_fleet_watcher.py \u2192 'All checks passed!'. mypy src/forge/adapters/nats/fleet_watcher.py \u2192 'Success: no issues found in 1 source file'. Both files use Black-compatible 88-col formatting, snake_case names, full type hints, and Google-style docstrings consistent with the rest of forge."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Three event types dispatched correctly to `FleetEventSink` methods",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FleetWatcher.on_fleet_change routes manifest!=None to sink.upsert_agent and manifest=None to sink.remove_agent. FleetWatcher.on_heartbeat validates the AgentHeartbeatPayload and routes to sink.update_heartbeat(agent_id, hb, status_changed). Verified by TestThreeEventTypesDispatched (4 tests, including a direct AsyncMock(spec=FleetEventSink) assertion that each named method is awaited with the correct arguments).",
+        "notes": "FleetWatcher.on_fleet_change routes manifest!=None to sink.upsert_agent and manifest=None to sink.remove_agent. FleetWatcher.on_heartbeat validates the AgentHeartbeatPayload and routes to sink.update_heartbeat(agent_id, hb, status_changed). Verified by TestThreeEventTypesDispatched (4 tests, including a direct AsyncMock(spec=FleetEventSink) assertion that each named method is awaited with the correct arguments)."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Events failing `AgentManifest.model_validate` / `AgentHeartbeatPayload.model_validate` are logged (WARN) and dropped; subsequent valid events still processed",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "on_heartbeat catches ValidationError/ValueError/TypeError around AgentHeartbeatPayload.model_validate, logs at WARN with the envelope source, and returns without invoking the sink. on_fleet_change catches all non-CancelledError exceptions per dispatch and logs them. Verified by TestMalformedEventsAreLoggedAndDropped (3 tests including a 'bad-then-good' sequence that confirms a malformed heartbeat does not poison subsequent valid heartbeats).",
+        "notes": "on_heartbeat catches ValidationError/ValueError/TypeError around AgentHeartbeatPayload.model_validate, logs at WARN with the envelope source, and returns without invoking the sink. on_fleet_change catches all non-CancelledError exceptions per dispatch and logs them. Verified by TestMalformedEventsAreLoggedAndDropped (3 tests including a 'bad-then-good' sequence that confirms a malformed heartbeat does not poison subsequent valid heartbeats)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`status_changed` flag computed correctly (compares previous heartbeat status to new one)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FleetWatcher._previous_status reads the cache snapshot via the injected SnapshotReader and falls back to an in-memory mirror. status_changed is computed as `prev_status != hb.status` and forwarded as the third positional argument to sink.update_heartbeat. Verified by TestStatusChangedFlag (3 tests covering first-heartbeat-after-register, repeated same-status, and the cache-view path that observes a stale_sweeper-induced flip).",
+        "notes": "FleetWatcher._previous_status reads the cache snapshot via the injected SnapshotReader and falls back to an in-memory mirror. status_changed is computed as `prev_status != hb.status` and forwarded as the third positional argument to sink.update_heartbeat. Verified by TestStatusChangedFlag (3 tests covering first-heartbeat-after-register, repeated same-status, and the cache-view path that observes a stale_sweeper-induced flip)."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Re-registration with newer manifest version supersedes (idempotency \u2014 no duplicate cache entries)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "on_fleet_change calls sink.upsert_agent unconditionally for non-None manifests. DiscoveryCache.upsert_agent replaces the entry by agent_id, so a v0.1.0 \u2192 v0.2.0 re-register leaves exactly one entry with the newer version. Verified by TestReRegistrationIdempotency.test_reregister_replaces_manifest_no_duplicates (asserts len(snapshot)==1 and version==0.2.0 after two registers for the same agent_id).",
+        "notes": "on_fleet_change calls sink.upsert_agent unconditionally for non-None manifests. DiscoveryCache.upsert_agent replaces the entry by agent_id, so a v0.1.0 \u2192 v0.2.0 re-register leaves exactly one entry with the newer version. Verified by TestReRegistrationIdempotency.test_reregister_replaces_manifest_no_duplicates (asserts len(snapshot)==1 and version==0.2.0 after two registers for the same agent_id)."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`stale_sweeper` marks degraded agents whose `last_heartbeat_at` age exceeds `stale_heartbeat_seconds` (uses injected Clock)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "run_one_sweep iterates the snapshot, computes age = clock.now() - entry.last_heartbeat_at, and synthesises an AgentHeartbeatPayload(status='degraded') passed to sink.update_heartbeat with status_changed=True when age > threshold. Already-degraded agents are skipped (idempotency). stale_sweeper wraps run_one_sweep in a cancellable loop. Verified by TestStaleSweeper (5 tests: marks-stale, skips-fresh, skips-already-degraded, loop-cancellable, uses-injected-clock).",
+        "notes": "run_one_sweep iterates the snapshot, computes age = clock.now() - entry.last_heartbeat_at, and synthesises an AgentHeartbeatPayload(status='degraded') passed to sink.update_heartbeat with status_changed=True when age > threshold. Already-degraded agents are skipped (idempotency). stale_sweeper wraps run_one_sweep in a cancellable loop. Verified by TestStaleSweeper (5 tests: marks-stale, skips-fresh, skips-already-degraded, loop-cancellable, uses-injected-clock)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Racing register+deregister test (asyncio.gather) \u2014 final cache state consistent with one-event-wins semantics",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FleetWatcher delegates all mutation to FleetEventSink (DiscoveryCache), which serialises every write through a single asyncio.Lock \u2014 exactly the architectural invariant the AC requires. TestRacingRegisterDeregister.test_concurrent_register_and_deregister_are_consistent fires both events via asyncio.gather and asserts the final snapshot is either {} or {agent_id: entry} but never a torn read.",
+        "notes": "FleetWatcher delegates all mutation to FleetEventSink (DiscoveryCache), which serialises every write through a single asyncio.Lock \u2014 exactly the architectural invariant the AC requires. TestRacingRegisterDeregister.test_concurrent_register_and_deregister_are_consistent fires both events via asyncio.gather and asserts the final snapshot is either {} or {agent_id: entry} but never a torn read."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`watch` survives transient `nats_client` errors via reconnect loop; test with a `nats_client` mock that raises once then recovers",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FleetWatcher.run wraps the (subscribe, watch_fleet) calls in `while True` with an asyncio.sleep(reconnect_backoff_seconds) on any non-CancelledError. CancelledError propagates so callers control shutdown. Verified by TestReconnectLoop with a FakeNATSClient that raises RuntimeError on the first watch_fleet call: the test asserts watch_fleet_calls >= 2 and that subscribe was re-invoked, plus a separate test asserting the WARN log was emitted.",
+        "notes": "FleetWatcher.run wraps the (subscribe, watch_fleet) calls in `while True` with an asyncio.sleep(reconnect_backoff_seconds) on any non-CancelledError. CancelledError propagates so callers control shutdown. Verified by TestReconnectLoop with a FakeNATSClient that raises RuntimeError on the first watch_fleet call: the test asserts watch_fleet_calls >= 2 and that subscribe was re-invoked, plus a separate test asserting the WARN log was emitted."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ruff check src/forge/adapters/nats/fleet_watcher.py tests/forge/adapters/test_fleet_watcher.py \u2192 'All checks passed!'. mypy src/forge/adapters/nats/fleet_watcher.py \u2192 'Success: no issues found in 1 source file'. Both files use Black-compatible 88-col formatting, snake_case names, full type hints, and Google-style docstrings consistent with the rest of forge.",
+        "notes": "ruff check src/forge/adapters/nats/fleet_watcher.py tests/forge/adapters/test_fleet_watcher.py \u2192 'All checks passed!'. mypy src/forge/adapters/nats/fleet_watcher.py \u2192 'Success: no issues found in 1 source file'. Both files use Black-compatible 88-col formatting, snake_case names, full type hints, and Google-style docstrings consistent with the rest of forge."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 356 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1549/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- DESCRIBES\n- ASSIGNS_TASK_TO\n- IDENTIFIES_PARALLEL_WORK\n- INSTRUCTS_USER_TO_START\n\n### \u26a0\ufe0f Warnings\n- HAS_ROOT_CAUSE\n- HAS_IMPLEMENTATION_TARGET\n- USES_ENDPOINT\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATE_TO_TASK_WORK\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

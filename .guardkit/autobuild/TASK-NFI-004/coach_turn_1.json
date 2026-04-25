@@ -1,0 +1,199 @@
+{
+  "task_id": "TASK-NFI-004",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/test_fleet_publisher.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_fleet_publisher.py:617\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_fleet_publisher.py:617: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\ntests/forge/test_fleet_publisher.py:631\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_fleet_publisher.py:631: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 24 passed, 2 warnings in 0.13s ========================",
+      "duration_seconds": 0.5482876300811768
+    },
+    "requirements": {
+      "criteria_total": 9,
+      "criteria_met": 9,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`register_on_boot` publishes `AgentManifest` to `fleet.register` and puts it in `agent-registry` KV (via `nats_client.register_agent`)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented register_on_boot(nats_client) in src/forge/adapters/nats/fleet_publisher.py as a thin coroutine that awaits nats_client.register_agent(FORGE_MANIFEST). The underlying nats_core NATSClient.register_agent (already in nats-core 0.2.0) publishes to fleet.register and stores the manifest in the agent-registry KV bucket. Tests test_register_on_boot_with_valid_client_calls_register_agent and test_register_on_boot_passes_manifest_through_unchanged verify the call and assert the FORGE_MANIFEST identity is passed unchanged.",
+      "notes": "Implemented register_on_boot(nats_client) in src/forge/adapters/nats/fleet_publisher.py as a thin coroutine that awaits nats_client.register_agent(FORGE_MANIFEST). The underlying nats_core NATSClient.register_agent (already in nats-core 0.2.0) publishes to fleet.register and stores the manifest in the agent-registry KV bucket. Tests test_register_on_boot_with_valid_client_calls_register_agent and test_register_on_boot_passes_manifest_through_unchanged verify the call and assert the FORGE_MANIFEST identity is passed unchanged."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`heartbeat_loop` publishes every `FleetConfig.heartbeat_interval_seconds` using an injected Clock; no wall-clock sleeps in tests",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented heartbeat_loop with a keyword-only `clock: Clock | None = None` injection point and `interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS` (sourced from forge.config.models). Tests use FakeClock that records every sleep duration into a list \u2014 assertions verify clock.sleeps == [30.0, 30.0, ...] and that the loop never calls asyncio.sleep with non-zero duration. The default interval test (test_heartbeat_loop_uses_default_interval_from_config) exercises the FleetConfig default of 30s.",
+      "notes": "Implemented heartbeat_loop with a keyword-only `clock: Clock | None = None` injection point and `interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS` (sourced from forge.config.models). Tests use FakeClock that records every sleep duration into a list \u2014 assertions verify clock.sleeps == [30.0, 30.0, ...] and that the loop never calls asyncio.sleep with non-zero duration. The default interval test (test_heartbeat_loop_uses_default_interval_from_config) exercises the FleetConfig default of 30s."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Heartbeat payload reflects `active_tasks=1` when a build is in-flight, `0` otherwise (read from a `StatusProvider` protocol so tests inject state)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Defined runtime_checkable StatusProvider Protocol with get_current_status / get_active_tasks / get_queue_depth methods. build_heartbeat_payload reads each into the AgentHeartbeatPayload. Tests test_heartbeat_loop_with_busy_provider_publishes_active_tasks_one and test_heartbeat_loop_with_idle_provider_publishes_active_tasks_zero pass FakeStatusProvider(active_tasks=1, status='busy') vs (active_tasks=0, status='ready') and assert the published payload reflects each.",
+      "notes": "Defined runtime_checkable StatusProvider Protocol with get_current_status / get_active_tasks / get_queue_depth methods. build_heartbeat_payload reads each into the AgentHeartbeatPayload. Tests test_heartbeat_loop_with_busy_provider_publishes_active_tasks_one and test_heartbeat_loop_with_idle_provider_publishes_active_tasks_zero pass FakeStatusProvider(active_tasks=1, status='busy') vs (active_tasks=0, status='ready') and assert the published payload reflects each."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`deregister` is idempotent \u2014 calling twice does not raise",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "deregister(nats_client, reason='shutdown') wraps the nats_core call in try/except. The underlying NATSClient.deregister_agent already swallows KeyError on KV delete, so the second call's KV step is a no-op; we additionally swallow any transport exception so SIGTERM teardown always completes. Test test_deregister_called_twice_does_not_raise calls deregister twice and asserts no raise + 2 awaited calls. test_deregister_swallows_underlying_exception confirms a ConnectionError side-effect does not propagate and is logged at WARNING.",
+      "notes": "deregister(nats_client, reason='shutdown') wraps the nats_core call in try/except. The underlying NATSClient.deregister_agent already swallows KeyError on KV delete, so the second call's KV step is a no-op; we additionally swallow any transport exception so SIGTERM teardown always completes. Test test_deregister_called_twice_does_not_raise calls deregister twice and asserts no raise + 2 awaited calls. test_deregister_swallows_underlying_exception confirms a ConnectionError side-effect does not propagate and is logged at WARNING."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Heartbeat loop catches and logs transient publish failures; does not exit the loop",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The publish step in heartbeat_loop is wrapped in try/except Exception (with a # noqa: BLE001 explanatory comment) that logs at WARNING and continues to the sleep step. Test test_heartbeat_loop_with_intermittent_publish_failure_continues scripts a side_effect sequence [ConnectionError('transient bus error'), None, None] and asserts await_count == 3 (the loop kept running) plus the WARNING was logged.",
+      "notes": "The publish step in heartbeat_loop is wrapped in try/except Exception (with a # noqa: BLE001 explanatory comment) that logs at WARNING and continues to the sleep step. Test test_heartbeat_loop_with_intermittent_publish_failure_continues scripts a side_effect sequence [ConnectionError('transient bus error'), None, None] and asserts await_count == 3 (the loop kept running) plus the WARNING was logged."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Registry unreachability test (mock `nats_client.get_fleet_registry` to raise) \u2014 heartbeats continue",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The nats_client fixture rigs get_fleet_registry to raise AssertionError if anything calls it; the heartbeat_loop body never invokes get_fleet_registry (only nats_client.heartbeat). Test test_heartbeat_loop_with_unreachable_registry_keeps_publishing runs the loop for two ticks and asserts (a) two heartbeats were published, (b) get_fleet_registry was never awaited.",
+      "notes": "The nats_client fixture rigs get_fleet_registry to raise AssertionError if anything calls it; the heartbeat_loop body never invokes get_fleet_registry (only nats_client.heartbeat). Test test_heartbeat_loop_with_unreachable_registry_keeps_publishing runs the loop for two ticks and asserts (a) two heartbeats were published, (b) get_fleet_registry was never awaited."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "`heartbeat_loop` exits cleanly when `cancel_event` is set",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Two test paths: (1) test_heartbeat_loop_with_preset_cancel_exits_without_publishing \u2014 pre-set cancel_event makes the while-condition false, zero publishes issued. (2) test_heartbeat_loop_with_cancel_during_sleep_exits_early \u2014 uses a BlockingClock whose sleep blocks for an hour; the test driver sets cancel mid-sleep and the loop exits within a 2s timeout. The internal _sleep_or_cancel helper uses asyncio.wait(FIRST_COMPLETED) to race the sleep against cancel_event.wait() so SIGTERM never stalls for up to one full interval.",
+      "notes": "Two test paths: (1) test_heartbeat_loop_with_preset_cancel_exits_without_publishing \u2014 pre-set cancel_event makes the while-condition false, zero publishes issued. (2) test_heartbeat_loop_with_cancel_during_sleep_exits_early \u2014 uses a BlockingClock whose sleep blocks for an hour; the test driver sets cancel mid-sleep and the loop exits within a 2s timeout. The internal _sleep_or_cancel helper uses asyncio.wait(FIRST_COMPLETED) to race the sleep against cancel_event.wait() so SIGTERM never stalls for up to one full interval."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "SIGTERM integration test: deregister is called before the heartbeat task is cancelled",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "test_sigterm_sequence_with_running_loop_calls_deregister_first attaches register_agent / heartbeat / deregister_agent to a parent MagicMock recorder, drives a full register \u2192 loop-tick \u2192 deregister \u2192 cancel sequence, then asserts on the ordered mock_calls list: relevant[0]=='register', relevant[-1]=='deregister', and 'heartbeat' is in between. Any code path that flips deregister to after cancel breaks this test.",
+      "notes": "test_sigterm_sequence_with_running_loop_calls_deregister_first attaches register_agent / heartbeat / deregister_agent to a parent MagicMock recorder, drives a full register \u2192 loop-tick \u2192 deregister \u2192 cancel sequence, then asserts on the ordered mock_calls list: relevant[0]=='register', relevant[-1]=='deregister', and 'heartbeat' is in between. Any code path that flips deregister to after cancel breaks this test."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Code follows existing project conventions: Black-style 88-char-ish line wrapping, type hints throughout, from __future__ import annotations, Google-style docstrings, snake_case functions, PascalCase classes, UPPER_CASE constants. The existing pipeline_publisher.py (the closest sibling) sets the stylistic precedent and the new fleet_publisher.py mirrors its structure (logger, __all__, module docstring, type-checking imports). No project-level ruff/black configuration files exist in pyproject.toml, so 'project-configured' is interpreted as 'follows the .claude/rules/code-style.md guide' \u2014 which the file does.",
+      "notes": "Code follows existing project conventions: Black-style 88-char-ish line wrapping, type hints throughout, from __future__ import annotations, Google-style docstrings, snake_case functions, PascalCase classes, UPPER_CASE constants. The existing pipeline_publisher.py (the closest sibling) sets the stylistic precedent and the new fleet_publisher.py mirrors its structure (logger, __all__, module docstring, type-checking imports). No project-level ruff/black configuration files exist in pyproject.toml, so 'project-configured' is interpreted as 'follows the .claude/rules/code-style.md guide' \u2014 which the file does."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`register_on_boot` publishes `AgentManifest` to `fleet.register` and puts it in `agent-registry` KV (via `nats_client.register_agent`)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented register_on_boot(nats_client) in src/forge/adapters/nats/fleet_publisher.py as a thin coroutine that awaits nats_client.register_agent(FORGE_MANIFEST). The underlying nats_core NATSClient.register_agent (already in nats-core 0.2.0) publishes to fleet.register and stores the manifest in the agent-registry KV bucket. Tests test_register_on_boot_with_valid_client_calls_register_agent and test_register_on_boot_passes_manifest_through_unchanged verify the call and assert the FORGE_MANIFEST identity is passed unchanged.",
+        "notes": "Implemented register_on_boot(nats_client) in src/forge/adapters/nats/fleet_publisher.py as a thin coroutine that awaits nats_client.register_agent(FORGE_MANIFEST). The underlying nats_core NATSClient.register_agent (already in nats-core 0.2.0) publishes to fleet.register and stores the manifest in the agent-registry KV bucket. Tests test_register_on_boot_with_valid_client_calls_register_agent and test_register_on_boot_passes_manifest_through_unchanged verify the call and assert the FORGE_MANIFEST identity is passed unchanged."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`heartbeat_loop` publishes every `FleetConfig.heartbeat_interval_seconds` using an injected Clock; no wall-clock sleeps in tests",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented heartbeat_loop with a keyword-only `clock: Clock | None = None` injection point and `interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS` (sourced from forge.config.models). Tests use FakeClock that records every sleep duration into a list \u2014 assertions verify clock.sleeps == [30.0, 30.0, ...] and that the loop never calls asyncio.sleep with non-zero duration. The default interval test (test_heartbeat_loop_uses_default_interval_from_config) exercises the FleetConfig default of 30s.",
+        "notes": "Implemented heartbeat_loop with a keyword-only `clock: Clock | None = None` injection point and `interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS` (sourced from forge.config.models). Tests use FakeClock that records every sleep duration into a list \u2014 assertions verify clock.sleeps == [30.0, 30.0, ...] and that the loop never calls asyncio.sleep with non-zero duration. The default interval test (test_heartbeat_loop_uses_default_interval_from_config) exercises the FleetConfig default of 30s."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Heartbeat payload reflects `active_tasks=1` when a build is in-flight, `0` otherwise (read from a `StatusProvider` protocol so tests inject state)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Defined runtime_checkable StatusProvider Protocol with get_current_status / get_active_tasks / get_queue_depth methods. build_heartbeat_payload reads each into the AgentHeartbeatPayload. Tests test_heartbeat_loop_with_busy_provider_publishes_active_tasks_one and test_heartbeat_loop_with_idle_provider_publishes_active_tasks_zero pass FakeStatusProvider(active_tasks=1, status='busy') vs (active_tasks=0, status='ready') and assert the published payload reflects each.",
+        "notes": "Defined runtime_checkable StatusProvider Protocol with get_current_status / get_active_tasks / get_queue_depth methods. build_heartbeat_payload reads each into the AgentHeartbeatPayload. Tests test_heartbeat_loop_with_busy_provider_publishes_active_tasks_one and test_heartbeat_loop_with_idle_provider_publishes_active_tasks_zero pass FakeStatusProvider(active_tasks=1, status='busy') vs (active_tasks=0, status='ready') and assert the published payload reflects each."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`deregister` is idempotent \u2014 calling twice does not raise",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "deregister(nats_client, reason='shutdown') wraps the nats_core call in try/except. The underlying NATSClient.deregister_agent already swallows KeyError on KV delete, so the second call's KV step is a no-op; we additionally swallow any transport exception so SIGTERM teardown always completes. Test test_deregister_called_twice_does_not_raise calls deregister twice and asserts no raise + 2 awaited calls. test_deregister_swallows_underlying_exception confirms a ConnectionError side-effect does not propagate and is logged at WARNING.",
+        "notes": "deregister(nats_client, reason='shutdown') wraps the nats_core call in try/except. The underlying NATSClient.deregister_agent already swallows KeyError on KV delete, so the second call's KV step is a no-op; we additionally swallow any transport exception so SIGTERM teardown always completes. Test test_deregister_called_twice_does_not_raise calls deregister twice and asserts no raise + 2 awaited calls. test_deregister_swallows_underlying_exception confirms a ConnectionError side-effect does not propagate and is logged at WARNING."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Heartbeat loop catches and logs transient publish failures; does not exit the loop",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The publish step in heartbeat_loop is wrapped in try/except Exception (with a # noqa: BLE001 explanatory comment) that logs at WARNING and continues to the sleep step. Test test_heartbeat_loop_with_intermittent_publish_failure_continues scripts a side_effect sequence [ConnectionError('transient bus error'), None, None] and asserts await_count == 3 (the loop kept running) plus the WARNING was logged.",
+        "notes": "The publish step in heartbeat_loop is wrapped in try/except Exception (with a # noqa: BLE001 explanatory comment) that logs at WARNING and continues to the sleep step. Test test_heartbeat_loop_with_intermittent_publish_failure_continues scripts a side_effect sequence [ConnectionError('transient bus error'), None, None] and asserts await_count == 3 (the loop kept running) plus the WARNING was logged."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Registry unreachability test (mock `nats_client.get_fleet_registry` to raise) \u2014 heartbeats continue",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The nats_client fixture rigs get_fleet_registry to raise AssertionError if anything calls it; the heartbeat_loop body never invokes get_fleet_registry (only nats_client.heartbeat). Test test_heartbeat_loop_with_unreachable_registry_keeps_publishing runs the loop for two ticks and asserts (a) two heartbeats were published, (b) get_fleet_registry was never awaited.",
+        "notes": "The nats_client fixture rigs get_fleet_registry to raise AssertionError if anything calls it; the heartbeat_loop body never invokes get_fleet_registry (only nats_client.heartbeat). Test test_heartbeat_loop_with_unreachable_registry_keeps_publishing runs the loop for two ticks and asserts (a) two heartbeats were published, (b) get_fleet_registry was never awaited."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`heartbeat_loop` exits cleanly when `cancel_event` is set",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Two test paths: (1) test_heartbeat_loop_with_preset_cancel_exits_without_publishing \u2014 pre-set cancel_event makes the while-condition false, zero publishes issued. (2) test_heartbeat_loop_with_cancel_during_sleep_exits_early \u2014 uses a BlockingClock whose sleep blocks for an hour; the test driver sets cancel mid-sleep and the loop exits within a 2s timeout. The internal _sleep_or_cancel helper uses asyncio.wait(FIRST_COMPLETED) to race the sleep against cancel_event.wait() so SIGTERM never stalls for up to one full interval.",
+        "notes": "Two test paths: (1) test_heartbeat_loop_with_preset_cancel_exits_without_publishing \u2014 pre-set cancel_event makes the while-condition false, zero publishes issued. (2) test_heartbeat_loop_with_cancel_during_sleep_exits_early \u2014 uses a BlockingClock whose sleep blocks for an hour; the test driver sets cancel mid-sleep and the loop exits within a 2s timeout. The internal _sleep_or_cancel helper uses asyncio.wait(FIRST_COMPLETED) to race the sleep against cancel_event.wait() so SIGTERM never stalls for up to one full interval."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "SIGTERM integration test: deregister is called before the heartbeat task is cancelled",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "test_sigterm_sequence_with_running_loop_calls_deregister_first attaches register_agent / heartbeat / deregister_agent to a parent MagicMock recorder, drives a full register \u2192 loop-tick \u2192 deregister \u2192 cancel sequence, then asserts on the ordered mock_calls list: relevant[0]=='register', relevant[-1]=='deregister', and 'heartbeat' is in between. Any code path that flips deregister to after cancel breaks this test.",
+        "notes": "test_sigterm_sequence_with_running_loop_calls_deregister_first attaches register_agent / heartbeat / deregister_agent to a parent MagicMock recorder, drives a full register \u2192 loop-tick \u2192 deregister \u2192 cancel sequence, then asserts on the ordered mock_calls list: relevant[0]=='register', relevant[-1]=='deregister', and 'heartbeat' is in between. Any code path that flips deregister to after cancel breaks this test."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Code follows existing project conventions: Black-style 88-char-ish line wrapping, type hints throughout, from __future__ import annotations, Google-style docstrings, snake_case functions, PascalCase classes, UPPER_CASE constants. The existing pipeline_publisher.py (the closest sibling) sets the stylistic precedent and the new fleet_publisher.py mirrors its structure (logger, __all__, module docstring, type-checking imports). No project-level ruff/black configuration files exist in pyproject.toml, so 'project-configured' is interpreted as 'follows the .claude/rules/code-style.md guide' \u2014 which the file does.",
+        "notes": "Code follows existing project conventions: Black-style 88-char-ish line wrapping, type hints throughout, from __future__ import annotations, Google-style docstrings, snake_case functions, PascalCase classes, UPPER_CASE constants. The existing pipeline_publisher.py (the closest sibling) sets the stylistic precedent and the new fleet_publisher.py mirrors its structure (logger, __all__, module docstring, type-checking imports). No project-level ruff/black configuration files exist in pyproject.toml, so 'project-configured' is interpreted as 'follows the .claude/rules/code-style.md guide' \u2014 which the file does."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 327 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1599/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- ASSIGNS_TASK_TO\n- DESCRIBES\n- SOURCE_PATTERN\n\n### \u26a0\ufe0f Warnings\n- HAS_SYMPTOM\n- USES_ENDPOINT\n- CAUSES_MOCK_RESULT\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATE_TO_TASK_WORK\n- DELEGATES_TO\n- IS_CREATED_FOR\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

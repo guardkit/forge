@@ -1,0 +1,7 @@
+{
+  "tests_run": 35,
+  "tests_failed": 0,
+  "coverage_pct": 94.01,
+  "output_summary": "pytest tests/forge/discovery: 35 passed, 0 failed, 94.01% line coverage on src/forge/discovery (167 stmts, 10 missed)",
+  "quality_gates_passed": true
+}
