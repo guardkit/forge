@@ -1,22 +1,29 @@
 ---
-id: TASK-SAD-003
-title: "CorrelationRegistry: subscribe-before-publish, exactly-once, source-auth"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 2
-implementation_mode: task-work
 complexity: 7
-dependencies: [TASK-SAD-001]
-tags: [dispatch, correlation, security, exactly-once, les1, source-auth]
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-001
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-003
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- dispatch
+- correlation
+- security
+- exactly-once
+- les1
+- source-auth
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: 'CorrelationRegistry: subscribe-before-publish, exactly-once, source-auth'
+updated: 2026-04-25 00:00:00+00:00
+wave: 2
 ---
 
 # Task: CorrelationRegistry — subscribe-before-publish, exactly-once, source-auth

@@ -1,0 +1,7 @@
+{
+  "tests_run": 112,
+  "tests_failed": 0,
+  "coverage_pct": 97.0,
+  "output_summary": "pytest tests/forge/dispatch (incl. 17 timeout-coordinator tests): 112 passed, 0 failed, 97% line coverage; timeout.py at 100%.",
+  "quality_gates_passed": true
+}

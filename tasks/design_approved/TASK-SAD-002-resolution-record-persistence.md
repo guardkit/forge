@@ -1,28 +1,34 @@
 ---
-id: TASK-SAD-002
-title: "Resolution-record persistence + sensitive-parameter scrub"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 1
-implementation_mode: task-work
 complexity: 5
-dependencies: []
-tags: [dispatch, persistence, security, sensitive-params, sqlite]
 consumer_context:
-  - task: TASK-SAD-001
-    consumes: CapabilityResolution
-    framework: "Pydantic v2"
-    driver: "sqlite via existing forge_pipeline_history schema"
-    format_note: "Read-only consumer of the model; this task implements the durable write path. retry_of field added in TASK-SAD-001 must persist."
+- consumes: CapabilityResolution
+  driver: sqlite via existing forge_pipeline_history schema
+  format_note: Read-only consumer of the model; this task implements the durable write
+    path. retry_of field added in TASK-SAD-001 must persist.
+  framework: Pydantic v2
+  task: TASK-SAD-001
+created: 2026-04-25 00:00:00+00:00
+dependencies: []
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-002
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- dispatch
+- persistence
+- security
+- sensitive-params
+- sqlite
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Resolution-record persistence + sensitive-parameter scrub
+updated: 2026-04-25 00:00:00+00:00
+wave: 1
 ---
 
 # Task: Resolution-record persistence + sensitive-parameter scrub

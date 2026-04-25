@@ -1,22 +1,29 @@
 ---
-id: TASK-SAD-005
-title: "Reply parser: Coach top-level/nested, FLAG_FOR_REVIEW fallback, malformed envelope"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 2
-implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-SAD-001]
-tags: [dispatch, parser, coach-output, schema-validation, gate-fallback]
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-001
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-005
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- dispatch
+- parser
+- coach-output
+- schema-validation
+- gate-fallback
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: 'Reply parser: Coach top-level/nested, FLAG_FOR_REVIEW fallback, malformed
+  envelope'
+updated: 2026-04-25 00:00:00+00:00
+wave: 2
 ---
 
 # Task: Reply parser — Coach output extraction, FLAG_FOR_REVIEW fallback, malformed envelope handling

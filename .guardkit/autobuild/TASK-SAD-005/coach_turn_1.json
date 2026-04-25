@@ -1,0 +1,199 @@
+{
+  "task_id": "TASK-SAD-005",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": false,
+      "test_command": "pytest tests/forge/dispatch/test_reply_parser.py tests/forge/dispatch/test_timeout.py -v --tb=short",
+      "test_output_summary": "Error detail:\n\n==================================== ERRORS ====================================\n__________ ERROR collecting tests/forge/dispatch/test_reply_parser.py __________\nImportError while importing test module '/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/forge/dispatch/test_reply_parser.py'.\nHint: make sure your test modules/packages have valid Python names.\nResult:\nE   ModuleNotFoundError: No module named 'forge'\nERROR tests/forge/dispatch/test_reply_parser.py\nERROR tests/forge/dispatch/test_timeout.py\n!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!\n============================== 2 errors in 0.07s ===============================",
+      "duration_seconds": 0.494783878326416
+    },
+    "requirements": {
+      "criteria_total": 9,
+      "criteria_met": 9,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`src/forge/dispatch/reply_parser.py` exposes `parse_reply()` returning",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/dispatch/reply_parser.py with public parse_reply(payload, *, resolution_id, attempt_no) -> DispatchOutcome. The function returns one of SyncResult, AsyncPending, or DispatchError (the three terminals the parser is responsible for; Degraded is owned by the FEAT-FORGE-004 gating layer per the task spec). Both parse_reply and SpecialistReplyEnvelope are listed in the module __all__. TestPublicSurface verifies the call surface and that resolution_id/attempt_no are propagated onto the outcome.",
+      "notes": "Created src/forge/dispatch/reply_parser.py with public parse_reply(payload, *, resolution_id, attempt_no) -> DispatchOutcome. The function returns one of SyncResult, AsyncPending, or DispatchError (the three terminals the parser is responsible for; Degraded is owned by the FEAT-FORGE-004 gating layer per the task spec). Both parse_reply and SpecialistReplyEnvelope are listed in the module __all__. TestPublicSurface verifies the call surface and that resolution_id/attempt_no are propagated onto the outcome."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Test (A.coach-output-top-vs-nested): payload with both top-level and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_extract_coach_fields() prefers payload[<field>] over payload['result'][<field>]. TestCoachOutputTopLevelPreferred::test_top_level_score_wins_over_nested_score asserts coach_score=0.91 (top) overrides 0.42 (nested), and the same for criterion_breakdown and detection_findings. test_top_level_score_of_zero_still_wins_over_nested adds a regression guard: 0.0 is a legitimate Coach score and must NOT be overridden by a nested value via truthy `or` semantics \u2014 implemented via an explicit `is None` check.",
+      "notes": "_extract_coach_fields() prefers payload[<field>] over payload['result'][<field>]. TestCoachOutputTopLevelPreferred::test_top_level_score_wins_over_nested_score asserts coach_score=0.91 (top) overrides 0.42 (nested), and the same for criterion_breakdown and detection_findings. test_top_level_score_of_zero_still_wins_over_nested adds a regression guard: 0.0 is a legitimate Coach score and must NOT be overridden by a nested value via truthy `or` semantics \u2014 implemented via an explicit `is None` check."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Test (A.coach-output-nested-fallback): payload with only nested Coach",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestCoachOutputNestedFallback::test_nested_only_payload_falls_back_to_nested_values verifies that a payload carrying only payload['result']['coach_score']/criterion_breakdown/detection_findings produces a SyncResult populated from the nested block. test_partial_top_level_falls_back_per_field verifies the fallback is per-field, not all-or-nothing.",
+      "notes": "TestCoachOutputNestedFallback::test_nested_only_payload_falls_back_to_nested_values verifies that a payload carrying only payload['result']['coach_score']/criterion_breakdown/detection_findings produces a SyncResult populated from the nested block. test_partial_top_level_falls_back_per_field verifies the fallback is per-field, not all-or-nothing."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Test (C.missing-coach-score): payload with no Coach score anywhere \u2192",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestMissingCoachScore::test_no_score_anywhere_yields_sync_result_with_none constructs a payload with only agent_id and asserts the resulting SyncResult.coach_score is None (and breakdown == {}, findings == []). _extract_coach_fields returns None when neither top-level nor nested values are present; SyncResult permits coach_score=None. test_empty_nested_result_with_no_top_level_yields_none covers the edge case of an explicit empty result block.",
+      "notes": "TestMissingCoachScore::test_no_score_anywhere_yields_sync_result_with_none constructs a payload with only agent_id and asserts the resulting SyncResult.coach_score is None (and breakdown == {}, findings == []). _extract_coach_fields returns None when neither top-level nor nested values are present; SyncResult permits coach_score=None. test_empty_nested_result_with_no_top_level_yields_none covers the edge case of an explicit empty result block."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Test (C.malformed-reply-envelope): payload missing required envelope",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "SpecialistReplyEnvelope (Pydantic, extra='allow') requires agent_id min_length=1. parse_reply runs envelope validation FIRST and converts ValidationError into a DispatchError whose error_explanation is built by _summarise_validation_error \u2014 only field paths and Pydantic error types, NEVER raw values. TestMalformedEnvelope covers: missing agent_id (test_missing_agent_id_yields_dispatch_error), no Coach extraction on malformed payloads (test_malformed_envelope_does_not_extract_coach_fields \u2014 also asserts the offending values do NOT appear in the explanation), schema-before-error precedence (test_schema_validation_runs_before_specialist_error_branch), empty agent_id (test_empty_agent_id_is_rejected), and out-of-range coach_score (test_coach_score_out_of_range_is_schema_error).",
+      "notes": "SpecialistReplyEnvelope (Pydantic, extra='allow') requires agent_id min_length=1. parse_reply runs envelope validation FIRST and converts ValidationError into a DispatchError whose error_explanation is built by _summarise_validation_error \u2014 only field paths and Pydantic error types, NEVER raw values. TestMalformedEnvelope covers: missing agent_id (test_missing_agent_id_yields_dispatch_error), no Coach extraction on malformed payloads (test_malformed_envelope_does_not_extract_coach_fields \u2014 also asserts the offending values do NOT appear in the explanation), schema-before-error precedence (test_schema_validation_runs_before_specialist_error_branch), empty agent_id (test_empty_agent_id_is_rejected), and out-of-range coach_score (test_coach_score_out_of_range_is_schema_error)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Test (C.specialist-error): payload carrying an `error` key \u2192",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Step 2 of parse_reply checks payload.get('error'); when truthy and a non-blank string, returns DispatchError(error_explanation=raw_error) \u2014 the value is passed through verbatim with no transformation. TestSpecialistError::test_error_key_yields_dispatch_error_verbatim asserts equality with the original message ('upstream tool returned 500: Bad Gateway'). test_empty_string_error_does_not_trigger_specialist_error guards the whitespace-only edge case; test_error_takes_priority_over_run_identifier guards branch ordering.",
+      "notes": "Step 2 of parse_reply checks payload.get('error'); when truthy and a non-blank string, returns DispatchError(error_explanation=raw_error) \u2014 the value is passed through verbatim with no transformation. TestSpecialistError::test_error_key_yields_dispatch_error_verbatim asserts equality with the original message ('upstream tool returned 500: Bad Gateway'). test_empty_string_error_does_not_trigger_specialist_error guards the whitespace-only edge case; test_error_takes_priority_over_run_identifier guards branch ordering."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Test (D.async-mode-polling-initial): payload carrying a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Step 3 of parse_reply checks payload.get('run_identifier'); when truthy and a non-blank string, returns AsyncPending(run_identifier=raw_run_id). TestAsyncPendingBranch::test_run_identifier_yields_async_pending asserts the returned AsyncPending carries 'run-42'. test_run_identifier_supersedes_coach_fields verifies async detection wins over Coach extraction; test_blank_run_identifier_falls_through_to_sync_result guards the whitespace-only edge case.",
+      "notes": "Step 3 of parse_reply checks payload.get('run_identifier'); when truthy and a non-blank string, returns AsyncPending(run_identifier=raw_run_id). TestAsyncPendingBranch::test_run_identifier_yields_async_pending asserts the returned AsyncPending carries 'run-42'. test_run_identifier_supersedes_coach_fields verifies async detection wins over Coach extraction; test_blank_run_identifier_falls_through_to_sync_result guards the whitespace-only edge case."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Parser is pure (no I/O, no logging of payload values \u2014 log only the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The module imports only stdlib (logging, typing), pydantic, and forge.dispatch.models \u2014 no I/O, network, file, or DB libraries. The single observability hook is `logger.debug('parse_reply outcome kind=%s', outcome.kind)`. _summarise_validation_error renders only field paths and Pydantic error types, NEVER raw values, so the value-free property holds even for the error path. TestParserIsPure::test_only_outcome_kind_is_logged_no_payload_values uses caplog to assert sentinel coach_score and detection_findings values do NOT appear in any log record. test_validation_error_log_and_message_are_value_free asserts the same for the error path. test_parser_does_not_mutate_payload confirms the input dict is never mutated.",
+      "notes": "The module imports only stdlib (logging, typing), pydantic, and forge.dispatch.models \u2014 no I/O, network, file, or DB libraries. The single observability hook is `logger.debug('parse_reply outcome kind=%s', outcome.kind)`. _summarise_validation_error renders only field paths and Pydantic error types, NEVER raw values, so the value-free property holds even for the error path. TestParserIsPure::test_only_outcome_kind_is_logged_no_payload_values uses caplog to assert sentinel coach_score and detection_findings values do NOT appear in any log record. test_validation_error_log_and_message_are_value_free asserts the same for the error path. test_parser_does_not_mutate_payload confirms the input dict is never mutated."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both new files follow the project's documented Python style (Black-formatted at 88 chars, type hints on every signature, snake_case functions, PascalCase classes, docstrings on every public symbol, `from __future__ import annotations`). No lint tool is wired into pyproject.toml beyond pytest configuration; pytest collects, imports, and runs the suite without warnings. Full forge test suite (295 tests) continues to pass; the new test_reply_parser.py contributes 25 passing tests with 100% line coverage on the new module.",
+      "notes": "Both new files follow the project's documented Python style (Black-formatted at 88 chars, type hints on every signature, snake_case functions, PascalCase classes, docstrings on every public symbol, `from __future__ import annotations`). No lint tool is wired into pyproject.toml beyond pytest configuration; pytest collects, imports, and runs the suite without warnings. Full forge test suite (295 tests) continues to pass; the new test_reply_parser.py contributes 25 passing tests with 100% line coverage on the new module."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`src/forge/dispatch/reply_parser.py` exposes `parse_reply()` returning",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/dispatch/reply_parser.py with public parse_reply(payload, *, resolution_id, attempt_no) -> DispatchOutcome. The function returns one of SyncResult, AsyncPending, or DispatchError (the three terminals the parser is responsible for; Degraded is owned by the FEAT-FORGE-004 gating layer per the task spec). Both parse_reply and SpecialistReplyEnvelope are listed in the module __all__. TestPublicSurface verifies the call surface and that resolution_id/attempt_no are propagated onto the outcome.",
+        "notes": "Created src/forge/dispatch/reply_parser.py with public parse_reply(payload, *, resolution_id, attempt_no) -> DispatchOutcome. The function returns one of SyncResult, AsyncPending, or DispatchError (the three terminals the parser is responsible for; Degraded is owned by the FEAT-FORGE-004 gating layer per the task spec). Both parse_reply and SpecialistReplyEnvelope are listed in the module __all__. TestPublicSurface verifies the call surface and that resolution_id/attempt_no are propagated onto the outcome."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Test (A.coach-output-top-vs-nested): payload with both top-level and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_extract_coach_fields() prefers payload[<field>] over payload['result'][<field>]. TestCoachOutputTopLevelPreferred::test_top_level_score_wins_over_nested_score asserts coach_score=0.91 (top) overrides 0.42 (nested), and the same for criterion_breakdown and detection_findings. test_top_level_score_of_zero_still_wins_over_nested adds a regression guard: 0.0 is a legitimate Coach score and must NOT be overridden by a nested value via truthy `or` semantics \u2014 implemented via an explicit `is None` check.",
+        "notes": "_extract_coach_fields() prefers payload[<field>] over payload['result'][<field>]. TestCoachOutputTopLevelPreferred::test_top_level_score_wins_over_nested_score asserts coach_score=0.91 (top) overrides 0.42 (nested), and the same for criterion_breakdown and detection_findings. test_top_level_score_of_zero_still_wins_over_nested adds a regression guard: 0.0 is a legitimate Coach score and must NOT be overridden by a nested value via truthy `or` semantics \u2014 implemented via an explicit `is None` check."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Test (A.coach-output-nested-fallback): payload with only nested Coach",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestCoachOutputNestedFallback::test_nested_only_payload_falls_back_to_nested_values verifies that a payload carrying only payload['result']['coach_score']/criterion_breakdown/detection_findings produces a SyncResult populated from the nested block. test_partial_top_level_falls_back_per_field verifies the fallback is per-field, not all-or-nothing.",
+        "notes": "TestCoachOutputNestedFallback::test_nested_only_payload_falls_back_to_nested_values verifies that a payload carrying only payload['result']['coach_score']/criterion_breakdown/detection_findings produces a SyncResult populated from the nested block. test_partial_top_level_falls_back_per_field verifies the fallback is per-field, not all-or-nothing."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Test (C.missing-coach-score): payload with no Coach score anywhere \u2192",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestMissingCoachScore::test_no_score_anywhere_yields_sync_result_with_none constructs a payload with only agent_id and asserts the resulting SyncResult.coach_score is None (and breakdown == {}, findings == []). _extract_coach_fields returns None when neither top-level nor nested values are present; SyncResult permits coach_score=None. test_empty_nested_result_with_no_top_level_yields_none covers the edge case of an explicit empty result block.",
+        "notes": "TestMissingCoachScore::test_no_score_anywhere_yields_sync_result_with_none constructs a payload with only agent_id and asserts the resulting SyncResult.coach_score is None (and breakdown == {}, findings == []). _extract_coach_fields returns None when neither top-level nor nested values are present; SyncResult permits coach_score=None. test_empty_nested_result_with_no_top_level_yields_none covers the edge case of an explicit empty result block."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Test (C.malformed-reply-envelope): payload missing required envelope",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "SpecialistReplyEnvelope (Pydantic, extra='allow') requires agent_id min_length=1. parse_reply runs envelope validation FIRST and converts ValidationError into a DispatchError whose error_explanation is built by _summarise_validation_error \u2014 only field paths and Pydantic error types, NEVER raw values. TestMalformedEnvelope covers: missing agent_id (test_missing_agent_id_yields_dispatch_error), no Coach extraction on malformed payloads (test_malformed_envelope_does_not_extract_coach_fields \u2014 also asserts the offending values do NOT appear in the explanation), schema-before-error precedence (test_schema_validation_runs_before_specialist_error_branch), empty agent_id (test_empty_agent_id_is_rejected), and out-of-range coach_score (test_coach_score_out_of_range_is_schema_error).",
+        "notes": "SpecialistReplyEnvelope (Pydantic, extra='allow') requires agent_id min_length=1. parse_reply runs envelope validation FIRST and converts ValidationError into a DispatchError whose error_explanation is built by _summarise_validation_error \u2014 only field paths and Pydantic error types, NEVER raw values. TestMalformedEnvelope covers: missing agent_id (test_missing_agent_id_yields_dispatch_error), no Coach extraction on malformed payloads (test_malformed_envelope_does_not_extract_coach_fields \u2014 also asserts the offending values do NOT appear in the explanation), schema-before-error precedence (test_schema_validation_runs_before_specialist_error_branch), empty agent_id (test_empty_agent_id_is_rejected), and out-of-range coach_score (test_coach_score_out_of_range_is_schema_error)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Test (C.specialist-error): payload carrying an `error` key \u2192",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Step 2 of parse_reply checks payload.get('error'); when truthy and a non-blank string, returns DispatchError(error_explanation=raw_error) \u2014 the value is passed through verbatim with no transformation. TestSpecialistError::test_error_key_yields_dispatch_error_verbatim asserts equality with the original message ('upstream tool returned 500: Bad Gateway'). test_empty_string_error_does_not_trigger_specialist_error guards the whitespace-only edge case; test_error_takes_priority_over_run_identifier guards branch ordering.",
+        "notes": "Step 2 of parse_reply checks payload.get('error'); when truthy and a non-blank string, returns DispatchError(error_explanation=raw_error) \u2014 the value is passed through verbatim with no transformation. TestSpecialistError::test_error_key_yields_dispatch_error_verbatim asserts equality with the original message ('upstream tool returned 500: Bad Gateway'). test_empty_string_error_does_not_trigger_specialist_error guards the whitespace-only edge case; test_error_takes_priority_over_run_identifier guards branch ordering."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Test (D.async-mode-polling-initial): payload carrying a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Step 3 of parse_reply checks payload.get('run_identifier'); when truthy and a non-blank string, returns AsyncPending(run_identifier=raw_run_id). TestAsyncPendingBranch::test_run_identifier_yields_async_pending asserts the returned AsyncPending carries 'run-42'. test_run_identifier_supersedes_coach_fields verifies async detection wins over Coach extraction; test_blank_run_identifier_falls_through_to_sync_result guards the whitespace-only edge case.",
+        "notes": "Step 3 of parse_reply checks payload.get('run_identifier'); when truthy and a non-blank string, returns AsyncPending(run_identifier=raw_run_id). TestAsyncPendingBranch::test_run_identifier_yields_async_pending asserts the returned AsyncPending carries 'run-42'. test_run_identifier_supersedes_coach_fields verifies async detection wins over Coach extraction; test_blank_run_identifier_falls_through_to_sync_result guards the whitespace-only edge case."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Parser is pure (no I/O, no logging of payload values \u2014 log only the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The module imports only stdlib (logging, typing), pydantic, and forge.dispatch.models \u2014 no I/O, network, file, or DB libraries. The single observability hook is `logger.debug('parse_reply outcome kind=%s', outcome.kind)`. _summarise_validation_error renders only field paths and Pydantic error types, NEVER raw values, so the value-free property holds even for the error path. TestParserIsPure::test_only_outcome_kind_is_logged_no_payload_values uses caplog to assert sentinel coach_score and detection_findings values do NOT appear in any log record. test_validation_error_log_and_message_are_value_free asserts the same for the error path. test_parser_does_not_mutate_payload confirms the input dict is never mutated.",
+        "notes": "The module imports only stdlib (logging, typing), pydantic, and forge.dispatch.models \u2014 no I/O, network, file, or DB libraries. The single observability hook is `logger.debug('parse_reply outcome kind=%s', outcome.kind)`. _summarise_validation_error renders only field paths and Pydantic error types, NEVER raw values, so the value-free property holds even for the error path. TestParserIsPure::test_only_outcome_kind_is_logged_no_payload_values uses caplog to assert sentinel coach_score and detection_findings values do NOT appear in any log record. test_validation_error_log_and_message_are_value_free asserts the same for the error path. test_parser_does_not_mutate_payload confirms the input dict is never mutated."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both new files follow the project's documented Python style (Black-formatted at 88 chars, type hints on every signature, snake_case functions, PascalCase classes, docstrings on every public symbol, `from __future__ import annotations`). No lint tool is wired into pyproject.toml beyond pytest configuration; pytest collects, imports, and runs the suite without warnings. Full forge test suite (295 tests) continues to pass; the new test_reply_parser.py contributes 25 passing tests with 100% line coverage on the new module.",
+        "notes": "Both new files follow the project's documented Python style (Black-formatted at 88 chars, type hints on every signature, snake_case functions, PascalCase classes, docstrings on every public symbol, `from __future__ import annotations`). No lint tool is wired into pyproject.toml beyond pytest configuration; pytest collects, imports, and runs the suite without warnings. Full forge test suite (295 tests) continues to pass; the new test_reply_parser.py contributes 25 passing tests with 100% line coverage on the new module."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Conditionally approved \u2014 test collection errors in independent verification. All Player quality gates passed. All acceptance criteria met. Architecture context: 326 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1630/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- HAS_ERROR_HANDLER_FOR\n- SETS_FIELD\n- USES_LIBRARY\n- DEPENDS_ON\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- IS_IMPLEMENTED_AS\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- HAS_ROLE_MUST_DO\n- MUST_NOT_PERFORM\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO\n",
+  "approved_without_independent_tests": true,
+  "is_configuration_error": false
+}

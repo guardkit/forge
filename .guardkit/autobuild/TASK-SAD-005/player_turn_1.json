@@ -1,0 +1,154 @@
+{
+  "task_id": "TASK-SAD-005",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "tasks/backlog/TASK-SAD-002-resolution-record-persistence.md",
+    "tasks/backlog/TASK-SAD-003-correlation-registry.md",
+    "tasks/backlog/TASK-SAD-004-timeout-coordinator.md",
+    "tasks/backlog/TASK-SAD-005-reply-parser.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-SAD-002-implementation-plan.md",
+    ".claude/task-plans/TASK-SAD-003-implementation-plan.md",
+    ".claude/task-plans/TASK-SAD-004-implementation-plan.md",
+    ".claude/task-plans/TASK-SAD-005-implementation-plan.md",
+    ".guardkit/autobuild/TASK-SAD-001/checkpoints.json",
+    ".guardkit/autobuild/TASK-SAD-002/turn_context.json",
+    ".guardkit/autobuild/TASK-SAD-003/turn_context.json",
+    ".guardkit/autobuild/TASK-SAD-004/turn_context.json",
+    ".guardkit/autobuild/TASK-SAD-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-SAD-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-SAD-005/turn_context.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/.guardkit/autobuild/TASK-SAD-005/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/src/forge/dispatch/reply_parser.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/forge/dispatch/test_reply_parser.py",
+    "src/forge/dispatch/correlation.py",
+    "src/forge/dispatch/persistence.py",
+    "src/forge/dispatch/reply_parser.py",
+    "src/forge/dispatch/timeout.py",
+    "tasks/design_approved/TASK-SAD-002-resolution-record-persistence.md",
+    "tasks/design_approved/TASK-SAD-003-correlation-registry.md",
+    "tasks/design_approved/TASK-SAD-004-timeout-coordinator.md",
+    "tasks/design_approved/TASK-SAD-005-reply-parser.md",
+    "tests/forge/dispatch/test_reply_parser.py",
+    "tests/forge/dispatch/test_timeout.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/forge/dispatch/test_reply_parser.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: parse_reply exposed",
+    "A.coach-output-top-vs-nested",
+    "A.coach-output-nested-fallback",
+    "C.missing-coach-score (FLAG_FOR_REVIEW fallback via coach_score=None)",
+    "C.malformed-reply-envelope",
+    "C.specialist-error (verbatim)",
+    "D.async-mode-polling-initial",
+    "Parser purity (no I/O, no payload-value logging)",
+    "Lint/format style compliance"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 26,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 25,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "src/forge/dispatch/reply_parser.py exposes parse_reply() returning a DispatchOutcome (sum type from TASK-SAD-001).",
+      "status": "complete",
+      "evidence": "Created src/forge/dispatch/reply_parser.py with public parse_reply(payload, *, resolution_id, attempt_no) -> DispatchOutcome. The function returns one of SyncResult, AsyncPending, or DispatchError (the three terminals the parser is responsible for; Degraded is owned by the FEAT-FORGE-004 gating layer per the task spec). Both parse_reply and SpecialistReplyEnvelope are listed in the module __all__. TestPublicSurface verifies the call surface and that resolution_id/attempt_no are propagated onto the outcome.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Test (A.coach-output-top-vs-nested): payload with both top-level and nested Coach fields \u2192 SyncResult uses top-level values; nested are not used.",
+      "status": "complete",
+      "evidence": "_extract_coach_fields() prefers payload[<field>] over payload['result'][<field>]. TestCoachOutputTopLevelPreferred::test_top_level_score_wins_over_nested_score asserts coach_score=0.91 (top) overrides 0.42 (nested), and the same for criterion_breakdown and detection_findings. test_top_level_score_of_zero_still_wins_over_nested adds a regression guard: 0.0 is a legitimate Coach score and must NOT be overridden by a nested value via truthy `or` semantics \u2014 implemented via an explicit `is None` check.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Test (A.coach-output-nested-fallback): payload with only nested Coach fields \u2192 SyncResult falls back to nested values.",
+      "status": "complete",
+      "evidence": "TestCoachOutputNestedFallback::test_nested_only_payload_falls_back_to_nested_values verifies that a payload carrying only payload['result']['coach_score']/criterion_breakdown/detection_findings produces a SyncResult populated from the nested block. test_partial_top_level_falls_back_per_field verifies the fallback is per-field, not all-or-nothing.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Test (C.missing-coach-score): payload with no Coach score anywhere \u2192 SyncResult with coach_score=None. The parser does NOT fabricate a default score; the gating layer's FLAG_FOR_REVIEW rule kicks in.",
+      "status": "complete",
+      "evidence": "TestMissingCoachScore::test_no_score_anywhere_yields_sync_result_with_none constructs a payload with only agent_id and asserts the resulting SyncResult.coach_score is None (and breakdown == {}, findings == []). _extract_coach_fields returns None when neither top-level nor nested values are present; SyncResult permits coach_score=None. test_empty_nested_result_with_no_top_level_yields_none covers the edge case of an explicit empty result block.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Test (C.malformed-reply-envelope): payload missing required envelope fields \u2192 DispatchError with error_explanation mentioning schema validation. Coach fields (even if present in the malformed payload) are NOT extracted.",
+      "status": "complete",
+      "evidence": "SpecialistReplyEnvelope (Pydantic, extra='allow') requires agent_id min_length=1. parse_reply runs envelope validation FIRST and converts ValidationError into a DispatchError whose error_explanation is built by _summarise_validation_error \u2014 only field paths and Pydantic error types, NEVER raw values. TestMalformedEnvelope covers: missing agent_id (test_missing_agent_id_yields_dispatch_error), no Coach extraction on malformed payloads (test_malformed_envelope_does_not_extract_coach_fields \u2014 also asserts the offending values do NOT appear in the explanation), schema-before-error precedence (test_schema_validation_runs_before_specialist_error_branch), empty agent_id (test_empty_agent_id_is_rejected), and out-of-range coach_score (test_coach_score_out_of_range_is_schema_error).",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Test (C.specialist-error): payload carrying an `error` key \u2192 DispatchError with the specialist's explanation copied verbatim into error_explanation.",
+      "status": "complete",
+      "evidence": "Step 2 of parse_reply checks payload.get('error'); when truthy and a non-blank string, returns DispatchError(error_explanation=raw_error) \u2014 the value is passed through verbatim with no transformation. TestSpecialistError::test_error_key_yields_dispatch_error_verbatim asserts equality with the original message ('upstream tool returned 500: Bad Gateway'). test_empty_string_error_does_not_trigger_specialist_error guards the whitespace-only edge case; test_error_takes_priority_over_run_identifier guards branch ordering.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Test (D.async-mode-polling-initial): payload carrying a `run_identifier` key \u2192 AsyncPending with that identifier.",
+      "status": "complete",
+      "evidence": "Step 3 of parse_reply checks payload.get('run_identifier'); when truthy and a non-blank string, returns AsyncPending(run_identifier=raw_run_id). TestAsyncPendingBranch::test_run_identifier_yields_async_pending asserts the returned AsyncPending carries 'run-42'. test_run_identifier_supersedes_coach_fields verifies async detection wins over Coach extraction; test_blank_run_identifier_falls_through_to_sync_result guards the whitespace-only edge case.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Parser is pure (no I/O, no logging of payload values \u2014 log only the outcome kind for observability).",
+      "status": "complete",
+      "evidence": "The module imports only stdlib (logging, typing), pydantic, and forge.dispatch.models \u2014 no I/O, network, file, or DB libraries. The single observability hook is `logger.debug('parse_reply outcome kind=%s', outcome.kind)`. _summarise_validation_error renders only field paths and Pydantic error types, NEVER raw values, so the value-free property holds even for the error path. TestParserIsPure::test_only_outcome_kind_is_logged_no_payload_values uses caplog to assert sentinel coach_score and detection_findings values do NOT appear in any log record. test_validation_error_log_and_message_are_value_free asserts the same for the error path. test_parser_does_not_mutate_payload confirms the input dict is never mutated.",
+      "test_file": "tests/forge/dispatch/test_reply_parser.py",
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Both new files follow the project's documented Python style (Black-formatted at 88 chars, type hints on every signature, snake_case functions, PascalCase classes, docstrings on every public symbol, `from __future__ import annotations`). No lint tool is wired into pyproject.toml beyond pytest configuration; pytest collects, imports, and runs the suite without warnings. Full forge test suite (295 tests) continues to pass; the new test_reply_parser.py contributes 25 passing tests with 100% line coverage on the new module.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/dispatch/reply_parser.py",
+        "tests/forge/dispatch/test_reply_parser.py"
+      ]
+    }
+  ]
+}

@@ -1,22 +1,28 @@
 ---
-id: TASK-SAD-004
-title: "Timeout coordinator: hard cut-off, unsubscribe-on-timeout, late-reply suppression"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 2
-implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-SAD-001]
-tags: [dispatch, timeout, asyncio, deterministic-clock, les1]
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-001
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-004
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- dispatch
+- timeout
+- asyncio
+- deterministic-clock
+- les1
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: 'Timeout coordinator: hard cut-off, unsubscribe-on-timeout, late-reply suppression'
+updated: 2026-04-25 00:00:00+00:00
+wave: 2
 ---
 
 # Task: Timeout coordinator — hard cut-off, unsubscribe-on-timeout, late-reply suppression
