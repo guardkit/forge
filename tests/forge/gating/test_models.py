@@ -436,8 +436,13 @@ class TestEvaluateGateStub:
             )
 
     def test_evaluate_gate_return_annotation_is_gate_decision(self) -> None:
-        sig = inspect.signature(evaluate_gate)
-        assert sig.return_annotation is GateDecision
+        # ``from __future__ import annotations`` keeps annotations as
+        # strings; resolve them through ``get_type_hints`` to compare to
+        # the actual class object.
+        import typing
+
+        hints = typing.get_type_hints(evaluate_gate)
+        assert hints["return"] is GateDecision
 
     def test_constitutional_rule_can_be_constructed(self) -> None:
         # Ensures the placeholder type used by the stub signature is real.

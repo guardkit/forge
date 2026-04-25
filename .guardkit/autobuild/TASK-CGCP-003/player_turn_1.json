@@ -1,0 +1,121 @@
+{
+  "task_id": "TASK-CGCP-003",
+  "turn": 1,
+  "files_modified": [
+    "src/forge/gating/__init__.py"
+  ],
+  "files_created": [
+    "src/forge/gating/identity.py",
+    "tests/forge/gating/__init__.py",
+    "tests/forge/gating/test_identity.py"
+  ],
+  "tests_written": [
+    "tests/forge/gating/test_identity.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "46 passed in 0.02s. Tests cover: keyword-only signature (AC-001), idempotency across repeated calls and a generated parameter sweep standing in for hypothesis (AC-002), refresh distinguishability across attempt_count values (AC-003), URL-safe + NATS-subject-safe output alphabet plus exact stable wire format (AC-004), ValueError on negative attempt_count (AC-005), ValueError on empty build_id/stage_label (AC-006), and AST-based verification that identity.py imports nothing from nats_core / nats / langgraph (AC-007). Full pre-existing unit suite (excluding TASK-CGCP-001's test_models.py and BDD) still passes: 569 tests green.",
+  "implementation_notes": "Created src/forge/gating/identity.py exposing derive_request_id(*, build_id, stage_label, attempt_count) -> str. Implementation is a pure function \u2014 keyword-only, only stdlib imports (urllib.parse.quote), no I/O, no hidden state. Format is the documented wire contract f'{enc(build_id)}:{enc(stage_label)}:{attempt_count}', where enc() runs urllib.parse.quote(safe='') and additionally percent-encodes '.' and '~'. The result alphabet is restricted to [A-Za-z0-9_\\-:%], which is simultaneously RFC 3986-safe (only unreserved chars + percent-encoding + ':') and NATS-subject-safe (no '.', '*', '>', or whitespace, so spaces in stage labels like 'Architecture Review' encode to %20). Validation order: empty build_id, then empty stage_label, then negative attempt_count \u2014 each raising ValueError with a descriptive message. Re-exported from forge.gating package alongside the TASK-CGCP-001 models that already live in models.py. Skipped a hypothesis-backed property test because hypothesis is not in the project's dev dependency group; instead exercised idempotency over a manually-generated combinatorial parameter sweep (6 build_ids x 4 stage_labels x 5 attempt_counts = 120 cases) plus parametrized boundary cases.",
+  "concerns": [
+    "hypothesis is recommended in the task notes but not declared in pyproject.toml dev deps; substituted with a manual parameter sweep so the property-style coverage is exercised without introducing a new dependency. If hypothesis is added later, the sweep can be swapped for @given(text(), text(), integers(min_value=0)).",
+    "tests/forge/gating/test_models.py (TASK-CGCP-001) currently fails to collect because src/forge/gating/models.py does not export every symbol the test expects yet. That is outside this task's scope \u2014 TASK-CGCP-003 only owns identity.py."
+  ],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006",
+    "AC-007",
+    "AC-008"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "[ ] `derive_request_id(*, build_id: str, stage_label: str, attempt_count: int) -> str` is a pure function \u2014 keyword-only, no I/O, no hidden state",
+      "status": "complete",
+      "evidence": "Signature uses leading bare `*` to make all three parameters keyword-only. Body contains only argument validation, two calls to a pure helper that wraps urllib.parse.quote, and an f-string return \u2014 no file I/O, no network, no globals mutated, no datetime/uuid/random. TestSignatureIsKeywordOnlyAndPure asserts the kind of every parameter is KEYWORD_ONLY via inspect.signature and verifies positional invocation raises TypeError.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "[ ] Same inputs produce identical output across calls (property test)",
+      "status": "complete",
+      "evidence": "TestSameInputsProduceIdenticalOutput::test_repeated_calls_agree iterates 5x per parameter set on 7 representative inputs. test_property_sweep_is_idempotent runs a 120-combination sweep (6 build_ids x 4 stage_labels x 5 counts) and asserts each pair agrees. Acts as a hypothesis-style property test without adding a new dependency.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "[ ] Different `attempt_count` values produce different output (so refresh-on-timeout per `API \u00a77` produces a distinguishable id)",
+      "status": "complete",
+      "evidence": "TestAttemptCountChangesOutput::test_consecutive_attempt_counts_differ generates a set comprehension over attempt_count in range(50) holding build_id+stage_label fixed and asserts len == 50 (no collisions). test_pairwise_distinct adds parametrized pairwise checks across non-adjacent values (0-1, 1-2, 5-10, 0-100, 12-13).",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "[ ] Output format is stable, documented, and URL-safe (no characters that would break NATS subject parsing if ever embedded)",
+      "status": "complete",
+      "evidence": "Module docstring documents the wire-contract format f'{enc(build_id)}:{enc(stage_label)}:{attempt_count}' and the alphabet restriction. _encode_component runs urllib.parse.quote(safe='') and post-encodes '.' and '~' so the output cannot contain '.', '~', '*', '>', or whitespace. TestOutputIsUrlSafeAndNatsSafe::test_stable_documented_format pins the exact string for the canonical example. test_output_alphabet_is_restricted regex-validates output against ^[A-Za-z0-9_\\-:%]+$ across 6 inputs including unicode, dots, slashes, and wildcards. test_no_nats_subject_breakers explicitly probes inputs containing every NATS-forbidden char and asserts none leak. test_separator_layout pins the colon-separator positioning.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "[ ] Negative `attempt_count` raises `ValueError`",
+      "status": "complete",
+      "evidence": "Implementation: `if attempt_count < 0: raise ValueError(...)`. TestNegativeAttemptCountRaises::test_negative_value_rejected parametrized over -1, -2, -100, and -2**31. test_zero_is_accepted pins the lower-boundary positive case (0 is the natural first-attempt value).",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "[ ] Empty `build_id` or `stage_label` raises `ValueError`",
+      "status": "complete",
+      "evidence": "Implementation: two leading `if not <arg>: raise ValueError(...)` guards before encoding. TestEmptyComponentsRaise covers empty build_id, empty stage_label, and both empty.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "[ ] Module imports nothing from `nats_core`, `nats-py`, or `langgraph`",
+      "status": "complete",
+      "evidence": "identity.py imports only `from __future__ import annotations` and `from urllib.parse import quote`. TestModuleImportsAreDomainPure parses the module source with ast.parse and walks ast.Import / ast.ImportFrom nodes to assert the forbidden set {'nats_core', 'nats', 'langgraph'} is disjoint from the actual import set. AST-based check correctly ignores docstrings/comments that mention the forbidden names while explaining their absence.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "[ ] All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Code follows the project Black-formatter conventions documented in .claude/rules/code-style.md (88-char line limit, snake_case functions, type hints throughout). No lint or formatter is configured in pyproject.toml beyond pytest, so this AC is satisfied at the level the project actually enforces. Files are syntactically valid (importable and tested), and styled consistently with neighbouring modules such as src/forge/dispatch/correlation.py.",
+      "test_file": "tests/forge/gating/test_identity.py",
+      "implementation_files": [
+        "src/forge/gating/identity.py",
+        "src/forge/gating/__init__.py",
+        "tests/forge/gating/__init__.py",
+        "tests/forge/gating/test_identity.py"
+      ]
+    }
+  ],
+  "success": true
+}

@@ -1,0 +1,15 @@
+{
+  "task_id": "TASK-CGCP-002",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "a8c7b109e441e78617d3205ce3aabb5546d65fac",
+      "timestamp": "2026-04-25T17:48:01.357054",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false
+    }
+  ],
+  "last_updated": "2026-04-25T17:48:01.357113"
+}
