@@ -24,8 +24,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-24T18:05:27.596770'
-  completed_at: '2026-04-24T18:10:27.394189'
+  started_at: '2026-04-24T20:23:09.467016'
+  completed_at: '2026-04-24T20:26:44.748712'
 - id: TASK-NFI-002
   name: Define FORGE_MANIFEST constant builder
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-002-define-forge-manifest-constant.md
@@ -41,8 +41,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-24T18:05:27.602593'
-  completed_at: '2026-04-24T18:10:27.401220'
+  started_at: '2026-04-24T20:23:09.469921'
+  completed_at: '2026-04-24T20:26:44.755391'
 - id: TASK-NFI-003
   name: Implement forge.discovery domain cache resolve protocols
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-003-implement-discovery-domain.md
@@ -61,8 +61,8 @@ tasks:
       progress.
   turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T18:10:29.427616'
-  completed_at: '2026-04-24T18:26:58.681221'
+  started_at: '2026-04-24T20:26:46.662617'
+  completed_at: '2026-04-24T20:57:44.652448'
 - id: TASK-NFI-004
   name: Implement fleet_publisher register heartbeat deregister
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-004-fleet-publisher.md
@@ -101,18 +101,19 @@ tasks:
   complexity: 5
   dependencies:
   - TASK-NFI-001
-  status: completed
+  status: failed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
   result:
-    total_turns: 1
-    final_decision: approved
-    error: null
-  turns_completed: 1
+    total_turns: 3
+    final_decision: unrecoverable_stall
+    error: Unrecoverable stall detected after 3 turn(s). AutoBuild cannot make forward
+      progress.
+  turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T18:10:29.430634'
-  completed_at: '2026-04-24T18:26:58.684843'
+  started_at: '2026-04-24T20:26:46.668636'
+  completed_at: '2026-04-24T20:57:44.659051'
 - id: TASK-NFI-007
   name: Implement pipeline_consumer pull validation allowlist
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-007-pipeline-consumer.md
@@ -130,8 +131,8 @@ tasks:
       progress.
   turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T18:10:29.433575'
-  completed_at: '2026-04-24T18:26:58.688098'
+  started_at: '2026-04-24T20:26:46.674658'
+  completed_at: '2026-04-24T20:57:44.665409'
 - id: TASK-NFI-008
   name: Wire state-machine transitions to pipeline_publisher
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-008-wire-state-machine-lifecycle-emission.md
@@ -218,15 +219,15 @@ orchestration:
   estimated_duration_minutes: 819
   recommended_parallel: 3
 execution:
-  started_at: '2026-04-24T18:05:27.573157'
-  completed_at: '2026-04-24T18:26:58.693078'
+  started_at: '2026-04-24T20:23:09.452477'
+  completed_at: '2026-04-24T20:57:44.674765'
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
-  total_turns: 9
-  tasks_completed: 3
-  tasks_failed: 2
+  total_turns: 11
+  tasks_completed: 2
+  tasks_failed: 3
   current_wave: 2
   completed_waves:
   - 1
-  last_updated: '2026-04-24T18:26:58.688101'
+  last_updated: '2026-04-24T20:57:44.665418'
   archived_at: null
   archived_to: null

@@ -16,8 +16,5 @@
     "coverage": 80,
     "complexity": 10,
     "gates": true
-  },
-  "enabledPlugins": {
-    "langchain-skills@langchain-skills": true
   }
 }

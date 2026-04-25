@@ -2265,6 +2265,221 @@ tests
 
 
 
+/feature-spec FEAT-FORGE-003 \
+  --context forge/docs/design/contracts/API-nats-agent-dispatch.md \
+  --context forge/docs/design/models/DM-discovery.md \
+  --context forge/docs/design/decisions/DDR-001-reply-subject-correlation.md \
+  --context nats-core/docs/design/specs/nats-core-system-spec.md
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: Specialist Agent Delegation (FEAT-FORGE-003)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Files written:
+
+features/specialist-agent-delegation/specialist-agent-delegation.feature
+features/specialist-agent-delegation/specialist-agent-delegation_assumptions.yaml
+features/specialist-agent-delegation/specialist-agent-delegation_summary.md
+Scenarios: 33 total
+
+@key-example: 5 · @boundary: 6
+@negative: 9 · @edge-case: 15
+@smoke: 2 · @regression: 0
+@security: 3 · @concurrency: 3 · @data-integrity: 1 · @integration: 2
+Assumptions: 6 total
+
+high: 5 (auto-proceed)
+medium: 1 (Coach review recommended — ASSUM-005, retry policy)
+low: 0
+Review required: No — all assumptions grounded in supplied context files and ADRs.
+
+Deferred: None.
+
+Next step:
+
+
+/feature-plan "Specialist Agent Delegation" \
+  --context features/specialist-agent-delegation/specialist-agent-delegation_summary.md
+/feature-plan Step 11 will insert @task:<TASK-ID> tags into the .feature file after tasks are created.
+
+
+
+
+
+
+
+/feature-spec FEAT-FORGE-005 \
+  --context forge/docs/design/contracts/API-tool-layer.md \
+  --context forge/docs/design/contracts/API-subprocess.md \
+  --context forge/docs/design/decisions/DDR-005-cli-context-manifest-resolution.md
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: GuardKit Command Invocation Engine (FEAT-FORGE-005)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files written:
+
+guardkit-command-invocation-engine.feature
+guardkit-command-invocation-engine_assumptions.yaml
+guardkit-command-invocation-engine_summary.md
+Scenarios: 32 total
+@key-example: 7   @boundary: 6
+@negative: 10     @edge-case: 14
+@smoke: 3         @regression: 0
+
+Assumptions: 7 total
+high: 4 (auto-proceed — all drawn from API-subprocess.md / DDR-005 explicit text)
+medium: 3 (Coach-reviewable — retry contract, in-build parallelism, cross-build isolation)
+low: 0
+
+Deferred: none.
+
+Review required: No — no low-confidence assumptions.
+
+Next steps:
+
+Review: guardkit-command-invocation-engine.feature
+Pass to feature-plan (FEAT-FORGE-005 depends on FEAT-FORGE-001, can parallel FEAT-FORGE-002):
+
+guardkit feature-plan FEAT-FORGE-005 \
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine_summary.md
+
+
+
+
+/feature-spec FEAT-FORGE-006 \
+  --context forge/docs/design/models/DM-graphiti-entities.md \
+  --context forge/docs/design/models/DM-calibration.md \
+  --context forge/docs/design/contracts/API-subprocess.md \
+  --context forge/docs/design/decisions/DDR-004-graphiti-group-partitioning.md
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: Infrastructure Coordination (FEAT-FORGE-006)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Files written:
+
+features/infrastructure-coordination/infrastructure-coordination.feature
+features/infrastructure-coordination/infrastructure-coordination_assumptions.yaml
+features/infrastructure-coordination/infrastructure-coordination_summary.md
+Scenarios: 43 total
+
+@key-example: 10 · @boundary: 5 · @negative: 7 · @edge-case: 14
+@smoke: 6 · @regression: 0
+@security: 6 · @concurrency: 3 · @data-integrity: 4 · @integration: 3
+Assumptions: 8 total
+
+high: 2 (auto-proceed) · medium: 3 (Coach review recommended) · low: 3 (human review required)
+REVIEW REQUIRED: 3 low-confidence assumptions accepted as defaults
+
+ASSUM-006 — rationale-field credential redaction pattern
+ASSUM-007 — split-brain mirror dedupe mechanism
+ASSUM-008 — GateDecision link ordering inside SessionOutcome
+See infrastructure-coordination_assumptions.yaml for full rationale.
+
+Deferred: none.
+
+Next step:
+
+
+/feature-plan "Infrastructure Coordination" \
+  --context features/infrastructure-coordination/infrastructure-coordination_summary.md
+
+
+
+ 
+/feature-spec FEAT-FORGE-007 \
+  --context forge/docs/design/contracts/API-subagents.md \
+  --context forge/docs/design/contracts/API-nats-approval-protocol.md \
+  --context forge/docs/design/models/DM-build-lifecycle.md \
+  --context forge/docs/design/diagrams/agent-runtime.md \
+  --context forge/docs/design/diagrams/domain-core.md \
+  --context forge/docs/design/decisions/DDR-006-async-subagent-state-channel-contract.md \
+  --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration.feature \
+  --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md \
+  --context forge/features/nats-fleet-integration/nats-fleet-integration.feature \
+  --context forge/features/nats-fleet-integration/nats-fleet-integration_summary.md \
+  --context forge/features/specialist-agent-delegation/specialist-agent-delegation.feature \
+  --context forge/features/specialist-agent-delegation/specialist-agent-delegation_summary.md \
+  --context forge/features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol.feature \
+  --context forge/features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol_summary.md \
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature \
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine_summary.md \
+  --context forge/features/infrastructure-coordination/infrastructure-coordination.feature \
+  --context forge/features/infrastructure-coordination/infrastructure-coordination_summary.md 
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC COMPLETE: Mode A Greenfield End-to-End (FEAT-FORGE-007)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files written:
+
+features/mode-a-greenfield-end-to-end/mode-a-greenfield-end-to-end.feature
+features/mode-a-greenfield-end-to-end/mode-a-greenfield-end-to-end_assumptions.yaml
+features/mode-a-greenfield-end-to-end/mode-a-greenfield-end-to-end_summary.md
+Scenarios: 47 total
+
+@key-example: 8 @boundary: 6
+@negative: 9 @edge-case: 11
+@smoke: 4 @regression: 4
+@security: 3 @concurrency: 3
+@data-integrity: 6 @integration: 4
+Assumptions: 8 total
+
+high: 5 (auto-proceed)
+medium: 3 (Coach review recommended)
+low: 0
+Deferred: None.
+
+Next steps:
+
+
+/feature-plan "Mode A Greenfield End-to-End" \
+  --context features/mode-a-greenfield-end-to-end/mode-a-greenfield-end-to-end_summary.md
+Per the build plan, FEAT-FORGE-007 depends on FEAT-FORGE-003, 004, 005, and 006 (all spec'd; 002 already planned & merged). Step 11 of /feature-plan will tag each scenario above with @task:<TASK-ID> for the task-level BDD runner.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /feature-plan "NATS Fleet Integration" \
   --context features/nats-fleet-integration/nats-fleet-integration_summary.md
 
@@ -2309,3 +2524,32 @@ Wave 3 cannot start until FEAT-FORGE-001 provides: builds table with uq_builds_f
 
 
 GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-FORGE-002 --verbose --max-turns 30
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-FORGE-002 --verbose --max-turns 30
+
+
+

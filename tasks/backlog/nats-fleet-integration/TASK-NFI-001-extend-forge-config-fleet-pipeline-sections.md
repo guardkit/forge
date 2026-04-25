@@ -27,20 +27,20 @@ autobuild_state:
   max_turns: 30
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
   base_branch: main
-  started_at: '2026-04-24T18:05:27.621444'
-  last_updated: '2026-04-24T18:09:01.416861'
+  started_at: '2026-04-24T20:23:09.481255'
+  last_updated: '2026-04-24T20:26:16.494469'
   turns:
   - turn: 1
     decision: approve
     feedback: null
-    timestamp: '2026-04-24T18:05:27.621444'
-    player_summary: 'Created src/forge/config/ package with models.py containing FleetConfig
-      (heartbeat=30, stale=90, cache_ttl=30, intent=0.7), PipelineConfig (progress=60,
-      build_queue_subject=''pipeline.build-queued.>'', approved_originators list),
-      FilesystemPermissions (required allowlist: list[Path] with field_validator rejecting
-      non-absolute paths), PermissionsConfig (required filesystem), and ForgeConfig
-      (fleet/pipeline default via default_factory, permissions required). Used Pydantic
-      v2 Field/field_validator id'
+    timestamp: '2026-04-24T20:23:09.481255'
+    player_summary: 'Created src/forge/config/ as a new Pydantic v2 model package.
+      models.py defines FleetConfig (heartbeat 30s / stale 90s / cache 30s / intent
+      0.7), PipelineConfig (progress 60s, build_queue_subject ''pipeline.build-queued.>'',
+      approved_originators list), FilesystemPermissions (required allowlist: list[Path]
+      with field_validator rejecting non-absolute paths), PermissionsConfig (required
+      filesystem), and ForgeConfig (fleet/pipeline via Field(default_factory=...)
+      to avoid shared mutable defaults; permi'
     player_success: true
     coach_success: true
 ---

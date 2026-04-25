@@ -1,0 +1,21 @@
+{
+  "task_id": "TASK-NFI-007",
+  "turn": 1,
+  "files_modified": [
+    "src/forge/adapters/nats/pipeline_consumer.py",
+    "pyproject.toml"
+  ],
+  "files_created": [],
+  "tests_written": [],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "14 passed in 0.12s",
+  "implementation_notes": "Three surgical edits only — no other lines touched.\n\nIssue 1 (pipeline_consumer.py ~line 365): Wrapped the bare `await msg.ack()` on the duplicate-skip path in a try/except Exception block that logs a WARNING with subject and exception, then continues (return is outside the try block so it still fires). CancelledError is not caught because it inherits from BaseException, not Exception.\n\nIssue 2 (pipeline_consumer.py ~line 519 after edit): Wrapped the bare `await msg.ack()` at the end of `_reject` in the same try/except Exception pattern with a WARNING log. This is independent of the existing try/except around the publish call above it.\n\nIssue 3 (pyproject.toml line 18): Added `nats-py>=2.7,<3` as an explicit entry in [project.dependencies], immediately after the existing `nats-core` line. The existing `nats-core` entry was left in place.",
+  "concerns": [],
+  "requirements_addressed": [
+    "Unguarded msg.ack() on duplicate-skip path wrapped in try/except Exception with WARNING log",
+    "Unguarded msg.ack() inside _reject wrapped in try/except Exception with WARNING log",
+    "nats-py declared as direct dependency in pyproject.toml [project.dependencies] with version spec nats-py>=2.7,<3"
+  ],
+  "requirements_remaining": []
+}

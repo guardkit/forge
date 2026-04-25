@@ -1,6 +1,6 @@
 # Forge Build Plan — Pipeline Orchestrator & Checkpoint Manager
 
-## Status: `/system-arch` ✅ done · `/system-design` ✅ done · `/feature-spec` 🟡 **1 / 8 complete** (FEAT-FORGE-001 ✅ · 7 remaining; later steps blocked on specialist-agent Phase 3 + NATS infra running)
+## Status: `/system-arch` ✅ done · `/system-design` ✅ done · `/feature-spec` 🟡 **5 / 8 complete** (FEAT-FORGE-001..005 ✅ · 3 remaining; later steps blocked on specialist-agent Phase 3 + NATS infra running)
 ## Repo: `guardkit/forge`
 ## Agent ID: `forge`
 ## Target: Post specialist-agent Phase 3 completion
@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|
 | 1 | `/system-arch` | ✅ complete | 2026-04-18 | `9f41e22` (seeded by later refinements) | `docs/architecture/ARCHITECTURE.md`, `system-context.md`, `container.md`, `domain-model.md`, `assumptions.yaml`, **31 ADRs** (`ADR-ARCH-001`..`031`) |
 | 2 | `/system-design` | ✅ complete | 2026-04-23 | `b40365c` | `docs/design/` — **9 API contracts + 5 data models + 6 DDRs + 2 C4 L3 diagrams**; 20 artefacts seeded into Graphiti (`project_design` + `architecture_decisions`) |
-| 3 | `/feature-spec × 8` | 🟡 in progress (1 / 8) | 2026-04-24 (FEAT-FORGE-001) | — | FEAT-FORGE-001 ✅ → `features/pipeline-state-machine-and-configuration/` (34 scenarios, 5 assumptions all confirmed medium — ASSUM-002 retired, ASSUM-005 promoted post-revision) |
+| 3 | `/feature-spec × 8` | 🟡 in progress (5 / 8) | 2026-04-24 (FEAT-FORGE-001..005) | — | FEAT-FORGE-001..004 ✅ (see Step 3 for per-feature details); FEAT-FORGE-005 ✅ → `features/guardkit-command-invocation-engine/` (32 scenarios, 7 assumptions resolved — 4 high, 3 medium, 0 low) |
 | 4 | `/feature-plan × 8` | ◻ pending | — | — | — |
 | 5 | `autobuild × 8` (Waves 1–6) | ◻ pending | — | — | — |
 | 6 | Validation | ◻ pending | — | — | — |
@@ -257,7 +257,7 @@ Two C4 L3 diagrams ([`forge/docs/design/diagrams/`](../../design/diagrams/)):
 
 **Sibling task created in `nats-core`:** [`TASK-NCFA-003`](../../../../nats-core/tasks/backlog/forge-v2-alignment/TASK-NCFA-003-add-forge-system-design-pipeline-payloads.md) — shipped same-day as `nats-core 0.2.0`.
 
-### Step 3: /feature-spec × 8 — 🟡 IN PROGRESS (1 / 8)
+### Step 3: /feature-spec × 8 — 🟡 IN PROGRESS (6 / 8)
 
 Produces BDD feature specifications for each feature. Run sequentially — later features
 reference earlier ones.
@@ -268,6 +268,40 @@ reference earlier ones.
   - Scenarios: 34 (6 @key-example · 6 @boundary · 11 @negative · 16 @edge-case · 3 @smoke)
   - Assumptions: 5 resolved — 5 medium, 0 low, 0 open. Ready for `/feature-plan`.
     - Post-review revisions: ASSUM-002 (arbitrary turn-budget ceiling) retired; ASSUM-005 (cancel-operator audit) promoted low → medium on schema grounds.
+- ✅ **FEAT-FORGE-002** — NATS Fleet Integration (2026-04-24)
+  - Artefacts: `features/nats-fleet-integration/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 33 (7 @key-example · 5 @boundary · 8 @negative · 15 @edge-case · 3 @smoke · 2 @security · 2 @concurrency · 2 @data-integrity · 2 @integration)
+  - Assumptions: 5 resolved — 5 high, 0 medium, 0 low, 0 open. Ready for `/feature-plan` (plan already run — commit `6a29ed3`).
+- ✅ **FEAT-FORGE-003** — Specialist Agent Delegation (2026-04-24)
+  - Artefacts: `features/specialist-agent-delegation/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 33 (5 @key-example · 6 @boundary · 9 @negative · 15 @edge-case · 2 @smoke · 3 @security · 3 @concurrency · 1 @data-integrity · 2 @integration)
+  - Assumptions: 6 resolved — 5 high, 1 medium, 0 low, 0 open. Ready for `/feature-plan`.
+    - ASSUM-005 (retry policy on soft-failure dispatch) kept at medium — build plan §128 mandates retry but leaves the count to the reasoning loop per ADR-ARCH-015.
+- ✅ **FEAT-FORGE-004** — Confidence-Gated Checkpoint Protocol (2026-04-24)
+  - Artefacts: `features/confidence-gated-checkpoint-protocol/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 32 (8 @key-example · 5 @boundary · 7 @negative · 10 @edge-case · 4 @smoke · 4 @regression · 2 @security · 2 @concurrency · 2 @data-integrity · 1 @integration)
+  - Assumptions: 7 resolved — 5 high, 2 medium, 0 low, 0 open. Ready for `/feature-plan`.
+    - ASSUM-003 (behaviour at max-wait ceiling) kept at medium — API-nats-approval-protocol §7 describes refresh up to ~3600s but does not describe the terminal action; specific fallback (cancel / escalate / fail-open) deferred to `forge-pipeline-config`.
+    - ASSUM-007 (expected-approver allowlist) kept at medium — API §4.1 shows `responder` as free-form string (`rich` / Jarvis adapter id); allowlist semantics implied by the constitutional framing but not explicitly enumerated.
+- ✅ **FEAT-FORGE-005** — GuardKit Command Invocation Engine (2026-04-24)
+  - Artefacts: `features/guardkit-command-invocation-engine/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 32 (7 @key-example · 6 @boundary · 10 @negative · 14 @edge-case · 3 @smoke) — Groups A–D plus security / concurrency / integration-boundary expansion accepted.
+  - Assumptions: 7 resolved — 4 high, 3 medium, 0 low, 0 open. Ready for `/feature-plan`.
+    - 4 high-confidence values drawn from explicit context: default subprocess timeout (600s, API-subprocess.md §2), dependency-traversal depth cap (2 levels, DDR-005), stdout-tail size (4 KB, API-subprocess.md §3.4), and feature-spec manifest-category filter (specs / contracts / source / decisions, DDR-005).
+    - ASSUM-005 (retry-with-additional-context) kept at medium — build plan §130 mandates "error handling and retry" but API-tool-layer.md §6 leaves retry shape to the reasoning loop; minimal inferred shape confirmed (fresh subprocess, explicit + manifest paths merged).
+    - ASSUM-006 (parallel `guardkit_*` within a single build) kept at medium — not prohibited by any contract but no explicit concurrency statement in API-tool-layer.md §6.
+    - ASSUM-007 (no cached state across concurrent builds) kept at medium — DDR-005 describes the resolver as a stateless function but does not explicitly forbid caching.
+- ✅ **FEAT-FORGE-006** — Infrastructure Coordination (2026-04-24)
+  - Artefacts: `features/infrastructure-coordination/{slug}.feature` · `{slug}_assumptions.yaml` · `{slug}_summary.md`
+  - Scenarios: 43 (10 @key-example · 5 @boundary · 7 @negative · 14 @edge-case · 6 @smoke · 6 @security · 3 @concurrency · 4 @data-integrity · 3 @integration) — Groups A–E plus security / concurrency / data-integrity / integration expansion accepted.
+  - Assumptions: 8 resolved — 2 high, 3 medium, 3 low, **3 open (REVIEW REQUIRED)**. Ready for `/feature-plan` subject to low-confidence review.
+    - 2 high-confidence values drawn from explicit context: override recency horizon (30 days, DM-graphiti-entities.md §4) and default PR base branch (`main`, API-subprocess.md §4).
+    - ASSUM-003 (test verification command = `pytest` from worktree root) kept at medium — build plan §131 references "test verification" without naming a runner; Python stack convention.
+    - ASSUM-004 (failed-test report shape: pass/fail counts + failing node-ids + tail) kept at medium — pytest convention; not specified in any contract.
+    - ASSUM-005 (priors empty-context shape = empty narrative section rather than omitted block or error) kept at medium — ADR-ARCH-018 specifies prose-style injection but not the empty case.
+    - ⚠️ ASSUM-006 (credential-shape redaction in rationale before Graphiti write) open at **low** — not stated in any provided context; inferred security hygiene only.
+    - ⚠️ ASSUM-007 (split-brain mirror dedupe via entity_id uniqueness + pre-check) open at **low** — inferred from CalibrationEvent deterministic id pattern; GateDecision uses UUID so a separate "already written" check is assumed.
+    - ⚠️ ASSUM-008 (GateDecision links inside SessionOutcome ordered by decided_at ascending) open at **low** — no ordering semantics specified for `SessionOutcome -[CONTAINS]-> GateDecision` edges in DM-graphiti-entities.md.
 
 > **Context-flag resolution (post-`/system-design`):** placeholders from the original
 > build plan resolve as follows. `DESIGN.md` / `forge-system-spec.md` were not produced
@@ -285,7 +319,8 @@ guardkit feature-spec FEAT-FORGE-001 \
   --context forge/docs/design/contracts/API-cli.md \
   --context forge/docs/design/decisions/DDR-003-sqlite-schema-layout-wal.md
 
-# FEAT-FORGE-002: NATS Fleet Integration
+# FEAT-FORGE-002: NATS Fleet Integration  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/nats-fleet-integration/
 guardkit feature-spec FEAT-FORGE-002 \
   --context forge/docs/design/contracts/API-nats-pipeline-events.md \
   --context forge/docs/design/contracts/API-nats-fleet-lifecycle.md \
@@ -293,26 +328,30 @@ guardkit feature-spec FEAT-FORGE-002 \
   --context nats-core/docs/design/specs/nats-core-system-spec.md \
   --context nats-core/docs/design/contracts/agent-manifest-contract.md
 
-# FEAT-FORGE-003: Specialist Agent Delegation
+# FEAT-FORGE-003: Specialist Agent Delegation  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/specialist-agent-delegation/
 guardkit feature-spec FEAT-FORGE-003 \
   --context forge/docs/design/contracts/API-nats-agent-dispatch.md \
   --context forge/docs/design/models/DM-discovery.md \
   --context forge/docs/design/decisions/DDR-001-reply-subject-correlation.md \
   --context nats-core/docs/design/specs/nats-core-system-spec.md
 
-# FEAT-FORGE-004: Confidence-Gated Checkpoint Protocol
+# FEAT-FORGE-004: Confidence-Gated Checkpoint Protocol  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/confidence-gated-checkpoint-protocol/
 guardkit feature-spec FEAT-FORGE-004 \
   --context forge/docs/design/contracts/API-nats-approval-protocol.md \
   --context forge/docs/design/models/DM-gating.md \
   --context forge/docs/design/decisions/DDR-002-resume-value-rehydration-helper.md
 
-# FEAT-FORGE-005: GuardKit Command Invocation Engine
+# FEAT-FORGE-005: GuardKit Command Invocation Engine  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/guardkit-command-invocation-engine/
 guardkit feature-spec FEAT-FORGE-005 \
   --context forge/docs/design/contracts/API-tool-layer.md \
   --context forge/docs/design/contracts/API-subprocess.md \
   --context forge/docs/design/decisions/DDR-005-cli-context-manifest-resolution.md
 
-# FEAT-FORGE-006: Infrastructure Coordination
+# FEAT-FORGE-006: Infrastructure Coordination  ✅ COMPLETE (2026-04-24)
+# Output: forge/features/infrastructure-coordination/
 guardkit feature-spec FEAT-FORGE-006 \
   --context forge/docs/design/models/DM-graphiti-entities.md \
   --context forge/docs/design/models/DM-calibration.md \
@@ -320,12 +359,30 @@ guardkit feature-spec FEAT-FORGE-006 \
   --context forge/docs/design/decisions/DDR-004-graphiti-group-partitioning.md
 
 # FEAT-FORGE-007: Mode A Greenfield End-to-End
+# Design context: async-subagent stack (subagents API + both C4 L3 diagrams + DDR-006)
+# plus the state machine (DM-build-lifecycle) and checkpoint protocol
+# (API-nats-approval-protocol) that the mode threads through every stage.
+# Prior-feature context: `.feature` + `_summary.md` for FEAT-FORGE-001..006
+# (assumptions.yaml omitted — already echoed inside each summary).
 guardkit feature-spec FEAT-FORGE-007 \
   --context forge/docs/design/contracts/API-subagents.md \
+  --context forge/docs/design/contracts/API-nats-approval-protocol.md \
+  --context forge/docs/design/models/DM-build-lifecycle.md \
   --context forge/docs/design/diagrams/agent-runtime.md \
   --context forge/docs/design/diagrams/domain-core.md \
   --context forge/docs/design/decisions/DDR-006-async-subagent-state-channel-contract.md \
-  # plus all previous feature spec files (forge/features/FEAT-FORGE-001..006/*)
+  --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration.feature \
+  --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md \
+  --context forge/features/nats-fleet-integration/nats-fleet-integration.feature \
+  --context forge/features/nats-fleet-integration/nats-fleet-integration_summary.md \
+  --context forge/features/specialist-agent-delegation/specialist-agent-delegation.feature \
+  --context forge/features/specialist-agent-delegation/specialist-agent-delegation_summary.md \
+  --context forge/features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol.feature \
+  --context forge/features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol_summary.md \
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature \
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine_summary.md \
+  --context forge/features/infrastructure-coordination/infrastructure-coordination.feature \
+  --context forge/features/infrastructure-coordination/infrastructure-coordination_summary.md
 
 # FEAT-FORGE-008: Mode B Feature & Mode C Review-Fix
 guardkit feature-spec FEAT-FORGE-008 \
@@ -357,25 +414,25 @@ so the plan is grounded in the curated scenarios and resolved assumptions (see
 guardkit feature-plan "Pipeline State Machine and Configuration" \
   --context forge/features/pipeline-state-machine-and-configuration/pipeline-state-machine-and-configuration_summary.md
 
-# FEAT-FORGE-002: NATS Fleet Integration (depends on 001)
-guardkit feature-plan FEAT-FORGE-002 \
-  --context forge/features/<feat-forge-002-slug>/<feat-forge-002-slug>_summary.md
+# FEAT-FORGE-002: NATS Fleet Integration (depends on 001)  ✅ COMPLETE (commit 6a29ed3)
+guardkit feature-plan "NATS Fleet Integration" \
+  --context forge/features/nats-fleet-integration/nats-fleet-integration_summary.md
 
 # FEAT-FORGE-005: GuardKit Command Invocation Engine (depends on 001 — can parallel with 002)
 guardkit feature-plan FEAT-FORGE-005 \
-  --context forge/features/<feat-forge-005-slug>/<feat-forge-005-slug>_summary.md
+  --context forge/features/guardkit-command-invocation-engine/guardkit-command-invocation-engine_summary.md
 
 # FEAT-FORGE-003: Specialist Agent Delegation (depends on 002)
-guardkit feature-plan FEAT-FORGE-003 \
-  --context forge/features/<feat-forge-003-slug>/<feat-forge-003-slug>_summary.md
+guardkit feature-plan "Specialist Agent Delegation" \
+  --context forge/features/specialist-agent-delegation/specialist-agent-delegation_summary.md
 
 # FEAT-FORGE-004: Confidence-Gated Checkpoint Protocol (depends on 003)
-guardkit feature-plan FEAT-FORGE-004 \
-  --context forge/features/<feat-forge-004-slug>/<feat-forge-004-slug>_summary.md
+guardkit feature-plan "Confidence-Gated Checkpoint Protocol" \
+  --context forge/features/confidence-gated-checkpoint-protocol/confidence-gated-checkpoint-protocol_summary.md
 
 # FEAT-FORGE-006: Infrastructure Coordination (depends on 001, 002)
-guardkit feature-plan FEAT-FORGE-006 \
-  --context forge/features/<feat-forge-006-slug>/<feat-forge-006-slug>_summary.md
+guardkit feature-plan "Infrastructure Coordination" \
+  --context forge/features/infrastructure-coordination/infrastructure-coordination_summary.md
 
 # FEAT-FORGE-007: Mode A Greenfield End-to-End (depends on 003, 004, 005, 006)
 guardkit feature-plan FEAT-FORGE-007 \

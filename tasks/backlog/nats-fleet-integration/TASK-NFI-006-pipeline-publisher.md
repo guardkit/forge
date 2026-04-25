@@ -2,7 +2,7 @@
 id: TASK-NFI-006
 title: Implement pipeline_publisher (8 lifecycle publisher methods)
 task_type: feature
-status: in_review
+status: blocked
 priority: high
 created: 2026-04-24 00:00:00+00:00
 updated: 2026-04-24 00:00:00+00:00
@@ -32,17 +32,51 @@ test_results:
   coverage: null
   last_run: null
 autobuild_state:
-  current_turn: 1
+  current_turn: 3
   max_turns: 30
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
   base_branch: main
-  started_at: '2026-04-24T18:10:29.451505'
-  last_updated: '2026-04-24T18:19:43.434311'
+  started_at: '2026-04-24T20:26:46.699882'
+  last_updated: '2026-04-24T20:41:49.624686'
   turns:
   - turn: 1
-    decision: approve
-    feedback: null
-    timestamp: '2026-04-24T18:10:29.451505'
+    decision: feedback
+    feedback: '- Task-work produced a report with 1 of 3 required agent invocations.
+      Missing phases: 4 (Testing), 5 (Code Review). Invoke these agents via the Task
+      tool before re-emitting the report:
+
+      - Phase 4: `test-orchestrator` (Testing)
+
+      - Phase 5: `code-reviewer` (Code Review)'
+    timestamp: '2026-04-24T20:26:46.699882'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: '- Task-work produced a report with 1 of 3 required agent invocations.
+      Missing phases: 3 (Implementation), 5 (Code Review). Invoke these agents via
+      the Task tool before re-emitting the report:
+
+      - Phase 3: `python-api-specialist` (Implementation)
+
+      - Phase 5: `code-reviewer` (Code Review)'
+    timestamp: '2026-04-24T20:35:11.269358'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: feedback
+    feedback: '- Task-work produced a report with 1 of 3 required agent invocations.
+      Missing phases: 4 (Testing), 5 (Code Review). Invoke these agents via the Task
+      tool before re-emitting the report:
+
+      - Phase 4: `test-orchestrator` (Testing)
+
+      - Phase 5: `code-reviewer` (Code Review)'
+    timestamp: '2026-04-24T20:37:24.195277'
     player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
       actual: 0'
     player_success: true
