@@ -148,6 +148,12 @@ class FakeNatsClient:
         # When True, the next register_agent call raises RuntimeError to
         # simulate transport failure (used by integration scenarios).
         self.simulate_registry_unreachable: bool = False
+        # Per-correlation deliver callbacks owned by the
+        # CorrelationRegistry transport seam. Populated by ``subscribe``
+        # and consulted by ``deliver_reply`` so step files can inject
+        # specialist replies without importing transport types.
+        # TASK-SAD-011 — extends the recorder for the dispatch suite.
+        self._reply_callbacks: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Methods used by forge.adapters.nats.fleet_publisher
@@ -180,6 +186,56 @@ class FakeNatsClient:
         # ``record_pipeline_publish`` shim below, so this generic
         # publish() is only here to satisfy duck-typing.
         self.published.append(_RecordedPublish(subject, body))
+
+    # ------------------------------------------------------------------
+    # ReplyChannel surface used by forge.dispatch.correlation
+    # ------------------------------------------------------------------
+    # The CorrelationRegistry (TASK-SAD-003) treats its transport as a
+    # ``ReplyChannel`` Protocol with ``async subscribe``/``async
+    # unsubscribe``. The methods below let the BDD suite reuse this
+    # recorder as the dispatch transport — TASK-SAD-011 AC requires
+    # NOT introducing a parallel test transport. Subscribe/unsubscribe
+    # events land in ``self.published`` so step assertions can verify
+    # subscribe-before-publish ordering against a single recording list.
+
+    async def subscribe(self, correlation_key: str, deliver: Any) -> str:
+        """Register a deliver callback and record the subscribe event.
+
+        Returns the correlation key as the opaque subscription handle —
+        the registry passes it back to :meth:`unsubscribe`.
+        """
+        self._reply_callbacks[correlation_key] = deliver
+        self.published.append(
+            _RecordedPublish(
+                "reply.subscribe", {"correlation_key": correlation_key}
+            )
+        )
+        return correlation_key
+
+    async def unsubscribe(self, subscription: Any) -> None:
+        """Drop the deliver callback and record the unsubscribe event."""
+        self._reply_callbacks.pop(subscription, None)
+        self.published.append(
+            _RecordedPublish(
+                "reply.unsubscribe", {"correlation_key": subscription}
+            )
+        )
+
+    def deliver_reply(
+        self,
+        correlation_key: str,
+        source_agent_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Invoke the registered deliver callback for ``correlation_key``.
+
+        Step ``Then`` clauses use this to simulate a specialist publishing
+        its result on the correlation-keyed reply channel — the canonical
+        round-trip half of the LES1 invariant test.
+        """
+        callback = self._reply_callbacks.get(correlation_key)
+        if callback is not None:
+            callback(correlation_key, source_agent_id, payload)
 
 
 @dataclass

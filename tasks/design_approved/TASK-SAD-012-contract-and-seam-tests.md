@@ -1,22 +1,27 @@
 ---
-id: TASK-SAD-012
-title: "Contract & seam tests for the dispatch boundary"
-task_type: testing
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 5
-implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-SAD-010]
-tags: [testing, contract-tests, seam-tests, integration-contracts]
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-010
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-012
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- testing
+- contract-tests
+- seam-tests
+- integration-contracts
+task_type: testing
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Contract & seam tests for the dispatch boundary
+updated: 2026-04-25 00:00:00+00:00
+wave: 5
 ---
 
 # Task: Contract & seam tests for the dispatch boundary

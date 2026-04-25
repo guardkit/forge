@@ -1,0 +1,173 @@
+{
+  "task_id": "TASK-SAD-011",
+  "timestamp": "2026-04-25T17:28:40.940503",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 5,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/bdd/conftest.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/bdd/test_specialist_agent_delegation.py",
+    "tasks/backlog/TASK-SAD-011-bdd-smoke-pytest-wiring.md",
+    "tasks/backlog/TASK-SAD-012-contract-and-seam-tests.md",
+    "tests/bdd/conftest.py"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-SAD-011-implementation-plan.md",
+    ".claude/task-plans/TASK-SAD-012-implementation-plan.md",
+    ".guardkit/autobuild/TASK-SAD-010/checkpoints.json",
+    ".guardkit/autobuild/TASK-SAD-011/player_turn_1.json",
+    ".guardkit/autobuild/TASK-SAD-011/task_work_results.json",
+    ".guardkit/autobuild/TASK-SAD-011/turn_context.json",
+    ".guardkit/autobuild/TASK-SAD-012/player_turn_1.json",
+    ".guardkit/autobuild/TASK-SAD-012/task_work_results.json",
+    ".guardkit/autobuild/TASK-SAD-012/turn_context.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/.guardkit/autobuild/TASK-SAD-011/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/bdd/test_specialist_agent_delegation.py",
+    "tasks/design_approved/TASK-SAD-011-bdd-smoke-pytest-wiring.md",
+    "tasks/design_approved/TASK-SAD-012-contract-and-seam-tests.md",
+    "tests/bdd/test_specialist_agent_delegation.py",
+    "tests/forge/dispatch/test_contract_and_seam.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003/tests/bdd/test_specialist_agent_delegation.py"
+  ],
+  "summary": "5 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 46,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "tests/bdd/test_specialist_agent_delegation.py created using pytest-bdd's scenarios(\"specialist-agent-delegation.feature\") pattern.",
+      "status": "complete",
+      "evidence": "Created tests/bdd/test_specialist_agent_delegation.py using the pytest-bdd @scenario decorator pattern (the same cherry-picking variant test_nats_fleet_integration.py adopts to avoid pulling in the 28 deferred Group B/C/D/E scenarios that have no step bindings yet). Each of the five key-example scenarios is bound via an @scenario(FEATURE_FILE, \"...\") call against the canonical feature file path.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Step definitions for the Background, all 5 key-example scenarios (including 2 smoke scenarios) are implemented and passing.",
+      "status": "complete",
+      "evidence": "All 5 key-example scenarios pass: test_exact_tool_dispatch (smoke), test_intent_pattern_fallback, test_coach_output_top_vs_nested (smoke), test_retry_with_additional_context, test_outcome_correlation. Background steps (Forge registered+watching, cache fresh) are wired and shared across scenarios. Final pytest run: 5 passed.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Reuses tests/bdd/conftest.py:FakeNatsClient \u2014 does NOT introduce a parallel test transport. Extend conftest with subscribe/unsubscribe recording if needed.",
+      "status": "complete",
+      "evidence": "Extended FakeNatsClient with async subscribe/unsubscribe and a sync deliver_reply method. Subscribe/unsubscribe events land in the same self.published list used for register/heartbeat so the canonical recording-order assertion remains a single-list inspection. No parallel transport is introduced \u2014 the dispatch test composes CorrelationRegistry(transport=nats_client_mock) directly.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/conftest.py",
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Smoke scenarios run in the project's pytest -m smoke selection.",
+      "status": "complete",
+      "evidence": "Verified via `pytest tests/bdd/ -m smoke -q` which collects 5 smoke tests (3 NFI + 2 SAD-011). Each smoke scenario is decorated with @pytest.mark.smoke + @pytest.mark.key_example, mirroring the @smoke / @key-example Gherkin tags. The two smoke scenarios are exact-tool-dispatch and coach-output-parsing.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Step definitions assert subscribe-before-publish ordering using the FakeNatsClient's recording-order property (the canonical LES1 assertion).",
+      "status": "complete",
+      "evidence": "assert_subscribe_before_publish reads nats_client_mock.published, builds the list of topic strings, and asserts topics.index(\"reply.subscribe\") < topics.index(\"dispatch.publish\"). Both events land in the same recorder list (subscribe via the extended FakeNatsClient.subscribe; publish via _FakeDispatchPublisher.publish_dispatch), so the comparison is a deterministic recording-order check exactly matching the LES1 invariant.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/conftest.py",
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "No flaky scenarios. Use the deterministic Clock fixture from conftest for any time-sensitive steps.",
+      "status": "complete",
+      "evidence": "TimeoutCoordinator is wired with the conftest's FakeClock via a thin _DispatchClockAdapter (Clock.now passthrough). The specialist-reply round-trip is delivered synchronously by the fake publisher when publish_dispatch is recorded \u2014 no time.sleep/asyncio.sleep anywhere. The hard-cut-off path is bounded by the TimeoutCoordinator's own asyncio.timeout (5 s sentinel) but is never reached in the happy paths because the reply lands in the same loop tick.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Imports cleaned (no unused sqlite3 / parsers). Code uses snake_case, type hints, max-88-char-friendly line wraps, f-strings, and follows the existing test_nats_fleet_integration.py module style. No black/ruff configuration is registered in pyproject.toml, so the project lint surface is the test runner itself: full project test run is 516 passed, 0 failed.",
+      "test_file": "tests/bdd/test_specialist_agent_delegation.py",
+      "implementation_files": [
+        "tests/bdd/conftest.py",
+        "tests/bdd/test_specialist_agent_delegation.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 38.93705093101016
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 153.61896461399738
+    }
+  ]
+}

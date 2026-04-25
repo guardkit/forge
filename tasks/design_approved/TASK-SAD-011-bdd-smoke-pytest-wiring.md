@@ -1,22 +1,28 @@
 ---
-id: TASK-SAD-011
-title: "BDD smoke + key-example pytest wiring"
-task_type: testing
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 5
-implementation_mode: task-work
 complexity: 4
-dependencies: [TASK-SAD-010]
-tags: [testing, bdd, pytest-bdd, smoke, key-example]
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-010
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-011
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- testing
+- bdd
+- pytest-bdd
+- smoke
+- key-example
+task_type: testing
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: BDD smoke + key-example pytest wiring
+updated: 2026-04-25 00:00:00+00:00
+wave: 5
 ---
 
 # Task: BDD smoke + key-example pytest wiring
