@@ -212,3 +212,6 @@ __marimo__/
 # GuardKit runtime logs (append-only, regenerated on each run)
 .guardkit/autobuild/*/events.jsonl
 .guardkit/graphiti-query-log.jsonl
+
+# Per-machine Claude Code overrides
+.claude/settings.local.json
