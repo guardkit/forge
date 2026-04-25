@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-003
-title: 'Define request_id derivation helper (deterministic, pure)'
+title: Define request_id derivation helper (deterministic, pure)
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 1
@@ -22,6 +22,27 @@ test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T17:43:15.782838'
+  last_updated: '2026-04-25T17:49:29.358876'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:43:15.782838'
+    player_summary: "Created src/forge/gating/identity.py exposing derive_request_id(*,\
+      \ build_id, stage_label, attempt_count) -> str. Implementation is a pure function\
+      \ \u2014 keyword-only, only stdlib imports (urllib.parse.quote), no I/O, no\
+      \ hidden state. Format is the documented wire contract f'{enc(build_id)}:{enc(stage_label)}:{attempt_count}',\
+      \ where enc() runs urllib.parse.quote(safe='') and additionally percent-encodes\
+      \ '.' and '~'. The result alphabet is restricted to [A-Za-z0-9_\\-:%], which\
+      \ is simultaneously RFC 39"
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Define request_id derivation helper (deterministic, pure)

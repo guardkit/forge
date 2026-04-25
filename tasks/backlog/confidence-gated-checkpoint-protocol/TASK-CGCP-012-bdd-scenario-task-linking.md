@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-012
-title: 'BDD scenario→task linking and pytest-bdd wiring (R2 oracle activation)'
+title: "BDD scenario\u2192task linking and pytest-bdd wiring (R2 oracle activation)"
 task_type: testing
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 5
@@ -23,6 +23,27 @@ test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T18:43:53.518992'
+  last_updated: '2026-04-25T18:55:38.764143'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T18:43:53.518992'
+    player_summary: "1) Fixed the Gherkin parse-blocker on line 176: the informal\
+      \ `Or the decision should record no threshold value at all` was rewritten as\
+      \ `And the decision should record no threshold value at all` paired with a tightened\
+      \ `Then the decision should be marked as a constitutional override with no threshold\
+      \ applied` \u2014 both assertions are now legal Gherkin and `feature-plan-bdd-link\
+      \ prepare` parses cleanly (status=ready, scenarios_to_match=32). 2) Ran `feature-plan-bdd-link\
+      \ prepare` against the .feature"
+    player_success: true
+    coach_success: true
 ---
 
 # Task: BDD scenario→task linking and pytest-bdd wiring (R2 oracle activation)

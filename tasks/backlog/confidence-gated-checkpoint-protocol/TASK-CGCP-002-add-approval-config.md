@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-002
-title: 'Add forge.config.approval settings (default_wait, max_wait)'
+title: Add forge.config.approval settings (default_wait, max_wait)
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 1
@@ -21,6 +21,26 @@ test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T17:43:15.758562'
+  last_updated: '2026-04-25T17:48:01.361479'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:43:15.758562'
+    player_summary: 'Added ApprovalConfig (Pydantic v2, extra=''forbid'') in src/forge/config/models.py
+      with two int fields default_wait_seconds (default 300, ge=0) and max_wait_seconds
+      (default 3600, ge=0), plus a model_validator(mode=''after'') that rejects default_wait_seconds
+      > max_wait_seconds. Wired approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+      onto ForgeConfig (mirrors the existing fleet/pipeline default_factory pattern).
+      Added module-level constants DEFAULT_APPROVAL_WAIT_SECONDS / DEFAULT_APPR'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Add forge.config.approval settings (default_wait, max_wait)

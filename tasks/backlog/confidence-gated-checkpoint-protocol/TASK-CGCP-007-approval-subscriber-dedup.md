@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-007
-title: 'Implement approval_subscriber with short-TTL dedup buffer (first-response-wins)'
+title: Implement approval_subscriber with short-TTL dedup buffer (first-response-wins)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 3
@@ -27,16 +27,35 @@ consumer_context:
   consumes: request_id derivation
   framework: pure-Python helper (forge.gating.identity.derive_request_id)
   driver: forge.gating.identity
-  format_note: request_id is deterministic over (build_id, stage_label, attempt_count); the dedup set keys directly on the literal request_id string the responder echoes back. Subscriber MUST NOT re-derive — it MUST trust the echoed value.
+  format_note: "request_id is deterministic over (build_id, stage_label, attempt_count);\
+    \ the dedup set keys directly on the literal request_id string the responder echoes\
+    \ back. Subscriber MUST NOT re-derive \u2014 it MUST trust the echoed value."
 - task: TASK-CGCP-002
   consumes: ApprovalConfig.max_wait_seconds
   framework: Pydantic v2 BaseModel (forge.config.models)
   driver: pyyaml + pydantic
-  format_note: ApprovalConfig.max_wait_seconds caps total wait (default 3600). Subscriber refresh-loop logic refreshes within this ceiling per API §7.
+  format_note: "ApprovalConfig.max_wait_seconds caps total wait (default 3600). Subscriber\
+    \ refresh-loop logic refreshes within this ceiling per API \xA77."
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T18:04:48.093428'
+  last_updated: '2026-04-25T18:28:10.314388'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T18:04:48.093428'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Implement approval_subscriber with short-TTL dedup buffer (first-response-wins)

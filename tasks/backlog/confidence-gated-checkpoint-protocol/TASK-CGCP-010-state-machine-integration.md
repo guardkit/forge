@@ -1,11 +1,12 @@
 ---
 id: TASK-CGCP-010
-title: 'Wire gate_check wrapper into FEAT-FORGE-001 state machine (pause-and-publish atomicity)'
+title: Wire gate_check wrapper into FEAT-FORGE-001 state machine (pause-and-publish
+  atomicity)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 4
@@ -26,16 +27,36 @@ consumer_context:
   consumes: ApprovalPublisher.publish_request
   framework: NATS adapter (nats-py + nats-core typed payloads)
   driver: forge.adapters.nats.approval_publisher
-  format_note: Wrapper writes GateDecision to SQLite FIRST, then calls publish_request. Publish failure surfaces as an operational signal but does NOT roll back the SQLite row (F10).
+  format_note: Wrapper writes GateDecision to SQLite FIRST, then calls publish_request.
+    Publish failure surfaces as an operational signal but does NOT roll back the SQLite
+    row (F10).
 - task: TASK-CGCP-007
   consumes: ApprovalSubscriber.await_response
   framework: NATS adapter (nats-py + nats-core typed payloads)
   driver: forge.adapters.nats.approval_subscriber
-  format_note: await_response returns Optional[ApprovalResponsePayload]; None means timeout/duplicate/refused — caller's wait loop continues. Wrapper invokes resume_value_as on the response payload before attribute access (DDR-002, TASK-CGCP-009).
+  format_note: "await_response returns Optional[ApprovalResponsePayload]; None means\
+    \ timeout/duplicate/refused \u2014 caller's wait loop continues. Wrapper invokes\
+    \ resume_value_as on the response payload before attribute access (DDR-002, TASK-CGCP-009)."
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T18:28:12.555029'
+  last_updated: '2026-04-25T18:43:51.406101'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T18:28:12.555029'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Wire gate_check wrapper into FEAT-FORGE-001 state machine (pause-and-publish atomicity)

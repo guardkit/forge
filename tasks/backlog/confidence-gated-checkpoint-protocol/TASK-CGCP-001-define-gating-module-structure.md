@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-001
-title: 'Define forge.gating module structure (models + pure-function shell)'
+title: Define forge.gating module structure (models + pure-function shell)
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 1
@@ -22,6 +22,27 @@ test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T17:43:15.778641'
+  last_updated: '2026-04-25T17:49:57.580645'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:43:15.778641'
+    player_summary: "Added forge.gating.models per DM-gating.md \xA71/\xA72/\xA73/\xA7\
+      6. Defined GateMode (4 members) and ResponseKind (5 members) as str-Enum subclasses,\
+      \ plus PriorReference, DetectionFinding, GateDecision, CalibrationAdjustment,\
+      \ and a minimal placeholder ConstitutionalRule needed only to type the evaluate_gate\
+      \ signature (the detailed schema is owned by TASK-CGCP-004). All Pydantic models\
+      \ use ConfigDict(extra='forbid') and Field(..., description='...') consistent\
+      \ with forge.config.models / forge.discovery.model"
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Define forge.gating module structure (models + pure-function shell)

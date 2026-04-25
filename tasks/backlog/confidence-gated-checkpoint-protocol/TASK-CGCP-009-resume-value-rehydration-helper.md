@@ -1,11 +1,11 @@
 ---
 id: TASK-CGCP-009
-title: 'Wire resume_value_as helper at every interrupt() consumer (DDR-002)'
+title: Wire resume_value_as helper at every interrupt() consumer (DDR-002)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-CG44
 feature_id: FEAT-FORGE-004
 wave: 3
@@ -23,6 +23,22 @@ test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  base_branch: main
+  started_at: '2026-04-25T18:04:48.083523'
+  last_updated: '2026-04-25T18:16:23.894548'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T18:04:48.083523'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Wire resume_value_as helper at every interrupt() consumer (DDR-002)

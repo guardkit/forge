@@ -7,7 +7,7 @@ description: 'Confidence-gated checkpoint protocol for Forge: four gate modes (a
   idempotency, forge cancel/skip CLI steering, DDR-002 resume-value rehydration, SQLite-first
   durable recording, crash-recovery re-emission.'
 created: '2026-04-25T15:58:49.140417'
-status: planned
+status: completed
 complexity: 7
 estimated_tasks: 12
 tasks:
@@ -16,48 +16,88 @@ tasks:
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-001-define-gating-module-structure.md
   complexity: 3
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:43:15.742589'
+  completed_at: '2026-04-25T17:49:57.583681'
 - id: TASK-CGCP-002
   name: Add ApprovalConfig settings
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-002-add-approval-config.md
   complexity: 2
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 22
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:43:15.745634'
+  completed_at: '2026-04-25T17:49:57.590636'
 - id: TASK-CGCP-003
   name: Define request_id derivation helper
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-003-request-id-derivation-helper.md
   complexity: 3
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:43:15.748611'
+  completed_at: '2026-04-25T17:49:57.597394'
 - id: TASK-CGCP-004
   name: Implement constitutional override branch
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-004-constitutional-override-branch.md
   complexity: 5
   dependencies:
   - TASK-CGCP-001
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:49:59.489343'
+  completed_at: '2026-04-25T18:04:45.913044'
 - id: TASK-CGCP-005
   name: Implement reasoning-model assembly post-conditions
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-005-reasoning-model-assembly.md
   complexity: 6
   dependencies:
   - TASK-CGCP-001
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:49:59.492666'
+  completed_at: '2026-04-25T18:04:45.916798'
 - id: TASK-CGCP-006
   name: Implement approval_publisher
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-006-approval-publisher.md
@@ -65,10 +105,18 @@ tasks:
   dependencies:
   - TASK-CGCP-005
   - TASK-CGCP-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:04:48.058909'
+  completed_at: '2026-04-25T18:28:10.320991'
 - id: TASK-CGCP-007
   name: Implement approval_subscriber with dedup buffer
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-007-approval-subscriber-dedup.md
@@ -77,10 +125,18 @@ tasks:
   - TASK-CGCP-005
   - TASK-CGCP-002
   - TASK-CGCP-003
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:04:48.062278'
+  completed_at: '2026-04-25T18:28:10.331990'
 - id: TASK-CGCP-008
   name: Implement synthetic_response_injector for CLI steering
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-008-synthetic-response-injector.md
@@ -88,20 +144,36 @@ tasks:
   dependencies:
   - TASK-CGCP-003
   - TASK-CGCP-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T17:49:59.495952'
+  completed_at: '2026-04-25T18:04:45.920183'
 - id: TASK-CGCP-009
   name: Wire resume_value_as helper at every interrupt consumer
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-009-resume-value-rehydration-helper.md
   complexity: 4
   dependencies:
   - TASK-CGCP-005
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:04:48.065606'
+  completed_at: '2026-04-25T18:28:10.335544'
 - id: TASK-CGCP-010
   name: Wire gate_check wrapper into state machine
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-010-state-machine-integration.md
@@ -109,10 +181,18 @@ tasks:
   dependencies:
   - TASK-CGCP-006
   - TASK-CGCP-007
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:28:12.535662'
+  completed_at: '2026-04-25T18:43:51.408921'
 - id: TASK-CGCP-011
   name: Contract and seam tests for approval round-trip
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-011-contract-and-seam-tests.md
@@ -121,20 +201,36 @@ tasks:
   - TASK-CGCP-010
   - TASK-CGCP-008
   - TASK-CGCP-009
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:43:53.493446'
+  completed_at: '2026-04-25T19:02:18.640277'
 - id: TASK-CGCP-012
   name: BDD scenario task linking and pytest-bdd wiring
   file_path: tasks/backlog/confidence-gated-checkpoint-protocol/TASK-CGCP-012-bdd-scenario-task-linking.md
   complexity: 3
   dependencies:
   - TASK-CGCP-010
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-25T18:43:53.500929'
+  completed_at: '2026-04-25T19:02:18.648069'
 orchestration:
   parallel_groups:
   - - TASK-CGCP-001
@@ -151,3 +247,20 @@ orchestration:
     - TASK-CGCP-012
   estimated_duration_minutes: 785
   recommended_parallel: 3
+execution:
+  started_at: '2026-04-25T17:43:15.725947'
+  completed_at: '2026-04-25T19:02:18.665382'
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-004
+  total_turns: 12
+  tasks_completed: 12
+  tasks_failed: 0
+  current_wave: 5
+  completed_waves:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  last_updated: '2026-04-25T19:02:18.655827'
+  archived_at: null
+  archived_to: null
