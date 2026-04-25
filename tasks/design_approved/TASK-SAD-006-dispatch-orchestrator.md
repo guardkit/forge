@@ -1,33 +1,45 @@
 ---
-id: TASK-SAD-006
-title: "Dispatch orchestrator: resolve → bind → publish → wait → parse → outcome"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-SAD3
-feature_id: FEAT-FORGE-003
-wave: 3
-implementation_mode: task-work
 complexity: 7
-dependencies: [TASK-SAD-001, TASK-SAD-002, TASK-SAD-003, TASK-SAD-004, TASK-SAD-005]
-tags: [dispatch, orchestrator, lifecycle, write-before-send, subscribe-before-publish]
 consumer_context:
-  - task: TASK-SAD-001
-    consumes: CapabilityResolution
-    framework: "Pydantic v2"
-    driver: "in-memory + persisted via TASK-SAD-002"
-    format_note: "Reuses the model unchanged; this task instantiates it from resolve() output and threads it through the dispatch lifecycle."
-  - task: TASK-SAD-003
-    consumes: CorrelationKey
-    framework: "asyncio"
-    driver: "CorrelationRegistry"
-    format_note: "Opaque 32-hex-char string. Orchestrator obtains via registry.fresh_correlation_key() and threads into bind() and the publish payload header."
+- consumes: CapabilityResolution
+  driver: in-memory + persisted via TASK-SAD-002
+  format_note: Reuses the model unchanged; this task instantiates it from resolve()
+    output and threads it through the dispatch lifecycle.
+  framework: Pydantic v2
+  task: TASK-SAD-001
+- consumes: CorrelationKey
+  driver: CorrelationRegistry
+  format_note: Opaque 32-hex-char string. Orchestrator obtains via registry.fresh_correlation_key()
+    and threads into bind() and the publish payload header.
+  framework: asyncio
+  task: TASK-SAD-003
+created: 2026-04-25 00:00:00+00:00
+dependencies:
+- TASK-SAD-001
+- TASK-SAD-002
+- TASK-SAD-003
+- TASK-SAD-004
+- TASK-SAD-005
+feature_id: FEAT-FORGE-003
+id: TASK-SAD-006
+implementation_mode: task-work
+parent_review: TASK-REV-SAD3
+priority: high
+status: design_approved
+tags:
+- dispatch
+- orchestrator
+- lifecycle
+- write-before-send
+- subscribe-before-publish
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: 'Dispatch orchestrator: resolve → bind → publish → wait → parse → outcome'
+updated: 2026-04-25 00:00:00+00:00
+wave: 3
 ---
 
 # Task: Dispatch orchestrator — resolve → bind → publish → wait → parse → outcome

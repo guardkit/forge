@@ -62,4 +62,9 @@ markers = [
     "concurrency: @concurrency scenarios — concurrent-event coverage",
     "data_integrity: @data-integrity scenarios — data-integrity coverage",
     "integration: @integration scenarios — integration-boundary coverage",
+    # Seam tests stamping the §4 Integration Contract they exercise. The
+    # argument is the contract name (e.g. ``CapabilityResolution``,
+    # ``CorrelationKey``); reviewers grep for the contract to find the
+    # seam test that exercises it.
+    "integration_contract: seam test for a §4 integration contract",
 ]
