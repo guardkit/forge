@@ -1,0 +1,183 @@
+{
+  "task_id": "TASK-SAD-009",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/dispatch/test_async_polling.py tests/forge/dispatch/test_outcome.py tests/forge/dispatch/test_retry.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/dispatch/test_async_polling.py::TestRepeatedPendingHitsCeiling::test_repeated_pending_yields_async_polling_ceiling_exceeded PASSED [ 22%]\ntests/forge/dispatch/test_async_polling.py::TestStatusToolError::test_status_tool_error_stops_polling_after_one_call PASSED [ 25%]\ntests/forge/dispatch/test_async_polling.py::TestCeilingTrackedViaClock::test_ceiling_does_not_fire_when_clock_does_not_advance PASSED [ 27%]\ntests/forge/dispatch/test_async_polling.py::TestCeilingTrackedViaClock::test_ceiling_fires_at_expected_clock_elapsed_time PASSED [ 29%]\ntests/forge/dispatch/test_async_polling.py::TestDegradedOutcomePassthrough::test_degraded_status_outcome_is_returned_with_restamped_resolution_id PASSED [ 31%]\nResult:\ntests/forge/dispatch/test_retry.py::TestRetryCoordinatorConstruction::test_retry_coordinator_holds_injected_orchestrator PASSED [ 97%]\ntests/forge/dispatch/test_retry.py::TestSeamCapabilityResolutionSiblingContract::test_retry_creates_sibling_record_not_ove...",
+      "duration_seconds": 0.6052865982055664
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`src/forge/dispatch/outcome.py` defines `correlate_outcome()` and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/dispatch/outcome.py exporting both correlate_outcome (writer wrapper that delegates SQL-level idempotency to SqliteHistoryWriter.correlate_outcome) and synthesize_degraded (pure-function Degraded factory). Public surface is asserted by TestPublicSurface.",
+      "notes": "Created src/forge/dispatch/outcome.py exporting both correlate_outcome (writer wrapper that delegates SQL-level idempotency to SqliteHistoryWriter.correlate_outcome) and synthesize_degraded (pure-function Degraded factory). Public surface is asserted by TestPublicSurface."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`correlate_outcome()` is idempotent: two consecutive calls with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Idempotency is implemented at the persistence layer via SELECT-then-conditional-UPDATE inside SqliteHistoryWriter.correlate_outcome (persistence.py). When the row already carries outcome_correlated=1 and gate_decision_id matching the argument, the UPDATE is skipped. TestCorrelateOutcomeIdempotency.test_two_calls_return_equal_records verifies r1 == r2.",
+      "notes": "Idempotency is implemented at the persistence layer via SELECT-then-conditional-UPDATE inside SqliteHistoryWriter.correlate_outcome (persistence.py). When the row already carries outcome_correlated=1 and gate_decision_id matching the argument, the UPDATE is skipped. TestCorrelateOutcomeIdempotency.test_two_calls_return_equal_records verifies r1 == r2."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Test (idempotency): mock the db_writer; assert exactly one",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestCorrelateOutcomeIdempotency.test_only_one_update_across_two_calls wraps the writer's connection in _UpdateCountingConnection that counts UPDATE-prefixed SQL statements. Two consecutive correlate_outcome calls with identical args produce update_count == 1 (asserted). A second test (test_mock_writer_only_invokes_update_once) uses MagicMock(spec=SqliteHistoryWriter) to verify the helper-to-writer delegation contract.",
+      "notes": "TestCorrelateOutcomeIdempotency.test_only_one_update_across_two_calls wraps the writer's connection in _UpdateCountingConnection that counts UPDATE-prefixed SQL statements. Two consecutive correlate_outcome calls with identical args produce update_count == 1 (asserted). A second test (test_mock_writer_only_invokes_update_once) uses MagicMock(spec=SqliteHistoryWriter) to verify the helper-to-writer delegation contract."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Test (A.outcome-correlation): after `correlate_outcome()`, the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Added a new optional gate_decision_id: str | None = None field to CapabilityResolution (discovery/models.py) and a sibling TEXT column to the persistence DDL. After correlate_outcome runs, the returned record has outcome_correlated=True and gate_decision_id set to the gate_decision_id argument, verified by TestCorrelateOutcomePostState.test_outcome_correlated_flag_flipped, test_gate_decision_id_recorded_on_record, and test_correlation_persists_across_reads.",
+      "notes": "Added a new optional gate_decision_id: str | None = None field to CapabilityResolution (discovery/models.py) and a sibling TEXT column to the persistence DDL. After correlate_outcome runs, the returned record has outcome_correlated=True and gate_decision_id set to the gate_decision_id argument, verified by TestCorrelateOutcomePostState.test_outcome_correlated_flag_flipped, test_gate_decision_id_recorded_on_record, and test_correlation_persists_across_reads."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Test (C.unresolved-capability): `synthesize_degraded(reason=\"no_specialist_resolvable\")`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "synthesize_degraded composes the input reason into the Degraded.reason field as a colon-separated prefix. TestSynthesizeDegradedReasons.test_no_specialist_resolvable_reason_round_trip asserts 'no_specialist_resolvable' in degraded.reason. Companion tests cover the other three enum values (all_resolvable_specialists_degraded, bus_disconnected, registry_unreadable_stale_snapshot).",
+      "notes": "synthesize_degraded composes the input reason into the Degraded.reason field as a colon-separated prefix. TestSynthesizeDegradedReasons.test_no_specialist_resolvable_reason_round_trip asserts 'no_specialist_resolvable' in degraded.reason. Companion tests cover the other three enum values (all_resolvable_specialists_degraded, bus_disconnected, registry_unreadable_stale_snapshot)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Test (E.registry-outage-stale-snapshot): `snapshot_stale=True`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When snapshot_stale=True, synthesize_degraded appends 'stale_snapshot' to the reason components (also expands the inline 'stale' literal so the reasoning loop's matcher fires uniformly). TestSynthesizeDegradedReasons.test_snapshot_stale_true_records_staleness asserts 'stale' in degraded.reason.lower() and test_registry_unreadable_stale_snapshot_reason_round_trip covers the explicit-reason path.",
+      "notes": "When snapshot_stale=True, synthesize_degraded appends 'stale_snapshot' to the reason components (also expands the inline 'stale' literal so the reasoning loop's matcher fires uniformly). TestSynthesizeDegradedReasons.test_snapshot_stale_true_records_staleness asserts 'stale' in degraded.reason.lower() and test_registry_unreadable_stale_snapshot_reason_round_trip covers the explicit-reason path."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Test (E.bus-disconnect): when the orchestrator catches a bus",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "synthesize_degraded supports reason='bus_disconnected' and produces a Degraded outcome the reasoning loop consumes as a normal failed stage. TestSynthesizeDegradedReasons.test_bus_disconnected_reason_round_trip verifies the reason round-trips. The orchestrator's transport-error path will compose with this helper without further changes \u2014 synthesize_degraded is pure, so the orchestrator can call it from any except-block without coordination.",
+      "notes": "synthesize_degraded supports reason='bus_disconnected' and produces a Degraded outcome the reasoning loop consumes as a normal failed stage. TestSynthesizeDegradedReasons.test_bus_disconnected_reason_round_trip verifies the reason round-trips. The orchestrator's transport-error path will compose with this helper without further changes \u2014 synthesize_degraded is pure, so the orchestrator can call it from any except-block without coordination."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Ran `ruff check` against src/forge/dispatch/outcome.py, src/forge/dispatch/persistence.py, src/forge/discovery/models.py, and tests/forge/dispatch/test_outcome.py \u2014 all checks passed.",
+      "notes": "Ran `ruff check` against src/forge/dispatch/outcome.py, src/forge/dispatch/persistence.py, src/forge/discovery/models.py, and tests/forge/dispatch/test_outcome.py \u2014 all checks passed."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`src/forge/dispatch/outcome.py` defines `correlate_outcome()` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/dispatch/outcome.py exporting both correlate_outcome (writer wrapper that delegates SQL-level idempotency to SqliteHistoryWriter.correlate_outcome) and synthesize_degraded (pure-function Degraded factory). Public surface is asserted by TestPublicSurface.",
+        "notes": "Created src/forge/dispatch/outcome.py exporting both correlate_outcome (writer wrapper that delegates SQL-level idempotency to SqliteHistoryWriter.correlate_outcome) and synthesize_degraded (pure-function Degraded factory). Public surface is asserted by TestPublicSurface."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`correlate_outcome()` is idempotent: two consecutive calls with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Idempotency is implemented at the persistence layer via SELECT-then-conditional-UPDATE inside SqliteHistoryWriter.correlate_outcome (persistence.py). When the row already carries outcome_correlated=1 and gate_decision_id matching the argument, the UPDATE is skipped. TestCorrelateOutcomeIdempotency.test_two_calls_return_equal_records verifies r1 == r2.",
+        "notes": "Idempotency is implemented at the persistence layer via SELECT-then-conditional-UPDATE inside SqliteHistoryWriter.correlate_outcome (persistence.py). When the row already carries outcome_correlated=1 and gate_decision_id matching the argument, the UPDATE is skipped. TestCorrelateOutcomeIdempotency.test_two_calls_return_equal_records verifies r1 == r2."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Test (idempotency): mock the db_writer; assert exactly one",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestCorrelateOutcomeIdempotency.test_only_one_update_across_two_calls wraps the writer's connection in _UpdateCountingConnection that counts UPDATE-prefixed SQL statements. Two consecutive correlate_outcome calls with identical args produce update_count == 1 (asserted). A second test (test_mock_writer_only_invokes_update_once) uses MagicMock(spec=SqliteHistoryWriter) to verify the helper-to-writer delegation contract.",
+        "notes": "TestCorrelateOutcomeIdempotency.test_only_one_update_across_two_calls wraps the writer's connection in _UpdateCountingConnection that counts UPDATE-prefixed SQL statements. Two consecutive correlate_outcome calls with identical args produce update_count == 1 (asserted). A second test (test_mock_writer_only_invokes_update_once) uses MagicMock(spec=SqliteHistoryWriter) to verify the helper-to-writer delegation contract."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Test (A.outcome-correlation): after `correlate_outcome()`, the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Added a new optional gate_decision_id: str | None = None field to CapabilityResolution (discovery/models.py) and a sibling TEXT column to the persistence DDL. After correlate_outcome runs, the returned record has outcome_correlated=True and gate_decision_id set to the gate_decision_id argument, verified by TestCorrelateOutcomePostState.test_outcome_correlated_flag_flipped, test_gate_decision_id_recorded_on_record, and test_correlation_persists_across_reads.",
+        "notes": "Added a new optional gate_decision_id: str | None = None field to CapabilityResolution (discovery/models.py) and a sibling TEXT column to the persistence DDL. After correlate_outcome runs, the returned record has outcome_correlated=True and gate_decision_id set to the gate_decision_id argument, verified by TestCorrelateOutcomePostState.test_outcome_correlated_flag_flipped, test_gate_decision_id_recorded_on_record, and test_correlation_persists_across_reads."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Test (C.unresolved-capability): `synthesize_degraded(reason=\"no_specialist_resolvable\")`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "synthesize_degraded composes the input reason into the Degraded.reason field as a colon-separated prefix. TestSynthesizeDegradedReasons.test_no_specialist_resolvable_reason_round_trip asserts 'no_specialist_resolvable' in degraded.reason. Companion tests cover the other three enum values (all_resolvable_specialists_degraded, bus_disconnected, registry_unreadable_stale_snapshot).",
+        "notes": "synthesize_degraded composes the input reason into the Degraded.reason field as a colon-separated prefix. TestSynthesizeDegradedReasons.test_no_specialist_resolvable_reason_round_trip asserts 'no_specialist_resolvable' in degraded.reason. Companion tests cover the other three enum values (all_resolvable_specialists_degraded, bus_disconnected, registry_unreadable_stale_snapshot)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Test (E.registry-outage-stale-snapshot): `snapshot_stale=True`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When snapshot_stale=True, synthesize_degraded appends 'stale_snapshot' to the reason components (also expands the inline 'stale' literal so the reasoning loop's matcher fires uniformly). TestSynthesizeDegradedReasons.test_snapshot_stale_true_records_staleness asserts 'stale' in degraded.reason.lower() and test_registry_unreadable_stale_snapshot_reason_round_trip covers the explicit-reason path.",
+        "notes": "When snapshot_stale=True, synthesize_degraded appends 'stale_snapshot' to the reason components (also expands the inline 'stale' literal so the reasoning loop's matcher fires uniformly). TestSynthesizeDegradedReasons.test_snapshot_stale_true_records_staleness asserts 'stale' in degraded.reason.lower() and test_registry_unreadable_stale_snapshot_reason_round_trip covers the explicit-reason path."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Test (E.bus-disconnect): when the orchestrator catches a bus",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "synthesize_degraded supports reason='bus_disconnected' and produces a Degraded outcome the reasoning loop consumes as a normal failed stage. TestSynthesizeDegradedReasons.test_bus_disconnected_reason_round_trip verifies the reason round-trips. The orchestrator's transport-error path will compose with this helper without further changes \u2014 synthesize_degraded is pure, so the orchestrator can call it from any except-block without coordination.",
+        "notes": "synthesize_degraded supports reason='bus_disconnected' and produces a Degraded outcome the reasoning loop consumes as a normal failed stage. TestSynthesizeDegradedReasons.test_bus_disconnected_reason_round_trip verifies the reason round-trips. The orchestrator's transport-error path will compose with this helper without further changes \u2014 synthesize_degraded is pure, so the orchestrator can call it from any except-block without coordination."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran `ruff check` against src/forge/dispatch/outcome.py, src/forge/dispatch/persistence.py, src/forge/discovery/models.py, and tests/forge/dispatch/test_outcome.py \u2014 all checks passed.",
+        "notes": "Ran `ruff check` against src/forge/dispatch/outcome.py, src/forge/dispatch/persistence.py, src/forge/discovery/models.py, and tests/forge/dispatch/test_outcome.py \u2014 all checks passed."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 353 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1659/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- DESERIALIZES_FROM_FILE_USING\n- SOURCE_PATTERN\n- USES_PATHLIB_PATH\n- USES_PATH_TYPE_FOR\n\n### \u26a0\ufe0f Warnings\n- HAS_FIX\n- IS_IMPLEMENTED_AS\n- HAS_ROOT_CAUSE\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- HAS_ROLE_MUST_DO\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
