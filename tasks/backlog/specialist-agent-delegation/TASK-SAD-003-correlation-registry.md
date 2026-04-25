@@ -2,7 +2,7 @@
 id: TASK-SAD-003
 title: 'CorrelationRegistry: subscribe-before-publish, exactly-once, source-auth'
 task_type: feature
-status: in_progress
+status: in_review
 priority: high
 created: 2026-04-25 00:00:00+00:00
 updated: 2026-04-25 00:00:00+00:00
@@ -25,13 +25,21 @@ test_results:
   coverage: null
   last_run: null
 autobuild_state:
-  current_turn: 0
+  current_turn: 1
   max_turns: 30
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
   base_branch: main
-  started_at: '2026-04-25T16:36:39.047158'
-  last_updated: '2026-04-25T16:36:39.047160'
-  turns: []
+  started_at: '2026-04-25T16:36:39.047951'
+  last_updated: '2026-04-25T16:49:29.950316'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T16:36:39.047951'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: CorrelationRegistry — subscribe-before-publish, exactly-once, source-auth

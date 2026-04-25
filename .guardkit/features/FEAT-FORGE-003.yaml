@@ -8,7 +8,7 @@ description: "Single capability-driven dispatch path: resolve specialist via dis
   \ and outcome correlation. Pure-domain forge.dispatch package + thin NATS adapter\
   \ (Option 1 from TASK-REV-SAD3)."
 created: '2026-04-25T16:21:45.115257'
-status: in_progress
+status: completed
 complexity: 7
 estimated_tasks: 12
 tasks:
@@ -35,60 +35,72 @@ tasks:
   complexity: 5
   dependencies:
   - TASK-SAD-001
-  status: in_progress
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
-  current_turn: 1
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
   started_at: '2026-04-25T16:36:39.019207'
-  completed_at: null
+  completed_at: '2026-04-25T16:49:29.951784'
 - id: TASK-SAD-003
   name: CorrelationRegistry (subscribe-before-publish, exactly-once, source-auth)
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-003-correlation-registry.md
   complexity: 7
   dependencies:
   - TASK-SAD-001
-  status: in_progress
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
-  current_turn: 1
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
   started_at: '2026-04-25T16:36:39.022393'
-  completed_at: null
+  completed_at: '2026-04-25T16:49:29.955479'
 - id: TASK-SAD-004
   name: Timeout coordinator
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-004-timeout-coordinator.md
   complexity: 5
   dependencies:
   - TASK-SAD-001
-  status: in_progress
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
-  current_turn: 1
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
   started_at: '2026-04-25T16:36:39.025761'
-  completed_at: null
+  completed_at: '2026-04-25T16:49:29.958739'
 - id: TASK-SAD-005
   name: Reply parser
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-005-reply-parser.md
   complexity: 5
   dependencies:
   - TASK-SAD-001
-  status: in_progress
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
-  current_turn: 1
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
   started_at: '2026-04-25T16:36:39.028925'
-  completed_at: null
+  completed_at: '2026-04-25T16:49:29.962011'
 - id: TASK-SAD-006
   name: Dispatch orchestrator
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-006-dispatch-orchestrator.md
@@ -99,15 +111,18 @@ tasks:
   - TASK-SAD-003
   - TASK-SAD-004
   - TASK-SAD-005
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T16:49:31.986941'
+  completed_at: '2026-04-25T17:04:25.780008'
 - id: TASK-SAD-007
   name: Retry coordinator
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-007-retry-coordinator.md
@@ -115,30 +130,36 @@ tasks:
   dependencies:
   - TASK-SAD-001
   - TASK-SAD-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:04:27.725922'
+  completed_at: '2026-04-25T17:19:53.617175'
 - id: TASK-SAD-008
   name: Async-mode polling
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-008-async-mode-polling.md
   complexity: 4
   dependencies:
   - TASK-SAD-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:04:27.729277'
+  completed_at: '2026-04-25T17:19:53.621185'
 - id: TASK-SAD-009
   name: correlate_outcome() + degraded-path synthesis
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-009-correlate-outcome-and-degraded.md
@@ -147,15 +168,18 @@ tasks:
   - TASK-SAD-001
   - TASK-SAD-002
   - TASK-SAD-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:04:27.732554'
+  completed_at: '2026-04-25T17:19:53.624677'
 - id: TASK-SAD-010
   name: NATS adapter specialist_dispatch.py
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-010-nats-adapter-specialist-dispatch.md
@@ -163,45 +187,54 @@ tasks:
   dependencies:
   - TASK-SAD-003
   - TASK-SAD-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:04:27.735837'
+  completed_at: '2026-04-25T17:19:53.628161'
 - id: TASK-SAD-011
   name: BDD smoke + key-example pytest wiring
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-011-bdd-smoke-pytest-wiring.md
   complexity: 4
   dependencies:
   - TASK-SAD-010
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:19:55.571740'
+  completed_at: '2026-04-25T17:32:07.309251'
 - id: TASK-SAD-012
   name: Contract and seam tests for the dispatch boundary
   file_path: tasks/backlog/specialist-agent-delegation/TASK-SAD-012-contract-and-seam-tests.md
   complexity: 5
   dependencies:
   - TASK-SAD-010
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T17:19:55.575299'
+  completed_at: '2026-04-25T17:32:07.313154'
 orchestration:
   parallel_groups:
   - - TASK-SAD-001
@@ -220,14 +253,18 @@ orchestration:
   recommended_parallel: 4
 execution:
   started_at: '2026-04-25T16:32:40.945451'
-  completed_at: null
+  completed_at: '2026-04-25T17:32:07.322209'
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
-  total_turns: 0
-  tasks_completed: 1
+  total_turns: 12
+  tasks_completed: 12
   tasks_failed: 0
-  current_wave: 2
+  current_wave: 5
   completed_waves:
   - 1
-  last_updated: '2026-04-25T16:36:39.028928'
+  - 2
+  - 3
+  - 4
+  - 5
+  last_updated: '2026-04-25T17:32:07.317237'
   archived_at: null
   archived_to: null

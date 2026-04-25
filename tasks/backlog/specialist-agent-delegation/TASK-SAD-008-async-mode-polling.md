@@ -1,22 +1,43 @@
 ---
 id: TASK-SAD-008
-title: "Async-mode polling: run-identifier handling, status-tool convergence"
+title: 'Async-mode polling: run-identifier handling, status-tool convergence'
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-SAD3
 feature_id: FEAT-FORGE-003
 wave: 4
 implementation_mode: task-work
 complexity: 4
-dependencies: [TASK-SAD-006]
-tags: [dispatch, async-mode, polling, run-identifier]
+dependencies:
+- TASK-SAD-006
+tags:
+- dispatch
+- async-mode
+- polling
+- run-identifier
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
+  base_branch: main
+  started_at: '2026-04-25T17:04:27.751774'
+  last_updated: '2026-04-25T17:15:51.998764'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:04:27.751774'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Async-mode polling — run-identifier handling, status-tool convergence

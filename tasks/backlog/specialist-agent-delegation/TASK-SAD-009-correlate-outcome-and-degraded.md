@@ -1,28 +1,53 @@
 ---
 id: TASK-SAD-009
-title: "correlate_outcome() writer + degraded-path synthesis"
+title: correlate_outcome() writer + degraded-path synthesis
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-SAD3
 feature_id: FEAT-FORGE-003
 wave: 4
 implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-SAD-001, TASK-SAD-002, TASK-SAD-006]
-tags: [dispatch, outcome-correlation, degraded-path, idempotent]
+dependencies:
+- TASK-SAD-001
+- TASK-SAD-002
+- TASK-SAD-006
+tags:
+- dispatch
+- outcome-correlation
+- degraded-path
+- idempotent
 consumer_context:
-  - task: TASK-SAD-001
-    consumes: CapabilityResolution
-    framework: "Pydantic v2"
-    driver: "persisted via TASK-SAD-002"
-    format_note: "Updates the existing outcome_correlated boolean flag declared in TASK-SAD-001 / FEAT-FORGE-002. This task implements the correlate_outcome() helper referenced in CapabilityResolution docstrings."
+- task: TASK-SAD-001
+  consumes: CapabilityResolution
+  framework: Pydantic v2
+  driver: persisted via TASK-SAD-002
+  format_note: Updates the existing outcome_correlated boolean flag declared in TASK-SAD-001
+    / FEAT-FORGE-002. This task implements the correlate_outcome() helper referenced
+    in CapabilityResolution docstrings.
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
+  base_branch: main
+  started_at: '2026-04-25T17:04:27.759582'
+  last_updated: '2026-04-25T17:16:01.905166'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:04:27.759582'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: correlate_outcome() writer + degraded-path synthesis

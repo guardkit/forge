@@ -1,33 +1,62 @@
 ---
 id: TASK-SAD-006
-title: "Dispatch orchestrator: resolve → bind → publish → wait → parse → outcome"
+title: "Dispatch orchestrator: resolve \u2192 bind \u2192 publish \u2192 wait \u2192\
+  \ parse \u2192 outcome"
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-SAD3
 feature_id: FEAT-FORGE-003
 wave: 3
 implementation_mode: task-work
 complexity: 7
-dependencies: [TASK-SAD-001, TASK-SAD-002, TASK-SAD-003, TASK-SAD-004, TASK-SAD-005]
-tags: [dispatch, orchestrator, lifecycle, write-before-send, subscribe-before-publish]
+dependencies:
+- TASK-SAD-001
+- TASK-SAD-002
+- TASK-SAD-003
+- TASK-SAD-004
+- TASK-SAD-005
+tags:
+- dispatch
+- orchestrator
+- lifecycle
+- write-before-send
+- subscribe-before-publish
 consumer_context:
-  - task: TASK-SAD-001
-    consumes: CapabilityResolution
-    framework: "Pydantic v2"
-    driver: "in-memory + persisted via TASK-SAD-002"
-    format_note: "Reuses the model unchanged; this task instantiates it from resolve() output and threads it through the dispatch lifecycle."
-  - task: TASK-SAD-003
-    consumes: CorrelationKey
-    framework: "asyncio"
-    driver: "CorrelationRegistry"
-    format_note: "Opaque 32-hex-char string. Orchestrator obtains via registry.fresh_correlation_key() and threads into bind() and the publish payload header."
+- task: TASK-SAD-001
+  consumes: CapabilityResolution
+  framework: Pydantic v2
+  driver: in-memory + persisted via TASK-SAD-002
+  format_note: Reuses the model unchanged; this task instantiates it from resolve()
+    output and threads it through the dispatch lifecycle.
+- task: TASK-SAD-003
+  consumes: CorrelationKey
+  framework: asyncio
+  driver: CorrelationRegistry
+  format_note: Opaque 32-hex-char string. Orchestrator obtains via registry.fresh_correlation_key()
+    and threads into bind() and the publish payload header.
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
+  base_branch: main
+  started_at: '2026-04-25T16:49:31.997981'
+  last_updated: '2026-04-25T17:04:25.777861'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T16:49:31.997981'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Dispatch orchestrator — resolve → bind → publish → wait → parse → outcome

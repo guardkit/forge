@@ -1,28 +1,54 @@
 ---
 id: TASK-SAD-010
-title: "NATS adapter: specialist_dispatch.py — bind, publish, deliver"
+title: "NATS adapter: specialist_dispatch.py \u2014 bind, publish, deliver"
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-SAD3
 feature_id: FEAT-FORGE-003
 wave: 4
 implementation_mode: task-work
 complexity: 6
-dependencies: [TASK-SAD-003, TASK-SAD-006]
-tags: [dispatch, nats, transport, adapter, jetstream]
+dependencies:
+- TASK-SAD-003
+- TASK-SAD-006
+tags:
+- dispatch
+- nats
+- transport
+- adapter
+- jetstream
 consumer_context:
-  - task: TASK-SAD-003
-    consumes: CorrelationKey
-    framework: "asyncio"
-    driver: "nats.aio"
-    format_note: "Reply subject must be agents.result.{matched_agent_id}.{correlation_key} where correlation_key is 32 lowercase hex (per CorrelationKey contract from TASK-SAD-003). Headers carry correlation_key, requesting_agent_id (forge), dispatched_at (ISO8601 UTC)."
+- task: TASK-SAD-003
+  consumes: CorrelationKey
+  framework: asyncio
+  driver: nats.aio
+  format_note: Reply subject must be agents.result.{matched_agent_id}.{correlation_key}
+    where correlation_key is 32 lowercase hex (per CorrelationKey contract from TASK-SAD-003).
+    Headers carry correlation_key, requesting_agent_id (forge), dispatched_at (ISO8601
+    UTC).
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
+  base_branch: main
+  started_at: '2026-04-25T17:04:27.753788'
+  last_updated: '2026-04-25T17:19:53.614371'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T17:04:27.753788'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: NATS adapter — specialist_dispatch.py — bind, publish, deliver
