@@ -1,7 +1,7 @@
 {
-  "tests_run": 33,
+  "tests_run": 144,
   "tests_failed": 0,
-  "coverage_pct": 96.0,
-  "output_summary": "33 passed, 0 failed in tests/forge/test_pipeline_publisher.py; pipeline_publisher.py line coverage 96% (2 missed lines 167-171).",
+  "coverage_pct": 81.28,
+  "output_summary": "pytest: 144 passed, 0 failed, 81.28% line coverage on src/forge (pytest-cov, python 3.12.3)",
   "quality_gates_passed": true
 }

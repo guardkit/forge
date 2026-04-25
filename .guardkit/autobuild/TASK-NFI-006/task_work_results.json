@@ -1,11 +1,11 @@
 {
   "task_id": "TASK-NFI-006",
-  "timestamp": "2026-04-25T14:09:52.206073",
+  "timestamp": "2026-04-25T14:14:55.526959",
   "completed": true,
   "phases": {
     "phase_3": {
       "detected": true,
-      "text": "Implementation",
+      "text": "Implementation \u2014 addressing AC-008 (lint/format)",
       "completed": true
     }
   },
@@ -18,28 +18,33 @@
     "all_passed": true
   },
   "files_modified": [
-    ".guardkit/bootstrap_state.json",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/pipeline_publisher.py",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_pipeline_publisher.py",
-    "tasks/backlog/TASK-NFI-003-implement-discovery-domain.md",
-    "tasks/backlog/TASK-NFI-006-pipeline-publisher.md",
-    "tasks/backlog/TASK-NFI-007-pipeline-consumer.md"
-  ],
-  "files_created": [
     ".claude/task-plans/TASK-NFI-003-implementation-plan.md",
     ".claude/task-plans/TASK-NFI-006-implementation-plan.md",
     ".claude/task-plans/TASK-NFI-007-implementation-plan.md",
     ".guardkit/autobuild/TASK-NFI-001/checkpoints.json",
+    ".guardkit/autobuild/TASK-NFI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-003/task_work_results.json",
     ".guardkit/autobuild/TASK-NFI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-NFI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-NFI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/phase_4_summary.json",
     ".guardkit/autobuild/TASK-NFI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-NFI-006/specialist_results.json",
     ".guardkit/autobuild/TASK-NFI-006/task_work_results.json",
     ".guardkit/autobuild/TASK-NFI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-007/task_work_results.json",
     ".guardkit/autobuild/TASK-NFI-007/turn_context.json",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/.guardkit/autobuild/TASK-NFI-006/player_turn_1.json",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/__init__.py",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/__init__.py",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/src/forge/adapters/nats/pipeline_publisher.py",
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_pipeline_publisher.py",
+    ".guardkit/bootstrap_state.json",
     "src/forge/adapters/__init__.py",
     "src/forge/adapters/nats/__init__.py",
     "src/forge/adapters/nats/pipeline_consumer.py",
@@ -49,30 +54,35 @@
     "src/forge/discovery/models.py",
     "src/forge/discovery/protocol.py",
     "src/forge/discovery/resolve.py",
+    "tasks/backlog/nats-fleet-integration/TASK-NFI-006-pipeline-publisher.md",
     "tasks/design_approved/TASK-NFI-003-implement-discovery-domain.md",
     "tasks/design_approved/TASK-NFI-006-pipeline-publisher.md",
     "tasks/design_approved/TASK-NFI-007-pipeline-consumer.md",
     "tests/forge/discovery/__init__.py",
     "tests/forge/discovery/test_discovery.py",
+    "tests/forge/test_pipeline_consumer.py",
     "tests/forge/test_pipeline_publisher.py"
   ],
-  "tests_written": [
-    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/tests/forge/test_pipeline_publisher.py"
+  "files_created": [
+    ".guardkit/autobuild/TASK-NFI-003/checkpoints.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/.guardkit/autobuild/TASK-NFI-006/player_turn_2.json"
   ],
+  "tests_written": [],
   "summary": "33 tests passed, all quality gates passed",
   "sdk_turns": {
-    "turns_used": 53,
+    "turns_used": 10,
     "max_turns": 100,
     "ceiling_hit": false
   },
   "agent_invocations_validation": {
     "status": "violation",
     "expected_phases": 3,
-    "actual_invocations": 2,
+    "actual_invocations": 1,
     "missing_phases": [
-      "3"
+      "4",
+      "5"
     ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 1 completed invocations\n\nMissing phases:\n  - Phase 4 (Testing)\n  - Phase 5 (Code Review)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 3 (Phase 3): Implementation \u2014 addressing AC-008 (lint/format) (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
   },
   "plan_audit": {
     "status": "skipped",
@@ -98,7 +108,7 @@
       "criterion_id": "AC-001",
       "criterion_text": "Eight methods exist on a `PipelinePublisher` class",
       "status": "complete",
-      "evidence": "Implemented `PipelinePublisher` in src/forge/adapters/nats/pipeline_publisher.py with the eight async methods publish_build_started, publish_build_progress, publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete, publish_build_failed, publish_build_cancelled. Verified by tests/forge/test_pipeline_publisher.py::TestPublisherSurface (parametrized over all eight method names; asserts each is a coroutine function).",
+      "evidence": "PipelinePublisher in src/forge/adapters/nats/pipeline_publisher.py exposes the eight async methods: publish_build_started, publish_build_progress, publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete, publish_build_failed, publish_build_cancelled. Verified by tests/forge/test_pipeline_publisher.py::TestPublisherSurface (parametrized over all eight names; asserts each is a coroutine function).",
       "test_file": "tests/forge/test_pipeline_publisher.py",
       "implementation_files": [
         "src/forge/adapters/nats/pipeline_publisher.py"
@@ -108,7 +118,7 @@
       "criterion_id": "AC-002",
       "criterion_text": "Each method publishes to the correct subject pattern `pipeline.{event}.{feature_id}` (e.g. `pipeline.build-started.FEAT-A1B2`)",
       "status": "complete",
-      "evidence": "Subjects are built by `PipelinePublisher._subject_for(event_name, feature_id)` returning f'pipeline.{event_name}.{feature_id}'. The `_EVENT_TABLE` ClassVar maps each method to its hyphenated subject segment (build-started, build-progress, stage-complete, build-paused, build-resumed, build-complete, build-failed, build-cancelled) per API-nats-pipeline-events.md \u00a73.1. Verified by TestPublishContract (one test per method asserting the exact subject), TestSubjectBuilder (parametrized over all eight events), and TestConcurrency (asserts subject under concurrent load).",
+      "evidence": "Subjects are built by PipelinePublisher._subject_for(event_name, feature_id) returning f'pipeline.{event_name}.{feature_id}'. Each public method passes its hyphenated subject segment (build-started, build-progress, stage-complete, build-paused, build-resumed, build-complete, build-failed, build-cancelled) per API-nats-pipeline-events.md \u00a73.1. Verified by TestPublishContract (one test per method asserting the exact subject) and TestSubjectBuilder (parametrized over all eight events).",
       "test_file": "tests/forge/test_pipeline_publisher.py",
       "implementation_files": [
         "src/forge/adapters/nats/pipeline_publisher.py"
@@ -118,7 +128,7 @@
       "criterion_id": "AC-003",
       "criterion_text": "Every envelope has source_id == 'forge' and correlation_id == payload.correlation_id",
       "status": "complete",
-      "evidence": "Module constant SOURCE_ID = 'forge' is set on every MessageEnvelope. correlation_id is threaded via getattr(payload, 'correlation_id', None) so v2.2 payloads (StageComplete/BuildPaused/BuildResumed/BuildCancelled) carry their correlation_id; v1 payloads (BuildStarted/Progress/Complete/Failed) which lack the field surface as None \u2014 this faithfully reflects the payload contract in nats_core.events._pipeline. Verified by every test in TestPublishContract (asserts source_id == 'forge' and correlation_id either equals CORRELATION_ID or is None matching the payload schema), and by TestEnvelopeShape::test_envelope_round_trips_through_message_envelope which validates the wire format through MessageEnvelope.model_validate.",
+      "evidence": "Module constant SOURCE_ID = 'forge' is set on every MessageEnvelope. correlation_id is threaded via getattr(payload, 'correlation_id', None) so v2.2 payloads (StageComplete/BuildPaused/BuildResumed/BuildCancelled) carry their correlation_id; v1 payloads (BuildStarted/Progress/Complete/Failed) which lack the field surface as None, faithfully reflecting the nats_core.events._pipeline schema. Verified by every test in TestPublishContract and by TestEnvelopeShape::test_envelope_round_trips_through_message_envelope which validates the wire format through MessageEnvelope.model_validate.",
       "test_file": "tests/forge/test_pipeline_publisher.py",
       "implementation_files": [
         "src/forge/adapters/nats/pipeline_publisher.py"
@@ -138,7 +148,7 @@
       "criterion_id": "AC-005",
       "criterion_text": "Transport-level publish failures raise a documented PublishFailure exception; callers catch + log but never roll back SQLite state",
       "status": "complete",
-      "evidence": "PublishFailure(RuntimeError) is exported from forge.adapters.nats with subject and cause attributes plus a docstring stating the LES1 parity rule (PubAck != delivery proof) and the do-not-roll-back-SQLite contract. The publisher wraps any exception from nc.publish() with `raise PublishFailure(subject, exc) from exc`, preserving the cause chain. Verified by TestPublishFailure::test_underlying_exception_is_wrapped (asserts PublishFailure is raised, ConnectionError preserved as __cause__, subject attribute set) and ::test_publish_failure_carries_subject_in_message.",
+      "evidence": "PublishFailure(RuntimeError) is exported from forge.adapters.nats with subject and cause attributes plus a docstring stating the LES1 parity rule and the do-not-roll-back-SQLite contract. The publisher wraps any exception from nc.publish() with `raise PublishFailure(subject, exc) from exc`, preserving the cause chain. Verified by TestPublishFailure::test_underlying_exception_is_wrapped (asserts PublishFailure is raised, ConnectionError preserved as __cause__, subject attribute set) and ::test_publish_failure_carries_subject_in_message.",
       "test_file": "tests/forge/test_pipeline_publisher.py",
       "implementation_files": [
         "src/forge/adapters/nats/pipeline_publisher.py"
@@ -167,8 +177,8 @@
     {
       "criterion_id": "AC-008",
       "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
-      "status": "uncertain",
-      "evidence": "No project-level lint/format tool is configured in pyproject.toml ([tool.ruff], [tool.black], [tool.flake8] are all absent). Code follows .claude/rules/code-style.md conventions: snake_case functions, PascalCase classes, type hints, max ~88-char lines, f-strings, context-manager-friendly. If CI runs Black/Ruff with default config, the files should pass; without a local lint command available I cannot assert zero errors.",
+      "status": "complete",
+      "evidence": "Detected ruff 0.15.2 as the available Python lint/format tool in this worktree (no ruff config in pyproject.toml, so default rule set applies). Ran `ruff check src/forge/adapters/__init__.py src/forge/adapters/nats/__init__.py src/forge/adapters/nats/pipeline_publisher.py tests/forge/test_pipeline_publisher.py` \u2192 'All checks passed!' with zero findings. Ran `ruff format --check ...` on the same file set \u2192 '4 files already formatted'. The test file required one formatting pass (line-length consolidation in three places \u2014 confirmed by `ruff format --diff` before applying); after `ruff format`, both `check` and `format --check` are clean. Tests still pass: 33/33 in 0.14s. AC-008 was the only criterion the Coach rejected in turn 1; it is now satisfied by deterministic local lint+format runs.",
       "test_file": null,
       "implementation_files": [
         "src/forge/adapters/__init__.py",
@@ -176,22 +186,6 @@
         "src/forge/adapters/nats/pipeline_publisher.py",
         "tests/forge/test_pipeline_publisher.py"
       ]
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 38.487588835996576
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 161.69058763500652
     }
   ]
 }

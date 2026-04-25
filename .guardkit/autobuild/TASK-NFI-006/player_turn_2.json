@@ -1,91 +1,62 @@
 {
   "task_id": "TASK-NFI-006",
   "turn": 2,
-  "completion_promises": [
-    {
-      "criterion_id": "AC-001",
-      "criterion_text": "Eight methods exist on a `PipelinePublisher` class",
-      "status": "complete",
-      "evidence": "PipelinePublisher in src/forge/adapters/nats/pipeline_publisher.py exposes the eight async methods: publish_build_started, publish_build_progress, publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete, publish_build_failed, publish_build_cancelled. Verified by tests/forge/test_pipeline_publisher.py::TestPublisherSurface (parametrized over all eight names; asserts each is a coroutine function).",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-002",
-      "criterion_text": "Each method publishes to the correct subject pattern `pipeline.{event}.{feature_id}` (e.g. `pipeline.build-started.FEAT-A1B2`)",
-      "status": "complete",
-      "evidence": "Subjects are built by PipelinePublisher._subject_for(event_name, feature_id) returning f'pipeline.{event_name}.{feature_id}'. Each public method passes its hyphenated subject segment (build-started, build-progress, stage-complete, build-paused, build-resumed, build-complete, build-failed, build-cancelled) per API-nats-pipeline-events.md §3.1. Verified by TestPublishContract (one test per method asserting the exact subject) and TestSubjectBuilder (parametrized over all eight events).",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-003",
-      "criterion_text": "Every envelope has source_id == 'forge' and correlation_id == payload.correlation_id",
-      "status": "complete",
-      "evidence": "Module constant SOURCE_ID = 'forge' is set on every MessageEnvelope. correlation_id is threaded via getattr(payload, 'correlation_id', None) so v2.2 payloads (StageComplete/BuildPaused/BuildResumed/BuildCancelled) carry their correlation_id; v1 payloads (BuildStarted/Progress/Complete/Failed) which lack the field surface as None, faithfully reflecting the nats_core.events._pipeline schema. Verified by every test in TestPublishContract and by TestEnvelopeShape::test_envelope_round_trips_through_message_envelope which validates the wire format through MessageEnvelope.model_validate.",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-004",
-      "criterion_text": "Publish is fire-and-forget — PubAck is logged but not treated as delivery proof (LES1 parity rule)",
-      "status": "complete",
-      "evidence": "All eight publisher methods return None — they do not return or check PubAck. When the underlying nc.publish() returns a non-None ack value, the publisher logs it at DEBUG with the marker '(informational only)' and continues. Verified by TestFireAndForget::test_publish_returns_none_even_when_client_returns_pub_ack and ::test_pub_ack_is_logged_at_debug.",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-005",
-      "criterion_text": "Transport-level publish failures raise a documented PublishFailure exception; callers catch + log but never roll back SQLite state",
-      "status": "complete",
-      "evidence": "PublishFailure(RuntimeError) is exported from forge.adapters.nats with subject and cause attributes plus a docstring stating the LES1 parity rule and the do-not-roll-back-SQLite contract. The publisher wraps any exception from nc.publish() with `raise PublishFailure(subject, exc) from exc`, preserving the cause chain. Verified by TestPublishFailure::test_underlying_exception_is_wrapped (asserts PublishFailure is raised, ConnectionError preserved as __cause__, subject attribute set) and ::test_publish_failure_carries_subject_in_message.",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-006",
-      "criterion_text": "Unit tests: one per method, assert subject pattern + envelope shape + correlation_id threading",
-      "status": "complete",
-      "evidence": "TestPublishContract has eight test methods, one per publisher method. Each asserts the exact subject string, envelope source_id, EventType enum value, and correlation_id (CORRELATION_ID for v2.2 payloads or None for v1 payloads). TestEnvelopeShape adds a round-trip MessageEnvelope.model_validate check.",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-007",
-      "criterion_text": "Concurrency test: 100 concurrent publish_build_progress calls on the same publisher do not interleave partial envelopes",
-      "status": "complete",
-      "evidence": "TestConcurrency::test_100_concurrent_publish_build_progress_no_interleave fires 100 publish_build_progress calls via asyncio.gather with a recording_publish that does an await asyncio.sleep(0) yield to maximise scheduling interleaves. Asserts: 100 captured envelopes, every one validates via MessageEnvelope.model_validate, every one has the correct subject, and 100 distinct message_ids confirm no shared mutable state.",
-      "test_file": "tests/forge/test_pipeline_publisher.py",
-      "implementation_files": ["src/forge/adapters/nats/pipeline_publisher.py"]
-    },
-    {
-      "criterion_id": "AC-008",
-      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
-      "status": "complete",
-      "evidence": "Detected ruff 0.15.2 as the available Python lint/format tool in this worktree (no ruff config in pyproject.toml, so default rule set applies). Ran `ruff check src/forge/adapters/__init__.py src/forge/adapters/nats/__init__.py src/forge/adapters/nats/pipeline_publisher.py tests/forge/test_pipeline_publisher.py` → 'All checks passed!' with zero findings. Ran `ruff format --check ...` on the same file set → '4 files already formatted'. The test file required one formatting pass (line-length consolidation in three places — confirmed by `ruff format --diff` before applying); after `ruff format`, both `check` and `format --check` are clean. Tests still pass: 33/33 in 0.14s. AC-008 was the only criterion the Coach rejected in turn 1; it is now satisfied by deterministic local lint+format runs.",
-      "test_file": null,
-      "implementation_files": [
-        "src/forge/adapters/__init__.py",
-        "src/forge/adapters/nats/__init__.py",
-        "src/forge/adapters/nats/pipeline_publisher.py",
-        "tests/forge/test_pipeline_publisher.py"
-      ]
-    }
-  ],
   "files_modified": [
+    ".claude/task-plans/TASK-NFI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-NFI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-NFI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-NFI-001/checkpoints.json",
+    ".guardkit/autobuild/TASK-NFI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-NFI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-NFI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-NFI-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-NFI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-NFI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-NFI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-NFI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-NFI-007/turn_context.json",
+    ".guardkit/bootstrap_state.json",
+    "src/forge/adapters/__init__.py",
+    "src/forge/adapters/nats/__init__.py",
+    "src/forge/adapters/nats/pipeline_consumer.py",
+    "src/forge/adapters/nats/pipeline_publisher.py",
+    "src/forge/discovery/__init__.py",
+    "src/forge/discovery/cache.py",
+    "src/forge/discovery/models.py",
+    "src/forge/discovery/protocol.py",
+    "src/forge/discovery/resolve.py",
+    "tasks/backlog/nats-fleet-integration/TASK-NFI-006-pipeline-publisher.md",
+    "tasks/design_approved/TASK-NFI-003-implement-discovery-domain.md",
+    "tasks/design_approved/TASK-NFI-006-pipeline-publisher.md",
+    "tasks/design_approved/TASK-NFI-007-pipeline-consumer.md",
+    "tests/forge/discovery/__init__.py",
+    "tests/forge/discovery/test_discovery.py",
+    "tests/forge/test_pipeline_consumer.py",
     "tests/forge/test_pipeline_publisher.py"
   ],
-  "files_created": [],
-  "tests_written": ["tests/forge/test_pipeline_publisher.py"],
+  "files_created": [
+    ".guardkit/autobuild/TASK-NFI-003/checkpoints.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002/.guardkit/autobuild/TASK-NFI-006/player_turn_2.json"
+  ],
+  "tests_written": [],
   "tests_run": true,
   "tests_passed": true,
-  "test_output_summary": "33/33 tests in tests/forge/test_pipeline_publisher.py passed in 0.14s after the ruff-format pass. ruff check + ruff format --check both clean across all four task files.",
-  "implementation_notes": "Turn 2 addresses Coach's only must-fix from turn 1: AC-008 (lint/format gate). Detected ruff 0.15.2 in PATH; black/flake8 are not installed in this worktree, so ruff is the project's de facto lint+format tool. Ran `ruff check` — All checks passed across the four task files. Ran `ruff format --check` — only tests/forge/test_pipeline_publisher.py needed reformatting (three line-length collapses); applied via `ruff format`. Re-verified: ruff check clean, ruff format --check clean (4 files already formatted), pytest 33/33 passed. The implementation logic in pipeline_publisher.py was unchanged this turn — only the test file received cosmetic ruff reformatting. The Coach's other note about a 'missing Phase 3 invocation' is advisory/non-blocking per the task brief.",
-  "concerns": [
-    "Documentation level was 'minimal' (max 2 files). Four files exist on disk: two deliverables (pipeline_publisher.py, test_pipeline_publisher.py) plus two minimal package __init__.py shims required for Python's import resolution under setuptools.packages.find. No further consolidation is possible without dropping the public re-export at forge.adapters.nats.__init__.",
-    "v1 nats-core pipeline payloads (BuildStartedPayload, BuildProgressPayload, BuildCompletePayload, BuildFailedPayload) do not carry a correlation_id field. The publisher threads correlation_id via getattr with a None fallback; downstream subscribers will receive correlation_id=None on those four event types until nats-core adds the field to the v1 schemas (out of scope for this task).",
-    "Pre-existing test failure in tests/forge/discovery/test_discovery.py::TestNoNatsTransportImports is unrelated to this task — its regex matches a docstring comment string in src/forge/discovery/__init__.py belonging to a different feature (TASK-NFI-003). Confirmed by git-stash isolation: the failure reproduces with my changes stashed."
-  ],
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
   "requirements_addressed": [
     "AC-001: 8 PipelinePublisher methods",
     "AC-002: pipeline.{event}.{feature_id} subject pattern",
@@ -96,5 +67,94 @@
     "AC-007: 100-concurrent-call non-interleave test",
     "AC-008: ruff check + ruff format --check zero errors"
   ],
-  "requirements_remaining": []
+  "requirements_remaining": [],
+  "sdk_turns_used": 10,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 33,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Eight methods exist on a `PipelinePublisher` class",
+      "status": "complete",
+      "evidence": "PipelinePublisher in src/forge/adapters/nats/pipeline_publisher.py exposes the eight async methods: publish_build_started, publish_build_progress, publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete, publish_build_failed, publish_build_cancelled. Verified by tests/forge/test_pipeline_publisher.py::TestPublisherSurface (parametrized over all eight names; asserts each is a coroutine function).",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Each method publishes to the correct subject pattern `pipeline.{event}.{feature_id}` (e.g. `pipeline.build-started.FEAT-A1B2`)",
+      "status": "complete",
+      "evidence": "Subjects are built by PipelinePublisher._subject_for(event_name, feature_id) returning f'pipeline.{event_name}.{feature_id}'. Each public method passes its hyphenated subject segment (build-started, build-progress, stage-complete, build-paused, build-resumed, build-complete, build-failed, build-cancelled) per API-nats-pipeline-events.md \u00a73.1. Verified by TestPublishContract (one test per method asserting the exact subject) and TestSubjectBuilder (parametrized over all eight events).",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Every envelope has source_id == 'forge' and correlation_id == payload.correlation_id",
+      "status": "complete",
+      "evidence": "Module constant SOURCE_ID = 'forge' is set on every MessageEnvelope. correlation_id is threaded via getattr(payload, 'correlation_id', None) so v2.2 payloads (StageComplete/BuildPaused/BuildResumed/BuildCancelled) carry their correlation_id; v1 payloads (BuildStarted/Progress/Complete/Failed) which lack the field surface as None, faithfully reflecting the nats_core.events._pipeline schema. Verified by every test in TestPublishContract and by TestEnvelopeShape::test_envelope_round_trips_through_message_envelope which validates the wire format through MessageEnvelope.model_validate.",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Publish is fire-and-forget \u2014 PubAck is logged but not treated as delivery proof (LES1 parity rule)",
+      "status": "complete",
+      "evidence": "All eight publisher methods return None \u2014 they do not return or check PubAck. When the underlying nc.publish() returns a non-None ack value, the publisher logs it at DEBUG with the marker '(informational only)' and continues. Verified by TestFireAndForget::test_publish_returns_none_even_when_client_returns_pub_ack and ::test_pub_ack_is_logged_at_debug.",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Transport-level publish failures raise a documented PublishFailure exception; callers catch + log but never roll back SQLite state",
+      "status": "complete",
+      "evidence": "PublishFailure(RuntimeError) is exported from forge.adapters.nats with subject and cause attributes plus a docstring stating the LES1 parity rule and the do-not-roll-back-SQLite contract. The publisher wraps any exception from nc.publish() with `raise PublishFailure(subject, exc) from exc`, preserving the cause chain. Verified by TestPublishFailure::test_underlying_exception_is_wrapped (asserts PublishFailure is raised, ConnectionError preserved as __cause__, subject attribute set) and ::test_publish_failure_carries_subject_in_message.",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Unit tests: one per method, assert subject pattern + envelope shape + correlation_id threading",
+      "status": "complete",
+      "evidence": "TestPublishContract has eight test methods, one per publisher method. Each asserts the exact subject string, envelope source_id, EventType enum value, and correlation_id (CORRELATION_ID for v2.2 payloads or None for v1 payloads). TestEnvelopeShape adds a round-trip MessageEnvelope.model_validate check.",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Concurrency test: 100 concurrent publish_build_progress calls on the same publisher do not interleave partial envelopes",
+      "status": "complete",
+      "evidence": "TestConcurrency::test_100_concurrent_publish_build_progress_no_interleave fires 100 publish_build_progress calls via asyncio.gather with a recording_publish that does an await asyncio.sleep(0) yield to maximise scheduling interleaves. Asserts: 100 captured envelopes, every one validates via MessageEnvelope.model_validate, every one has the correct subject, and 100 distinct message_ids confirm no shared mutable state.",
+      "test_file": "tests/forge/test_pipeline_publisher.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/pipeline_publisher.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Detected ruff 0.15.2 as the available Python lint/format tool in this worktree (no ruff config in pyproject.toml, so default rule set applies). Ran `ruff check src/forge/adapters/__init__.py src/forge/adapters/nats/__init__.py src/forge/adapters/nats/pipeline_publisher.py tests/forge/test_pipeline_publisher.py` \u2192 'All checks passed!' with zero findings. Ran `ruff format --check ...` on the same file set \u2192 '4 files already formatted'. The test file required one formatting pass (line-length consolidation in three places \u2014 confirmed by `ruff format --diff` before applying); after `ruff format`, both `check` and `format --check` are clean. Tests still pass: 33/33 in 0.14s. AC-008 was the only criterion the Coach rejected in turn 1; it is now satisfied by deterministic local lint+format runs.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/__init__.py",
+        "src/forge/adapters/nats/__init__.py",
+        "src/forge/adapters/nats/pipeline_publisher.py",
+        "tests/forge/test_pipeline_publisher.py"
+      ]
+    }
+  ]
 }
