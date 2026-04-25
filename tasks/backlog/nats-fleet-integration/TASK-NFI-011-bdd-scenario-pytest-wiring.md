@@ -1,28 +1,48 @@
 ---
 id: TASK-NFI-011
-title: "BDD @smoke + @key-example pytest wiring (33 scenarios → tagged tests)"
+title: "BDD @smoke + @key-example pytest wiring (33 scenarios \u2192 tagged tests)"
 task_type: testing
-status: backlog
+status: in_review
 priority: normal
-created: 2026-04-24T00:00:00Z
-updated: 2026-04-24T00:00:00Z
+created: 2026-04-24 00:00:00+00:00
+updated: 2026-04-24 00:00:00+00:00
 parent_review: TASK-REV-NF20
 feature_id: FEAT-FORGE-002
 wave: 5
 implementation_mode: task-work
 complexity: 4
 dependencies:
-  - TASK-NFI-004
-  - TASK-NFI-005
-  - TASK-NFI-006
-  - TASK-NFI-007
-  - TASK-NFI-008
-  - TASK-NFI-009
-tags: [testing, bdd, scenarios, r2-oracle]
+- TASK-NFI-004
+- TASK-NFI-005
+- TASK-NFI-006
+- TASK-NFI-007
+- TASK-NFI-008
+- TASK-NFI-009
+tags:
+- testing
+- bdd
+- scenarios
+- r2-oracle
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
+  base_branch: main
+  started_at: '2026-04-25T14:49:38.888615'
+  last_updated: '2026-04-25T15:07:01.105808'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T14:49:38.888615'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: BDD @smoke + @key-example pytest wiring

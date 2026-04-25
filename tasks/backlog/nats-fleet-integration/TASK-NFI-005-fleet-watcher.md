@@ -1,34 +1,59 @@
 ---
 id: TASK-NFI-005
-title: "Implement fleet_watcher (subscribe + delegate to FleetEventSink)"
+title: Implement fleet_watcher (subscribe + delegate to FleetEventSink)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-24T00:00:00Z
-updated: 2026-04-24T00:00:00Z
+created: 2026-04-24 00:00:00+00:00
+updated: 2026-04-24 00:00:00+00:00
 parent_review: TASK-REV-NF20
 feature_id: FEAT-FORGE-002
 wave: 3
 implementation_mode: task-work
 complexity: 5
 dependencies:
-  - TASK-NFI-003
-tags: [nats, adapter, watcher, subscriber, fleet, cache-invalidation]
+- TASK-NFI-003
+tags:
+- nats
+- adapter
+- watcher
+- subscriber
+- fleet
+- cache-invalidation
 consumer_context:
-  - task: TASK-NFI-003
-    consumes: FleetEventSink
-    framework: "Python asyncio Protocol (PEP 544)"
-    driver: "forge.discovery.protocol"
-    format_note: "Calls `sink.upsert_agent(manifest)`, `sink.remove_agent(agent_id)`, `sink.update_heartbeat(agent_id, hb, status_changed)` — must match protocol signatures exactly; mutations happen inside the sink's asyncio.Lock"
-  - task: TASK-NFI-001
-    consumes: ForgeConfig.fleet
-    framework: "Pydantic v2 BaseModel"
-    driver: "pyyaml + pydantic"
-    format_note: "FleetConfig.stale_heartbeat_seconds (int, default 90) drives background stale-agent sweeper"
+- task: TASK-NFI-003
+  consumes: FleetEventSink
+  framework: Python asyncio Protocol (PEP 544)
+  driver: forge.discovery.protocol
+  format_note: "Calls `sink.upsert_agent(manifest)`, `sink.remove_agent(agent_id)`,\
+    \ `sink.update_heartbeat(agent_id, hb, status_changed)` \u2014 must match protocol\
+    \ signatures exactly; mutations happen inside the sink's asyncio.Lock"
+- task: TASK-NFI-001
+  consumes: ForgeConfig.fleet
+  framework: Pydantic v2 BaseModel
+  driver: pyyaml + pydantic
+  format_note: FleetConfig.stale_heartbeat_seconds (int, default 90) drives background
+    stale-agent sweeper
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
+  base_branch: main
+  started_at: '2026-04-25T14:19:57.078735'
+  last_updated: '2026-04-25T14:35:37.103434'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T14:19:57.078735'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Implement fleet_watcher (subscribe + delegate to FleetEventSink)

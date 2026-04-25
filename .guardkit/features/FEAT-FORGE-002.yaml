@@ -5,7 +5,7 @@ description: 'Forge''s participation on the shared NATS fleet: self-registration
   fallback, outbound pipeline lifecycle event stream, and inbound build-queue with
   terminal-only ack.'
 created: '2026-04-24T10:41:02.328017'
-status: failed
+status: completed
 complexity: 7
 estimated_tasks: 11
 tasks:
@@ -24,8 +24,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-25T12:22:10.859606'
-  completed_at: '2026-04-25T12:25:30.162775'
+  started_at: '2026-04-25T13:58:15.154100'
+  completed_at: '2026-04-25T14:02:51.067021'
 - id: TASK-NFI-002
   name: Define FORGE_MANIFEST constant builder
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-002-define-forge-manifest-constant.md
@@ -41,8 +41,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-25T12:22:10.862480'
-  completed_at: '2026-04-25T12:25:30.166061'
+  started_at: '2026-04-25T13:58:15.156951'
+  completed_at: '2026-04-25T14:02:51.070224'
 - id: TASK-NFI-003
   name: Implement forge.discovery domain cache resolve protocols
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-003-implement-discovery-domain.md
@@ -50,19 +50,18 @@ tasks:
   dependencies:
   - TASK-NFI-001
   - TASK-NFI-002
-  status: failed
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
   result:
-    total_turns: 3
-    final_decision: unrecoverable_stall
-    error: Unrecoverable stall detected after 3 turn(s). AutoBuild cannot make forward
-      progress.
-  turns_completed: 3
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-25T12:25:32.028020'
-  completed_at: '2026-04-25T12:55:56.951016'
+  started_at: '2026-04-25T14:02:53.086354'
+  completed_at: '2026-04-25T14:19:57.011033'
 - id: TASK-NFI-004
   name: Implement fleet_publisher register heartbeat deregister
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-004-fleet-publisher.md
@@ -71,83 +70,90 @@ tasks:
   - TASK-NFI-001
   - TASK-NFI-002
   - TASK-NFI-003
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:19:57.049504'
+  completed_at: '2026-04-25T14:36:11.576521'
 - id: TASK-NFI-005
   name: Implement fleet_watcher subscribe delegate FleetEventSink
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-005-fleet-watcher.md
   complexity: 5
   dependencies:
   - TASK-NFI-003
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:19:57.055782'
+  completed_at: '2026-04-25T14:36:11.580268'
 - id: TASK-NFI-006
   name: Implement pipeline_publisher 8 lifecycle publisher methods
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-006-pipeline-publisher.md
   complexity: 5
   dependencies:
   - TASK-NFI-001
-  status: failed
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
   result:
-    total_turns: 3
-    final_decision: unrecoverable_stall
-    error: Unrecoverable stall detected after 3 turn(s). AutoBuild cannot make forward
-      progress.
-  turns_completed: 3
+    total_turns: 2
+    final_decision: approved
+    error: null
+  turns_completed: 2
   current_turn: 0
-  started_at: '2026-04-25T12:25:32.031016'
-  completed_at: '2026-04-25T12:55:56.954419'
+  started_at: '2026-04-25T14:02:53.089355'
+  completed_at: '2026-04-25T14:19:57.017574'
 - id: TASK-NFI-007
   name: Implement pipeline_consumer pull validation allowlist
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-007-pipeline-consumer.md
   complexity: 6
   dependencies:
   - TASK-NFI-001
-  status: failed
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
   result:
-    total_turns: 3
-    final_decision: unrecoverable_stall
-    error: Unrecoverable stall detected after 3 turn(s). AutoBuild cannot make forward
-      progress.
-  turns_completed: 3
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-25T12:25:32.034103'
-  completed_at: '2026-04-25T12:55:56.957693'
+  started_at: '2026-04-25T14:02:53.092273'
+  completed_at: '2026-04-25T14:19:57.024173'
 - id: TASK-NFI-008
   name: Wire state-machine transitions to pipeline_publisher
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-008-wire-state-machine-lifecycle-emission.md
   complexity: 5
   dependencies:
   - TASK-NFI-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:19:57.062144'
+  completed_at: '2026-04-25T14:36:11.583522'
 - id: TASK-NFI-009
   name: Implement reconcile_on_boot crash recovery paused re-announce
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-009-reconcile-on-boot-crash-recovery.md
@@ -155,15 +161,18 @@ tasks:
   dependencies:
   - TASK-NFI-007
   - TASK-NFI-008
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:36:11.596545'
+  completed_at: '2026-04-25T14:49:38.845432'
 - id: TASK-NFI-010
   name: Contract and seam tests for nats_client boundary
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-010-contract-and-seam-tests.md
@@ -174,15 +183,18 @@ tasks:
   - TASK-NFI-006
   - TASK-NFI-007
   - TASK-NFI-009
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:49:38.870894'
+  completed_at: '2026-04-25T15:07:01.107414'
 - id: TASK-NFI-011
   name: BDD smoke and key-example pytest wiring
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-011-bdd-scenario-pytest-wiring.md
@@ -194,15 +206,18 @@ tasks:
   - TASK-NFI-007
   - TASK-NFI-008
   - TASK-NFI-009
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
   current_turn: 0
-  started_at: null
-  completed_at: null
+  started_at: '2026-04-25T14:49:38.877425'
+  completed_at: '2026-04-25T15:07:01.111132'
 orchestration:
   parallel_groups:
   - - TASK-NFI-001
@@ -219,15 +234,19 @@ orchestration:
   estimated_duration_minutes: 819
   recommended_parallel: 3
 execution:
-  started_at: '2026-04-25T12:22:10.845404'
-  completed_at: '2026-04-25T12:55:56.962522'
+  started_at: '2026-04-25T13:58:15.141557'
+  completed_at: '2026-04-25T15:07:01.119079'
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
-  total_turns: 11
-  tasks_completed: 2
-  tasks_failed: 3
-  current_wave: 2
+  total_turns: 12
+  tasks_completed: 11
+  tasks_failed: 0
+  current_wave: 5
   completed_waves:
   - 1
-  last_updated: '2026-04-25T12:55:56.957697'
+  - 2
+  - 3
+  - 4
+  - 5
+  last_updated: '2026-04-25T15:07:01.114858'
   archived_at: null
   archived_to: null

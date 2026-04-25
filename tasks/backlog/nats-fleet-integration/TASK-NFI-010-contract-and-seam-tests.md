@@ -1,27 +1,48 @@
 ---
 id: TASK-NFI-010
-title: "Contract + seam tests (nats_client mock, FleetEventSink seam, terminal-ack invariant)"
+title: Contract + seam tests (nats_client mock, FleetEventSink seam, terminal-ack
+  invariant)
 task_type: testing
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-24T00:00:00Z
-updated: 2026-04-24T00:00:00Z
+created: 2026-04-24 00:00:00+00:00
+updated: 2026-04-24 00:00:00+00:00
 parent_review: TASK-REV-NF20
 feature_id: FEAT-FORGE-002
 wave: 5
 implementation_mode: task-work
 complexity: 5
 dependencies:
-  - TASK-NFI-004
-  - TASK-NFI-005
-  - TASK-NFI-006
-  - TASK-NFI-007
-  - TASK-NFI-009
-tags: [testing, contract-tests, seam-tests, boundary-tests]
+- TASK-NFI-004
+- TASK-NFI-005
+- TASK-NFI-006
+- TASK-NFI-007
+- TASK-NFI-009
+tags:
+- testing
+- contract-tests
+- seam-tests
+- boundary-tests
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
+  base_branch: main
+  started_at: '2026-04-25T14:49:38.892222'
+  last_updated: '2026-04-25T15:05:38.881063'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T14:49:38.892222'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Contract + seam tests

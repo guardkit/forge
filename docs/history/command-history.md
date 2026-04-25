@@ -2445,20 +2445,19 @@ Per the build plan, FEAT-FORGE-007 depends on FEAT-FORGE-003, 004, 005, and 006 
 
 
 
+guardkit autobuild task TASK-AB59-CANON
+
+
+guardkit autobuild task TASK-AB59-CANON
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild task TASK-AB59-CANON --verbose --max-turns 30
 
 
 
 
 
 
-
-
-
-
-
-
-
-
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild task TASK-AB59-CANON --no-pre-loop --max-turns 5
 
 
 

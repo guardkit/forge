@@ -1,29 +1,53 @@
 ---
 id: TASK-NFI-008
-title: "Wire state-machine transitions to pipeline_publisher (lifecycle emission points)"
+title: Wire state-machine transitions to pipeline_publisher (lifecycle emission points)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-24T00:00:00Z
-updated: 2026-04-24T00:00:00Z
+created: 2026-04-24 00:00:00+00:00
+updated: 2026-04-24 00:00:00+00:00
 parent_review: TASK-REV-NF20
 feature_id: FEAT-FORGE-002
 wave: 4
 implementation_mode: task-work
 complexity: 5
 dependencies:
-  - TASK-NFI-006
-tags: [integration, state-machine, pipeline, lifecycle]
+- TASK-NFI-006
+tags:
+- integration
+- state-machine
+- pipeline
+- lifecycle
 consumer_context:
-  - task: TASK-NFI-006
-    consumes: PipelinePublisher
-    framework: "Python class with async methods"
-    driver: "forge.adapters.nats.pipeline_publisher"
-    format_note: "Eight async methods (publish_build_started, publish_build_progress, publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete, publish_build_failed, publish_build_cancelled); each takes a typed payload from nats_core.events.pipeline; caller is responsible for building the payload with correct correlation_id threading"
+- task: TASK-NFI-006
+  consumes: PipelinePublisher
+  framework: Python class with async methods
+  driver: forge.adapters.nats.pipeline_publisher
+  format_note: Eight async methods (publish_build_started, publish_build_progress,
+    publish_stage_complete, publish_build_paused, publish_build_resumed, publish_build_complete,
+    publish_build_failed, publish_build_cancelled); each takes a typed payload from
+    nats_core.events.pipeline; caller is responsible for building the payload with
+    correct correlation_id threading
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
+  base_branch: main
+  started_at: '2026-04-25T14:19:57.083875'
+  last_updated: '2026-04-25T14:36:11.574396'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-25T14:19:57.083875'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Wire state-machine transitions to pipeline_publisher
