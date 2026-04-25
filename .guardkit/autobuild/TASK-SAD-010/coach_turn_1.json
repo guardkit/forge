@@ -1,0 +1,199 @@
+{
+  "task_id": "TASK-SAD-010",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/test_specialist_dispatch.py tests/forge/dispatch/test_async_polling.py tests/forge/dispatch/test_outcome.py tests/forge/dispatch/test_retry.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/dispatch/test_async_polling.py::TestRepeatedPendingHitsCeiling::test_repeated_pending_yields_async_polling_ceiling_exceeded PASSED [ 55%]\ntests/forge/dispatch/test_async_polling.py::TestStatusToolError::test_status_tool_error_stops_polling_after_one_call PASSED [ 56%]\ntests/forge/dispatch/test_async_polling.py::TestCeilingTrackedViaClock::test_ceiling_does_not_fire_when_clock_does_not_advance PASSED [ 57%]\ntests/forge/dispatch/test_async_polling.py::TestCeilingTrackedViaClock::test_ceiling_fires_at_expected_clock_elapsed_time PASSED [ 59%]\ntests/forge/dispatch/test_async_polling.py::TestDegradedOutcomePassthrough::test_degraded_status_outcome_is_returned_with_restamped_resolution_id PASSED [ 60%]\nResult:\ntests/forge/dispatch/test_retry.py::TestRetryCoordinatorConstruction::test_retry_coordinator_holds_injected_orchestrator PASSED [ 98%]\ntests/forge/dispatch/test_retry.py::TestSeamCapabilityResolutionSiblingContract::test_retry_creates_sibling_record_not_ove...",
+      "duration_seconds": 0.5518798828125
+    },
+    "requirements": {
+      "criteria_total": 9,
+      "criteria_met": 9,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`src/forge/adapters/nats/specialist_dispatch.py` implements",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Module created at src/forge/adapters/nats/specialist_dispatch.py exports NatsSpecialistDispatchAdapter with all three async methods (subscribe_reply, unsubscribe_reply, publish_dispatch) plus _on_reply_received callback. Verified by TestPublicSurface::test_adapter_exposes_three_lifecycle_methods which checks each method exists and is a coroutine function.",
+      "notes": "Module created at src/forge/adapters/nats/specialist_dispatch.py exports NatsSpecialistDispatchAdapter with all three async methods (subscribe_reply, unsubscribe_reply, publish_dispatch) plus _on_reply_received callback. Verified by TestPublicSurface::test_adapter_exposes_three_lifecycle_methods which checks each method exists and is a coroutine function."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Subjects use singular convention: `agents.command.{agent_id}` and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "COMMAND_SUBJECT_TEMPLATE='agents.command.{agent_id}' and RESULT_SUBJECT_TEMPLATE='agents.result.{agent_id}.{correlation_key}' constants are exported and used by command_subject_for/result_subject_for static helpers. TestSubjectConvention::test_subscribe_reply_uses_singular_result_subject and test_publish_dispatch_uses_singular_command_subject verify with re.fullmatch using the spec regexes (agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32} and agents\\.command\\.[a-z0-9-]+).",
+      "notes": "COMMAND_SUBJECT_TEMPLATE='agents.command.{agent_id}' and RESULT_SUBJECT_TEMPLATE='agents.result.{agent_id}.{correlation_key}' constants are exported and used by command_subject_for/result_subject_for static helpers. TestSubjectConvention::test_subscribe_reply_uses_singular_result_subject and test_publish_dispatch_uses_singular_command_subject verify with re.fullmatch using the spec regexes (agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32} and agents\\.command\\.[a-z0-9-]+)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Headers on the published dispatch include `correlation_key`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "publish_dispatch builds headers dict with all three keys: CORRELATION_KEY_HEADER=attempt.correlation_key, REQUESTING_AGENT_HEADER='forge', DISPATCHED_AT_HEADER=self._clock.now().isoformat(). TestDispatchHeaders has four tests verifying each header is present, correlation_key matches the attempt, requesting_agent_id is 'forge', and dispatched_at parses as ISO 8601 with UTC offset. Clock injection (default SystemClock) keeps the adapter compliant with the project's clock-hygiene rule.",
+      "notes": "publish_dispatch builds headers dict with all three keys: CORRELATION_KEY_HEADER=attempt.correlation_key, REQUESTING_AGENT_HEADER='forge', DISPATCHED_AT_HEADER=self._clock.now().isoformat(). TestDispatchHeaders has four tests verifying each header is present, correlation_key matches the attempt, requesting_agent_id is 'forge', and dispatched_at parses as ISO 8601 with UTC offset. Clock injection (default SystemClock) keeps the adapter compliant with the project's clock-hygiene rule."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`subscribe_reply()` returns ONLY after the underlying NATS",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "subscribe_reply awaits self._nc.subscribe(...) which (per nats-py contract) returns after SUB is sent, then issues a belt-and-braces flush() so the SUB lands at the server before return. TestSubscribeBeforePublish::test_subscribe_reply_blocks_until_underlying_subscribe_returns uses a subscribe_gate Event to assert subscribe_reply does not return while subscribe is parked. test_reply_published_after_subscribe_return_is_received calls subscribe_reply then immediately delivers via the recorded subscription callback and asserts the reply is forwarded to the registry.",
+      "notes": "subscribe_reply awaits self._nc.subscribe(...) which (per nats-py contract) returns after SUB is sent, then issues a belt-and-braces flush() so the SUB lands at the server before return. TestSubscribeBeforePublish::test_subscribe_reply_blocks_until_underlying_subscribe_returns uses a subscribe_gate Event to assert subscribe_reply does not return while subscribe is parked. test_reply_published_after_subscribe_return_is_received calls subscribe_reply then immediately delivers via the recorded subscription callback and asserts the reply is forwarded to the registry."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "PubAck on the audit stream does NOT trigger",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "publish_dispatch logs PubAck at DEBUG only \u2014 no call to registry.deliver_reply on the success path. TestPubAckNotSuccess::test_pubAck_is_not_routed_through_registry sets nats_client.publish_ack to a sentinel object and verifies recording_registry.delivered remains empty. test_pubAck_is_not_routed_with_real_registry repeats with a real CorrelationRegistry instance.",
+      "notes": "publish_dispatch logs PubAck at DEBUG only \u2014 no call to registry.deliver_reply on the success path. TestPubAckNotSuccess::test_pubAck_is_not_routed_through_registry sets nats_client.publish_ack to a sentinel object and verifies recording_registry.delivered remains empty. test_pubAck_is_not_routed_with_real_registry repeats with a real CorrelationRegistry instance."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`unsubscribe_reply()` is idempotent (safe to call twice with the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "unsubscribe_reply uses self._subscriptions.pop(correlation_key, None) so a second call observes None and returns early. TestUnsubscribeIdempotency has four tests: invokes_underlying_unsubscribe_once, twice_is_no_op (verifies sub.unsubscribe_calls == 1 after multiple invocations), unsubscribe_unknown_key_is_no_op (never-subscribed key), swallows_transport_error (RuntimeError from sub.unsubscribe is caught and logged).",
+      "notes": "unsubscribe_reply uses self._subscriptions.pop(correlation_key, None) so a second call observes None and returns early. TestUnsubscribeIdempotency has four tests: invokes_underlying_unsubscribe_once, twice_is_no_op (verifies sub.unsubscribe_calls == 1 after multiple invocations), unsubscribe_unknown_key_is_no_op (never-subscribed key), swallows_transport_error (RuntimeError from sub.unsubscribe is caught and logged)."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "`_on_reply_received()` extracts the source agent ID from msg headers",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_on_reply_received reads SOURCE_AGENT_HEADER and CORRELATION_KEY_HEADER from msg.headers, decodes the JSON body, and forwards to self._registry.deliver_reply(correlation_key, source_agent_id, payload) verbatim \u2014 no source comparison, no authentication. TestOnReplyReceived::test_does_not_authenticate_locally explicitly verifies that an 'imposter-agent' source value is forwarded unchanged to the registry. Defensive drops (missing headers, malformed JSON, non-dict root, callback exceptions) are covered by six additional tests in the class.",
+      "notes": "_on_reply_received reads SOURCE_AGENT_HEADER and CORRELATION_KEY_HEADER from msg.headers, decodes the JSON body, and forwards to self._registry.deliver_reply(correlation_key, source_agent_id, payload) verbatim \u2014 no source comparison, no authentication. TestOnReplyReceived::test_does_not_authenticate_locally explicitly verifies that an 'imposter-agent' source value is forwarded unchanged to the registry. Defensive drops (missing headers, malformed JSON, non-dict root, callback exceptions) are covered by six additional tests in the class."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Compatibility: existing `tests/bdd/conftest.py:FakeNatsClient`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The adapter's transport surface is restricted to subscribe(subject, cb=...), publish(subject, body, headers=...), and flush() \u2014 methods either present or trivially addable to the BDD FakeNatsClient. TestFakeNatsClientCompatibility::test_adapter_uses_only_subscribe_publish_flush builds a deliberately-minimal client exposing only those three methods and exercises the full adapter surface (subscribe_reply, publish_dispatch, unsubscribe_reply) against it. Per the task's Implementation Notes, the actual conftest extension (subscribe/unsubscribe recording) is deferred to TASK-SAD-011 \u2014 this task only proves the adapter does not require additional transport surface beyond what FakeNatsClient already provides.",
+      "notes": "The adapter's transport surface is restricted to subscribe(subject, cb=...), publish(subject, body, headers=...), and flush() \u2014 methods either present or trivially addable to the BDD FakeNatsClient. TestFakeNatsClientCompatibility::test_adapter_uses_only_subscribe_publish_flush builds a deliberately-minimal client exposing only those three methods and exercises the full adapter surface (subscribe_reply, publish_dispatch, unsubscribe_reply) against it. Per the task's Implementation Notes, the actual conftest extension (subscribe/unsubscribe recording) is deferred to TASK-SAD-011 \u2014 this task only proves the adapter does not require additional transport surface beyond what FakeNatsClient already provides."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Code follows project style (Black-compatible, 88-char lines, type hints, snake_case/PascalCase, docstrings, f-strings, context managers). Module passes the project's clock-hygiene gate (tests/forge/test_contract_and_seam.py::TestClockHygiene) \u2014 the initial datetime.now(timezone.utc) call was refactored to inject a Clock dependency (defaulting to SystemClock) which is the project-canonical pattern used by DiscoveryCache. No other lint configuration (ruff, flake8, mypy) is committed at the repo root.",
+      "notes": "Code follows project style (Black-compatible, 88-char lines, type hints, snake_case/PascalCase, docstrings, f-strings, context managers). Module passes the project's clock-hygiene gate (tests/forge/test_contract_and_seam.py::TestClockHygiene) \u2014 the initial datetime.now(timezone.utc) call was refactored to inject a Clock dependency (defaulting to SystemClock) which is the project-canonical pattern used by DiscoveryCache. No other lint configuration (ruff, flake8, mypy) is committed at the repo root."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`src/forge/adapters/nats/specialist_dispatch.py` implements",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Module created at src/forge/adapters/nats/specialist_dispatch.py exports NatsSpecialistDispatchAdapter with all three async methods (subscribe_reply, unsubscribe_reply, publish_dispatch) plus _on_reply_received callback. Verified by TestPublicSurface::test_adapter_exposes_three_lifecycle_methods which checks each method exists and is a coroutine function.",
+        "notes": "Module created at src/forge/adapters/nats/specialist_dispatch.py exports NatsSpecialistDispatchAdapter with all three async methods (subscribe_reply, unsubscribe_reply, publish_dispatch) plus _on_reply_received callback. Verified by TestPublicSurface::test_adapter_exposes_three_lifecycle_methods which checks each method exists and is a coroutine function."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Subjects use singular convention: `agents.command.{agent_id}` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "COMMAND_SUBJECT_TEMPLATE='agents.command.{agent_id}' and RESULT_SUBJECT_TEMPLATE='agents.result.{agent_id}.{correlation_key}' constants are exported and used by command_subject_for/result_subject_for static helpers. TestSubjectConvention::test_subscribe_reply_uses_singular_result_subject and test_publish_dispatch_uses_singular_command_subject verify with re.fullmatch using the spec regexes (agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32} and agents\\.command\\.[a-z0-9-]+).",
+        "notes": "COMMAND_SUBJECT_TEMPLATE='agents.command.{agent_id}' and RESULT_SUBJECT_TEMPLATE='agents.result.{agent_id}.{correlation_key}' constants are exported and used by command_subject_for/result_subject_for static helpers. TestSubjectConvention::test_subscribe_reply_uses_singular_result_subject and test_publish_dispatch_uses_singular_command_subject verify with re.fullmatch using the spec regexes (agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32} and agents\\.command\\.[a-z0-9-]+)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Headers on the published dispatch include `correlation_key`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "publish_dispatch builds headers dict with all three keys: CORRELATION_KEY_HEADER=attempt.correlation_key, REQUESTING_AGENT_HEADER='forge', DISPATCHED_AT_HEADER=self._clock.now().isoformat(). TestDispatchHeaders has four tests verifying each header is present, correlation_key matches the attempt, requesting_agent_id is 'forge', and dispatched_at parses as ISO 8601 with UTC offset. Clock injection (default SystemClock) keeps the adapter compliant with the project's clock-hygiene rule.",
+        "notes": "publish_dispatch builds headers dict with all three keys: CORRELATION_KEY_HEADER=attempt.correlation_key, REQUESTING_AGENT_HEADER='forge', DISPATCHED_AT_HEADER=self._clock.now().isoformat(). TestDispatchHeaders has four tests verifying each header is present, correlation_key matches the attempt, requesting_agent_id is 'forge', and dispatched_at parses as ISO 8601 with UTC offset. Clock injection (default SystemClock) keeps the adapter compliant with the project's clock-hygiene rule."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`subscribe_reply()` returns ONLY after the underlying NATS",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "subscribe_reply awaits self._nc.subscribe(...) which (per nats-py contract) returns after SUB is sent, then issues a belt-and-braces flush() so the SUB lands at the server before return. TestSubscribeBeforePublish::test_subscribe_reply_blocks_until_underlying_subscribe_returns uses a subscribe_gate Event to assert subscribe_reply does not return while subscribe is parked. test_reply_published_after_subscribe_return_is_received calls subscribe_reply then immediately delivers via the recorded subscription callback and asserts the reply is forwarded to the registry.",
+        "notes": "subscribe_reply awaits self._nc.subscribe(...) which (per nats-py contract) returns after SUB is sent, then issues a belt-and-braces flush() so the SUB lands at the server before return. TestSubscribeBeforePublish::test_subscribe_reply_blocks_until_underlying_subscribe_returns uses a subscribe_gate Event to assert subscribe_reply does not return while subscribe is parked. test_reply_published_after_subscribe_return_is_received calls subscribe_reply then immediately delivers via the recorded subscription callback and asserts the reply is forwarded to the registry."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "PubAck on the audit stream does NOT trigger",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "publish_dispatch logs PubAck at DEBUG only \u2014 no call to registry.deliver_reply on the success path. TestPubAckNotSuccess::test_pubAck_is_not_routed_through_registry sets nats_client.publish_ack to a sentinel object and verifies recording_registry.delivered remains empty. test_pubAck_is_not_routed_with_real_registry repeats with a real CorrelationRegistry instance.",
+        "notes": "publish_dispatch logs PubAck at DEBUG only \u2014 no call to registry.deliver_reply on the success path. TestPubAckNotSuccess::test_pubAck_is_not_routed_through_registry sets nats_client.publish_ack to a sentinel object and verifies recording_registry.delivered remains empty. test_pubAck_is_not_routed_with_real_registry repeats with a real CorrelationRegistry instance."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`unsubscribe_reply()` is idempotent (safe to call twice with the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "unsubscribe_reply uses self._subscriptions.pop(correlation_key, None) so a second call observes None and returns early. TestUnsubscribeIdempotency has four tests: invokes_underlying_unsubscribe_once, twice_is_no_op (verifies sub.unsubscribe_calls == 1 after multiple invocations), unsubscribe_unknown_key_is_no_op (never-subscribed key), swallows_transport_error (RuntimeError from sub.unsubscribe is caught and logged).",
+        "notes": "unsubscribe_reply uses self._subscriptions.pop(correlation_key, None) so a second call observes None and returns early. TestUnsubscribeIdempotency has four tests: invokes_underlying_unsubscribe_once, twice_is_no_op (verifies sub.unsubscribe_calls == 1 after multiple invocations), unsubscribe_unknown_key_is_no_op (never-subscribed key), swallows_transport_error (RuntimeError from sub.unsubscribe is caught and logged)."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`_on_reply_received()` extracts the source agent ID from msg headers",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_on_reply_received reads SOURCE_AGENT_HEADER and CORRELATION_KEY_HEADER from msg.headers, decodes the JSON body, and forwards to self._registry.deliver_reply(correlation_key, source_agent_id, payload) verbatim \u2014 no source comparison, no authentication. TestOnReplyReceived::test_does_not_authenticate_locally explicitly verifies that an 'imposter-agent' source value is forwarded unchanged to the registry. Defensive drops (missing headers, malformed JSON, non-dict root, callback exceptions) are covered by six additional tests in the class.",
+        "notes": "_on_reply_received reads SOURCE_AGENT_HEADER and CORRELATION_KEY_HEADER from msg.headers, decodes the JSON body, and forwards to self._registry.deliver_reply(correlation_key, source_agent_id, payload) verbatim \u2014 no source comparison, no authentication. TestOnReplyReceived::test_does_not_authenticate_locally explicitly verifies that an 'imposter-agent' source value is forwarded unchanged to the registry. Defensive drops (missing headers, malformed JSON, non-dict root, callback exceptions) are covered by six additional tests in the class."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Compatibility: existing `tests/bdd/conftest.py:FakeNatsClient`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The adapter's transport surface is restricted to subscribe(subject, cb=...), publish(subject, body, headers=...), and flush() \u2014 methods either present or trivially addable to the BDD FakeNatsClient. TestFakeNatsClientCompatibility::test_adapter_uses_only_subscribe_publish_flush builds a deliberately-minimal client exposing only those three methods and exercises the full adapter surface (subscribe_reply, publish_dispatch, unsubscribe_reply) against it. Per the task's Implementation Notes, the actual conftest extension (subscribe/unsubscribe recording) is deferred to TASK-SAD-011 \u2014 this task only proves the adapter does not require additional transport surface beyond what FakeNatsClient already provides.",
+        "notes": "The adapter's transport surface is restricted to subscribe(subject, cb=...), publish(subject, body, headers=...), and flush() \u2014 methods either present or trivially addable to the BDD FakeNatsClient. TestFakeNatsClientCompatibility::test_adapter_uses_only_subscribe_publish_flush builds a deliberately-minimal client exposing only those three methods and exercises the full adapter surface (subscribe_reply, publish_dispatch, unsubscribe_reply) against it. Per the task's Implementation Notes, the actual conftest extension (subscribe/unsubscribe recording) is deferred to TASK-SAD-011 \u2014 this task only proves the adapter does not require additional transport surface beyond what FakeNatsClient already provides."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Code follows project style (Black-compatible, 88-char lines, type hints, snake_case/PascalCase, docstrings, f-strings, context managers). Module passes the project's clock-hygiene gate (tests/forge/test_contract_and_seam.py::TestClockHygiene) \u2014 the initial datetime.now(timezone.utc) call was refactored to inject a Clock dependency (defaulting to SystemClock) which is the project-canonical pattern used by DiscoveryCache. No other lint configuration (ruff, flake8, mypy) is committed at the repo root.",
+        "notes": "Code follows project style (Black-compatible, 88-char lines, type hints, snake_case/PascalCase, docstrings, f-strings, context managers). Module passes the project's clock-hygiene gate (tests/forge/test_contract_and_seam.py::TestClockHygiene) \u2014 the initial datetime.now(timezone.utc) call was refactored to inject a Clock dependency (defaulting to SystemClock) which is the project-canonical pattern used by DiscoveryCache. No other lint configuration (ruff, flake8, mypy) is committed at the repo root."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 348 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1685/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- INSTRUCTS_USER_TO_START\n- DESCRIPTION_OF\n- ASSIGNS_TASK_TO\n- IS_PARAM_TYPE_OF\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- REQUIRES_USE_OF\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- HAS_ROLE_MUST_DO\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_PROJECT_ID\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
