@@ -1,7 +1,7 @@
 # Autobuild Review Summary: FEAT-FORGE-002
 
 **Status:** FAILED  
-**Generated:** 2026-04-24 20:57 UTC
+**Generated:** 2026-04-25 12:55 UTC
 
 ## Metrics
 
@@ -36,7 +36,7 @@
 | Avg turns/task | 2.2 |
 | Single-turn tasks | 2 |
 | Multi-turn tasks | 3 |
-| Avg SDK turns/invocation | 20.3 |
+| Avg SDK turns/invocation | 24.6 |
 
 ## Key Findings
 

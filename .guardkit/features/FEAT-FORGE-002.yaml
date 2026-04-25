@@ -24,8 +24,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-24T20:23:09.467016'
-  completed_at: '2026-04-24T20:26:44.748712'
+  started_at: '2026-04-25T12:22:10.859606'
+  completed_at: '2026-04-25T12:25:30.162775'
 - id: TASK-NFI-002
   name: Define FORGE_MANIFEST constant builder
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-002-define-forge-manifest-constant.md
@@ -41,8 +41,8 @@ tasks:
     error: null
   turns_completed: 1
   current_turn: 0
-  started_at: '2026-04-24T20:23:09.469921'
-  completed_at: '2026-04-24T20:26:44.755391'
+  started_at: '2026-04-25T12:22:10.862480'
+  completed_at: '2026-04-25T12:25:30.166061'
 - id: TASK-NFI-003
   name: Implement forge.discovery domain cache resolve protocols
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-003-implement-discovery-domain.md
@@ -61,8 +61,8 @@ tasks:
       progress.
   turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T20:26:46.662617'
-  completed_at: '2026-04-24T20:57:44.652448'
+  started_at: '2026-04-25T12:25:32.028020'
+  completed_at: '2026-04-25T12:55:56.951016'
 - id: TASK-NFI-004
   name: Implement fleet_publisher register heartbeat deregister
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-004-fleet-publisher.md
@@ -112,8 +112,8 @@ tasks:
       progress.
   turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T20:26:46.668636'
-  completed_at: '2026-04-24T20:57:44.659051'
+  started_at: '2026-04-25T12:25:32.031016'
+  completed_at: '2026-04-25T12:55:56.954419'
 - id: TASK-NFI-007
   name: Implement pipeline_consumer pull validation allowlist
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-007-pipeline-consumer.md
@@ -131,8 +131,8 @@ tasks:
       progress.
   turns_completed: 3
   current_turn: 0
-  started_at: '2026-04-24T20:26:46.674658'
-  completed_at: '2026-04-24T20:57:44.665409'
+  started_at: '2026-04-25T12:25:32.034103'
+  completed_at: '2026-04-25T12:55:56.957693'
 - id: TASK-NFI-008
   name: Wire state-machine transitions to pipeline_publisher
   file_path: tasks/backlog/nats-fleet-integration/TASK-NFI-008-wire-state-machine-lifecycle-emission.md
@@ -219,8 +219,8 @@ orchestration:
   estimated_duration_minutes: 819
   recommended_parallel: 3
 execution:
-  started_at: '2026-04-24T20:23:09.452477'
-  completed_at: '2026-04-24T20:57:44.674765'
+  started_at: '2026-04-25T12:22:10.845404'
+  completed_at: '2026-04-25T12:55:56.962522'
   worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-002
   total_turns: 11
   tasks_completed: 2
@@ -228,6 +228,6 @@ execution:
   current_wave: 2
   completed_waves:
   - 1
-  last_updated: '2026-04-24T20:57:44.665418'
+  last_updated: '2026-04-25T12:55:56.957697'
   archived_at: null
   archived_to: null
