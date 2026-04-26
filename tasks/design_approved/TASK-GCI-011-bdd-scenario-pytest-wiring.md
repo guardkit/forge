@@ -1,26 +1,31 @@
 ---
-id: TASK-GCI-011
-title: "BDD scenario pytest wiring (R2 oracle activation)"
-task_type: testing
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-GCI0
-feature_id: FEAT-FORGE-005
-wave: 5
-implementation_mode: task-work
 complexity: 5
+created: 2026-04-25 00:00:00+00:00
 dependencies:
-  - TASK-GCI-009
-  - TASK-GCI-010
-  - TASK-GCI-006
-  - TASK-GCI-007
-tags: [bdd, pytest, testing, scenarios, oracle]
+- TASK-GCI-009
+- TASK-GCI-010
+- TASK-GCI-006
+- TASK-GCI-007
+feature_id: FEAT-FORGE-005
+id: TASK-GCI-011
+implementation_mode: task-work
+parent_review: TASK-REV-GCI0
+priority: high
+status: design_approved
+tags:
+- bdd
+- pytest
+- testing
+- scenarios
+- oracle
+task_type: testing
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: BDD scenario pytest wiring (R2 oracle activation)
+updated: 2026-04-25 00:00:00+00:00
+wave: 5
 ---
 
 # Task: BDD scenario pytest wiring (R2 oracle activation)
