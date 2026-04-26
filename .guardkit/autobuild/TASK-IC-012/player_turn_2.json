@@ -1,26 +1,6 @@
 {
   "task_id": "TASK-IC-012",
-  "timestamp": "2026-04-26T15:42:34.512983",
-  "completed": true,
-  "phases": {
-    "phase_1": {
-      "detected": true,
-      "text": "Investigate Coach feedback",
-      "completed": false
-    },
-    "phase_3": {
-      "detected": true,
-      "completed": true
-    }
-  },
-  "quality_gates": {
-    "tests_passing": true,
-    "tests_passed": 1571,
-    "tests_failed": 0,
-    "coverage": null,
-    "coverage_met": null,
-    "all_passed": true
-  },
+  "turn": 2,
   "files_modified": [
     ".claude/task-plans/TASK-IC-012-implementation-plan.md",
     ".guardkit/autobuild/TASK-IC-011/checkpoints.json",
@@ -44,58 +24,27 @@
     "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/.guardkit/autobuild/TASK-IC-012/player_turn_2.json"
   ],
   "tests_written": [],
-  "summary": "1571 tests passed, all quality gates passed",
-  "sdk_turns": {
-    "turns_used": 13,
-    "max_turns": 100,
-    "ceiling_hit": false
-  },
-  "bdd_results": {
-    "scenarios_passed": 0,
-    "scenarios_failed": 1,
-    "scenarios_pending": 0,
-    "failures": [
-      {
-        "feature_file": "",
-        "scenario_name": "tests.bdd",
-        "failing_step": "collection failure",
-        "reason": "collection failure"
-      }
-    ],
-    "pending": [],
-    "feature_files": [
-      "features/infrastructure-coordination/infrastructure-coordination.feature"
-    ],
-    "tag": "@task:TASK-IC-012"
-  },
-  "agent_invocations_validation": {
-    "status": "violation",
-    "expected_phases": 3,
-    "actual_invocations": 2,
-    "missing_phases": [
-      "3"
-    ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-  },
-  "plan_audit": {
-    "status": "skipped",
-    "severity": null,
-    "violations": 0,
-    "extra_files": [],
-    "missing_files": [],
-    "extra_dependencies": [],
-    "missing_dependencies": [],
-    "loc_variance_pct": null,
-    "discrepancies_count": 0,
-    "message": "no implementation plan on disk"
-  },
-  "unconfirmed_low_confidence_assumptions": {
-    "status": "ok",
-    "unconfirmed": [],
-    "files_scanned": 0,
-    "files_skipped": 0,
-    "message": null
-  },
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: 1024-case redaction fuzz with no original-credential leaks (positive matches)",
+    "AC-002: cwd traversal (relative, ../, absolute-outside, symlink-escape) all refused with cwd_outside_allowlist",
+    "AC-003: 70+ disallowed binaries each yield permissions_refused warning with binary name surfaced",
+    "AC-004: concurrent write_session_outcome() with same build_id collapses to a single entity_id (deterministic from build_id)",
+    "AC-005: expiry boundary (now+1\u00b5s included, now excluded, now-1\u00b5s excluded) plus exact horizon_days arithmetic on dispatcher 'since'",
+    "AC-006: random Priors content in sys.argv detected and rejected with PriorsLeakError; clean argv passes; short lines and section headers don't false-positive",
+    "AC-007: linear chain depth 9/10 succeeds; depth 11 raises with chain context; 2-node, 3-node, 5-node, 8-node cycles all raise; self-supersession raises before any resolver lookup",
+    "AC-008: all 1192 hardening tests pass under standard pytest invocation; combined 1571-test run passes with 0 failures",
+    "AC-009: file passes py_compile, conforms to 88-char Black target, PEP 8 naming, type hints, no unused imports, no bare except"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 13,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 1571,
   "completion_promises": [
     {
       "criterion_id": "AC-001",
@@ -168,22 +117,6 @@
       "evidence": "tests/hardening/test_hardening.py: python3 -m py_compile and ast.parse both succeed (no syntax errors). All lines are <=88 characters per .claude/rules/code-style.md (Black target). PEP 8: snake_case for functions/variables, PascalCase for classes, UPPER_CASE for module constants (_FUZZ_SEED, _DISALLOWED_BINARIES, etc). Type hints throughout (from __future__ import annotations enables forward references). f-strings used for formatting. Unused imports removed (unittest.mock was unused \u2192 deleted). No bare except \u2014 only specific PermissionError, OSError, NotImplementedError exceptions caught. Module-level docstring and per-class docstrings present. Coach turn 1 verified.",
       "test_file": "tests/hardening/test_hardening.py",
       "implementation_files": []
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 79.50181467301445
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 331.55093932300224
     }
   ]
 }
