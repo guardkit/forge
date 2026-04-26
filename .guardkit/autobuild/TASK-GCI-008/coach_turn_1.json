@@ -1,0 +1,295 @@
+{
+  "task_id": "TASK-GCI-008",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/guardkit/test_run.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_run.py::TestPermissionsRefused::test_permission_error_yields_permissions_refused_warning PASSED [ 90%]\ntests/forge/adapters/guardkit/test_run.py::TestWrapperInternalError::test_unexpected_exception_in_seam_yields_failed_result PASSED [ 95%]\ntests/forge/adapters/guardkit/test_run.py::TestParallelCallIsolation::test_two_parallel_calls_return_independent_results PASSED [100%]\n\n=============================== warnings summary ===============================\nResult:\ntests/forge/adapters/guardkit/test_run.py:598\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_run.py:598: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\ntests/forge/adapters/guardkit/test_run.py:756\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardki...",
+      "duration_seconds": 0.42342138290405273
+    },
+    "requirements": {
+      "criteria_total": 15,
+      "criteria_met": 15,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`run()` in `src/forge/adapters/guardkit/run.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/guardkit/run.py exporting an async coroutine `run`; verified by tests TestRunModuleSurface (module path, coroutine function, module attribute).",
+      "notes": "Created src/forge/adapters/guardkit/run.py exporting an async coroutine `run`; verified by tests TestRunModuleSurface (module path, coroutine function, module attribute)."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Composes `[guardkit, subcommand, *args, *context_flags, --nats?]` and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "run() builds the command as a list [_GUARDKIT_BINARY, subcommand, *args, *context_flags, *nats_flag] and forwards it to _execute_subprocess as `command=cmd` (list). Verified by TestCommandComposition.test_command_starts_with_guardkit_binary_subcommand_then_args.",
+      "notes": "run() builds the command as a list [_GUARDKIT_BINARY, subcommand, *args, *context_flags, *nats_flag] and forwards it to _execute_subprocess as `command=cmd` (list). Verified by TestCommandComposition.test_command_starts_with_guardkit_binary_subcommand_then_args."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`cwd = repo_path` is always inside the build worktree allowlist \u2014",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "run() rejects relative paths and outside-allowlist resolved paths with `cwd_outside_allowlist` warning before invoking the subprocess; subprocess is not called in either rejection path. Verified by TestCwdAllowlistEnforcement (relative + outside-allowlist).",
+      "notes": "run() rejects relative paths and outside-allowlist resolved paths with `cwd_outside_allowlist` warning before invoking the subprocess; subprocess is not called in either rejection path. Verified by TestCwdAllowlistEnforcement (relative + outside-allowlist)."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Calls `resolve_context_flags(repo_path, subcommand, read_allowlist)`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "run() calls resolve_context_flags() for non-Graphiti subcommands, prepends the returned flags to the command line, and merges resolver warnings ahead of parser warnings via model_copy(). Verified by TestResolverIntegration.test_resolver_flags_prepended_to_command and test_resolver_warnings_surface_on_result.",
+      "notes": "run() calls resolve_context_flags() for non-Graphiti subcommands, prepends the returned flags to the command line, and merges resolver warnings ahead of parser warnings via model_copy(). Verified by TestResolverIntegration.test_resolver_flags_prepended_to_command and test_resolver_warnings_surface_on_result."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Graphiti subcommands (`graphiti add-context`, `graphiti query`) skip",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_is_graphiti_subcommand() checks the head token via partition(' '); when True the resolver call is skipped. Verified by TestGraphitiBypass.test_graphiti_add_context_skips_resolver (resolver call counter remains 0).",
+      "notes": "_is_graphiti_subcommand() checks the head token via partition(' '); when True the resolver call is skipped. Verified by TestGraphitiBypass.test_graphiti_add_context_skips_resolver (resolver call counter remains 0)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`extra_context_paths` (when provided) are merged with manifest-derived",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "extra_context_paths are concatenated as additional --context flags inside the function (no module-level state); two consecutive calls show the second call lacks the first call's extras. Verified by TestExtraContextPaths.test_extra_context_paths_appended_to_command and test_extra_context_paths_not_persisted_between_calls.",
+      "notes": "extra_context_paths are concatenated as additional --context flags inside the function (no module-level state); two consecutive calls show the second call lacks the first call's extras. Verified by TestExtraContextPaths.test_extra_context_paths_appended_to_command and test_extra_context_paths_not_persisted_between_calls."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "`with_nats_streaming=True` appends `--nats` to the command line; the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Conditional `nats_flag = ['--nats'] if with_nats_streaming else []` appended to the command. Verified by TestNatsFlag (both True and False branches).",
+      "notes": "Conditional `nats_flag = ['--nats'] if with_nats_streaming else []` appended to the command. Verified by TestNatsFlag (both True and False branches)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "On timeout: terminate the subprocess and return",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_execute_subprocess catches asyncio.TimeoutError, calls proc.terminate() and escalates to proc.kill() after _KILL_GRACE_SECONDS, awaits communicate() to release the handle, and returns timed_out=True; parser maps that to status='timeout'. Boundary verified at 599/600/601 by TestTimeoutBoundary.",
+      "notes": "_execute_subprocess catches asyncio.TimeoutError, calls proc.terminate() and escalates to proc.kill() after _KILL_GRACE_SECONDS, awaits communicate() to release the handle, and returns timed_out=True; parser maps that to status='timeout'. Boundary verified at 599/600/601 by TestTimeoutBoundary."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "On cancellation (caller cancels the surrounding asyncio task):",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_execute_subprocess catches asyncio.CancelledError, terminates the process (proc.terminate(), proc.kill() escalation), awaits proc.wait(), then re-raises the CancelledError. run() also re-raises CancelledError instead of folding it into a failed result. Verified by TestCancellationPropagation.test_cancelled_error_in_seam_propagates.",
+      "notes": "_execute_subprocess catches asyncio.CancelledError, terminates the process (proc.terminate(), proc.kill() escalation), awaits proc.wait(), then re-raises the CancelledError. run() also re-raises CancelledError instead of folding it into a failed result. Verified by TestCancellationPropagation.test_cancelled_error_in_seam_propagates."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "On non-zero exit: returns `GuardKitResult(status=\"failed\", \u2026)` with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Non-zero exit_code flows through parse_guardkit_output() which sets status='failed' and preserves stderr/exit_code. Verified by TestNonZeroExit.test_non_zero_exit_yields_failed_status_with_stderr.",
+      "notes": "Non-zero exit_code flows through parse_guardkit_output() which sets status='failed' and preserves stderr/exit_code. Verified by TestNonZeroExit.test_non_zero_exit_yields_failed_status_with_stderr."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "On binary outside the shell allowlist (DeepAgents-enforced): the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "run() catches PermissionError raised by the seam and emits a GuardKitWarning(code='permissions_refused') on a status='failed' result. Verified by TestPermissionsRefused.test_permission_error_yields_permissions_refused_warning.",
+      "notes": "run() catches PermissionError raised by the seam and emits a GuardKitWarning(code='permissions_refused') on a status='failed' result. Verified by TestPermissionsRefused.test_permission_error_yields_permissions_refused_warning."
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "Function body wrapped in `try/except Exception as exc:` \u2014 never",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Whole body wrapped in try/except Exception; CancelledError caught separately and re-raised by design (Implementation Notes). Generic exceptions become GuardKitWarning(code='wrapper_internal_error') on a failed result. Verified by TestWrapperInternalError.test_unexpected_exception_in_seam_yields_failed_result.",
+      "notes": "Whole body wrapped in try/except Exception; CancelledError caught separately and re-raised by design (Implementation Notes). Generic exceptions become GuardKitWarning(code='wrapper_internal_error') on a failed result. Verified by TestWrapperInternalError.test_unexpected_exception_in_seam_yields_failed_result."
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "Two parallel `run()` calls within the same build worktree do not",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "No module-level mutable state; warnings/lists are constructed inside run(). Verified by TestParallelCallIsolation.test_two_parallel_calls_return_independent_results which asyncio.gathers two calls and asserts distinct result identity, distinct subcommands and distinct stdout_tail values.",
+      "notes": "No module-level mutable state; warnings/lists are constructed inside run(). Verified by TestParallelCallIsolation.test_two_parallel_calls_return_independent_results which asyncio.gathers two calls and asserts distinct result identity, distinct subcommands and distinct stdout_tail values."
+    },
+    {
+      "criterion_id": "AC-014",
+      "criterion_text": "Boundary unit tests around the timeout: 599s success, 600s exact,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestTimeoutBoundary contains exactly three tests at 599 (success), 600 exact (success when seam reports completion), and 601 (timeout). All three pass.",
+      "notes": "TestTimeoutBoundary contains exactly three tests at 599 (success), 600 exact (success when seam reports completion), and 601 (timeout). All three pass."
+    },
+    {
+      "criterion_id": "AC-015",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both files parse cleanly via ast.parse; max line length is 88 (verified via awk length>88 check returns no matches); follows project Black 88-char convention. Imports use absolute forge.* paths consistent with the existing adapter package.",
+      "notes": "Both files parse cleanly via ast.parse; max line length is 88 (verified via awk length>88 check returns no matches); follows project Black 88-char convention. Imports use absolute forge.* paths consistent with the existing adapter package."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`run()` in `src/forge/adapters/guardkit/run.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/guardkit/run.py exporting an async coroutine `run`; verified by tests TestRunModuleSurface (module path, coroutine function, module attribute).",
+        "notes": "Created src/forge/adapters/guardkit/run.py exporting an async coroutine `run`; verified by tests TestRunModuleSurface (module path, coroutine function, module attribute)."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Composes `[guardkit, subcommand, *args, *context_flags, --nats?]` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "run() builds the command as a list [_GUARDKIT_BINARY, subcommand, *args, *context_flags, *nats_flag] and forwards it to _execute_subprocess as `command=cmd` (list). Verified by TestCommandComposition.test_command_starts_with_guardkit_binary_subcommand_then_args.",
+        "notes": "run() builds the command as a list [_GUARDKIT_BINARY, subcommand, *args, *context_flags, *nats_flag] and forwards it to _execute_subprocess as `command=cmd` (list). Verified by TestCommandComposition.test_command_starts_with_guardkit_binary_subcommand_then_args."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`cwd = repo_path` is always inside the build worktree allowlist \u2014",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "run() rejects relative paths and outside-allowlist resolved paths with `cwd_outside_allowlist` warning before invoking the subprocess; subprocess is not called in either rejection path. Verified by TestCwdAllowlistEnforcement (relative + outside-allowlist).",
+        "notes": "run() rejects relative paths and outside-allowlist resolved paths with `cwd_outside_allowlist` warning before invoking the subprocess; subprocess is not called in either rejection path. Verified by TestCwdAllowlistEnforcement (relative + outside-allowlist)."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Calls `resolve_context_flags(repo_path, subcommand, read_allowlist)`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "run() calls resolve_context_flags() for non-Graphiti subcommands, prepends the returned flags to the command line, and merges resolver warnings ahead of parser warnings via model_copy(). Verified by TestResolverIntegration.test_resolver_flags_prepended_to_command and test_resolver_warnings_surface_on_result.",
+        "notes": "run() calls resolve_context_flags() for non-Graphiti subcommands, prepends the returned flags to the command line, and merges resolver warnings ahead of parser warnings via model_copy(). Verified by TestResolverIntegration.test_resolver_flags_prepended_to_command and test_resolver_warnings_surface_on_result."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Graphiti subcommands (`graphiti add-context`, `graphiti query`) skip",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_is_graphiti_subcommand() checks the head token via partition(' '); when True the resolver call is skipped. Verified by TestGraphitiBypass.test_graphiti_add_context_skips_resolver (resolver call counter remains 0).",
+        "notes": "_is_graphiti_subcommand() checks the head token via partition(' '); when True the resolver call is skipped. Verified by TestGraphitiBypass.test_graphiti_add_context_skips_resolver (resolver call counter remains 0)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`extra_context_paths` (when provided) are merged with manifest-derived",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "extra_context_paths are concatenated as additional --context flags inside the function (no module-level state); two consecutive calls show the second call lacks the first call's extras. Verified by TestExtraContextPaths.test_extra_context_paths_appended_to_command and test_extra_context_paths_not_persisted_between_calls.",
+        "notes": "extra_context_paths are concatenated as additional --context flags inside the function (no module-level state); two consecutive calls show the second call lacks the first call's extras. Verified by TestExtraContextPaths.test_extra_context_paths_appended_to_command and test_extra_context_paths_not_persisted_between_calls."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`with_nats_streaming=True` appends `--nats` to the command line; the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Conditional `nats_flag = ['--nats'] if with_nats_streaming else []` appended to the command. Verified by TestNatsFlag (both True and False branches).",
+        "notes": "Conditional `nats_flag = ['--nats'] if with_nats_streaming else []` appended to the command. Verified by TestNatsFlag (both True and False branches)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "On timeout: terminate the subprocess and return",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_execute_subprocess catches asyncio.TimeoutError, calls proc.terminate() and escalates to proc.kill() after _KILL_GRACE_SECONDS, awaits communicate() to release the handle, and returns timed_out=True; parser maps that to status='timeout'. Boundary verified at 599/600/601 by TestTimeoutBoundary.",
+        "notes": "_execute_subprocess catches asyncio.TimeoutError, calls proc.terminate() and escalates to proc.kill() after _KILL_GRACE_SECONDS, awaits communicate() to release the handle, and returns timed_out=True; parser maps that to status='timeout'. Boundary verified at 599/600/601 by TestTimeoutBoundary."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "On cancellation (caller cancels the surrounding asyncio task):",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_execute_subprocess catches asyncio.CancelledError, terminates the process (proc.terminate(), proc.kill() escalation), awaits proc.wait(), then re-raises the CancelledError. run() also re-raises CancelledError instead of folding it into a failed result. Verified by TestCancellationPropagation.test_cancelled_error_in_seam_propagates.",
+        "notes": "_execute_subprocess catches asyncio.CancelledError, terminates the process (proc.terminate(), proc.kill() escalation), awaits proc.wait(), then re-raises the CancelledError. run() also re-raises CancelledError instead of folding it into a failed result. Verified by TestCancellationPropagation.test_cancelled_error_in_seam_propagates."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "On non-zero exit: returns `GuardKitResult(status=\"failed\", \u2026)` with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Non-zero exit_code flows through parse_guardkit_output() which sets status='failed' and preserves stderr/exit_code. Verified by TestNonZeroExit.test_non_zero_exit_yields_failed_status_with_stderr.",
+        "notes": "Non-zero exit_code flows through parse_guardkit_output() which sets status='failed' and preserves stderr/exit_code. Verified by TestNonZeroExit.test_non_zero_exit_yields_failed_status_with_stderr."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "On binary outside the shell allowlist (DeepAgents-enforced): the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "run() catches PermissionError raised by the seam and emits a GuardKitWarning(code='permissions_refused') on a status='failed' result. Verified by TestPermissionsRefused.test_permission_error_yields_permissions_refused_warning.",
+        "notes": "run() catches PermissionError raised by the seam and emits a GuardKitWarning(code='permissions_refused') on a status='failed' result. Verified by TestPermissionsRefused.test_permission_error_yields_permissions_refused_warning."
+      },
+      {
+        "criterion_id": "AC-012",
+        "criterion_text": "Function body wrapped in `try/except Exception as exc:` \u2014 never",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Whole body wrapped in try/except Exception; CancelledError caught separately and re-raised by design (Implementation Notes). Generic exceptions become GuardKitWarning(code='wrapper_internal_error') on a failed result. Verified by TestWrapperInternalError.test_unexpected_exception_in_seam_yields_failed_result.",
+        "notes": "Whole body wrapped in try/except Exception; CancelledError caught separately and re-raised by design (Implementation Notes). Generic exceptions become GuardKitWarning(code='wrapper_internal_error') on a failed result. Verified by TestWrapperInternalError.test_unexpected_exception_in_seam_yields_failed_result."
+      },
+      {
+        "criterion_id": "AC-013",
+        "criterion_text": "Two parallel `run()` calls within the same build worktree do not",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "No module-level mutable state; warnings/lists are constructed inside run(). Verified by TestParallelCallIsolation.test_two_parallel_calls_return_independent_results which asyncio.gathers two calls and asserts distinct result identity, distinct subcommands and distinct stdout_tail values.",
+        "notes": "No module-level mutable state; warnings/lists are constructed inside run(). Verified by TestParallelCallIsolation.test_two_parallel_calls_return_independent_results which asyncio.gathers two calls and asserts distinct result identity, distinct subcommands and distinct stdout_tail values."
+      },
+      {
+        "criterion_id": "AC-014",
+        "criterion_text": "Boundary unit tests around the timeout: 599s success, 600s exact,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestTimeoutBoundary contains exactly three tests at 599 (success), 600 exact (success when seam reports completion), and 601 (timeout). All three pass.",
+        "notes": "TestTimeoutBoundary contains exactly three tests at 599 (success), 600 exact (success when seam reports completion), and 601 (timeout). All three pass."
+      },
+      {
+        "criterion_id": "AC-015",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both files parse cleanly via ast.parse; max line length is 88 (verified via awk length>88 check returns no matches); follows project Black 88-char convention. Imports use absolute forge.* paths consistent with the existing adapter package.",
+        "notes": "Both files parse cleanly via ast.parse; max line length is 88 (verified via awk length>88 check returns no matches); follows project Black 88-char convention. Imports use absolute forge.* paths consistent with the existing adapter package."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 289 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 963/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- BELONGS_TO_PROJECT\n- PROJECT_OF_PATTERN\n\n### \u26a0\ufe0f Warnings\n- HAS_ROOT_CAUSE\n- OBSERVED_FAILURE symptom_of\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

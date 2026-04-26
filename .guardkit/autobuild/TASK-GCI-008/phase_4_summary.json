@@ -1,0 +1,7 @@
+{
+  "tests_run": 22,
+  "tests_failed": 0,
+  "coverage_pct": 67.0,
+  "output_summary": "pytest tests/forge/adapters/guardkit/test_run.py: 22 passed, 0 failed; line coverage 67% on src/forge/adapters/guardkit/run.py (89 stmts, 29 missed).",
+  "quality_gates_passed": true
+}
