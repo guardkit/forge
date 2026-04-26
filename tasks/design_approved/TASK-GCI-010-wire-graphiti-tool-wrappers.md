@@ -1,23 +1,28 @@
 ---
-id: TASK-GCI-010
-title: "Wire 2 Graphiti guardkit_* @tool wrappers (bypass resolver)"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-GCI0
-feature_id: FEAT-FORGE-005
-wave: 4
-implementation_mode: task-work
 complexity: 4
+created: 2026-04-25 00:00:00+00:00
 dependencies:
-  - TASK-GCI-008
-tags: [guardkit, graphiti, tools, langchain, decorator]
+- TASK-GCI-008
+feature_id: FEAT-FORGE-005
+id: TASK-GCI-010
+implementation_mode: task-work
+parent_review: TASK-REV-GCI0
+priority: high
+status: design_approved
+tags:
+- guardkit
+- graphiti
+- tools
+- langchain
+- decorator
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Wire 2 Graphiti guardkit_* @tool wrappers (bypass resolver)
+updated: 2026-04-25 00:00:00+00:00
+wave: 4
 ---
 
 # Task: Wire 2 Graphiti guardkit_* @tool wrappers (bypass resolver)

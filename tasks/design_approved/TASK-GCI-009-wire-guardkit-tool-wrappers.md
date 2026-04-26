@@ -1,24 +1,29 @@
 ---
-id: TASK-GCI-009
-title: "Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)"
-task_type: feature
-status: backlog
-priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
-parent_review: TASK-REV-GCI0
-feature_id: FEAT-FORGE-005
-wave: 4
-implementation_mode: task-work
 complexity: 6
+created: 2026-04-25 00:00:00+00:00
 dependencies:
-  - TASK-GCI-008
-  - TASK-GCI-005
-tags: [guardkit, tools, langchain, decorator, error-contract]
+- TASK-GCI-008
+- TASK-GCI-005
+feature_id: FEAT-FORGE-005
+id: TASK-GCI-009
+implementation_mode: task-work
+parent_review: TASK-REV-GCI0
+priority: high
+status: design_approved
+tags:
+- guardkit
+- tools
+- langchain
+- decorator
+- error-contract
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)
+updated: 2026-04-25 00:00:00+00:00
+wave: 4
 ---
 
 # Task: Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)

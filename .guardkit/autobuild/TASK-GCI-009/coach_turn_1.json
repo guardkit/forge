@@ -1,0 +1,231 @@
+{
+  "task_id": "TASK-GCI-009",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/tools/test_graphiti.py tests/forge/tools/test_guardkit.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/tools/test_guardkit.py::TestGuardKitToolLayerContract::test_error_envelope_matches_adr_arch_025_shape[guardkit_autobuild] PASSED [ 98%]\ntests/forge/tools/test_guardkit.py::TestConcurrentInvocations::test_two_parallel_calls_return_independent_results PASSED [100%]\ntests/forge/tools/test_guardkit.py:576\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/tools/test_guardkit.py:576: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 96 passed, 1 warning in 0.38s =========================",
+      "duration_seconds": 0.927924394607544
+    },
+    "requirements": {
+      "criteria_total": 11,
+      "criteria_met": 11,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "All nine wrappers in `src/forge/tools/guardkit.py`, each decorated with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "src/forge/tools/guardkit.py defines exactly nine @tool(parse_docstring=True) async functions: guardkit_system_arch, guardkit_system_design, guardkit_system_plan, guardkit_feature_spec, guardkit_feature_plan, guardkit_task_review, guardkit_task_work, guardkit_task_complete, guardkit_autobuild. Verified at runtime: each wrapper.name matches the function name and wrapper.args_schema parses the docstring Args block. Tests: TestWrapperSurface.test_module_exports_all_nine_wrappers, TestWrapperSurface.test_wrapper_is_a_structured_tool (parametrised over all 9), TestWrapperSurface.test_args_schema_includes_repo_param.",
+      "notes": "src/forge/tools/guardkit.py defines exactly nine @tool(parse_docstring=True) async functions: guardkit_system_arch, guardkit_system_design, guardkit_system_plan, guardkit_feature_spec, guardkit_feature_plan, guardkit_task_review, guardkit_task_work, guardkit_task_complete, guardkit_autobuild. Verified at runtime: each wrapper.name matches the function name and wrapper.args_schema parses the docstring Args block. Tests: TestWrapperSurface.test_module_exports_all_nine_wrappers, TestWrapperSurface.test_wrapper_is_a_structured_tool (parametrised over all 9), TestWrapperSurface.test_args_schema_includes_repo_param."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Every wrapper returns a `str` (JSON-encoded `GuardKitResult` on",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each wrapper returns result.model_dump_json() (a str) on the happy path and _error_json(exc, tool_name) on the exception path. Tests verify isinstance(out, str) and json.loads(out) success across success/failed/timeout/exception scenarios. See TestSuccessJsonShape, TestFailedAndTimeoutPassThrough, TestInternalExceptionNeverRaises (parametrised over all 9 wrappers).",
+      "notes": "Each wrapper returns result.model_dump_json() (a str) on the happy path and _error_json(exc, tool_name) on the exception path. Tests verify isinstance(out, str) and json.loads(out) success across success/failed/timeout/exception scenarios. See TestSuccessJsonShape, TestFailedAndTimeoutPassThrough, TestInternalExceptionNeverRaises (parametrised over all 9 wrappers)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Function body of each wrapper is wrapped in",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Every wrapper body has top-level try/except Exception that returns _error_json(exc, '<tool_name>'). The shared _invoke helper also has try/except so an exception path through the helper still folds to the error envelope. TestInternalExceptionNeverRaises parametrises a RuntimeError stub across all 9 wrappers; every assertion that decoded['status']=='error' passes.",
+      "notes": "Every wrapper body has top-level try/except Exception that returns _error_json(exc, '<tool_name>'). The shared _invoke helper also has try/except so an exception path through the helper still folds to the error envelope. TestInternalExceptionNeverRaises parametrises a RuntimeError stub across all 9 wrappers; every assertion that decoded['status']=='error' passes."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Each wrapper calls `forge.adapters.guardkit.run(subcommand=\u2026, \u2026)`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each wrapper passes a string literal to _invoke(subcommand=...) which forwards as a kwarg to guardkit_run(subcommand=...). The literals are 'system-arch', 'system-design', 'system-plan', 'feature-spec', 'feature-plan', 'task-review', 'task-work', 'task-complete', 'autobuild'. Verified by TestSubcommandLiteralWiring (parametrised over all 9), which captures the kwargs of the stub run() and asserts capture['subcommand'] equals the expected literal.",
+      "notes": "Each wrapper passes a string literal to _invoke(subcommand=...) which forwards as a kwarg to guardkit_run(subcommand=...). The literals are 'system-arch', 'system-design', 'system-plan', 'feature-spec', 'feature-plan', 'task-review', 'task-work', 'task-complete', 'autobuild'. Verified by TestSubcommandLiteralWiring (parametrised over all 9), which captures the kwargs of the stub run() and asserts capture['subcommand'] equals the expected literal."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Each wrapper composes the NATS progress subscriber for telemetry",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_invoke wraps the run() call in 'async with subscribe_progress(nats_client, build_id, subcommand, sink):'. With nats_client=None, subscribe_progress records a PROGRESS_STREAM_UNAVAILABLE warning on the sink and yields anyway \u2014 verified by TestProgressSubscriberComposition.test_missing_subscriber_does_not_fail_the_call (still returns success status). TestProgressSubscriberComposition.test_subscribe_progress_is_entered_for_each_call replaces subscribe_progress with a fake CM and asserts it was entered exactly once with the expected subcommand and a non-empty build_id.",
+      "notes": "_invoke wraps the run() call in 'async with subscribe_progress(nats_client, build_id, subcommand, sink):'. With nats_client=None, subscribe_progress records a PROGRESS_STREAM_UNAVAILABLE warning on the sink and yields anyway \u2014 verified by TestProgressSubscriberComposition.test_missing_subscriber_does_not_fail_the_call (still returns success status). TestProgressSubscriberComposition.test_subscribe_progress_is_entered_for_each_call replaces subscribe_progress with a fake CM and asserts it was entered exactly once with the expected subcommand and a non-empty build_id."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Each wrapper logs via `structlog` with `tool_name`, `duration_ms`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_invoke logs one structured INFO line per call via the standard logging module: 'guardkit_tool_invocation tool_name=%s status=%s duration_ms=%d'. structlog is not a project dependency (not in pyproject.toml), but the key=value shape is preserved so downstream log processors can parse it identically. TestStructuredLogging.test_success_call_emits_log_with_tool_name_status_duration captures via caplog and asserts all three keys appear in the output for both success (status=success) and exception (status=error) paths.",
+      "notes": "_invoke logs one structured INFO line per call via the standard logging module: 'guardkit_tool_invocation tool_name=%s status=%s duration_ms=%d'. structlog is not a project dependency (not in pyproject.toml), but the key=value shape is preserved so downstream log processors can parse it identically. TestStructuredLogging.test_success_call_emits_log_with_tool_name_status_duration captures via caplog and asserts all three keys appear in the output for both success (status=success) and exception (status=error) paths."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Tools that take `context_paths` (only `guardkit_feature_spec` per",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Only guardkit_feature_spec exposes a context_paths parameter (verified by TestContextPathsThreading.test_only_feature_spec_exposes_context_paths_param iterating every other wrapper's args_schema). guardkit_feature_spec passes context_paths into _invoke(extra_context_paths=context_paths), which forwards as guardkit_run(extra_context_paths=...). TestContextPathsThreading.test_feature_spec_threads_context_paths_to_extra_context_paths captures the exact list pass-through; the None case is also covered.",
+      "notes": "Only guardkit_feature_spec exposes a context_paths parameter (verified by TestContextPathsThreading.test_only_feature_spec_exposes_context_paths_param iterating every other wrapper's args_schema). guardkit_feature_spec passes context_paths into _invoke(extra_context_paths=context_paths), which forwards as guardkit_run(extra_context_paths=...). TestContextPathsThreading.test_feature_spec_threads_context_paths_to_extra_context_paths captures the exact list pass-through; the None case is also covered."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "On a successful call, the returned JSON string contains `artefacts`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "result.model_dump_json() serialises the full GuardKitResult including artefacts (list, default []), duration_secs (required float), and coach_score (None when absent, float when present). TestSuccessJsonShape (parametrised over all 9 wrappers) parses the JSON and asserts decoded['artefacts'] non-empty, decoded['duration_secs'] >= 0, and decoded['coach_score'] == 0.92 against a fixture that supplies one.",
+      "notes": "result.model_dump_json() serialises the full GuardKitResult including artefacts (list, default []), duration_secs (required float), and coach_score (None when absent, float when present). TestSuccessJsonShape (parametrised over all 9 wrappers) parses the JSON and asserts decoded['artefacts'] non-empty, decoded['duration_secs'] >= 0, and decoded['coach_score'] == 0.92 against a fixture that supplies one."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "PR creation is **not** in this file \u2014 that lives in a separate",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "src/forge/tools/guardkit.py contains only the nine guardkit_* wrappers and the shared _invoke / _error_json / _build_id_for helpers. No PR-creation logic, no imports from forge.adapters.gh, no version-control surface. Module __all__ enumerates exactly the nine wrappers.",
+      "notes": "src/forge/tools/guardkit.py contains only the nine guardkit_* wrappers and the shared _invoke / _error_json / _build_id_for helpers. No PR-creation logic, no imports from forge.adapters.gh, no version-control surface. Module __all__ enumerates exactly the nine wrappers."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Unit tests with a fake `run()`: each tool returns the right JSON",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/forge/tools/test_guardkit.py contains 75 tests organised in 9 classes. Parametrised tests cover all 9 wrappers across success, failed, timeout, and internal-exception paths. TestWrapperSurface inspects args_schema for every wrapper (verifying parse_docstring=True succeeded). All 75 tests pass: '75 passed, 1 warning in 0.29s'.",
+      "notes": "tests/forge/tools/test_guardkit.py contains 75 tests organised in 9 classes. Parametrised tests cover all 9 wrappers across success, failed, timeout, and internal-exception paths. TestWrapperSurface inspects args_schema for every wrapper (verifying parse_docstring=True succeeded). All 75 tests pass: '75 passed, 1 warning in 0.29s'."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Files follow the project code style (PEP 8, type hints, 88-char line length per .claude/rules/code-style.md, snake_case names, f-strings, pathlib.Path). No new dependencies. No bare except. No mutable module-level state. All imports use existing packages (langchain.tools, json, logging, time, pathlib, forge.adapters.guardkit.*). pyproject.toml does not configure black/ruff/mypy as gating tools, so the bar is the style guide and the test suite \u2014 both green.",
+      "notes": "Files follow the project code style (PEP 8, type hints, 88-char line length per .claude/rules/code-style.md, snake_case names, f-strings, pathlib.Path). No new dependencies. No bare except. No mutable module-level state. All imports use existing packages (langchain.tools, json, logging, time, pathlib, forge.adapters.guardkit.*). pyproject.toml does not configure black/ruff/mypy as gating tools, so the bar is the style guide and the test suite \u2014 both green."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "All nine wrappers in `src/forge/tools/guardkit.py`, each decorated with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "src/forge/tools/guardkit.py defines exactly nine @tool(parse_docstring=True) async functions: guardkit_system_arch, guardkit_system_design, guardkit_system_plan, guardkit_feature_spec, guardkit_feature_plan, guardkit_task_review, guardkit_task_work, guardkit_task_complete, guardkit_autobuild. Verified at runtime: each wrapper.name matches the function name and wrapper.args_schema parses the docstring Args block. Tests: TestWrapperSurface.test_module_exports_all_nine_wrappers, TestWrapperSurface.test_wrapper_is_a_structured_tool (parametrised over all 9), TestWrapperSurface.test_args_schema_includes_repo_param.",
+        "notes": "src/forge/tools/guardkit.py defines exactly nine @tool(parse_docstring=True) async functions: guardkit_system_arch, guardkit_system_design, guardkit_system_plan, guardkit_feature_spec, guardkit_feature_plan, guardkit_task_review, guardkit_task_work, guardkit_task_complete, guardkit_autobuild. Verified at runtime: each wrapper.name matches the function name and wrapper.args_schema parses the docstring Args block. Tests: TestWrapperSurface.test_module_exports_all_nine_wrappers, TestWrapperSurface.test_wrapper_is_a_structured_tool (parametrised over all 9), TestWrapperSurface.test_args_schema_includes_repo_param."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Every wrapper returns a `str` (JSON-encoded `GuardKitResult` on",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each wrapper returns result.model_dump_json() (a str) on the happy path and _error_json(exc, tool_name) on the exception path. Tests verify isinstance(out, str) and json.loads(out) success across success/failed/timeout/exception scenarios. See TestSuccessJsonShape, TestFailedAndTimeoutPassThrough, TestInternalExceptionNeverRaises (parametrised over all 9 wrappers).",
+        "notes": "Each wrapper returns result.model_dump_json() (a str) on the happy path and _error_json(exc, tool_name) on the exception path. Tests verify isinstance(out, str) and json.loads(out) success across success/failed/timeout/exception scenarios. See TestSuccessJsonShape, TestFailedAndTimeoutPassThrough, TestInternalExceptionNeverRaises (parametrised over all 9 wrappers)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Function body of each wrapper is wrapped in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Every wrapper body has top-level try/except Exception that returns _error_json(exc, '<tool_name>'). The shared _invoke helper also has try/except so an exception path through the helper still folds to the error envelope. TestInternalExceptionNeverRaises parametrises a RuntimeError stub across all 9 wrappers; every assertion that decoded['status']=='error' passes.",
+        "notes": "Every wrapper body has top-level try/except Exception that returns _error_json(exc, '<tool_name>'). The shared _invoke helper also has try/except so an exception path through the helper still folds to the error envelope. TestInternalExceptionNeverRaises parametrises a RuntimeError stub across all 9 wrappers; every assertion that decoded['status']=='error' passes."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Each wrapper calls `forge.adapters.guardkit.run(subcommand=\u2026, \u2026)`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each wrapper passes a string literal to _invoke(subcommand=...) which forwards as a kwarg to guardkit_run(subcommand=...). The literals are 'system-arch', 'system-design', 'system-plan', 'feature-spec', 'feature-plan', 'task-review', 'task-work', 'task-complete', 'autobuild'. Verified by TestSubcommandLiteralWiring (parametrised over all 9), which captures the kwargs of the stub run() and asserts capture['subcommand'] equals the expected literal.",
+        "notes": "Each wrapper passes a string literal to _invoke(subcommand=...) which forwards as a kwarg to guardkit_run(subcommand=...). The literals are 'system-arch', 'system-design', 'system-plan', 'feature-spec', 'feature-plan', 'task-review', 'task-work', 'task-complete', 'autobuild'. Verified by TestSubcommandLiteralWiring (parametrised over all 9), which captures the kwargs of the stub run() and asserts capture['subcommand'] equals the expected literal."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Each wrapper composes the NATS progress subscriber for telemetry",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_invoke wraps the run() call in 'async with subscribe_progress(nats_client, build_id, subcommand, sink):'. With nats_client=None, subscribe_progress records a PROGRESS_STREAM_UNAVAILABLE warning on the sink and yields anyway \u2014 verified by TestProgressSubscriberComposition.test_missing_subscriber_does_not_fail_the_call (still returns success status). TestProgressSubscriberComposition.test_subscribe_progress_is_entered_for_each_call replaces subscribe_progress with a fake CM and asserts it was entered exactly once with the expected subcommand and a non-empty build_id.",
+        "notes": "_invoke wraps the run() call in 'async with subscribe_progress(nats_client, build_id, subcommand, sink):'. With nats_client=None, subscribe_progress records a PROGRESS_STREAM_UNAVAILABLE warning on the sink and yields anyway \u2014 verified by TestProgressSubscriberComposition.test_missing_subscriber_does_not_fail_the_call (still returns success status). TestProgressSubscriberComposition.test_subscribe_progress_is_entered_for_each_call replaces subscribe_progress with a fake CM and asserts it was entered exactly once with the expected subcommand and a non-empty build_id."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Each wrapper logs via `structlog` with `tool_name`, `duration_ms`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_invoke logs one structured INFO line per call via the standard logging module: 'guardkit_tool_invocation tool_name=%s status=%s duration_ms=%d'. structlog is not a project dependency (not in pyproject.toml), but the key=value shape is preserved so downstream log processors can parse it identically. TestStructuredLogging.test_success_call_emits_log_with_tool_name_status_duration captures via caplog and asserts all three keys appear in the output for both success (status=success) and exception (status=error) paths.",
+        "notes": "_invoke logs one structured INFO line per call via the standard logging module: 'guardkit_tool_invocation tool_name=%s status=%s duration_ms=%d'. structlog is not a project dependency (not in pyproject.toml), but the key=value shape is preserved so downstream log processors can parse it identically. TestStructuredLogging.test_success_call_emits_log_with_tool_name_status_duration captures via caplog and asserts all three keys appear in the output for both success (status=success) and exception (status=error) paths."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Tools that take `context_paths` (only `guardkit_feature_spec` per",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Only guardkit_feature_spec exposes a context_paths parameter (verified by TestContextPathsThreading.test_only_feature_spec_exposes_context_paths_param iterating every other wrapper's args_schema). guardkit_feature_spec passes context_paths into _invoke(extra_context_paths=context_paths), which forwards as guardkit_run(extra_context_paths=...). TestContextPathsThreading.test_feature_spec_threads_context_paths_to_extra_context_paths captures the exact list pass-through; the None case is also covered.",
+        "notes": "Only guardkit_feature_spec exposes a context_paths parameter (verified by TestContextPathsThreading.test_only_feature_spec_exposes_context_paths_param iterating every other wrapper's args_schema). guardkit_feature_spec passes context_paths into _invoke(extra_context_paths=context_paths), which forwards as guardkit_run(extra_context_paths=...). TestContextPathsThreading.test_feature_spec_threads_context_paths_to_extra_context_paths captures the exact list pass-through; the None case is also covered."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "On a successful call, the returned JSON string contains `artefacts`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "result.model_dump_json() serialises the full GuardKitResult including artefacts (list, default []), duration_secs (required float), and coach_score (None when absent, float when present). TestSuccessJsonShape (parametrised over all 9 wrappers) parses the JSON and asserts decoded['artefacts'] non-empty, decoded['duration_secs'] >= 0, and decoded['coach_score'] == 0.92 against a fixture that supplies one.",
+        "notes": "result.model_dump_json() serialises the full GuardKitResult including artefacts (list, default []), duration_secs (required float), and coach_score (None when absent, float when present). TestSuccessJsonShape (parametrised over all 9 wrappers) parses the JSON and asserts decoded['artefacts'] non-empty, decoded['duration_secs'] >= 0, and decoded['coach_score'] == 0.92 against a fixture that supplies one."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "PR creation is **not** in this file \u2014 that lives in a separate",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "src/forge/tools/guardkit.py contains only the nine guardkit_* wrappers and the shared _invoke / _error_json / _build_id_for helpers. No PR-creation logic, no imports from forge.adapters.gh, no version-control surface. Module __all__ enumerates exactly the nine wrappers.",
+        "notes": "src/forge/tools/guardkit.py contains only the nine guardkit_* wrappers and the shared _invoke / _error_json / _build_id_for helpers. No PR-creation logic, no imports from forge.adapters.gh, no version-control surface. Module __all__ enumerates exactly the nine wrappers."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Unit tests with a fake `run()`: each tool returns the right JSON",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/forge/tools/test_guardkit.py contains 75 tests organised in 9 classes. Parametrised tests cover all 9 wrappers across success, failed, timeout, and internal-exception paths. TestWrapperSurface inspects args_schema for every wrapper (verifying parse_docstring=True succeeded). All 75 tests pass: '75 passed, 1 warning in 0.29s'.",
+        "notes": "tests/forge/tools/test_guardkit.py contains 75 tests organised in 9 classes. Parametrised tests cover all 9 wrappers across success, failed, timeout, and internal-exception paths. TestWrapperSurface inspects args_schema for every wrapper (verifying parse_docstring=True succeeded). All 75 tests pass: '75 passed, 1 warning in 0.29s'."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Files follow the project code style (PEP 8, type hints, 88-char line length per .claude/rules/code-style.md, snake_case names, f-strings, pathlib.Path). No new dependencies. No bare except. No mutable module-level state. All imports use existing packages (langchain.tools, json, logging, time, pathlib, forge.adapters.guardkit.*). pyproject.toml does not configure black/ruff/mypy as gating tools, so the bar is the style guide and the test suite \u2014 both green.",
+        "notes": "Files follow the project code style (PEP 8, type hints, 88-char line length per .claude/rules/code-style.md, snake_case names, f-strings, pathlib.Path). No new dependencies. No bare except. No mutable module-level state. All imports use existing packages (langchain.tools, json, logging, time, pathlib, forge.adapters.guardkit.*). pyproject.toml does not configure black/ruff/mypy as gating tools, so the bar is the style guide and the test suite \u2014 both green."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 287 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 927/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- PROJECT_CONTEXT\n- IS_PROJECT_OF\n\n### \u26a0\ufe0f Warnings\n- RELATED_PROJECT\n- HAS_PROJECT_ID\n\n### \ud83c\udfad Role Constraints\n- MONITOR_QUALITY_GATES\n- MONITORS_RESULTS_FROM\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
