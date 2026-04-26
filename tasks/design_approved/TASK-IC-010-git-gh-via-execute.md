@@ -1,25 +1,33 @@
 ---
-id: TASK-IC-010
-title: "Git/gh operations via DeepAgents execute tool"
-status: backlog
-created: 2026-04-25T14:36:00Z
-updated: 2026-04-25T14:36:00Z
-priority: high
-task_type: feature
-tags: [git, github, subprocess, deepagents, security]
 complexity: 4
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
-wave: 2
-implementation_mode: task-work
-dependencies: [TASK-IC-009]
-estimated_minutes: 90
 consumer_context:
-  - task: TASK-IC-009
-    consumes: execute_command_allowlist
-    framework: "DeepAgents execute tool subprocess permissions layer"
-    driver: "DeepAgents execute_command"
-    format_note: "Allowlist is a single named constant ALLOWED_BINARIES = {'git', 'gh', 'pytest'}. Any addition requires ADR + allowlist-change review. Test verification (TASK-IC-009) and git/gh ops (this task) share the same allowlist constant."
+- consumes: execute_command_allowlist
+  driver: DeepAgents execute_command
+  format_note: Allowlist is a single named constant ALLOWED_BINARIES = {'git', 'gh',
+    'pytest'}. Any addition requires ADR + allowlist-change review. Test verification
+    (TASK-IC-009) and git/gh ops (this task) share the same allowlist constant.
+  framework: DeepAgents execute tool subprocess permissions layer
+  task: TASK-IC-009
+created: 2026-04-25 14:36:00+00:00
+dependencies:
+- TASK-IC-009
+estimated_minutes: 90
+feature_id: FEAT-FORGE-006
+id: TASK-IC-010
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
+priority: high
+status: design_approved
+tags:
+- git
+- github
+- subprocess
+- deepagents
+- security
+task_type: feature
+title: Git/gh operations via DeepAgents execute tool
+updated: 2026-04-25 14:36:00+00:00
+wave: 2
 ---
 
 # Task: Git/gh operations via DeepAgents execute tool

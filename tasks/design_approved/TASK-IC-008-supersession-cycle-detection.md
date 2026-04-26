@@ -1,19 +1,23 @@
 ---
-id: TASK-IC-008
-title: "Supersession-cycle detection for CalibrationAdjustment"
-status: backlog
-created: 2026-04-25T14:36:00Z
-updated: 2026-04-25T14:36:00Z
-priority: high
-task_type: feature
-tags: [memory, data-integrity, cycle-detection]
 complexity: 4
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
-wave: 2
-implementation_mode: task-work
-dependencies: [TASK-IC-001]
+created: 2026-04-25 14:36:00+00:00
+dependencies:
+- TASK-IC-001
 estimated_minutes: 75
+feature_id: FEAT-FORGE-006
+id: TASK-IC-008
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
+priority: high
+status: design_approved
+tags:
+- memory
+- data-integrity
+- cycle-detection
+task_type: feature
+title: Supersession-cycle detection for CalibrationAdjustment
+updated: 2026-04-25 14:36:00+00:00
+wave: 2
 ---
 
 # Task: Supersession-cycle detection for CalibrationAdjustment

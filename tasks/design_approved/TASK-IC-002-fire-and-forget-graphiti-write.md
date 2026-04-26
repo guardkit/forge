@@ -1,25 +1,31 @@
 ---
-id: TASK-IC-002
-title: "Fire-and-forget Graphiti write wrapper"
-status: backlog
-created: 2026-04-25T14:36:00Z
-updated: 2026-04-25T14:36:00Z
-priority: high
-task_type: feature
-tags: [memory, graphiti, async, failure-tolerance]
 complexity: 5
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
-wave: 2
-implementation_mode: task-work
-dependencies: [TASK-IC-001]
-estimated_minutes: 120
 consumer_context:
-  - task: TASK-IC-001
-    consumes: pipeline_history_entity_id_contract
-    framework: "Graphiti async client (mcp__graphiti__add_memory or graphiti-core)"
-    driver: "graphiti-core"
-    format_note: "entity_id MUST equal the SQLite-row UUID for GateDecision/CapabilityResolution/OverrideEvent/CalibrationAdjustment/SessionOutcome — never generated at write time. CalibrationEvent uses deterministic hash."
+- consumes: pipeline_history_entity_id_contract
+  driver: graphiti-core
+  format_note: entity_id MUST equal the SQLite-row UUID for GateDecision/CapabilityResolution/OverrideEvent/CalibrationAdjustment/SessionOutcome
+    — never generated at write time. CalibrationEvent uses deterministic hash.
+  framework: Graphiti async client (mcp__graphiti__add_memory or graphiti-core)
+  task: TASK-IC-001
+created: 2026-04-25 14:36:00+00:00
+dependencies:
+- TASK-IC-001
+estimated_minutes: 120
+feature_id: FEAT-FORGE-006
+id: TASK-IC-002
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
+priority: high
+status: design_approved
+tags:
+- memory
+- graphiti
+- async
+- failure-tolerance
+task_type: feature
+title: Fire-and-forget Graphiti write wrapper
+updated: 2026-04-25 14:36:00+00:00
+wave: 2
 ---
 
 # Task: Fire-and-forget Graphiti write wrapper
