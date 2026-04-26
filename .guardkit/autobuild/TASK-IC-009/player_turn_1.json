@@ -1,0 +1,134 @@
+{
+  "task_id": "TASK-IC-009",
+  "turn": 1,
+  "files_modified": [],
+  "files_created": [
+    "src/forge/build/__init__.py",
+    "src/forge/build/test_verification.py",
+    "tests/forge/build/__init__.py",
+    "tests/forge/build/test_verify_tests.py",
+    "tests/forge/build/test_verify_timeout.py"
+  ],
+  "tests_written": [
+    "tests/forge/build/test_verify_tests.py",
+    "tests/forge/build/test_verify_timeout.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "27 tests pass in tests/forge/build/ (PYTHONPATH=src python3 -m pytest tests/forge/build/). Full forge suite still green at 1051 passed. Black --check and ruff check both pass with zero issues for the new files (target Python 3.11).",
+  "implementation_notes": "Created forge.build.test_verification with the canonical TestVerificationResult TypedDict (passed, pass_count, fail_count, failing_tests, output_tail, duration_seconds) and an async verify_tests(worktree_path, test_command='pytest', timeout_seconds=600, output_tail_chars=4000) entry point. Subprocess execution is mediated through a stubbable _execute_via_deepagents seam \u2014 the constitutional path required by AGENTS.md and the architecture_decisions Graphiti record (subprocess.run is rejected). The default seam body raises RuntimeError so an unwired call fails loud rather than silently no-op-ing. set_execute_seam(seam) lets the orchestrator bind the real DeepAgents execute tool at boot. Pytest summary parsing uses three pre-compiled regex modules (passed, failed, error counts) to remain order-independent and to fold collection errors into fail_count. Failing identifiers are deduplicated because pytest emits FAILED lines twice (inline and short-test-summary). When the regex does not match, pass_count/fail_count return COUNTS_UNAVAILABLE (-1) and exit code remains authoritative. duration_seconds is parsed from the pytest summary line; falls back to the seam-reported wall-clock when the summary is absent. Timeout behaviour normalises both signalling shapes (timed_out=True flag and TimeoutError raise) into the canonical [TIMEOUT_MARKER='__TIMEOUT__'] failing_tests result with passed=False. Pre-execution invariants enforce absolute worktree paths and a binary allowlist (pytest/git/gh) as defence-in-depth atop DeepAgents' own enforcement.",
+  "concerns": [
+    "Production wiring of the DeepAgents execute tool to set_execute_seam() is an out-of-scope orchestrator-boot concern, tracked separately. Callers will hit the loud RuntimeError until that wire-up lands.",
+    "BDD step implementation for @key-example test-verification and @boundary subprocess-timeout is explicitly TASK-IC-011 and not part of this turn."
+  ],
+  "requirements_addressed": [
+    "AC-001 \u2014 execute seam used (subprocess.run never called; sentinel test asserts this)",
+    "AC-002 \u2014 cwd locked to absolute worktree_path; relative path raises ValueError",
+    "AC-003 \u2014 exit code 0 \u2192 passed=True; non-zero \u2192 passed=False",
+    "AC-004 \u2014 pytest summary parsed for pass_count / fail_count",
+    "AC-005 \u2014 FAILED tests/... identifiers extracted (deduplicated)",
+    "AC-006 \u2014 output_tail = last 4000 chars of stdout (configurable)",
+    "AC-007 \u2014 duration_seconds from summary; wall-clock fallback",
+    "AC-008 \u2014 timeout returns passed=False with failing_tests=['__TIMEOUT__']",
+    "AC-009 \u2014 black --check and ruff check pass with zero errors"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "[ ] Spawn subprocess via DeepAgents `execute` tool (NOT `subprocess.run()` directly \u2014 constitutional constraint per AGENTS.md)",
+      "status": "complete",
+      "evidence": "Implemented _execute_via_deepagents async seam in src/forge/build/test_verification.py; verify_tests calls only that seam. Default seam body raises RuntimeError so unwired calls fail loud. test_calls_execute_seam_not_subprocess_run patches subprocess.run with an AssertionError-raising bomb to prove subprocess.run is never invoked. test_default_seam_raises_runtime_error confirms the unwired behaviour. set_execute_seam() exposed for orchestrator-boot wiring of the real DeepAgents execute tool.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "[ ] Working directory locked to `worktree_path` (validated against allowlist by execute tool, not by this module)",
+      "status": "complete",
+      "evidence": "verify_tests passes str(worktree_path) as cwd to the execute seam. Pre-execution check raises ValueError if worktree_path.is_absolute() is False so the execute tool's allowlist always sees an absolute path. test_cwd_is_absolute_worktree_path asserts the seam receives the absolute worktree path; test_relative_worktree_path_raises_value_error asserts the boundary check.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "[ ] Exit code 0 \u2192 `passed=True`; non-zero \u2192 `passed=False`",
+      "status": "complete",
+      "evidence": "passed = exit_code == 0 in verify_tests, with timeout overriding to passed=False. test_exit_code_zero_means_passed and test_exit_code_one_means_failed cover the mapping; the no-tests/collection-error/timeout cases also assert passed=False with non-zero exit codes.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "[ ] Parse pytest summary line for `pass_count` / `fail_count` (e.g. `=== 12 passed, 3 failed in 4.2s ===`)",
+      "status": "complete",
+      "evidence": "_parse_summary scans stdout for the pytest summary line via _SUMMARY_LINE_RE plus _PASSED_RE / _FAILED_RE / _ERROR_RE so counts are order-independent. Errors fold into fail_count. Unknown formats yield COUNTS_UNAVAILABLE (-1) and the docstring documents the fallback. test_all_pass_summary_yields_pass_count, test_partial_fail_summary_yields_both_counts, test_no_tests_collected_yields_unavailable_counts, test_collection_error_folds_errors_into_fail_count, and test_unknown_summary_format_yields_unavailable_counts cover the matrix.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "[ ] Extract failing test identifiers (the `FAILED tests/...` lines)",
+      "status": "complete",
+      "evidence": "_extract_failing_tests scans stdout for ^FAILED\\s+(\\S+) and preserves order while deduplicating (pytest emits FAILED lines both inline and in the short-test-summary section). test_partial_fail_summary_yields_both_counts asserts the three expected identifiers in order; test_failed_lines_are_deduplicated asserts a re-emitted FAILED line is collapsed to a single entry.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "[ ] `output_tail` = last 4000 chars of captured stdout (configurable)",
+      "status": "complete",
+      "evidence": "_tail(s, n) returns the last n characters of stdout (or the full string if shorter; empty for n<=0). DEFAULT_OUTPUT_TAIL_CHARS=4000 is the default; verify_tests exposes output_tail_chars override. test_output_tail_returns_last_4000_chars_by_default proves the default and that the slice is a suffix of stdout. test_output_tail_chars_is_configurable proves the override path. test_output_tail_returns_full_string_when_shorter proves the under-N case.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "[ ] `duration_seconds` parsed from pytest summary; fall back to wall-clock measurement",
+      "status": "complete",
+      "evidence": "_parse_summary returns the duration captured from the pytest summary line ('in 4.20s' \u2192 4.2). verify_tests prefers the parsed value, falling back to the seam-reported exec_duration, then to time.monotonic() wall-clock. test_duration_parsed_from_pytest_summary asserts the summary wins over the seam value (99.0); test_duration_falls_back_to_seam_value_when_summary_missing asserts the fallback path.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "[ ] Timeout (default 600s) respected; on timeout, returns `passed=False` with synthetic `failing_tests=['__TIMEOUT__']` marker (@boundary subprocess-timeout)",
+      "status": "complete",
+      "evidence": "DEFAULT_TIMEOUT_SECONDS=600 is the default. _timeout_result builds the canonical timeout shape (passed=False, failing_tests=[TIMEOUT_MARKER='__TIMEOUT__'], pass/fail_count=COUNTS_UNAVAILABLE). Both signalling shapes \u2014 seam returns timed_out=True and seam raises TimeoutError \u2014 normalise through this helper. test_returns_passed_false_with_timeout_marker, test_timeout_duration_uses_seam_value_when_present, test_timeout_preserves_partial_stdout_in_output_tail, test_timeout_error_normalised_to_timeout_result, test_default_timeout_is_600_seconds, and test_custom_timeout_is_forwarded cover the boundary.",
+      "test_file": "tests/forge/build/test_verify_timeout.py",
+      "implementation_files": [
+        "src/forge/build/test_verification.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "[ ] All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "python3 -m black --check --fast --target-version py311 reports '5 files would be left unchanged' across the new src/forge/build/* and tests/forge/build/* files. python3 -m ruff check reports 'All checks passed!' for the same set. The full forge test suite still passes at 1051 tests.",
+      "test_file": "tests/forge/build/test_verify_tests.py",
+      "implementation_files": [
+        "src/forge/build/__init__.py",
+        "src/forge/build/test_verification.py",
+        "tests/forge/build/__init__.py",
+        "tests/forge/build/test_verify_tests.py",
+        "tests/forge/build/test_verify_timeout.py"
+      ]
+    }
+  ],
+  "success": true
+}
