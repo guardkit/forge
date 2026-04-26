@@ -1,0 +1,188 @@
+{
+  "task_id": "TASK-IC-001",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": false,
+      "test_command": "pytest tests/unit/test_models.py tests/unit/test_redaction.py -v --tb=short",
+      "test_output_summary": "Error detail:\n\n==================================== ERRORS ====================================\n__________________ ERROR collecting tests/unit/test_models.py __________________\nImportError while importing test module '/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_models.py'.\nHint: make sure your test modules/packages have valid Python names.\nResult:\nE   ModuleNotFoundError: No module named 'forge'\nERROR tests/unit/test_models.py\nERROR tests/unit/test_redaction.py\n!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!\n============================== 2 errors in 0.10s ===============================",
+      "duration_seconds": 0.8888237476348877
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 7,
+      "all_criteria_met": false,
+      "missing": [
+        "All modified files pass project-configured lint/format checks with zero errors"
+      ]
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "All six entity models defined with Pydantic v2 BaseModel",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Defined GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome, and CalibrationEvent in src/forge/memory/models.py. Each subclasses pydantic.BaseModel and uses the v2 ConfigDict-based model_config (no v1 inner Config class). Verified by tests/unit/test_models.py::TestPydanticV2BaseModel which asserts BaseModel inheritance and the v2 surface (model_config, model_fields) for all six models, plus that all six are exported from the module __all__.",
+      "notes": "Defined GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome, and CalibrationEvent in src/forge/memory/models.py. Each subclasses pydantic.BaseModel and uses the v2 ConfigDict-based model_config (no v1 inner Config class). Verified by tests/unit/test_models.py::TestPydanticV2BaseModel which asserts BaseModel inheritance and the v2 surface (model_config, model_fields) for all six models, plus that all six are exported from the module __all__."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`entity_id` field documented as \"MUST be sourced from SQLite UUID, never",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Every UUID-typed entity_id field on the five pipeline-history models (GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome) carries the description 'MUST be sourced from SQLite UUID, never generated at write time (ASSUM-007 resolution).' The module docstring also states the rule. Verified by TestEntityIdSourcedFromSqliteDocstring, which case-insensitively asserts both 'sqlite' and 'never generated at write time' appear in each field's description, plus a separate parametrised test that the annotation is exactly UUID for those five models.",
+      "notes": "Every UUID-typed entity_id field on the five pipeline-history models (GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome) carries the description 'MUST be sourced from SQLite UUID, never generated at write time (ASSUM-007 resolution).' The module docstring also states the rule. Verified by TestEntityIdSourcedFromSqliteDocstring, which case-insensitively asserts both 'sqlite' and 'never generated at write time' appear in each field's description, plus a separate parametrised test that the annotation is exactly UUID for those five models."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`gate_decision_ids` on `SessionOutcome` documented as ordered ascending",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "SessionOutcome.gate_decision_ids has a Field(description=...) that explicitly states 'The list MUST be sorted ascending by each referenced GateDecision.decided_at timestamp (ASSUM-008 resolution).' Verified by TestSessionOutcomeOrdering::test_gate_decision_ids_field_documents_ordering, which asserts both 'ascending' and 'decided_at' appear in the description, plus round-trip and default-empty behavioural checks.",
+      "notes": "SessionOutcome.gate_decision_ids has a Field(description=...) that explicitly states 'The list MUST be sorted ascending by each referenced GateDecision.decided_at timestamp (ASSUM-008 resolution).' Verified by TestSessionOutcomeOrdering::test_gate_decision_ids_field_documents_ordering, which asserts both 'ascending' and 'decided_at' appear in the description, plus round-trip and default-empty behavioural checks."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`CalibrationEvent.entity_id` is deterministic from `(source_file,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "CalibrationEvent.entity_id is typed as str (not UUID) and carries a description that explicitly references 'deterministic', 'source_file', and 'line_range' so callers know how to construct it. Verified by TestCalibrationEventDeterministicId: (a) entity_id annotation is str, (b) description contains the determinism contract, (c) re-ingesting two events with the same deterministic id yields identical entity_ids \u2014 the idempotency invariant.",
+      "notes": "CalibrationEvent.entity_id is typed as str (not UUID) and carries a description that explicitly references 'deterministic', 'source_file', and 'line_range' so callers know how to construct it. Verified by TestCalibrationEventDeterministicId: (a) entity_id annotation is str, (b) description contains the determinism contract, (c) re-ingesting two events with the same deterministic id yields identical entity_ids \u2014 the idempotency invariant."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`redact_credentials()` function implemented with documented regex set",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented redact_credentials(text: str) -> str in src/forge/memory/redaction.py covering all required patterns: 'Bearer [A-Za-z0-9._-]{20,}', 'ghp_[A-Za-z0-9]{36}', 'ghs_[A-Za-z0-9]{36}', 'github_pat_[A-Za-z0-9_]{82,}', and word-bounded long-hex '[0-9a-fA-F]{40,}'. Each pattern's justification is documented in the module docstring (ordered most-specific-first). Function is pure (no logging, no I/O), idempotent, raises TypeError for non-str input. Verified by tests/unit/test_redaction.py::TestPurityAndApi::test_module_docstring_documents_each_pattern which asserts every pattern's justification phrase appears in the docstring.",
+      "notes": "Implemented redact_credentials(text: str) -> str in src/forge/memory/redaction.py covering all required patterns: 'Bearer [A-Za-z0-9._-]{20,}', 'ghp_[A-Za-z0-9]{36}', 'ghs_[A-Za-z0-9]{36}', 'github_pat_[A-Za-z0-9_]{82,}', and word-bounded long-hex '[0-9a-fA-F]{40,}'. Each pattern's justification is documented in the module docstring (ordered most-specific-first). Function is pure (no logging, no I/O), idempotent, raises TypeError for non-str input. Verified by tests/unit/test_redaction.py::TestPurityAndApi::test_module_docstring_documents_each_pattern which asserts every pattern's justification phrase appears in the docstring."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Unit tests for `redact_credentials()` covering each pattern (positive +",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/unit/test_redaction.py has 31 tests organised as: TestBearerPattern (3 cases), TestGithubClassicPattern (3), TestGithubServerPattern (3), TestGithubFineGrainedPattern (3), TestLongHexPattern (3), TestHexFuzz (3 fuzz tests of 40/40/20 random hex blobs each), TestOverlappingMatches (4 tests including 'github_pat then bearer no truncation' and 'no original credential value survives in overlapping input'), TestUnicode (3 tests covering Japanese/Arabic surroundings and emoji-adjacent hex), and TestPurityAndApi (6 tests including caplog assertion that the function does not log the original).",
+      "notes": "tests/unit/test_redaction.py has 31 tests organised as: TestBearerPattern (3 cases), TestGithubClassicPattern (3), TestGithubServerPattern (3), TestGithubFineGrainedPattern (3), TestLongHexPattern (3), TestHexFuzz (3 fuzz tests of 40/40/20 random hex blobs each), TestOverlappingMatches (4 tests including 'github_pat then bearer no truncation' and 'no original credential value survives in overlapping input'), TestUnicode (3 tests covering Japanese/Arabic surroundings and emoji-adjacent hex), and TestPurityAndApi (6 tests including caplog assertion that the function does not log the original)."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Unit tests confirming model validation rejects empty/missing required fields",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestModelValidationRejectsBadInput in tests/unit/test_models.py covers each model: missing entity_id on GateDecision, empty stage_name, score outside [0,1], empty capability on CapabilityResolution, missing gate_decision_id on OverrideEvent, missing approved on CalibrationAdjustment plus a positive companion that supersedes defaults to None, invalid outcome literal and empty build_id on SessionOutcome, empty entity_id and empty source_file on CalibrationEvent. All assert pydantic.ValidationError is raised. Models use ConfigDict(extra='forbid') and Field(..., min_length=1) on string fields that must be non-empty.",
+      "notes": "TestModelValidationRejectsBadInput in tests/unit/test_models.py covers each model: missing entity_id on GateDecision, empty stage_name, score outside [0,1], empty capability on CapabilityResolution, missing gate_decision_id on OverrideEvent, missing approved on CalibrationAdjustment plus a positive companion that supersedes defaults to None, invalid outcome literal and empty build_id on SessionOutcome, empty entity_id and empty source_file on CalibrationEvent. All assert pydantic.ValidationError is raised. Models use ConfigDict(extra='forbid') and Field(..., min_length=1) on string fields that must be non-empty."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "Promise status: uncertain",
+      "notes": "Promise status: uncertain"
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "All six entity models defined with Pydantic v2 BaseModel",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Defined GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome, and CalibrationEvent in src/forge/memory/models.py. Each subclasses pydantic.BaseModel and uses the v2 ConfigDict-based model_config (no v1 inner Config class). Verified by tests/unit/test_models.py::TestPydanticV2BaseModel which asserts BaseModel inheritance and the v2 surface (model_config, model_fields) for all six models, plus that all six are exported from the module __all__.",
+        "notes": "Defined GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome, and CalibrationEvent in src/forge/memory/models.py. Each subclasses pydantic.BaseModel and uses the v2 ConfigDict-based model_config (no v1 inner Config class). Verified by tests/unit/test_models.py::TestPydanticV2BaseModel which asserts BaseModel inheritance and the v2 surface (model_config, model_fields) for all six models, plus that all six are exported from the module __all__."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`entity_id` field documented as \"MUST be sourced from SQLite UUID, never",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Every UUID-typed entity_id field on the five pipeline-history models (GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome) carries the description 'MUST be sourced from SQLite UUID, never generated at write time (ASSUM-007 resolution).' The module docstring also states the rule. Verified by TestEntityIdSourcedFromSqliteDocstring, which case-insensitively asserts both 'sqlite' and 'never generated at write time' appear in each field's description, plus a separate parametrised test that the annotation is exactly UUID for those five models.",
+        "notes": "Every UUID-typed entity_id field on the five pipeline-history models (GateDecision, CapabilityResolution, OverrideEvent, CalibrationAdjustment, SessionOutcome) carries the description 'MUST be sourced from SQLite UUID, never generated at write time (ASSUM-007 resolution).' The module docstring also states the rule. Verified by TestEntityIdSourcedFromSqliteDocstring, which case-insensitively asserts both 'sqlite' and 'never generated at write time' appear in each field's description, plus a separate parametrised test that the annotation is exactly UUID for those five models."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`gate_decision_ids` on `SessionOutcome` documented as ordered ascending",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "SessionOutcome.gate_decision_ids has a Field(description=...) that explicitly states 'The list MUST be sorted ascending by each referenced GateDecision.decided_at timestamp (ASSUM-008 resolution).' Verified by TestSessionOutcomeOrdering::test_gate_decision_ids_field_documents_ordering, which asserts both 'ascending' and 'decided_at' appear in the description, plus round-trip and default-empty behavioural checks.",
+        "notes": "SessionOutcome.gate_decision_ids has a Field(description=...) that explicitly states 'The list MUST be sorted ascending by each referenced GateDecision.decided_at timestamp (ASSUM-008 resolution).' Verified by TestSessionOutcomeOrdering::test_gate_decision_ids_field_documents_ordering, which asserts both 'ascending' and 'decided_at' appear in the description, plus round-trip and default-empty behavioural checks."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`CalibrationEvent.entity_id` is deterministic from `(source_file,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "CalibrationEvent.entity_id is typed as str (not UUID) and carries a description that explicitly references 'deterministic', 'source_file', and 'line_range' so callers know how to construct it. Verified by TestCalibrationEventDeterministicId: (a) entity_id annotation is str, (b) description contains the determinism contract, (c) re-ingesting two events with the same deterministic id yields identical entity_ids \u2014 the idempotency invariant.",
+        "notes": "CalibrationEvent.entity_id is typed as str (not UUID) and carries a description that explicitly references 'deterministic', 'source_file', and 'line_range' so callers know how to construct it. Verified by TestCalibrationEventDeterministicId: (a) entity_id annotation is str, (b) description contains the determinism contract, (c) re-ingesting two events with the same deterministic id yields identical entity_ids \u2014 the idempotency invariant."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`redact_credentials()` function implemented with documented regex set",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented redact_credentials(text: str) -> str in src/forge/memory/redaction.py covering all required patterns: 'Bearer [A-Za-z0-9._-]{20,}', 'ghp_[A-Za-z0-9]{36}', 'ghs_[A-Za-z0-9]{36}', 'github_pat_[A-Za-z0-9_]{82,}', and word-bounded long-hex '[0-9a-fA-F]{40,}'. Each pattern's justification is documented in the module docstring (ordered most-specific-first). Function is pure (no logging, no I/O), idempotent, raises TypeError for non-str input. Verified by tests/unit/test_redaction.py::TestPurityAndApi::test_module_docstring_documents_each_pattern which asserts every pattern's justification phrase appears in the docstring.",
+        "notes": "Implemented redact_credentials(text: str) -> str in src/forge/memory/redaction.py covering all required patterns: 'Bearer [A-Za-z0-9._-]{20,}', 'ghp_[A-Za-z0-9]{36}', 'ghs_[A-Za-z0-9]{36}', 'github_pat_[A-Za-z0-9_]{82,}', and word-bounded long-hex '[0-9a-fA-F]{40,}'. Each pattern's justification is documented in the module docstring (ordered most-specific-first). Function is pure (no logging, no I/O), idempotent, raises TypeError for non-str input. Verified by tests/unit/test_redaction.py::TestPurityAndApi::test_module_docstring_documents_each_pattern which asserts every pattern's justification phrase appears in the docstring."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Unit tests for `redact_credentials()` covering each pattern (positive +",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/unit/test_redaction.py has 31 tests organised as: TestBearerPattern (3 cases), TestGithubClassicPattern (3), TestGithubServerPattern (3), TestGithubFineGrainedPattern (3), TestLongHexPattern (3), TestHexFuzz (3 fuzz tests of 40/40/20 random hex blobs each), TestOverlappingMatches (4 tests including 'github_pat then bearer no truncation' and 'no original credential value survives in overlapping input'), TestUnicode (3 tests covering Japanese/Arabic surroundings and emoji-adjacent hex), and TestPurityAndApi (6 tests including caplog assertion that the function does not log the original).",
+        "notes": "tests/unit/test_redaction.py has 31 tests organised as: TestBearerPattern (3 cases), TestGithubClassicPattern (3), TestGithubServerPattern (3), TestGithubFineGrainedPattern (3), TestLongHexPattern (3), TestHexFuzz (3 fuzz tests of 40/40/20 random hex blobs each), TestOverlappingMatches (4 tests including 'github_pat then bearer no truncation' and 'no original credential value survives in overlapping input'), TestUnicode (3 tests covering Japanese/Arabic surroundings and emoji-adjacent hex), and TestPurityAndApi (6 tests including caplog assertion that the function does not log the original)."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Unit tests confirming model validation rejects empty/missing required fields",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestModelValidationRejectsBadInput in tests/unit/test_models.py covers each model: missing entity_id on GateDecision, empty stage_name, score outside [0,1], empty capability on CapabilityResolution, missing gate_decision_id on OverrideEvent, missing approved on CalibrationAdjustment plus a positive companion that supersedes defaults to None, invalid outcome literal and empty build_id on SessionOutcome, empty entity_id and empty source_file on CalibrationEvent. All assert pydantic.ValidationError is raised. Models use ConfigDict(extra='forbid') and Field(..., min_length=1) on string fields that must be non-empty.",
+        "notes": "TestModelValidationRejectsBadInput in tests/unit/test_models.py covers each model: missing entity_id on GateDecision, empty stage_name, score outside [0,1], empty capability on CapabilityResolution, missing gate_decision_id on OverrideEvent, missing approved on CalibrationAdjustment plus a positive companion that supersedes defaults to None, invalid outcome literal and empty build_id on SessionOutcome, empty entity_id and empty source_file on CalibrationEvent. All assert pydantic.ValidationError is raised. Models use ConfigDict(extra='forbid') and Field(..., min_length=1) on string fields that must be non-empty."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "Promise status: uncertain",
+        "notes": "Promise status: uncertain"
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "missing_requirement",
+      "description": "Not all acceptance criteria met",
+      "missing_criteria": [
+        "All modified files pass project-configured lint/format checks with zero errors"
+      ]
+    }
+  ],
+  "rationale": "Missing 1 acceptance criteria: All modified files pass project-configured lint/format checks with zero errors",
+  "context_used": "## Job-Specific Context\n\nBudget: 1555/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- CREATED_BY\n- DESCRIPTION_OF\n- ASSIGNS_TASK_TO\n- IS_USED_IN_PATTERN\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- IS_IMPLEMENTED_AS\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATE_TO_TASK_WORK\n- PROJECT_INVOLVES\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_ENTITY_TYPE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

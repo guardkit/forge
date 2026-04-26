@@ -1,0 +1,7 @@
+{
+  "tests_run": 70,
+  "tests_failed": 0,
+  "coverage_pct": 100.0,
+  "output_summary": "70/70 unit tests passed (tests/unit/) with 100% line coverage on src/forge/memory (models, redaction, __init__).",
+  "quality_gates_passed": true
+}
