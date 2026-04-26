@@ -1,29 +1,32 @@
 ---
-id: TASK-IC-011
-title: "BDD step implementations for all 43 scenarios"
-status: backlog
-created: 2026-04-25T14:36:00Z
-updated: 2026-04-25T14:36:00Z
-priority: high
-task_type: testing
-tags: [bdd, testing, integration]
 complexity: 6
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
-wave: 5
-implementation_mode: task-work
+created: 2026-04-25 14:36:00+00:00
 dependencies:
-  - TASK-IC-001
-  - TASK-IC-002
-  - TASK-IC-003
-  - TASK-IC-004
-  - TASK-IC-005
-  - TASK-IC-006
-  - TASK-IC-007
-  - TASK-IC-008
-  - TASK-IC-009
-  - TASK-IC-010
+- TASK-IC-001
+- TASK-IC-002
+- TASK-IC-003
+- TASK-IC-004
+- TASK-IC-005
+- TASK-IC-006
+- TASK-IC-007
+- TASK-IC-008
+- TASK-IC-009
+- TASK-IC-010
 estimated_minutes: 240
+feature_id: FEAT-FORGE-006
+id: TASK-IC-011
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
+priority: high
+status: design_approved
+tags:
+- bdd
+- testing
+- integration
+task_type: testing
+title: BDD step implementations for all 43 scenarios
+updated: 2026-04-25 14:36:00+00:00
+wave: 5
 ---
 
 # Task: BDD step implementations for all 43 scenarios

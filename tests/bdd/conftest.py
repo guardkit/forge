@@ -537,10 +537,217 @@ def approval_config():
 
 # Re-export the constant so step files can assert on AGENT_ID without
 # re-importing from the production module's deeper path.
+# ---------------------------------------------------------------------------
+# Infrastructure Coordination fixtures (TASK-IC-011)
+# ---------------------------------------------------------------------------
+#
+# These fixtures activate the R2 BDD oracle for FEAT-FORGE-006 (the
+# 43 scenarios in
+# ``features/infrastructure-coordination/infrastructure-coordination.feature``).
+# Cardinal rule: scenarios bind to the **real** production modules
+# (``forge.memory.*``, ``forge.build.*``); the fixtures below provide
+# the seams the steps need (Graphiti recorder, tmp worktree, tmp SQLite,
+# env-cleared subprocess) without ever touching the network or the
+# filesystem outside the per-scenario ``tmp_path``.
+
+
+class FakeGraphitiClient:
+    """In-process recorder standing in for the Graphiti write/read path.
+
+    The IC scenarios assert against three observable Graphiti effects:
+
+    1. ``writes`` — every entity passed to ``write_entity``-like seams.
+       Each entry is a ``(group_id, entity_type, entity_dict)`` tuple so
+       step functions can grep by group / type / id.
+    2. ``query_results`` — pre-canned dict-shaped rows the priors-retrieval
+       seam returns when a scenario primes the query side.
+    3. ``unreachable`` — when ``True``, every write seam raises
+       :class:`forge.memory.writer.GraphitiUnavailableError` so the
+       ``@negative memory-write-failure-tolerated`` scenario can prove
+       the build proceeds despite the failure.
+
+    The recorder also tracks ``write_order`` — a list of timestamps
+    captured as each write enters the seam — so the
+    ``@edge-case write-ordering`` scenario can prove the SQLite commit
+    happened *before* the Graphiti dispatch.
+    """
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str, dict[str, Any]]] = []
+        self.query_results: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.existing_session_outcomes: set[str] = set()
+        self.unreachable: bool = False
+        self.cli_unreachable: bool = False
+        self.write_order: list[float] = []
+        # Per-entity_id index so split-brain dedupe / session-outcome
+        # idempotency scenarios can assert "exactly one stored entity".
+        self.entities_by_id: dict[str, dict[str, Any]] = {}
+
+    async def add_episode(
+        self,
+        *,
+        name: str,
+        episode_body: str,
+        group_id: str,
+        source: str = "json",
+    ) -> None:
+        """``graphiti_core.Graphiti().add_episode`` shape.
+
+        Patched into :func:`forge.memory.writer._dispatch_write` via
+        ``monkeypatch`` in step setup so production code reaches this
+        recorder rather than a real backend.
+        """
+        if self.unreachable:
+            raise RuntimeError("graphiti unreachable (test-controlled)")
+        import json as _json
+        import time as _time
+
+        payload = _json.loads(episode_body)
+        entity_id = payload.get("entity_id", "<unknown>")
+        entity_type = name.split(":", 1)[0]
+        # Dedupe on entity_id so split-brain / session-outcome idempotency
+        # scenarios see exactly one record per id.
+        if entity_id not in self.entities_by_id:
+            self.writes.append((group_id, entity_type, payload))
+            self.entities_by_id[entity_id] = payload
+            self.write_order.append(_time.monotonic())
+
+    def queue_query(
+        self, group_id: str, entity_type: str, rows: list[dict[str, Any]]
+    ) -> None:
+        """Pre-canned rows for a priors-retrieval query category."""
+        self.query_results[(group_id, entity_type)] = list(rows)
+
+    async def query(
+        self, *, group_id: str, entity_type: str, **_: Any
+    ) -> list[dict[str, Any]]:
+        return list(self.query_results.get((group_id, entity_type), []))
+
+
+@pytest.fixture
+def graphiti_client_mock() -> FakeGraphitiClient:
+    """In-process recorder for the Graphiti add-context / query path."""
+    return FakeGraphitiClient()
+
+
+@pytest.fixture
+def patched_graphiti_writer(monkeypatch, graphiti_client_mock):
+    """Patch :mod:`forge.memory.writer` to route writes through the recorder.
+
+    Returns the recorder so step functions have a single named handle
+    for both pre-flight setup (``queue_query`` / ``unreachable=True``)
+    and post-flight assertion (``writes``).
+    """
+    from forge.memory import writer as _writer_mod
+
+    async def _fake_dispatch(payload, group_id, episode_name):
+        if graphiti_client_mock.unreachable:
+            raise _writer_mod.GraphitiUnavailableError(
+                "test-controlled unreachable"
+            )
+        await graphiti_client_mock.add_episode(
+            name=episode_name,
+            episode_body=__import__("json").dumps(payload),
+            group_id=group_id,
+            source="json",
+        )
+
+    monkeypatch.setattr(_writer_mod, "_dispatch_write", _fake_dispatch)
+    return graphiti_client_mock
+
+
+@pytest.fixture
+def tmp_worktree(tmp_path):
+    """Per-scenario absolute worktree path under ``tmp_path``.
+
+    Mirrors the per-build ephemeral worktree contract from TASK-IC-010 —
+    the directory exists, is writable, and is absolute (so the
+    ``security-working-directory-allowlist`` invariant has something
+    concrete to validate against).
+    """
+    worktree = tmp_path / "build-worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+    return worktree
+
+
+@pytest.fixture
+def tmp_sqlite_db(tmp_path):
+    """Per-scenario SQLite ledger path used by reconcile / session-outcome.
+
+    Returned as a :class:`Path` rather than a connection — the IC code
+    paths use a Protocol-typed repository, so individual steps build a
+    minimal in-memory repository implementation rather than coupling to
+    a SQLite schema. The path is provided so scenarios that need a
+    backing file (e.g. snapshot store, reconcile) have a stable location.
+    """
+    return tmp_path / "forge-history.sqlite"
+
+
+@pytest.fixture
+def env_cleared_subprocess(monkeypatch):
+    """Strip credential env vars so ``create_pull_request`` returns ``None``.
+
+    Used by the ``@negative cred-missing-pr-graceful`` scenario. The
+    pop is reversed automatically by ``monkeypatch`` teardown.
+    """
+    for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+@pytest.fixture
+def execute_seam_recorder(monkeypatch):
+    """Stub the DeepAgents ``execute`` seam in build modules.
+
+    Records every command the test code dispatches and returns scripted
+    ``(stdout, stderr, exit_code, duration, timed_out)`` tuples. The
+    git/gh seam in :mod:`forge.build.git_operations` and the pytest
+    seam in :mod:`forge.build.test_verification` are patched together
+    so a single scenario can drive both.
+    """
+
+    from forge.build import git_operations as _git
+    from forge.build import test_verification as _tv
+
+    @dataclass
+    class _Recorder:
+        commands: list[tuple[list[str], str]] = field(default_factory=list)
+        next_results: list[tuple[str, str, int, float, bool]] = field(
+            default_factory=list
+        )
+        # When True, raise DisallowedBinaryError-equivalent semantics
+        # are tested via the production module's own validation, so the
+        # seam itself just records and returns success.
+        default_result: tuple[str, str, int, float, bool] = (
+            "",
+            "",
+            0,
+            0.01,
+            False,
+        )
+
+        def queue(self, result: tuple[str, str, int, float, bool]) -> None:
+            self.next_results.append(result)
+
+        async def __call__(
+            self, *, command: list[str], cwd: str, timeout: int
+        ) -> tuple[str, str, int, float, bool]:
+            self.commands.append((list(command), cwd))
+            if self.next_results:
+                return self.next_results.pop(0)
+            return self.default_result
+
+    recorder = _Recorder()
+    monkeypatch.setattr(_git, "_execute_via_deepagents", recorder)
+    monkeypatch.setattr(_tv, "_execute_via_deepagents", recorder)
+    return recorder
+
+
 __all__ = [
     "AGENT_ID",
     "DeterministicReasoningModel",
     "FakeClock",
+    "FakeGraphitiClient",
     "FakeNatsClient",
     "RecordingPipelinePublisher",
     "StubPipelineConsumer",
