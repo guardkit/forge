@@ -227,7 +227,9 @@ def _given_no_gh_credentials(
     monkeypatch.setattr(operations, "_execute", spy)
 
 
-@then("the adapter should return a structured error explaining the credential is missing")
+@then(
+    "the adapter should return a structured error explaining the credential is missing"
+)
 def _then_structured_missing_credential_error(gci_world: dict[str, Any]) -> None:
     result: PRResult = gci_world["result"]
     assert isinstance(result, PRResult)
@@ -500,9 +502,7 @@ def _when_subprocess_exits_cleanly(gci_world: dict[str, Any]) -> None:
     gci_world["result"] = asyncio.run(_run())
 
 
-@then(
-    "the invocation should still return a parsed success result with artefact paths"
-)
+@then("the invocation should still return a parsed success result with artefact paths")
 def _then_returns_parsed_success_with_artefacts(gci_world: dict[str, Any]) -> None:
     result: GuardKitResult = gci_world["result"]
     assert isinstance(result, GuardKitResult)
