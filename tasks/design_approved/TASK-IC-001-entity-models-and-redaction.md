@@ -1,51 +1,22 @@
 ---
-id: TASK-IC-001
-title: Entity model layer and credential redaction
-status: in_review
+complexity: 4
 created: 2026-04-25 14:36:00+00:00
-updated: 2026-04-25 14:36:00+00:00
+dependencies: []
+estimated_minutes: 90
+feature_id: FEAT-FORGE-006
+id: TASK-IC-001
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
 priority: high
-task_type: declarative
+status: design_approved
 tags:
 - models
 - scaffolding
 - security
-complexity: 4
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
+task_type: declarative
+title: Entity model layer and credential redaction
+updated: 2026-04-25 14:36:00+00:00
 wave: 1
-implementation_mode: task-work
-dependencies: []
-estimated_minutes: 90
-autobuild_state:
-  current_turn: 2
-  max_turns: 30
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10
-  base_branch: main
-  started_at: '2026-04-26T13:54:50.487569'
-  last_updated: '2026-04-26T14:14:02.128857'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
-      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
-      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
-      \ 3: `python-api-specialist` (Implementation)\n- Not all acceptance criteria\
-      \ met:\n  \u2022 All modified files pass project-configured lint/format checks\
-      \ with zero errors"
-    timestamp: '2026-04-26T13:54:50.487569'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: approve
-    feedback: null
-    timestamp: '2026-04-26T14:07:08.359967'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
 ---
 
 # Task: Entity model layer and credential redaction

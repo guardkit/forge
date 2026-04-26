@@ -1,0 +1,7 @@
+{
+  "tests_run": 97,
+  "tests_failed": 0,
+  "coverage_pct": 80.0,
+  "output_summary": "pytest: 97 passed, 0 failed across test_reconciler.py, test_ordering.py, test_pipeline_consumer.py; reconciler.py line coverage 80% (meets 80% gate).",
+  "quality_gates_passed": true
+}

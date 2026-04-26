@@ -1,0 +1,24 @@
+{
+  "task_id": "TASK-IC-001",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "46084c2627d76e178cd0a47227d6c11ea8080873",
+      "timestamp": "2026-04-26T14:07:08.359396",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false
+    },
+    {
+      "turn": 2,
+      "commit_hash": "06280968467bec6bcb6d6e601ce7d7721a4218af",
+      "timestamp": "2026-04-26T14:14:02.121083",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 2 complete (tests: pass)",
+      "from_prior_run": false
+    }
+  ],
+  "last_updated": "2026-04-26T14:14:02.121179"
+}

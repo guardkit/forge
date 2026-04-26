@@ -1,70 +1,24 @@
 ---
-id: TASK-IC-012
-title: Security and concurrency scenario hardening
-status: in_review
+complexity: 4
 created: 2026-04-25 14:36:00+00:00
-updated: 2026-04-25 14:36:00+00:00
+dependencies:
+- TASK-IC-011
+estimated_minutes: 90
+feature_id: FEAT-FORGE-006
+id: TASK-IC-012
+implementation_mode: task-work
+parent_review: TASK-REV-IC8B
 priority: high
-task_type: testing
+status: design_approved
 tags:
 - security
 - concurrency
 - data-integrity
 - hardening
-complexity: 4
-parent_review: TASK-REV-IC8B
-feature_id: FEAT-FORGE-006
+task_type: testing
+title: Security and concurrency scenario hardening
+updated: 2026-04-25 14:36:00+00:00
 wave: 6
-implementation_mode: task-work
-dependencies:
-- TASK-IC-011
-estimated_minutes: 90
-autobuild_state:
-  current_turn: 3
-  max_turns: 30
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10
-  base_branch: main
-  started_at: '2026-04-26T15:20:19.313732'
-  last_updated: '2026-04-26T15:57:18.431687'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: '- Advisory (non-blocking): task-work produced a report with 2 of 3
-      expected agent invocations. Missing phases: 3 (Implementation). Consider invoking
-      these agents via the Task tool to strengthen stack-specific quality:
-
-      - Phase 3: `python-api-specialist` (Implementation)
-
-      - BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation
-      does not satisfy the Gherkin specification.'
-    timestamp: '2026-04-26T15:20:19.313732'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: feedback
-    feedback: '- Advisory (non-blocking): task-work produced a report with 2 of 3
-      expected agent invocations. Missing phases: 3 (Implementation). Consider invoking
-      these agents via the Task tool to strengthen stack-specific quality:
-
-      - Phase 3: `python-api-specialist` (Implementation)
-
-      - BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation
-      does not satisfy the Gherkin specification.'
-    timestamp: '2026-04-26T15:38:29.631091'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 3
-    decision: approve
-    feedback: null
-    timestamp: '2026-04-26T15:49:26.642751'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
 ---
 
 # Task: Security and concurrency scenario hardening

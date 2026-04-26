@@ -1,0 +1,136 @@
+{
+  "task_id": "TASK-IC-007",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/session_outcome.py",
+    "tasks/backlog/TASK-IC-004-reconcile-backfill.md",
+    "tasks/backlog/TASK-IC-007-session-outcome-writer.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-IC-004-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-IC-004/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-IC-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-007/turn_context.json",
+    ".guardkit/bdd/TASK-IC-007_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/.guardkit/autobuild/TASK-IC-007/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/session_outcome.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_session_outcome.py",
+    "src/forge/memory/reconciler.py",
+    "src/forge/memory/session_outcome.py",
+    "tasks/design_approved/TASK-IC-004-reconcile-backfill.md",
+    "tasks/design_approved/TASK-IC-007-session-outcome-writer.md",
+    "tests/unit/test_session_outcome.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_session_outcome.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001 pre-write existence check",
+    "AC-002 idempotent no-op return",
+    "AC-003 read-only SQLite repo collection",
+    "AC-004 ASSUM-008 ordering with tiebreaker",
+    "AC-005 synchronous write_entity dispatch",
+    "AC-006 terminal-only guard",
+    "AC-007 deterministic entity_id for split-brain dedupe",
+    "AC-008 lint/format hygiene (88-char, snake_case, type hints, docstrings)"
+  ],
+  "requirements_remaining": [
+    "BDD step impls for the listed scenarios \u2014 explicitly out of scope per task spec ('TASK-IC-011')."
+  ],
+  "sdk_turns_used": 39,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 35,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Pre-write existence check by build_id in forge_pipeline_history",
+      "status": "complete",
+      "evidence": "write_session_outcome calls the injected SessionOutcomeExistsCheck (async callable typed Callable[[str], Awaitable[bool]]) with the build_id BEFORE collecting decisions or constructing the entity. Verified by TestPreWriteExistenceCheck::test_existence_check_called_with_build_id and the parameter contract documented in the module docstring 'Pre-write existence check'.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Existing entity \u2192 no-op return None (@edge-case session-outcome-retry-idempotency)",
+      "status": "complete",
+      "evidence": "When exists_check returns True, write_session_outcome returns None without invoking the SQLite repo or the writer. Tests TestPreWriteExistenceCheck::test_existing_outcome_returns_none_no_op, test_existing_outcome_does_not_write, and test_existing_outcome_does_not_query_repo verify each branch of the no-op path.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "GateDecision references collected from SQLite repo (read-only via FEAT-FORGE-001 interface)",
+      "status": "complete",
+      "evidence": "PipelineHistoryRepository is declared as a typing.Protocol with a single read method get_gate_decisions_for_build(build_id) -> Sequence[GateDecision]. The module imports nothing from FEAT-FORGE-001 and has no write surface against SQLite. TestGateDecisionCollection::test_repo_queried_with_build_id confirms the repository is queried with the build_id; test_repo_without_required_method_raises_typeerror enforces the Protocol shape at runtime.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Sort by decided_at ASC before constructing gate_decision_ids list (ASSUM-008 resolution)",
+      "status": "complete",
+      "evidence": "_sort_gate_decisions returns sorted(decisions, key=lambda d: (d.decided_at, str(d.entity_id))) \u2014 primary by decided_at ASC, secondary by entity_id for deterministic tie-breaking when timestamps collide at microsecond resolution. Verified by TestOrderingByDecidedAt::test_out_of_order_decisions_are_sorted_on_output and test_microsecond_tied_timestamps_use_entity_id_tiebreaker; test_pure_helper_does_not_mutate_input pins the immutability contract.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Writes via write_entity() (synchronous, NOT fire-and-forget \u2014 caller wants confirmation)",
+      "status": "complete",
+      "evidence": "The default 'write' parameter is forge.memory.writer.write_entity, awaited directly inside write_session_outcome (no asyncio.ensure_future / no thread). Failures from write_entity propagate to the caller. TestSynchronousWrite::test_write_invoked_with_session_outcome_and_group_id verifies the call shape (PIPELINE_HISTORY_GROUP_ID + built SessionOutcome). test_write_failure_propagates_to_caller verifies the synchronous-failure contract.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Only fires on first terminal-state transition; in-progress states produce no SessionOutcome (@edge-case no-in-progress-session-outcome)",
+      "status": "complete",
+      "evidence": "_is_terminal(outcome) is checked before the existence check; non-terminal outcomes (in_progress, running, pending, queued, '', SUCCESS) short-circuit to a logged warning + None return. TestTerminalOnly::test_non_terminal_outcome_returns_none parametrises over six non-terminal strings; test_non_terminal_does_not_query_existence proves the short-circuit happens before any I/O; test_non_terminal_logs_warning_with_build_id verifies the structured log line.",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Concurrent calls (two Forge instances) \u2192 both see the same existence check; one writes, one no-ops (@concurrency gate-decisions-in-close-succession and split-brain safety from TASK-IC-001 entity_id contract)",
+      "status": "complete",
+      "evidence": "_session_outcome_entity_id derives a deterministic UUID5 from build_id under a namespaced URI prefix, so two writers for the same build produce the same entity_id (Graphiti upsert-key dedupe \u2014 TASK-IC-001 contract). TestConcurrentDedupeContract: test_entity_id_is_deterministic_for_build_id, test_entity_id_differs_for_distinct_build_ids, test_concurrent_callers_one_writes_one_no_ops (stateful exists-check simulating two-instance race), and test_split_brain_writes_share_entity_id (worst-case both-see-False race verifies the entity_id remains identical).",
+      "test_file": "tests/unit/test_session_outcome.py",
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "No ruff/black/mypy/flake8 configuration is present in pyproject.toml. Source and test files were authored to satisfy the .claude/rules/code-style.md guide: snake_case, PascalCase, type hints, max 88-char lines (verified by awk 'length > 88' returning zero matches on both files), f-strings, context managers, list comprehensions, no relative-style imports outside the package.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/memory/session_outcome.py",
+        "tests/unit/test_session_outcome.py"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,183 @@
+{
+  "task_id": "TASK-IC-007",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": false,
+      "test_command": "pytest tests/unit/test_session_outcome.py -v --tb=short",
+      "test_output_summary": "Error detail:\n\n==================================== ERRORS ====================================\n_____________ ERROR collecting tests/unit/test_session_outcome.py ______________\nImportError while importing test module '/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_session_outcome.py'.\nHint: make sure your test modules/packages have valid Python names.\nResult:\ntests/unit/test_session_outcome.py:42: in <module>\nE   ModuleNotFoundError: No module named 'forge'\nERROR tests/unit/test_session_outcome.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n=============================== 1 error in 0.06s ===============================",
+      "duration_seconds": 0.44526052474975586
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Pre-write existence check by `build_id` in `forge_pipeline_history`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "write_session_outcome calls the injected SessionOutcomeExistsCheck (async callable typed Callable[[str], Awaitable[bool]]) with the build_id BEFORE collecting decisions or constructing the entity. Verified by TestPreWriteExistenceCheck::test_existence_check_called_with_build_id and the parameter contract documented in the module docstring 'Pre-write existence check'.",
+      "notes": "write_session_outcome calls the injected SessionOutcomeExistsCheck (async callable typed Callable[[str], Awaitable[bool]]) with the build_id BEFORE collecting decisions or constructing the entity. Verified by TestPreWriteExistenceCheck::test_existence_check_called_with_build_id and the parameter contract documented in the module docstring 'Pre-write existence check'."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Existing entity \u2192 no-op return None (`@edge-case session-outcome-retry-idempotency`)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When exists_check returns True, write_session_outcome returns None without invoking the SQLite repo or the writer. Tests TestPreWriteExistenceCheck::test_existing_outcome_returns_none_no_op, test_existing_outcome_does_not_write, and test_existing_outcome_does_not_query_repo verify each branch of the no-op path.",
+      "notes": "When exists_check returns True, write_session_outcome returns None without invoking the SQLite repo or the writer. Tests TestPreWriteExistenceCheck::test_existing_outcome_returns_none_no_op, test_existing_outcome_does_not_write, and test_existing_outcome_does_not_query_repo verify each branch of the no-op path."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`GateDecision` references collected from SQLite repo (read-only via",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "PipelineHistoryRepository is declared as a typing.Protocol with a single read method get_gate_decisions_for_build(build_id) -> Sequence[GateDecision]. The module imports nothing from FEAT-FORGE-001 and has no write surface against SQLite. TestGateDecisionCollection::test_repo_queried_with_build_id confirms the repository is queried with the build_id; test_repo_without_required_method_raises_typeerror enforces the Protocol shape at runtime.",
+      "notes": "PipelineHistoryRepository is declared as a typing.Protocol with a single read method get_gate_decisions_for_build(build_id) -> Sequence[GateDecision]. The module imports nothing from FEAT-FORGE-001 and has no write surface against SQLite. TestGateDecisionCollection::test_repo_queried_with_build_id confirms the repository is queried with the build_id; test_repo_without_required_method_raises_typeerror enforces the Protocol shape at runtime."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Sort by `decided_at` ASC before constructing `gate_decision_ids` list",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_sort_gate_decisions returns sorted(decisions, key=lambda d: (d.decided_at, str(d.entity_id))) \u2014 primary by decided_at ASC, secondary by entity_id for deterministic tie-breaking when timestamps collide at microsecond resolution. Verified by TestOrderingByDecidedAt::test_out_of_order_decisions_are_sorted_on_output and test_microsecond_tied_timestamps_use_entity_id_tiebreaker; test_pure_helper_does_not_mutate_input pins the immutability contract.",
+      "notes": "_sort_gate_decisions returns sorted(decisions, key=lambda d: (d.decided_at, str(d.entity_id))) \u2014 primary by decided_at ASC, secondary by entity_id for deterministic tie-breaking when timestamps collide at microsecond resolution. Verified by TestOrderingByDecidedAt::test_out_of_order_decisions_are_sorted_on_output and test_microsecond_tied_timestamps_use_entity_id_tiebreaker; test_pure_helper_does_not_mutate_input pins the immutability contract."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Writes via `write_entity()` (synchronous, NOT fire-and-forget \u2014 caller",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The default 'write' parameter is forge.memory.writer.write_entity, awaited directly inside write_session_outcome (no asyncio.ensure_future / no thread). Failures from write_entity propagate to the caller. TestSynchronousWrite::test_write_invoked_with_session_outcome_and_group_id verifies the call shape (PIPELINE_HISTORY_GROUP_ID + built SessionOutcome). test_write_failure_propagates_to_caller verifies the synchronous-failure contract.",
+      "notes": "The default 'write' parameter is forge.memory.writer.write_entity, awaited directly inside write_session_outcome (no asyncio.ensure_future / no thread). Failures from write_entity propagate to the caller. TestSynchronousWrite::test_write_invoked_with_session_outcome_and_group_id verifies the call shape (PIPELINE_HISTORY_GROUP_ID + built SessionOutcome). test_write_failure_propagates_to_caller verifies the synchronous-failure contract."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Only fires on first terminal-state transition; in-progress states",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_is_terminal(outcome) is checked before the existence check; non-terminal outcomes (in_progress, running, pending, queued, '', SUCCESS) short-circuit to a logged warning + None return. TestTerminalOnly::test_non_terminal_outcome_returns_none parametrises over six non-terminal strings; test_non_terminal_does_not_query_existence proves the short-circuit happens before any I/O; test_non_terminal_logs_warning_with_build_id verifies the structured log line.",
+      "notes": "_is_terminal(outcome) is checked before the existence check; non-terminal outcomes (in_progress, running, pending, queued, '', SUCCESS) short-circuit to a logged warning + None return. TestTerminalOnly::test_non_terminal_outcome_returns_none parametrises over six non-terminal strings; test_non_terminal_does_not_query_existence proves the short-circuit happens before any I/O; test_non_terminal_logs_warning_with_build_id verifies the structured log line."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Concurrent calls (two Forge instances) \u2192 both see the same existence",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_session_outcome_entity_id derives a deterministic UUID5 from build_id under a namespaced URI prefix, so two writers for the same build produce the same entity_id (Graphiti upsert-key dedupe \u2014 TASK-IC-001 contract). TestConcurrentDedupeContract: test_entity_id_is_deterministic_for_build_id, test_entity_id_differs_for_distinct_build_ids, test_concurrent_callers_one_writes_one_no_ops (stateful exists-check simulating two-instance race), and test_split_brain_writes_share_entity_id (worst-case both-see-False race verifies the entity_id remains identical).",
+      "notes": "_session_outcome_entity_id derives a deterministic UUID5 from build_id under a namespaced URI prefix, so two writers for the same build produce the same entity_id (Graphiti upsert-key dedupe \u2014 TASK-IC-001 contract). TestConcurrentDedupeContract: test_entity_id_is_deterministic_for_build_id, test_entity_id_differs_for_distinct_build_ids, test_concurrent_callers_one_writes_one_no_ops (stateful exists-check simulating two-instance race), and test_split_brain_writes_share_entity_id (worst-case both-see-False race verifies the entity_id remains identical)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "No ruff/black/mypy/flake8 configuration is present in pyproject.toml. Source and test files were authored to satisfy the .claude/rules/code-style.md guide: snake_case, PascalCase, type hints, max 88-char lines (verified by awk 'length > 88' returning zero matches on both files), f-strings, context managers, list comprehensions, no relative-style imports outside the package.",
+      "notes": "No ruff/black/mypy/flake8 configuration is present in pyproject.toml. Source and test files were authored to satisfy the .claude/rules/code-style.md guide: snake_case, PascalCase, type hints, max 88-char lines (verified by awk 'length > 88' returning zero matches on both files), f-strings, context managers, list comprehensions, no relative-style imports outside the package."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Pre-write existence check by `build_id` in `forge_pipeline_history`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "write_session_outcome calls the injected SessionOutcomeExistsCheck (async callable typed Callable[[str], Awaitable[bool]]) with the build_id BEFORE collecting decisions or constructing the entity. Verified by TestPreWriteExistenceCheck::test_existence_check_called_with_build_id and the parameter contract documented in the module docstring 'Pre-write existence check'.",
+        "notes": "write_session_outcome calls the injected SessionOutcomeExistsCheck (async callable typed Callable[[str], Awaitable[bool]]) with the build_id BEFORE collecting decisions or constructing the entity. Verified by TestPreWriteExistenceCheck::test_existence_check_called_with_build_id and the parameter contract documented in the module docstring 'Pre-write existence check'."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Existing entity \u2192 no-op return None (`@edge-case session-outcome-retry-idempotency`)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When exists_check returns True, write_session_outcome returns None without invoking the SQLite repo or the writer. Tests TestPreWriteExistenceCheck::test_existing_outcome_returns_none_no_op, test_existing_outcome_does_not_write, and test_existing_outcome_does_not_query_repo verify each branch of the no-op path.",
+        "notes": "When exists_check returns True, write_session_outcome returns None without invoking the SQLite repo or the writer. Tests TestPreWriteExistenceCheck::test_existing_outcome_returns_none_no_op, test_existing_outcome_does_not_write, and test_existing_outcome_does_not_query_repo verify each branch of the no-op path."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`GateDecision` references collected from SQLite repo (read-only via",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "PipelineHistoryRepository is declared as a typing.Protocol with a single read method get_gate_decisions_for_build(build_id) -> Sequence[GateDecision]. The module imports nothing from FEAT-FORGE-001 and has no write surface against SQLite. TestGateDecisionCollection::test_repo_queried_with_build_id confirms the repository is queried with the build_id; test_repo_without_required_method_raises_typeerror enforces the Protocol shape at runtime.",
+        "notes": "PipelineHistoryRepository is declared as a typing.Protocol with a single read method get_gate_decisions_for_build(build_id) -> Sequence[GateDecision]. The module imports nothing from FEAT-FORGE-001 and has no write surface against SQLite. TestGateDecisionCollection::test_repo_queried_with_build_id confirms the repository is queried with the build_id; test_repo_without_required_method_raises_typeerror enforces the Protocol shape at runtime."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Sort by `decided_at` ASC before constructing `gate_decision_ids` list",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_sort_gate_decisions returns sorted(decisions, key=lambda d: (d.decided_at, str(d.entity_id))) \u2014 primary by decided_at ASC, secondary by entity_id for deterministic tie-breaking when timestamps collide at microsecond resolution. Verified by TestOrderingByDecidedAt::test_out_of_order_decisions_are_sorted_on_output and test_microsecond_tied_timestamps_use_entity_id_tiebreaker; test_pure_helper_does_not_mutate_input pins the immutability contract.",
+        "notes": "_sort_gate_decisions returns sorted(decisions, key=lambda d: (d.decided_at, str(d.entity_id))) \u2014 primary by decided_at ASC, secondary by entity_id for deterministic tie-breaking when timestamps collide at microsecond resolution. Verified by TestOrderingByDecidedAt::test_out_of_order_decisions_are_sorted_on_output and test_microsecond_tied_timestamps_use_entity_id_tiebreaker; test_pure_helper_does_not_mutate_input pins the immutability contract."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Writes via `write_entity()` (synchronous, NOT fire-and-forget \u2014 caller",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The default 'write' parameter is forge.memory.writer.write_entity, awaited directly inside write_session_outcome (no asyncio.ensure_future / no thread). Failures from write_entity propagate to the caller. TestSynchronousWrite::test_write_invoked_with_session_outcome_and_group_id verifies the call shape (PIPELINE_HISTORY_GROUP_ID + built SessionOutcome). test_write_failure_propagates_to_caller verifies the synchronous-failure contract.",
+        "notes": "The default 'write' parameter is forge.memory.writer.write_entity, awaited directly inside write_session_outcome (no asyncio.ensure_future / no thread). Failures from write_entity propagate to the caller. TestSynchronousWrite::test_write_invoked_with_session_outcome_and_group_id verifies the call shape (PIPELINE_HISTORY_GROUP_ID + built SessionOutcome). test_write_failure_propagates_to_caller verifies the synchronous-failure contract."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Only fires on first terminal-state transition; in-progress states",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_is_terminal(outcome) is checked before the existence check; non-terminal outcomes (in_progress, running, pending, queued, '', SUCCESS) short-circuit to a logged warning + None return. TestTerminalOnly::test_non_terminal_outcome_returns_none parametrises over six non-terminal strings; test_non_terminal_does_not_query_existence proves the short-circuit happens before any I/O; test_non_terminal_logs_warning_with_build_id verifies the structured log line.",
+        "notes": "_is_terminal(outcome) is checked before the existence check; non-terminal outcomes (in_progress, running, pending, queued, '', SUCCESS) short-circuit to a logged warning + None return. TestTerminalOnly::test_non_terminal_outcome_returns_none parametrises over six non-terminal strings; test_non_terminal_does_not_query_existence proves the short-circuit happens before any I/O; test_non_terminal_logs_warning_with_build_id verifies the structured log line."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Concurrent calls (two Forge instances) \u2192 both see the same existence",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_session_outcome_entity_id derives a deterministic UUID5 from build_id under a namespaced URI prefix, so two writers for the same build produce the same entity_id (Graphiti upsert-key dedupe \u2014 TASK-IC-001 contract). TestConcurrentDedupeContract: test_entity_id_is_deterministic_for_build_id, test_entity_id_differs_for_distinct_build_ids, test_concurrent_callers_one_writes_one_no_ops (stateful exists-check simulating two-instance race), and test_split_brain_writes_share_entity_id (worst-case both-see-False race verifies the entity_id remains identical).",
+        "notes": "_session_outcome_entity_id derives a deterministic UUID5 from build_id under a namespaced URI prefix, so two writers for the same build produce the same entity_id (Graphiti upsert-key dedupe \u2014 TASK-IC-001 contract). TestConcurrentDedupeContract: test_entity_id_is_deterministic_for_build_id, test_entity_id_differs_for_distinct_build_ids, test_concurrent_callers_one_writes_one_no_ops (stateful exists-check simulating two-instance race), and test_split_brain_writes_share_entity_id (worst-case both-see-False race verifies the entity_id remains identical)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "No ruff/black/mypy/flake8 configuration is present in pyproject.toml. Source and test files were authored to satisfy the .claude/rules/code-style.md guide: snake_case, PascalCase, type hints, max 88-char lines (verified by awk 'length > 88' returning zero matches on both files), f-strings, context managers, list comprehensions, no relative-style imports outside the package.",
+        "notes": "No ruff/black/mypy/flake8 configuration is present in pyproject.toml. Source and test files were authored to satisfy the .claude/rules/code-style.md guide: snake_case, PascalCase, type hints, max 88-char lines (verified by awk 'length > 88' returning zero matches on both files), f-strings, context managers, list comprehensions, no relative-style imports outside the package."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Conditionally approved \u2014 test collection errors in independent verification. All Player quality gates passed. All acceptance criteria met. Architecture context: 352 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1635/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- ASSIGNS_TASK_TO\n- IS_USED_AS_OPTIONAL_TYPE_IN\n- INSTRUCTS_USER_TO_START\n- USES_TYPE\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- IS_IMPLEMENTED_AS\n- USES_ENDPOINT\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- HAS_ROLE_MUST_DO\n- DELEGATES_TO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n",
+  "approved_without_independent_tests": true,
+  "is_configuration_error": false
+}

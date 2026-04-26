@@ -1,0 +1,7 @@
+{
+  "tests_run": 64,
+  "tests_failed": 0,
+  "coverage_pct": 82.58,
+  "output_summary": "64/64 unit tests passed (priors/ordering/qa_ingestion); line coverage 82.58% on changed memory modules, above 80% threshold.",
+  "quality_gates_passed": true
+}

@@ -1,0 +1,173 @@
+{
+  "task_id": "TASK-IC-008",
+  "timestamp": "2026-04-26T14:18:00.829024",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 11,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".guardkit/autobuild/TASK-IC-001/checkpoints.json",
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/supersession.py",
+    "tasks/backlog/TASK-IC-002-fire-and-forget-graphiti-write.md",
+    "tasks/backlog/TASK-IC-008-supersession-cycle-detection.md",
+    "tasks/backlog/TASK-IC-010-git-gh-via-execute.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-IC-002-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-008-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-010-implementation-plan.md",
+    ".guardkit/autobuild/TASK-IC-002/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-008/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-008/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-008/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-010/turn_context.json",
+    ".guardkit/bdd/TASK-IC-008_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/.guardkit/autobuild/TASK-IC-008/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/supersession.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_supersession.py",
+    "src/forge/memory/supersession.py",
+    "tasks/design_approved/TASK-IC-002-fire-and-forget-graphiti-write.md",
+    "tasks/design_approved/TASK-IC-008-supersession-cycle-detection.md",
+    "tasks/design_approved/TASK-IC-010-git-gh-via-execute.md",
+    "tests/unit/test_supersession.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_supersession.py"
+  ],
+  "summary": "11 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 32,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Walks the `supersedes` chain via `chain_resolver` (lookup by entity_id)",
+      "status": "complete",
+      "evidence": "assert_no_cycle iterates from new_adjustment.supersedes upward, calling chain_resolver(str(current_id)) once per step. Test test_walks_via_chain_resolver_lookup asserts the resolver is invoked with str(entity_id) keys in walk order.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Uses a `set[str]` of visited entity_ids; cycle detected when a visited id is re-entered",
+      "status": "complete",
+      "evidence": "Implementation declares `visited: set[str]` seeded with str(new_adjustment.entity_id) and raises SupersessionCycleError on re-entry. Tests test_cycle_of_length_two_raises and test_cycle_of_length_five_raises exercise both short and longer cycles.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Configurable `max_depth` (default 10); chain longer than depth raises `SupersessionCycleError` with chain context in the message",
+      "status": "complete",
+      "evidence": "max_depth parameter defaults to 10 and is configurable. After max_depth iterations with chain still active, raises SupersessionCycleError with formatted chain path and depth. Tests test_chain_of_depth_eleven_raises_at_default_cap and test_max_depth_is_configurable cover both branches.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Clean linear chains (no cycles, depth \u2264 10) return None",
+      "status": "complete",
+      "evidence": "Function returns None when supersedes is None, when resolver returns None for an unknown ancestor, or when chain terminates within max_depth. Tests test_no_supersedes_returns_none, test_short_linear_chain_returns_none, and test_chain_at_max_depth_returns_none all assert result is None.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Self-supersession (`new.supersedes == new.entity_id`) is a special case that raises immediately",
+      "status": "complete",
+      "evidence": "Implementation checks self-supersession before any resolver invocation and raises SupersessionCycleError with a dedicated message. Test test_self_supersession_raises_immediately verifies (a) the error is raised and (b) the resolver was never called.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Error message includes the cycle path for operator debugging",
+      "status": "complete",
+      "evidence": "All three SupersessionCycleError raise sites include the path (joined with ' -> ') or the offending entity id. test_cycle_of_length_five_raises asserts every node id appears in the message; test_self_supersession_raises_immediately asserts the offending id appears.",
+      "test_file": "tests/unit/test_supersession.py",
+      "implementation_files": [
+        "src/forge/memory/supersession.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Both new files pass `black --check`, `ruff check`, and `mypy` with zero issues. Verified locally: black reports '2 files would be left unchanged', ruff reports 'All checks passed!', mypy reports 'Success: no issues found in 1 source file'.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/memory/supersession.py",
+        "tests/unit/test_supersession.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 53.028580815007444
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 132.5056484520028
+    }
+  ]
+}

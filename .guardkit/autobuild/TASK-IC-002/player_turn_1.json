@@ -1,0 +1,135 @@
+{
+  "task_id": "TASK-IC-002",
+  "turn": 1,
+  "files_modified": [
+    ".claude/task-plans/TASK-IC-002-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-008-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-010-implementation-plan.md",
+    ".guardkit/autobuild/TASK-IC-001/checkpoints.json",
+    ".guardkit/autobuild/TASK-IC-002/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-008/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-008/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-IC-008/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-008/specialist_results.json",
+    ".guardkit/autobuild/TASK-IC-008/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-008/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-008/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-010/turn_context.json",
+    ".guardkit/bdd/TASK-IC-008_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_writer.py",
+    "src/forge/memory/supersession.py",
+    "src/forge/memory/writer.py",
+    "tasks/design_approved/TASK-IC-002-fire-and-forget-graphiti-write.md",
+    "tasks/design_approved/TASK-IC-008-supersession-cycle-detection.md",
+    "tasks/design_approved/TASK-IC-010-git-gh-via-execute.md",
+    "tests/unit/test_git_operations.py",
+    "tests/unit/test_supersession.py",
+    "tests/unit/test_writer.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-IC-002/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-002/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-008/checkpoints.json",
+    ".guardkit/autobuild/TASK-IC-010/player_turn_1.json",
+    ".guardkit/bdd/TASK-IC-002_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/.guardkit/autobuild/TASK-IC-002/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/writer.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_writer.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_writer.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001 redaction before write",
+    "AC-002 MCP/CLI 3-tier selection",
+    "AC-003 fire-and-forget returns synchronously",
+    "AC-004 failures caught and logged",
+    "AC-005 structured log shape",
+    "AC-006 @negative memory-write-failure-tolerated",
+    "AC-007 lint/format clean",
+    "Seam test for pipeline_history_entity_id_contract"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 46,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 22,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "write_entity() redacts every text field via redact_credentials() before write",
+      "status": "complete",
+      "evidence": "write_entity() calls _entity_to_redacted_payload(entity), which serialises via model_dump(mode='json') then recurses through _redact_payload(), applying redact_credentials() to every str leaf (including nested dicts/lists). Verified by TestWriteEntityRedaction (4 tests) \u2014 credentials in GateDecision.rationale, OverrideEvent.operator_rationale, CalibrationEvent.question/answer, and arbitrary nested str fields are all replaced with the canonical ***REDACTED-* markers before _dispatch_write is invoked.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "write_entity() chooses MCP vs CLI based on availability (mirrors graphiti-preamble.md 3-tier pattern)",
+      "status": "complete",
+      "evidence": "_dispatch_write() implements the 3-tier pattern: Tier 0 calls _write_via_mcp() when importlib.util.find_spec('graphiti_core') is not None; Tier 1 calls _write_via_cli() (asyncio.create_subprocess_exec on 'guardkit graphiti add-context') when shutil.which('guardkit') is on PATH; Tier 2 raises GraphitiUnavailableError. Verified by TestWriteEntityBackendSelection (4 tests covering MCP-preferred, CLI-fallback, neither-available, and CLI non-zero exit wrapped in GraphitiCLIError).",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "fire_and_forget_write() dispatches the coroutine and returns synchronously",
+      "status": "complete",
+      "evidence": "fire_and_forget_write() detects the running loop via asyncio.get_running_loop() and uses asyncio.ensure_future(); when no loop is running it spawns a daemon threading.Thread that runs asyncio.run() in the background. Verified by TestFireAndForgetReturnsSync (2 tests) \u2014 async-loop variant returns in <20ms while a 50ms slow_write still completes; sync variant returns in <50ms while the background thread completes within 2s.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Failures in fire-and-forget are caught, logged with full entity_id + group_id + error, and never raised",
+      "status": "complete",
+      "evidence": "fire_and_forget_write() wraps the asyncio.ensure_future() call in try/except and attaches a done-callback (_log_future_outcome) that funnels future.exception() into _log_failure(). The thread variant wraps asyncio.run() in try/except. Verified by TestFireAndForgetSwallowsErrors (3 tests) \u2014 RuntimeError raised from _dispatch_write does not propagate to the caller from either the async-loop or sync-thread path, and the @negative memory-write-failure-tolerated scenario (both backends unavailable) confirms the pipeline keeps running.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Structured log line includes entity_id, group_id, entity_type, error_class, error_message for downstream alerting",
+      "status": "complete",
+      "evidence": "_log_failure() emits logger.error('graphiti_fire_and_forget_write_failed', extra={...}) with all five required fields plus exc_info for traceback. Verified by TestStructuredLogShape \u2014 the captured LogRecord exposes entity_id/group_id/entity_type/error_class/error_message attributes (logging flattens 'extra' onto the record) and rec.exc_info is not None.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Covers @negative memory-write-failure-tolerated: simulated Graphiti outage does NOT abort the pipeline",
+      "status": "complete",
+      "evidence": "TestFireAndForgetSwallowsErrors::test_negative_memory_write_failure_tolerated patches both _mcp_backend_available and _cli_backend_available to return False (simulating a complete outage), invokes fire_and_forget_write inside an asyncio loop, and asserts the driver returns True (pipeline keeps running) and a structured failure log is emitted. The test also exercises the GraphitiUnavailableError path through the done-callback.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Both files pass `ruff check` (All checks passed!) and `black --target-version py311` (formatted in place). All 136 unit tests pass (22 new + 114 existing) with no regressions.",
+      "test_file": "tests/unit/test_writer.py",
+      "implementation_files": [
+        "src/forge/memory/writer.py"
+      ]
+    }
+  ]
+}

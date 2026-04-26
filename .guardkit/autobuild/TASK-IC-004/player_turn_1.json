@@ -1,0 +1,140 @@
+{
+  "task_id": "TASK-IC-004",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/reconciler.py",
+    "tasks/backlog/TASK-IC-004-reconcile-backfill.md",
+    "tasks/backlog/TASK-IC-007-session-outcome-writer.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-IC-004-implementation-plan.md",
+    ".claude/task-plans/TASK-IC-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-IC-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-004/turn_context.json",
+    ".guardkit/autobuild/TASK-IC-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-IC-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-IC-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-IC-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-IC-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-IC-007/turn_context.json",
+    ".guardkit/bdd/TASK-IC-004_junit.xml",
+    ".guardkit/bdd/TASK-IC-007_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/.guardkit/autobuild/TASK-IC-004/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/src/forge/memory/reconciler.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_reconciler.py",
+    "src/forge/memory/reconciler.py",
+    "src/forge/memory/session_outcome.py",
+    "tasks/design_approved/TASK-IC-004-reconcile-backfill.md",
+    "tasks/design_approved/TASK-IC-007-session-outcome-writer.md",
+    "tests/unit/test_reconciler.py",
+    "tests/unit/test_session_outcome.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-8D10/tests/unit/test_reconciler.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: PipelineHistoryRepository Protocol (no SQLite schema coupling)",
+    "AC-002: Graphiti entity_id query against forge_pipeline_history within horizon",
+    "AC-003: set difference SQLite \u2209 Graphiti",
+    "AC-004: replay via write_entity (NOT fire-and-forget); per-entity outcomes",
+    "AC-005: ReconcileReport with all five required fields + FailedEntity shape",
+    "AC-006: backfill failures do NOT raise; recorded + structured log",
+    "AC-007: default horizon=30 days, configurable, validated",
+    "AC-008: lint/format clean (py_compile, max-line-length 88)"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 63,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 38,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Reads SQLite via the FEAT-FORGE-001 PipelineHistoryRepository interface \u2014 NEVER via direct SQLite SQL or schema knowledge (Risk 3 mitigation from review)",
+      "status": "complete",
+      "evidence": "Defined a runtime_checkable Protocol `PipelineHistoryRepository` in src/forge/memory/reconciler.py whose only method is `list_entities_since(since: datetime) -> Iterable[PipelineHistoryEntity]`. The reconcile loop calls only that method and consumes already-validated pydantic entities \u2014 no sqlite3 imports, no SQL strings, no schema knowledge. Source-level guard test (TestRepositoryProtocolBoundary.test_module_does_not_reference_sqlite_internals) inspects the module source for forbidden tokens ('sqlite3', 'CREATE TABLE', 'SELECT ', 'stage_log') and asserts none appear. The runtime_checkable isinstance check is also exercised.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Queries Graphiti for entity_ids existing in forge_pipeline_history within the horizon window",
+      "status": "complete",
+      "evidence": "`reconcile_pipeline_history` calls a `GraphitiIdQueryFn` (default: `_dispatch_id_query`) with kwargs `group_id=PIPELINE_HISTORY_GROUP` (= 'forge_pipeline_history') and `since=now - timedelta(days=horizon_days)`. The 3-tier dispatcher mirrors writer.py/priors.py (MCP via graphiti_core \u2192 CLI via guardkit \u2192 empty-set fallback). Test class TestGraphitiHorizonQuery covers: target group, lower-bound timestamp, query failure degrades to empty-set, list/tuple coercion to set.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Computes set difference: SQLite UUIDs \u2209 Graphiti entity_ids",
+      "status": "complete",
+      "evidence": "Inside the backfill loop, each entity's `str(entity.entity_id)` is checked against `graphiti_ids` (set[str]); entities present in Graphiti are skipped via `continue`, only missing ones are dispatched to write. Tests `TestSetDifferenceDiff.test_entities_present_in_graphiti_are_skipped`, `test_full_overlap_writes_nothing`, and `test_disjoint_sqlite_writes_every_entity` cover all three diff cases.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "For each missing entity, replays via write_entity() (NOT fire-and-forget); collects per-entity outcomes",
+      "status": "complete",
+      "evidence": "Default write callable is `forge.memory.writer.write_entity` (the synchronous-failure variant) \u2014 NOT `fire_and_forget_write`. Each call is awaited and wrapped in try/except so the per-entity outcome is captured: success increments `backfilled_count`, failure appends a `FailedEntity` and increments `failed_count`. Test `TestBackfillReplay.test_replay_is_synchronous_not_fire_and_forget` explicitly verifies that writer failures surface in the report (which would not happen if fire-and-forget had been used). `TestBackfillReplay.test_default_write_fn_is_writer_dot_write_entity` patches `reconciler_module.write_entity` to confirm the production default fall-through.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Returns ReconcileReport with total_sqlite, total_graphiti, backfilled_count, failed_count, failed_entities list",
+      "status": "complete",
+      "evidence": "`ReconcileReport` is a frozen slotted dataclass with all five fields (total_sqlite, total_graphiti, backfilled_count, failed_count, failed_entities). `FailedEntity` is also a frozen dataclass with entity_id/entity_type/error_class/error_message. Test class `TestReconcileReportShape` covers empty-input zeros, populated counts matching set sizes, and the FailedEntity field shape.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Backfill failures do NOT raise \u2014 recorded in report and surfaced to structured log",
+      "status": "complete",
+      "evidence": "The per-entity write is wrapped in `try/except Exception` (boundary swallow). On failure: a `FailedEntity` is appended to the report, AND a structured log line is emitted via `logger.error(\"reconcile_backfill_failed\", extra={entity_id, entity_type, group_id, error_class, error_message}, exc_info=...)`. The function NEVER re-raises. Tests `TestBackfillFailureTolerance.test_single_failure_is_recorded_and_does_not_raise`, `test_failure_emits_structured_log_with_required_fields`, and `test_multiple_failures_do_not_short_circuit` cover all three failure cases.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Default horizon = 30 days (configurable via forge.yaml)",
+      "status": "complete",
+      "evidence": "Module-level constant `DEFAULT_RECONCILE_HORIZON_DAYS = 30` is the default value of the `horizon_days` keyword argument on `reconcile_pipeline_history`. Callers can override (config-driven via forge.yaml at the call site). Validation rejects non-positive ints and non-int values with ValueError. Tests `TestHorizonConfigurable.test_default_constant_is_thirty_days`, `test_default_horizon_passed_to_repo_and_query`, `test_explicit_horizon_overrides_default`, and the parametrized invalid-value tests cover all paths.",
+      "test_file": "tests/unit/test_reconciler.py",
+      "implementation_files": [
+        "src/forge/memory/reconciler.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Both files are PEP8-clean: `python3 -m py_compile` succeeds on both, max line length \u2264 88 (Black default per .claude/rules/code-style.md) verified by an awk scan, type hints used throughout, snake_case/PascalCase respected, docstrings on every public symbol, no bare except. No project-level black/ruff config is present in this worktree but the code follows the conventions in the existing forge/memory modules (writer.py, priors.py).",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/memory/reconciler.py",
+        "tests/unit/test_reconciler.py"
+      ]
+    }
+  ]
+}

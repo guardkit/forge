@@ -42,6 +42,14 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
+# Source layout: production code lives under ``src/forge``. Pytest
+# resolves imports via this ``pythonpath`` entry so ``import forge`` works
+# without callers needing to set ``PYTHONPATH=src`` on every invocation.
+# This matches how the GuardKit BDD oracle (TASK-IC-012) invokes pytest
+# with the feature file as a positional arg — without this entry,
+# ``tests/bdd/conftest.py`` fails to import ``forge.adapters.*`` at
+# collection time and the oracle reports a synthetic BDD failure.
+pythonpath = ["src"]
 # pytest-bdd: feature files live alongside the source-of-truth Gherkin
 # under ``features/``. Scenarios are wired to step functions in
 # ``tests/bdd/``. See TASK-NFI-011.
