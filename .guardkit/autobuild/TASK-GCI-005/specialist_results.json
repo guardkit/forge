@@ -1,12 +1,12 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 47.73642444598954,
+    "duration_seconds": 126.23294032798731,
     "error": null,
-    "tests_run": 22,
+    "tests_run": 129,
     "tests_failed": 0,
     "coverage_pct": 100.0,
-    "output_summary": "22/22 progress_subscriber tests passed; 100% line coverage on src/forge/adapters/guardkit/progress_subscriber.py; full guardkit suite (124) green",
+    "output_summary": "22 progress_subscriber unit tests + 5 BDD scenarios + 102 sibling guardkit tests passed; 100% line coverage on src/forge/adapters/guardkit/progress_subscriber.py",
     "quality_gates_passed": true
   },
   "phase_5": {

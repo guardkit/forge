@@ -70,7 +70,6 @@ from forge.adapters.guardkit.progress_subscriber import (
     subscribe_progress,
 )
 
-
 FEATURE_FILE = (
     "guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature"
 )
@@ -578,3 +577,627 @@ def _then_authoritative_result_unaffected(gci_world: dict[str, Any]) -> None:
     # happened, which is silent (the deque drops oldest on its own).
     sink: ProgressSink = gci_world["sink"]
     assert all(w.code != PROGRESS_STREAM_UNAVAILABLE for w in sink.warnings)
+
+
+# ===========================================================================
+# TASK-GCI-006 — git adapter scenarios
+# ===========================================================================
+#
+# The two @task:TASK-GCI-006 scenarios in
+# ``features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature``
+# bind here. They drive the real
+# :mod:`forge.adapters.git.operations` module against the same
+# ``FakeExecute`` shape used by the unit tests, but with the BDD oracle's
+# Given/When/Then ordering — so the Gherkin specification is executable
+# end-to-end rather than only spot-checked by unit tests.
+#
+# Scenarios wired:
+#
+# - "A failed worktree cleanup is logged but does not prevent build
+#    completion" — drives :func:`cleanup_worktree` against a fake
+#    ``execute`` that exits non-zero, asserts the result is a structured
+#    failure (not an exception) and that the WARNING-level log line was
+#    emitted by the adapter so operators can see the cleanup miss.
+#
+# - "Shell metacharacters in subprocess arguments are passed as literal
+#    tokens" — drives :func:`commit_all` with a commit message containing
+#    ``;``, ``&&`` and quotes, asserts the recorded argv slot is the
+#    *exact* same string identity-equal to the input (no shell expansion,
+#    no splitting, no escaping).
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402 — placed near step bindings that need it.
+
+from forge.adapters.git import operations as git_operations  # noqa: E402
+from forge.adapters.git.models import GitOpResult  # noqa: E402
+from forge.adapters.git.operations import (  # noqa: E402
+    ExecuteResult as GitExecuteResult,
+)
+
+
+class _GCI006FakeExecute:
+    """Recording fake matching the production ``ExecuteCallable`` shape.
+
+    Identical in spirit to ``tests/forge/adapters/git/test_operations.py``'s
+    ``FakeExecute``, restated here so this BDD module stays self-contained
+    (the unit-test helper is private to the unit-test module by
+    convention; cross-importing it would couple two suites that are
+    intentionally independent).
+    """
+
+    def __init__(
+        self,
+        *,
+        responses: list[GitExecuteResult] | None = None,
+    ) -> None:
+        self.responses: list[GitExecuteResult] = list(responses or [])
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self,
+        *,
+        command: list[str],
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> GitExecuteResult:
+        self.calls.append({"command": list(command), "cwd": cwd, "timeout": timeout})
+        if not self.responses:
+            return GitExecuteResult(exit_code=0, stdout="", stderr="")
+        if len(self.responses) == 1:
+            return self.responses[0]
+        return self.responses.pop(0)
+
+
+# ---------------------------------------------------------------------------
+# @edge-case (TASK-GCI-006): A failed worktree cleanup is logged but does
+#                            not prevent build completion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.edge_case
+@scenario(
+    FEATURE_FILE,
+    "A failed worktree cleanup is logged but does not prevent build completion",
+)
+def test_edge_case_failed_cleanup_does_not_block_completion() -> None:
+    """@edge-case — TASK-GCI-006 best-effort cleanup contract."""
+
+
+@given("a build has reached a terminal state")
+def _given_build_at_terminal_state(gci_world: dict[str, Any]) -> None:
+    # The "terminal state" is represented as the build_id + worktree path
+    # the state machine would hand to the adapter on the cleanup edge.
+    # The state machine itself lives elsewhere; the contract under test
+    # is: regardless of cleanup outcome, the function returns a
+    # GitOpResult and never raises.
+    gci_world["build_id"] = "build-cleanup-bdd"
+    gci_world["worktree"] = Path("/var/forge/builds/build-cleanup-bdd")
+    gci_world["terminal_marked"] = False  # state machine flips after cleanup returns
+
+
+@when("the adapter attempts to delete the build's worktree")
+def _when_adapter_attempts_delete(gci_world: dict[str, Any]) -> None:
+    # Snapshot the FakeExecute the And-step will provide; storing the
+    # exec on world keeps the When/And-steps decoupled.
+    gci_world["execute"] = _GCI006FakeExecute(
+        responses=[
+            GitExecuteResult(
+                exit_code=128,
+                stdout="",
+                stderr="fatal: worktree locked by another process\n",
+            )
+        ]
+    )
+
+
+@when("the deletion fails")
+def _when_deletion_fails(
+    gci_world: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    # Capture the WARNING the adapter emits on best-effort failure.
+    caplog.set_level(logging.WARNING, logger=git_operations.logger.name)
+
+    async def _drive() -> GitOpResult:
+        return await git_operations.cleanup_worktree(
+            gci_world["build_id"],
+            gci_world["worktree"],
+            execute=gci_world["execute"],
+        )
+
+    gci_world["cleanup_result"] = asyncio.run(_drive())
+    gci_world["caplog_records"] = list(caplog.records)
+    # The state machine (caller) only flips the build to terminal-in-
+    # history *after* cleanup_worktree returns — the contract under
+    # test is that this assignment is reachable regardless of the
+    # cleanup outcome (i.e. the adapter never raised).
+    gci_world["terminal_marked"] = True
+
+
+@then("the build should still be marked as terminal in history")
+def _then_build_marked_terminal(gci_world: dict[str, Any]) -> None:
+    # The flip happened — meaning cleanup_worktree returned normally
+    # and did not raise past the adapter boundary (ADR-ARCH-025).
+    assert gci_world["terminal_marked"] is True
+    result: GitOpResult = gci_world["cleanup_result"]
+    assert isinstance(result, GitOpResult)
+    # The structured failure stays a failure — the adapter does not
+    # silently rewrite it as success — but it is observable, not
+    # raised.
+    assert result.status == "failed"
+    assert result.operation == "cleanup_worktree"
+    assert result.exit_code == 128
+    assert result.stderr is not None and "locked" in result.stderr
+
+
+@then("a structured warning should be logged about the failed cleanup")
+def _then_warning_logged_about_cleanup(gci_world: dict[str, Any]) -> None:
+    records: list[logging.LogRecord] = gci_world["caplog_records"]
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert any("cleanup_worktree non-zero exit" in r.getMessage() for r in warnings), [
+        r.getMessage() for r in warnings
+    ]
+    # The log carries the build_id so operators can correlate it.
+    assert any(gci_world["build_id"] in r.getMessage() for r in warnings), [
+        r.getMessage() for r in warnings
+    ]
+
+
+# ---------------------------------------------------------------------------
+# @edge-case @negative (TASK-GCI-006): Shell metacharacters in subprocess
+#                                       arguments are passed as literal
+#                                       tokens
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.edge_case
+@pytest.mark.negative
+@scenario(
+    FEATURE_FILE,
+    "Shell metacharacters in subprocess arguments are passed as literal tokens",
+)
+def test_edge_case_shell_metacharacters_pass_as_literal_tokens() -> None:
+    """@edge-case @negative — TASK-GCI-006 list-token contract."""
+
+
+@given(
+    "the reasoning model builds subprocess arguments that contain shell metacharacters"
+)
+def _given_args_with_shell_metacharacters(gci_world: dict[str, Any]) -> None:
+    # Canonical injection probe: ``;`` would chain a second shell
+    # command, ``&&`` would short-circuit, the embedded double-quotes
+    # would terminate a shell-quoted string. None of these can have any
+    # effect when delivered as a single argv slot.
+    gci_world["nasty_message"] = 'feat: pwn; rm -rf / && echo "owned" `whoami`'
+    gci_world["worktree"] = Path("/var/forge/builds/build-meta-bdd")
+    gci_world["execute"] = _GCI006FakeExecute(
+        responses=[
+            GitExecuteResult(exit_code=0, stdout="", stderr=""),  # git add -A
+            GitExecuteResult(  # git commit -m
+                exit_code=0,
+                stdout="[main deadbee] " + gci_world["nasty_message"] + "\n",
+                stderr="",
+            ),
+            GitExecuteResult(  # git rev-parse HEAD
+                exit_code=0, stdout="deadbeefcafebabe\n", stderr=""
+            ),
+        ]
+    )
+
+
+@when("the adapter launches the subprocess")
+def _when_adapter_launches_subprocess(gci_world: dict[str, Any]) -> None:
+    async def _drive() -> GitOpResult:
+        return await git_operations.commit_all(
+            gci_world["worktree"],
+            gci_world["nasty_message"],
+            execute=gci_world["execute"],
+        )
+
+    gci_world["commit_result"] = asyncio.run(_drive())
+
+
+@then("each argument should be delivered to the binary as a single literal token")
+def _then_each_arg_literal_token(gci_world: dict[str, Any]) -> None:
+    fake: _GCI006FakeExecute = gci_world["execute"]
+    nasty: str = gci_world["nasty_message"]
+    # The ``commit`` invocation is the second of the three; isolate it
+    # and assert the message lives in a single argv slot identity-equal
+    # to the input — no shell-expansion, no splitting, no escaping.
+    commit_call = fake.calls[1]
+    assert commit_call["command"][:3] == ["git", "commit", "-m"]
+    assert commit_call["command"][3] is nasty
+    # The total argv length is exactly 4 — there is no extra token from
+    # accidental ``;`` or ``&&`` splitting.
+    assert len(commit_call["command"]) == 4
+    # And the result is a structured success carrying the commit SHA —
+    # proving the literal-token path does not mangle the workflow.
+    result: GitOpResult = gci_world["commit_result"]
+    assert isinstance(result, GitOpResult)
+    assert result.status == "success"
+    assert result.sha == "deadbeefcafebabe"
+
+
+@then("no shell expansion or secondary command should be evaluated")
+def _then_no_shell_expansion(gci_world: dict[str, Any]) -> None:
+    # The default executor is ``asyncio.create_subprocess_exec`` (no
+    # shell). The injected fake doesn't shell out either. We verify the
+    # contract by source inspection — ``shell=True`` must never appear
+    # in the operations module — and by call-shape: every recorded
+    # command was delivered as a list of discrete argv tokens, not a
+    # single shell string.
+    source = Path(git_operations.__file__).read_text(encoding="utf-8")
+    assert "shell=True," not in source
+    assert "shell=True)" not in source
+    fake: _GCI006FakeExecute = gci_world["execute"]
+    for call in fake.calls:
+        # Each command is a list[str] — no element is itself a
+        # shell-string with ``;`` between subcommands.
+        assert isinstance(call["command"], list)
+        assert all(isinstance(token, str) for token in call["command"])
+        # The first token is always the binary, never a shell wrapper.
+        assert call["command"][0] == "git"
+
+
+# ===========================================================================
+# TASK-GCI-004 — tolerant output parser scenarios
+# ===========================================================================
+#
+# The five @task:TASK-GCI-004 scenarios in
+# ``features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature``
+# all bind to ``forge.adapters.guardkit.parser.parse_guardkit_output``.
+# The parser is a pure function over (stdout, stderr, exit_code,
+# duration_secs, timed_out) that returns a canonical
+# :class:`GuardKitResult` and **never raises** past its own boundary
+# (ADR-ARCH-025). The Given-steps assemble the subprocess outcome as
+# the wrapper would observe it; the When-step calls the parser; the
+# Then-steps assert on the structured result.
+#
+# Scenarios wired:
+#
+# - "A failing GuardKit subprocess is reported as a structured error,
+#    not an exception" (@key-example @smoke).
+# - "A non-zero exit is reported as a failure with the subprocess error
+#    output" (@negative).
+# - "An unknown GuardKit output shape degrades to success with no
+#    artefacts" (@negative @edge-case).
+# - "A compact stdout is preserved verbatim in the returned result"
+#    (@boundary).
+# - "A large stdout is truncated to the most recent tail in the
+#    returned result" (@boundary).
+# ---------------------------------------------------------------------------
+
+
+from forge.adapters.guardkit.parser import (  # noqa: E402
+    _STDOUT_TAIL_BYTES,
+    parse_guardkit_output,
+)
+
+
+_GCI004_SUBCOMMAND = "feature-spec"
+
+
+def _gci004_invoke_parser(gci_world: dict[str, Any]) -> GuardKitResult:
+    """Drive ``parse_guardkit_output`` with the inputs assembled in ``gci_world``.
+
+    Wraps the call in a try/except so the BDD oracle can verify the
+    "tool layer should not propagate an exception" contract directly:
+    if the parser ever raised, ``gci_world['parser_raised']`` would be
+    set and the Then-step would fail loudly. In practice the parser is
+    designed to never raise (AC-008).
+    """
+    try:
+        result = parse_guardkit_output(
+            subcommand=gci_world.get("subcommand", _GCI004_SUBCOMMAND),
+            stdout=gci_world.get("stdout", ""),
+            stderr=gci_world.get("stderr", ""),
+            exit_code=gci_world.get("exit_code", 0),
+            duration_secs=gci_world.get("duration_secs", 1.0),
+            timed_out=gci_world.get("timed_out", False),
+        )
+    except Exception as exc:  # pragma: no cover — guarded by AC-008
+        gci_world["parser_raised"] = exc
+        raise
+    gci_world["parser_raised"] = None
+    gci_world["result"] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# @key-example @smoke (TASK-GCI-004): A failing GuardKit subprocess is
+#                                     reported as a structured error,
+#                                     not an exception
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.key_example
+@pytest.mark.smoke
+@scenario(
+    FEATURE_FILE,
+    "A failing GuardKit subprocess is reported as a structured error, not an exception",
+)
+def test_key_example_failing_subprocess_structured_error() -> None:
+    """@key-example @smoke — TASK-GCI-004 structured-failure happy path."""
+
+
+# ---------------------------------------------------------------------------
+# @negative (TASK-GCI-004): A non-zero exit is reported as a failure
+#                           with the subprocess error output
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.negative
+@scenario(
+    FEATURE_FILE,
+    "A non-zero exit is reported as a failure with the subprocess error output",
+)
+def test_negative_non_zero_exit_failure_with_stderr() -> None:
+    """@negative — TASK-GCI-004 non-zero exit preserves stderr."""
+
+
+# ---------------------------------------------------------------------------
+# @negative @edge-case (TASK-GCI-004): An unknown GuardKit output shape
+#                                       degrades to success with no
+#                                       artefacts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.negative
+@pytest.mark.edge_case
+@scenario(
+    FEATURE_FILE,
+    "An unknown GuardKit output shape degrades to success with no artefacts",
+)
+def test_negative_unknown_shape_success_empty() -> None:
+    """@negative @edge-case — TASK-GCI-004 tolerant unknown-shape contract."""
+
+
+# ---------------------------------------------------------------------------
+# @boundary (TASK-GCI-004): A compact stdout is preserved verbatim in
+#                           the returned result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.boundary
+@scenario(
+    FEATURE_FILE,
+    "A compact stdout is preserved verbatim in the returned result",
+)
+def test_boundary_compact_stdout_preserved_verbatim() -> None:
+    """@boundary — TASK-GCI-004 just-inside stdout-tail boundary."""
+
+
+# ---------------------------------------------------------------------------
+# @boundary (TASK-GCI-004): A large stdout is truncated to the most
+#                           recent tail in the returned result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.boundary
+@scenario(
+    FEATURE_FILE,
+    "A large stdout is truncated to the most recent tail in the returned result",
+)
+def test_boundary_large_stdout_truncated_to_tail() -> None:
+    """@boundary — TASK-GCI-004 just-outside stdout-tail boundary."""
+
+
+# ---------------------------------------------------------------------------
+# Step bindings — TASK-GCI-004
+# ---------------------------------------------------------------------------
+
+
+@given("the reasoning model invokes a GuardKit wrapper")
+def _given_reasoning_invokes_guardkit_wrapper(gci_world: dict[str, Any]) -> None:
+    # Establish the canonical "wrapper invocation" inputs the parser
+    # would normally receive from the subprocess wrapper. Per-scenario
+    # When-steps mutate exit_code / stdout / stderr / timed_out before
+    # the parser is driven.
+    gci_world["subcommand"] = _GCI004_SUBCOMMAND
+    gci_world["stdout"] = ""
+    gci_world["stderr"] = ""
+    gci_world["exit_code"] = 0
+    gci_world["duration_secs"] = 0.42
+    gci_world["timed_out"] = False
+
+
+@when("the subprocess exits with a non-zero status")
+def _when_subprocess_exits_non_zero(gci_world: dict[str, Any]) -> None:
+    # Canonical failing-process probe: non-zero exit + non-empty stderr.
+    # The parser must produce status="failed" and surface the captured
+    # error stream verbatim — no exception ever escapes the boundary.
+    gci_world["exit_code"] = 2
+    gci_world["stderr"] = (
+        "guardkit: feature-spec stage refused — "
+        "manifest missing required key 'specs'\n"
+    )
+    _gci004_invoke_parser(gci_world)
+
+
+@when(
+    "the subprocess exits with a non-zero status and writes diagnostics "
+    "to its error stream"
+)
+def _when_non_zero_with_diagnostics(gci_world: dict[str, Any]) -> None:
+    # Slightly richer probe than the @key-example variant: include a
+    # multi-line stderr with diagnostic detail so the Then-step can
+    # assert *exit_code AND error output* both reached the result.
+    gci_world["exit_code"] = 64
+    gci_world["stderr"] = (
+        "Traceback (most recent call last):\n"
+        '  File "guardkit/cli.py", line 117, in <module>\n'
+        '    raise ManifestError("required key missing")\n'
+        "guardkit.errors.ManifestError: required key missing\n"
+    )
+    _gci004_invoke_parser(gci_world)
+
+
+@when(
+    "the subprocess exits cleanly but its output does not match "
+    "the expected artefact shape"
+)
+def _when_clean_exit_unknown_shape(gci_world: dict[str, Any]) -> None:
+    # Clean exit (exit_code=0, timed_out=False) with stdout that looks
+    # nothing like the documented GuardKit shape. The parser must NOT
+    # raise on the unknown shape — instead it must degrade to
+    # status="success" with empty artefacts so the reasoning model
+    # decides whether the stage produced useful work.
+    gci_world["exit_code"] = 0
+    gci_world["stdout"] = (
+        "??? not a guardkit output ???\n"
+        "<<< binary noise + freeform prose >>>\n"
+    )
+    _gci004_invoke_parser(gci_world)
+
+
+@given(
+    "a GuardKit subprocess that prints fewer than four kilobytes "
+    "to standard output"
+)
+def _given_compact_stdout(gci_world: dict[str, Any]) -> None:
+    # Ten lines of recognisable output, well under the 4 KB cap. The
+    # tail-truncation branch must NOT fire on this input — the parser
+    # should preserve the stdout verbatim on the ``stdout_tail`` field.
+    gci_world["subcommand"] = _GCI004_SUBCOMMAND
+    gci_world["stdout"] = "".join(f"line {i}: compact output\n" for i in range(10))
+    gci_world["stderr"] = ""
+    gci_world["exit_code"] = 0
+    gci_world["duration_secs"] = 0.05
+    gci_world["timed_out"] = False
+    # Sanity check the fixture: confirm the precondition matches the
+    # Gherkin phrasing ("fewer than four kilobytes") so the assertion
+    # actually exercises the small-stdout branch.
+    assert len(gci_world["stdout"].encode("utf-8")) < _STDOUT_TAIL_BYTES
+
+
+@given(
+    "a GuardKit subprocess that prints far more than the captured tail size"
+)
+def _given_oversize_stdout(gci_world: dict[str, Any]) -> None:
+    # 10_000 ASCII bytes is comfortably above the 4 KB tail cap. We use
+    # distinguishable head/tail markers so the Then-step can assert we
+    # kept the END (truncation is "last N bytes", not "first N").
+    gci_world["subcommand"] = _GCI004_SUBCOMMAND
+    head_marker = "GCI004-HEAD-MARKER"
+    tail_marker = "GCI004-TAIL-MARKER"
+    filler = "X" * 10_000
+    gci_world["stdout"] = head_marker + filler + tail_marker
+    gci_world["stderr"] = ""
+    gci_world["exit_code"] = 0
+    gci_world["duration_secs"] = 0.05
+    gci_world["timed_out"] = False
+    gci_world["head_marker"] = head_marker
+    gci_world["tail_marker"] = tail_marker
+    # Sanity: precondition really does exceed the tail cap.
+    assert len(gci_world["stdout"].encode("utf-8")) > _STDOUT_TAIL_BYTES
+
+
+@when("the invocation completes")
+def _when_invocation_completes(gci_world: dict[str, Any]) -> None:
+    # Both compact and oversize scenarios share this When-step; the
+    # parser is driven once with whatever the Given-step assembled.
+    _gci004_invoke_parser(gci_world)
+
+
+@then("the invocation should return a structured failure result")
+def _then_structured_failure_result(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    assert isinstance(result, GuardKitResult)
+    assert result.status == "failed"
+    assert result.subcommand == _GCI004_SUBCOMMAND
+
+
+@then("the failure result should carry the captured error output")
+def _then_failure_carries_error_output(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    # The wrapper's stderr capture is preserved verbatim on the
+    # structured result — no log-only side-channel.
+    assert result.stderr == gci_world["stderr"]
+
+
+@then("the tool layer should not propagate an exception to the reasoning model")
+def _then_no_exception_propagates(gci_world: dict[str, Any]) -> None:
+    # ``_gci004_invoke_parser`` records any escaping exception on
+    # ``gci_world['parser_raised']``. AC-008 says it must always be
+    # ``None`` — the parser folds internal failures into structured
+    # warnings, never re-raises.
+    assert gci_world["parser_raised"] is None
+
+
+@then("the failure result should include the subprocess exit status and error output")
+def _then_failure_has_exit_and_stderr(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    assert result.exit_code == gci_world["exit_code"]
+    assert result.stderr == gci_world["stderr"]
+    # And the failure status was reached — not silently rewritten as
+    # success on a non-zero exit.
+    assert result.status == "failed"
+
+
+@then("the invocation should still report success")
+def _then_invocation_still_reports_success(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    assert isinstance(result, GuardKitResult)
+    # Tolerant by design: unknown-shape stdout still yields success on
+    # a clean exit (AC-005). The reasoning model evaluates whether the
+    # stage produced useful work — not the parser.
+    assert result.status == "success"
+
+
+@then("the returned artefact list should be empty")
+def _then_artefact_list_empty(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    assert result.artefacts == []
+    # And no exception escaped.
+    assert gci_world["parser_raised"] is None
+
+
+@then(
+    "the reasoning model should be responsible for deciding whether "
+    "the stage produced useful work"
+)
+def _then_reasoning_model_decides(gci_world: dict[str, Any]) -> None:
+    # The parser surfaces enough context (status, artefacts,
+    # stdout_tail, warnings) for the reasoning model to make the call,
+    # but NEVER pre-decides the stage's verdict by raising or by
+    # silently rewriting status. Verify the fields the reasoning model
+    # consults are intact and observable.
+    result: GuardKitResult = gci_world["result"]
+    assert result.status == "success"
+    assert result.artefacts == []
+    # stdout_tail is byte-truncated on the success path; assert the
+    # field is at least observable so the reasoning model can inspect
+    # it. None is *not* the contract — the parser always produces a
+    # string (possibly empty).
+    assert isinstance(result.stdout_tail, str)
+
+
+@then("the returned result should include the full standard output")
+def _then_full_stdout_in_result(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    assert isinstance(result, GuardKitResult)
+    # ``stdout_tail`` mirrors the input verbatim when the input is
+    # below the tail cap. Compare bytes-for-bytes — no normalisation.
+    assert result.stdout_tail == gci_world["stdout"]
+    # And we did not slip into a failure / timeout path on a clean
+    # exit just because the output was small.
+    assert result.status == "success"
+
+
+@then("the returned result should include only the most recent slice of standard output")
+def _then_only_most_recent_slice(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    # The truncation must keep the END of stdout, not the start.
+    assert gci_world["tail_marker"] in result.stdout_tail
+    assert gci_world["head_marker"] not in result.stdout_tail
+    assert result.stdout_tail.endswith(gci_world["tail_marker"])
+
+
+@then("the slice size should match the configured tail limit")
+def _then_slice_size_matches_tail_limit(gci_world: dict[str, Any]) -> None:
+    result: GuardKitResult = gci_world["result"]
+    # ``_STDOUT_TAIL_BYTES`` is the documented 4 KB cap (ASSUM-003).
+    # The tail is byte-based, so re-encoding must come in at-or-below
+    # the cap regardless of how many *characters* that represents.
+    assert len(result.stdout_tail.encode("utf-8")) <= _STDOUT_TAIL_BYTES
+    # And on this all-ASCII input the tail is exactly the cap.
+    assert len(result.stdout_tail.encode("utf-8")) == _STDOUT_TAIL_BYTES

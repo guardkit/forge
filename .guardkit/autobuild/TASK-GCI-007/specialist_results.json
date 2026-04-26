@@ -1,17 +1,17 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 66.13493061100598,
+    "duration_seconds": 46.086633888975484,
     "error": null,
-    "tests_run": 19,
+    "tests_run": 1035,
     "tests_failed": 0,
-    "coverage_pct": 79.0,
-    "output_summary": "pytest tests/forge/adapters/gh + tests/bdd: 19 passed, 0 failed; gh adapter coverage 79% (operations.py 78%, __init__.py 100%).",
+    "coverage_pct": 92.0,
+    "output_summary": "pytest 9.0.2 with pytest-cov 7.0.0: 1035 passed, 0 failed; 92% line coverage across src/forge (2552 stmts, 194 missed).",
     "quality_gates_passed": true
   },
   "phase_5": {
     "status": "passed",
-    "duration_seconds": 173.7551561559958,
+    "duration_seconds": 237.23582396900747,
     "error": null,
     "issues": [],
     "quality_score": 0.0,
