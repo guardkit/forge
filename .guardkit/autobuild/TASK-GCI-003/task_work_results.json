@@ -1,0 +1,306 @@
+{
+  "task_id": "TASK-GCI-003",
+  "timestamp": "2026-04-26T09:22:45.653776",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 28,
+    "tests_failed": 0,
+    "coverage": 88.0,
+    "coverage_met": true,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coverage.json",
+    ".guardkit/autobuild/TASK-GCI-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_2.json",
+    ".guardkit/bdd/TASK-GCI-003_junit.xml",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    ".guardkit/bdd/TASK-GCI-006_junit.xml",
+    ".guardkit/bdd/TASK-GCI-007_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/bdd/test_guardkit_command_invocation_engine.py",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_context_resolver.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_3.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-003/player_turn_3.json",
+    "conftest.py"
+  ],
+  "tests_written": [],
+  "summary": "28 tests passed, 88.0% coverage, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 57,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "resolve_context_flags() in src/forge/adapters/guardkit/context_resolver.py returns a ResolvedContext with flags, paths, warnings",
+      "status": "complete",
+      "evidence": "src/forge/adapters/guardkit/context_resolver.py lines 83-94 declare `@dataclass(frozen=True) class ResolvedContext` with `flags: list[str]`, `paths: list[str]`, `warnings: list[GuardKitWarning]` (default-factory list per ASSUM-007 stateless contract). Function `resolve_context_flags()` (lines 102-299) constructs and returns this dataclass. Verified by tests/forge/adapters/guardkit/test_context_resolver.py::TestResolvedContextShape::test_resolved_context_has_three_named_attributes (PASSED in this turn's pytest run).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "_COMMAND_CATEGORY_FILTER matches DDR-005 verbatim (9 entries \u2014 Graphiti subcommands are intentionally absent)",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 49-60 define _COMMAND_CATEGORY_FILTER with exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) and category sets matching DDR-005 verbatim. Comment at line 59 documents the deliberate Graphiti omission. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-* absence checks for graphiti-search, graphiti-export, graphiti-import, graphiti-prune) \u2014 all PASSED.",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Missing manifest -> returns empty flags, single GuardKitWarning(code='context_manifest_missing', ...), never raises",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 152-167: when origin manifest path does not exist, _load_manifest returns None, the function appends a single GuardKitWarning(code='context_manifest_missing', message=..., details={'path': ...}) and returns ResolvedContext(flags=[], paths=[], warnings=[warning]) without raising. Verified by TestMissingManifestDegradesGracefully \u2014 3 tests (returns_empty_flags, emits_single_warning, does_not_raise) all PASSED.",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "internal_docs.always_include paths are prepended to the flag list regardless of category filter",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 172-187 read internal_docs.always_include from origin manifest and validate each path; line 291 starts the ordered_paths list with always_include_paths BEFORE the category-filtered docs are appended (lines 292-293). always_include paths bypass the category filter check entirely (no filter is applied in that loop). Verified by TestAlwaysIncludePrepended \u2014 3 tests (test_always_include_paths_appear_before_category_paths, test_always_include_added_for_uncategorised_doc, test_flags_pair_each_path_with_context_argument) all PASSED.",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Dependency chase follows manifests up to depth 2 then stops with context_manifest_cycle_detected warning",
+      "status": "complete",
+      "evidence": "context_resolver.py line 74 sets _DEPTH_CAP=2 (ASSUM-002, manifest hops). The BFS loop (lines 196-286) carries depth in each frame; lines 240-256 emit a GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'depth_cap', 'depth_cap': 2, ...}) and skip recursion when depth+1 > _DEPTH_CAP. Verified by TestDepthCapChase \u2014 3 tests (depth_one_chase_collects_dep_doc, depth_two_chase_collects_dep_doc, depth_three_stops_with_depth_cap_warning) all PASSED.",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Cycle detection: a manifest already visited in the current chain is not re-visited",
+      "status": "complete",
+      "evidence": "context_resolver.py line 197 initialises the BFS chain as frozenset({origin_manifest_path}); line 283 extends the chain on each recursion (chain | {dep_manifest_path}); lines 257-272 emit GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'cycle', ...}) and skip recursion when dep_manifest_path is already in the current chain. Per-chain (not global) tracking allows diamond imports to remain legal. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely (PASSED).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Documents whose resolved absolute path is outside read_allowlist are omitted with a structured warning naming the omitted path",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 372-386 (_validate_doc_path): after the repo-root check, iterates read_allowlist with `_is_within(resolved, allowed)` \u2014 if no entry matches, emits GuardKitWarning(code='context_manifest_path_outside_allowlist', message=..., details={'path': abs_path, 'allowlist': [...]}) and returns (False, abs_path) so the doc is omitted from output. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned (PASSED).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Documents whose path resolves outside the repo root are omitted with a structured warning",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 356-370 (_validate_doc_path): performs `_is_within(resolved, owning_repo_root)` BEFORE the allowlist check; if the resolved path escapes the repo (e.g. via `..` or symlink), emits GuardKitWarning(code='context_manifest_path_outside_repo', details={'path': abs_path, 'repo_root': str(owning_repo_root)}) and returns (False, abs_path). Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected (PASSED).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Resolution is stateless \u2014 two concurrent calls against the same repo_path produce independent ResolvedContext values, no module-level cache",
+      "status": "complete",
+      "evidence": "context_resolver.py uses no @functools.cache, no module-level mutable state, and ResolvedContext fields use field(default_factory=list) so every call constructs fresh lists. Each invocation re-reads manifests from disk (lines 152-153, 273). Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result's lists and asserts the second call's lists are independent (PASSED).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Order is stable: always_include first, then categories in _COMMAND_CATEGORY_FILTER insertion order, then by manifest declaration order within each category",
+      "status": "complete",
+      "evidence": "context_resolver.py lines 66-72 declare _CATEGORY_ORDER=('architecture', 'decisions', 'specs', 'contracts', 'source') \u2014 first-appearance order across DDR-005 dict values. Lines 291-293 assemble ordered_paths by extending always_include_paths first, then iterating _CATEGORY_ORDER and extending docs_by_category[category] (which preserves BFS+declaration order via list.append in the BFS loop at line 234). Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures (PASSED).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "Symlinks are followed before allowlist check",
+      "status": "complete",
+      "evidence": "context_resolver.py line 353 (_validate_doc_path) calls `candidate.resolve(strict=False)` BEFORE either the repo-root or allowlist checks. Path.resolve() follows symlinks, so a symlink whose target is outside the allowlist is correctly rejected by the subsequent `_is_within` check. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (PASSED on Linux; skipped on Windows where symlinks require admin).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "Exhaustive unit tests covering: missing manifest, depth-1 chase, depth-2 chase, depth-3 stop, two-node cycle, allowlist-omitted doc, escaping-path doc, Graphiti-bypass-by-caller (resolver raises KeyError on Graphiti subcommand keys)",
+      "status": "complete",
+      "evidence": "tests/forge/adapters/guardkit/test_context_resolver.py contains 28 tests across 12 test classes covering each acceptance criterion. Graphiti-bypass-by-caller is verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + an unknown subcommand) \u2014 each asserts pytest.raises(KeyError). All other listed scenarios have dedicated test methods. Full suite: 28 PASSED in 0.04s this turn.",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Re-ran this turn: `black --check --line-length 88 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' `ruff check src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All checks passed!'. Per .claude/rules/code-style.md (Black formatter, 88-char line length).",
+      "test_file": "tests/forge/adapters/guardkit/test_context_resolver.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/context_resolver.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 93.1606503810035
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 168.1193269760115
+    }
+  ]
+}

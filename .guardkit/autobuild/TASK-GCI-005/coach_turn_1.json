@@ -1,0 +1,208 @@
+{
+  "task_id": "TASK-GCI-005",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/adapters/git/test_operations.py:495\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/git/test_operations.py:495: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\ntests/forge/adapters/git/test_operations.py:535\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/git/test_operations.py:535: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 95 passed, 4 warnings in 0.19s ========================",
+      "duration_seconds": 0.5995168685913086
+    },
+    "requirements": {
+      "criteria_total": 9,
+      "criteria_met": 9,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`subscribe_progress` async context manager in",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented `subscribe_progress` as an `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified via `TestModuleSurface::test_subscribe_progress_is_async_context_manager` (object exposes `__aenter__`/`__aexit__`) and `test_module_path` (canonical module path).",
+      "notes": "Implemented `subscribe_progress` as an `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified via `TestModuleSurface::test_subscribe_progress_is_async_context_manager` (object exposes `__aenter__`/`__aexit__`) and `test_module_path` (canonical module path)."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`ProgressSink` retains the most recent event per `(build_id,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ProgressSink stores per-key `collections.deque(maxlen=N)` so append() drops the oldest entry on full \u2014 exactly the 'most recent observable' guarantee. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` (5 events into a 3-slot sink \u2014 last 3 retained, oldest 2 evicted) plus `test_latest_returns_most_recent`.",
+      "notes": "ProgressSink stores per-key `collections.deque(maxlen=N)` so append() drops the oldest entry on full \u2014 exactly the 'most recent observable' guarantee. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` (5 events into a 3-slot sink \u2014 last 3 retained, oldest 2 evicted) plus `test_latest_returns_most_recent`."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Unsubscribe runs on context-manager exit, including the exception",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The async context manager wraps `yield` in a `try/finally` and awaits `sub.unsubscribe()` in the finally block. A second try/except inside the finally swallows unsubscribe failures so cleanup never propagates. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit` (RuntimeError raised inside the body), and `test_unsubscribe_failure_does_not_propagate`.",
+      "notes": "The async context manager wraps `yield` in a `try/finally` and awaits `sub.unsubscribe()` in the finally block. A second try/except inside the finally swallows unsubscribe failures so cleanup never propagates. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit` (RuntimeError raised inside the body), and `test_unsubscribe_failure_does_not_propagate`."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "If the NATS client is `None` or unavailable, `subscribe_progress`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Two no-op paths implemented: (a) `nats_client is None` records one `PROGRESS_STREAM_UNAVAILABLE` warning, logs, and yields; (b) `subscribe()` raising likewise records the warning and yields. Verified by `TestUnavailableClient::test_none_client_is_noop_and_warns` (asserts `inside is True`, exactly one warning with code `progress_stream_unavailable`) and `test_subscribe_failure_yields_noop` (uses `BrokenNATSClient` raising `ConnectionError`).",
+      "notes": "Two no-op paths implemented: (a) `nats_client is None` records one `PROGRESS_STREAM_UNAVAILABLE` warning, logs, and yields; (b) `subscribe()` raising likewise records the warning and yields. Verified by `TestUnavailableClient::test_none_client_is_noop_and_warns` (asserts `inside is True`, exactly one warning with code `progress_stream_unavailable`) and `test_subscribe_failure_yields_noop` (uses `BrokenNATSClient` raising `ConnectionError`)."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Each subscription is scoped to one",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`subject_for(build_id, subcommand)` builds the exact subject; `subscribe_progress` only subscribes to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` (asserts the subscribe topic literal) and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands; each sink slot receives only its own events).",
+      "notes": "`subject_for(build_id, subcommand)` builds the exact subject; `subscribe_progress` only subscribes to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` (asserts the subscribe topic literal) and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands; each sink slot receives only its own events)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Two concurrent builds against the same repo get isolated sinks (no",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks`: two distinct sinks for two build_ids; events delivered on each subject only land in the corresponding sink, and querying the cross-build slot returns None.",
+      "notes": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks`: two distinct sinks for two build_ids; events delivered on each subject only land in the corresponding sink, and querying the cross-build slot returns None."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Invalid payloads (malformed JSON, missing fields) are dropped with a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in a try/except catching `ValidationError`, `ValueError`, `TypeError`; on failure it records a `PROGRESS_PAYLOAD_INVALID` warning and returns (never raises). Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (subscription continues consuming after a bad payload).",
+      "notes": "The inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in a try/except catching `ValidationError`, `ValueError`, `TypeError`; on failure it records a `PROGRESS_PAYLOAD_INVALID` warning and returns (never raises). Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (subscription continues consuming after a bad payload)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Unit tests with a fake NATS client: ordered delivery, back-pressure",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage: ordered delivery (`test_ordered_delivery_within_one_subscription`), back-pressure (`test_back_pressure_drops_oldest`), malformed payload (3 cases under TestMalformedPayloads), unavailable client (`test_none_client_is_noop_and_warns`, `test_subscribe_failure_yields_noop`), parallel subscriptions (`test_parallel_subscriptions_are_independent`, `test_two_builds_have_isolated_sinks`). 22 tests, all passing.",
+      "notes": "Hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage: ordered delivery (`test_ordered_delivery_within_one_subscription`), back-pressure (`test_back_pressure_drops_oldest`), malformed payload (3 cases under TestMalformedPayloads), unavailable client (`test_none_client_is_noop_and_warns`, `test_subscribe_failure_yields_noop`), parallel subscriptions (`test_parallel_subscriptions_are_independent`, `test_two_builds_have_isolated_sinks`). 22 tests, all passing."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`ruff check` reports 'All checks passed!' on both files. `ruff format --check` reports '2 files already formatted' after applying the project's default ruff format. No new linter rules added.",
+      "notes": "`ruff check` reports 'All checks passed!' on both files. `ruff format --check` reports '2 files already formatted' after applying the project's default ruff format. No new linter rules added."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`subscribe_progress` async context manager in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented `subscribe_progress` as an `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified via `TestModuleSurface::test_subscribe_progress_is_async_context_manager` (object exposes `__aenter__`/`__aexit__`) and `test_module_path` (canonical module path).",
+        "notes": "Implemented `subscribe_progress` as an `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified via `TestModuleSurface::test_subscribe_progress_is_async_context_manager` (object exposes `__aenter__`/`__aexit__`) and `test_module_path` (canonical module path)."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`ProgressSink` retains the most recent event per `(build_id,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ProgressSink stores per-key `collections.deque(maxlen=N)` so append() drops the oldest entry on full \u2014 exactly the 'most recent observable' guarantee. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` (5 events into a 3-slot sink \u2014 last 3 retained, oldest 2 evicted) plus `test_latest_returns_most_recent`.",
+        "notes": "ProgressSink stores per-key `collections.deque(maxlen=N)` so append() drops the oldest entry on full \u2014 exactly the 'most recent observable' guarantee. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` (5 events into a 3-slot sink \u2014 last 3 retained, oldest 2 evicted) plus `test_latest_returns_most_recent`."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Unsubscribe runs on context-manager exit, including the exception",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The async context manager wraps `yield` in a `try/finally` and awaits `sub.unsubscribe()` in the finally block. A second try/except inside the finally swallows unsubscribe failures so cleanup never propagates. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit` (RuntimeError raised inside the body), and `test_unsubscribe_failure_does_not_propagate`.",
+        "notes": "The async context manager wraps `yield` in a `try/finally` and awaits `sub.unsubscribe()` in the finally block. A second try/except inside the finally swallows unsubscribe failures so cleanup never propagates. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit` (RuntimeError raised inside the body), and `test_unsubscribe_failure_does_not_propagate`."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "If the NATS client is `None` or unavailable, `subscribe_progress`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Two no-op paths implemented: (a) `nats_client is None` records one `PROGRESS_STREAM_UNAVAILABLE` warning, logs, and yields; (b) `subscribe()` raising likewise records the warning and yields. Verified by `TestUnavailableClient::test_none_client_is_noop_and_warns` (asserts `inside is True`, exactly one warning with code `progress_stream_unavailable`) and `test_subscribe_failure_yields_noop` (uses `BrokenNATSClient` raising `ConnectionError`).",
+        "notes": "Two no-op paths implemented: (a) `nats_client is None` records one `PROGRESS_STREAM_UNAVAILABLE` warning, logs, and yields; (b) `subscribe()` raising likewise records the warning and yields. Verified by `TestUnavailableClient::test_none_client_is_noop_and_warns` (asserts `inside is True`, exactly one warning with code `progress_stream_unavailable`) and `test_subscribe_failure_yields_noop` (uses `BrokenNATSClient` raising `ConnectionError`)."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Each subscription is scoped to one",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`subject_for(build_id, subcommand)` builds the exact subject; `subscribe_progress` only subscribes to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` (asserts the subscribe topic literal) and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands; each sink slot receives only its own events).",
+        "notes": "`subject_for(build_id, subcommand)` builds the exact subject; `subscribe_progress` only subscribes to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` (asserts the subscribe topic literal) and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands; each sink slot receives only its own events)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Two concurrent builds against the same repo get isolated sinks (no",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks`: two distinct sinks for two build_ids; events delivered on each subject only land in the corresponding sink, and querying the cross-build slot returns None.",
+        "notes": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks`: two distinct sinks for two build_ids; events delivered on each subject only land in the corresponding sink, and querying the cross-build slot returns None."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Invalid payloads (malformed JSON, missing fields) are dropped with a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in a try/except catching `ValidationError`, `ValueError`, `TypeError`; on failure it records a `PROGRESS_PAYLOAD_INVALID` warning and returns (never raises). Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (subscription continues consuming after a bad payload).",
+        "notes": "The inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in a try/except catching `ValidationError`, `ValueError`, `TypeError`; on failure it records a `PROGRESS_PAYLOAD_INVALID` warning and returns (never raises). Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (subscription continues consuming after a bad payload)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Unit tests with a fake NATS client: ordered delivery, back-pressure",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage: ordered delivery (`test_ordered_delivery_within_one_subscription`), back-pressure (`test_back_pressure_drops_oldest`), malformed payload (3 cases under TestMalformedPayloads), unavailable client (`test_none_client_is_noop_and_warns`, `test_subscribe_failure_yields_noop`), parallel subscriptions (`test_parallel_subscriptions_are_independent`, `test_two_builds_have_isolated_sinks`). 22 tests, all passing.",
+        "notes": "Hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage: ordered delivery (`test_ordered_delivery_within_one_subscription`), back-pressure (`test_back_pressure_drops_oldest`), malformed payload (3 cases under TestMalformedPayloads), unavailable client (`test_none_client_is_noop_and_warns`, `test_subscribe_failure_yields_noop`), parallel subscriptions (`test_parallel_subscriptions_are_independent`, `test_two_builds_have_isolated_sinks`). 22 tests, all passing."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`ruff check` reports 'All checks passed!' on both files. `ruff format --check` reports '2 files already formatted' after applying the project's default ruff format. No new linter rules added.",
+        "notes": "`ruff check` reports 'All checks passed!' on both files. `ruff format --check` reports '2 files already formatted' after applying the project's default ruff format. No new linter rules added."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "bdd_failure",
+      "description": "BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.",
+      "scenarios_failed": 1,
+      "scenarios_passed": 0,
+      "scenarios_pending": 0,
+      "feature_files": [
+        "features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature"
+      ],
+      "failure_examples": [
+        "pytest_runner_error \u2014 pytest_runner_error: exit=4; ERROR: not found: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/features/guardkit-comman"
+      ]
+    }
+  ],
+  "rationale": "BDD scenarios failed: 1 scenario(s) reported assertion failure during pytest-bdd execution.",
+  "context_used": "## Job-Specific Context\n\nBudget: 980/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- CALLED_BY\n- SOURCE_PATTERN\n\n### \u26a0\ufe0f Warnings\n- REQUIRES_USE_OF\n- CALLS\n\n### \ud83c\udfad Role Constraints\n- MONITOR_QUALITY_GATES_RESULTS_FROM_JSON\n- MONITORS_RESULTS_FROM\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- ASSOCIATED_WITH_PROJECT\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

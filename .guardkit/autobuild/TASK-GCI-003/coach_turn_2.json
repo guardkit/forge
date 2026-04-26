@@ -1,0 +1,272 @@
+{
+  "task_id": "TASK-GCI-003",
+  "turn": 2,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/bdd/test_guardkit_command_invocation_engine.py tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_context_resolver.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_context_resolver.py::TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected PASSED [ 49%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-search] PASSED [ 50%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-export] PASSED [ 50%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-import] PASSED [ 51%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-prune] PASSED [ 52%]\nResult:\ntests/forge/adapters/git/test_operations.py:478\n/home/richardwoollcott/Projects/appmilla_githu...",
+      "duration_seconds": 0.7402031421661377
+    },
+    "requirements": {
+      "criteria_total": 13,
+      "criteria_met": 13,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`resolve_context_flags()` in `src/forge/adapters/guardkit/context_resolver.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented `resolve_context_flags()` returning a frozen `ResolvedContext` dataclass with `flags: list[str]`, `paths: list[str]`, and `warnings: list[GuardKitWarning]` fields. Verified by TestResolvedContextShape::test_resolved_context_has_three_named_attributes (passes).",
+      "notes": "Implemented `resolve_context_flags()` returning a frozen `ResolvedContext` dataclass with `flags: list[str]`, `paths: list[str]`, and `warnings: list[GuardKitWarning]` fields. Verified by TestResolvedContextShape::test_resolved_context_has_three_named_attributes (passes)."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`_COMMAND_CATEGORY_FILTER` matches DDR-005 verbatim (9 entries \u2014 Graphiti",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_COMMAND_CATEGORY_FILTER has exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) with sets matching DDR-005 verbatim. No graphiti-* keys. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-absence checks).",
+      "notes": "_COMMAND_CATEGORY_FILTER has exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) with sets matching DDR-005 verbatim. No graphiti-* keys. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-absence checks)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Missing manifest \u2192 returns empty `flags`, single",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When `.guardkit/context-manifest.yaml` is absent, `resolve_context_flags` returns `ResolvedContext(flags=[], paths=[], warnings=[GuardKitWarning(code='context_manifest_missing', ...)])` with no exception. Verified by TestMissingManifestDegradesGracefully (3 tests).",
+      "notes": "When `.guardkit/context-manifest.yaml` is absent, `resolve_context_flags` returns `ResolvedContext(flags=[], paths=[], warnings=[GuardKitWarning(code='context_manifest_missing', ...)])` with no exception. Verified by TestMissingManifestDegradesGracefully (3 tests)."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`internal_docs.always_include` paths are prepended to the flag list",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "always_include paths are read from origin manifest and prepended to `paths`/`flags` before any category-filtered docs. Even an uncategorised doc is included regardless of the subcommand's filter. Verified by TestAlwaysIncludePrepended (3 tests: ordering, uncategorised doc, flags pairing).",
+      "notes": "always_include paths are read from origin manifest and prepended to `paths`/`flags` before any category-filtered docs. Even an uncategorised doc is included regardless of the subcommand's filter. Verified by TestAlwaysIncludePrepended (3 tests: ordering, uncategorised doc, flags pairing)."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Dependency chase follows manifests up to depth 2 then stops with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "BFS over manifests with `_DEPTH_CAP = 2`. At depth+1 > _DEPTH_CAP a warning with code `context_manifest_cycle_detected` and `details.reason='depth_cap'` is emitted. Verified by TestDepthCapChase (3 tests: depth-1 chase, depth-2 chase, depth-3 stop with warning).",
+      "notes": "BFS over manifests with `_DEPTH_CAP = 2`. At depth+1 > _DEPTH_CAP a warning with code `context_manifest_cycle_detected` and `details.reason='depth_cap'` is emitted. Verified by TestDepthCapChase (3 tests: depth-1 chase, depth-2 chase, depth-3 stop with warning)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Cycle detection: a manifest already visited in the current chain is not",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Per-chain visited set (frozenset) carried with each BFS frame. When a dep manifest is already in the chain, recursion is skipped and a `context_manifest_cycle_detected` warning with `details.reason='cycle'` is emitted. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely.",
+      "notes": "Per-chain visited set (frozenset) carried with each BFS frame. When a dep manifest is already in the chain, recursion is skipped and a `context_manifest_cycle_detected` warning with `details.reason='cycle'` is emitted. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Documents whose resolved absolute path is outside `read_allowlist` are",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`_validate_doc_path()` checks `_is_within(resolved, allowed)` for each entry of read_allowlist. If none match, the doc is omitted and a `context_manifest_path_outside_allowlist` warning is emitted with `details.path` set to the omitted absolute path. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned.",
+      "notes": "`_validate_doc_path()` checks `_is_within(resolved, allowed)` for each entry of read_allowlist. If none match, the doc is omitted and a `context_manifest_path_outside_allowlist` warning is emitted with `details.path` set to the omitted absolute path. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Documents whose path resolves outside the repo root are omitted with a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`_validate_doc_path()` first checks `_is_within(resolved, owning_repo_root)`. If the resolved path escapes the repo root (e.g. via `..`), a `context_manifest_path_outside_repo` warning is emitted and the doc is omitted. Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected.",
+      "notes": "`_validate_doc_path()` first checks `_is_within(resolved, owning_repo_root)`. If the resolved path escapes the repo root (e.g. via `..`), a `context_manifest_path_outside_repo` warning is emitted and the doc is omitted. Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Resolution is **stateless** \u2014 two concurrent calls against the same",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "No module-level cache (no `@functools.cache`, no module-level mutable state). Each call constructs fresh lists for `flags`, `paths`, `warnings`. Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result and asserts the second is unaffected.",
+      "notes": "No module-level cache (no `@functools.cache`, no module-level mutable state). Each call constructs fresh lists for `flags`, `paths`, `warnings`. Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result and asserts the second is unaffected."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Order is stable: `always_include` first, then categories in",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "always_include paths prepended; then docs bucketed per-category and emitted in canonical `_CATEGORY_ORDER` (architecture, decisions, specs, contracts, source \u2014 first-appearance order in DDR-005 dict values). Within each category bucket, docs are appended in BFS+declaration order. Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures.",
+      "notes": "always_include paths prepended; then docs bucketed per-category and emitted in canonical `_CATEGORY_ORDER` (architecture, decisions, specs, contracts, source \u2014 first-appearance order in DDR-005 dict values). Within each category bucket, docs are appended in BFS+declaration order. Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "Symlinks are followed before allowlist check",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`_validate_doc_path()` calls `candidate.resolve(strict=False)` before either the repo-root or allowlist checks. `resolve()` follows symlinks, so a symlink pointing outside the repo or allowlist is correctly rejected. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (skipped on Windows).",
+      "notes": "`_validate_doc_path()` calls `candidate.resolve(strict=False)` before either the repo-root or allowlist checks. `resolve()` follows symlinks, so a symlink pointing outside the repo or allowlist is correctly rejected. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (skipped on Windows)."
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "Exhaustive unit tests: missing manifest, depth-1 chase, depth-2 chase,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "28 tests across 11 test classes mirror each acceptance criterion. Graphiti scenario verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + unknown subcommand) which asserts `KeyError`. All other listed scenarios have dedicated test methods. All 28 tests pass; full guardkit suite (124 tests) also passes.",
+      "notes": "28 tests across 11 test classes mirror each acceptance criterion. Graphiti scenario verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + unknown subcommand) which asserts `KeyError`. All other listed scenarios have dedicated test methods. All 28 tests pass; full guardkit suite (124 tests) also passes."
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Per .claude/rules/code-style.md (Black formatter, 88-char line length): ran `black --check --line-length 88 --target-version py311 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' Also ran `ruff check` on both files \u2192 'All checks passed!'. Both files were Black-reformatted on this turn (288 LOC source / 644 LOC test) and re-verified with both linters. Test suite still green: 28/28 context_resolver tests pass, 124/124 guardkit suite passes (no regressions from formatting).",
+      "notes": "Per .claude/rules/code-style.md (Black formatter, 88-char line length): ran `black --check --line-length 88 --target-version py311 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' Also ran `ruff check` on both files \u2192 'All checks passed!'. Both files were Black-reformatted on this turn (288 LOC source / 644 LOC test) and re-verified with both linters. Test suite still green: 28/28 context_resolver tests pass, 124/124 guardkit suite passes (no regressions from formatting)."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`resolve_context_flags()` in `src/forge/adapters/guardkit/context_resolver.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented `resolve_context_flags()` returning a frozen `ResolvedContext` dataclass with `flags: list[str]`, `paths: list[str]`, and `warnings: list[GuardKitWarning]` fields. Verified by TestResolvedContextShape::test_resolved_context_has_three_named_attributes (passes).",
+        "notes": "Implemented `resolve_context_flags()` returning a frozen `ResolvedContext` dataclass with `flags: list[str]`, `paths: list[str]`, and `warnings: list[GuardKitWarning]` fields. Verified by TestResolvedContextShape::test_resolved_context_has_three_named_attributes (passes)."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`_COMMAND_CATEGORY_FILTER` matches DDR-005 verbatim (9 entries \u2014 Graphiti",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_COMMAND_CATEGORY_FILTER has exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) with sets matching DDR-005 verbatim. No graphiti-* keys. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-absence checks).",
+        "notes": "_COMMAND_CATEGORY_FILTER has exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) with sets matching DDR-005 verbatim. No graphiti-* keys. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-absence checks)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Missing manifest \u2192 returns empty `flags`, single",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When `.guardkit/context-manifest.yaml` is absent, `resolve_context_flags` returns `ResolvedContext(flags=[], paths=[], warnings=[GuardKitWarning(code='context_manifest_missing', ...)])` with no exception. Verified by TestMissingManifestDegradesGracefully (3 tests).",
+        "notes": "When `.guardkit/context-manifest.yaml` is absent, `resolve_context_flags` returns `ResolvedContext(flags=[], paths=[], warnings=[GuardKitWarning(code='context_manifest_missing', ...)])` with no exception. Verified by TestMissingManifestDegradesGracefully (3 tests)."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`internal_docs.always_include` paths are prepended to the flag list",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "always_include paths are read from origin manifest and prepended to `paths`/`flags` before any category-filtered docs. Even an uncategorised doc is included regardless of the subcommand's filter. Verified by TestAlwaysIncludePrepended (3 tests: ordering, uncategorised doc, flags pairing).",
+        "notes": "always_include paths are read from origin manifest and prepended to `paths`/`flags` before any category-filtered docs. Even an uncategorised doc is included regardless of the subcommand's filter. Verified by TestAlwaysIncludePrepended (3 tests: ordering, uncategorised doc, flags pairing)."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Dependency chase follows manifests up to depth 2 then stops with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "BFS over manifests with `_DEPTH_CAP = 2`. At depth+1 > _DEPTH_CAP a warning with code `context_manifest_cycle_detected` and `details.reason='depth_cap'` is emitted. Verified by TestDepthCapChase (3 tests: depth-1 chase, depth-2 chase, depth-3 stop with warning).",
+        "notes": "BFS over manifests with `_DEPTH_CAP = 2`. At depth+1 > _DEPTH_CAP a warning with code `context_manifest_cycle_detected` and `details.reason='depth_cap'` is emitted. Verified by TestDepthCapChase (3 tests: depth-1 chase, depth-2 chase, depth-3 stop with warning)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Cycle detection: a manifest already visited in the current chain is not",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Per-chain visited set (frozenset) carried with each BFS frame. When a dep manifest is already in the chain, recursion is skipped and a `context_manifest_cycle_detected` warning with `details.reason='cycle'` is emitted. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely.",
+        "notes": "Per-chain visited set (frozenset) carried with each BFS frame. When a dep manifest is already in the chain, recursion is skipped and a `context_manifest_cycle_detected` warning with `details.reason='cycle'` is emitted. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Documents whose resolved absolute path is outside `read_allowlist` are",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`_validate_doc_path()` checks `_is_within(resolved, allowed)` for each entry of read_allowlist. If none match, the doc is omitted and a `context_manifest_path_outside_allowlist` warning is emitted with `details.path` set to the omitted absolute path. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned.",
+        "notes": "`_validate_doc_path()` checks `_is_within(resolved, allowed)` for each entry of read_allowlist. If none match, the doc is omitted and a `context_manifest_path_outside_allowlist` warning is emitted with `details.path` set to the omitted absolute path. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Documents whose path resolves outside the repo root are omitted with a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`_validate_doc_path()` first checks `_is_within(resolved, owning_repo_root)`. If the resolved path escapes the repo root (e.g. via `..`), a `context_manifest_path_outside_repo` warning is emitted and the doc is omitted. Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected.",
+        "notes": "`_validate_doc_path()` first checks `_is_within(resolved, owning_repo_root)`. If the resolved path escapes the repo root (e.g. via `..`), a `context_manifest_path_outside_repo` warning is emitted and the doc is omitted. Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Resolution is **stateless** \u2014 two concurrent calls against the same",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "No module-level cache (no `@functools.cache`, no module-level mutable state). Each call constructs fresh lists for `flags`, `paths`, `warnings`. Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result and asserts the second is unaffected.",
+        "notes": "No module-level cache (no `@functools.cache`, no module-level mutable state). Each call constructs fresh lists for `flags`, `paths`, `warnings`. Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result and asserts the second is unaffected."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Order is stable: `always_include` first, then categories in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "always_include paths prepended; then docs bucketed per-category and emitted in canonical `_CATEGORY_ORDER` (architecture, decisions, specs, contracts, source \u2014 first-appearance order in DDR-005 dict values). Within each category bucket, docs are appended in BFS+declaration order. Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures.",
+        "notes": "always_include paths prepended; then docs bucketed per-category and emitted in canonical `_CATEGORY_ORDER` (architecture, decisions, specs, contracts, source \u2014 first-appearance order in DDR-005 dict values). Within each category bucket, docs are appended in BFS+declaration order. Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "Symlinks are followed before allowlist check",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`_validate_doc_path()` calls `candidate.resolve(strict=False)` before either the repo-root or allowlist checks. `resolve()` follows symlinks, so a symlink pointing outside the repo or allowlist is correctly rejected. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (skipped on Windows).",
+        "notes": "`_validate_doc_path()` calls `candidate.resolve(strict=False)` before either the repo-root or allowlist checks. `resolve()` follows symlinks, so a symlink pointing outside the repo or allowlist is correctly rejected. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (skipped on Windows)."
+      },
+      {
+        "criterion_id": "AC-012",
+        "criterion_text": "Exhaustive unit tests: missing manifest, depth-1 chase, depth-2 chase,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "28 tests across 11 test classes mirror each acceptance criterion. Graphiti scenario verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + unknown subcommand) which asserts `KeyError`. All other listed scenarios have dedicated test methods. All 28 tests pass; full guardkit suite (124 tests) also passes.",
+        "notes": "28 tests across 11 test classes mirror each acceptance criterion. Graphiti scenario verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + unknown subcommand) which asserts `KeyError`. All other listed scenarios have dedicated test methods. All 28 tests pass; full guardkit suite (124 tests) also passes."
+      },
+      {
+        "criterion_id": "AC-013",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Per .claude/rules/code-style.md (Black formatter, 88-char line length): ran `black --check --line-length 88 --target-version py311 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' Also ran `ruff check` on both files \u2192 'All checks passed!'. Both files were Black-reformatted on this turn (288 LOC source / 644 LOC test) and re-verified with both linters. Test suite still green: 28/28 context_resolver tests pass, 124/124 guardkit suite passes (no regressions from formatting).",
+        "notes": "Per .claude/rules/code-style.md (Black formatter, 88-char line length): ran `black --check --line-length 88 --target-version py311 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' Also ran `ruff check` on both files \u2192 'All checks passed!'. Both files were Black-reformatted on this turn (288 LOC source / 644 LOC test) and re-verified with both linters. Test suite still green: 28/28 context_resolver tests pass, 124/124 guardkit suite passes (no regressions from formatting)."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "bdd_failure",
+      "description": "BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.",
+      "scenarios_failed": 1,
+      "scenarios_passed": 0,
+      "scenarios_pending": 0,
+      "feature_files": [
+        "features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature"
+      ],
+      "failure_examples": [
+        "pytest_runner_error \u2014 pytest_runner_error: exit=4; ERROR: not found: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/features/guardkit-comman"
+      ]
+    }
+  ],
+  "rationale": "BDD scenarios failed: 1 scenario(s) reported assertion failure during pytest-bdd execution.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1133/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- CREATED_AT_PATTERN_VERSION\n- CALLED_BY\n\n### \u26a0\ufe0f Warnings\n- HAS_INCORRECT_PATH_REFERENCE\n- USES_ENDPOINT\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATE_TO_TASK_WORK\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO\n- HAS_RESULT_LOCATION\n\n\n## Previous Turn Summary (Turn 1)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 All modified files pass project-configured lint/format checks with zero\n\n**Acceptance Criteria Status**:\n  \u25cb AC-001: verified\n  \u25cb AC-002: verified\n  \u25cb AC-003: verified\n  \u25cb AC-004: verified\n  \u25cb AC-005: verified\n  \u25cb AC-006: verified\n  \u25cb AC-007: verified\n  \u25cb AC-008: verified\n  \u25cb AC-009: verified\n  \u25cb AC-010: verified\n  \u25cb AC-011: verified\n  \u25cb AC-012: verified\n  \u2717 AC-013: rejected",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

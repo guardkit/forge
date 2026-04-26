@@ -1,0 +1,203 @@
+{
+  "task_id": "TASK-GCI-006",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/git/test_operations.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    ".guardkit/bdd/TASK-GCI-006_junit.xml",
+    ".guardkit/bdd/TASK-GCI-007_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/src/forge/adapters/git/operations.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/git/test_operations.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_context_resolver.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/git/test_operations.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001 four functions in operations.py returning GitOpResult",
+    "AC-002 every git call goes through the injected execute callable; no subprocess.run / os.system / shell=True",
+    "AC-003 cwd is the build worktree (or the source repo for prepare_worktree)",
+    "AC-004 prepare_worktree runs git worktree add and returns worktree_path",
+    "AC-005 commit_all runs add/commit/rev-parse and returns sha",
+    "AC-006 push runs git push origin <branch> and converts non-zero into status=failed with stderr",
+    "AC-007 cleanup_worktree runs git worktree remove --force best-effort: logs warning, returns failed, never raises",
+    "AC-008 every function is wrapped in try/except Exception with type:msg in stderr (ADR-ARCH-025)",
+    "AC-009 shell metacharacters pass as literal argv tokens (verified by unit test)",
+    "AC-010 unit tests with fake execute cover success, non-zero exit, raised exception, and shell-metacharacter passthrough for each operation",
+    "Seam tests (@pytest.mark.seam @pytest.mark.integration_contract('git_adapter_subprocess_contract')) hit a real git binary"
+  ],
+  "requirements_remaining": [
+    "AC-011 lint/format check against the project-configured tooling \u2014 no project-level black/ruff config was found in pyproject.toml; code is formatted to PEP 8 / 88-col / type hints per .claude/rules/code-style.md and compiles cleanly under py_compile."
+  ],
+  "sdk_turns_used": 53,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 18,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "All four functions in src/forge/adapters/git/operations.py, returning GitOpResult",
+      "status": "complete",
+      "evidence": "src/forge/adapters/git/operations.py defines prepare_worktree, commit_all, push, and cleanup_worktree. Each is async and the return type annotation is GitOpResult (re-exported from forge.adapters.git.models). Verified by tests TestPrepareWorktree::test_success_populates_worktree_path, TestCommitAll::test_success_returns_sha_from_rev_parse, TestPush::test_success_returns_success_with_zero_exit, TestCleanupWorktree::test_success_removes_worktree.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Every call goes through DeepAgents execute (no subprocess.run / os.system direct usage \u2014 permissions are enforced by the framework)",
+      "status": "complete",
+      "evidence": "All four operations accept a keyword-only `execute: ExecuteCallable` and delegate every git invocation through it. The default `_default_execute` uses asyncio.create_subprocess_exec (no shell, list tokens) so the in-module surface honours the same contract. TestAdapterContract::test_no_subprocess_run_or_os_system_in_module source-scans operations.py and rejects 'subprocess.run(', 'os.system(', and 'shell=True,' / 'shell=True)'. The test fixtures inject a FakeExecute and the assertion side checks that the recorded calls are the only path used.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "All calls run with cwd inside the build's worktree (Scenario 'Subprocesses are executed inside the current build's worktree')",
+      "status": "complete",
+      "evidence": "commit_all, push, and cleanup_worktree pass cwd=str(worktree) (cleanup uses worktree.parent so the to-be-removed path is not the cwd). prepare_worktree is the documented exception: the worktree does not yet exist, so cwd=str(repo) (source repo). TestCommitAll::test_success_returns_sha_from_rev_parse asserts every recorded call's cwd matches str(worktree); TestPush::test_success_returns_success_with_zero_exit asserts the same for push; TestPrepareWorktree::test_command_is_list_tokens_and_cwd_is_repo asserts cwd=str(repo) for prepare_worktree.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "prepare_worktree creates /var/forge/builds/{build_id}/, runs git worktree add <path> <branch>, returns GitOpResult.worktree_path",
+      "status": "complete",
+      "evidence": "prepare_worktree builds the path as `builds_root / build_id` (default builds_root = Path('/var/forge/builds')), issues `['git', 'worktree', 'add', str(path), branch]` via the injected execute, and on exit_code 0 returns GitOpResult(status='success', operation='prepare_worktree', worktree_path=str(path), exit_code=0). TestPrepareWorktree::test_success_populates_worktree_path and test_command_is_list_tokens_and_cwd_is_repo verify this. Builds_root is overridable for tests but defaults to /var/forge/builds in production.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "commit_all runs git add -A && git commit -m <msg> and returns GitOpResult.sha (parsed from git rev-parse HEAD after the commit)",
+      "status": "complete",
+      "evidence": "commit_all issues three sequential execute calls: ['git','add','-A'], ['git','commit','-m', message], ['git','rev-parse','HEAD']. The third call's stdout is stripped and assigned to GitOpResult.sha on success. TestCommitAll::test_success_returns_sha_from_rev_parse verifies the call sequence and that sha == 'abc1234567890abcdef'. The 'nothing to commit' real-world case is exercised by TestCommitAll::test_commit_with_nothing_to_commit_returns_failed_with_stdout (preserves stdout in stderr field of GitOpResult).",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "push runs git push origin <branch> and converts non-zero exit into status='failed' with stderr preserved",
+      "status": "complete",
+      "evidence": "push issues ['git','push','origin', remote_branch] and on non-zero exit returns GitOpResult(status='failed', operation='push', stderr=<stderr-or-stdout>, exit_code=<code>). TestPush::test_non_zero_exit_preserves_stderr feeds exit_code=1 + stderr='! [rejected] non-fast-forward' and asserts status=='failed', exit_code==1, 'rejected' in result.stderr.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "cleanup_worktree runs git worktree remove <path> --force and returns status='failed' on non-zero exit but logs and continues",
+      "status": "complete",
+      "evidence": "cleanup_worktree issues ['git','worktree','remove', str(worktree), '--force'] from worktree.parent. On non-zero exit it logger.warnings with prefix 'cleanup_worktree non-zero exit (best-effort, ...)' and returns GitOpResult(status='failed', ...) without raising. On exception it logger.exceptions 'cleanup_worktree exception (best-effort, ...)' and returns GitOpResult(status='failed', stderr='<Type>: <msg>'). TestCleanupWorktree::test_failure_logs_warning_and_returns_failed_without_raising and test_exception_in_execute_logs_and_returns_failed verify both branches; the seam test test_seam_cleanup_worktree_failure_does_not_block exercises the contract against a real git binary on a non-existent path.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Each function is wrapped in try/except Exception as exc returning GitOpResult(status='failed', operation=..., stderr=f'{type(exc).__name__}: {exc}') \u2014 never raises (ADR-ARCH-025)",
+      "status": "complete",
+      "evidence": "All four operations have a try: ... except Exception as exc: ... block ending in return _exception_failure(operation, exc), which constructs GitOpResult(status='failed', operation=<op>, stderr=f'{type(exc).__name__}: {exc}', exit_code=-1). TestPrepareWorktree::test_exception_in_execute_does_not_raise (OSError -> 'OSError: disk gone'), TestCommitAll::test_exception_in_execute_does_not_raise (RuntimeError -> 'RuntimeError: kaboom'), TestPush::test_exception_in_execute_does_not_raise (ConnectionError -> 'ConnectionError: network down'), and TestCleanupWorktree::test_exception_in_execute_logs_and_returns_failed (OSError -> 'OSError: permission denied') verify each.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Arguments containing shell metacharacters are passed as separate list tokens to execute, never via shell-string concatenation",
+      "status": "complete",
+      "evidence": "Every operation builds `command=['git', ...]` with each argument as a discrete list element \u2014 there is no f-string concatenation into a shell line and the default executor uses create_subprocess_exec (no shell). TestCommitAll::test_message_with_shell_metacharacters_passed_as_literal_token feeds nasty='feat: pwn; rm -rf / && echo \"owned\"' and asserts (a) commit_call.command == ['git','commit','-m', nasty] and (b) commit_call.command[3] is nasty (identity check \u2014 the message survives untouched as a single argv slot). TestAdapterContract::test_no_subprocess_run_or_os_system_in_module rejects 'shell=True,' / 'shell=True)' in the source.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Unit tests with a fake execute: success path for each op, non-zero exit, raised exception, shell-metacharacter argument passthrough",
+      "status": "complete",
+      "evidence": "tests/forge/adapters/git/test_operations.py defines a FakeExecute dataclass that records every call and replays scripted ExecuteResults / raised exceptions. Coverage matrix: prepare_worktree (success / non-zero / exception), commit_all (success / add-fail / commit-fail-with-stdout / exception / shell-metacharacter), push (success / non-zero / exception), cleanup_worktree (success / non-zero-best-effort / exception). 16 unit tests + 2 seam tests = 18 total, all passing.",
+      "test_file": "tests/forge/adapters/git/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "uncertain",
+      "evidence": "No project-level lint/format tool config (black, ruff, flake8) is declared in pyproject.toml or as a dev dependency in this worktree. Code is hand-formatted to the project rules in .claude/rules/code-style.md (PEP 8, 88-col, type hints, snake_case, f-strings, context managers) and compiles cleanly under `python3 -m py_compile`. If a CI lint job runs ruff/black, it should pass \u2014 but with no configured baseline I cannot assert it deterministically. Marked uncertain rather than complete to flag for the Coach.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/git/operations.py",
+        "tests/forge/adapters/git/test_operations.py"
+      ]
+    }
+  ]
+}

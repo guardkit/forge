@@ -1,0 +1,216 @@
+{
+  "task_id": "TASK-GCI-005",
+  "turn": 2,
+  "files_modified": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coverage.json",
+    ".guardkit/autobuild/TASK-GCI-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_2.json",
+    ".guardkit/bdd/TASK-GCI-003_junit.xml",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    ".guardkit/bdd/TASK-GCI-006_junit.xml",
+    ".guardkit/bdd/TASK-GCI-007_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/bdd/test_guardkit_command_invocation_engine.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/bdd/test_guardkit_command_invocation_engine.py",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_context_resolver.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_2.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-005/player_turn_2.json",
+    "conftest.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/bdd/test_guardkit_command_invocation_engine.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001..AC-009 (all 9 ACs from turn 1, still satisfied \u2014 production source unchanged)",
+    "Turn 2 must_fix: BDD scenarios for @task:TASK-GCI-005 are now wired to executable step definitions and pass under correct pytest invocation"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 56,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 130,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "subscribe_progress async context manager in src/forge/adapters/guardkit/progress_subscriber.py",
+      "status": "complete",
+      "evidence": "Implemented in turn 1 as `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified by `TestModuleSurface::test_subscribe_progress_is_async_context_manager` and `test_module_path`. Turn 2 also exercises it via the new BDD scenario `test_key_example_progress_streamed_while_running`.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "ProgressSink retains the most recent event per (build_id, subcommand) pair; old events are evicted under back-pressure (Scenario 'Progress events emitted faster than Forge consumes them are still observable for live status')",
+      "status": "complete",
+      "evidence": "ProgressSink uses `collections.deque(maxlen=N)` for O(1) drop-oldest back-pressure. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` AND by the new BDD scenario `test_edge_case_back_pressure_most_recent_observable` (10 events into a 3-slot sink \u2014 Then-step asserts the most-recent 3 are retained and the latest seq=10).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Unsubscribe runs on context-manager exit, including the exception path",
+      "status": "complete",
+      "evidence": "`async with subscribe_progress` wraps `yield` in try/finally and awaits `sub.unsubscribe()` in the finally; a nested try/except swallows broker-side cleanup errors. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit`, and `test_unsubscribe_failure_does_not_propagate`. The BDD `test_key_example_progress_streamed_while_running` scenario exercises the normal-exit cleanup path as well.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "If the NATS client is None or unavailable, subscribe_progress yields a no-op subscription that records a single progress_stream_unavailable warning to the sink and the surrounding call still proceeds (Scenario 'The authoritative result still returns when progress streaming is unavailable')",
+      "status": "complete",
+      "evidence": "Two no-op paths: nats_client=None and subscribe() raising. Verified by unit tests `TestUnavailableClient::test_none_client_is_noop_and_warns` and `test_subscribe_failure_yields_noop`, AND by the new BDD scenario `test_edge_case_authoritative_result_when_stream_unavailable` (drives `subscribe_progress(None, ...)` and asserts a `GuardKitResult` is still returned with artefacts AND that the sink carries a `progress_stream_unavailable` warning).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Each subscription is scoped to one pipeline.stage-complete.{build_id}.{subcommand} subject \u2014 two parallel invocations within the same build receive independent event streams (Scenario 'Parallel GuardKit invocations in the same build do not corrupt each other's results')",
+      "status": "complete",
+      "evidence": "`subject_for(build_id, subcommand)` builds the literal `pipeline.stage-complete.{build_id}.{subcommand}` subject; `subscribe_progress` subscribes only to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands receive independent event streams).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Two concurrent builds against the same repo get isolated sinks (no shared state, ASSUM-007)",
+      "status": "complete",
+      "evidence": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks` (two distinct sinks for two build_ids; cross-build queries return None).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Invalid payloads (malformed JSON, missing fields) are dropped with a structured warning, never raised",
+      "status": "complete",
+      "evidence": "Inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in try/except for `ValidationError`, `ValueError`, `TypeError`; on failure it records `PROGRESS_PAYLOAD_INVALID` warning and returns. Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (continued consumption after a bad payload).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Unit tests with a fake NATS client: ordered delivery, back-pressure eviction, malformed payload, unavailable client, parallel subscriptions",
+      "status": "complete",
+      "evidence": "22 unit tests in `test_progress_subscriber.py` using hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage matrix: ordered delivery, back-pressure, malformed payload (3 cases), unavailable client (2 paths), parallel subscriptions (2 patterns). Plus 3 BDD scenarios in `tests/bdd/test_guardkit_command_invocation_engine.py` driving the real `subscribe_progress` against a fake NATS client. Total: 25 tests, all passing.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "`ruff check` reports 'All checks passed!' on `src/forge/adapters/guardkit/progress_subscriber.py`, `tests/forge/adapters/guardkit/test_progress_subscriber.py`, and `tests/bdd/test_guardkit_command_invocation_engine.py`. `ruff format --check` reports all three are formatted to project default.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py",
+        "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+        "tests/bdd/test_guardkit_command_invocation_engine.py"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+{
+  "task_id": "TASK-GCI-004",
+  "turn": 3,
+  "files_modified": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coverage.json",
+    ".guardkit/autobuild/TASK-GCI-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_4.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_3.json",
+    ".guardkit/bdd/TASK-GCI-003_junit.xml",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    ".guardkit/bdd/TASK-GCI-006_junit.xml",
+    ".guardkit/bdd/TASK-GCI-007_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/conftest.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/bdd/test_guardkit_command_invocation_engine.py",
+    "conftest.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/bdd/test_guardkit_command_invocation_engine.py",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_context_resolver.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_4.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-004/player_turn_3.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/conftest.py",
+    "/tmp/test_conftest.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/bdd/test_guardkit_command_invocation_engine.py",
+    "/tmp/test_conftest.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001 \u2014 parse_guardkit_output() exists at src/forge/adapters/guardkit/parser.py (turn 2)",
+    "AC-002 \u2014 timed_out=True takes precedence over exit_code (turn 2)",
+    "AC-003 \u2014 non-zero exit yields failed + stderr preserved (turn 2)",
+    "AC-004 \u2014 recognised shape populates artefacts/coach_score/criterion_breakdown/detection_findings (turn 2)",
+    "AC-005 \u2014 unknown shape degrades to success-empty (turn 2)",
+    "AC-006 \u2014 stdout_tail is the last 4 KB; verbatim when smaller (turn 2)",
+    "AC-007 \u2014 byte-safe multi-byte UTF-8 tail (turn 2)",
+    "AC-008 \u2014 internal errors become parser_unrecognised_shape warnings, never raised (turn 2)",
+    "AC-009 \u2014 unit tests cover all listed scenarios (turn 2)",
+    "AC-010 \u2014 black --check clean on src/forge/adapters/guardkit/parser.py + tests/forge/adapters/guardkit/test_parser.py + new conftest.py + extended tests/bdd/test_guardkit_command_invocation_engine.py (turn 3 reformat)",
+    "BDD oracle (turn 3) \u2014 5 @task:TASK-GCI-004 Gherkin scenarios bound to step functions, all passing"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 97,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 5,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "parse_guardkit_output() in src/forge/adapters/guardkit/parser.py",
+      "status": "complete",
+      "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (verified by inspect.getsourcefile in TestParserModuleSurface; AST inspection in test_parser_module_does_not_import_subprocess_wrapper additionally confirms the parser does not import any subprocess module, satisfying the 'pure function on its inputs' Implementation Note). No code changes in turn 3 \u2014 implementation from turn 2 is intact and pytest re-run reports 38 passed in 0.02s.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "timed_out=True \u2192 status='timeout', regardless of exit_code (Scenario 'A subprocess that exceeds the timeout is reported as timed-out')",
+      "status": "complete",
+      "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are all preserved on the timeout path. Unchanged from turn 2.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "timed_out=False, exit_code != 0 \u2192 status='failed', stderr preserved (Scenario 'A non-zero exit is reported as a failure with the subprocess error output')",
+      "status": "complete",
+      "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr. TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test. Turn 3 also wires the matching @negative Gherkin scenario ('A non-zero exit is reported as a failure with the subprocess error output') to step functions that drive the real parser and assert the exit code + stderr propagate through to the structured result; pytest-bdd run reports the scenario as passed.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "timed_out=False, exit_code == 0, recognised shape \u2192 status='success', artefacts/coach_score/criterion_breakdown/detection_findings populated",
+      "status": "complete",
+      "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table with header-row filtering), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip. Unchanged from turn 2.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "timed_out=False, exit_code == 0, unrecognised shape \u2192 status='success', artefacts=[], no exception raised (Scenario 'An unknown GuardKit output shape degrades to success with no artefacts')",
+      "status": "complete",
+      "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser. Turn 3 additionally wires the matching @negative @edge-case Gherkin scenario ('An unknown GuardKit output shape degrades to success with no artefacts') to step functions that feed unknown stdout to the real parser and assert status=='success', artefacts==[], and no exception escaped via gci_world['parser_raised']; pytest-bdd reports the scenario as passed.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "stdout_tail is the last 4 KB of stdout when stdout is larger than 4 KB; preserves stdout verbatim when it is smaller",
+      "status": "complete",
+      "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start. Turn 3 additionally wires the two @boundary scenarios ('A compact stdout is preserved verbatim in the returned result' and 'A large stdout is truncated to the most recent tail in the returned result') to step functions that craft compact and oversize stdout inputs, drive the real parser, and assert (a) verbatim preservation when below the cap and (b) tail-marker presence + head-marker absence + len(tail.encode('utf-8'))==_STDOUT_TAIL_BYTES on oversize input. Both scenarios pass.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is sliced safely with errors='ignore' on the decode of the leading remainder)",
+      "status": "complete",
+      "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake). Unchanged from turn 2.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced as GuardKitWarning(code='parser_unrecognised_shape', \u2026); never propagate as exceptions (Scenario 'An unexpected error inside a wrapper is returned as a structured error, not raised')",
+      "status": "complete",
+      "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings and a mock.patch-injected RuntimeError on _extract_artefacts; status remains 'success' in every case. Turn 3 additionally wires the @key-example @smoke scenario ('A failing GuardKit subprocess is reported as a structured error, not an exception') to a step function that drives the parser through a try/except, records any escaping exception on gci_world['parser_raised'], and asserts the boundary contract: parser_raised is None, the result is a structured failure (status='failed', stderr preserved), and no exception propagated to the reasoning model.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Unit tests cover: success-with-artefacts, success-empty, success-unknown-shape, failed-with-stderr, timeout, stdout < 4 KB, stdout >> 4 KB, multi-byte stdout tail, malformed JSON in stdout",
+      "status": "complete",
+      "evidence": "test_parser.py contains 38 unit tests across 7 classes (TestParserModuleSurface, TestTimeoutTakesPrecedenceOverExitCode, TestNonZeroExitYieldsFailedWithStderr, TestRecognisedShapeYieldsSuccessWithArtefacts, TestUnrecognisedShapeDegradesToSuccessEmpty, TestStdoutTailTruncation, TestInternalErrorsBecomeWarningsNotRaises, TestResultFieldsAlwaysPopulated). All nine listed scenarios are covered. Turn 3 adds 5 BDD scenarios on top, exercising the same parser against Gherkin Given/When/Then phrasing \u2014 the BDD oracle now reports tests=5, errors=0, failures=0 for @task:TASK-GCI-004. Combined turn-3 pytest run: 38 unit tests + 5 BDD scenarios = 43 parser-related tests passing.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Per .claude/rules/code-style.md: Black formatter, line-length 88. Ran 'python3 -m black --check --line-length 88 --target-version py312 conftest.py tests/bdd/test_guardkit_command_invocation_engine.py src/forge/adapters/guardkit/parser.py tests/forge/adapters/guardkit/test_parser.py' \u2192 '4 files would be left unchanged.' Black reformatted the BDD test file once during turn 3 (trailing-blank-line normalisation); subsequent --check is clean. Type hints (PEP 604 union syntax), snake_case functions, PascalCase classes, UPPER_CASE constants, f-strings, and list comprehensions are all aligned with the documented style guide. pytest re-run after reformat: 38 unit + 5 BDD passed.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py",
+        "tests/forge/adapters/guardkit/test_parser.py",
+        "conftest.py",
+        "tests/bdd/test_guardkit_command_invocation_engine.py"
+      ]
+    }
+  ]
+}

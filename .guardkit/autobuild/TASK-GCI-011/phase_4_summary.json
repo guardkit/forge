@@ -1,0 +1,7 @@
+{
+  "tests_run": 34,
+  "tests_failed": 0,
+  "coverage_pct": 99.0,
+  "output_summary": "pytest tests/bdd/test_guardkit_command_invocation_engine.py: 34 passed, 0 failed; BDD test file line coverage 99%.",
+  "quality_gates_passed": true
+}

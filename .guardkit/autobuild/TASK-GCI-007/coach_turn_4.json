@@ -1,0 +1,178 @@
+{
+  "task_id": "TASK-GCI-007",
+  "turn": 4,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/bdd/test_guardkit_command_invocation_engine.py tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_context_resolver.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_context_resolver.py::TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected PASSED [ 51%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-search] PASSED [ 52%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-export] PASSED [ 53%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-import] PASSED [ 54%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-prune] PASSED [ 54%]\nResult:\ntests/forge/adapters/git/test_operations.py:478\n/home/richardwoollcott/Projects/appmilla_githu...",
+      "duration_seconds": 0.6626536846160889
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`create_pr()` in `src/forge/adapters/gh/operations.py`, returning",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "create_pr is implemented in src/forge/adapters/gh/operations.py with signature (worktree: Path, title: str, body: str, base: str = 'main', draft: bool = False) -> PRResult, exported via src/forge/adapters/gh/__init__.py. Verified by TestCreatePrReturnContract (4 tests) which check isinstance(result, PRResult) on every code path (missing creds, success, failure, exception). The BDD key-example oracle also asserts isinstance(result, PRResult) on the happy path.",
+      "notes": "create_pr is implemented in src/forge/adapters/gh/operations.py with signature (worktree: Path, title: str, body: str, base: str = 'main', draft: bool = False) -> PRResult, exported via src/forge/adapters/gh/__init__.py. Verified by TestCreatePrReturnContract (4 tests) which check isinstance(result, PRResult) on every code path (missing creds, success, failure, exception). The BDD key-example oracle also asserts isinstance(result, PRResult) on the happy path."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Pre-flight check: if `GH_TOKEN` is unset (or empty) in `os.environ`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "create_pr() reads os.environ.get('GH_TOKEN', '') on every call (no import-time caching) and returns _missing_credentials_result() when the value is falsy. Verified by TestCreatePrMissingCredentials::test_missing_gh_token_returns_missing_credentials_failure (asserts execute_mock.assert_not_called()), test_empty_gh_token_is_treated_as_missing (asserts the same for empty-string), and test_gh_token_is_re_read_on_every_call (toggles env between calls). BDD scenario test_negative_create_pr_missing_credentials passes against the real adapter via the pytest-bdd oracle.",
+      "notes": "create_pr() reads os.environ.get('GH_TOKEN', '') on every call (no import-time caching) and returns _missing_credentials_result() when the value is falsy. Verified by TestCreatePrMissingCredentials::test_missing_gh_token_returns_missing_credentials_failure (asserts execute_mock.assert_not_called()), test_empty_gh_token_is_treated_as_missing (asserts the same for empty-string), and test_gh_token_is_re_read_on_every_call (toggles env between calls). BDD scenario test_negative_create_pr_missing_credentials passes against the real adapter via the pytest-bdd oracle."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "On success, parse the PR URL from gh's stdout and populate",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] with optional '--draft' append, and create_pr passes cwd=str(worktree) to _execute. Verified by test_default_command_shape_uses_separate_tokens (exact list match), test_draft_flag_appends_dash_dash_draft (--draft & --base develop override), and BDD test_key_example_create_pr_success which asserts cwd == str(worktree) and the canonical argv shape.",
+      "notes": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] with optional '--draft' append, and create_pr passes cwd=str(worktree) to _execute. Verified by test_default_command_shape_uses_separate_tokens (exact list match), test_draft_flag_appends_dash_dash_draft (--draft & --base develop override), and BDD test_key_example_create_pr_success which asserts cwd == str(worktree) and the canonical argv shape."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "On non-zero exit, `PRResult(status=\"failed\", stderr=...)`, no",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Module-level _PR_URL_PATTERN regex r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)' is searched against stdout.strip(); match.group(0) becomes pr_url and int(match.group(1)) becomes pr_number. Verified by test_success_parses_pr_url_and_number_from_stdout (expects pr_number=123) and test_pr_number_parsed_from_trailing_slash_component (multiline stdout, expects pr_number=4567). BDD scenario asserts pr_number=77.",
+      "notes": "Module-level _PR_URL_PATTERN regex r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)' is searched against stdout.strip(); match.group(0) becomes pr_url and int(match.group(1)) becomes pr_number. Verified by test_success_parses_pr_url_and_number_from_stdout (expects pr_number=123) and test_pr_number_parsed_from_trailing_slash_component (multiline stdout, expects pr_number=4567). BDD scenario asserts pr_number=77."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Function body wrapped in `try/except Exception as exc:` returning a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When exit_code != 0, create_pr returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None) without raising. error_code remains None (only credential failures populate it). Verified by test_non_zero_exit_returns_failed_with_stderr which asserts 'not a git repository' in result.stderr and result.error_code is None.",
+      "notes": "When exit_code != 0, create_pr returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None) without raising. error_code remains None (only credential failures populate it). Verified by test_non_zero_exit_returns_failed_with_stderr which asserts 'not a git repository' in result.stderr and result.error_code is None."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Arguments containing shell metacharacters (e.g. backticks in PR body)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The _execute call is wrapped in try/except Exception, converting exc to PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Verified by test_execute_exception_is_caught_and_returned_as_failed (RuntimeError) and test_return_type_is_prresult_on_exception (ValueError). Also catches the 0-exit-no-URL contract violation as 'failed' to avoid fabricating success.",
+      "notes": "The _execute call is wrapped in try/except Exception, converting exc to PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Verified by test_execute_exception_is_caught_and_returned_as_failed (RuntimeError) and test_return_type_is_prresult_on_exception (ValueError). Also catches the 0-exit-no-URL contract violation as 'failed' to avoid fabricating success."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Unit tests: missing GH_TOKEN, success path with parsed URL, non-zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_build_command() builds a Python list and passes each user value as its own argv element; _execute uses asyncio.create_subprocess_exec(*command) (no shell=True, no string concatenation). Verified by test_backticks_in_body_pass_through_literal ('Run `rm -rf /` to test'), test_dollar_signs_in_body_pass_through_literal ('Set $HOME and $PATH explicitly'), and test_metacharacters_in_title_pass_through_literal ('Fix `bug` in $service && rm tmp'). Each asserts the literal string is the next list element after --body or --title.",
+      "notes": "_build_command() builds a Python list and passes each user value as its own argv element; _execute uses asyncio.create_subprocess_exec(*command) (no shell=True, no string concatenation). Verified by test_backticks_in_body_pass_through_literal ('Run `rm -rf /` to test'), test_dollar_signs_in_body_pass_through_literal ('Set $HOME and $PATH explicitly'), and test_metacharacters_in_title_pass_through_literal ('Fix `bug` in $service && rm tmp'). Each asserts the literal string is the next list element after --body or --title."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/forge/adapters/gh/test_operations.py contains 17 tests organised into 5 test classes mirroring the AC list: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All 17 unit tests + 2 BDD oracle scenarios pass. Code uses type hints, snake_case, f-strings, list-token argv, max line under 88, follows the project's PEP 8 / Black conventions documented in .claude/rules/code-style.md.",
+      "notes": "tests/forge/adapters/gh/test_operations.py contains 17 tests organised into 5 test classes mirroring the AC list: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All 17 unit tests + 2 BDD oracle scenarios pass. Code uses type hints, snake_case, f-strings, list-token argv, max line under 88, follows the project's PEP 8 / Black conventions documented in .claude/rules/code-style.md."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`create_pr()` in `src/forge/adapters/gh/operations.py`, returning",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "create_pr is implemented in src/forge/adapters/gh/operations.py with signature (worktree: Path, title: str, body: str, base: str = 'main', draft: bool = False) -> PRResult, exported via src/forge/adapters/gh/__init__.py. Verified by TestCreatePrReturnContract (4 tests) which check isinstance(result, PRResult) on every code path (missing creds, success, failure, exception). The BDD key-example oracle also asserts isinstance(result, PRResult) on the happy path.",
+        "notes": "create_pr is implemented in src/forge/adapters/gh/operations.py with signature (worktree: Path, title: str, body: str, base: str = 'main', draft: bool = False) -> PRResult, exported via src/forge/adapters/gh/__init__.py. Verified by TestCreatePrReturnContract (4 tests) which check isinstance(result, PRResult) on every code path (missing creds, success, failure, exception). The BDD key-example oracle also asserts isinstance(result, PRResult) on the happy path."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Pre-flight check: if `GH_TOKEN` is unset (or empty) in `os.environ`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "create_pr() reads os.environ.get('GH_TOKEN', '') on every call (no import-time caching) and returns _missing_credentials_result() when the value is falsy. Verified by TestCreatePrMissingCredentials::test_missing_gh_token_returns_missing_credentials_failure (asserts execute_mock.assert_not_called()), test_empty_gh_token_is_treated_as_missing (asserts the same for empty-string), and test_gh_token_is_re_read_on_every_call (toggles env between calls). BDD scenario test_negative_create_pr_missing_credentials passes against the real adapter via the pytest-bdd oracle.",
+        "notes": "create_pr() reads os.environ.get('GH_TOKEN', '') on every call (no import-time caching) and returns _missing_credentials_result() when the value is falsy. Verified by TestCreatePrMissingCredentials::test_missing_gh_token_returns_missing_credentials_failure (asserts execute_mock.assert_not_called()), test_empty_gh_token_is_treated_as_missing (asserts the same for empty-string), and test_gh_token_is_re_read_on_every_call (toggles env between calls). BDD scenario test_negative_create_pr_missing_credentials passes against the real adapter via the pytest-bdd oracle."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "On success, parse the PR URL from gh's stdout and populate",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] with optional '--draft' append, and create_pr passes cwd=str(worktree) to _execute. Verified by test_default_command_shape_uses_separate_tokens (exact list match), test_draft_flag_appends_dash_dash_draft (--draft & --base develop override), and BDD test_key_example_create_pr_success which asserts cwd == str(worktree) and the canonical argv shape.",
+        "notes": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] with optional '--draft' append, and create_pr passes cwd=str(worktree) to _execute. Verified by test_default_command_shape_uses_separate_tokens (exact list match), test_draft_flag_appends_dash_dash_draft (--draft & --base develop override), and BDD test_key_example_create_pr_success which asserts cwd == str(worktree) and the canonical argv shape."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "On non-zero exit, `PRResult(status=\"failed\", stderr=...)`, no",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Module-level _PR_URL_PATTERN regex r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)' is searched against stdout.strip(); match.group(0) becomes pr_url and int(match.group(1)) becomes pr_number. Verified by test_success_parses_pr_url_and_number_from_stdout (expects pr_number=123) and test_pr_number_parsed_from_trailing_slash_component (multiline stdout, expects pr_number=4567). BDD scenario asserts pr_number=77.",
+        "notes": "Module-level _PR_URL_PATTERN regex r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)' is searched against stdout.strip(); match.group(0) becomes pr_url and int(match.group(1)) becomes pr_number. Verified by test_success_parses_pr_url_and_number_from_stdout (expects pr_number=123) and test_pr_number_parsed_from_trailing_slash_component (multiline stdout, expects pr_number=4567). BDD scenario asserts pr_number=77."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Function body wrapped in `try/except Exception as exc:` returning a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When exit_code != 0, create_pr returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None) without raising. error_code remains None (only credential failures populate it). Verified by test_non_zero_exit_returns_failed_with_stderr which asserts 'not a git repository' in result.stderr and result.error_code is None.",
+        "notes": "When exit_code != 0, create_pr returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None) without raising. error_code remains None (only credential failures populate it). Verified by test_non_zero_exit_returns_failed_with_stderr which asserts 'not a git repository' in result.stderr and result.error_code is None."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Arguments containing shell metacharacters (e.g. backticks in PR body)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The _execute call is wrapped in try/except Exception, converting exc to PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Verified by test_execute_exception_is_caught_and_returned_as_failed (RuntimeError) and test_return_type_is_prresult_on_exception (ValueError). Also catches the 0-exit-no-URL contract violation as 'failed' to avoid fabricating success.",
+        "notes": "The _execute call is wrapped in try/except Exception, converting exc to PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Verified by test_execute_exception_is_caught_and_returned_as_failed (RuntimeError) and test_return_type_is_prresult_on_exception (ValueError). Also catches the 0-exit-no-URL contract violation as 'failed' to avoid fabricating success."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Unit tests: missing GH_TOKEN, success path with parsed URL, non-zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_build_command() builds a Python list and passes each user value as its own argv element; _execute uses asyncio.create_subprocess_exec(*command) (no shell=True, no string concatenation). Verified by test_backticks_in_body_pass_through_literal ('Run `rm -rf /` to test'), test_dollar_signs_in_body_pass_through_literal ('Set $HOME and $PATH explicitly'), and test_metacharacters_in_title_pass_through_literal ('Fix `bug` in $service && rm tmp'). Each asserts the literal string is the next list element after --body or --title.",
+        "notes": "_build_command() builds a Python list and passes each user value as its own argv element; _execute uses asyncio.create_subprocess_exec(*command) (no shell=True, no string concatenation). Verified by test_backticks_in_body_pass_through_literal ('Run `rm -rf /` to test'), test_dollar_signs_in_body_pass_through_literal ('Set $HOME and $PATH explicitly'), and test_metacharacters_in_title_pass_through_literal ('Fix `bug` in $service && rm tmp'). Each asserts the literal string is the next list element after --body or --title."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/forge/adapters/gh/test_operations.py contains 17 tests organised into 5 test classes mirroring the AC list: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All 17 unit tests + 2 BDD oracle scenarios pass. Code uses type hints, snake_case, f-strings, list-token argv, max line under 88, follows the project's PEP 8 / Black conventions documented in .claude/rules/code-style.md.",
+        "notes": "tests/forge/adapters/gh/test_operations.py contains 17 tests organised into 5 test classes mirroring the AC list: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All 17 unit tests + 2 BDD oracle scenarios pass. Code uses type hints, snake_case, f-strings, list-token argv, max line under 88, follows the project's PEP 8 / Black conventions documented in .claude/rules/code-style.md."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 1037 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1094/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- BELONGS_TO_PROJECT\n- CREATED_AT\n\n### \u26a0\ufe0f Warnings\n- CREATES\n- HAS_ROOT_CAUSE\n\n### \ud83c\udfad Role Constraints\n- IS_CREATED_FOR\n- MUST_CONSULT_BEFORE_MODIFYING\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_PITFALL\n- HAS_SOURCE\n\n\n## Previous Turn Summary (Turn 3)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)\n- BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.\n\n**Acceptance Criteria Status**:\n  \u25cb AC-001: verified\n  \u25cb AC-002: verified\n  \u25cb AC-003: verified\n  \u25cb AC-004: verified\n  \u25cb AC-005: verified\n  \u25cb AC-006: verified\n  \u25cb AC-007: verified\n  \u25cb AC-008: verified",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

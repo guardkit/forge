@@ -1,0 +1,215 @@
+{
+  "task_id": "TASK-GCI-004",
+  "turn": 3,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest /tmp/test_conftest.py tests/bdd/test_guardkit_command_invocation_engine.py tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_context_resolver.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_context_resolver.py::TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected PASSED [ 51%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-search] PASSED [ 52%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-export] PASSED [ 53%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-import] PASSED [ 54%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-prune] PASSED [ 54%]\nResult:\ntests/forge/adapters/git/test_operations.py:478\n/home/richardwoollcott/Projects/appmilla_githu...",
+      "duration_seconds": 0.7182936668395996
+    },
+    "requirements": {
+      "criteria_total": 10,
+      "criteria_met": 10,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`parse_guardkit_output()` in `src/forge/adapters/guardkit/parser.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (verified by inspect.getsourcefile in TestParserModuleSurface; AST inspection in test_parser_module_does_not_import_subprocess_wrapper additionally confirms the parser does not import any subprocess module, satisfying the 'pure function on its inputs' Implementation Note). No code changes in turn 3 \u2014 implementation from turn 2 is intact and pytest re-run reports 38 passed in 0.02s.",
+      "notes": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (verified by inspect.getsourcefile in TestParserModuleSurface; AST inspection in test_parser_module_does_not_import_subprocess_wrapper additionally confirms the parser does not import any subprocess module, satisfying the 'pure function on its inputs' Implementation Note). No code changes in turn 3 \u2014 implementation from turn 2 is intact and pytest re-run reports 38 passed in 0.02s."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`timed_out=True` \u2192 `status=\"timeout\"`, regardless of `exit_code`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are all preserved on the timeout path. Unchanged from turn 2.",
+      "notes": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are all preserved on the timeout path. Unchanged from turn 2."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`timed_out=False, exit_code != 0` \u2192 `status=\"failed\"`, `stderr`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr. TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test. Turn 3 also wires the matching @negative Gherkin scenario ('A non-zero exit is reported as a failure with the subprocess error output') to step functions that drive the real parser and assert the exit code + stderr propagate through to the structured result; pytest-bdd run reports the scenario as passed.",
+      "notes": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr. TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test. Turn 3 also wires the matching @negative Gherkin scenario ('A non-zero exit is reported as a failure with the subprocess error output') to step functions that drive the real parser and assert the exit code + stderr propagate through to the structured result; pytest-bdd run reports the scenario as passed."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`timed_out=False, exit_code == 0, recognised shape` \u2192 `status=\"success\"`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table with header-row filtering), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip. Unchanged from turn 2.",
+      "notes": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table with header-row filtering), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip. Unchanged from turn 2."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`timed_out=False, exit_code == 0, unrecognised shape` \u2192",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser. Turn 3 additionally wires the matching @negative @edge-case Gherkin scenario ('An unknown GuardKit output shape degrades to success with no artefacts') to step functions that feed unknown stdout to the real parser and assert status=='success', artefacts==[], and no exception escaped via gci_world['parser_raised']; pytest-bdd reports the scenario as passed.",
+      "notes": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser. Turn 3 additionally wires the matching @negative @edge-case Gherkin scenario ('An unknown GuardKit output shape degrades to success with no artefacts') to step functions that feed unknown stdout to the real parser and assert status=='success', artefacts==[], and no exception escaped via gci_world['parser_raised']; pytest-bdd reports the scenario as passed."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`stdout_tail` is the **last** 4 KB of stdout when stdout is larger",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start. Turn 3 additionally wires the two @boundary scenarios ('A compact stdout is preserved verbatim in the returned result' and 'A large stdout is truncated to the most recent tail in the returned result') to step functions that craft compact and oversize stdout inputs, drive the real parser, and assert (a) verbatim preservation when below the cap and (b) tail-marker presence + head-marker absence + len(tail.encode('utf-8'))==_STDOUT_TAIL_BYTES on oversize input. Both scenarios pass.",
+      "notes": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start. Turn 3 additionally wires the two @boundary scenarios ('A compact stdout is preserved verbatim in the returned result' and 'A large stdout is truncated to the most recent tail in the returned result') to step functions that craft compact and oversize stdout inputs, drive the real parser, and assert (a) verbatim preservation when below the cap and (b) tail-marker presence + head-marker absence + len(tail.encode('utf-8'))==_STDOUT_TAIL_BYTES on oversize input. Both scenarios pass."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake). Unchanged from turn 2.",
+      "notes": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake). Unchanged from turn 2."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings and a mock.patch-injected RuntimeError on _extract_artefacts; status remains 'success' in every case. Turn 3 additionally wires the @key-example @smoke scenario ('A failing GuardKit subprocess is reported as a structured error, not an exception') to a step function that drives the parser through a try/except, records any escaping exception on gci_world['parser_raised'], and asserts the boundary contract: parser_raised is None, the result is a structured failure (status='failed', stderr preserved), and no exception propagated to the reasoning model.",
+      "notes": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings and a mock.patch-injected RuntimeError on _extract_artefacts; status remains 'success' in every case. Turn 3 additionally wires the @key-example @smoke scenario ('A failing GuardKit subprocess is reported as a structured error, not an exception') to a step function that drives the parser through a try/except, records any escaping exception on gci_world['parser_raised'], and asserts the boundary contract: parser_raised is None, the result is a structured failure (status='failed', stderr preserved), and no exception propagated to the reasoning model."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Unit tests cover: success-with-artefacts, success-empty,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "test_parser.py contains 38 unit tests across 7 classes (TestParserModuleSurface, TestTimeoutTakesPrecedenceOverExitCode, TestNonZeroExitYieldsFailedWithStderr, TestRecognisedShapeYieldsSuccessWithArtefacts, TestUnrecognisedShapeDegradesToSuccessEmpty, TestStdoutTailTruncation, TestInternalErrorsBecomeWarningsNotRaises, TestResultFieldsAlwaysPopulated). All nine listed scenarios are covered. Turn 3 adds 5 BDD scenarios on top, exercising the same parser against Gherkin Given/When/Then phrasing \u2014 the BDD oracle now reports tests=5, errors=0, failures=0 for @task:TASK-GCI-004. Combined turn-3 pytest run: 38 unit tests + 5 BDD scenarios = 43 parser-related tests passing.",
+      "notes": "test_parser.py contains 38 unit tests across 7 classes (TestParserModuleSurface, TestTimeoutTakesPrecedenceOverExitCode, TestNonZeroExitYieldsFailedWithStderr, TestRecognisedShapeYieldsSuccessWithArtefacts, TestUnrecognisedShapeDegradesToSuccessEmpty, TestStdoutTailTruncation, TestInternalErrorsBecomeWarningsNotRaises, TestResultFieldsAlwaysPopulated). All nine listed scenarios are covered. Turn 3 adds 5 BDD scenarios on top, exercising the same parser against Gherkin Given/When/Then phrasing \u2014 the BDD oracle now reports tests=5, errors=0, failures=0 for @task:TASK-GCI-004. Combined turn-3 pytest run: 38 unit tests + 5 BDD scenarios = 43 parser-related tests passing."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Per .claude/rules/code-style.md: Black formatter, line-length 88. Ran 'python3 -m black --check --line-length 88 --target-version py312 conftest.py tests/bdd/test_guardkit_command_invocation_engine.py src/forge/adapters/guardkit/parser.py tests/forge/adapters/guardkit/test_parser.py' \u2192 '4 files would be left unchanged.' Black reformatted the BDD test file once during turn 3 (trailing-blank-line normalisation); subsequent --check is clean. Type hints (PEP 604 union syntax), snake_case functions, PascalCase classes, UPPER_CASE constants, f-strings, and list comprehensions are all aligned with the documented style guide. pytest re-run after reformat: 38 unit + 5 BDD passed.",
+      "notes": "Per .claude/rules/code-style.md: Black formatter, line-length 88. Ran 'python3 -m black --check --line-length 88 --target-version py312 conftest.py tests/bdd/test_guardkit_command_invocation_engine.py src/forge/adapters/guardkit/parser.py tests/forge/adapters/guardkit/test_parser.py' \u2192 '4 files would be left unchanged.' Black reformatted the BDD test file once during turn 3 (trailing-blank-line normalisation); subsequent --check is clean. Type hints (PEP 604 union syntax), snake_case functions, PascalCase classes, UPPER_CASE constants, f-strings, and list comprehensions are all aligned with the documented style guide. pytest re-run after reformat: 38 unit + 5 BDD passed."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`parse_guardkit_output()` in `src/forge/adapters/guardkit/parser.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (verified by inspect.getsourcefile in TestParserModuleSurface; AST inspection in test_parser_module_does_not_import_subprocess_wrapper additionally confirms the parser does not import any subprocess module, satisfying the 'pure function on its inputs' Implementation Note). No code changes in turn 3 \u2014 implementation from turn 2 is intact and pytest re-run reports 38 passed in 0.02s.",
+        "notes": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (verified by inspect.getsourcefile in TestParserModuleSurface; AST inspection in test_parser_module_does_not_import_subprocess_wrapper additionally confirms the parser does not import any subprocess module, satisfying the 'pure function on its inputs' Implementation Note). No code changes in turn 3 \u2014 implementation from turn 2 is intact and pytest re-run reports 38 passed in 0.02s."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`timed_out=True` \u2192 `status=\"timeout\"`, regardless of `exit_code`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are all preserved on the timeout path. Unchanged from turn 2.",
+        "notes": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are all preserved on the timeout path. Unchanged from turn 2."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`timed_out=False, exit_code != 0` \u2192 `status=\"failed\"`, `stderr`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr. TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test. Turn 3 also wires the matching @negative Gherkin scenario ('A non-zero exit is reported as a failure with the subprocess error output') to step functions that drive the real parser and assert the exit code + stderr propagate through to the structured result; pytest-bdd run reports the scenario as passed.",
+        "notes": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr. TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test. Turn 3 also wires the matching @negative Gherkin scenario ('A non-zero exit is reported as a failure with the subprocess error output') to step functions that drive the real parser and assert the exit code + stderr propagate through to the structured result; pytest-bdd run reports the scenario as passed."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`timed_out=False, exit_code == 0, recognised shape` \u2192 `status=\"success\"`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table with header-row filtering), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip. Unchanged from turn 2.",
+        "notes": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table with header-row filtering), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip. Unchanged from turn 2."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`timed_out=False, exit_code == 0, unrecognised shape` \u2192",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser. Turn 3 additionally wires the matching @negative @edge-case Gherkin scenario ('An unknown GuardKit output shape degrades to success with no artefacts') to step functions that feed unknown stdout to the real parser and assert status=='success', artefacts==[], and no exception escaped via gci_world['parser_raised']; pytest-bdd reports the scenario as passed.",
+        "notes": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser. Turn 3 additionally wires the matching @negative @edge-case Gherkin scenario ('An unknown GuardKit output shape degrades to success with no artefacts') to step functions that feed unknown stdout to the real parser and assert status=='success', artefacts==[], and no exception escaped via gci_world['parser_raised']; pytest-bdd reports the scenario as passed."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`stdout_tail` is the **last** 4 KB of stdout when stdout is larger",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start. Turn 3 additionally wires the two @boundary scenarios ('A compact stdout is preserved verbatim in the returned result' and 'A large stdout is truncated to the most recent tail in the returned result') to step functions that craft compact and oversize stdout inputs, drive the real parser, and assert (a) verbatim preservation when below the cap and (b) tail-marker presence + head-marker absence + len(tail.encode('utf-8'))==_STDOUT_TAIL_BYTES on oversize input. Both scenarios pass.",
+        "notes": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start. Turn 3 additionally wires the two @boundary scenarios ('A compact stdout is preserved verbatim in the returned result' and 'A large stdout is truncated to the most recent tail in the returned result') to step functions that craft compact and oversize stdout inputs, drive the real parser, and assert (a) verbatim preservation when below the cap and (b) tail-marker presence + head-marker absence + len(tail.encode('utf-8'))==_STDOUT_TAIL_BYTES on oversize input. Both scenarios pass."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake). Unchanged from turn 2.",
+        "notes": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake). Unchanged from turn 2."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings and a mock.patch-injected RuntimeError on _extract_artefacts; status remains 'success' in every case. Turn 3 additionally wires the @key-example @smoke scenario ('A failing GuardKit subprocess is reported as a structured error, not an exception') to a step function that drives the parser through a try/except, records any escaping exception on gci_world['parser_raised'], and asserts the boundary contract: parser_raised is None, the result is a structured failure (status='failed', stderr preserved), and no exception propagated to the reasoning model.",
+        "notes": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings and a mock.patch-injected RuntimeError on _extract_artefacts; status remains 'success' in every case. Turn 3 additionally wires the @key-example @smoke scenario ('A failing GuardKit subprocess is reported as a structured error, not an exception') to a step function that drives the parser through a try/except, records any escaping exception on gci_world['parser_raised'], and asserts the boundary contract: parser_raised is None, the result is a structured failure (status='failed', stderr preserved), and no exception propagated to the reasoning model."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Unit tests cover: success-with-artefacts, success-empty,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "test_parser.py contains 38 unit tests across 7 classes (TestParserModuleSurface, TestTimeoutTakesPrecedenceOverExitCode, TestNonZeroExitYieldsFailedWithStderr, TestRecognisedShapeYieldsSuccessWithArtefacts, TestUnrecognisedShapeDegradesToSuccessEmpty, TestStdoutTailTruncation, TestInternalErrorsBecomeWarningsNotRaises, TestResultFieldsAlwaysPopulated). All nine listed scenarios are covered. Turn 3 adds 5 BDD scenarios on top, exercising the same parser against Gherkin Given/When/Then phrasing \u2014 the BDD oracle now reports tests=5, errors=0, failures=0 for @task:TASK-GCI-004. Combined turn-3 pytest run: 38 unit tests + 5 BDD scenarios = 43 parser-related tests passing.",
+        "notes": "test_parser.py contains 38 unit tests across 7 classes (TestParserModuleSurface, TestTimeoutTakesPrecedenceOverExitCode, TestNonZeroExitYieldsFailedWithStderr, TestRecognisedShapeYieldsSuccessWithArtefacts, TestUnrecognisedShapeDegradesToSuccessEmpty, TestStdoutTailTruncation, TestInternalErrorsBecomeWarningsNotRaises, TestResultFieldsAlwaysPopulated). All nine listed scenarios are covered. Turn 3 adds 5 BDD scenarios on top, exercising the same parser against Gherkin Given/When/Then phrasing \u2014 the BDD oracle now reports tests=5, errors=0, failures=0 for @task:TASK-GCI-004. Combined turn-3 pytest run: 38 unit tests + 5 BDD scenarios = 43 parser-related tests passing."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Per .claude/rules/code-style.md: Black formatter, line-length 88. Ran 'python3 -m black --check --line-length 88 --target-version py312 conftest.py tests/bdd/test_guardkit_command_invocation_engine.py src/forge/adapters/guardkit/parser.py tests/forge/adapters/guardkit/test_parser.py' \u2192 '4 files would be left unchanged.' Black reformatted the BDD test file once during turn 3 (trailing-blank-line normalisation); subsequent --check is clean. Type hints (PEP 604 union syntax), snake_case functions, PascalCase classes, UPPER_CASE constants, f-strings, and list comprehensions are all aligned with the documented style guide. pytest re-run after reformat: 38 unit + 5 BDD passed.",
+        "notes": "Per .claude/rules/code-style.md: Black formatter, line-length 88. Ran 'python3 -m black --check --line-length 88 --target-version py312 conftest.py tests/bdd/test_guardkit_command_invocation_engine.py src/forge/adapters/guardkit/parser.py tests/forge/adapters/guardkit/test_parser.py' \u2192 '4 files would be left unchanged.' Black reformatted the BDD test file once during turn 3 (trailing-blank-line normalisation); subsequent --check is clean. Type hints (PEP 604 union syntax), snake_case functions, PascalCase classes, UPPER_CASE constants, f-strings, and list comprehensions are all aligned with the documented style guide. pytest re-run after reformat: 38 unit + 5 BDD passed."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 1080 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1170/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- IS_PROJECT_OF\n- BELONGS_TO_PROJECT\n\n### \u26a0\ufe0f Warnings\n- RELATED_PROJECT\n- HAS_FIX\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- HAS_ROLE_MUST_DO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n- IS_USED_IN\n\n\n## Previous Turn Summary (Turn 2)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)\n- BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.\n\n**Acceptance Criteria Status**:\n  \u25cb AC-001: verified\n  \u25cb AC-002: verified\n  \u25cb AC-003: verified\n  \u25cb AC-004: verified\n  \u25cb AC-005: verified\n  \u25cb AC-006: verified\n  \u25cb AC-007: verified\n  \u25cb AC-008: verified\n  \u25cb AC-009: verified\n  \u25cb AC-010: verified",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

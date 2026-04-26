@@ -1,0 +1,276 @@
+{
+  "task_id": "TASK-GCI-007",
+  "timestamp": "2026-04-26T09:26:04.662940",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 29,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-003/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-003/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-005/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/coverage.json",
+    ".guardkit/autobuild/TASK-GCI-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-006/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_feedback_for_turn_4.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/coach_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_state_turn_3.json",
+    ".guardkit/bdd/TASK-GCI-003_junit.xml",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    ".guardkit/bdd/TASK-GCI-006_junit.xml",
+    ".guardkit/bdd/TASK-GCI-007_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "conftest.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/bdd/test_guardkit_command_invocation_engine.py",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_context_resolver.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_3.json",
+    ".guardkit/autobuild/TASK-GCI-007/player_turn_4.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-007/player_turn_4.json"
+  ],
+  "tests_written": [],
+  "summary": "29 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 22,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "bdd_results": {
+    "scenarios_passed": 2,
+    "scenarios_failed": 0,
+    "scenarios_pending": 0,
+    "failures": [],
+    "pending": [],
+    "feature_files": [
+      "features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature"
+    ],
+    "tag": "@task:TASK-GCI-007"
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "create_pr() in src/forge/adapters/gh/operations.py, returning PRResult",
+      "status": "complete",
+      "evidence": "create_pr is implemented in src/forge/adapters/gh/operations.py with signature (worktree: Path, title: str, body: str, base: str = 'main', draft: bool = False) -> PRResult, exported via src/forge/adapters/gh/__init__.py. Verified by TestCreatePrReturnContract (4 tests) which check isinstance(result, PRResult) on every code path (missing creds, success, failure, exception). The BDD key-example oracle also asserts isinstance(result, PRResult) on the happy path.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py",
+        "src/forge/adapters/gh/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Pre-flight check: if GH_TOKEN is unset (or empty) in os.environ, return PRResult(status='failed', error_code='missing_credentials', stderr='GH_TOKEN not set in environment') without invoking gh",
+      "status": "complete",
+      "evidence": "create_pr() reads os.environ.get('GH_TOKEN', '') on every call (no import-time caching) and returns _missing_credentials_result() when the value is falsy. Verified by TestCreatePrMissingCredentials::test_missing_gh_token_returns_missing_credentials_failure (asserts execute_mock.assert_not_called()), test_empty_gh_token_is_treated_as_missing (asserts the same for empty-string), and test_gh_token_is_re_read_on_every_call (toggles env between calls). BDD scenario test_negative_create_pr_missing_credentials passes against the real adapter via the pytest-bdd oracle.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Otherwise, invoke gh pr create --title <t> --body <b> --base <base> (plus --draft if requested) via DeepAgents execute with cwd = worktree",
+      "status": "complete",
+      "evidence": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] with optional '--draft' append, and create_pr passes cwd=str(worktree) to _execute. Verified by test_default_command_shape_uses_separate_tokens (exact list match), test_draft_flag_appends_dash_dash_draft (--draft & --base develop override), and BDD test_key_example_create_pr_success which asserts cwd == str(worktree) and the canonical argv shape.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "On success, parse the PR URL from gh's stdout and populate PRResult.pr_url and PRResult.pr_number (parsed from the trailing slash component of the URL)",
+      "status": "complete",
+      "evidence": "Module-level _PR_URL_PATTERN regex r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)' is searched against stdout.strip(); match.group(0) becomes pr_url and int(match.group(1)) becomes pr_number. Verified by test_success_parses_pr_url_and_number_from_stdout (expects pr_number=123) and test_pr_number_parsed_from_trailing_slash_component (multiline stdout, expects pr_number=4567). BDD scenario asserts pr_number=77.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "On non-zero exit, PRResult(status='failed', stderr=...), no exception",
+      "status": "complete",
+      "evidence": "When exit_code != 0, create_pr returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None) without raising. error_code remains None (only credential failures populate it). Verified by test_non_zero_exit_returns_failed_with_stderr which asserts 'not a git repository' in result.stderr and result.error_code is None.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Function body wrapped in try/except Exception as exc: returning a failed PRResult \u2014 never raises (ADR-ARCH-025)",
+      "status": "complete",
+      "evidence": "The _execute call is wrapped in try/except Exception, converting exc to PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Verified by test_execute_exception_is_caught_and_returned_as_failed (RuntimeError) and test_return_type_is_prresult_on_exception (ValueError). Also catches the 0-exit-no-URL contract violation as 'failed' to avoid fabricating success.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Arguments containing shell metacharacters (e.g. backticks in PR body) are passed as separate list tokens to execute, never via shell-string concatenation",
+      "status": "complete",
+      "evidence": "_build_command() builds a Python list and passes each user value as its own argv element; _execute uses asyncio.create_subprocess_exec(*command) (no shell=True, no string concatenation). Verified by test_backticks_in_body_pass_through_literal ('Run `rm -rf /` to test'), test_dollar_signs_in_body_pass_through_literal ('Set $HOME and $PATH explicitly'), and test_metacharacters_in_title_pass_through_literal ('Fix `bug` in $service && rm tmp'). Each asserts the literal string is the next list element after --body or --title.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Unit tests: missing GH_TOKEN, success path with parsed URL, non-zero exit, raised exception, body containing backticks/dollar-signs; All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "tests/forge/adapters/gh/test_operations.py contains 17 tests organised into 5 test classes mirroring the AC list: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All 17 unit tests + 2 BDD oracle scenarios pass. Code uses type hints, snake_case, f-strings, list-token argv, max line under 88, follows the project's PEP 8 / Black conventions documented in .claude/rules/code-style.md.",
+      "test_file": "tests/forge/adapters/gh/test_operations.py",
+      "implementation_files": [
+        "src/forge/adapters/gh/operations.py",
+        "tests/forge/adapters/gh/test_operations.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 48.83074498298811
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 327.1163810209837
+    }
+  ]
+}

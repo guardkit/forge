@@ -1,0 +1,178 @@
+{
+  "task_id": "TASK-GCI-010",
+  "turn": 2,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/tools/test_graphiti.py tests/forge/tools/test_guardkit.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/tools/test_guardkit.py::TestGuardKitToolLayerContract::test_error_envelope_matches_adr_arch_025_shape[guardkit_autobuild] PASSED [ 98%]\ntests/forge/tools/test_guardkit.py::TestConcurrentInvocations::test_two_parallel_calls_return_independent_results PASSED [100%]\ntests/forge/tools/test_guardkit.py:576\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/tools/test_guardkit.py:576: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 96 passed, 1 warning in 0.36s =========================",
+      "duration_seconds": 0.8220868110656738
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Both wrappers in `src/forge/tools/graphiti.py`, each decorated with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "src/forge/tools/graphiti.py exports guardkit_graphiti_add_context and guardkit_graphiti_query, each defined under @tool(parse_docstring=True). Verified at runtime: both are LangChain BaseTool instances; args_schema.model_fields contains doc_path/group/repo and query/group/repo respectively; the parsed description starts with 'Run `guardkit graphiti \u2026`'. TestDecoratorSurface.* (4/4) passes.",
+      "notes": "src/forge/tools/graphiti.py exports guardkit_graphiti_add_context and guardkit_graphiti_query, each defined under @tool(parse_docstring=True). Verified at runtime: both are LangChain BaseTool instances; args_schema.model_fields contains doc_path/group/repo and query/group/repo respectively; the parsed description starts with 'Run `guardkit graphiti \u2026`'. TestDecoratorSurface.* (4/4) passes."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Both call `forge.adapters.guardkit.run()` with a `subcommand`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_invoke_graphiti() forwards literal subcommand='graphiti add-context' / 'graphiti query' into guardkit_run. Captured kwargs in TestSubcommandPrefixBypassesResolver.* assert subcommand exact-match AND .startswith('graphiti '), which satisfies run()'s _is_graphiti_subcommand head-token detector (TASK-GCI-008) and triggers the resolver-skip branch.",
+      "notes": "_invoke_graphiti() forwards literal subcommand='graphiti add-context' / 'graphiti query' into guardkit_run. Captured kwargs in TestSubcommandPrefixBypassesResolver.* assert subcommand exact-match AND .startswith('graphiti '), which satisfies run()'s _is_graphiti_subcommand head-token detector (TASK-GCI-008) and triggers the resolver-skip branch."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "No `--context` flags appear in the assembled command line for either",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_invoke_graphiti() deliberately does NOT accept or thread an extra_context_paths kwarg through to guardkit_run() (contrast with the GCI-009 helper which does). TestNoContextFlagInArgv.* (4 tests) assert '--context' not in kwargs['args'] AND kwargs.get('extra_context_paths') in (None, []) for both tools. Combined with AC-002 (resolver skipped at run() level), no --context token can appear in the final argv.",
+      "notes": "_invoke_graphiti() deliberately does NOT accept or thread an extra_context_paths kwarg through to guardkit_run() (contrast with the GCI-009 helper which does). TestNoContextFlagInArgv.* (4 tests) assert '--context' not in kwargs['args'] AND kwargs.get('extra_context_paths') in (None, []) for both tools. Combined with AC-002 (resolver skipped at run() level), no --context token can appear in the final argv."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Both return a JSON string; on internal exception, return",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Success/failed/timeout paths return result.model_dump_json() (canonical GuardKitResult). Exception path uses _error_json() with json.dumps to build {'status':'error','error':'<ExcType>: <msg>','tool':'<name>'} \u2014 safe under quote/backslash payloads. TestReturnIsJsonString.* (3) and TestInternalExceptionsAreAbsorbed.* (3) verify all four code paths.",
+      "notes": "Success/failed/timeout paths return result.model_dump_json() (canonical GuardKitResult). Exception path uses _error_json() with json.dumps to build {'status':'error','error':'<ExcType>: <msg>','tool':'<name>'} \u2014 safe under quote/backslash payloads. TestReturnIsJsonString.* (3) and TestInternalExceptionsAreAbsorbed.* (3) verify all four code paths."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Function body wrapped in `try/except Exception as exc:`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each @tool body is wrapped in try/except Exception as exc: returning _error_json(exc, tool_name). _invoke_graphiti() has its own try/except as defence-in-depth. TestInternalExceptionsAreAbsorbed.test_*_returns_error_json_when_run_raises confirms exceptions never propagate.",
+      "notes": "Each @tool body is wrapped in try/except Exception as exc: returning _error_json(exc, tool_name). _invoke_graphiti() has its own try/except as defence-in-depth. TestInternalExceptionsAreAbsorbed.test_*_returns_error_json_when_run_raises confirms exceptions never propagate."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Each wrapper logs via `structlog` with `tool_name`, `duration_ms`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Module-level logger built via _build_logger() prefers structlog.get_logger('forge.tools.graphiti') and falls back to a kwargs-accepting _StdlibStructLogger shim if structlog is unavailable. Success path calls logger.info('guardkit_graphiti_tool_invocation', tool_name=..., duration_ms=..., status=result.status); error path calls logger.exception(..., status='error'). TestStructuredLogging.* (2 tests) assert the contractual triple is captured on logger.info kwargs.",
+      "notes": "Module-level logger built via _build_logger() prefers structlog.get_logger('forge.tools.graphiti') and falls back to a kwargs-accepting _StdlibStructLogger shim if structlog is unavailable. Success path calls logger.info('guardkit_graphiti_tool_invocation', tool_name=..., duration_ms=..., status=result.status); error path calls logger.exception(..., status='error'). TestStructuredLogging.* (2 tests) assert the contractual triple is captured on logger.info kwargs."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Unit tests: each wrapper returns the right JSON shape on",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/forge/tools/test_graphiti.py organises 21 tests by AC. Coverage: success/failed/timeout JSON shape (TestReturnIsJsonString), exception \u2192 ADR-ARCH-025 envelope (TestInternalExceptionsAreAbsorbed), no --context in kwargs (TestNoContextFlagInArgv), 'graphiti ' subcommand prefix (TestSubcommandPrefixBypassesResolver), parse_docstring schema (TestDecoratorSurface), kwargs structured-logging contract (TestStructuredLogging), AST-based resolver-import guard (TestModuleHygiene), and absolute-allowlist-eligible cwd (TestRepoConfinement). All 21 pass; the wider tests/forge/adapters/guardkit/ + tests/forge/tools/ regression set (242 tests) also passes.",
+      "notes": "tests/forge/tools/test_graphiti.py organises 21 tests by AC. Coverage: success/failed/timeout JSON shape (TestReturnIsJsonString), exception \u2192 ADR-ARCH-025 envelope (TestInternalExceptionsAreAbsorbed), no --context in kwargs (TestNoContextFlagInArgv), 'graphiti ' subcommand prefix (TestSubcommandPrefixBypassesResolver), parse_docstring schema (TestDecoratorSurface), kwargs structured-logging contract (TestStructuredLogging), AST-based resolver-import guard (TestModuleHygiene), and absolute-allowlist-eligible cwd (TestRepoConfinement). All 21 pass; the wider tests/forge/adapters/guardkit/ + tests/forge/tools/ regression set (242 tests) also passes."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Turn 2 fix: ran black --line-length 88 --target-version py312 (.claude/rules/code-style.md mandates 'Use Black formatter, Max line length: 88') against both new files and accepted the reformat (a few line-collapse changes in test_graphiti.py \u2014 no semantic change). Then ran ruff check, which flagged one F401 'unittest.mock imported but unused' in test_graphiti.py \u2014 fixed via ruff check --fix (the import was a leftover from an earlier draft). Final state: `black --check --line-length 88 --target-version py312 src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All done! \u2728 \ud83c\udf70 \u2728 2 files would be left unchanged.' and `ruff check src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All checks passed!'. All 21 tests still pass after the lint fixes (and the wider 242-test regression set is unchanged).",
+      "notes": "Turn 2 fix: ran black --line-length 88 --target-version py312 (.claude/rules/code-style.md mandates 'Use Black formatter, Max line length: 88') against both new files and accepted the reformat (a few line-collapse changes in test_graphiti.py \u2014 no semantic change). Then ran ruff check, which flagged one F401 'unittest.mock imported but unused' in test_graphiti.py \u2014 fixed via ruff check --fix (the import was a leftover from an earlier draft). Final state: `black --check --line-length 88 --target-version py312 src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All done! \u2728 \ud83c\udf70 \u2728 2 files would be left unchanged.' and `ruff check src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All checks passed!'. All 21 tests still pass after the lint fixes (and the wider 242-test regression set is unchanged)."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Both wrappers in `src/forge/tools/graphiti.py`, each decorated with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "src/forge/tools/graphiti.py exports guardkit_graphiti_add_context and guardkit_graphiti_query, each defined under @tool(parse_docstring=True). Verified at runtime: both are LangChain BaseTool instances; args_schema.model_fields contains doc_path/group/repo and query/group/repo respectively; the parsed description starts with 'Run `guardkit graphiti \u2026`'. TestDecoratorSurface.* (4/4) passes.",
+        "notes": "src/forge/tools/graphiti.py exports guardkit_graphiti_add_context and guardkit_graphiti_query, each defined under @tool(parse_docstring=True). Verified at runtime: both are LangChain BaseTool instances; args_schema.model_fields contains doc_path/group/repo and query/group/repo respectively; the parsed description starts with 'Run `guardkit graphiti \u2026`'. TestDecoratorSurface.* (4/4) passes."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Both call `forge.adapters.guardkit.run()` with a `subcommand`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_invoke_graphiti() forwards literal subcommand='graphiti add-context' / 'graphiti query' into guardkit_run. Captured kwargs in TestSubcommandPrefixBypassesResolver.* assert subcommand exact-match AND .startswith('graphiti '), which satisfies run()'s _is_graphiti_subcommand head-token detector (TASK-GCI-008) and triggers the resolver-skip branch.",
+        "notes": "_invoke_graphiti() forwards literal subcommand='graphiti add-context' / 'graphiti query' into guardkit_run. Captured kwargs in TestSubcommandPrefixBypassesResolver.* assert subcommand exact-match AND .startswith('graphiti '), which satisfies run()'s _is_graphiti_subcommand head-token detector (TASK-GCI-008) and triggers the resolver-skip branch."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "No `--context` flags appear in the assembled command line for either",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_invoke_graphiti() deliberately does NOT accept or thread an extra_context_paths kwarg through to guardkit_run() (contrast with the GCI-009 helper which does). TestNoContextFlagInArgv.* (4 tests) assert '--context' not in kwargs['args'] AND kwargs.get('extra_context_paths') in (None, []) for both tools. Combined with AC-002 (resolver skipped at run() level), no --context token can appear in the final argv.",
+        "notes": "_invoke_graphiti() deliberately does NOT accept or thread an extra_context_paths kwarg through to guardkit_run() (contrast with the GCI-009 helper which does). TestNoContextFlagInArgv.* (4 tests) assert '--context' not in kwargs['args'] AND kwargs.get('extra_context_paths') in (None, []) for both tools. Combined with AC-002 (resolver skipped at run() level), no --context token can appear in the final argv."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Both return a JSON string; on internal exception, return",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Success/failed/timeout paths return result.model_dump_json() (canonical GuardKitResult). Exception path uses _error_json() with json.dumps to build {'status':'error','error':'<ExcType>: <msg>','tool':'<name>'} \u2014 safe under quote/backslash payloads. TestReturnIsJsonString.* (3) and TestInternalExceptionsAreAbsorbed.* (3) verify all four code paths.",
+        "notes": "Success/failed/timeout paths return result.model_dump_json() (canonical GuardKitResult). Exception path uses _error_json() with json.dumps to build {'status':'error','error':'<ExcType>: <msg>','tool':'<name>'} \u2014 safe under quote/backslash payloads. TestReturnIsJsonString.* (3) and TestInternalExceptionsAreAbsorbed.* (3) verify all four code paths."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Function body wrapped in `try/except Exception as exc:`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each @tool body is wrapped in try/except Exception as exc: returning _error_json(exc, tool_name). _invoke_graphiti() has its own try/except as defence-in-depth. TestInternalExceptionsAreAbsorbed.test_*_returns_error_json_when_run_raises confirms exceptions never propagate.",
+        "notes": "Each @tool body is wrapped in try/except Exception as exc: returning _error_json(exc, tool_name). _invoke_graphiti() has its own try/except as defence-in-depth. TestInternalExceptionsAreAbsorbed.test_*_returns_error_json_when_run_raises confirms exceptions never propagate."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Each wrapper logs via `structlog` with `tool_name`, `duration_ms`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Module-level logger built via _build_logger() prefers structlog.get_logger('forge.tools.graphiti') and falls back to a kwargs-accepting _StdlibStructLogger shim if structlog is unavailable. Success path calls logger.info('guardkit_graphiti_tool_invocation', tool_name=..., duration_ms=..., status=result.status); error path calls logger.exception(..., status='error'). TestStructuredLogging.* (2 tests) assert the contractual triple is captured on logger.info kwargs.",
+        "notes": "Module-level logger built via _build_logger() prefers structlog.get_logger('forge.tools.graphiti') and falls back to a kwargs-accepting _StdlibStructLogger shim if structlog is unavailable. Success path calls logger.info('guardkit_graphiti_tool_invocation', tool_name=..., duration_ms=..., status=result.status); error path calls logger.exception(..., status='error'). TestStructuredLogging.* (2 tests) assert the contractual triple is captured on logger.info kwargs."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Unit tests: each wrapper returns the right JSON shape on",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/forge/tools/test_graphiti.py organises 21 tests by AC. Coverage: success/failed/timeout JSON shape (TestReturnIsJsonString), exception \u2192 ADR-ARCH-025 envelope (TestInternalExceptionsAreAbsorbed), no --context in kwargs (TestNoContextFlagInArgv), 'graphiti ' subcommand prefix (TestSubcommandPrefixBypassesResolver), parse_docstring schema (TestDecoratorSurface), kwargs structured-logging contract (TestStructuredLogging), AST-based resolver-import guard (TestModuleHygiene), and absolute-allowlist-eligible cwd (TestRepoConfinement). All 21 pass; the wider tests/forge/adapters/guardkit/ + tests/forge/tools/ regression set (242 tests) also passes.",
+        "notes": "tests/forge/tools/test_graphiti.py organises 21 tests by AC. Coverage: success/failed/timeout JSON shape (TestReturnIsJsonString), exception \u2192 ADR-ARCH-025 envelope (TestInternalExceptionsAreAbsorbed), no --context in kwargs (TestNoContextFlagInArgv), 'graphiti ' subcommand prefix (TestSubcommandPrefixBypassesResolver), parse_docstring schema (TestDecoratorSurface), kwargs structured-logging contract (TestStructuredLogging), AST-based resolver-import guard (TestModuleHygiene), and absolute-allowlist-eligible cwd (TestRepoConfinement). All 21 pass; the wider tests/forge/adapters/guardkit/ + tests/forge/tools/ regression set (242 tests) also passes."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Turn 2 fix: ran black --line-length 88 --target-version py312 (.claude/rules/code-style.md mandates 'Use Black formatter, Max line length: 88') against both new files and accepted the reformat (a few line-collapse changes in test_graphiti.py \u2014 no semantic change). Then ran ruff check, which flagged one F401 'unittest.mock imported but unused' in test_graphiti.py \u2014 fixed via ruff check --fix (the import was a leftover from an earlier draft). Final state: `black --check --line-length 88 --target-version py312 src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All done! \u2728 \ud83c\udf70 \u2728 2 files would be left unchanged.' and `ruff check src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All checks passed!'. All 21 tests still pass after the lint fixes (and the wider 242-test regression set is unchanged).",
+        "notes": "Turn 2 fix: ran black --line-length 88 --target-version py312 (.claude/rules/code-style.md mandates 'Use Black formatter, Max line length: 88') against both new files and accepted the reformat (a few line-collapse changes in test_graphiti.py \u2014 no semantic change). Then ran ruff check, which flagged one F401 'unittest.mock imported but unused' in test_graphiti.py \u2014 fixed via ruff check --fix (the import was a leftover from an earlier draft). Final state: `black --check --line-length 88 --target-version py312 src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All done! \u2728 \ud83c\udf70 \u2728 2 files would be left unchanged.' and `ruff check src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All checks passed!'. All 21 tests still pass after the lint fixes (and the wider 242-test regression set is unchanged)."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 1038 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1074/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- ASSOCIATED_WITH\n- IS_PROJECT_OF\n\n### \u26a0\ufe0f Warnings\n- RELATED_PROJECT\n- USES_FIX\n\n### \ud83c\udfad Role Constraints\n- MONITOR_QUALITY_GATES\n- MONITORS_RESULTS_FROM\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n- IS_USED_IN\n\n\n## Previous Turn Summary (Turn 1)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 All modified files pass project-configured lint/format checks with zero\n\n**Acceptance Criteria Status**:\n  \u25cb AC-001: verified\n  \u25cb AC-002: verified\n  \u25cb AC-003: verified\n  \u25cb AC-004: verified\n  \u25cb AC-005: verified\n  \u25cb AC-006: verified\n  \u25cb AC-007: verified\n  \u2717 AC-008: rejected",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

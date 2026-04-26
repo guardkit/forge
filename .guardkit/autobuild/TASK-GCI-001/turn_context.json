@@ -1,0 +1,17 @@
+{
+  "task_id": "TASK-GCI-001",
+  "turn": 1,
+  "max_turns": 30,
+  "turns_remaining": 29,
+  "approaching_limit": false,
+  "escape_hatch_active": false,
+  "instructions": "If approaching_limit is true and you cannot complete the task, include a 'blocked_report' field in your player report JSON. See autobuild-player.md for the blocked_report schema.",
+  "promise_schema_reminder": {
+    "criterion_id": "CORRECT \u2014 do NOT use ac_id or id",
+    "criterion_text": "CORRECT \u2014 do NOT use description or text",
+    "status": "must be 'complete' or 'incomplete' \u2014 do NOT use done/finished",
+    "evidence": "description of what you did",
+    "test_file": "path to test file (if applicable)",
+    "implementation_files": "list of files modified/created"
+  }
+}

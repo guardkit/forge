@@ -1,0 +1,170 @@
+{
+  "task_id": "TASK-GCI-005",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_progress_subscriber.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    ".guardkit/bdd/TASK-GCI-005_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-005/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/src/forge/adapters/guardkit/progress_subscriber.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_progress_subscriber.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/gh/operations.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/context_resolver.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/git/test_operations.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: subscribe_progress async context manager",
+    "AC-002: ProgressSink with back-pressure eviction",
+    "AC-003: Unsubscribe on every exit path",
+    "AC-004: None/unavailable client is no-op + structured warning",
+    "AC-005: Per-(build_id, subcommand) subject scoping; parallel invocations independent",
+    "AC-006: Per-instance sinks isolate concurrent builds",
+    "AC-007: Malformed payloads dropped with structured warning",
+    "AC-008: Unit tests with fake NATS client cover all listed scenarios",
+    "AC-009: ruff check + ruff format both clean"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 51,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 22,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "subscribe_progress async context manager in src/forge/adapters/guardkit/progress_subscriber.py",
+      "status": "complete",
+      "evidence": "Implemented `subscribe_progress` as an `@asynccontextmanager` in `src/forge/adapters/guardkit/progress_subscriber.py`. Verified via `TestModuleSurface::test_subscribe_progress_is_async_context_manager` (object exposes `__aenter__`/`__aexit__`) and `test_module_path` (canonical module path).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "ProgressSink retains the most recent event per (build_id, subcommand) pair; old events are evicted under back-pressure (Scenario 'Progress events emitted faster than Forge consumes them are still observable for live status')",
+      "status": "complete",
+      "evidence": "ProgressSink stores per-key `collections.deque(maxlen=N)` so append() drops the oldest entry on full \u2014 exactly the 'most recent observable' guarantee. Verified by `TestProgressSinkRetention::test_back_pressure_drops_oldest` (5 events into a 3-slot sink \u2014 last 3 retained, oldest 2 evicted) plus `test_latest_returns_most_recent`.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Unsubscribe runs on context-manager exit, including the exception path",
+      "status": "complete",
+      "evidence": "The async context manager wraps `yield` in a `try/finally` and awaits `sub.unsubscribe()` in the finally block. A second try/except inside the finally swallows unsubscribe failures so cleanup never propagates. Verified by `TestUnsubscribeOnExit::test_unsubscribes_on_normal_exit`, `test_unsubscribes_on_exception_exit` (RuntimeError raised inside the body), and `test_unsubscribe_failure_does_not_propagate`.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "If the NATS client is None or unavailable, subscribe_progress yields a no-op subscription that records a single progress_stream_unavailable warning to the sink and the surrounding call still proceeds (Scenario 'The authoritative result still returns when progress streaming is unavailable')",
+      "status": "complete",
+      "evidence": "Two no-op paths implemented: (a) `nats_client is None` records one `PROGRESS_STREAM_UNAVAILABLE` warning, logs, and yields; (b) `subscribe()` raising likewise records the warning and yields. Verified by `TestUnavailableClient::test_none_client_is_noop_and_warns` (asserts `inside is True`, exactly one warning with code `progress_stream_unavailable`) and `test_subscribe_failure_yields_noop` (uses `BrokenNATSClient` raising `ConnectionError`).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Each subscription is scoped to one pipeline.stage-complete.{build_id}.{subcommand} subject \u2014 two parallel invocations within the same build receive independent event streams (Scenario 'Parallel GuardKit invocations in the same build do not corrupt each other's results')",
+      "status": "complete",
+      "evidence": "`subject_for(build_id, subcommand)` builds the exact subject; `subscribe_progress` only subscribes to that one subject. Verified by `TestSubjectScoping::test_subscribes_to_correct_subject` (asserts the subscribe topic literal) and `test_parallel_subscriptions_are_independent` (two `async with` blocks for the same build_id but distinct subcommands; each sink slot receives only its own events).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Two concurrent builds against the same repo get isolated sinks (no shared state, ASSUM-007)",
+      "status": "complete",
+      "evidence": "ProgressSink owns no class- or module-level state \u2014 each instance has its own `_buffers` and `_warnings`. Verified by `TestParallelBuilds::test_two_builds_have_isolated_sinks`: two distinct sinks for two build_ids; events delivered on each subject only land in the corresponding sink, and querying the cross-build slot returns None.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Invalid payloads (malformed JSON, missing fields) are dropped with a structured warning, never raised",
+      "status": "complete",
+      "evidence": "The inbound `_on_envelope` callback wraps `GuardKitProgressEvent.model_validate(envelope.payload)` in a try/except catching `ValidationError`, `ValueError`, `TypeError`; on failure it records a `PROGRESS_PAYLOAD_INVALID` warning and returns (never raises). Verified by `TestMalformedPayloads::test_missing_required_field_dropped`, `test_wrong_payload_type_dropped`, and `test_valid_event_after_malformed_still_recorded` (subscription continues consuming after a bad payload).",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Unit tests with a fake NATS client: ordered delivery, back-pressure eviction, malformed payload, unavailable client, parallel subscriptions",
+      "status": "complete",
+      "evidence": "Hand-rolled `FakeNATSClient` and `BrokenNATSClient` (no nats-py imports). Coverage: ordered delivery (`test_ordered_delivery_within_one_subscription`), back-pressure (`test_back_pressure_drops_oldest`), malformed payload (3 cases under TestMalformedPayloads), unavailable client (`test_none_client_is_noop_and_warns`, `test_subscribe_failure_yields_noop`), parallel subscriptions (`test_parallel_subscriptions_are_independent`, `test_two_builds_have_isolated_sinks`). 22 tests, all passing.",
+      "test_file": "tests/forge/adapters/guardkit/test_progress_subscriber.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "`ruff check` reports 'All checks passed!' on both files. `ruff format --check` reports '2 files already formatted' after applying the project's default ruff format. No new linter rules added.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/guardkit/progress_subscriber.py",
+        "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+      ]
+    }
+  ]
+}

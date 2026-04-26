@@ -1,0 +1,192 @@
+{
+  "task_id": "TASK-GCI-007",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_context_resolver.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_context_resolver.py::TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected PASSED [ 47%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-search] PASSED [ 47%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-export] PASSED [ 48%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-import] PASSED [ 49%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-prune] PASSED [ 50%]\nResult:\ntests/forge/adapters/git/test_operations.py:495\n/home/richardwoollcott/Projects/appmilla_githu...",
+      "duration_seconds": 0.6581718921661377
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`create_pr()` in `src/forge/adapters/gh/operations.py`, returning",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented async def create_pr(worktree, title, body, base='main', draft=False) -> PRResult in src/forge/adapters/gh/operations.py. PRResult import is from forge.adapters.git.models per the shared adapter return contract (API-subprocess.md \u00a74). TestCreatePrReturnContract has four asserts confirming PRResult is returned on missing-credentials, success, non-zero-exit, and exception paths.",
+      "notes": "Implemented async def create_pr(worktree, title, body, base='main', draft=False) -> PRResult in src/forge/adapters/gh/operations.py. PRResult import is from forge.adapters.git.models per the shared adapter return contract (API-subprocess.md \u00a74). TestCreatePrReturnContract has four asserts confirming PRResult is returned on missing-credentials, success, non-zero-exit, and exception paths."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Pre-flight check: if `GH_TOKEN` is unset (or empty) in `os.environ`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "create_pr reads os.environ.get('GH_TOKEN', '') on every call and returns PRResult(status='failed', error_code='missing_credentials', stderr='GH_TOKEN not set in environment') before reaching _execute. Tests test_missing_gh_token_returns_missing_credentials_failure and test_empty_gh_token_is_treated_as_missing both call execute_mock.assert_not_called() to prove gh is never invoked. test_gh_token_is_re_read_on_every_call verifies the token is not cached at import time.",
+      "notes": "create_pr reads os.environ.get('GH_TOKEN', '') on every call and returns PRResult(status='failed', error_code='missing_credentials', stderr='GH_TOKEN not set in environment') before reaching _execute. Tests test_missing_gh_token_returns_missing_credentials_failure and test_empty_gh_token_is_treated_as_missing both call execute_mock.assert_not_called() to prove gh is never invoked. test_gh_token_is_re_read_on_every_call verifies the token is not cached at import time."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "On success, parse the PR URL from gh's stdout and populate",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] and appends '--draft' when draft=True. _execute is invoked with command=command, cwd=str(worktree). Tests test_default_command_shape_uses_separate_tokens and test_draft_flag_appends_dash_dash_draft assert the exact argv shape, including --base override and the cwd value /var/forge/builds/B1.",
+      "notes": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] and appends '--draft' when draft=True. _execute is invoked with command=command, cwd=str(worktree). Tests test_default_command_shape_uses_separate_tokens and test_draft_flag_appends_dash_dash_draft assert the exact argv shape, including --base override and the cwd value /var/forge/builds/B1."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "On non-zero exit, `PRResult(status=\"failed\", stderr=...)`, no",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_PR_URL_PATTERN = re.compile(r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)'). On exit_code==0, _PR_URL_PATTERN.search(stdout.strip()) extracts both the full URL (group 0) and the integer PR number (group 1). Tests test_success_parses_pr_url_and_number_from_stdout and test_pr_number_parsed_from_trailing_slash_component verify owner/repo/pull/123 and pull/4567 are parsed correctly with multiline stdout.",
+      "notes": "_PR_URL_PATTERN = re.compile(r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)'). On exit_code==0, _PR_URL_PATTERN.search(stdout.strip()) extracts both the full URL (group 0) and the integer PR number (group 1). Tests test_success_parses_pr_url_and_number_from_stdout and test_pr_number_parsed_from_trailing_slash_component verify owner/repo/pull/123 and pull/4567 are parsed correctly with multiline stdout."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Function body wrapped in `try/except Exception as exc:` returning a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "After _execute returns, if exit_code != 0 the function returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None). Test test_non_zero_exit_returns_failed_with_stderr asserts that exit_code=1 with stderr 'fatal: not a git repository' yields status='failed' with stderr preserved and pr_url/pr_number=None.",
+      "notes": "After _execute returns, if exit_code != 0 the function returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None). Test test_non_zero_exit_returns_failed_with_stderr asserts that exit_code=1 with stderr 'fatal: not a git repository' yields status='failed' with stderr preserved and pr_url/pr_number=None."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Arguments containing shell metacharacters (e.g. backticks in PR body)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_execute is wrapped in try/except Exception as exc returning PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Test test_execute_exception_is_caught_and_returned_as_failed uses AsyncMock(side_effect=RuntimeError('transport boom')) and asserts the call returns rather than raises, with stderr containing both the exception type and message. test_return_type_is_prresult_on_exception double-checks isinstance.",
+      "notes": "_execute is wrapped in try/except Exception as exc returning PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Test test_execute_exception_is_caught_and_returned_as_failed uses AsyncMock(side_effect=RuntimeError('transport boom')) and asserts the call returns rather than raises, with stderr containing both the exception type and message. test_return_type_is_prresult_on_exception double-checks isinstance."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Unit tests: missing GH_TOKEN, success path with parsed URL, non-zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_build_command places title and body as their own list elements, never interpolated into a shell string. _execute uses asyncio.create_subprocess_exec(*command, ...) which spawns the binary directly without a shell. Tests test_backticks_in_body_pass_through_literal, test_dollar_signs_in_body_pass_through_literal, and test_metacharacters_in_title_pass_through_literal assert that bodies/titles like 'Run `rm -rf /` to test', 'Set $HOME and $PATH explicitly', and 'Fix `bug` in $service && rm tmp' appear verbatim as a single list token preceded by --body or --title.",
+      "notes": "_build_command places title and body as their own list elements, never interpolated into a shell string. _execute uses asyncio.create_subprocess_exec(*command, ...) which spawns the binary directly without a shell. Tests test_backticks_in_body_pass_through_literal, test_dollar_signs_in_body_pass_through_literal, and test_metacharacters_in_title_pass_through_literal assert that bodies/titles like 'Run `rm -rf /` to test', 'Set $HOME and $PATH explicitly', and 'Fix `bug` in $service && rm tmp' appear verbatim as a single list token preceded by --body or --title."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/forge/adapters/gh/test_operations.py contains 17 unit tests organised into 5 classes: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All five mandated scenarios are covered. All 17 tests pass.",
+      "notes": "tests/forge/adapters/gh/test_operations.py contains 17 unit tests organised into 5 classes: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All five mandated scenarios are covered. All 17 tests pass."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`create_pr()` in `src/forge/adapters/gh/operations.py`, returning",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented async def create_pr(worktree, title, body, base='main', draft=False) -> PRResult in src/forge/adapters/gh/operations.py. PRResult import is from forge.adapters.git.models per the shared adapter return contract (API-subprocess.md \u00a74). TestCreatePrReturnContract has four asserts confirming PRResult is returned on missing-credentials, success, non-zero-exit, and exception paths.",
+        "notes": "Implemented async def create_pr(worktree, title, body, base='main', draft=False) -> PRResult in src/forge/adapters/gh/operations.py. PRResult import is from forge.adapters.git.models per the shared adapter return contract (API-subprocess.md \u00a74). TestCreatePrReturnContract has four asserts confirming PRResult is returned on missing-credentials, success, non-zero-exit, and exception paths."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Pre-flight check: if `GH_TOKEN` is unset (or empty) in `os.environ`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "create_pr reads os.environ.get('GH_TOKEN', '') on every call and returns PRResult(status='failed', error_code='missing_credentials', stderr='GH_TOKEN not set in environment') before reaching _execute. Tests test_missing_gh_token_returns_missing_credentials_failure and test_empty_gh_token_is_treated_as_missing both call execute_mock.assert_not_called() to prove gh is never invoked. test_gh_token_is_re_read_on_every_call verifies the token is not cached at import time.",
+        "notes": "create_pr reads os.environ.get('GH_TOKEN', '') on every call and returns PRResult(status='failed', error_code='missing_credentials', stderr='GH_TOKEN not set in environment') before reaching _execute. Tests test_missing_gh_token_returns_missing_credentials_failure and test_empty_gh_token_is_treated_as_missing both call execute_mock.assert_not_called() to prove gh is never invoked. test_gh_token_is_re_read_on_every_call verifies the token is not cached at import time."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "On success, parse the PR URL from gh's stdout and populate",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] and appends '--draft' when draft=True. _execute is invoked with command=command, cwd=str(worktree). Tests test_default_command_shape_uses_separate_tokens and test_draft_flag_appends_dash_dash_draft assert the exact argv shape, including --base override and the cwd value /var/forge/builds/B1.",
+        "notes": "_build_command() assembles ['gh', 'pr', 'create', '--title', title, '--body', body, '--base', base] and appends '--draft' when draft=True. _execute is invoked with command=command, cwd=str(worktree). Tests test_default_command_shape_uses_separate_tokens and test_draft_flag_appends_dash_dash_draft assert the exact argv shape, including --base override and the cwd value /var/forge/builds/B1."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "On non-zero exit, `PRResult(status=\"failed\", stderr=...)`, no",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_PR_URL_PATTERN = re.compile(r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)'). On exit_code==0, _PR_URL_PATTERN.search(stdout.strip()) extracts both the full URL (group 0) and the integer PR number (group 1). Tests test_success_parses_pr_url_and_number_from_stdout and test_pr_number_parsed_from_trailing_slash_component verify owner/repo/pull/123 and pull/4567 are parsed correctly with multiline stdout.",
+        "notes": "_PR_URL_PATTERN = re.compile(r'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)'). On exit_code==0, _PR_URL_PATTERN.search(stdout.strip()) extracts both the full URL (group 0) and the integer PR number (group 1). Tests test_success_parses_pr_url_and_number_from_stdout and test_pr_number_parsed_from_trailing_slash_component verify owner/repo/pull/123 and pull/4567 are parsed correctly with multiline stdout."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Function body wrapped in `try/except Exception as exc:` returning a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "After _execute returns, if exit_code != 0 the function returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None). Test test_non_zero_exit_returns_failed_with_stderr asserts that exit_code=1 with stderr 'fatal: not a git repository' yields status='failed' with stderr preserved and pr_url/pr_number=None.",
+        "notes": "After _execute returns, if exit_code != 0 the function returns PRResult(status='failed', stderr=stderr.strip() or stdout.strip() or None). Test test_non_zero_exit_returns_failed_with_stderr asserts that exit_code=1 with stderr 'fatal: not a git repository' yields status='failed' with stderr preserved and pr_url/pr_number=None."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Arguments containing shell metacharacters (e.g. backticks in PR body)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_execute is wrapped in try/except Exception as exc returning PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Test test_execute_exception_is_caught_and_returned_as_failed uses AsyncMock(side_effect=RuntimeError('transport boom')) and asserts the call returns rather than raises, with stderr containing both the exception type and message. test_return_type_is_prresult_on_exception double-checks isinstance.",
+        "notes": "_execute is wrapped in try/except Exception as exc returning PRResult(status='failed', stderr=f'{type(exc).__name__}: {exc}'). Test test_execute_exception_is_caught_and_returned_as_failed uses AsyncMock(side_effect=RuntimeError('transport boom')) and asserts the call returns rather than raises, with stderr containing both the exception type and message. test_return_type_is_prresult_on_exception double-checks isinstance."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Unit tests: missing GH_TOKEN, success path with parsed URL, non-zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_build_command places title and body as their own list elements, never interpolated into a shell string. _execute uses asyncio.create_subprocess_exec(*command, ...) which spawns the binary directly without a shell. Tests test_backticks_in_body_pass_through_literal, test_dollar_signs_in_body_pass_through_literal, and test_metacharacters_in_title_pass_through_literal assert that bodies/titles like 'Run `rm -rf /` to test', 'Set $HOME and $PATH explicitly', and 'Fix `bug` in $service && rm tmp' appear verbatim as a single list token preceded by --body or --title.",
+        "notes": "_build_command places title and body as their own list elements, never interpolated into a shell string. _execute uses asyncio.create_subprocess_exec(*command, ...) which spawns the binary directly without a shell. Tests test_backticks_in_body_pass_through_literal, test_dollar_signs_in_body_pass_through_literal, and test_metacharacters_in_title_pass_through_literal assert that bodies/titles like 'Run `rm -rf /` to test', 'Set $HOME and $PATH explicitly', and 'Fix `bug` in $service && rm tmp' appear verbatim as a single list token preceded by --body or --title."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/forge/adapters/gh/test_operations.py contains 17 unit tests organised into 5 classes: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All five mandated scenarios are covered. All 17 tests pass.",
+        "notes": "tests/forge/adapters/gh/test_operations.py contains 17 unit tests organised into 5 classes: TestCreatePrMissingCredentials (3), TestCreatePrSuccessPath (4), TestCreatePrFailurePath (3), TestCreatePrShellMetacharacters (3), TestCreatePrReturnContract (4). All five mandated scenarios are covered. All 17 tests pass."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "bdd_failure",
+      "description": "BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.",
+      "scenarios_failed": 1,
+      "scenarios_passed": 0,
+      "scenarios_pending": 0,
+      "feature_files": [
+        "features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature"
+      ],
+      "failure_examples": [
+        "pytest_runner_error \u2014 pytest_runner_error: exit=4; ERROR: not found: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/features/guardkit-comman"
+      ]
+    }
+  ],
+  "rationale": "BDD scenarios failed: 1 scenario(s) reported assertion failure during pytest-bdd execution.",
+  "context_used": "## Job-Specific Context\n\nBudget: 975/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- BELONGS_TO_PROJECT\n- CREATED_AT\n\n### \u26a0\ufe0f Warnings\n- CREATES\n- HAS_ROOT_CAUSE\n\n### \ud83c\udfad Role Constraints\n- IS_CREATED_FOR\n- MUST_CONSULT_BEFORE_MODIFYING\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_PITFALL\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

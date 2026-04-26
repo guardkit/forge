@@ -1,0 +1,174 @@
+{
+  "task_id": "TASK-GCI-004",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bootstrap_state.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_parser.py",
+    "tasks/backlog/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/backlog/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/backlog/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/backlog/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/backlog/TASK-GCI-007-implement-gh-adapter.md"
+  ],
+  "files_created": [
+    ".claude/task-plans/TASK-GCI-003-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-004-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-005-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-006-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-002/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-003/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-004/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-004/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-005/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-006/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-007/turn_context.json",
+    ".guardkit/bdd/TASK-GCI-004_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-004/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/src/forge/adapters/guardkit/parser.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_parser.py",
+    "src/forge/adapters/gh/__init__.py",
+    "src/forge/adapters/git/operations.py",
+    "src/forge/adapters/guardkit/parser.py",
+    "src/forge/adapters/guardkit/progress_subscriber.py",
+    "tasks/design_approved/TASK-GCI-003-implement-context-resolver.md",
+    "tasks/design_approved/TASK-GCI-004-implement-tolerant-output-parser.md",
+    "tasks/design_approved/TASK-GCI-005-implement-progress-stream-subscriber.md",
+    "tasks/design_approved/TASK-GCI-006-implement-git-adapter.md",
+    "tasks/design_approved/TASK-GCI-007-implement-gh-adapter.md",
+    "tests/forge/adapters/gh/__init__.py",
+    "tests/forge/adapters/gh/test_operations.py",
+    "tests/forge/adapters/guardkit/test_parser.py",
+    "tests/forge/adapters/guardkit/test_progress_subscriber.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/guardkit/test_parser.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001 \u2014 parser module exists at canonical path",
+    "AC-002 \u2014 timeout outranks exit_code",
+    "AC-003 \u2014 non-zero exit yields failed + stderr preserved",
+    "AC-004 \u2014 recognised shape populates optional fields",
+    "AC-005 \u2014 unknown shape degrades to success-empty",
+    "AC-006 \u2014 stdout_tail truncation",
+    "AC-007 \u2014 byte-safe multi-byte UTF-8 tail",
+    "AC-008 \u2014 internal errors become warnings",
+    "AC-009 \u2014 unit tests cover all listed scenarios"
+  ],
+  "requirements_remaining": [
+    "AC-010 \u2014 black/format check not run (formatter not installed in worktree); orchestrator-side lint pass needed"
+  ],
+  "sdk_turns_used": 32,
+  "sdk_max_turns": 100,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 38,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "parse_guardkit_output() in src/forge/adapters/guardkit/parser.py",
+      "status": "complete",
+      "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (module path verified by inspect.getsourcefile in TestParserModuleSurface). The function signature matches the task spec: keyword-only subcommand, stdout, stderr, exit_code, duration_secs, and timed_out=False default.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "timed_out=True \u2192 status='timeout', regardless of exit_code (Scenario 'A subprocess that exceeds the timeout is reported as timed-out')",
+      "status": "complete",
+      "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are also preserved on the timeout path.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "timed_out=False, exit_code != 0 \u2192 status='failed', stderr preserved (Scenario 'A non-zero exit is reported as a failure with the subprocess error output')",
+      "status": "complete",
+      "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr (or None when empty). TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "timed_out=False, exit_code == 0, recognised shape \u2192 status='success', artefacts/coach_score/criterion_breakdown/detection_findings populated",
+      "status": "complete",
+      "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "timed_out=False, exit_code == 0, unrecognised shape \u2192 status='success', artefacts=[], no exception raised (Scenario 'An unknown GuardKit output shape degrades to success with no artefacts')",
+      "status": "complete",
+      "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "stdout_tail is the last 4 KB of stdout when stdout is larger than 4 KB; preserves stdout verbatim when it is smaller",
+      "status": "complete",
+      "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is sliced safely with errors='ignore' on the decode of the leading remainder)",
+      "status": "complete",
+      "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake).",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced as GuardKitWarning(code='parser_unrecognised_shape', \u2026); never propagate as exceptions (Scenario 'An unexpected error inside a wrapper is returned as a structured error, not raised')",
+      "status": "complete",
+      "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings, a mock.patch-injected RuntimeError on _extract_artefacts, and asserts the warning carries diagnostic context. Status remains 'success' in every case.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Unit tests cover: success-with-artefacts, success-empty, success-unknown-shape, failed-with-stderr, timeout, stdout < 4 KB, stdout >> 4 KB, multi-byte stdout tail, malformed JSON in stdout",
+      "status": "complete",
+      "evidence": "test_parser.py contains 38 tests organised into 7 classes: TestParserModuleSurface (3), TestTimeoutTakesPrecedenceOverExitCode (6 incl. parametrised), TestNonZeroExitYieldsFailedWithStderr (7), TestRecognisedShapeYieldsSuccessWithArtefacts (5), TestUnrecognisedShapeDegradesToSuccessEmpty (3), TestStdoutTailTruncation (5), TestInternalErrorsBecomeWarningsNotRaises (3), TestResultFieldsAlwaysPopulated (6). All nine listed scenarios are covered.",
+      "test_file": "tests/forge/adapters/guardkit/test_parser.py",
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "uncertain",
+      "evidence": "py_compile passed cleanly on both files (syntax OK). Black is not installed in the worktree's environment ('No module named black'), so I could not run the configured formatter directly. Code adheres to the documented 88-char line length, uses snake_case / PascalCase, type hints, and f-strings per .claude/rules/code-style.md. Re-running 'black --check' once the venv is provisioned should be a no-op; flagging as uncertain because the formatter could not be executed in this turn.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/guardkit/parser.py",
+        "tests/forge/adapters/guardkit/test_parser.py"
+      ]
+    }
+  ]
+}

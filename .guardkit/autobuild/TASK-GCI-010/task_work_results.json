@@ -1,0 +1,192 @@
+{
+  "task_id": "TASK-GCI-010",
+  "timestamp": "2026-04-26T10:00:06.005916",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation (Turn 2 \u2014 addressing AC-008)",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 21,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".claude/task-plans/TASK-GCI-009-implementation-plan.md",
+    ".claude/task-plans/TASK-GCI-010-implementation-plan.md",
+    ".guardkit/autobuild/TASK-GCI-008/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-009/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-009/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-009/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-009/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-009/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-009/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-009/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-009/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-010/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-010/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-GCI-010/player_turn_1.json",
+    ".guardkit/autobuild/TASK-GCI-010/specialist_results.json",
+    ".guardkit/autobuild/TASK-GCI-010/task_work_results.json",
+    ".guardkit/autobuild/TASK-GCI-010/turn_context.json",
+    ".guardkit/autobuild/TASK-GCI-010/turn_state_turn_1.json",
+    ".guardkit/bdd/TASK-GCI-009_junit.xml",
+    ".guardkit/bdd/TASK-GCI-010_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "src/forge/tools/__init__.py",
+    "src/forge/tools/graphiti.py",
+    "src/forge/tools/guardkit.py",
+    "tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-010-wire-graphiti-tool-wrappers.md",
+    "tasks/design_approved/TASK-GCI-009-wire-guardkit-tool-wrappers.md",
+    "tasks/design_approved/TASK-GCI-010-wire-graphiti-tool-wrappers.md",
+    "tests/forge/tools/__init__.py",
+    "tests/forge/tools/test_graphiti.py",
+    "tests/forge/tools/test_guardkit.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-GCI-010/checkpoints.json",
+    ".guardkit/autobuild/TASK-GCI-010/coach_feedback_for_turn_2.json",
+    ".guardkit/autobuild/TASK-GCI-010/player_turn_2.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/.guardkit/autobuild/TASK-GCI-010/player_turn_2.json"
+  ],
+  "tests_written": [],
+  "summary": "21 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 12,
+    "max_turns": 100,
+    "ceiling_hit": false
+  },
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Both wrappers in src/forge/tools/graphiti.py, each decorated with @tool(parse_docstring=True)",
+      "status": "complete",
+      "evidence": "src/forge/tools/graphiti.py exports guardkit_graphiti_add_context and guardkit_graphiti_query, each defined under @tool(parse_docstring=True). Verified at runtime: both are LangChain BaseTool instances; args_schema.model_fields contains doc_path/group/repo and query/group/repo respectively; the parsed description starts with 'Run `guardkit graphiti \u2026`'. TestDecoratorSurface.* (4/4) passes.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Both call forge.adapters.guardkit.run() with a subcommand starting with 'graphiti ' so the resolver is not invoked",
+      "status": "complete",
+      "evidence": "_invoke_graphiti() forwards literal subcommand='graphiti add-context' / 'graphiti query' into guardkit_run. Captured kwargs in TestSubcommandPrefixBypassesResolver.* assert subcommand exact-match AND .startswith('graphiti '), which satisfies run()'s _is_graphiti_subcommand head-token detector (TASK-GCI-008) and triggers the resolver-skip branch.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "No --context flags appear in the assembled command line for either wrapper, even when a manifest exists in the target repo",
+      "status": "complete",
+      "evidence": "_invoke_graphiti() deliberately does NOT accept or thread an extra_context_paths kwarg through to guardkit_run() (contrast with the GCI-009 helper which does). TestNoContextFlagInArgv.* (4 tests) assert '--context' not in kwargs['args'] AND kwargs.get('extra_context_paths') in (None, []) for both tools. Combined with AC-002 (resolver skipped at run() level), no --context token can appear in the final argv.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Both return a JSON string; on internal exception, return {\"status\":\"error\",\"error\":\"...\"} per ADR-ARCH-025 \u2014 never raises",
+      "status": "complete",
+      "evidence": "Success/failed/timeout paths return result.model_dump_json() (canonical GuardKitResult). Exception path uses _error_json() with json.dumps to build {'status':'error','error':'<ExcType>: <msg>','tool':'<name>'} \u2014 safe under quote/backslash payloads. TestReturnIsJsonString.* (3) and TestInternalExceptionsAreAbsorbed.* (3) verify all four code paths.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Function body wrapped in try/except Exception as exc:",
+      "status": "complete",
+      "evidence": "Each @tool body is wrapped in try/except Exception as exc: returning _error_json(exc, tool_name). _invoke_graphiti() has its own try/except as defence-in-depth. TestInternalExceptionsAreAbsorbed.test_*_returns_error_json_when_run_raises confirms exceptions never propagate.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Each wrapper logs via structlog with tool_name, duration_ms, status",
+      "status": "complete",
+      "evidence": "Module-level logger built via _build_logger() prefers structlog.get_logger('forge.tools.graphiti') and falls back to a kwargs-accepting _StdlibStructLogger shim if structlog is unavailable. Success path calls logger.info('guardkit_graphiti_tool_invocation', tool_name=..., duration_ms=..., status=result.status); error path calls logger.exception(..., status='error'). TestStructuredLogging.* (2 tests) assert the contractual triple is captured on logger.info kwargs.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Unit tests: each wrapper returns the right JSON shape on success/failed/timeout/exception; verify (via fake run()) that no --context flag is added regardless of the target repo's manifest",
+      "status": "complete",
+      "evidence": "tests/forge/tools/test_graphiti.py organises 21 tests by AC. Coverage: success/failed/timeout JSON shape (TestReturnIsJsonString), exception \u2192 ADR-ARCH-025 envelope (TestInternalExceptionsAreAbsorbed), no --context in kwargs (TestNoContextFlagInArgv), 'graphiti ' subcommand prefix (TestSubcommandPrefixBypassesResolver), parse_docstring schema (TestDecoratorSurface), kwargs structured-logging contract (TestStructuredLogging), AST-based resolver-import guard (TestModuleHygiene), and absolute-allowlist-eligible cwd (TestRepoConfinement). All 21 pass; the wider tests/forge/adapters/guardkit/ + tests/forge/tools/ regression set (242 tests) also passes.",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Turn 2 fix: ran black --line-length 88 --target-version py312 (.claude/rules/code-style.md mandates 'Use Black formatter, Max line length: 88') against both new files and accepted the reformat (a few line-collapse changes in test_graphiti.py \u2014 no semantic change). Then ran ruff check, which flagged one F401 'unittest.mock imported but unused' in test_graphiti.py \u2014 fixed via ruff check --fix (the import was a leftover from an earlier draft). Final state: `black --check --line-length 88 --target-version py312 src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All done! \u2728 \ud83c\udf70 \u2728 2 files would be left unchanged.' and `ruff check src/forge/tools/graphiti.py tests/forge/tools/test_graphiti.py` reports 'All checks passed!'. All 21 tests still pass after the lint fixes (and the wider 242-test regression set is unchanged).",
+      "test_file": "tests/forge/tools/test_graphiti.py",
+      "implementation_files": [
+        "src/forge/tools/graphiti.py",
+        "tests/forge/tools/test_graphiti.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 44.66934345700429
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 159.95174111399683
+    }
+  ]
+}

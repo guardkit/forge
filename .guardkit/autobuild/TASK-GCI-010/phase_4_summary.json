@@ -1,0 +1,7 @@
+{
+  "tests_run": 96,
+  "tests_failed": 0,
+  "coverage_pct": 82.0,
+  "output_summary": "pytest tests/forge/tools/ with --cov=src/forge/tools: 96 passed, 0 failed; line coverage 82% (graphiti.py 85%, guardkit.py 80%).",
+  "quality_gates_passed": true
+}

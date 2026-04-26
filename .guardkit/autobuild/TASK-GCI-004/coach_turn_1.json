@@ -1,0 +1,220 @@
+{
+  "task_id": "TASK-GCI-004",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/gh/test_operations.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/adapters/gh/test_operations.py:76\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/gh/test_operations.py:76: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\ntests/forge/adapters/gh/test_operations.py:101\n/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005/tests/forge/adapters/gh/test_operations.py:101: PytestUnknownMarkWarning: Unknown pytest.mark.seam - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html\n======================== 77 passed, 2 warnings in 0.15s ========================",
+      "duration_seconds": 0.6123447418212891
+    },
+    "requirements": {
+      "criteria_total": 10,
+      "criteria_met": 9,
+      "all_criteria_met": false,
+      "missing": [
+        "All modified files pass project-configured lint/format checks with zero"
+      ]
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`parse_guardkit_output()` in `src/forge/adapters/guardkit/parser.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (module path verified by inspect.getsourcefile in TestParserModuleSurface). The function signature matches the task spec: keyword-only subcommand, stdout, stderr, exit_code, duration_secs, and timed_out=False default.",
+      "notes": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (module path verified by inspect.getsourcefile in TestParserModuleSurface). The function signature matches the task spec: keyword-only subcommand, stdout, stderr, exit_code, duration_secs, and timed_out=False default."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`timed_out=True` \u2192 `status=\"timeout\"`, regardless of `exit_code`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are also preserved on the timeout path.",
+      "notes": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are also preserved on the timeout path."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`timed_out=False, exit_code != 0` \u2192 `status=\"failed\"`, `stderr`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr (or None when empty). TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test.",
+      "notes": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr (or None when empty). TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`timed_out=False, exit_code == 0, recognised shape` \u2192 `status=\"success\"`,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip.",
+      "notes": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`timed_out=False, exit_code == 0, unrecognised shape` \u2192",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser.",
+      "notes": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`stdout_tail` is the **last** 4 KB of stdout when stdout is larger",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start.",
+      "notes": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake).",
+      "notes": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings, a mock.patch-injected RuntimeError on _extract_artefacts, and asserts the warning carries diagnostic context. Status remains 'success' in every case.",
+      "notes": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings, a mock.patch-injected RuntimeError on _extract_artefacts, and asserts the warning carries diagnostic context. Status remains 'success' in every case."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Unit tests cover: success-with-artefacts, success-empty,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "test_parser.py contains 38 tests organised into 7 classes: TestParserModuleSurface (3), TestTimeoutTakesPrecedenceOverExitCode (6 incl. parametrised), TestNonZeroExitYieldsFailedWithStderr (7), TestRecognisedShapeYieldsSuccessWithArtefacts (5), TestUnrecognisedShapeDegradesToSuccessEmpty (3), TestStdoutTailTruncation (5), TestInternalErrorsBecomeWarningsNotRaises (3), TestResultFieldsAlwaysPopulated (6). All nine listed scenarios are covered.",
+      "notes": "test_parser.py contains 38 tests organised into 7 classes: TestParserModuleSurface (3), TestTimeoutTakesPrecedenceOverExitCode (6 incl. parametrised), TestNonZeroExitYieldsFailedWithStderr (7), TestRecognisedShapeYieldsSuccessWithArtefacts (5), TestUnrecognisedShapeDegradesToSuccessEmpty (3), TestStdoutTailTruncation (5), TestInternalErrorsBecomeWarningsNotRaises (3), TestResultFieldsAlwaysPopulated (6). All nine listed scenarios are covered."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "Promise status: uncertain",
+      "notes": "Promise status: uncertain"
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`parse_guardkit_output()` in `src/forge/adapters/guardkit/parser.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (module path verified by inspect.getsourcefile in TestParserModuleSurface). The function signature matches the task spec: keyword-only subcommand, stdout, stderr, exit_code, duration_secs, and timed_out=False default.",
+        "notes": "parse_guardkit_output() is defined and exported from src/forge/adapters/guardkit/parser.py (module path verified by inspect.getsourcefile in TestParserModuleSurface). The function signature matches the task spec: keyword-only subcommand, stdout, stderr, exit_code, duration_secs, and timed_out=False default."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`timed_out=True` \u2192 `status=\"timeout\"`, regardless of `exit_code`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are also preserved on the timeout path.",
+        "notes": "Status arbitration in parse_guardkit_output() checks timed_out first; TestTimeoutTakesPrecedenceOverExitCode parametrises exit_code over [0, 1, -9, 124] and asserts status=='timeout' in every case. subcommand, exit_code, duration_secs, and stderr are also preserved on the timeout path."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`timed_out=False, exit_code != 0` \u2192 `status=\"failed\"`, `stderr`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr (or None when empty). TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test.",
+        "notes": "Status arbitration falls through to 'failed' when timed_out is False and exit_code is non-zero. stderr is propagated verbatim to GuardKitResult.stderr (or None when empty). TestNonZeroExitYieldsFailedWithStderr parametrises exit_code over [1, 2, 64, 127, 255] and verifies status=='failed' in every case, plus a verbatim stderr round-trip test."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`timed_out=False, exit_code == 0, recognised shape` \u2192 `status=\"success\"`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip.",
+        "notes": "Helper functions _extract_artefacts (## Artefacts section + '- /path' lines), _extract_coach_score (coach_score: <float> regex), _extract_criterion_breakdown (## Coach Breakdown markdown table), and _extract_detection_findings (## Detection Findings JSON-fenced block) populate the optional fields. TestRecognisedShapeYieldsSuccessWithArtefacts asserts each helper individually plus a full-shape round-trip."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`timed_out=False, exit_code == 0, unrecognised shape` \u2192",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser.",
+        "notes": "When no recognised section regex matches, all extractors return [] / None and status remains 'success'. TestUnrecognisedShapeDegradesToSuccessEmpty covers completely-unknown text, empty stdout, and binary-noise stdout, and asserts no exception escapes the parser."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`stdout_tail` is the **last** 4 KB of stdout when stdout is larger",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start.",
+        "notes": "_tail_bytes() returns the input verbatim when len(encoded) <= 4096 and otherwise slices encoded[-4096:]. TestStdoutTailTruncation covers small stdout (verbatim), exactly-4096-byte stdout (verbatim), large stdout (last 4096 bytes), and a leading/trailing-marker test that proves we kept the end and dropped the start."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Tail boundary is byte-based, not character-based (multi-byte UTF-8 is",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake).",
+        "notes": "_tail_bytes() encodes to UTF-8, slices bytes, then decodes with errors='ignore'. test_multibyte_utf8_tail_is_byte_safe pads stdout with 2000 em-dashes (3 bytes each = 6000 bytes), invokes the parser, and asserts (a) no UnicodeDecodeError is raised, (b) the resulting tail re-encodes to <= 4096 bytes, and (c) every surviving character is a clean em-dash (no boundary mojibake)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Internal parse errors (malformed JSON, etc.) are caught and surfaced",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings, a mock.patch-injected RuntimeError on _extract_artefacts, and asserts the warning carries diagnostic context. Status remains 'success' in every case.",
+        "notes": "Each helper invocation in parse_guardkit_output() is wrapped in try/except that builds a GuardKitWarning(code='parser_unrecognised_shape', message=..., details={context, exception_type, exception_message}). TestInternalErrorsBecomeWarningsNotRaises covers malformed JSON in detection_findings, a mock.patch-injected RuntimeError on _extract_artefacts, and asserts the warning carries diagnostic context. Status remains 'success' in every case."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Unit tests cover: success-with-artefacts, success-empty,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "test_parser.py contains 38 tests organised into 7 classes: TestParserModuleSurface (3), TestTimeoutTakesPrecedenceOverExitCode (6 incl. parametrised), TestNonZeroExitYieldsFailedWithStderr (7), TestRecognisedShapeYieldsSuccessWithArtefacts (5), TestUnrecognisedShapeDegradesToSuccessEmpty (3), TestStdoutTailTruncation (5), TestInternalErrorsBecomeWarningsNotRaises (3), TestResultFieldsAlwaysPopulated (6). All nine listed scenarios are covered.",
+        "notes": "test_parser.py contains 38 tests organised into 7 classes: TestParserModuleSurface (3), TestTimeoutTakesPrecedenceOverExitCode (6 incl. parametrised), TestNonZeroExitYieldsFailedWithStderr (7), TestRecognisedShapeYieldsSuccessWithArtefacts (5), TestUnrecognisedShapeDegradesToSuccessEmpty (3), TestStdoutTailTruncation (5), TestInternalErrorsBecomeWarningsNotRaises (3), TestResultFieldsAlwaysPopulated (6). All nine listed scenarios are covered."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "Promise status: uncertain",
+        "notes": "Promise status: uncertain"
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "missing_requirement",
+      "description": "Not all acceptance criteria met",
+      "missing_criteria": [
+        "All modified files pass project-configured lint/format checks with zero"
+      ]
+    }
+  ],
+  "rationale": "Missing 1 acceptance criteria: All modified files pass project-configured lint/format checks with zero",
+  "context_used": "## Job-Specific Context\n\nBudget: 1034/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- IS_PROJECT_OF\n- BELONGS_TO_PROJECT\n\n### \u26a0\ufe0f Warnings\n- RELATED_PROJECT\n- HAS_FIX\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- HAS_ROLE_MUST_DO\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

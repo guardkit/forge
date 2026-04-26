@@ -1,0 +1,226 @@
+{
+  "task_id": "TASK-GCI-011",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "skipped",
+      "test_output_summary": "Independent test verification skipped (tests not required for testing tasks)",
+      "duration_seconds": 0.0
+    },
+    "requirements": {
+      "criteria_total": 11,
+      "criteria_met": 11,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`pyproject.toml` (or equivalent) declares `pytest-bdd` and any bdd",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "pyproject.toml [dependency-groups].dev already declared 'pytest-bdd>=8.1,<9' (and 'pytest>=9.0.2'). The pytest-bdd glue (pytest-bdd-base) is transitive; no extra deps were needed for the wiring this task adds.",
+      "notes": "pyproject.toml [dependency-groups].dev already declared 'pytest-bdd>=8.1,<9' (and 'pytest>=9.0.2'). The pytest-bdd glue (pytest-bdd-base) is transitive; no extra deps were needed for the wiring this task adds."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "All 32 scenarios from the feature file resolve to a step-definition",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`pytest --collect-only tests/bdd/test_guardkit_command_invocation_engine.py` collects 34 items (32 scenarios + 2 extra rows from the 3-row Outline). Every scenario in features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature now has a @scenario decorator and step bindings.",
+      "notes": "`pytest --collect-only tests/bdd/test_guardkit_command_invocation_engine.py` collects 34 items (32 scenarios + 2 extra rows from the 3-row Outline). Every scenario in features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature now has a @scenario decorator and step bindings."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "At least one Background fixture wires:",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The Background steps populate gci_world['worktree'], gci_world['permissions_defined'] and gci_world['manifest_available'] for every scenario. TASK-GCI-008 + TASK-GCI-003 bindings additionally build real tmp_path build worktrees with .guardkit/context-manifest.yaml seeded via _gci_seed_manifest(); the read_allowlist threaded into run() is the in-process equivalent of forge.yaml's permissions allowlist.",
+      "notes": "The Background steps populate gci_world['worktree'], gci_world['permissions_defined'] and gci_world['manifest_available'] for every scenario. TASK-GCI-008 + TASK-GCI-003 bindings additionally build real tmp_path build worktrees with .guardkit/context-manifest.yaml seeded via _gci_seed_manifest(); the read_allowlist threaded into run() is the in-process equivalent of forge.yaml's permissions allowlist."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Step definitions use the **public** tool layer surface",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The TASK-GCI-009 (guardkit_feature_spec) and TASK-GCI-010 (guardkit_graphiti_query) tools are driven via .ainvoke() in the relevant scenarios. The git operations (commit_all, cleanup_worktree) and gh operations (create_pr) are driven through their public adapter functions. The cwd-confinement, parallel, and retry scenarios drive run() directly because they assert on contracts (cwd, parallelism, extra_context_paths merge) that the @tool wrappers obscure.",
+      "notes": "The TASK-GCI-009 (guardkit_feature_spec) and TASK-GCI-010 (guardkit_graphiti_query) tools are driven via .ainvoke() in the relevant scenarios. The git operations (commit_all, cleanup_worktree) and gh operations (create_pr) are driven through their public adapter functions. The cwd-confinement, parallel, and retry scenarios drive run() directly because they assert on contracts (cwd, parallelism, extra_context_paths merge) that the @tool wrappers obscure."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "DeepAgents `execute` is **stubbed** to return canned subprocess",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Every scenario that exercises run() monkeypatches forge.adapters.guardkit.run._execute_subprocess to return (stdout, stderr, exit_code, duration, timed_out) tuples covering success, failed (exit 2), timeout (exit 124), permissions refusal (PermissionError), unknown stdout shape, and shell-meta passthrough (the existing GCI-006 binding asserts the literal-token contract by source-grep on the operations module).",
+      "notes": "Every scenario that exercises run() monkeypatches forge.adapters.guardkit.run._execute_subprocess to return (stdout, stderr, exit_code, duration, timed_out) tuples covering success, failed (exit 2), timeout (exit 124), permissions refusal (PermissionError), unknown stdout shape, and shell-meta passthrough (the existing GCI-006 binding asserts the literal-token contract by source-grep on the operations module)."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "NATS client is faked \u2014 for streaming scenarios, drive",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The pre-existing TASK-GCI-005 bindings use _BDDFakeNATSClient (a Subscription/Subscribe-shaped recorder) to deliver MessageEnvelope payloads through subscribe_progress() and assert the ProgressSink received the events; this remains unchanged. The new TASK-GCI-010 scenario also exercises the wrapper without a real NATS client (passes None through subscribe_progress).",
+      "notes": "The pre-existing TASK-GCI-005 bindings use _BDDFakeNATSClient (a Subscription/Subscribe-shaped recorder) to deliver MessageEnvelope payloads through subscribe_progress() and assert the ProgressSink received the events; this remains unchanged. The new TASK-GCI-010 scenario also exercises the wrapper without a real NATS client (passes None through subscribe_progress)."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Boundary `Scenario Outline` for the 1/300/599-second timeout examples",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The @boundary scenario outline 'A subprocess that finishes within the timeout is reported as successful' is wired with @scenario + parsers.parse('a GuardKit wrapper completes after {seconds:d} seconds of runtime'). Pytest collection shows test_boundary_finish_within_timeout_outline[1], [300], and [599] as three parameterised test items.",
+      "notes": "The @boundary scenario outline 'A subprocess that finishes within the timeout is reported as successful' is wired with @scenario + parsers.parse('a GuardKit wrapper completes after {seconds:d} seconds of runtime'). Pytest collection shows test_boundary_finish_within_timeout_outline[1], [300], and [599] as three parameterised test items."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Each scenario passes; all 32 are visible in pytest collection output",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "`pytest tests/bdd/test_guardkit_command_invocation_engine.py` reports '34 passed, 24 warnings'. All 32 scenarios pass; the Outline contributes 3 examples for a total of 34 test items. The full project suite (1182 tests) also passes.",
+      "notes": "`pytest tests/bdd/test_guardkit_command_invocation_engine.py` reports '34 passed, 24 warnings'. All 32 scenarios pass; the Outline contributes 3 examples for a total of 34 test items. The full project suite (1182 tests) also passes."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Tests run in CI as part of the standard pytest invocation; no",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/bdd/test_guardkit_command_invocation_engine.py is collected and run by `pytest tests/` with no special flags or targets. The conftest.py shim that maps .feature args to test_*.py modules is also invoked automatically via pytest_load_initial_conftests / pytest_cmdline_main.",
+      "notes": "tests/bdd/test_guardkit_command_invocation_engine.py is collected and run by `pytest tests/` with no special flags or targets. The conftest.py shim that maps .feature args to test_*.py modules is also invoked automatically via pytest_load_initial_conftests / pytest_cmdline_main."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Coverage of touched modules (`src/forge/adapters/guardkit/*` and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Aggregate coverage across the touched modules is 89% (416 statements, 47 missing). adapters/guardkit aggregate: context_resolver 90%, models 100%, parser 93%, progress 100%, progress_subscriber 100%, run 67% \u2014 overall 89%. tools/graphiti.py 85%, tools/guardkit.py 82% (the 16 missed lines are unreachable defensive double-guard except branches noqa-marked in the source). The aggregate exceeds the 85% threshold.",
+      "notes": "Aggregate coverage across the touched modules is 89% (416 statements, 47 missing). adapters/guardkit aggregate: context_resolver 90%, models 100%, parser 93%, progress 100%, progress_subscriber 100%, run 67% \u2014 overall 89%. tools/graphiti.py 85%, tools/guardkit.py 82% (the 16 missed lines are unreachable defensive double-guard except branches noqa-marked in the source). The aggregate exceeds the 85% threshold."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The project has no configured lint/format toolchain (no ruff, black, flake8, mypy, isort, pre-commit configuration in pyproject.toml or repo root). The added code follows PEP 8, uses type hints, and respects the 88-char Black-style line length convention from .claude/rules/code-style.md.",
+      "notes": "The project has no configured lint/format toolchain (no ruff, black, flake8, mypy, isort, pre-commit configuration in pyproject.toml or repo root). The added code follows PEP 8, uses type hints, and respects the 88-char Black-style line length convention from .claude/rules/code-style.md."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`pyproject.toml` (or equivalent) declares `pytest-bdd` and any bdd",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "pyproject.toml [dependency-groups].dev already declared 'pytest-bdd>=8.1,<9' (and 'pytest>=9.0.2'). The pytest-bdd glue (pytest-bdd-base) is transitive; no extra deps were needed for the wiring this task adds.",
+        "notes": "pyproject.toml [dependency-groups].dev already declared 'pytest-bdd>=8.1,<9' (and 'pytest>=9.0.2'). The pytest-bdd glue (pytest-bdd-base) is transitive; no extra deps were needed for the wiring this task adds."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "All 32 scenarios from the feature file resolve to a step-definition",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`pytest --collect-only tests/bdd/test_guardkit_command_invocation_engine.py` collects 34 items (32 scenarios + 2 extra rows from the 3-row Outline). Every scenario in features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature now has a @scenario decorator and step bindings.",
+        "notes": "`pytest --collect-only tests/bdd/test_guardkit_command_invocation_engine.py` collects 34 items (32 scenarios + 2 extra rows from the 3-row Outline). Every scenario in features/guardkit-command-invocation-engine/guardkit-command-invocation-engine.feature now has a @scenario decorator and step bindings."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "At least one Background fixture wires:",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The Background steps populate gci_world['worktree'], gci_world['permissions_defined'] and gci_world['manifest_available'] for every scenario. TASK-GCI-008 + TASK-GCI-003 bindings additionally build real tmp_path build worktrees with .guardkit/context-manifest.yaml seeded via _gci_seed_manifest(); the read_allowlist threaded into run() is the in-process equivalent of forge.yaml's permissions allowlist.",
+        "notes": "The Background steps populate gci_world['worktree'], gci_world['permissions_defined'] and gci_world['manifest_available'] for every scenario. TASK-GCI-008 + TASK-GCI-003 bindings additionally build real tmp_path build worktrees with .guardkit/context-manifest.yaml seeded via _gci_seed_manifest(); the read_allowlist threaded into run() is the in-process equivalent of forge.yaml's permissions allowlist."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Step definitions use the **public** tool layer surface",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The TASK-GCI-009 (guardkit_feature_spec) and TASK-GCI-010 (guardkit_graphiti_query) tools are driven via .ainvoke() in the relevant scenarios. The git operations (commit_all, cleanup_worktree) and gh operations (create_pr) are driven through their public adapter functions. The cwd-confinement, parallel, and retry scenarios drive run() directly because they assert on contracts (cwd, parallelism, extra_context_paths merge) that the @tool wrappers obscure.",
+        "notes": "The TASK-GCI-009 (guardkit_feature_spec) and TASK-GCI-010 (guardkit_graphiti_query) tools are driven via .ainvoke() in the relevant scenarios. The git operations (commit_all, cleanup_worktree) and gh operations (create_pr) are driven through their public adapter functions. The cwd-confinement, parallel, and retry scenarios drive run() directly because they assert on contracts (cwd, parallelism, extra_context_paths merge) that the @tool wrappers obscure."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "DeepAgents `execute` is **stubbed** to return canned subprocess",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Every scenario that exercises run() monkeypatches forge.adapters.guardkit.run._execute_subprocess to return (stdout, stderr, exit_code, duration, timed_out) tuples covering success, failed (exit 2), timeout (exit 124), permissions refusal (PermissionError), unknown stdout shape, and shell-meta passthrough (the existing GCI-006 binding asserts the literal-token contract by source-grep on the operations module).",
+        "notes": "Every scenario that exercises run() monkeypatches forge.adapters.guardkit.run._execute_subprocess to return (stdout, stderr, exit_code, duration, timed_out) tuples covering success, failed (exit 2), timeout (exit 124), permissions refusal (PermissionError), unknown stdout shape, and shell-meta passthrough (the existing GCI-006 binding asserts the literal-token contract by source-grep on the operations module)."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "NATS client is faked \u2014 for streaming scenarios, drive",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The pre-existing TASK-GCI-005 bindings use _BDDFakeNATSClient (a Subscription/Subscribe-shaped recorder) to deliver MessageEnvelope payloads through subscribe_progress() and assert the ProgressSink received the events; this remains unchanged. The new TASK-GCI-010 scenario also exercises the wrapper without a real NATS client (passes None through subscribe_progress).",
+        "notes": "The pre-existing TASK-GCI-005 bindings use _BDDFakeNATSClient (a Subscription/Subscribe-shaped recorder) to deliver MessageEnvelope payloads through subscribe_progress() and assert the ProgressSink received the events; this remains unchanged. The new TASK-GCI-010 scenario also exercises the wrapper without a real NATS client (passes None through subscribe_progress)."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Boundary `Scenario Outline` for the 1/300/599-second timeout examples",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The @boundary scenario outline 'A subprocess that finishes within the timeout is reported as successful' is wired with @scenario + parsers.parse('a GuardKit wrapper completes after {seconds:d} seconds of runtime'). Pytest collection shows test_boundary_finish_within_timeout_outline[1], [300], and [599] as three parameterised test items.",
+        "notes": "The @boundary scenario outline 'A subprocess that finishes within the timeout is reported as successful' is wired with @scenario + parsers.parse('a GuardKit wrapper completes after {seconds:d} seconds of runtime'). Pytest collection shows test_boundary_finish_within_timeout_outline[1], [300], and [599] as three parameterised test items."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Each scenario passes; all 32 are visible in pytest collection output",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "`pytest tests/bdd/test_guardkit_command_invocation_engine.py` reports '34 passed, 24 warnings'. All 32 scenarios pass; the Outline contributes 3 examples for a total of 34 test items. The full project suite (1182 tests) also passes.",
+        "notes": "`pytest tests/bdd/test_guardkit_command_invocation_engine.py` reports '34 passed, 24 warnings'. All 32 scenarios pass; the Outline contributes 3 examples for a total of 34 test items. The full project suite (1182 tests) also passes."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Tests run in CI as part of the standard pytest invocation; no",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/bdd/test_guardkit_command_invocation_engine.py is collected and run by `pytest tests/` with no special flags or targets. The conftest.py shim that maps .feature args to test_*.py modules is also invoked automatically via pytest_load_initial_conftests / pytest_cmdline_main.",
+        "notes": "tests/bdd/test_guardkit_command_invocation_engine.py is collected and run by `pytest tests/` with no special flags or targets. The conftest.py shim that maps .feature args to test_*.py modules is also invoked automatically via pytest_load_initial_conftests / pytest_cmdline_main."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Coverage of touched modules (`src/forge/adapters/guardkit/*` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Aggregate coverage across the touched modules is 89% (416 statements, 47 missing). adapters/guardkit aggregate: context_resolver 90%, models 100%, parser 93%, progress 100%, progress_subscriber 100%, run 67% \u2014 overall 89%. tools/graphiti.py 85%, tools/guardkit.py 82% (the 16 missed lines are unreachable defensive double-guard except branches noqa-marked in the source). The aggregate exceeds the 85% threshold.",
+        "notes": "Aggregate coverage across the touched modules is 89% (416 statements, 47 missing). adapters/guardkit aggregate: context_resolver 90%, models 100%, parser 93%, progress 100%, progress_subscriber 100%, run 67% \u2014 overall 89%. tools/graphiti.py 85%, tools/guardkit.py 82% (the 16 missed lines are unreachable defensive double-guard except branches noqa-marked in the source). The aggregate exceeds the 85% threshold."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The project has no configured lint/format toolchain (no ruff, black, flake8, mypy, isort, pre-commit configuration in pyproject.toml or repo root). The added code follows PEP 8, uses type hints, and respects the 88-char Black-style line length convention from .claude/rules/code-style.md.",
+        "notes": "The project has no configured lint/format toolchain (no ruff, black, flake8, mypy, isort, pre-commit configuration in pyproject.toml or repo root). The added code follows PEP 8, uses type hints, and respects the 88-char Black-style line length convention from .claude/rules/code-style.md."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "rationale": "All quality gates passed. Tests not required for this task type. All acceptance criteria met. Architecture context: 283 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 954/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- EXAMPLE_CONTAINS\n- SOURCE_OF_PATTERN\n\n### \u26a0\ufe0f Warnings\n- IS_IMPLEMENTED_AS\n- REQUIRES_USE_OF\n\n### \ud83c\udfad Role Constraints\n- PROJECT_INVOLVES\n- PROJECT_INVOLVES\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_INVOCATION_METHOD\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

@@ -1,0 +1,258 @@
+{
+  "task_id": "TASK-GCI-003",
+  "turn": 3,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/bdd/test_guardkit_command_invocation_engine.py tests/forge/adapters/gh/test_operations.py tests/forge/adapters/git/test_operations.py tests/forge/adapters/guardkit/test_context_resolver.py tests/forge/adapters/guardkit/test_parser.py tests/forge/adapters/guardkit/test_progress_subscriber.py -v --tb=short",
+      "test_output_summary": "Error detail:\ntests/forge/adapters/guardkit/test_context_resolver.py::TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected PASSED [ 51%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-search] PASSED [ 52%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-export] PASSED [ 53%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-import] PASSED [ 54%]\ntests/forge/adapters/guardkit/test_context_resolver.py::TestGraphitiSubcommandsRaiseKeyError::test_resolver_raises_keyerror_for_graphiti_subcommands[graphiti-prune] PASSED [ 54%]\nResult:\ntests/forge/adapters/git/test_operations.py:478\n/home/richardwoollcott/Projects/appmilla_githu...",
+      "duration_seconds": 0.6718549728393555
+    },
+    "requirements": {
+      "criteria_total": 13,
+      "criteria_met": 13,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`resolve_context_flags()` in `src/forge/adapters/guardkit/context_resolver.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "src/forge/adapters/guardkit/context_resolver.py lines 83-94 declare `@dataclass(frozen=True) class ResolvedContext` with `flags: list[str]`, `paths: list[str]`, `warnings: list[GuardKitWarning]` (default-factory list per ASSUM-007 stateless contract). Function `resolve_context_flags()` (lines 102-299) constructs and returns this dataclass. Verified by tests/forge/adapters/guardkit/test_context_resolver.py::TestResolvedContextShape::test_resolved_context_has_three_named_attributes (PASSED in this turn's pytest run).",
+      "notes": "src/forge/adapters/guardkit/context_resolver.py lines 83-94 declare `@dataclass(frozen=True) class ResolvedContext` with `flags: list[str]`, `paths: list[str]`, `warnings: list[GuardKitWarning]` (default-factory list per ASSUM-007 stateless contract). Function `resolve_context_flags()` (lines 102-299) constructs and returns this dataclass. Verified by tests/forge/adapters/guardkit/test_context_resolver.py::TestResolvedContextShape::test_resolved_context_has_three_named_attributes (PASSED in this turn's pytest run)."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`_COMMAND_CATEGORY_FILTER` matches DDR-005 verbatim (9 entries \u2014 Graphiti",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 49-60 define _COMMAND_CATEGORY_FILTER with exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) and category sets matching DDR-005 verbatim. Comment at line 59 documents the deliberate Graphiti omission. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-* absence checks for graphiti-search, graphiti-export, graphiti-import, graphiti-prune) \u2014 all PASSED.",
+      "notes": "context_resolver.py lines 49-60 define _COMMAND_CATEGORY_FILTER with exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) and category sets matching DDR-005 verbatim. Comment at line 59 documents the deliberate Graphiti omission. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-* absence checks for graphiti-search, graphiti-export, graphiti-import, graphiti-prune) \u2014 all PASSED."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Missing manifest \u2192 returns empty `flags`, single",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 152-167: when origin manifest path does not exist, _load_manifest returns None, the function appends a single GuardKitWarning(code='context_manifest_missing', message=..., details={'path': ...}) and returns ResolvedContext(flags=[], paths=[], warnings=[warning]) without raising. Verified by TestMissingManifestDegradesGracefully \u2014 3 tests (returns_empty_flags, emits_single_warning, does_not_raise) all PASSED.",
+      "notes": "context_resolver.py lines 152-167: when origin manifest path does not exist, _load_manifest returns None, the function appends a single GuardKitWarning(code='context_manifest_missing', message=..., details={'path': ...}) and returns ResolvedContext(flags=[], paths=[], warnings=[warning]) without raising. Verified by TestMissingManifestDegradesGracefully \u2014 3 tests (returns_empty_flags, emits_single_warning, does_not_raise) all PASSED."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`internal_docs.always_include` paths are prepended to the flag list",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 172-187 read internal_docs.always_include from origin manifest and validate each path; line 291 starts the ordered_paths list with always_include_paths BEFORE the category-filtered docs are appended (lines 292-293). always_include paths bypass the category filter check entirely (no filter is applied in that loop). Verified by TestAlwaysIncludePrepended \u2014 3 tests (test_always_include_paths_appear_before_category_paths, test_always_include_added_for_uncategorised_doc, test_flags_pair_each_path_with_context_argument) all PASSED.",
+      "notes": "context_resolver.py lines 172-187 read internal_docs.always_include from origin manifest and validate each path; line 291 starts the ordered_paths list with always_include_paths BEFORE the category-filtered docs are appended (lines 292-293). always_include paths bypass the category filter check entirely (no filter is applied in that loop). Verified by TestAlwaysIncludePrepended \u2014 3 tests (test_always_include_paths_appear_before_category_paths, test_always_include_added_for_uncategorised_doc, test_flags_pair_each_path_with_context_argument) all PASSED."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Dependency chase follows manifests up to depth 2 then stops with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py line 74 sets _DEPTH_CAP=2 (ASSUM-002, manifest hops). The BFS loop (lines 196-286) carries depth in each frame; lines 240-256 emit a GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'depth_cap', 'depth_cap': 2, ...}) and skip recursion when depth+1 > _DEPTH_CAP. Verified by TestDepthCapChase \u2014 3 tests (depth_one_chase_collects_dep_doc, depth_two_chase_collects_dep_doc, depth_three_stops_with_depth_cap_warning) all PASSED.",
+      "notes": "context_resolver.py line 74 sets _DEPTH_CAP=2 (ASSUM-002, manifest hops). The BFS loop (lines 196-286) carries depth in each frame; lines 240-256 emit a GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'depth_cap', 'depth_cap': 2, ...}) and skip recursion when depth+1 > _DEPTH_CAP. Verified by TestDepthCapChase \u2014 3 tests (depth_one_chase_collects_dep_doc, depth_two_chase_collects_dep_doc, depth_three_stops_with_depth_cap_warning) all PASSED."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Cycle detection: a manifest already visited in the current chain is not",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py line 197 initialises the BFS chain as frozenset({origin_manifest_path}); line 283 extends the chain on each recursion (chain | {dep_manifest_path}); lines 257-272 emit GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'cycle', ...}) and skip recursion when dep_manifest_path is already in the current chain. Per-chain (not global) tracking allows diamond imports to remain legal. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely (PASSED).",
+      "notes": "context_resolver.py line 197 initialises the BFS chain as frozenset({origin_manifest_path}); line 283 extends the chain on each recursion (chain | {dep_manifest_path}); lines 257-272 emit GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'cycle', ...}) and skip recursion when dep_manifest_path is already in the current chain. Per-chain (not global) tracking allows diamond imports to remain legal. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely (PASSED)."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "Documents whose resolved absolute path is outside `read_allowlist` are",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 372-386 (_validate_doc_path): after the repo-root check, iterates read_allowlist with `_is_within(resolved, allowed)` \u2014 if no entry matches, emits GuardKitWarning(code='context_manifest_path_outside_allowlist', message=..., details={'path': abs_path, 'allowlist': [...]}) and returns (False, abs_path) so the doc is omitted from output. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned (PASSED).",
+      "notes": "context_resolver.py lines 372-386 (_validate_doc_path): after the repo-root check, iterates read_allowlist with `_is_within(resolved, allowed)` \u2014 if no entry matches, emits GuardKitWarning(code='context_manifest_path_outside_allowlist', message=..., details={'path': abs_path, 'allowlist': [...]}) and returns (False, abs_path) so the doc is omitted from output. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned (PASSED)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Documents whose path resolves outside the repo root are omitted with a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 356-370 (_validate_doc_path): performs `_is_within(resolved, owning_repo_root)` BEFORE the allowlist check; if the resolved path escapes the repo (e.g. via `..` or symlink), emits GuardKitWarning(code='context_manifest_path_outside_repo', details={'path': abs_path, 'repo_root': str(owning_repo_root)}) and returns (False, abs_path). Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected (PASSED).",
+      "notes": "context_resolver.py lines 356-370 (_validate_doc_path): performs `_is_within(resolved, owning_repo_root)` BEFORE the allowlist check; if the resolved path escapes the repo (e.g. via `..` or symlink), emits GuardKitWarning(code='context_manifest_path_outside_repo', details={'path': abs_path, 'repo_root': str(owning_repo_root)}) and returns (False, abs_path). Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected (PASSED)."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Resolution is **stateless** \u2014 two concurrent calls against the same",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py uses no @functools.cache, no module-level mutable state, and ResolvedContext fields use field(default_factory=list) so every call constructs fresh lists. Each invocation re-reads manifests from disk (lines 152-153, 273). Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result's lists and asserts the second call's lists are independent (PASSED).",
+      "notes": "context_resolver.py uses no @functools.cache, no module-level mutable state, and ResolvedContext fields use field(default_factory=list) so every call constructs fresh lists. Each invocation re-reads manifests from disk (lines 152-153, 273). Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result's lists and asserts the second call's lists are independent (PASSED)."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Order is stable: `always_include` first, then categories in",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py lines 66-72 declare _CATEGORY_ORDER=('architecture', 'decisions', 'specs', 'contracts', 'source') \u2014 first-appearance order across DDR-005 dict values. Lines 291-293 assemble ordered_paths by extending always_include_paths first, then iterating _CATEGORY_ORDER and extending docs_by_category[category] (which preserves BFS+declaration order via list.append in the BFS loop at line 234). Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures (PASSED).",
+      "notes": "context_resolver.py lines 66-72 declare _CATEGORY_ORDER=('architecture', 'decisions', 'specs', 'contracts', 'source') \u2014 first-appearance order across DDR-005 dict values. Lines 291-293 assemble ordered_paths by extending always_include_paths first, then iterating _CATEGORY_ORDER and extending docs_by_category[category] (which preserves BFS+declaration order via list.append in the BFS loop at line 234). Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures (PASSED)."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "Symlinks are followed before allowlist check",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "context_resolver.py line 353 (_validate_doc_path) calls `candidate.resolve(strict=False)` BEFORE either the repo-root or allowlist checks. Path.resolve() follows symlinks, so a symlink whose target is outside the allowlist is correctly rejected by the subsequent `_is_within` check. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (PASSED on Linux; skipped on Windows where symlinks require admin).",
+      "notes": "context_resolver.py line 353 (_validate_doc_path) calls `candidate.resolve(strict=False)` BEFORE either the repo-root or allowlist checks. Path.resolve() follows symlinks, so a symlink whose target is outside the allowlist is correctly rejected by the subsequent `_is_within` check. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (PASSED on Linux; skipped on Windows where symlinks require admin)."
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "Exhaustive unit tests: missing manifest, depth-1 chase, depth-2 chase,",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "tests/forge/adapters/guardkit/test_context_resolver.py contains 28 tests across 12 test classes covering each acceptance criterion. Graphiti-bypass-by-caller is verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + an unknown subcommand) \u2014 each asserts pytest.raises(KeyError). All other listed scenarios have dedicated test methods. Full suite: 28 PASSED in 0.04s this turn.",
+      "notes": "tests/forge/adapters/guardkit/test_context_resolver.py contains 28 tests across 12 test classes covering each acceptance criterion. Graphiti-bypass-by-caller is verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + an unknown subcommand) \u2014 each asserts pytest.raises(KeyError). All other listed scenarios have dedicated test methods. Full suite: 28 PASSED in 0.04s this turn."
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Re-ran this turn: `black --check --line-length 88 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' `ruff check src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All checks passed!'. Per .claude/rules/code-style.md (Black formatter, 88-char line length).",
+      "notes": "Re-ran this turn: `black --check --line-length 88 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' `ruff check src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All checks passed!'. Per .claude/rules/code-style.md (Black formatter, 88-char line length)."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`resolve_context_flags()` in `src/forge/adapters/guardkit/context_resolver.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "src/forge/adapters/guardkit/context_resolver.py lines 83-94 declare `@dataclass(frozen=True) class ResolvedContext` with `flags: list[str]`, `paths: list[str]`, `warnings: list[GuardKitWarning]` (default-factory list per ASSUM-007 stateless contract). Function `resolve_context_flags()` (lines 102-299) constructs and returns this dataclass. Verified by tests/forge/adapters/guardkit/test_context_resolver.py::TestResolvedContextShape::test_resolved_context_has_three_named_attributes (PASSED in this turn's pytest run).",
+        "notes": "src/forge/adapters/guardkit/context_resolver.py lines 83-94 declare `@dataclass(frozen=True) class ResolvedContext` with `flags: list[str]`, `paths: list[str]`, `warnings: list[GuardKitWarning]` (default-factory list per ASSUM-007 stateless contract). Function `resolve_context_flags()` (lines 102-299) constructs and returns this dataclass. Verified by tests/forge/adapters/guardkit/test_context_resolver.py::TestResolvedContextShape::test_resolved_context_has_three_named_attributes (PASSED in this turn's pytest run)."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`_COMMAND_CATEGORY_FILTER` matches DDR-005 verbatim (9 entries \u2014 Graphiti",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 49-60 define _COMMAND_CATEGORY_FILTER with exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) and category sets matching DDR-005 verbatim. Comment at line 59 documents the deliberate Graphiti omission. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-* absence checks for graphiti-search, graphiti-export, graphiti-import, graphiti-prune) \u2014 all PASSED.",
+        "notes": "context_resolver.py lines 49-60 define _COMMAND_CATEGORY_FILTER with exactly 9 keys (system-arch, system-design, system-plan, feature-spec, feature-plan, task-review, task-work, task-complete, autobuild) and category sets matching DDR-005 verbatim. Comment at line 59 documents the deliberate Graphiti omission. Verified by TestCommandCategoryFilterMatchesDDR005 (4 tests including parametrised graphiti-* absence checks for graphiti-search, graphiti-export, graphiti-import, graphiti-prune) \u2014 all PASSED."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Missing manifest \u2192 returns empty `flags`, single",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 152-167: when origin manifest path does not exist, _load_manifest returns None, the function appends a single GuardKitWarning(code='context_manifest_missing', message=..., details={'path': ...}) and returns ResolvedContext(flags=[], paths=[], warnings=[warning]) without raising. Verified by TestMissingManifestDegradesGracefully \u2014 3 tests (returns_empty_flags, emits_single_warning, does_not_raise) all PASSED.",
+        "notes": "context_resolver.py lines 152-167: when origin manifest path does not exist, _load_manifest returns None, the function appends a single GuardKitWarning(code='context_manifest_missing', message=..., details={'path': ...}) and returns ResolvedContext(flags=[], paths=[], warnings=[warning]) without raising. Verified by TestMissingManifestDegradesGracefully \u2014 3 tests (returns_empty_flags, emits_single_warning, does_not_raise) all PASSED."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`internal_docs.always_include` paths are prepended to the flag list",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 172-187 read internal_docs.always_include from origin manifest and validate each path; line 291 starts the ordered_paths list with always_include_paths BEFORE the category-filtered docs are appended (lines 292-293). always_include paths bypass the category filter check entirely (no filter is applied in that loop). Verified by TestAlwaysIncludePrepended \u2014 3 tests (test_always_include_paths_appear_before_category_paths, test_always_include_added_for_uncategorised_doc, test_flags_pair_each_path_with_context_argument) all PASSED.",
+        "notes": "context_resolver.py lines 172-187 read internal_docs.always_include from origin manifest and validate each path; line 291 starts the ordered_paths list with always_include_paths BEFORE the category-filtered docs are appended (lines 292-293). always_include paths bypass the category filter check entirely (no filter is applied in that loop). Verified by TestAlwaysIncludePrepended \u2014 3 tests (test_always_include_paths_appear_before_category_paths, test_always_include_added_for_uncategorised_doc, test_flags_pair_each_path_with_context_argument) all PASSED."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Dependency chase follows manifests up to depth 2 then stops with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py line 74 sets _DEPTH_CAP=2 (ASSUM-002, manifest hops). The BFS loop (lines 196-286) carries depth in each frame; lines 240-256 emit a GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'depth_cap', 'depth_cap': 2, ...}) and skip recursion when depth+1 > _DEPTH_CAP. Verified by TestDepthCapChase \u2014 3 tests (depth_one_chase_collects_dep_doc, depth_two_chase_collects_dep_doc, depth_three_stops_with_depth_cap_warning) all PASSED.",
+        "notes": "context_resolver.py line 74 sets _DEPTH_CAP=2 (ASSUM-002, manifest hops). The BFS loop (lines 196-286) carries depth in each frame; lines 240-256 emit a GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'depth_cap', 'depth_cap': 2, ...}) and skip recursion when depth+1 > _DEPTH_CAP. Verified by TestDepthCapChase \u2014 3 tests (depth_one_chase_collects_dep_doc, depth_two_chase_collects_dep_doc, depth_three_stops_with_depth_cap_warning) all PASSED."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Cycle detection: a manifest already visited in the current chain is not",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py line 197 initialises the BFS chain as frozenset({origin_manifest_path}); line 283 extends the chain on each recursion (chain | {dep_manifest_path}); lines 257-272 emit GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'cycle', ...}) and skip recursion when dep_manifest_path is already in the current chain. Per-chain (not global) tracking allows diamond imports to remain legal. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely (PASSED).",
+        "notes": "context_resolver.py line 197 initialises the BFS chain as frozenset({origin_manifest_path}); line 283 extends the chain on each recursion (chain | {dep_manifest_path}); lines 257-272 emit GuardKitWarning(code='context_manifest_cycle_detected', details={'reason': 'cycle', ...}) and skip recursion when dep_manifest_path is already in the current chain. Per-chain (not global) tracking allows diamond imports to remain legal. Verified by TestCycleDetection::test_two_node_cycle_resolves_safely (PASSED)."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "Documents whose resolved absolute path is outside `read_allowlist` are",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 372-386 (_validate_doc_path): after the repo-root check, iterates read_allowlist with `_is_within(resolved, allowed)` \u2014 if no entry matches, emits GuardKitWarning(code='context_manifest_path_outside_allowlist', message=..., details={'path': abs_path, 'allowlist': [...]}) and returns (False, abs_path) so the doc is omitted from output. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned (PASSED).",
+        "notes": "context_resolver.py lines 372-386 (_validate_doc_path): after the repo-root check, iterates read_allowlist with `_is_within(resolved, allowed)` \u2014 if no entry matches, emits GuardKitWarning(code='context_manifest_path_outside_allowlist', message=..., details={'path': abs_path, 'allowlist': [...]}) and returns (False, abs_path) so the doc is omitted from output. Verified by TestReadAllowlistExclusion::test_doc_outside_allowlist_is_omitted_and_warned (PASSED)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Documents whose path resolves outside the repo root are omitted with a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 356-370 (_validate_doc_path): performs `_is_within(resolved, owning_repo_root)` BEFORE the allowlist check; if the resolved path escapes the repo (e.g. via `..` or symlink), emits GuardKitWarning(code='context_manifest_path_outside_repo', details={'path': abs_path, 'repo_root': str(owning_repo_root)}) and returns (False, abs_path). Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected (PASSED).",
+        "notes": "context_resolver.py lines 356-370 (_validate_doc_path): performs `_is_within(resolved, owning_repo_root)` BEFORE the allowlist check; if the resolved path escapes the repo (e.g. via `..` or symlink), emits GuardKitWarning(code='context_manifest_path_outside_repo', details={'path': abs_path, 'repo_root': str(owning_repo_root)}) and returns (False, abs_path). Verified by TestDocPathEscapesRepoRoot::test_path_with_dotdot_escape_is_rejected (PASSED)."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Resolution is **stateless** \u2014 two concurrent calls against the same",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py uses no @functools.cache, no module-level mutable state, and ResolvedContext fields use field(default_factory=list) so every call constructs fresh lists. Each invocation re-reads manifests from disk (lines 152-153, 273). Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result's lists and asserts the second call's lists are independent (PASSED).",
+        "notes": "context_resolver.py uses no @functools.cache, no module-level mutable state, and ResolvedContext fields use field(default_factory=list) so every call constructs fresh lists. Each invocation re-reads manifests from disk (lines 152-153, 273). Verified by TestStatelessness::test_two_calls_return_independent_lists which mutates the first result's lists and asserts the second call's lists are independent (PASSED)."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Order is stable: `always_include` first, then categories in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py lines 66-72 declare _CATEGORY_ORDER=('architecture', 'decisions', 'specs', 'contracts', 'source') \u2014 first-appearance order across DDR-005 dict values. Lines 291-293 assemble ordered_paths by extending always_include_paths first, then iterating _CATEGORY_ORDER and extending docs_by_category[category] (which preserves BFS+declaration order via list.append in the BFS loop at line 234). Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures (PASSED).",
+        "notes": "context_resolver.py lines 66-72 declare _CATEGORY_ORDER=('architecture', 'decisions', 'specs', 'contracts', 'source') \u2014 first-appearance order across DDR-005 dict values. Lines 291-293 assemble ordered_paths by extending always_include_paths first, then iterating _CATEGORY_ORDER and extending docs_by_category[category] (which preserves BFS+declaration order via list.append in the BFS loop at line 234). Verified by TestStableOrder::test_always_include_then_categories_then_declaration_order with mixed-category fixtures (PASSED)."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "Symlinks are followed before allowlist check",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "context_resolver.py line 353 (_validate_doc_path) calls `candidate.resolve(strict=False)` BEFORE either the repo-root or allowlist checks. Path.resolve() follows symlinks, so a symlink whose target is outside the allowlist is correctly rejected by the subsequent `_is_within` check. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (PASSED on Linux; skipped on Windows where symlinks require admin).",
+        "notes": "context_resolver.py line 353 (_validate_doc_path) calls `candidate.resolve(strict=False)` BEFORE either the repo-root or allowlist checks. Path.resolve() follows symlinks, so a symlink whose target is outside the allowlist is correctly rejected by the subsequent `_is_within` check. Verified by TestSymlinksFollowedBeforeAllowlistCheck::test_symlink_target_outside_allowlist_is_rejected (PASSED on Linux; skipped on Windows where symlinks require admin)."
+      },
+      {
+        "criterion_id": "AC-012",
+        "criterion_text": "Exhaustive unit tests: missing manifest, depth-1 chase, depth-2 chase,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "tests/forge/adapters/guardkit/test_context_resolver.py contains 28 tests across 12 test classes covering each acceptance criterion. Graphiti-bypass-by-caller is verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + an unknown subcommand) \u2014 each asserts pytest.raises(KeyError). All other listed scenarios have dedicated test methods. Full suite: 28 PASSED in 0.04s this turn.",
+        "notes": "tests/forge/adapters/guardkit/test_context_resolver.py contains 28 tests across 12 test classes covering each acceptance criterion. Graphiti-bypass-by-caller is verified by TestGraphitiSubcommandsRaiseKeyError (parametrised over graphiti-search/export/import/prune + an unknown subcommand) \u2014 each asserts pytest.raises(KeyError). All other listed scenarios have dedicated test methods. Full suite: 28 PASSED in 0.04s this turn."
+      },
+      {
+        "criterion_id": "AC-013",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Re-ran this turn: `black --check --line-length 88 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' `ruff check src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All checks passed!'. Per .claude/rules/code-style.md (Black formatter, 88-char line length).",
+        "notes": "Re-ran this turn: `black --check --line-length 88 src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All done! 2 files would be left unchanged.' `ruff check src/forge/adapters/guardkit/context_resolver.py tests/forge/adapters/guardkit/test_context_resolver.py` \u2192 'All checks passed!'. Per .claude/rules/code-style.md (Black formatter, 88-char line length)."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 1167 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1133/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- CREATED_AT_PATTERN_VERSION\n- CALLED_BY\n\n### \u26a0\ufe0f Warnings\n- HAS_INCORRECT_PATH_REFERENCE\n- USES_ENDPOINT\n\n### \ud83c\udfad Role Constraints\n- DELEGATES_TO\n- DELEGATE_TO_TASK_WORK\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO\n- HAS_RESULT_LOCATION\n\n\n## Previous Turn Summary (Turn 2)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `python-api-specialist` (Implementation)\n- BDD oracle: 1 scenario(s) failed during pytest-bdd execution. Implementation does not satisfy the Gherkin specification.\n\n**Acceptance Criteria Status**:\n  \u25cb AC-001: verified\n  \u25cb AC-002: verified\n  \u25cb AC-003: verified\n  \u25cb AC-004: verified\n  \u25cb AC-005: verified\n  \u25cb AC-006: verified\n  \u25cb AC-007: verified\n  \u25cb AC-008: verified\n  \u25cb AC-009: verified\n  \u25cb AC-010: verified\n  \u25cb AC-011: verified\n  \u25cb AC-012: verified\n  \u25cb AC-013: verified",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}

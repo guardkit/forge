@@ -1,0 +1,149 @@
+{
+  "task_id": "TASK-GCI-001",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/guardkit/test_models.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/adapters/guardkit/test_models.py::TestRoundTripsThroughJSON::test_round_trip_preserves_status_literal PASSED [ 88%]\ntests/forge/adapters/guardkit/test_models.py::TestPackageReExportShim::test_package_reexports_result_model PASSED [ 92%]\ntests/forge/adapters/guardkit/test_models.py::TestPackageReExportShim::test_package_reexports_warning_model PASSED [ 96%]\ntests/forge/adapters/guardkit/test_models.py::TestPackageReExportShim::test_package_dunder_all_includes_both_models PASSED [100%]\n============================== 26 passed in 0.02s ==============================",
+      "duration_seconds": 0.3871128559112549
+    },
+    "requirements": {
+      "criteria_total": 7,
+      "criteria_met": 7,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`GuardKitResult` and `GuardKitWarning` defined in",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/guardkit/models.py declaring both classes as Pydantic v2 BaseModels. TestModelsDefinedInModelsModule asserts `GuardKitResult.__module__ == 'forge.adapters.guardkit.models'`, the same for GuardKitWarning, and that `inspect.getsourcefile()` returns a path ending in `forge/adapters/guardkit/models.py`.",
+      "notes": "Created src/forge/adapters/guardkit/models.py declaring both classes as Pydantic v2 BaseModels. TestModelsDefinedInModelsModule asserts `GuardKitResult.__module__ == 'forge.adapters.guardkit.models'`, the same for GuardKitWarning, and that `inspect.getsourcefile()` returns a path ending in `forge/adapters/guardkit/models.py`."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`status` is a `Literal[\"success\", \"failed\", \"timeout\"]` (no `Enum`)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "GuardKitResult.status is annotated `Literal['success','failed','timeout']`. TestStatusFieldIsLiteralNotEnum verifies via `typing.get_origin` that the origin is `Literal` and the args are exactly `{'success','failed','timeout'}`, and that an unknown string ('errored') raises ValidationError.",
+      "notes": "GuardKitResult.status is annotated `Literal['success','failed','timeout']`. TestStatusFieldIsLiteralNotEnum verifies via `typing.get_origin` that the origin is `Literal` and the args are exactly `{'success','failed','timeout'}`, and that an unknown string ('errored') raises ValidationError."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`artefacts`, `warnings` use `Field(default_factory=list)` (no shared",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both list fields declared as `Field(default_factory=list)`. TestListFieldsUseDefaultFactory parametrises across both fields, asserting `model_fields[name].default_factory is list`, and proves mutation isolation by appending to one instance and checking another instance is still empty. The supporting `GuardKitWarning.details` dict field is similarly verified.",
+      "notes": "Both list fields declared as `Field(default_factory=list)`. TestListFieldsUseDefaultFactory parametrises across both fields, asserting `model_fields[name].default_factory is list`, and proves mutation isolation by appending to one instance and checking another instance is still empty. The supporting `GuardKitWarning.details` dict field is similarly verified."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`coach_score`, `criterion_breakdown`, `detection_findings`, `stderr`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All four fields declared with `| None = None`. TestOptionalFieldsAreNullable parametrises across all four, asserting they default to None on a minimal instance, accept explicit None, and that their resolved type hints contain `type(None)` in the union args.",
+      "notes": "All four fields declared with `| None = None`. TestOptionalFieldsAreNullable parametrises across all four, asserting they default to None on a minimal instance, accept explicit None, and that their resolved type hints contain `type(None)` in the union args."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`model_dump_json()` round-trips through `model_validate_json()` without",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestRoundTripsThroughJSON exercises the round-trip on (a) a minimal instance, (b) a fully-populated instance with non-empty artefacts, criterion_breakdown, detection_findings, stderr, stdout_tail and a nested GuardKitWarning carrying a non-empty details dict, and (c) each Literal status value. Each test asserts equality between the original and the rebuilt model.",
+      "notes": "TestRoundTripsThroughJSON exercises the round-trip on (a) a minimal instance, (b) a fully-populated instance with non-empty artefacts, criterion_breakdown, detection_findings, stderr, stdout_tail and a nested GuardKitWarning carrying a non-empty details dict, and (c) each Literal status value. Each test asserts equality between the original and the rebuilt model."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Re-export shim: `src/forge/adapters/guardkit/__init__.py` re-exports",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/guardkit/__init__.py importing `GuardKitResult` and `GuardKitWarning` from `.models` and listing them in __all__, mirroring the `forge.config.__init__` shim called out in Implementation Notes. TestPackageReExportShim asserts `forge.adapters.guardkit.GuardKitResult is models.GuardKitResult` (and same for GuardKitWarning) and that both names appear in `__all__`.",
+      "notes": "Created src/forge/adapters/guardkit/__init__.py importing `GuardKitResult` and `GuardKitWarning` from `.models` and listing them in __all__, mirroring the `forge.config.__init__` shim called out in Implementation Notes. TestPackageReExportShim asserts `forge.adapters.guardkit.GuardKitResult is models.GuardKitResult` (and same for GuardKitWarning) and that both names appear in `__all__`."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All new files compile cleanly under `python3 -m py_compile` (exit 0). All lines fit within the project's 88-character Black line limit (verified by awk scan: zero offenders across models.py, __init__.py, and test_models.py). Module docstrings, snake_case naming, and type hints follow .claude/rules/code-style.md. Black itself is not installed in any of the discovered environments on this host (.guardkit/venv has no pip-installed dev deps and there is no top-level .venv), so format equivalence was verified mechanically rather than via the Black binary.",
+      "notes": "All new files compile cleanly under `python3 -m py_compile` (exit 0). All lines fit within the project's 88-character Black line limit (verified by awk scan: zero offenders across models.py, __init__.py, and test_models.py). Module docstrings, snake_case naming, and type hints follow .claude/rules/code-style.md. Black itself is not installed in any of the discovered environments on this host (.guardkit/venv has no pip-installed dev deps and there is no top-level .venv), so format equivalence was verified mechanically rather than via the Black binary."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`GuardKitResult` and `GuardKitWarning` defined in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/guardkit/models.py declaring both classes as Pydantic v2 BaseModels. TestModelsDefinedInModelsModule asserts `GuardKitResult.__module__ == 'forge.adapters.guardkit.models'`, the same for GuardKitWarning, and that `inspect.getsourcefile()` returns a path ending in `forge/adapters/guardkit/models.py`.",
+        "notes": "Created src/forge/adapters/guardkit/models.py declaring both classes as Pydantic v2 BaseModels. TestModelsDefinedInModelsModule asserts `GuardKitResult.__module__ == 'forge.adapters.guardkit.models'`, the same for GuardKitWarning, and that `inspect.getsourcefile()` returns a path ending in `forge/adapters/guardkit/models.py`."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`status` is a `Literal[\"success\", \"failed\", \"timeout\"]` (no `Enum`)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "GuardKitResult.status is annotated `Literal['success','failed','timeout']`. TestStatusFieldIsLiteralNotEnum verifies via `typing.get_origin` that the origin is `Literal` and the args are exactly `{'success','failed','timeout'}`, and that an unknown string ('errored') raises ValidationError.",
+        "notes": "GuardKitResult.status is annotated `Literal['success','failed','timeout']`. TestStatusFieldIsLiteralNotEnum verifies via `typing.get_origin` that the origin is `Literal` and the args are exactly `{'success','failed','timeout'}`, and that an unknown string ('errored') raises ValidationError."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`artefacts`, `warnings` use `Field(default_factory=list)` (no shared",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both list fields declared as `Field(default_factory=list)`. TestListFieldsUseDefaultFactory parametrises across both fields, asserting `model_fields[name].default_factory is list`, and proves mutation isolation by appending to one instance and checking another instance is still empty. The supporting `GuardKitWarning.details` dict field is similarly verified.",
+        "notes": "Both list fields declared as `Field(default_factory=list)`. TestListFieldsUseDefaultFactory parametrises across both fields, asserting `model_fields[name].default_factory is list`, and proves mutation isolation by appending to one instance and checking another instance is still empty. The supporting `GuardKitWarning.details` dict field is similarly verified."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`coach_score`, `criterion_breakdown`, `detection_findings`, `stderr`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All four fields declared with `| None = None`. TestOptionalFieldsAreNullable parametrises across all four, asserting they default to None on a minimal instance, accept explicit None, and that their resolved type hints contain `type(None)` in the union args.",
+        "notes": "All four fields declared with `| None = None`. TestOptionalFieldsAreNullable parametrises across all four, asserting they default to None on a minimal instance, accept explicit None, and that their resolved type hints contain `type(None)` in the union args."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`model_dump_json()` round-trips through `model_validate_json()` without",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestRoundTripsThroughJSON exercises the round-trip on (a) a minimal instance, (b) a fully-populated instance with non-empty artefacts, criterion_breakdown, detection_findings, stderr, stdout_tail and a nested GuardKitWarning carrying a non-empty details dict, and (c) each Literal status value. Each test asserts equality between the original and the rebuilt model.",
+        "notes": "TestRoundTripsThroughJSON exercises the round-trip on (a) a minimal instance, (b) a fully-populated instance with non-empty artefacts, criterion_breakdown, detection_findings, stderr, stdout_tail and a nested GuardKitWarning carrying a non-empty details dict, and (c) each Literal status value. Each test asserts equality between the original and the rebuilt model."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Re-export shim: `src/forge/adapters/guardkit/__init__.py` re-exports",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/guardkit/__init__.py importing `GuardKitResult` and `GuardKitWarning` from `.models` and listing them in __all__, mirroring the `forge.config.__init__` shim called out in Implementation Notes. TestPackageReExportShim asserts `forge.adapters.guardkit.GuardKitResult is models.GuardKitResult` (and same for GuardKitWarning) and that both names appear in `__all__`.",
+        "notes": "Created src/forge/adapters/guardkit/__init__.py importing `GuardKitResult` and `GuardKitWarning` from `.models` and listing them in __all__, mirroring the `forge.config.__init__` shim called out in Implementation Notes. TestPackageReExportShim asserts `forge.adapters.guardkit.GuardKitResult is models.GuardKitResult` (and same for GuardKitWarning) and that both names appear in `__all__`."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All new files compile cleanly under `python3 -m py_compile` (exit 0). All lines fit within the project's 88-character Black line limit (verified by awk scan: zero offenders across models.py, __init__.py, and test_models.py). Module docstrings, snake_case naming, and type hints follow .claude/rules/code-style.md. Black itself is not installed in any of the discovered environments on this host (.guardkit/venv has no pip-installed dev deps and there is no top-level .venv), so format equivalence was verified mechanically rather than via the Black binary.",
+        "notes": "All new files compile cleanly under `python3 -m py_compile` (exit 0). All lines fit within the project's 88-character Black line limit (verified by awk scan: zero offenders across models.py, __init__.py, and test_models.py). Module docstrings, snake_case naming, and type hints follow .claude/rules/code-style.md. Black itself is not installed in any of the discovered environments on this host (.guardkit/venv has no pip-installed dev deps and there is no top-level .venv), so format equivalence was verified mechanically rather than via the Black binary."
+      }
+    ]
+  },
+  "issues": [],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 305 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1040/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- IS_USED_IN_PROJECT\n- OWNS_DEPENDENCY\n\n### \u26a0\ufe0f Warnings\n- OBSERVED_IN_PROJECT\n- SOURCE_PROJECT\n\n### \ud83c\udfad Role Constraints\n- PROJECT_INVOLVES\n- MONITOR_QUALITY_GATES\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_IMPLEMENTATION_MODE\n- IS_USED_IN\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
