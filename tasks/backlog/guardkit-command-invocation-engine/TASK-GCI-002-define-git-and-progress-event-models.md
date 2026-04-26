@@ -1,22 +1,49 @@
 ---
 id: TASK-GCI-002
-title: "Define GitOpResult, PRResult, and progress event DTOs"
+title: Define GitOpResult, PRResult, and progress event DTOs
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-GCI0
 feature_id: FEAT-FORGE-005
 wave: 1
 implementation_mode: direct
 complexity: 3
 dependencies: []
-tags: [pydantic, declarative, schemas, git, gh, nats]
+tags:
+- pydantic
+- declarative
+- schemas
+- git
+- gh
+- nats
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  base_branch: main
+  started_at: '2026-04-26T08:50:31.048967'
+  last_updated: '2026-04-26T08:56:01.017816'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-26T08:50:31.048967'
+    player_summary: 'Created the three Pydantic v2 DTOs exactly as specified in the
+      task brief. (1) src/forge/adapters/git/models.py defines GitOpResult (status:
+      Literal[''success'',''failed''], operation, optional sha/worktree_path/stderr
+      defaulting to None, required exit_code) and PRResult (status: Literal[''success'',''failed''],
+      optional pr_url/pr_number/error_code/stderr defaulting to None). The PRResult
+      docstring AND the error_code Field description both call out ''missing_credentials''
+      as a known value, anchored to the'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Define GitOpResult, PRResult, and progress event DTOs

@@ -1,26 +1,47 @@
 ---
 id: TASK-GCI-011
-title: "BDD scenario pytest wiring (R2 oracle activation)"
+title: BDD scenario pytest wiring (R2 oracle activation)
 task_type: testing
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-GCI0
 feature_id: FEAT-FORGE-005
 wave: 5
 implementation_mode: task-work
 complexity: 5
 dependencies:
-  - TASK-GCI-009
-  - TASK-GCI-010
-  - TASK-GCI-006
-  - TASK-GCI-007
-tags: [bdd, pytest, testing, scenarios, oracle]
+- TASK-GCI-009
+- TASK-GCI-010
+- TASK-GCI-006
+- TASK-GCI-007
+tags:
+- bdd
+- pytest
+- testing
+- scenarios
+- oracle
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  base_branch: main
+  started_at: '2026-04-26T10:03:39.218898'
+  last_updated: '2026-04-26T10:23:22.553056'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-26T10:03:39.218898'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: BDD scenario pytest wiring (R2 oracle activation)

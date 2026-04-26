@@ -1,24 +1,45 @@
 ---
 id: TASK-GCI-008
-title: "Implement forge.adapters.guardkit.run() subprocess wrapper"
+title: Implement forge.adapters.guardkit.run() subprocess wrapper
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-GCI0
 feature_id: FEAT-FORGE-005
 wave: 3
 implementation_mode: task-work
 complexity: 7
 dependencies:
-  - TASK-GCI-003
-  - TASK-GCI-004
-tags: [guardkit, adapter, subprocess, timeout, cancellation]
+- TASK-GCI-003
+- TASK-GCI-004
+tags:
+- guardkit
+- adapter
+- subprocess
+- timeout
+- cancellation
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  base_branch: main
+  started_at: '2026-04-26T09:32:31.123308'
+  last_updated: '2026-04-26T09:45:55.856702'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-26T09:32:31.123308'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Implement forge.adapters.guardkit.run() subprocess wrapper

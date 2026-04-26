@@ -1,22 +1,47 @@
 ---
 id: TASK-GCI-001
-title: "Define GuardKitResult and result Pydantic models"
+title: Define GuardKitResult and result Pydantic models
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-GCI0
 feature_id: FEAT-FORGE-005
 wave: 1
 implementation_mode: direct
 complexity: 3
 dependencies: []
-tags: [pydantic, declarative, schemas, guardkit]
+tags:
+- pydantic
+- declarative
+- schemas
+- guardkit
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  base_branch: main
+  started_at: '2026-04-26T08:50:31.055200'
+  last_updated: '2026-04-26T08:55:29.571940'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-26T08:50:31.055200'
+    player_summary: "Created `src/forge/adapters/guardkit/models.py` declaring two\
+      \ Pydantic v2 BaseModels: `GuardKitWarning` (code/message/details with default_factory=dict)\
+      \ and `GuardKitResult` (status as Literal['success','failed','timeout'], subcommand,\
+      \ artefacts/warnings via Field(default_factory=list), explicitly Optional coach_score\
+      \ / criterion_breakdown / detection_findings / stderr, duration_secs, stdout_tail\
+      \ (4 KB tail per ASSUM-003), exit_code). Module is purely declarative \u2014\
+      \ no validators or business logi"
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Define GuardKitResult and result Pydantic models

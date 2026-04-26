@@ -5,7 +5,7 @@ description: 'Forge''s subprocess surface for every GuardKit subcommand: context
   forge.adapters.guardkit.run() wrapper, 11 guardkit_* @tool wrappers, plus the git/gh
   adapter. Worktree-confined, never raises past the tool boundary (ADR-ARCH-025).'
 created: '2026-04-25T15:41:44.417827'
-status: planned
+status: completed
 complexity: 7
 estimated_tasks: 11
 tasks:
@@ -14,69 +14,125 @@ tasks:
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-001-define-guardkit-result-models.md
   complexity: 3
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-26T08:50:31.024441'
+  completed_at: '2026-04-26T08:56:01.019532'
 - id: TASK-GCI-002
   name: Define GitOpResult PRResult and progress event DTOs
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-002-define-git-and-progress-event-models.md
   complexity: 3
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-26T08:50:31.030178'
+  completed_at: '2026-04-26T08:56:01.023021'
 - id: TASK-GCI-003
   name: Implement context_resolver resolve_context_flags DDR-005
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-003-implement-context-resolver.md
   complexity: 6
   dependencies:
   - TASK-GCI-001
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-04-26T08:56:02.827402'
+  completed_at: '2026-04-26T09:32:29.098982'
 - id: TASK-GCI-004
   name: Implement parse_guardkit_output tolerant parser
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-004-implement-tolerant-output-parser.md
   complexity: 5
   dependencies:
   - TASK-GCI-001
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-04-26T08:56:02.830423'
+  completed_at: '2026-04-26T09:32:29.102278'
 - id: TASK-GCI-005
   name: Implement NATS progress-stream subscriber telemetry
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-005-implement-progress-stream-subscriber.md
   complexity: 5
   dependencies:
   - TASK-GCI-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-04-26T08:56:02.833300'
+  completed_at: '2026-04-26T09:32:29.105344'
 - id: TASK-GCI-006
   name: Implement forge adapters git worktree commit push cleanup
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-006-implement-git-adapter.md
   complexity: 5
   dependencies:
   - TASK-GCI-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-04-26T08:56:02.836175'
+  completed_at: '2026-04-26T09:32:29.108402'
 - id: TASK-GCI-007
   name: Implement forge adapters gh create_pr missing-credential error
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-007-implement-gh-adapter.md
   complexity: 4
   dependencies:
   - TASK-GCI-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 4
+    final_decision: approved
+    error: null
+  turns_completed: 4
+  current_turn: 0
+  started_at: '2026-04-26T08:56:02.839125'
+  completed_at: '2026-04-26T09:32:29.111501'
 - id: TASK-GCI-008
   name: Implement forge adapters guardkit run subprocess wrapper
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-008-implement-guardkit-run-subprocess-wrapper.md
@@ -84,10 +140,18 @@ tasks:
   dependencies:
   - TASK-GCI-003
   - TASK-GCI-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-26T09:32:31.116142'
+  completed_at: '2026-04-26T09:45:55.858122'
 - id: TASK-GCI-009
   name: Wire 9 guardkit_ tool wrappers system feature task autobuild
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-009-wire-guardkit-tool-wrappers.md
@@ -95,20 +159,36 @@ tasks:
   dependencies:
   - TASK-GCI-008
   - TASK-GCI-005
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-26T09:45:58.440006'
+  completed_at: '2026-04-26T10:03:37.247441'
 - id: TASK-GCI-010
   name: Wire 2 Graphiti guardkit_ tool wrappers bypass resolver
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-010-wire-graphiti-tool-wrappers.md
   complexity: 4
   dependencies:
   - TASK-GCI-008
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-04-26T09:45:58.446654'
+  completed_at: '2026-04-26T10:03:37.250935'
 - id: TASK-GCI-011
   name: BDD scenario pytest wiring R2 oracle activation
   file_path: tasks/backlog/guardkit-command-invocation-engine/TASK-GCI-011-bdd-scenario-pytest-wiring.md
@@ -118,10 +198,18 @@ tasks:
   - TASK-GCI-010
   - TASK-GCI-006
   - TASK-GCI-007
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-04-26T10:03:39.209152'
+  completed_at: '2026-04-26T10:23:22.555100'
 orchestration:
   parallel_groups:
   - - TASK-GCI-001
@@ -137,3 +225,20 @@ orchestration:
   - - TASK-GCI-011
   estimated_duration_minutes: 862
   recommended_parallel: 4
+execution:
+  started_at: '2026-04-26T08:50:31.003544'
+  completed_at: '2026-04-26T10:23:22.570556'
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  total_turns: 23
+  tasks_completed: 11
+  tasks_failed: 0
+  current_wave: 5
+  completed_waves:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  last_updated: '2026-04-26T10:23:22.562247'
+  archived_at: null
+  archived_to: null

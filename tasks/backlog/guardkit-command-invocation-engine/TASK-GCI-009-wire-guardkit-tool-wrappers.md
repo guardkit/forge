@@ -1,24 +1,45 @@
 ---
 id: TASK-GCI-009
-title: "Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)"
+title: Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)
 task_type: feature
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-GCI0
 feature_id: FEAT-FORGE-005
 wave: 4
 implementation_mode: task-work
 complexity: 6
 dependencies:
-  - TASK-GCI-008
-  - TASK-GCI-005
-tags: [guardkit, tools, langchain, decorator, error-contract]
+- TASK-GCI-008
+- TASK-GCI-005
+tags:
+- guardkit
+- tools
+- langchain
+- decorator
+- error-contract
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 30
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-005
+  base_branch: main
+  started_at: '2026-04-26T09:45:58.464204'
+  last_updated: '2026-04-26T09:57:51.916229'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-04-26T09:45:58.464204'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Wire 9 guardkit_* @tool wrappers (system/feature/task/autobuild)
