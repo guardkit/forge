@@ -1,0 +1,165 @@
+{
+  "task_id": "TASK-GCI-002",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/adapters/git/test_models.py tests/forge/adapters/guardkit/test_progress.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/adapters/guardkit/test_progress.py::TestGuardKitProgressEventBehaviour::test_minimal_construction PASSED [ 89%]\ntests/forge/adapters/guardkit/test_progress.py::TestGuardKitProgressEventBehaviour::test_missing_required_field_rejected PASSED [ 93%]\ntests/forge/adapters/guardkit/test_progress.py::TestGuardKitProgressEventBehaviour::test_json_round_trip_minimal PASSED [ 96%]\ntests/forge/adapters/guardkit/test_progress.py::TestGuardKitProgressEventBehaviour::test_json_round_trip_full PASSED [100%]\n============================== 29 passed in 0.02s ==============================",
+      "duration_seconds": 0.4393916130065918
+    },
+    "requirements": {
+      "criteria_total": 8,
+      "criteria_met": 8,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`GitOpResult` and `PRResult` in `src/forge/adapters/git/models.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/git/models.py defining GitOpResult and PRResult as Pydantic v2 BaseModel subclasses. test_module_path tests assert GitOpResult.__module__ == 'forge.adapters.git.models' and PRResult.__module__ == 'forge.adapters.git.models'.",
+      "notes": "Created src/forge/adapters/git/models.py defining GitOpResult and PRResult as Pydantic v2 BaseModel subclasses. test_module_path tests assert GitOpResult.__module__ == 'forge.adapters.git.models' and PRResult.__module__ == 'forge.adapters.git.models'."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`GuardKitProgressEvent` in `src/forge/adapters/guardkit/progress.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/guardkit/progress.py defining GuardKitProgressEvent as a Pydantic v2 BaseModel subclass with build_id/subcommand/stage_label/seq/timestamp required fields and coach_score/artefact optional fields. test_module_path asserts the class lives at the canonical module path.",
+      "notes": "Created src/forge/adapters/guardkit/progress.py defining GuardKitProgressEvent as a Pydantic v2 BaseModel subclass with build_id/subcommand/stage_label/seq/timestamp required fields and coach_score/artefact optional fields. test_module_path asserts the class lives at the canonical module path."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`status` fields are `Literal[...]` (no `Enum`)",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Both GitOpResult.status and PRResult.status are typed as Literal['success', 'failed'] using typing.Literal \u2014 no Enum subclass is involved. test_status_is_literal_not_enum asserts get_origin(annotation) is Literal, that get_args returns {'success', 'failed'}, and that the annotation is not an Enum subclass. GuardKitProgressEvent has no status field (it is a telemetry event with monotonic seq).",
+      "notes": "Both GitOpResult.status and PRResult.status are typed as Literal['success', 'failed'] using typing.Literal \u2014 no Enum subclass is involved. test_status_is_literal_not_enum asserts get_origin(annotation) is Literal, that get_args returns {'success', 'failed'}, and that the annotation is not an Enum subclass. GuardKitProgressEvent has no status field (it is a telemetry event with monotonic seq)."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "All optional fields explicitly default to `None`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Every optional field on every model uses `Field(default=None, ...)` (or carries `None` as its default value). test_optional_fields_default_to_none in both test modules iterates the optional field names (GitOpResult: sha/worktree_path/stderr; PRResult: pr_url/pr_number/error_code/stderr; GuardKitProgressEvent: coach_score/artefact) and asserts model_fields[name].default is None for each.",
+      "notes": "Every optional field on every model uses `Field(default=None, ...)` (or carries `None` as its default value). test_optional_fields_default_to_none in both test modules iterates the optional field names (GitOpResult: sha/worktree_path/stderr; PRResult: pr_url/pr_number/error_code/stderr; GuardKitProgressEvent: coach_score/artefact) and asserts model_fields[name].default is None for each."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Re-export shims: `src/forge/adapters/git/__init__.py` re-exports",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/adapters/git/__init__.py that imports GitOpResult and PRResult from forge.adapters.git.models and lists them in __all__. Also updated src/forge/adapters/guardkit/__init__.py to additionally re-export GuardKitProgressEvent alongside the existing GuardKitResult/GuardKitWarning. test_reexported_from_package_init asserts the re-exported objects are the same classes.",
+      "notes": "Created src/forge/adapters/git/__init__.py that imports GitOpResult and PRResult from forge.adapters.git.models and lists them in __all__. Also updated src/forge/adapters/guardkit/__init__.py to additionally re-export GuardKitProgressEvent alongside the existing GuardKitResult/GuardKitWarning. test_reexported_from_package_init asserts the re-exported objects are the same classes."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "`PRResult.error_code` documents `\"missing_credentials\"` as a known value",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "PRResult.__doc__ explicitly enumerates 'missing_credentials' as the only error_code currently emitted, citing the BDD scenario. The error_code Field also carries description='Stable failure tag. Known values: \"missing_credentials\" (no GitHub authentication available).' test_error_code_documents_missing_credentials asserts the literal string 'missing_credentials' appears in either the field description or the class docstring.",
+      "notes": "PRResult.__doc__ explicitly enumerates 'missing_credentials' as the only error_code currently emitted, citing the BDD scenario. The error_code Field also carries description='Stable failure tag. Known values: \"missing_credentials\" (no GitHub authentication available).' test_error_code_documents_missing_credentials asserts the literal string 'missing_credentials' appears in either the field description or the class docstring."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "`model_dump_json()` round-trips through `model_validate_json()` for all",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Each model has dedicated round-trip tests that build an instance, call .model_dump_json(), pass the result back through .model_validate_json(), and assert the rebuilt instance equals the original. GitOpResult: test_json_round_trip_success and test_json_round_trip_failure cover both status branches. PRResult: test_json_round_trip_success and test_json_round_trip_missing_credentials. GuardKitProgressEvent: test_json_round_trip_minimal (required-only) and test_json_round_trip_full (with coach_score and artefact populated).",
+      "notes": "Each model has dedicated round-trip tests that build an instance, call .model_dump_json(), pass the result back through .model_validate_json(), and assert the rebuilt instance equals the original. GitOpResult: test_json_round_trip_success and test_json_round_trip_failure cover both status branches. PRResult: test_json_round_trip_success and test_json_round_trip_missing_credentials. GuardKitProgressEvent: test_json_round_trip_minimal (required-only) and test_json_round_trip_full (with coach_score and artefact populated)."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All new and modified files are AST-valid (verified via python3 -m ast). All lines stay within the 88-character Black limit declared in .claude/rules/code-style.md (verified via awk 'length > 88' against all six files \u2014 zero matches). Files use snake_case for functions/variables, PascalCase for classes, type hints throughout, and f-strings/list comprehensions where applicable. No project-level ruff/black/flake8 config exists in pyproject.toml beyond the style guide, so this is the applicable lint/format gate. Full pytest suite for the adapter package: 187 passed, 0 failed.",
+      "notes": "All new and modified files are AST-valid (verified via python3 -m ast). All lines stay within the 88-character Black limit declared in .claude/rules/code-style.md (verified via awk 'length > 88' against all six files \u2014 zero matches). Files use snake_case for functions/variables, PascalCase for classes, type hints throughout, and f-strings/list comprehensions where applicable. No project-level ruff/black/flake8 config exists in pyproject.toml beyond the style guide, so this is the applicable lint/format gate. Full pytest suite for the adapter package: 187 passed, 0 failed."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`GitOpResult` and `PRResult` in `src/forge/adapters/git/models.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/git/models.py defining GitOpResult and PRResult as Pydantic v2 BaseModel subclasses. test_module_path tests assert GitOpResult.__module__ == 'forge.adapters.git.models' and PRResult.__module__ == 'forge.adapters.git.models'.",
+        "notes": "Created src/forge/adapters/git/models.py defining GitOpResult and PRResult as Pydantic v2 BaseModel subclasses. test_module_path tests assert GitOpResult.__module__ == 'forge.adapters.git.models' and PRResult.__module__ == 'forge.adapters.git.models'."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`GuardKitProgressEvent` in `src/forge/adapters/guardkit/progress.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/guardkit/progress.py defining GuardKitProgressEvent as a Pydantic v2 BaseModel subclass with build_id/subcommand/stage_label/seq/timestamp required fields and coach_score/artefact optional fields. test_module_path asserts the class lives at the canonical module path.",
+        "notes": "Created src/forge/adapters/guardkit/progress.py defining GuardKitProgressEvent as a Pydantic v2 BaseModel subclass with build_id/subcommand/stage_label/seq/timestamp required fields and coach_score/artefact optional fields. test_module_path asserts the class lives at the canonical module path."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`status` fields are `Literal[...]` (no `Enum`)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both GitOpResult.status and PRResult.status are typed as Literal['success', 'failed'] using typing.Literal \u2014 no Enum subclass is involved. test_status_is_literal_not_enum asserts get_origin(annotation) is Literal, that get_args returns {'success', 'failed'}, and that the annotation is not an Enum subclass. GuardKitProgressEvent has no status field (it is a telemetry event with monotonic seq).",
+        "notes": "Both GitOpResult.status and PRResult.status are typed as Literal['success', 'failed'] using typing.Literal \u2014 no Enum subclass is involved. test_status_is_literal_not_enum asserts get_origin(annotation) is Literal, that get_args returns {'success', 'failed'}, and that the annotation is not an Enum subclass. GuardKitProgressEvent has no status field (it is a telemetry event with monotonic seq)."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "All optional fields explicitly default to `None`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Every optional field on every model uses `Field(default=None, ...)` (or carries `None` as its default value). test_optional_fields_default_to_none in both test modules iterates the optional field names (GitOpResult: sha/worktree_path/stderr; PRResult: pr_url/pr_number/error_code/stderr; GuardKitProgressEvent: coach_score/artefact) and asserts model_fields[name].default is None for each.",
+        "notes": "Every optional field on every model uses `Field(default=None, ...)` (or carries `None` as its default value). test_optional_fields_default_to_none in both test modules iterates the optional field names (GitOpResult: sha/worktree_path/stderr; PRResult: pr_url/pr_number/error_code/stderr; GuardKitProgressEvent: coach_score/artefact) and asserts model_fields[name].default is None for each."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Re-export shims: `src/forge/adapters/git/__init__.py` re-exports",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/adapters/git/__init__.py that imports GitOpResult and PRResult from forge.adapters.git.models and lists them in __all__. Also updated src/forge/adapters/guardkit/__init__.py to additionally re-export GuardKitProgressEvent alongside the existing GuardKitResult/GuardKitWarning. test_reexported_from_package_init asserts the re-exported objects are the same classes.",
+        "notes": "Created src/forge/adapters/git/__init__.py that imports GitOpResult and PRResult from forge.adapters.git.models and lists them in __all__. Also updated src/forge/adapters/guardkit/__init__.py to additionally re-export GuardKitProgressEvent alongside the existing GuardKitResult/GuardKitWarning. test_reexported_from_package_init asserts the re-exported objects are the same classes."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "`PRResult.error_code` documents `\"missing_credentials\"` as a known value",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "PRResult.__doc__ explicitly enumerates 'missing_credentials' as the only error_code currently emitted, citing the BDD scenario. The error_code Field also carries description='Stable failure tag. Known values: \"missing_credentials\" (no GitHub authentication available).' test_error_code_documents_missing_credentials asserts the literal string 'missing_credentials' appears in either the field description or the class docstring.",
+        "notes": "PRResult.__doc__ explicitly enumerates 'missing_credentials' as the only error_code currently emitted, citing the BDD scenario. The error_code Field also carries description='Stable failure tag. Known values: \"missing_credentials\" (no GitHub authentication available).' test_error_code_documents_missing_credentials asserts the literal string 'missing_credentials' appears in either the field description or the class docstring."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`model_dump_json()` round-trips through `model_validate_json()` for all",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Each model has dedicated round-trip tests that build an instance, call .model_dump_json(), pass the result back through .model_validate_json(), and assert the rebuilt instance equals the original. GitOpResult: test_json_round_trip_success and test_json_round_trip_failure cover both status branches. PRResult: test_json_round_trip_success and test_json_round_trip_missing_credentials. GuardKitProgressEvent: test_json_round_trip_minimal (required-only) and test_json_round_trip_full (with coach_score and artefact populated).",
+        "notes": "Each model has dedicated round-trip tests that build an instance, call .model_dump_json(), pass the result back through .model_validate_json(), and assert the rebuilt instance equals the original. GitOpResult: test_json_round_trip_success and test_json_round_trip_failure cover both status branches. PRResult: test_json_round_trip_success and test_json_round_trip_missing_credentials. GuardKitProgressEvent: test_json_round_trip_minimal (required-only) and test_json_round_trip_full (with coach_score and artefact populated)."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All new and modified files are AST-valid (verified via python3 -m ast). All lines stay within the 88-character Black limit declared in .claude/rules/code-style.md (verified via awk 'length > 88' against all six files \u2014 zero matches). Files use snake_case for functions/variables, PascalCase for classes, type hints throughout, and f-strings/list comprehensions where applicable. No project-level ruff/black/flake8 config exists in pyproject.toml beyond the style guide, so this is the applicable lint/format gate. Full pytest suite for the adapter package: 187 passed, 0 failed.",
+        "notes": "All new and modified files are AST-valid (verified via python3 -m ast). All lines stay within the 88-character Black limit declared in .claude/rules/code-style.md (verified via awk 'length > 88' against all six files \u2014 zero matches). Files use snake_case for functions/variables, PascalCase for classes, type hints throughout, and f-strings/list comprehensions where applicable. No project-level ruff/black/flake8 config exists in pyproject.toml beyond the style guide, so this is the applicable lint/format gate. Full pytest suite for the adapter package: 187 passed, 0 failed."
+      }
+    ]
+  },
+  "issues": [],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 270 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 974/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- SOURCE_PATTERN\n- HAS_FIELD_TYPE\n\n### \u26a0\ufe0f Warnings\n- IS_IMPLEMENTED_AS\n- REQUIRES_USE_OF\n\n### \ud83c\udfad Role Constraints\n- IS_CREATED_FOR\n- PROJECT_INVOLVES\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- APPLIES_TO_TASK\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false
+}
