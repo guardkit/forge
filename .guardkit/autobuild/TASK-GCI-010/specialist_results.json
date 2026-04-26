@@ -1,17 +1,17 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 48.61785525101004,
+    "duration_seconds": 44.66934345700429,
     "error": null,
-    "tests_run": 21,
+    "tests_run": 96,
     "tests_failed": 0,
-    "coverage_pct": 85.0,
-    "output_summary": "pytest tests/forge/tools/test_graphiti.py: 21 passed, 0 failed, coverage 85% on src/forge/tools/graphiti.py",
+    "coverage_pct": 82.0,
+    "output_summary": "pytest tests/forge/tools/ with --cov=src/forge/tools: 96 passed, 0 failed; line coverage 82% (graphiti.py 85%, guardkit.py 80%).",
     "quality_gates_passed": true
   },
   "phase_5": {
     "status": "passed",
-    "duration_seconds": 163.59834964599577,
+    "duration_seconds": 159.95174111399683,
     "error": null,
     "issues": [],
     "quality_score": 0.0,

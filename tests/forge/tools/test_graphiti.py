@@ -37,7 +37,6 @@ import inspect
 import json
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 import pytest
 
@@ -47,7 +46,6 @@ from forge.tools.graphiti import (
     guardkit_graphiti_add_context,
     guardkit_graphiti_query,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -159,9 +157,7 @@ class TestDecoratorSurface:
 
     def test_underlying_callables_are_coroutine_functions(self) -> None:
         # ``@tool`` exposes the wrapped function via .coroutine for async tools.
-        assert asyncio.iscoroutinefunction(
-            guardkit_graphiti_add_context.coroutine
-        )
+        assert asyncio.iscoroutinefunction(guardkit_graphiti_add_context.coroutine)
         assert asyncio.iscoroutinefunction(guardkit_graphiti_query.coroutine)
 
 
@@ -183,9 +179,7 @@ class TestSubcommandPrefixBypassesResolver:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                capture, _success_result("graphiti add-context")
-            ),
+            _make_fake_run(capture, _success_result("graphiti add-context")),
         )
 
         await guardkit_graphiti_add_context.ainvoke(
@@ -246,9 +240,7 @@ class TestNoContextFlagInArgv:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                capture, _success_result("graphiti add-context")
-            ),
+            _make_fake_run(capture, _success_result("graphiti add-context")),
         )
 
         await guardkit_graphiti_add_context.ainvoke(
@@ -300,9 +292,7 @@ class TestNoContextFlagInArgv:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                capture, _success_result("graphiti add-context")
-            ),
+            _make_fake_run(capture, _success_result("graphiti add-context")),
         )
 
         await guardkit_graphiti_add_context.ainvoke(
@@ -361,9 +351,7 @@ class TestReturnIsJsonString:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                capture, _success_result("graphiti add-context")
-            ),
+            _make_fake_run(capture, _success_result("graphiti add-context")),
         )
 
         out = await guardkit_graphiti_add_context.ainvoke(
@@ -414,9 +402,7 @@ class TestReturnIsJsonString:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                {}, _timeout_result("graphiti add-context")
-            ),
+            _make_fake_run({}, _timeout_result("graphiti add-context")),
         )
 
         out = await guardkit_graphiti_add_context.ainvoke(
@@ -536,9 +522,7 @@ class TestStructuredLogging:
         monkeypatch.setattr(
             graphiti_tools,
             "guardkit_run",
-            _make_fake_run(
-                {}, _success_result("graphiti add-context", duration=0.123)
-            ),
+            _make_fake_run({}, _success_result("graphiti add-context", duration=0.123)),
         )
         recorded: list[tuple[str, dict[str, Any]]] = []
 
@@ -548,9 +532,7 @@ class TestStructuredLogging:
         # Whether the wrapper uses ``structlog`` or the stdlib logger, we
         # accept either by patching both names; the wrapper must reach at
         # least one of them with the contractual kwargs.
-        monkeypatch.setattr(
-            graphiti_tools.logger, "info", _capture_log, raising=False
-        )
+        monkeypatch.setattr(graphiti_tools.logger, "info", _capture_log, raising=False)
 
         await guardkit_graphiti_add_context.ainvoke(
             {
@@ -585,9 +567,7 @@ class TestStructuredLogging:
         def _capture_log(event: str, **kw: Any) -> None:
             recorded.append((event, kw))
 
-        monkeypatch.setattr(
-            graphiti_tools.logger, "info", _capture_log, raising=False
-        )
+        monkeypatch.setattr(graphiti_tools.logger, "info", _capture_log, raising=False)
 
         await guardkit_graphiti_query.ainvoke(
             {
@@ -634,9 +614,7 @@ class TestModuleHygiene:
             elif isinstance(node, ast.Import):
                 imported_modules.extend(alias.name for alias in node.names)
 
-        assert not any(
-            "context_resolver" in m for m in imported_modules
-        ), (
+        assert not any("context_resolver" in m for m in imported_modules), (
             "forge.tools.graphiti must not import the context resolver — "
             "Graphiti subcommands bypass resolution entirely (DDR-005). "
             f"Found: {imported_modules}"
@@ -688,6 +666,4 @@ class TestRepoConfinement:
         assert repo_path.is_absolute()
         # The allowlist must include the repo so run()'s confinement check passes.
         allowlist = kwargs["read_allowlist"]
-        assert any(
-            repo_path == a or repo_path.is_relative_to(a) for a in allowlist
-        )
+        assert any(repo_path == a or repo_path.is_relative_to(a) for a in allowlist)
