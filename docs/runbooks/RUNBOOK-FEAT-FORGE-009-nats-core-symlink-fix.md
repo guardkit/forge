@@ -1,8 +1,8 @@
 # Runbook: FEAT-FORGE-009 — `nats-core` Symlink Fix for AutoBuild Bootstrap
 
-**Status:** Active. Required one-time setup on every machine that runs `guardkit autobuild feature FEAT-FORGE-009` (or any other feature) against this repo until **TASK-FIX-F0E6b** republishes a working `nats-core` wheel to PyPI.
+**Status:** **Retired (2026-05-04)** by upstream guardkit fixes **TASK-FIX-AB60** (autonomous `uv venv` arrangement) and **TASK-FIX-AB61** (autonomous `[tool.uv.sources]` symlink pre-creation). Guardkit now creates the bridging symlink autonomously when copying `pyproject.toml` into a worktree — no per-machine setup required. Runbook kept for historical context; the manual `ln -s` step described below is no longer needed.
 
-**Supersedes:** `docs/history/RUNBOOK-FEAT-FORGE-009-bootstrap-prep.md` (TASK-FIX-F09A1 / `.guardkit/preflight.sh`). The preflight-script approach was incomplete on macOS — see *Why preflight.sh was insufficient* below.
+**Supersedes:** `docs/history/RUNBOOK-FEAT-FORGE-009-bootstrap-prep.md` (TASK-FIX-F09A1 / `.guardkit/preflight.sh`). The preflight-script approach was incomplete on macOS — see *Why preflight.sh was insufficient* below. The preflight script itself was retired by **TASK-CLN-FB61** at the same time as this runbook.
 
 **Applies to:** MacBook (verified 2026-05-01), GB10 (`promaxgb10-41b1`), and any future workstation cloning forge in the canonical sibling layout.
 
@@ -154,9 +154,7 @@ The symlink-at-the-correct-level approach removes both failure modes by giving u
 This symlink can be removed when **either** of the following lands:
 
 - **TASK-FIX-F0E6b** — republish a working `nats-core` wheel to PyPI. Once forge can drop `[tool.uv.sources]`, the path-resolution problem evaporates.
-- **TASK-FIX-F09A2** — guardkit-side fix that rewrites `[tool.uv.sources]` paths when copying `pyproject.toml` into a worktree, or that resolves them relative to the original repo root.
-
-Until then, the symlink is a one-time per-machine setup — not a per-run dance.
+- ~~**TASK-FIX-F09A2** — guardkit-side fix that rewrites `[tool.uv.sources]` paths when copying `pyproject.toml` into a worktree, or that resolves them relative to the original repo root.~~ **Landed as TASK-FIX-AB61 (2026-05-04).** Guardkit now parses `[tool.uv.sources]` and pre-creates the bridging symlink autonomously, retiring this runbook's manual setup. Paired with **TASK-FIX-AB60** (autonomous `uv venv` arrangement on the no-venv stderr sentinel).
 
 ---
 

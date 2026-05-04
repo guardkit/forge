@@ -37,6 +37,15 @@ test_results:
 
 # Task: Add `.guardkit/preflight.sh` + missing `click`/`rich` deps to unblock FEAT-FORGE-009 autobuild
 
+> **Deliverable retired (2026-05-04) — closed by TASK-CLN-FB61.**
+> The `.guardkit/preflight.sh` half of this task was obsoleted by upstream guardkit
+> fixes **TASK-FIX-AB60** (autonomous `uv venv` arrangement) and **TASK-FIX-AB61**
+> (autonomous `[tool.uv.sources]` symlink pre-creation). Guardkit now handles
+> bootstrap autonomously, so the script was deleted via TASK-CLN-FB61. The
+> `click`/`rich` dependency declarations remain in `pyproject.toml` and are
+> unaffected. See `forge/docs/runbooks/RUNBOOK-FEAT-FORGE-009-nats-core-symlink-fix.md`
+> ("Retiring this runbook" section) for the upstream-fix cross-reference.
+
 ## Description
 
 Layer 1 of the layered fix recommended by `TASK-REV-F09A`'s decision review.
