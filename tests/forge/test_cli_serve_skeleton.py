@@ -143,6 +143,46 @@ class TestServeConfigModel:
         cfg = ServeConfig.from_env({"FORGE_LOG_LEVEL": "debug"})
         assert cfg.log_level == "debug"
 
+    def test_default_autobuild_runner_url_is_none(self) -> None:
+        """TASK-FORGE-FRR-F010J: the new field defaults to ``None``.
+
+        Production callers MUST override via
+        ``FORGE_AUTOBUILD_RUNNER_URL``;
+        ``bind_production_serve`` enforces the override at boot
+        (TASK-FORGE-FRR-F010J Step 1.5 fail-fast). The ``None``
+        default is preserved so non-production callers (BDD oracle,
+        lint runners) can still construct ``ServeConfig()``.
+        """
+        from forge.cli._serve_config import ServeConfig
+
+        cfg = ServeConfig()
+        assert cfg.autobuild_runner_url is None
+
+    def test_env_var_overrides_for_autobuild_runner_url(self) -> None:
+        """TASK-FORGE-FRR-F010J: ``FORGE_AUTOBUILD_RUNNER_URL`` env var
+        is read by ``ServeConfig.from_env``.
+
+        Production deployments set this env var to point the daemon
+        at the langgraph-runner sidecar; the ``from_env`` parser must
+        honour it so ``bind_production_serve`` finds the URL on the
+        config.
+        """
+        from forge.cli._serve_config import ServeConfig
+
+        cfg = ServeConfig.from_env(
+            {
+                "FORGE_AUTOBUILD_RUNNER_URL": (
+                    "http://forge-autobuild-runner:8124"
+                ),
+            }
+        )
+        assert cfg.autobuild_runner_url == (
+            "http://forge-autobuild-runner:8124"
+        )
+        # Untouched fields fall back to defaults.
+        assert cfg.nats_url == "nats://127.0.0.1:4222"
+        assert cfg.healthz_port == 8080
+
 
 # ---------------------------------------------------------------------------
 # AC-006: SubscriptionState exposes live: bool and is concurrency-safe

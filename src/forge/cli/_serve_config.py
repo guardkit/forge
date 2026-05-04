@@ -70,6 +70,22 @@ DEFAULT_LOG_LEVEL: str = "info"
 #: :mod:`forge.cli.status` / :mod:`forge.cli.queue`).
 DEFAULT_DB_PATH: Path = Path("~/.forge/forge.db")
 
+#: Default URL of the langgraph-runner sidecar serving the
+#: ``autobuild_runner`` graph (TASK-FORGE-FRR-F010I/J). ``None`` is the
+#: default; :func:`forge.cli._serve_production.bind_production_serve`
+#: rejects the ``None`` case at boot because the in-process ASGI
+#: fallback path (``langgraph_sdk.get_client(url=None)`` →
+#: ``ASGITransport(app=None)``) raises ``'NoneType' object is not
+#: callable`` on every dispatch in the current forge venv
+#: (``langgraph_api`` is not installed). Production deploys MUST set
+#: ``FORGE_AUTOBUILD_RUNNER_URL`` to a reachable sidecar URL
+#: (e.g. ``http://forge-autobuild-runner:8124`` for compose
+#: service-name resolution, or ``http://localhost:8124`` for an in-pod
+#: sidecar via shared loopback). The ``None`` default is preserved so
+#: non-production callers (BDD oracle, lint runners) can still
+#: instantiate :class:`ServeConfig` without the env var being set.
+DEFAULT_AUTOBUILD_RUNNER_URL: str | None = None
+
 
 class ServeConfig(BaseModel):
     """Pydantic v2 settings model for the ``forge serve`` daemon.
@@ -87,6 +103,14 @@ class ServeConfig(BaseModel):
             (TASK-FIX-F010). Defaults to ``~/.forge/forge.db`` (the
             ``~`` is expanded eagerly by the default factory so tests
             see a deterministic absolute path at instantiation time).
+        autobuild_runner_url: URL of the ``langgraph-runner`` sidecar
+            serving the ``autobuild_runner`` graph
+            (TASK-FORGE-FRR-F010I/J). Defaults to ``None``; production
+            deploys MUST override via ``FORGE_AUTOBUILD_RUNNER_URL``,
+            because :func:`forge.cli._serve_production.bind_production_serve`
+            fails fast at boot when the URL is missing (the in-process
+            ASGI fallback path raises ``'NoneType' object is not
+            callable`` on every dispatch otherwise).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=False)
@@ -100,6 +124,9 @@ class ServeConfig(BaseModel):
     # monkeypatch ``$HOME``) rather than at module import.
     db_path: Path = Field(
         default_factory=lambda: DEFAULT_DB_PATH.expanduser()
+    )
+    autobuild_runner_url: str | None = Field(
+        default=DEFAULT_AUTOBUILD_RUNNER_URL
     )
 
     @classmethod
@@ -116,6 +143,8 @@ class ServeConfig(BaseModel):
         - ``FORGE_LOG_LEVEL``    → ``log_level``
         - ``FORGE_DB_PATH``      → ``db_path`` (``~`` is expanded;
           TASK-FIX-F010)
+        - ``FORGE_AUTOBUILD_RUNNER_URL`` → ``autobuild_runner_url``
+          (TASK-FORGE-FRR-F010J)
 
         Args:
             environ: Optional mapping to read from instead of
@@ -140,10 +169,18 @@ class ServeConfig(BaseModel):
             # status both read FORGE_DB_PATH); never introduce a parallel
             # FORGE_SQLITE_PATH (TASK-REV-F010 D2.A*).
             kwargs["db_path"] = Path(env["FORGE_DB_PATH"]).expanduser()
+        if "FORGE_AUTOBUILD_RUNNER_URL" in env:
+            # TASK-FORGE-FRR-F010J: production wiring for the
+            # langgraph-runner sidecar URL. ``bind_production_serve``
+            # fails fast at boot when this is missing/empty.
+            kwargs["autobuild_runner_url"] = env[
+                "FORGE_AUTOBUILD_RUNNER_URL"
+            ]
         return cls(**kwargs)
 
 
 __all__ = [
+    "DEFAULT_AUTOBUILD_RUNNER_URL",
     "DEFAULT_DB_PATH",
     "DEFAULT_DURABLE_NAME",
     "DEFAULT_HEALTHZ_PORT",

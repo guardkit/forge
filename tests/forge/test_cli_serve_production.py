@@ -95,9 +95,37 @@ def tmp_db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def serve_config(tmp_db_path: Path):
+    """Production-shaped ``ServeConfig`` fixture.
+
+    TASK-FORGE-FRR-F010J: ``bind_production_serve`` fail-fasts at
+    Step 1.5 when ``autobuild_runner_url`` is missing/empty. This
+    fixture sets the URL to a stub sidecar address so existing
+    AC-2/AC-3/.../AC-7 tests can keep exercising
+    ``bind_production_serve`` end-to-end. The missing-URL case is
+    covered by ``TestF010JBindProductionServeFailsFastOnMissingUrl``
+    below via the ``serve_config_without_runner_url`` fixture.
+    """
     from forge.cli._serve_config import ServeConfig
 
-    return ServeConfig(db_path=tmp_db_path)
+    return ServeConfig(
+        db_path=tmp_db_path,
+        autobuild_runner_url="http://forge-autobuild-runner:8124",
+    )
+
+
+@pytest.fixture
+def serve_config_without_runner_url(tmp_db_path: Path):
+    """``ServeConfig`` with ``autobuild_runner_url=None``.
+
+    TASK-FORGE-FRR-F010J: feeds
+    ``TestF010JBindProductionServeFailsFastOnMissingUrl`` so the
+    fail-fast guard at Step 1.5 of ``bind_production_serve`` is
+    exercised. Production-shaped tests should use the ``serve_config``
+    fixture instead.
+    """
+    from forge.cli._serve_config import ServeConfig
+
+    return ServeConfig(db_path=tmp_db_path, autobuild_runner_url=None)
 
 
 @pytest.fixture
@@ -140,7 +168,12 @@ class TestEagerMiddlewareConstruction:
 
         serve_production.bind_production_serve(serve_config, fake_forge_config)
 
-        middleware_factory.assert_called_once_with()
+        # TASK-FORGE-FRR-F010J: the factory now receives the
+        # ``autobuild_runner_url`` from the production-shaped fixture
+        # — assert it's called exactly once with the expected kwarg.
+        middleware_factory.assert_called_once_with(
+            autobuild_runner_url="http://forge-autobuild-runner:8124"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +201,7 @@ class TestComposeDispatchChainRebind:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _FakeMiddleware(tool_names=("start_async_task",)),
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
         )
         sentinel_composer = MagicMock(name="composer")
         monkeypatch.setattr(
@@ -220,7 +253,7 @@ class TestIdempotency:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _FakeMiddleware(tool_names=("start_async_task",)),
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
         )
         monkeypatch.setattr(
             serve_module,
@@ -271,7 +304,7 @@ class TestIdempotency:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _FakeMiddleware(tool_names=("start_async_task",)),
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
         )
         monkeypatch.setattr(
             serve_module,
@@ -304,7 +337,14 @@ class TestDbParentDirectoryAutoCreate:
 
         nested = tmp_path / "nested" / "deeper" / "forge.db"
         assert not nested.parent.exists()
-        config = ServeConfig(db_path=nested)
+        # TASK-FORGE-FRR-F010J: ``bind_production_serve`` fail-fasts at
+        # Step 1.5 when ``autobuild_runner_url`` is missing; this test
+        # exercises the Step 2 mkdir behaviour, so the URL must be set
+        # for the wrapper to reach Step 2.
+        config = ServeConfig(
+            db_path=nested,
+            autobuild_runner_url="http://forge-autobuild-runner:8124",
+        )
 
         monkeypatch.setattr(
             serve_production,
@@ -319,7 +359,7 @@ class TestDbParentDirectoryAutoCreate:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _FakeMiddleware(tool_names=("start_async_task",)),
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
         )
         monkeypatch.setattr(
             serve_module,
@@ -371,7 +411,7 @@ class TestRaisesOnMissingAsyncTaskStarterTool:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _FakeMiddleware(
+            lambda **kw: _FakeMiddleware(
                 tool_names=("check_async_task", "list_async_tasks")
             ),
         )
@@ -421,7 +461,7 @@ class TestAsyncTaskStarterThreading:
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
-            lambda: _MiddlewareWithKnownStarter(),
+            lambda **kw: _MiddlewareWithKnownStarter(),
         )
         monkeypatch.setattr(
             serve_production,
@@ -507,3 +547,171 @@ class TestServeConfigDbPath:
 
         config = ServeConfig()
         assert config.db_path == Path("~/.forge/forge.db").expanduser()
+
+
+# ---------------------------------------------------------------------------
+# TASK-FORGE-FRR-F010J — bind_production_serve fail-fasts on missing URL
+# ---------------------------------------------------------------------------
+
+
+class TestF010JBindProductionServeFailsFastOnMissingUrl:
+    """TASK-FORGE-FRR-F010J AC-3: ``bind_production_serve`` fails fast
+    when ``autobuild_runner_url`` is missing.
+
+    The in-process ASGI fallback path
+    (``langgraph_sdk.get_client(url=None)`` →
+    ``ASGITransport(app=None)``) raises ``'NoneType' object is not
+    callable`` on every dispatch in the current forge venv (the F010H
+    investigation confirmed ``langgraph_api`` is not installed). F010I
+    picked Option B.1 (sidecar URL); this guard makes the missing-URL
+    case fail at boot with an actionable error message — naming the
+    env var and the F010I/J task IDs — rather than failing at first
+    build dispatch with a low-level transport exception.
+
+    The guard MUST fire BEFORE any filesystem / database resource is
+    allocated (no orphan SQLite handle to leak), so the fail-fast
+    invariant is verifiable: a recording stand-in for
+    ``connect_writer`` MUST NOT be reached.
+    """
+
+    def test_bind_production_serve_raises_value_error_on_missing_autobuild_runner_url(
+        self,
+        serve_config_without_runner_url,
+        fake_forge_config,
+    ) -> None:
+        from forge.cli import _serve_production as serve_production
+
+        with pytest.raises(ValueError, match="autobuild_runner_url"):
+            serve_production.bind_production_serve(
+                serve_config_without_runner_url, fake_forge_config
+            )
+
+    def test_bind_production_serve_error_message_references_env_var_and_review_id(
+        self,
+        serve_config_without_runner_url,
+        fake_forge_config,
+    ) -> None:
+        from forge.cli import _serve_production as serve_production
+
+        with pytest.raises(ValueError) as exc_info:
+            serve_production.bind_production_serve(
+                serve_config_without_runner_url, fake_forge_config
+            )
+
+        message = str(exc_info.value)
+        # Operator-actionable: name the env var and the F010I/J task
+        # IDs so the operator can grep the runbook for context.
+        assert "FORGE_AUTOBUILD_RUNNER_URL" in message
+        assert "F010I" in message or "F010J" in message
+
+    def test_bind_production_serve_fail_fast_does_not_open_sqlite_writer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        serve_config_without_runner_url,
+        fake_forge_config,
+    ) -> None:
+        """The fail-fast guard must run BEFORE Step 3 (connect_writer).
+
+        Asserting that ``connect_writer`` is never called is the
+        signal that no orphan SQLite handle was created when the
+        guard fired. If the guard fired AFTER Step 3, this
+        monkeypatched stand-in would record the call and the test
+        would fail with the embedded AssertionError.
+        """
+        from forge.cli import _serve_production as serve_production
+
+        connect_writer_calls: list[Any] = []
+
+        def _recording_connect_writer(*args: Any, **kwargs: Any) -> Any:
+            connect_writer_calls.append((args, kwargs))
+            raise AssertionError(
+                "connect_writer was reached despite the fail-fast guard "
+                "for autobuild_runner_url=None — the guard must fire "
+                "before any resource is allocated (TASK-FORGE-FRR-F010J)"
+            )
+
+        monkeypatch.setattr(
+            serve_production,
+            "connect_writer",
+            _recording_connect_writer,
+        )
+
+        with pytest.raises(ValueError, match="autobuild_runner_url"):
+            serve_production.bind_production_serve(
+                serve_config_without_runner_url, fake_forge_config
+            )
+
+        assert connect_writer_calls == []
+
+    def test_bind_production_serve_rejects_empty_string_url(
+        self,
+        tmp_db_path: Path,
+        fake_forge_config,
+    ) -> None:
+        """Empty-string ``autobuild_runner_url`` is rejected.
+
+        Defensive against ``FORGE_AUTOBUILD_RUNNER_URL=`` (env var
+        set to empty string) — the ``not config.autobuild_runner_url``
+        guard treats both ``None`` and ``""`` as "no URL".
+        """
+        from forge.cli import _serve_production as serve_production
+        from forge.cli._serve_config import ServeConfig
+
+        config = ServeConfig(db_path=tmp_db_path, autobuild_runner_url="")
+
+        with pytest.raises(ValueError, match="autobuild_runner_url"):
+            serve_production.bind_production_serve(config, fake_forge_config)
+
+
+# ---------------------------------------------------------------------------
+# TASK-FORGE-FRR-F010J — bind_production_serve threads URL into middleware
+# ---------------------------------------------------------------------------
+
+
+class TestF010JBindProductionServeThreadsAutobuildRunnerUrl:
+    """TASK-FORGE-FRR-F010J AC-2 (production wiring): the URL stored on
+    ``ServeConfig.autobuild_runner_url`` is forwarded to
+    ``_build_async_subagent_middleware`` so the
+    ``AsyncSubAgent`` registration carries it.
+
+    This is the Step 5 wiring inside ``bind_production_serve``. The
+    factory-level test that the URL ends up in the spec dict is in
+    ``tests/forge/test_serve_async_task_starter.py``.
+    """
+
+    def test_bind_production_serve_passes_autobuild_runner_url_to_factory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        serve_config,
+        fake_forge_config,
+    ) -> None:
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+
+        captured: dict[str, Any] = {}
+
+        def _recording_factory(
+            *, autobuild_runner_url: str | None = None,
+        ) -> Any:
+            captured["autobuild_runner_url"] = autobuild_runner_url
+            return _FakeMiddleware(tool_names=("start_async_task",))
+
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            _recording_factory,
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "bind_production_dispatch_chain",
+            lambda **kw: lambda client: None,
+        )
+
+        serve_production.bind_production_serve(serve_config, fake_forge_config)
+
+        # The fixture sets autobuild_runner_url to the stub sidecar URL;
+        # the wrapper MUST thread it through to the factory.
+        assert (
+            captured["autobuild_runner_url"]
+            == "http://forge-autobuild-runner:8124"
+        )

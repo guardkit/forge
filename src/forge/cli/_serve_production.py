@@ -207,7 +207,11 @@ def bind_production_serve(
             rejection rules. ``None`` raises :class:`ValueError`.
 
     Raises:
-        ValueError: When ``forge_config`` is ``None``.
+        ValueError: When ``forge_config`` is ``None`` or when
+            ``config.autobuild_runner_url`` is missing/empty
+            (TASK-FORGE-FRR-F010I/J — fail-fast at boot rather than
+            failing at first build dispatch with the in-process ASGI
+            ``'NoneType' object is not callable`` error).
         RuntimeError: When the middleware does not expose a
             ``start_async_task`` tool (FW10-008 contract violation).
     """
@@ -219,6 +223,33 @@ def bind_production_serve(
             "reads approved_originators and the filesystem allowlist from "
             "it. Pass --config <path> to ``forge serve`` or run from a "
             "directory containing ./forge.yaml."
+        )
+
+    # Step 1.5 — validate ``autobuild_runner_url`` is set
+    # (TASK-FORGE-FRR-F010I/J). The in-process ASGI fallback path
+    # (``langgraph_sdk.get_client(url=None)`` →
+    # ``ASGITransport(app=None)``) raises ``'NoneType' object is not
+    # callable`` on every dispatch in the current forge venv (the
+    # F010H investigation confirmed ``langgraph_api`` is not installed,
+    # so ``get_client(url=None)``'s first branch falls through to the
+    # broken loopback fallback). F010I picked Option B.1 (sidecar
+    # URL); this guard makes the missing-URL case fail at boot — with
+    # an actionable error message naming the env var — instead of
+    # failing at first build dispatch with a low-level transport
+    # exception. Fires BEFORE any filesystem / database / writer-
+    # connection resource is allocated, so a missing URL never leaves
+    # a partially-initialised daemon with an orphan SQLite handle.
+    if not config.autobuild_runner_url:
+        raise ValueError(
+            "bind_production_serve: 'autobuild_runner_url' is required "
+            "but missing/empty. The in-process ASGI fallback path "
+            "(langgraph_sdk.get_client(url=None) → "
+            "ASGITransport(app=None)) raises 'NoneType' object is not "
+            "callable on every dispatch (TASK-FORGE-FRR-F010I/J). Set "
+            "FORGE_AUTOBUILD_RUNNER_URL to the langgraph-runner sidecar "
+            "URL (e.g. http://forge-autobuild-runner:8124 for compose "
+            "service-name resolution, or http://localhost:8124 for an "
+            "in-pod sidecar) and restart."
         )
 
     # Step 2 — auto-create parent dir so a fresh checkout does not need
@@ -256,7 +287,15 @@ def bind_production_serve(
 
     # Step 5 — eagerly construct the middleware. ImportErrors / wiring
     # bugs raise here, before the daemon attaches its consumer.
-    middleware = serve_module._build_async_subagent_middleware()
+    # TASK-FORGE-FRR-F010J: thread the langgraph-runner sidecar URL
+    # into the ``AsyncSubAgent`` registration so deepagents'
+    # ``_ClientCache.get_async()`` constructs an ``httpx.AsyncClient``
+    # with a real URL transport instead of the broken
+    # ``ASGITransport(app=None)`` fallback. The Step 1.5 guard above
+    # has already validated the URL is non-empty.
+    middleware = serve_module._build_async_subagent_middleware(
+        autobuild_runner_url=config.autobuild_runner_url,
+    )
 
     # Step 6 — derive the AsyncTaskStarter from the middleware tool
     # surface (per TASK-FW10-008 contract).

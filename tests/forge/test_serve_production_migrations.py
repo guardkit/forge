@@ -98,9 +98,20 @@ def tmp_db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def serve_config(tmp_db_path: Path) -> Any:
+    """Production-shaped ``ServeConfig`` fixture.
+
+    TASK-FORGE-FRR-F010J: ``bind_production_serve`` fail-fasts at
+    Step 1.5 when ``autobuild_runner_url`` is missing. This fixture
+    sets the URL to a stub sidecar address so the migration tests can
+    exercise the rest of ``bind_production_serve`` (Steps 2-8) without
+    being blocked by the new pre-resource guard.
+    """
     from forge.cli._serve_config import ServeConfig
 
-    return ServeConfig(db_path=tmp_db_path)
+    return ServeConfig(
+        db_path=tmp_db_path,
+        autobuild_runner_url="http://forge-autobuild-runner:8124",
+    )
 
 
 @pytest.fixture
@@ -123,7 +134,11 @@ def stub_serve_module(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         serve_module,
         "_build_async_subagent_middleware",
-        lambda: _FakeMiddleware(tool_names=("start_async_task",)),
+        # TASK-FORGE-FRR-F010J: factory now accepts
+        # ``autobuild_runner_url`` kwarg; the stub swallows it via
+        # ``**kw`` since this fixture exercises the migration step,
+        # not the URL-threading step.
+        lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
     )
     monkeypatch.setattr(
         serve_module,

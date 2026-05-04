@@ -767,3 +767,137 @@ class TestDispatchEndToEndUsesAsyncLaunchPath:
         assert sc_entry["task_id"] == "task-G-e2e-001"
         assert sc_entry["correlation_id"] == "corr-G-e2e"
         assert sc_entry["lifecycle"] == "starting"
+
+
+# ---------------------------------------------------------------------------
+# TASK-FORGE-FRR-F010J — _build_async_subagent_middleware threads
+# autobuild_runner_url into the AsyncSubAgent registration spec
+# ---------------------------------------------------------------------------
+
+
+class TestF010JBuildMiddlewareThreadsUrl:
+    """TASK-FORGE-FRR-F010J AC-2: factory threads URL into spec.
+
+    When ``autobuild_runner_url`` is provided, the
+    ``AsyncSubAgent`` registration dict passed to
+    ``AsyncSubAgentMiddleware(async_subagents=[...])`` MUST include
+    the ``url`` key — that's what deepagents'
+    ``_ClientCache.get_async()`` reads to construct an
+    ``httpx.AsyncClient`` with a real URL transport (instead of the
+    broken in-process ``ASGITransport(app=None)`` fallback that raises
+    ``'NoneType' object is not callable`` on every dispatch).
+
+    The test patches ``AsyncSubAgentMiddleware`` itself with a
+    capturing stand-in so the assertion inspects exactly what the
+    factory passes to the middleware constructor — independent of
+    deepagents' internal storage shape (which doesn't expose the
+    ``async_subagents`` list as a public attribute).
+    """
+
+    def test_build_middleware_includes_url_key_when_provided(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents.middleware import async_subagents as ds_module
+
+        from forge.pipeline.dispatchers.autobuild_async import (
+            AUTOBUILD_RUNNER_NAME,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _CapturingMiddleware:
+            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+                captured["async_subagents"] = async_subagents
+
+        monkeypatch.setattr(
+            ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware
+        )
+
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        url = "http://forge-autobuild-runner:8124"
+        _build_async_subagent_middleware(autobuild_runner_url=url)
+
+        specs = captured["async_subagents"]
+        autobuild_spec = next(
+            s for s in specs if s["name"] == AUTOBUILD_RUNNER_NAME
+        )
+        assert autobuild_spec["url"] == url
+        # Existing fields preserved.
+        assert autobuild_spec["graph_id"] == AUTOBUILD_RUNNER_NAME
+        assert "description" in autobuild_spec
+
+
+class TestF010JBuildMiddlewareOmitsUrlWhenAbsent:
+    """TASK-FORGE-FRR-F010J AC-2: factory omits ``url`` when not provided.
+
+    Non-production callers (BDD oracle, lint runners) construct the
+    middleware without a URL. In that mode the registration MUST
+    omit the ``url`` key entirely (deepagents' ``_ClientCache``
+    treats absence of ``url`` differently from ``url=None``); the
+    factory must NOT register ``url=None`` on the spec.
+
+    The truthy guard also defends against
+    ``FORGE_AUTOBUILD_RUNNER_URL=""`` — an empty string is treated
+    as "no URL" rather than registering a broken empty URL on the
+    spec.
+    """
+
+    def test_build_middleware_omits_url_when_argument_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents.middleware import async_subagents as ds_module
+
+        from forge.pipeline.dispatchers.autobuild_async import (
+            AUTOBUILD_RUNNER_NAME,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _CapturingMiddleware:
+            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+                captured["async_subagents"] = async_subagents
+
+        monkeypatch.setattr(
+            ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware
+        )
+
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        # Default arg (no URL).
+        _build_async_subagent_middleware()
+
+        specs = captured["async_subagents"]
+        autobuild_spec = next(
+            s for s in specs if s["name"] == AUTOBUILD_RUNNER_NAME
+        )
+        assert "url" not in autobuild_spec
+
+    def test_build_middleware_omits_url_when_argument_is_empty_string(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents.middleware import async_subagents as ds_module
+
+        from forge.pipeline.dispatchers.autobuild_async import (
+            AUTOBUILD_RUNNER_NAME,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _CapturingMiddleware:
+            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+                captured["async_subagents"] = async_subagents
+
+        monkeypatch.setattr(
+            ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware
+        )
+
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        _build_async_subagent_middleware(autobuild_runner_url="")
+
+        specs = captured["async_subagents"]
+        autobuild_spec = next(
+            s for s in specs if s["name"] == AUTOBUILD_RUNNER_NAME
+        )
+        assert "url" not in autobuild_spec

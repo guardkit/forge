@@ -259,7 +259,9 @@ def bind_production_dispatch_chain(
 # ---------------------------------------------------------------------------
 
 
-def _build_async_subagent_middleware() -> Any:
+def _build_async_subagent_middleware(
+    *, autobuild_runner_url: str | None = None
+) -> Any:
     """Return a configured :class:`AsyncSubAgentMiddleware` for autobuild.
 
     The middleware exposes the five tools (``start_async_task``,
@@ -276,6 +278,25 @@ def _build_async_subagent_middleware() -> Any:
     module import so :mod:`forge.cli.serve` stays importable in
     environments that do not have DeepAgents installed (the BDD oracle,
     static lint runners, etc.).
+
+    Args:
+        autobuild_runner_url: URL of the ``langgraph-runner`` sidecar
+            serving the autobuild_runner graph (TASK-FORGE-FRR-F010I/J).
+            When provided, the ``AsyncSubAgent`` registration includes
+            ``url=<url>`` so deepagents'
+            ``_ClientCache.get_async()`` constructs an
+            ``httpx.AsyncClient`` with a real URL transport (the path
+            this whole component was designed for). When ``None`` /
+            empty (default), the ``url`` key is omitted from the spec
+            so the in-process ASGI fallback applies — that path raises
+            ``'NoneType' object is not callable`` on every dispatch in
+            the current forge venv (``langgraph_api`` is not installed),
+            so production callers MUST pass the URL or
+            :func:`forge.cli._serve_production.bind_production_serve`
+            will fail-fast at boot. The ``None`` default is preserved
+            so non-production callers (BDD oracle, lint runners) can
+            still construct the middleware without the env var being
+            set.
     """
     from deepagents.middleware.async_subagents import AsyncSubAgentMiddleware
 
@@ -283,20 +304,24 @@ def _build_async_subagent_middleware() -> Any:
         AUTOBUILD_RUNNER_NAME,
     )
 
-    return AsyncSubAgentMiddleware(
-        async_subagents=[
-            {
-                "name": AUTOBUILD_RUNNER_NAME,
-                "description": (
-                    "Long-running autobuild stage runner (FEAT-FORGE-005, "
-                    "ADR-ARCH-031). The supervisor dispatches a feature's "
-                    "autobuild via start_async_task and tracks lifecycle "
-                    "transitions through the async_tasks state channel."
-                ),
-                "graph_id": AUTOBUILD_RUNNER_NAME,
-            }
-        ],
-    )
+    spec: dict[str, Any] = {
+        "name": AUTOBUILD_RUNNER_NAME,
+        "description": (
+            "Long-running autobuild stage runner (FEAT-FORGE-005, "
+            "ADR-ARCH-031). The supervisor dispatches a feature's "
+            "autobuild via start_async_task and tracks lifecycle "
+            "transitions through the async_tasks state channel."
+        ),
+        "graph_id": AUTOBUILD_RUNNER_NAME,
+    }
+    # Truthy check: empty-string values
+    # (``FORGE_AUTOBUILD_RUNNER_URL=``) are treated as "no URL" so a
+    # misconfigured deploy doesn't register a broken empty URL on the
+    # spec.
+    if autobuild_runner_url:
+        spec["url"] = autobuild_runner_url
+
+    return AsyncSubAgentMiddleware(async_subagents=[spec])
 
 
 def _make_autobuild_dispatcher_closure(
