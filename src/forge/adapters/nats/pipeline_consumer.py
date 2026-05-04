@@ -115,9 +115,18 @@ should ack-and-skip."""
 DispatchBuild = Callable[[BuildQueuedPayload, AckCallback], Awaitable[None]]
 """``async (payload, ack_callback) -> None`` — pipeline state-machine entry."""
 
-PublishBuildFailed = Callable[[BuildFailedPayload, str], Awaitable[None]]
-"""``async (failure_payload, feature_id) -> None`` — the wrapper publishes to
-``pipeline.build-failed.{feature_id}``. Owns envelope construction."""
+PublishBuildFailed = Callable[..., Awaitable[None]]
+"""``async (failure_payload, feature_id, *, correlation_id) -> None``.
+
+The wrapper publishes to ``pipeline.build-failed.{feature_id}`` and owns
+envelope construction. The ``correlation_id`` keyword is the inbound
+:attr:`MessageEnvelope.correlation_id` of the message that triggered the
+rejection — DDR-029 requires every outbound lifecycle envelope to carry
+the originating ``correlation_id`` so subscribers (jarvis ``forge_subscriber``)
+can route the notification back to the originating chat session. Pass
+``None`` only when the inbound envelope itself failed to parse — in every
+other rejection path the envelope is available and its ``correlation_id``
+must be threaded explicitly."""
 
 
 @runtime_checkable
@@ -259,6 +268,8 @@ async def _safe_publish_failure(
     deps: PipelineConsumerDeps,
     failure: BuildFailedPayload,
     feature_id: str,
+    *,
+    correlation_id: str | None,
 ) -> None:
     """Publish ``build-failed`` while absorbing transport-level errors.
 
@@ -274,6 +285,11 @@ async def _safe_publish_failure(
         failure: The :class:`BuildFailedPayload` to publish.
         feature_id: Feature identifier used for the
             ``pipeline.build-failed.{feature_id}`` subject.
+        correlation_id: Inbound envelope's ``correlation_id`` (DDR-029).
+            ``None`` only when the envelope itself failed to parse and
+            no source value is available; every other rejection path
+            MUST pass the inbound value so subscribers can route the
+            notification back to the originating chat session.
 
     Notes:
         We deliberately catch :class:`Exception` rather than a narrower
@@ -286,7 +302,9 @@ async def _safe_publish_failure(
     """
 
     try:
-        await deps.publish_build_failed(failure, feature_id)
+        await deps.publish_build_failed(
+            failure, feature_id, correlation_id=correlation_id
+        )
     except Exception as exc:
         logger.warning(
             "pipeline_consumer: publish_build_failed raised (%s) for "
@@ -340,6 +358,10 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             exc,
         )
         await msg.ack()
+        # Envelope itself failed to parse — there is no source value for
+        # ``correlation_id`` (DDR-029). This is the only rejection path
+        # where ``correlation_id=None`` on the outbound envelope is
+        # acceptable; every other path threads ``envelope.correlation_id``.
         await _safe_publish_failure(
             deps,
             _failure_payload(
@@ -348,15 +370,16 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
                 reason=REASON_MALFORMED_PAYLOAD,
             ),
             UNKNOWN_FEATURE_ID,
+            correlation_id=None,
         )
         return
 
     try:
         payload = BuildQueuedPayload.model_validate(envelope.payload)
     except ValidationError as exc:
-        # We have a parseable envelope, so use whatever identifying info it
-        # carries. ``correlation_id`` is informational only — it does not
-        # widen the failure surface.
+        # We have a parseable envelope, so thread its ``correlation_id``
+        # onto the outbound ``build-failed`` envelope (DDR-029) and use
+        # whatever identifying info the envelope carries.
         feature_id = _safe_envelope_feature(envelope) or UNKNOWN_FEATURE_ID
         logger.warning(
             "pipeline_consumer: BuildQueuedPayload validation failed for "
@@ -373,6 +396,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
                 reason=REASON_MALFORMED_PAYLOAD,
             ),
             feature_id,
+            correlation_id=envelope.correlation_id,
         )
         return
 
@@ -395,6 +419,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
                 reason=REASON_ORIGINATOR_NOT_RECOGNISED,
             ),
             payload.feature_id,
+            correlation_id=envelope.correlation_id,
         )
         return
 
@@ -416,6 +441,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
                 reason=REASON_PATH_OUTSIDE_ALLOWLIST,
             ),
             payload.feature_id,
+            correlation_id=envelope.correlation_id,
         )
         return
 

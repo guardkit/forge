@@ -307,22 +307,51 @@ def _build_dispatch_build(
 
 
 def _build_publish_build_failed(publisher):
-    """Return an ``async (failure_payload, feature_id) -> None`` wrapper.
+    """Return an ``async (failure_payload, feature_id, *, correlation_id)`` wrapper.
 
     The consumer's
     :data:`~forge.adapters.nats.pipeline_consumer.PublishBuildFailed`
     type alias passes ``feature_id`` separately for symmetry with the
-    other failure subjects in the API contract. The publisher derives
+    other failure subjects in the API contract; the publisher derives
     the subject from ``payload.feature_id`` itself, so the wrapper
-    simply discards the second argument after asserting the two agree
-    (defence-in-depth — a mismatched pair is a contract bug upstream
-    rather than a publish error).
+    swallows the second positional argument after asserting the two
+    agree (defence-in-depth — a mismatched pair is a contract bug
+    upstream rather than a publish error).
+
+    DDR-029 — the inbound envelope's ``correlation_id`` is threaded
+    through to the outbound envelope by attaching it to the v1
+    ``BuildFailedPayload`` via :func:`attach_correlation_id` before the
+    publisher reads it back through ``getattr(payload, "correlation_id")``.
+    The publisher's central ``_publish_envelope`` then writes it onto the
+    outbound :class:`MessageEnvelope`. ``correlation_id=None`` is only
+    accepted on the malformed-envelope path where no source value is
+    available; every other rejection path threads the inbound value
+    explicitly.
     """
 
+    from forge.pipeline import attach_correlation_id
+
     async def publish_build_failed(
-        failure_payload: "BuildFailedPayload", feature_id: str
+        failure_payload: "BuildFailedPayload",
+        feature_id: str,
+        *,
+        correlation_id: str | None,
     ) -> None:
-        """Publish ``pipeline.build-failed.{feature_id}`` via the shared publisher."""
+        """Publish ``pipeline.build-failed.{feature_id}`` via the shared publisher.
+
+        Args:
+            failure_payload: The :class:`BuildFailedPayload` describing the
+                rejection.
+            feature_id: Subject-construction key. Must equal
+                ``failure_payload.feature_id``; a mismatch is logged and
+                the publisher's payload-derived subject wins.
+            correlation_id: Inbound envelope ``correlation_id`` (DDR-029).
+                Attached to the v1 payload via
+                :func:`attach_correlation_id` so the publisher's
+                envelope-construction path threads it onto the outbound
+                envelope. ``None`` only on the malformed-envelope rejection
+                path where no source value is available.
+        """
         if failure_payload.feature_id != feature_id:
             # Surface contract bug rather than publish to a subject the
             # caller did not intend; the publisher will derive
@@ -333,6 +362,8 @@ def _build_publish_build_failed(publisher):
                 failure_payload.feature_id,
                 feature_id,
             )
+        if correlation_id is not None:
+            attach_correlation_id(failure_payload, correlation_id)
         await publisher.publish_build_failed(failure_payload)
 
     return publish_build_failed

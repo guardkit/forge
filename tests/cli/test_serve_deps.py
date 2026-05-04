@@ -421,7 +421,9 @@ class TestPublishBuildFailedDelegates:
             recoverable=False,
             failed_task_id=None,
         )
-        await deps.publish_build_failed(failure, "FEAT-F")
+        # TASK-FORGE-FRR-F010C — the wrapper requires correlation_id as a
+        # keyword-only argument (DDR-029).
+        await deps.publish_build_failed(failure, "FEAT-F", correlation_id=None)
 
         assert len(stub_client.published) == 1, (
             "publish_build_failed must result in exactly one NATS publish"
@@ -429,6 +431,51 @@ class TestPublishBuildFailedDelegates:
         subject, _body = stub_client.published[0]
         assert subject == "pipeline.build-failed.FEAT-F", (
             f"subject must be derived from feature_id; got {subject!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_publish_build_failed_threads_correlation_id_onto_envelope(
+        self,
+        stub_client: _StubNatsClient,
+        forge_config: ForgeConfig,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        """TASK-FORGE-FRR-F010C — the wrapper attaches the inbound
+        ``correlation_id`` to the v1 ``BuildFailedPayload`` so the
+        publisher's central envelope construction (which reads it back
+        via ``getattr(payload, "correlation_id", None)``) writes it onto
+        the outbound :class:`MessageEnvelope` (DDR-029).
+        """
+        import json
+
+        from nats_core.events import BuildFailedPayload
+
+        deps = build_pipeline_consumer_deps(
+            stub_client, forge_config, persistence
+        )
+
+        failure = BuildFailedPayload(
+            feature_id="FEAT-43DE",
+            build_id="FEAT-43DE",
+            failure_reason="path outside allowlist",
+            recoverable=False,
+            failed_task_id=None,
+        )
+        await deps.publish_build_failed(
+            failure,
+            "FEAT-43DE",
+            correlation_id="21df1258-63cb-4e8a-9bef-89234833b68e",
+        )
+
+        assert len(stub_client.published) == 1
+        subject, body = stub_client.published[0]
+        assert subject == "pipeline.build-failed.FEAT-43DE"
+        envelope = json.loads(body)
+        assert envelope["correlation_id"] == (
+            "21df1258-63cb-4e8a-9bef-89234833b68e"
+        ), (
+            "DDR-029: outbound build-failed envelope must carry the "
+            "inbound correlation_id"
         )
 
 
