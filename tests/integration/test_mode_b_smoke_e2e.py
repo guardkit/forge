@@ -436,19 +436,26 @@ class FakeSubprocessDispatcher:
 
 @dataclass
 class FakeAutobuildAsyncDispatcher:
-    """Sync autobuild dispatcher — returns a synthetic completed handle.
+    """Async autobuild dispatcher — returns a synthetic completed handle.
 
-    Mirrors the production ``dispatch_autobuild_async`` shape: returns
-    immediately with a task handle while the underlying AsyncSubAgent
-    runs separately. The smoke harness simulates the in-flight window
-    by writing to the async-task channel and then marking complete.
+    Mirrors the production ``dispatch_autobuild_async`` shape: awaits
+    the launch and returns the handle immediately while the underlying
+    AsyncSubAgent runs separately. The smoke harness simulates the
+    in-flight window by writing to the async-task channel and then
+    marking complete.
+
+    TASK-FORGE-FRR-F010G: this fake's ``__call__`` is now ``async def``
+    because :func:`dispatch_autobuild_async` (and hence the supervisor
+    closure that wraps it) is async — the launch path awaits the
+    deepagents middleware's ``StructuredTool.coroutine`` so the
+    autobuild_runner registration can stay URL-less in-process.
     """
 
     async_task_reader: FakeAsyncTaskReader
     calls: list[dict[str, Any]] = field(default_factory=list)
     next_task_id: int = 1000
 
-    def __call__(
+    async def __call__(
         self,
         *,
         build_id: str,

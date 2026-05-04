@@ -1,4 +1,4 @@
-"""Production binding for ``AsyncTaskStarter`` (TASK-FORGE-FRR-F010E).
+"""Production binding for ``AsyncTaskStarter`` (TASK-FORGE-FRR-F010E + F010G).
 
 This module bridges the impedance between the autobuild dispatcher's
 :class:`~forge.pipeline.dispatchers.autobuild_async.AsyncTaskStarter`
@@ -34,9 +34,22 @@ Design rules (mirrors the F010.B :mod:`_serve_deps_stage_log` precedent)
   outside a LangGraph tool-execution loop fails with
   ``TypeError: ... missing 1 required positional argument: 'runtime'``
   because the wrapper does not auto-synthesise ``ToolRuntime``. We call
-  ``tool.func`` directly with a synthesised runtime so the seam stays
-  testable and decoupled from the LangGraph runtime injection
-  machinery.
+  ``tool.func`` (sync path, kept for back-compat with in-memory test
+  fakes) and ``tool.coroutine`` (async path — the production launch
+  route per TASK-FORGE-FRR-F010G) directly with a synthesised runtime
+  so the seam stays testable and decoupled from the LangGraph runtime
+  injection machinery.
+* **Prefer the async path in production.** TASK-FORGE-FRR-F010G:
+  the deepagents middleware's sync ``_ClientCache.get_sync`` raises
+  ``ValueError`` when an ``AsyncSubAgent`` is registered without a
+  ``url`` field, while ``_ClientCache.get_async`` tolerates the same
+  shape and falls back to in-process ASGI transport via the LangGraph
+  SDK's ``get_client(url=None)``. The autobuild_runner registration
+  in :func:`forge.cli.serve._build_async_subagent_middleware` ships
+  without ``url`` (in-process daemon), so production calls
+  :meth:`_StructuredToolAsyncTaskStarter.astart_async_task` which
+  awaits ``tool.coroutine``. The legacy sync method is preserved for
+  Protocol compatibility and pre-F010G test fakes.
 * **Drop ``lifecycle_emitter``.** The dispatcher's launch_payload at
   ``autobuild_async.py:466-472`` carries an in-process
   :class:`PipelineLifecycleEmitter` (per DDR-007 §Decision Option A).
@@ -282,6 +295,63 @@ class _StructuredToolAsyncTaskStarter:
         )
         return task_id
 
+    async def astart_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        """Async sibling of :meth:`start_async_task` — production path.
+
+        TASK-FORGE-FRR-F010G: awaits the underlying ``StructuredTool``'s
+        ``coroutine`` (the deepagents ``astart_async_task`` async closure)
+        rather than calling ``func``. The async path's
+        ``_ClientCache.get_async`` does not raise on ``url=None`` — it
+        falls back to in-process ASGI transport via the LangGraph SDK's
+        ``get_client(url=None)``. This is the launch route the autobuild
+        dispatcher uses so the autobuild_runner registration can stay
+        URL-less (one-binary deployment shape).
+
+        Args:
+            subagent_name: Forwarded to the tool as ``subagent_type``.
+            context: As :meth:`start_async_task` — must include
+                ``correlation_id`` for the synthesised
+                :class:`ToolRuntime` ``tool_call_id``.
+
+        Returns:
+            The freshly-minted ``task_id`` extracted from
+            ``Command.update["async_tasks"]``.
+
+        Raises:
+            RuntimeError: As :meth:`start_async_task`.
+        """
+        correlation_id = context.get("correlation_id") or ""
+        if not isinstance(correlation_id, str):
+            correlation_id = str(correlation_id)
+        tool_call_id = (
+            f"autobuild-dispatch-{correlation_id}"
+            if correlation_id
+            else "autobuild-dispatch"
+        )
+
+        description = _synthesise_description(subagent_name, context)
+        runtime = SimpleNamespace(tool_call_id=tool_call_id)
+
+        result = await self._tool.coroutine(
+            description=description,
+            subagent_type=subagent_name,
+            runtime=runtime,
+        )
+
+        task_id = _extract_task_id(result)
+        logger.debug(
+            "async_task_starter: launched (async path) subagent_name=%s "
+            "task_id=%s correlation_id=%s",
+            subagent_name,
+            task_id,
+            correlation_id or "<unset>",
+        )
+        return task_id
+
 
 def build_async_task_starter(tool: Any) -> AsyncTaskStarter:
     """Build the production :class:`AsyncTaskStarter` for the autobuild dispatch.
@@ -301,12 +371,15 @@ def build_async_task_starter(tool: Any) -> AsyncTaskStarter:
     and siblings.
 
     Args:
-        tool: An object exposing a callable ``func`` attribute that
-            accepts the deepagents ``start_async_task`` keyword
-            arguments (``description: str``, ``subagent_type: str``,
+        tool: An object exposing a callable ``func`` attribute and a
+            callable ``coroutine`` attribute that both accept the
+            deepagents ``start_async_task`` keyword arguments
+            (``description: str``, ``subagent_type: str``,
             ``runtime: ToolRuntime``). In production this is the
             :class:`StructuredTool` returned by
-            :func:`AsyncSubAgentMiddleware._build_async_subagent_tools`.
+            :func:`AsyncSubAgentMiddleware._build_async_subagent_tools`,
+            which exposes both via ``StructuredTool.from_function(func=…,
+            coroutine=…)``.
 
     Returns:
         An :class:`AsyncTaskStarter` Protocol implementation. The
@@ -315,9 +388,11 @@ def build_async_task_starter(tool: Any) -> AsyncTaskStarter:
 
     Raises:
         TypeError: If ``tool`` does not expose a callable ``func``
-            attribute. Raising at composition time means a wiring
-            regression surfaces at boot rather than on the first
-            inbound dispatch envelope.
+            attribute or a callable ``coroutine`` attribute. Raising
+            at composition time means a wiring regression surfaces at
+            boot rather than on the first inbound dispatch envelope.
+            TASK-FORGE-FRR-F010G added the ``coroutine`` check because
+            production now uses the async launch path.
     """
     func = getattr(tool, "func", None)
     if not callable(func):
@@ -326,5 +401,18 @@ def build_async_task_starter(tool: Any) -> AsyncTaskStarter:
             "attribute matching the deepagents start_async_task shape "
             "(description, subagent_type, runtime); got "
             f"{type(tool).__name__} (func={func!r})"
+        )
+    coroutine = getattr(tool, "coroutine", None)
+    if not callable(coroutine):
+        raise TypeError(
+            "build_async_task_starter: tool must expose a callable "
+            "'coroutine' attribute matching the deepagents "
+            "astart_async_task shape (description, subagent_type, "
+            "runtime); got "
+            f"{type(tool).__name__} (coroutine={coroutine!r}). "
+            "Production uses the async launch path per "
+            "TASK-FORGE-FRR-F010G — the StructuredTool returned by "
+            "AsyncSubAgentMiddleware._build_async_subagent_tools "
+            "exposes both 'func' and 'coroutine'."
         )
     return _StructuredToolAsyncTaskStarter(tool)

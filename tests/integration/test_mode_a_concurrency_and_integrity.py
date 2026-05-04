@@ -266,14 +266,24 @@ class RecordingDispatcher:
 
 @dataclass
 class RecordingSyncDispatcher:
-    """Sync dispatcher — autobuild_async returns a handle synchronously."""
+    """Recording dispatcher — sync ``__call__`` returns a handle.
+
+    TASK-FORGE-FRR-F010G: the autobuild dispatcher Protocol switched to
+    ``Callable[..., Awaitable[Any]]`` so the launch path can await the
+    deepagents middleware's async ``coroutine`` entrypoint (URL-less
+    in-process ASGI transport). The class keeps a sync ``__call__`` for
+    the specialist / subprocess dispatchers (whose Protocols stayed
+    sync) but wraps the result in a coroutine when ``is_async=True`` is
+    set so the same fake can stand in for the autobuild dispatcher.
+    """
 
     label: str
     bus: FakeLifecycleBus | None = None
     correlation_lookup: dict[str, str] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    is_async: bool = False
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def _make_result(self, kwargs: dict[str, Any]) -> Any:
         self.calls.append({**kwargs})
         build_id = kwargs.get("build_id", "")
         feature_id = kwargs.get("feature_id")
@@ -294,6 +304,13 @@ class RecordingSyncDispatcher:
             "task_id": task_id,
             "correlation_id": correlation_id,
         }
+
+    def __call__(self, **kwargs: Any) -> Any:
+        if self.is_async:
+            async def _result() -> Any:
+                return self._make_result(kwargs)
+            return _result()
+        return self._make_result(kwargs)
 
 
 @dataclass
@@ -493,6 +510,7 @@ def _build_harness(
         label="autobuild_async",
         bus=bus,
         correlation_lookup=correlation_lookup,
+        is_async=True,
     )
     pr_review_gate = RecordingPRReviewGate(
         bus=bus,

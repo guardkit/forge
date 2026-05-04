@@ -309,7 +309,7 @@ def _make_autobuild_dispatcher_closure(
 ) -> Callable[..., Any]:
     """Return the supervisor-shaped autobuild dispatcher closure.
 
-    The supervisor calls ``self.autobuild_dispatcher(build_id=...,
+    The supervisor calls ``await self.autobuild_dispatcher(build_id=...,
     feature_id=..., rationale=...)`` (see ``Supervisor._dispatch``);
     this closure pre-binds the four wave-2 collaborators
     (TASK-FW10-003/004/005) plus the wave-2 lifecycle emitter
@@ -325,15 +325,20 @@ def _make_autobuild_dispatcher_closure(
     the FEAT-FORGE-007 Group I @data-integrity check in unit tests; the
     cross-feature integration tests assert the production correlation
     propagation path.
+
+    TASK-FORGE-FRR-F010G: the closure is ``async def`` because
+    :func:`dispatch_autobuild_async` is now async — the launch path
+    awaits ``StructuredTool.coroutine`` so the autobuild_runner
+    registration can stay URL-less (in-process ASGI transport).
     """
 
-    def dispatcher(
+    async def dispatcher(
         *,
         build_id: str,
         feature_id: str,
         rationale: str = "",
     ) -> Any:
-        return dispatch_autobuild_async(
+        return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
             correlation_id=feature_id,

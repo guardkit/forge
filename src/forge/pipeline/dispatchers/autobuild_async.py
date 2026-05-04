@@ -160,10 +160,13 @@ class AsyncTaskStarter(Protocol):
     deterministic ``task_id`` values so the dispatcher's behaviour can be
     asserted without standing up a LangGraph runtime.
 
-    The Protocol is deliberately narrow — exactly one method, taking the
-    subagent name and the context payload. Anything richer (cancellation,
-    progress polling, etc.) is owned by the supervisor and the runner
-    themselves; the dispatcher only needs the launch contract.
+    The Protocol exposes both a sync and an async launch method. The
+    sync ``start_async_task`` is preserved for in-memory test fakes and
+    pre-F010G callers; the async ``astart_async_task`` is the production
+    path because the deepagents middleware's sync ``_ClientCache.get_sync``
+    raises on ``url=None`` while ``get_async`` falls back to in-process
+    ASGI transport — see TASK-FORGE-FRR-F010G investigation §5 and
+    ``deepagents/middleware/async_subagents.py:239-262``.
     """
 
     def start_async_task(
@@ -185,6 +188,33 @@ class AsyncTaskStarter(Protocol):
             The freshly-minted ``task_id``. Per-call unique — concurrent
             calls (even with identical context) must return distinct
             values.
+        """
+        ...
+
+    async def astart_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:  # pragma: no cover - protocol stub
+        """Async sibling of :meth:`start_async_task` — production path.
+
+        TASK-FORGE-FRR-F010G: the autobuild_runner registration is shipped
+        without a ``url`` field (in-process ASGI transport). The deepagents
+        sync launch path raises ``ValueError`` on that shape; only the
+        async path's ``_ClientCache.get_async`` tolerates ``url=None`` and
+        falls back to in-process ASGI transport via the LangGraph SDK's
+        ``get_client(url=None)``. Production wires the
+        :class:`_StructuredToolAsyncTaskStarter` adapter which awaits
+        the underlying ``StructuredTool.coroutine``; the dispatcher
+        :func:`dispatch_autobuild_async` is ``async def`` for this
+        reason.
+
+        Args:
+            subagent_name: As :meth:`start_async_task`.
+            context: As :meth:`start_async_task`.
+
+        Returns:
+            The freshly-minted ``task_id``.
         """
         ...
 
@@ -292,7 +322,7 @@ def _serialise_context_entries(
 # ---------------------------------------------------------------------------
 
 
-def dispatch_autobuild_async(
+async def dispatch_autobuild_async(
     build_id: str,
     feature_id: str,
     correlation_id: str,
@@ -322,12 +352,14 @@ def dispatch_autobuild_async(
        write and the ``start_async_task`` ack, the SQLite row records
        that a dispatch was attempted.
 
-    3. **Invoke ``start_async_task``.** Call the middleware tool with
+    3. **Invoke ``astart_async_task``.** Call the middleware tool with
        :data:`AUTOBUILD_RUNNER_NAME` and a context payload that carries
        ``build_id``, ``feature_id``, ``correlation_id``, and the
-       serialised context entries. The call returns the assigned
-       ``task_id`` synchronously; the actual subagent work runs in the
-       background.
+       serialised context entries. The await resolves with the assigned
+       ``task_id``; the actual subagent work runs in the background.
+       TASK-FORGE-FRR-F010G drove the switch from the sync to the async
+       path because the deepagents sync ``_ClientCache.get_sync`` raises
+       on ``url=None`` while the async path tolerates it.
 
     4. **Re-record ``stage_log``** with the ``task_id`` threaded into
        ``details_json``. The upsert semantics of the recorder mean we
@@ -470,7 +502,12 @@ def dispatch_autobuild_async(
         "context_entries": serialised_context,
         "lifecycle_emitter": lifecycle_emitter,
     }
-    task_id = async_task_starter.start_async_task(
+    # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
+    # middleware's sync path raises on ``url=None`` (the autobuild_runner
+    # registration shape) while the async path tolerates ``url=None`` and
+    # falls back to in-process ASGI transport via the LangGraph SDK
+    # ``get_client(url=None)``.
+    task_id = await async_task_starter.astart_async_task(
         subagent_name=AUTOBUILD_RUNNER_NAME,
         context=launch_payload,
     )

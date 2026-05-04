@@ -258,19 +258,20 @@ class RecordingDispatcher:
 
 @dataclass
 class RecordingAutobuildDispatcher:
-    """Sync dispatcher that mirrors the production autobuild side effect.
+    """Async dispatcher that mirrors the production autobuild side effect.
 
-    The real :func:`dispatch_autobuild_async` writes an
-    ``AutobuildState`` entry into the LangGraph ``async_tasks`` channel
-    with ``lifecycle="running_wave"``. Tests propagate that side effect
-    here so the post-crash advisory snapshot is realistic.
+    The real :func:`dispatch_autobuild_async` (``async def`` per
+    TASK-FORGE-FRR-F010G) writes an ``AutobuildState`` entry into the
+    LangGraph ``async_tasks`` channel with ``lifecycle="running_wave"``.
+    Tests propagate that side effect here so the post-crash advisory
+    snapshot is realistic.
     """
 
     label: str
     advisory_channel: AdvisoryAsyncTaskChannel
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def __call__(self, **kwargs: Any) -> Any:
+    async def __call__(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         build_id = kwargs.get("build_id", "")
         feature_id = kwargs.get("feature_id", "")

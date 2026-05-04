@@ -320,7 +320,10 @@ def _build_supervisor() -> tuple[Supervisor, dict[str, Any]]:
     turn_recorder = RecordingTurnRecorder()
     specialist = RecordingAsyncDispatcher(label="specialist")
     subprocess_disp = RecordingAsyncDispatcher(label="subprocess")
-    autobuild_disp = RecordingSyncDispatcher(label="autobuild_async")
+    # TASK-FORGE-FRR-F010G: the autobuild dispatcher is now async (the
+    # launch path awaits ``StructuredTool.coroutine`` so the
+    # autobuild_runner registration can run URL-less in-process).
+    autobuild_disp = RecordingAsyncDispatcher(label="autobuild_async")
     pr_gate = RecordingPRReviewGate()
     mode_b_history = FakeModeBHistoryReader()
     mode_c_history = FakeModeCHistoryReader()

@@ -371,11 +371,18 @@ class FakeAutobuildAsyncDispatcher:
     The smoke harness treats AUTOBUILD as having already finished by
     the time ``next_turn`` returns; the real async lifecycle is owned
     by FEAT-FORGE-006 and is not under test here.
+
+    TASK-FORGE-FRR-F010G: the autobuild dispatcher Protocol is now
+    ``Callable[..., Awaitable[Any]]`` because the production launch
+    path awaits the deepagents middleware's async ``coroutine``
+    entrypoint (URL-less in-process ASGI transport). This fake's
+    ``__call__`` is therefore async to satisfy the supervisor's
+    ``await self.autobuild_dispatcher(...)`` site.
     """
 
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         build_id: str,

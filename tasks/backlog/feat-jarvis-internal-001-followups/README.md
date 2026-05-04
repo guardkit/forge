@@ -36,6 +36,7 @@ tracked in the jarvis repo separately.
 | [TASK-FORGE-FRR-F010C](TASK-FORGE-FRR-F010C-thread-correlation-id-into-outbound-envelopes.md) | Thread inbound `correlation_id` into outbound `pipeline.*` envelopes from `pipeline_consumer` | high | 3 | 📥 backlog (filed 2026-05-04) |
 | [TASK-FORGE-FRR-F010E](../../completed/TASK-FORGE-FRR-F010E/TASK-FORGE-FRR-F010E-resolve-structuredtool-start-async-task-attribute-error.md) | Resolve `'StructuredTool' object has no attribute 'start_async_task'` in autobuild dispatch path | high | 4 | ✅ completed (2026-05-04 — adapter wraps StructuredTool at composition seam; AC-6 operator runbook revalidation pending) |
 | [TASK-FORGE-FRR-F010F](TASK-FORGE-FRR-F010F-publish-build-failed-envelope-on-dispatch-error.md) | Publish terminal `build-failed` envelope when `dispatch_build` raises (instead of silently acking) | high | 3 | 📥 backlog (filed 2026-05-04) |
+| [TASK-FORGE-FRR-F010G](../../completed/TASK-FORGE-FRR-F010G/TASK-FORGE-FRR-F010G-configure-autobuild-runner-url-or-fallback-transport.md) | Configure `autobuild_runner` async subagent for ASGI transport (or fall back to in-process invocation when `url=None`) | high | 4 | ✅ completed (2026-05-04 — Option C: chain-async, adapter awaits `tool.coroutine`; AC-5 operator runbook revalidation pending) |
 
 > **Post-TASK-FIX-F010 follow-ups (2026-05-04 evening)**: TASK-FIX-F010
 > shipped and was verified live on the wire (correlation_id
@@ -86,6 +87,31 @@ tracked in the jarvis repo separately.
 > "Addendum 2: Joint live-wire validation rerun after F010.A–D"
 > section for the full evidence (chat-driven queue + synthetic
 > publish for the F010.C verification).
+
+> **Phase 7 structural close achieved — last-mile gap (2026-05-04 late evening)**:
+> Once F010Db (jarvis) + F010E + F010F (forge) all landed, a final
+> validation rerun (correlation_id
+> `db27f127-a863-4723-a4be-b8cbb68eab5a`, forge HEAD `50f646f`, jarvis
+> HEAD `85f2e39`) verified all three fixes live on the wire — the
+> **chat REPL now renders lifecycle notification lines between
+> prompts** in the canonical runbook §7.1 shape (`[14:38] Forge
+> FEAT-43DE: build-failed (RuntimeError: ...)`), threaded by the same
+> correlation_id jarvis published, drained before the next supervisor
+> response. Phase 7 **structural close achieved** — the DDR-030
+> contract is empirically satisfied (the operator never silently
+> loses the build outcome). The remaining gap (**F010.G** — this
+> task) is the last layer between structural close and the canonical
+> happy-path sequence: the `autobuild_runner` async subagent has
+> `url=None` and `deepagents.middleware.async_subagents`'s sync
+> ASGI-transport client cache fails fast on launch. F010F's
+> safety-net publishes a terminal `build-failed` envelope carrying
+> the deepagents `failure_reason` verbatim, so this gap is loud and
+> well-routed. Once F010.G closes, the runbook should produce the
+> full `build-started + stage-complete*N + build-complete` envelope
+> sequence on the wire and as rendered chat lines. See
+> [`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md`](../../../../../jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md)
+> "Addendum 3: Final validation rerun after F010Db + F010E + F010F"
+> section for the full evidence chain.
 
 > **Post-FEAT-DEA8 follow-up (2026-05-04)**: The 2026-05-04 rerun of the
 > jarvis first-real-run runbook (correlation_id
@@ -138,6 +164,7 @@ tracked in the jarvis repo separately.
 10. **TASK-FORGE-FRR-F010C** 📥 backlog (filed 2026-05-04) — Thread `inbound_envelope.correlation_id` into every outbound `pipeline.*` envelope from `pipeline_consumer` (and any caller in `pipeline.publisher` / `pipeline.lifecycle_emitter`). DDR-029 violation. Independent of F010.A/B; can land in parallel. Reproducer: runs 1+2 (`21df1258-…`, `b5c5e1e2-…`) — `pipeline.build-failed.FEAT-43DE` carried `correlation_id: null` instead of the threaded inbound value.
 11. **TASK-FORGE-FRR-F010E** 📥 backlog (filed 2026-05-04) — Resolve `'StructuredTool' object has no attribute 'start_async_task'` AttributeError in the autobuild dispatcher path (next-layer wiring drift exposed once F010.B's StageLogReader adapter unblocked the dispatcher's progression). The autobuild dispatcher's `AsyncTaskStarter` Protocol at `src/forge/pipeline/dispatchers/autobuild_async.py:155-189` declares a named-method shape (`start_async_task(subagent_name, context)`), but `_resolve_async_task_starter` at `src/forge/cli/_serve_production.py:139-142` returns the raw LangChain `StructuredTool` looked up by name from `middleware.tools` — `StructuredTool` exposes `tool.invoke({...})` / `tool.ainvoke({...})`, not the named method. Fix is either (A) change the caller to use `tool.invoke({...})` (LangChain-native) or (B) wrap the `StructuredTool` in a named-method adapter at the production-composition seam (symmetric with F010.B's adapter-wrapping strategy — likely the right answer). Reproducer: late-afternoon run 1 (`dfad8e7f-…`) — exception fires immediately after the QUEUED row is persisted but before any `build-started` envelope is emitted. Independent of F010.F; can land in either order.
 12. **TASK-FORGE-FRR-F010F** 📥 backlog (filed 2026-05-04) — Publish terminal `pipeline.build-failed.<feature_id>` envelope when `dispatch_build` raises an unhandled exception, **before** acking — instead of today's silent log+ack at `pipeline_consumer.py:470-506`. Re-uses F010.C's `_safe_publish_failure` / `_failure_payload` helpers so correlation_id-threading inherits transparently. Narrows ADR-ARCH-008's no-duplicate-publish protection to "when the state machine has started" (since pre-state-machine raises mean the state machine never gets to publish, and so there's no duplicate to guard against). Safety-net for *all* future dispatch failures, not just F010.E's StructuredTool case. Independent of F010.E; can land in either order. Recommended order is **F010.F first** — its AC-6 is verifiable today against the open F010.E failure mode (a chat-driven queue produces a visible `build-failed` envelope on the wire instead of a silent drop), and the implementation is small (one publish call + 3 unit tests). Reproducer (co-symptom): same late-afternoon run 1 (`dfad8e7f-…`) — `pipeline.>` tail captured zero outbound publishes from forge despite a known correlation_id and a logged WARNING.
+13. **TASK-FORGE-FRR-F010G** 📥 backlog (filed 2026-05-04) — Configure the `autobuild_runner` async subagent for ASGI transport (or fall back to in-process invocation when `url=None`) — the **last-mile** deployment gap surfaced once F010E's `_StructuredToolAsyncTaskStarter` adapter unblocked the call boundary into the middleware. The `_build_async_subagent_middleware` factory at `src/forge/cli/serve.py:262-299` registers `autobuild_runner` with `name` + `description` + `graph_id` only — **no `url`** — and `deepagents.middleware.async_subagents._ClientCache.get_sync` (line 239-244 of the vendored package) fails fast with `Async subagent 'autobuild_runner' has no url configured. ASGI transport (url=None) requires async invocation.` whenever the F010E adapter's sync `tool.func(...)` call lands. Four implementation options surfaced during initial reading of the deepagents source: **A1** (langgraph-dev sidecar), **A2** (in-process ASGI surface inside `forge serve`), **B** (extend / monkeypatch `deepagents` for `url=None` fallback in `get_sync`), and **C** (switch the F010E adapter to call `tool.coroutine` instead of `tool.func` — the async path uses `get_async()` which has **no url-None guard**, since the LangGraph SDK's `get_client(url=None)` falls back to the in-process ASGI transport per the docstring at `async_subagents.py:60-65`). Option C is likely the minimum-deviation fix (one-line adapter change + one-line dispatcher change) but requires confirming the dispatcher's sync Protocol shape can become `await`-shaped without ripple. Mandatory investigation step before any fix lands. Reproducer: late-evening rerun (correlation_id `db27f127-a863-4723-a4be-b8cbb68eab5a`) — chat REPL renders the canonical `[HH:MM] Forge FEAT-43DE: build-failed (RuntimeError: ...)` line carrying the deepagents `failure_reason` in full; F010F's safety-net publish guarantees the operator never silently loses the build outcome even with F010.G open. The Phase 7 happy-path sequence (`build-started + stage-complete*N + build-complete`) is one follow-up away.
 
 The jarvis runbook
 (`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md`)

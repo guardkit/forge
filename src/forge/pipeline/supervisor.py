@@ -527,10 +527,13 @@ SpecialistDispatcher = Callable[..., Awaitable[Any]]
 #: :func:`dispatch_subprocess_stage`.
 SubprocessDispatcher = Callable[..., Awaitable[Any]]
 
-#: Callable that dispatches an async autobuild. Sync because the
-#: production target (:func:`dispatch_autobuild_async`) returns the
-#: handle synchronously after launching the async task.
-AutobuildDispatcher = Callable[..., Any]
+#: Callable that dispatches an async autobuild. Async because the
+#: production target (:func:`dispatch_autobuild_async`) is ``async def``
+#: as of TASK-FORGE-FRR-F010G — the launch path awaits the deepagents
+#: middleware's async ``StructuredTool.coroutine`` so the
+#: autobuild_runner registration can stay URL-less (in-process ASGI
+#: transport instead of an HTTP-addressable Agent Protocol surface).
+AutobuildDispatcher = Callable[..., Awaitable[Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +569,11 @@ class Supervisor:
             :func:`dispatch_specialist_stage`.
         subprocess_dispatcher: Async callable wrapping
             :func:`dispatch_subprocess_stage`.
-        autobuild_dispatcher: Sync callable wrapping
-            :func:`dispatch_autobuild_async`.
+        autobuild_dispatcher: Async callable wrapping
+            :func:`dispatch_autobuild_async`. TASK-FORGE-FRR-F010G
+            switched the production target to ``async def`` so the
+            launch path can use the deepagents async ``coroutine``
+            entrypoint (URL-less in-process ASGI transport).
         pr_review_gate: FEAT-FORGE-004 gate surface.
         stage_hints: Optional per-stage forward-propagation hints
             mapping (TASK-MAG7-002). Defaults to empty.
@@ -1559,10 +1565,12 @@ class Supervisor:
 
         if stage is StageClass.AUTOBUILD:
             # feature_id presence is already enforced upstream (step 5
-            # of next_turn). The autobuild dispatcher is sync — it
-            # returns the launched task's handle synchronously.
+            # of next_turn). TASK-FORGE-FRR-F010G: the autobuild
+            # dispatcher is async because the launch path awaits
+            # ``StructuredTool.coroutine`` (deepagents async path) so
+            # the runner can run URL-less in-process.
             assert choice.feature_id is not None
-            return self.autobuild_dispatcher(
+            return await self.autobuild_dispatcher(
                 build_id=build_id,
                 feature_id=choice.feature_id,
                 rationale=choice.rationale,

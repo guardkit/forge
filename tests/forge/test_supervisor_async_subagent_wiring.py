@@ -91,13 +91,19 @@ class FakeWorktreeAllowlist:
 
 @dataclass
 class CapturingAsyncTaskStarter:
-    """Records each ``start_async_task`` call's context for inspection."""
+    """Records each launch call's context for inspection.
+
+    TASK-FORGE-FRR-F010G: production now awaits ``astart_async_task``
+    rather than calling sync ``start_async_task``, so this fake exposes
+    both methods. They share a single counter so tests can stay
+    method-agnostic.
+    """
 
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     _counter: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def start_async_task(
+    def _mint(
         self,
         subagent_name: str,
         context: Mapping[str, Any],
@@ -109,6 +115,20 @@ class CapturingAsyncTaskStarter:
             # the live context reference rather than a deep copy.
             self.calls.append((subagent_name, dict(context)))
         return task_id
+
+    def start_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        return self._mint(subagent_name, context)
+
+    async def astart_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        return self._mint(subagent_name, context)
 
 
 @dataclass
@@ -235,7 +255,8 @@ class TestDispatchAutobuildSignature:
 class TestEmitterThreadedIntoContext:
     """AC-001 + DDR-007 Option A seam test."""
 
-    def test_dispatch_threads_emitter_into_ctx(
+    @pytest.mark.asyncio
+    async def test_dispatch_threads_emitter_into_ctx(
         self,
         builder: ForwardContextBuilder,
         starter: CapturingAsyncTaskStarter,
@@ -253,7 +274,7 @@ class TestEmitterThreadedIntoContext:
             artefact_text=None,
         )
 
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -280,7 +301,8 @@ class TestEmitterThreadedIntoContext:
         assert ctx["feature_id"] == "FEAT-1"
         assert ctx["correlation_id"] == "corr-1"
 
-    def test_state_channel_still_initialised_with_starting_lifecycle(
+    @pytest.mark.asyncio
+    async def test_state_channel_still_initialised_with_starting_lifecycle(
         self,
         builder: ForwardContextBuilder,
         starter: CapturingAsyncTaskStarter,
@@ -288,7 +310,7 @@ class TestEmitterThreadedIntoContext:
         state_channel: FakeStateChannel,
         fake_emitter: MagicMock,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -375,7 +397,8 @@ class TestBuildSupervisorWiring:
         )
         assert bound_emitter is fake_emitter
 
-    def test_dispatcher_closure_threads_emitter_to_dispatch(
+    @pytest.mark.asyncio
+    async def test_dispatcher_closure_threads_emitter_to_dispatch(
         self,
         builder: ForwardContextBuilder,
         starter: CapturingAsyncTaskStarter,
@@ -399,7 +422,9 @@ class TestBuildSupervisorWiring:
             state_channel=state_channel,
             lifecycle_emitter=fake_emitter,
         )
-        dispatcher(build_id="build-1", feature_id="FEAT-1", rationale="r")
+        await dispatcher(
+            build_id="build-1", feature_id="FEAT-1", rationale="r"
+        )
         assert len(starter.calls) == 1
         _name, ctx = starter.calls[0]
         assert ctx["lifecycle_emitter"] is fake_emitter
@@ -542,7 +567,8 @@ class _NoOpReasoningModel:
 class TestSupervisorRemainsResponsive:
     """AC-003 / FEAT-FORGE-007 Group A — supervisor answers while autobuild runs."""
 
-    def test_next_turn_returns_waiting_while_autobuild_in_flight(
+    @pytest.mark.asyncio
+    async def test_next_turn_returns_waiting_while_autobuild_in_flight(
         self,
         builder: ForwardContextBuilder,
         starter: CapturingAsyncTaskStarter,
@@ -552,12 +578,18 @@ class TestSupervisorRemainsResponsive:
     ) -> None:
         """The supervisor's next_turn must NOT await the in-flight async task.
 
-        We dispatch an autobuild via the closure (which calls
-        ``start_async_task`` synchronously and returns immediately) and
-        then invoke ``next_turn`` on a fresh build to assert the
+        We dispatch an autobuild via the closure (which awaits
+        ``astart_async_task`` and returns immediately because the
+        deepagents middleware's launch contract is "submit and return")
+        and then invoke ``next_turn`` on a fresh build to assert the
         reasoning loop completes its turn without waiting on the
         autobuild's async work — the FEAT-FORGE-007 Group A scenario
         ("supervisor stays responsive during long runs").
+
+        TASK-FORGE-FRR-F010G: the dispatcher closure is now ``async def``
+        because :func:`dispatch_autobuild_async` is async — the
+        responsiveness contract is unchanged (the launch awaits, but the
+        runner's body does not), only the dispatch idiom changed.
         """
         # Pre-stage feature plan so the dispatcher proceeds.
         builder._reader.entries[  # type: ignore[attr-defined]
@@ -586,9 +618,10 @@ class TestSupervisorRemainsResponsive:
             **kwargs,
         )
 
-        # 1. Dispatch the autobuild; the closure returns immediately
-        #    because start_async_task is non-blocking by contract.
-        handle = sup.autobuild_dispatcher(
+        # 1. Dispatch the autobuild; the closure awaits the launch and
+        #    returns the handle. start_async_task is non-blocking on the
+        #    runner's body by contract.
+        handle = await sup.autobuild_dispatcher(
             build_id="build-1", feature_id="FEAT-1", rationale="initial"
         )
         assert handle.task_id.startswith("task-")
@@ -597,10 +630,7 @@ class TestSupervisorRemainsResponsive:
         # 2. While that "task" is in flight, run a supervisor turn for a
         #    different build and assert it returns WAITING (i.e. the
         #    reasoning loop kept its turn budget — it did not block).
-        async def _run_turn() -> Any:
-            return await asyncio.wait_for(sup.next_turn("build-2"), timeout=2.0)
-
-        report = asyncio.run(_run_turn())
+        report = await asyncio.wait_for(sup.next_turn("build-2"), timeout=2.0)
         # AC-003: the supervisor's reasoning loop COMPLETED its turn
         # without blocking on the in-flight autobuild's async task.
         # Either WAITING (no permitted stages) or NO_OP (reasoning model
@@ -609,7 +639,8 @@ class TestSupervisorRemainsResponsive:
         assert report.outcome in (TurnOutcome.WAITING, TurnOutcome.NO_OP)
         assert report.build_id == "build-2"
 
-    def test_supervisor_dispatcher_closure_is_synchronous(
+    @pytest.mark.asyncio
+    async def test_supervisor_dispatcher_closure_is_async(
         self,
         builder: ForwardContextBuilder,
         starter: CapturingAsyncTaskStarter,
@@ -617,13 +648,18 @@ class TestSupervisorRemainsResponsive:
         state_channel: FakeStateChannel,
         fake_emitter: MagicMock,
     ) -> None:
-        """The autobuild dispatcher closure returns synchronously.
+        """The autobuild dispatcher closure is ``async def``.
 
-        ADR-ARCH-031: ``start_async_task`` returns immediately with a
-        ``task_id``. The supervisor's call site is sync, so the closure
-        must return without awaiting — otherwise the reasoning loop
-        becomes sensitive to the autobuild_runner's wall-clock latency
-        and the Group A invariant breaks.
+        TASK-FORGE-FRR-F010G: the closure was sync pre-F010G; it is now
+        async because :func:`dispatch_autobuild_async` is async (the
+        launch path awaits the deepagents middleware's
+        ``StructuredTool.coroutine`` so the autobuild_runner registration
+        can stay URL-less / in-process).
+
+        The Group A responsiveness invariant ("the runner's body does
+        not block the supervisor") is unchanged — the launch contract is
+        still "await the submit, return immediately"; only the call
+        idiom changed from sync to async.
         """
         builder._reader.entries[  # type: ignore[attr-defined]
             ("build-1", StageClass.FEATURE_PLAN, "FEAT-1")
@@ -639,8 +675,9 @@ class TestSupervisorRemainsResponsive:
             state_channel=state_channel,
             lifecycle_emitter=fake_emitter,
         )
-        # The closure is sync; calling it must produce a non-coroutine
-        # handle without an await.
-        result = dispatcher(build_id="build-1", feature_id="FEAT-1", rationale="")
-        assert not inspect.iscoroutine(result)
+        # The closure is async; calling it produces a coroutine that
+        # resolves to the handle when awaited.
+        coro = dispatcher(build_id="build-1", feature_id="FEAT-1", rationale="")
+        assert inspect.iscoroutine(coro)
+        result = await coro
         assert result.task_id.startswith("task-")

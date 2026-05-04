@@ -300,7 +300,15 @@ class TestDispatchBuildWiresCollaborators:
             def start_async_task(self, subagent_name: str, context: dict) -> str:
                 return "task-A"
 
-        def _fake_dispatch(
+            async def astart_async_task(
+                self, subagent_name: str, context: dict
+            ) -> str:
+                return "task-A"
+
+        # TASK-FORGE-FRR-F010G: the production
+        # ``dispatch_autobuild_async`` is now ``async def`` so the
+        # patched stand-in must also be a coroutine function.
+        async def _fake_dispatch(
             build_id: str,
             feature_id: str,
             correlation_id: str,

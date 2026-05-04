@@ -79,20 +79,32 @@ class _StubNatsClient:
 
 
 class _RecordingAsyncTaskStarter:
-    """Records the single ``start_async_task`` call the dispatcher makes.
+    """Records the single launch call the dispatcher makes.
 
     Returns a deterministic ``task_id`` so the dispatcher's downstream
-    state-channel write succeeds. The recorded payload is asserted
-    on after dispatch to confirm the dispatcher reached this seam
-    without raising on the upstream
+    state-channel write succeeds. The recorded payload is asserted on
+    after dispatch to confirm the dispatcher reached this seam without
+    raising on the upstream
     :meth:`StageLogReader.get_approved_stage_entry` call (which is
     where the AttributeError used to fire).
+
+    TASK-FORGE-FRR-F010G: production now awaits ``astart_async_task``
+    rather than calling sync ``start_async_task`` (the deepagents
+    middleware's sync path raises on ``url=None``; the async path
+    tolerates it). The fake exposes both methods so the test stays
+    neutral on which path is used; both share a single ``calls`` list.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def start_async_task(
+        self, subagent_name: str, context: dict[str, Any]
+    ) -> str:
+        self.calls.append((subagent_name, dict(context)))
+        return "task-regression-lock"
+
+    async def astart_async_task(
         self, subagent_name: str, context: dict[str, Any]
     ) -> str:
         self.calls.append((subagent_name, dict(context)))

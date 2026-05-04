@@ -292,7 +292,7 @@ def _build_dispatch_build(
             payload.correlation_id,
         )
 
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=payload.feature_id,
             correlation_id=payload.correlation_id,

@@ -31,13 +31,12 @@ class _FakeStartAsyncTaskTool:
     """Minimal stand-in for the LangChain ``StructuredTool`` shape.
 
     Exposes ``.name`` (used by ``_resolve_async_task_starter``'s
-    by-name lookup) and ``.func`` (used by
-    :func:`forge.cli._serve_async_task_starter.build_async_task_starter`'s
-    composition-time duck-type check). The ``.func`` is a no-op
-    placeholder — none of the tests in this module actually drive the
-    starter; they only assert composition-time behaviour. See
-    ``tests/forge/test_serve_async_task_starter.py`` for the unit
-    coverage of the adapter's translation behaviour.
+    by-name lookup), ``.func`` (legacy sync path), and ``.coroutine``
+    (the async path used by production per TASK-FORGE-FRR-F010G). Both
+    callables are no-op placeholders — none of the tests in this module
+    actually drive the starter; they only assert composition-time
+    behaviour. See ``tests/forge/test_serve_async_task_starter.py``
+    for the unit coverage of the adapter's translation behaviour.
     """
 
     def __init__(self, name: str = "start_async_task") -> None:
@@ -50,6 +49,15 @@ class _FakeStartAsyncTaskTool:
             "_FakeStartAsyncTaskTool.func was invoked unexpectedly; the "
             "tests in this module exercise composition only, not the "
             "adapter's translation path"
+        )
+
+    async def coroutine(
+        self, *, description: str, subagent_type: str, runtime: Any
+    ) -> Any:  # pragma: no cover - placeholder, never invoked by these tests
+        raise AssertionError(
+            "_FakeStartAsyncTaskTool.coroutine was invoked unexpectedly; "
+            "the tests in this module exercise composition only, not "
+            "the adapter's translation path"
         )
 
 

@@ -217,11 +217,23 @@ class RecordingDispatcher:
 
 @dataclass
 class RecordingSyncDispatcher:
-    """Sync dispatcher (autobuild_async returns a handle synchronously)."""
+    """Recording dispatcher used as both sync and async fixture stand-in.
+
+    TASK-FORGE-FRR-F010G: the autobuild dispatcher is now ``async def``
+    (so the launch path can await the deepagents async ``coroutine``
+    entrypoint that tolerates ``url=None`` registrations). The class
+    keeps its legacy ``__call__`` synchronous return for the specialist /
+    subprocess dispatchers (whose Protocols stayed sync) but adds an
+    ``__await_call__``-shaped async sibling, exposed by making
+    ``__call__`` return whichever shape the supervisor expects: when
+    used as the autobuild dispatcher the supervisor awaits the result,
+    so we wrap the recorded return value in a coroutine.
+    """
 
     label: str
     calls: list[dict[str, Any]] = field(default_factory=list)
     return_value: Any = None
+    is_async: bool = False
 
     def __post_init__(self) -> None:
         if self.return_value is None:
@@ -229,6 +241,10 @@ class RecordingSyncDispatcher:
 
     def __call__(self, **kwargs: Any) -> Any:
         self.calls.append({**kwargs})
+        if self.is_async:
+            async def _result() -> Any:
+                return self.return_value
+            return _result()
         return self.return_value
 
 
@@ -309,7 +325,7 @@ def subprocess_dispatcher() -> RecordingDispatcher:
 
 @pytest.fixture
 def autobuild_dispatcher() -> RecordingSyncDispatcher:
-    return RecordingSyncDispatcher(label="autobuild_async")
+    return RecordingSyncDispatcher(label="autobuild_async", is_async=True)
 
 
 @pytest.fixture

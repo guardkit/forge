@@ -483,17 +483,21 @@ class _RecordingSubprocessDispatcher:
 
 @dataclass
 class _RecordingAutobuildDispatcher:
-    """Sync autobuild dispatcher — returns a unique task_id per call.
+    """Async autobuild dispatcher — returns a unique task_id per call.
 
-    Each dispatch additionally writes an in-flight lifecycle entry to the
-    matching :class:`_BuildState` so subsequent supervisor turns observe
-    the "running_wave" lifecycle (FEAT-FORGE-007 ASSUM-006).
+    Each dispatch additionally writes an in-flight lifecycle entry to
+    the matching :class:`_BuildState` so subsequent supervisor turns
+    observe the "running_wave" lifecycle (FEAT-FORGE-007 ASSUM-006).
+
+    TASK-FORGE-FRR-F010G: the autobuild dispatcher Protocol is now
+    async because :func:`dispatch_autobuild_async` awaits the
+    deepagents middleware's async ``coroutine`` entrypoint.
     """
 
     log: _CompositeStageLog
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def __call__(self, **kwargs: Any) -> dict[str, Any]:
+    async def __call__(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append({**kwargs})
         build_id = kwargs.get("build_id", "")
         feature_id = kwargs.get("feature_id", "")

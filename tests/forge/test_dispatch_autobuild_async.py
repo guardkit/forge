@@ -158,9 +158,14 @@ class FakeStateChannel:
 class FakeAsyncTaskStarter:
     """In-memory ``AsyncTaskStarter`` that mints sequential task IDs.
 
-    Each call to :meth:`start_async_task` returns a fresh ``task_id``
+    Each call to :meth:`astart_async_task` returns a fresh ``task_id``
     drawn from a thread-safe counter, so concurrent dispatches receive
     distinct identifiers (Group F @concurrency assertion).
+
+    TASK-FORGE-FRR-F010G: the production dispatcher now awaits the
+    Protocol's async ``astart_async_task`` method; the legacy sync
+    ``start_async_task`` is preserved for symmetry with the Protocol
+    and so isinstance checks against ``AsyncTaskStarter`` still pass.
     """
 
     prefix: str = "autobuild-task-"
@@ -168,7 +173,7 @@ class FakeAsyncTaskStarter:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
-    def start_async_task(
+    def _mint(
         self,
         subagent_name: str,
         context: Mapping[str, Any],
@@ -178,6 +183,20 @@ class FakeAsyncTaskStarter:
             task_id = f"{self.prefix}{self._counter:04d}"
             self.calls.append((subagent_name, dict(context)))
         return task_id
+
+    def start_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        return self._mint(subagent_name, context)
+
+    async def astart_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        return self._mint(subagent_name, context)
 
 
 class EmptyTaskIdStarter:
@@ -189,6 +208,13 @@ class EmptyTaskIdStarter:
     """
 
     def start_async_task(
+        self,
+        subagent_name: str,
+        context: Mapping[str, Any],
+    ) -> str:
+        return ""
+
+    async def astart_async_task(
         self,
         subagent_name: str,
         context: Mapping[str, Any],
@@ -284,6 +310,15 @@ class TestDispatchAutobuildAsyncExists:
     def test_dispatch_function_is_callable(self) -> None:
         assert callable(dispatch_autobuild_async)
 
+    def test_dispatch_function_is_a_coroutine_function(self) -> None:
+        # TASK-FORGE-FRR-F010G: the dispatcher is ``async def`` so it
+        # can ``await`` the deepagents middleware's async launch path
+        # (``StructuredTool.coroutine``) — the sync path raises on
+        # url=None which the autobuild_runner registration omits.
+        import asyncio
+
+        assert asyncio.iscoroutinefunction(dispatch_autobuild_async)
+
     def test_handle_dataclass_is_frozen(self) -> None:
         with pytest.raises(Exception):  # FrozenInstanceError subclasses Exception
             handle = AutobuildDispatchHandle(
@@ -303,7 +338,8 @@ class TestDispatchAutobuildAsyncExists:
 class TestForwardContextResolution:
     """AC-002 — the dispatcher resolves forward context via the builder."""
 
-    def test_calls_builder_with_autobuild_stage_and_feature_id(
+    @pytest.mark.asyncio
+    async def test_calls_builder_with_autobuild_stage_and_feature_id(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -328,7 +364,7 @@ class TestForwardContextResolution:
         builder.build_for = spy_build_for  # type: ignore[method-assign]
 
         # Act
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -354,7 +390,8 @@ class TestForwardContextResolution:
 class TestStartAsyncTaskInvocation:
     """AC-003 — middleware invocation contract."""
 
-    def test_invokes_start_async_task_with_autobuild_runner(
+    @pytest.mark.asyncio
+    async def test_invokes_start_async_task_with_autobuild_runner(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -362,7 +399,7 @@ class TestStartAsyncTaskInvocation:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -398,7 +435,8 @@ class TestStartAsyncTaskInvocation:
 class TestSynchronousReturn:
     """AC-004 — dispatch is non-blocking on the runner's body."""
 
-    def test_returns_handle_with_minted_task_id(
+    @pytest.mark.asyncio
+    async def test_returns_handle_with_minted_task_id(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -406,7 +444,7 @@ class TestSynchronousReturn:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -423,7 +461,8 @@ class TestSynchronousReturn:
         assert handle.feature_id == "FEAT-1"
         assert handle.correlation_id == "corr-1"
 
-    def test_dispatch_does_not_await_runner_completion(
+    @pytest.mark.asyncio
+    async def test_dispatch_does_not_await_runner_completion(
         self,
         builder: ForwardContextBuilder,
         stage_log: FakeStageLogRecorder,
@@ -444,8 +483,15 @@ class TestSynchronousReturn:
                 # — the dispatcher's contract is "submit and return".
                 return "task-x"
 
+            async def astart_async_task(
+                self,
+                subagent_name: str,
+                context: Mapping[str, Any],
+            ) -> str:
+                return "task-x"
+
         starter = _NonExecutingStarter()
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -467,7 +513,8 @@ class TestSynchronousReturn:
 class TestAsyncTasksStateChannelInit:
     """AC-005 — initial AutobuildState shape."""
 
-    def test_state_channel_entry_has_starting_lifecycle(
+    @pytest.mark.asyncio
+    async def test_state_channel_entry_has_starting_lifecycle(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -475,7 +522,7 @@ class TestAsyncTasksStateChannelInit:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -492,7 +539,8 @@ class TestAsyncTasksStateChannelInit:
         assert record.feature_id == "FEAT-1"
         assert record.build_id == "build-1"
 
-    def test_state_channel_task_id_matches_starter_minted_value(
+    @pytest.mark.asyncio
+    async def test_state_channel_task_id_matches_starter_minted_value(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -500,7 +548,7 @@ class TestAsyncTasksStateChannelInit:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -522,7 +570,8 @@ class TestAsyncTasksStateChannelInit:
 class TestCorrelationIdThreading:
     """AC-006 — correlation_id is threaded through state-channel + launch."""
 
-    def test_correlation_id_appears_on_state_channel_entry(
+    @pytest.mark.asyncio
+    async def test_correlation_id_appears_on_state_channel_entry(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -530,7 +579,7 @@ class TestCorrelationIdThreading:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-FEAT-1-2026",
@@ -541,7 +590,8 @@ class TestCorrelationIdThreading:
         )
         assert state_channel.calls[0].correlation_id == "corr-FEAT-1-2026"
 
-    def test_correlation_id_appears_in_launch_context(
+    @pytest.mark.asyncio
+    async def test_correlation_id_appears_in_launch_context(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -549,7 +599,7 @@ class TestCorrelationIdThreading:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-FEAT-1-2026",
@@ -570,7 +620,8 @@ class TestCorrelationIdThreading:
 class TestStageLogRecording:
     """AC-007 — stage_log row carries the task_id in details_json."""
 
-    def test_stage_log_recorded_with_running_state_and_autobuild_stage(
+    @pytest.mark.asyncio
+    async def test_stage_log_recorded_with_running_state_and_autobuild_stage(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -578,7 +629,7 @@ class TestStageLogRecording:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -594,7 +645,8 @@ class TestStageLogRecording:
             assert record.feature_id == "FEAT-1"
             assert record.stage == StageClass.AUTOBUILD
 
-    def test_post_dispatch_stage_log_carries_task_id(
+    @pytest.mark.asyncio
+    async def test_post_dispatch_stage_log_carries_task_id(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -602,7 +654,7 @@ class TestStageLogRecording:
         state_channel: FakeStateChannel,
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -616,7 +668,8 @@ class TestStageLogRecording:
         assert post.details_json["correlation_id"] == "corr-1"
         assert post.details_json["subagent"] == AUTOBUILD_RUNNER_NAME
 
-    def test_pre_dispatch_stage_log_has_null_task_id(
+    @pytest.mark.asyncio
+    async def test_pre_dispatch_stage_log_has_null_task_id(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -626,7 +679,7 @@ class TestStageLogRecording:
     ) -> None:
         # Pre-dispatch row exists so a crash between submit and ack still
         # leaves durable evidence. AC: "record stage_log BEFORE start_async_task".
-        dispatch_autobuild_async(
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -651,7 +704,8 @@ class TestCrashRecoveryOrdering:
     that satisfies Group D @edge-case crash-recovery semantics.
     """
 
-    def test_stage_log_write_precedes_start_async_task_call(
+    @pytest.mark.asyncio
+    async def test_stage_log_write_precedes_start_async_task_call(
         self,
         builder: ForwardContextBuilder,
         stage_log: FakeStageLogRecorder,
@@ -685,7 +739,15 @@ class TestCrashRecoveryOrdering:
                 events.append("start_async_task")
                 return "task-1"
 
-        dispatch_autobuild_async(
+            async def astart_async_task(
+                self,
+                subagent_name: str,
+                context: Mapping[str, Any],
+            ) -> str:
+                events.append("start_async_task")
+                return "task-1"
+
+        await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
@@ -708,69 +770,59 @@ class TestCrashRecoveryOrdering:
 class TestConcurrentDispatchesGetDistinctTaskIds:
     """AC-008 — Group F @concurrency: two concurrent builds dispatching
     autobuild at the same time receive distinct ``task_id`` values.
+
+    TASK-FORGE-FRR-F010G: ``dispatch_autobuild_async`` is now ``async
+    def`` so concurrency is exercised via :func:`asyncio.gather` instead
+    of OS threads — the contract is unchanged (two concurrent dispatches
+    must mint distinct task_ids), just expressed in the async idiom.
     """
 
-    def test_two_concurrent_dispatches_get_distinct_task_ids(
+    @pytest.mark.asyncio
+    async def test_two_concurrent_dispatches_get_distinct_task_ids(
         self,
     ) -> None:
+        import asyncio
+
         # Each concurrent dispatch gets its own collaborator set; the
         # shared piece is the AsyncTaskStarter so its counter is the
         # source of distinctness.
         shared_starter = FakeAsyncTaskStarter()
 
-        results: list[AutobuildDispatchHandle] = []
-        results_lock = threading.Lock()
-        errors: list[BaseException] = []
-
-        def _dispatch_one(
+        async def _dispatch_one(
             build_id: str, feature_id: str, correlation_id: str
-        ) -> None:
-            try:
-                reader = FakeStageLogReader()
-                allowlist = FakeWorktreeAllowlist(
-                    roots_by_build={build_id: f"/work/{build_id}"},
+        ) -> AutobuildDispatchHandle:
+            reader = FakeStageLogReader()
+            allowlist = FakeWorktreeAllowlist(
+                roots_by_build={build_id: f"/work/{build_id}"},
+            )
+            reader.entries[(build_id, StageClass.FEATURE_PLAN, feature_id)] = (
+                ApprovedStageEntry(
+                    gate_decision="approved",
+                    artefact_paths=(
+                        f"/work/{build_id}/plan-{feature_id}.md",
+                    ),
+                    artefact_text=None,
                 )
-                reader.entries[(build_id, StageClass.FEATURE_PLAN, feature_id)] = (
-                    ApprovedStageEntry(
-                        gate_decision="approved",
-                        artefact_paths=(
-                            f"/work/{build_id}/plan-{feature_id}.md",
-                        ),
-                        artefact_text=None,
-                    )
-                )
-                builder = ForwardContextBuilder(
-                    stage_log_reader=reader,
-                    worktree_allowlist=allowlist,
-                )
-                handle = dispatch_autobuild_async(
-                    build_id=build_id,
-                    feature_id=feature_id,
-                    correlation_id=correlation_id,
-                    forward_context_builder=builder,
-                    async_task_starter=shared_starter,
-                    stage_log_recorder=FakeStageLogRecorder(),
-                    state_channel=FakeStateChannel(),
-                )
-                with results_lock:
-                    results.append(handle)
-            except BaseException as exc:
-                errors.append(exc)
+            )
+            builder = ForwardContextBuilder(
+                stage_log_reader=reader,
+                worktree_allowlist=allowlist,
+            )
+            return await dispatch_autobuild_async(
+                build_id=build_id,
+                feature_id=feature_id,
+                correlation_id=correlation_id,
+                forward_context_builder=builder,
+                async_task_starter=shared_starter,
+                stage_log_recorder=FakeStageLogRecorder(),
+                state_channel=FakeStateChannel(),
+            )
 
-        t1 = threading.Thread(
-            target=_dispatch_one,
-            args=("build-A", "FEAT-A", "corr-A"),
+        results = await asyncio.gather(
+            _dispatch_one("build-A", "FEAT-A", "corr-A"),
+            _dispatch_one("build-B", "FEAT-B", "corr-B"),
         )
-        t2 = threading.Thread(
-            target=_dispatch_one,
-            args=("build-B", "FEAT-B", "corr-B"),
-        )
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
 
-        assert errors == []
         assert len(results) == 2
         task_ids = [h.task_id for h in results]
         assert len(set(task_ids)) == 2, (
@@ -796,7 +848,8 @@ class TestEmptyIdentifierGuards:
             ("build-1", "FEAT-1", "", "correlation_id"),
         ],
     )
-    def test_empty_identifier_raises_value_error(
+    @pytest.mark.asyncio
+    async def test_empty_identifier_raises_value_error(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -808,7 +861,7 @@ class TestEmptyIdentifierGuards:
         expected_substring: str,
     ) -> None:
         with pytest.raises(ValueError) as excinfo:
-            dispatch_autobuild_async(
+            await dispatch_autobuild_async(
                 build_id=build_id,
                 feature_id=feature_id,
                 correlation_id=correlation_id,
@@ -835,7 +888,8 @@ class TestEmptyTaskIdContractViolation:
     entry keyed on ``""`` (which would alias every subsequent dispatch).
     """
 
-    def test_empty_task_id_raises_value_error_and_does_not_init_state(
+    @pytest.mark.asyncio
+    async def test_empty_task_id_raises_value_error_and_does_not_init_state(
         self,
         builder: ForwardContextBuilder,
         stage_log: FakeStageLogRecorder,
@@ -843,7 +897,7 @@ class TestEmptyTaskIdContractViolation:
         approved_feature_plan: ApprovedStageEntry,
     ) -> None:
         with pytest.raises(ValueError) as excinfo:
-            dispatch_autobuild_async(
+            await dispatch_autobuild_async(
                 build_id="build-1",
                 feature_id="FEAT-1",
                 correlation_id="corr-1",
@@ -898,7 +952,8 @@ class TestEmptyContextFallback:
     (TASK-MAG7-003), not this dispatcher's.
     """
 
-    def test_dispatch_proceeds_with_empty_context_when_plan_unapproved(
+    @pytest.mark.asyncio
+    async def test_dispatch_proceeds_with_empty_context_when_plan_unapproved(
         self,
         builder: ForwardContextBuilder,
         starter: FakeAsyncTaskStarter,
@@ -906,7 +961,7 @@ class TestEmptyContextFallback:
         state_channel: FakeStateChannel,
     ) -> None:
         # No approved_feature_plan fixture used — builder returns [].
-        handle = dispatch_autobuild_async(
+        handle = await dispatch_autobuild_async(
             build_id="build-1",
             feature_id="FEAT-1",
             correlation_id="corr-1",
