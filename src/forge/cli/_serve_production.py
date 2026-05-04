@@ -43,9 +43,29 @@ from typing import Any
 from forge.adapters.sqlite.connect import connect_writer
 from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
+from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 
 logger = logging.getLogger(__name__)
+
+
+def _current_schema_version(connection: sqlite3.Connection) -> int:
+    """Return the highest applied schema version, or 0 if uninitialised.
+
+    Mirrors :func:`forge.lifecycle.migrations._current_version` so the
+    boot log line can report the *count* of newly-applied migrations
+    (``after - before``) — :func:`apply_at_boot` itself returns the
+    schema version after the run, not the delta. A brand-new DB has no
+    ``schema_version`` table, so an :class:`sqlite3.OperationalError`
+    falls back to 0 (TASK-FORGE-FRR-F010A).
+    """
+    try:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version;"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row[0]) if row else 0
 
 
 @dataclass
@@ -148,6 +168,12 @@ def bind_production_serve(
        ``forge queue`` assumption — fresh checkouts must not need
        manual ``mkdir``).
     3. Open the SQLite writer connection via :func:`connect_writer`.
+    3.5. Apply any pending SQLite migrations via :func:`apply_at_boot`
+       so a fresh ``FORGE_DB_PATH`` volume gets the canonical 5 tables
+       (``async_tasks`` / ``builds`` / ``stage_log`` /
+       ``sqlite_sequence`` / ``schema_version``) before the first
+       inbound envelope reaches ``dispatch_build``
+       (TASK-FORGE-FRR-F010A). Idempotent.
     4. Wrap it in :class:`SqliteLifecyclePersistence`.
     5. Eagerly construct the :class:`AsyncSubAgentMiddleware` via the
        existing :func:`forge.cli.serve._build_async_subagent_middleware`
@@ -185,8 +211,27 @@ def bind_production_serve(
     # ``mkdir -p ~/.forge`` before ``forge serve``.
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Step 3 + 4 — open the writer connection and wrap it.
+    # Step 3 — open the writer connection.
     connection = connect_writer(config.db_path)
+
+    # Step 3.5 — apply pending SQLite migrations idempotently
+    # (TASK-FORGE-FRR-F010A). A fresh ``FORGE_DB_PATH`` volume on a
+    # daemon-only deploy ships without the canonical 5 tables
+    # (``async_tasks`` / ``builds`` / ``stage_log`` / ``sqlite_sequence``
+    # / ``schema_version``), so the first inbound
+    # ``pipeline.build-queued.*`` envelope would fail with
+    # ``no such table: builds``. Mirrors the call pattern in
+    # :mod:`forge.cli.queue` (the operator-facing CLI seam). Idempotent
+    # — a re-bind in the same process emits ``applied 0`` so operators
+    # can ``grep`` for it on subsequent boots.
+    schema_version_before = _current_schema_version(connection)
+    schema_version_after = apply_at_boot(connection)
+    applied = max(0, schema_version_after - schema_version_before)
+    logger.info(
+        "forge-serve: applied %d SQLite migration(s) at boot", applied
+    )
+
+    # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
         connection=connection, db_path=config.db_path
     )

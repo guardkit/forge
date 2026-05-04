@@ -31,6 +31,31 @@ tracked in the jarvis repo separately.
 | [TASK-FORGE-FRR-003](../../completed/TASK-FORGE-FRR-003/TASK-FORGE-FRR-003-fix-build-image-script-context-path.md) | Fix `scripts/build-image.sh` so `--build-context nats-core=../nats-core` resolves on the canonical sibling layout | high | 2 | ✅ completed (fc7fd9a, 2026-05-01) |
 | [TASK-REV-F010](TASK-REV-F010-bind-production-dispatch-chain-in-serve-cmd.md) | Decide how to bind `compose_dispatch_chain` to the production composer in `serve_cmd` (post-FEAT-DEA8 gap) | high | 5 | ✅ review_complete (2026-05-04 — see [.claude/reviews/TASK-REV-F010-review-report.md](../../../.claude/reviews/TASK-REV-F010-review-report.md)) |
 | [TASK-FIX-F010](../../completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md) | Bind `compose_dispatch_chain` to the production composer in `serve_cmd` via `_serve_production` wrapper | high | 4 | ✅ completed (2026-05-04 — post-merge follow-ups: runbook revalidation, FW10-011 housekeeping) |
+| [TASK-FORGE-FRR-F010A](../../completed/TASK-FORGE-FRR-F010A/TASK-FORGE-FRR-F010A-apply-sqlite-migrations-on-daemon-boot.md) | Apply SQLite migrations on daemon boot in `bind_production_serve` | high | 2 | ✅ completed (2026-05-04 — code + tests; AC-6 operator runbook revalidation pending) |
+| [TASK-FORGE-FRR-F010B](TASK-FORGE-FRR-F010B-resolve-get-approved-stage-entry-attribute-error.md) | Resolve `get_approved_stage_entry` AttributeError in autobuild dispatch path | high | 4 | 📥 backlog (filed 2026-05-04) |
+| [TASK-FORGE-FRR-F010C](TASK-FORGE-FRR-F010C-thread-correlation-id-into-outbound-envelopes.md) | Thread inbound `correlation_id` into outbound `pipeline.*` envelopes from `pipeline_consumer` | high | 3 | 📥 backlog (filed 2026-05-04) |
+
+> **Post-TASK-FIX-F010 follow-ups (2026-05-04 evening)**: TASK-FIX-F010
+> shipped and was verified live on the wire (correlation_id
+> `f876fd47-5e3c-4851-8f89-a7b7bcab8464`) — the production composer is
+> bound, the receipt-only `_default_dispatch` stub is gone, and at
+> least one outbound `pipeline.build-failed` envelope did flow back
+> from `pipeline_consumer`. But three new forge-side gaps surfaced
+> once the wired composer was actually exercised end-to-end:
+> **F010.A** (`bind_production_serve` doesn't apply SQLite migrations
+> on a fresh `FORGE_DB_PATH`), **F010.B** (`get_approved_stage_entry`
+> AttributeError in the autobuild dispatcher path — wiring drift
+> between FW10-005's fake persistence and the real
+> `SqliteLifecyclePersistence`), and **F010.C** (outbound
+> `pipeline.*` envelopes carry `correlation_id: null` instead of the
+> threaded inbound value, violating DDR-029). One companion gap
+> (**F010.D** — jarvis-side `forge_subscriber` subscribes only to
+> `pipeline.stage-complete.>`) is jarvis-side and tracked separately
+> in the jarvis repo's FRR folder. See
+> [`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md`](../../../../../jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md)
+> "Addendum: Same-day post-TASK-FIX-F010 rerun" section for the full
+> evidence (4 successive correlation_ids exercising progressively
+> deeper rejection / dispatch paths).
 
 > **Post-FEAT-DEA8 follow-up (2026-05-04)**: The 2026-05-04 rerun of the
 > jarvis first-real-run runbook (correlation_id
@@ -76,8 +101,11 @@ tracked in the jarvis repo separately.
 6. ~~**TASK-FIX-F010**~~ ✅ **completed** (2026-05-04) — built `forge.cli._serve_production._serve_production` wrapper, extended `ServeConfig` with `db_path` (reuses `FORGE_DB_PATH`), decorated `serve_cmd` with `@click.pass_context`, and rebound `compose_dispatch_chain` at boot. 100/100 targeted tests pass; 2131/2132 in full forge suite (one pre-existing unrelated clock-hygiene failure). Code in working tree pending operator commit. See [tasks/completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md](../../completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md) for full report.
 7. **Post-merge follow-up (deferred from TASK-FIX-F010 ACs 10/11/12)**:
    - AC-10: cross-link `tasks/completed/TASK-FW10-011-...md` frontmatter (`parent_review: TASK-REV-F010`, `production_binding_sibling: TASK-FIX-F010`).
-   - AC-11: rebuild forge image from the new commit; re-run jarvis runbook §6.2+§7; verify `pipeline.build-started.*` envelope appears; flip RESULTS row 7.x ❌→✅; record new correlation_id in the completed task file.
-   - AC-12: resurrect TASK-FW10-011 from `tasks/completed/` to this folder with `dependencies: [TASK-FIX-F010]`, status `in_progress`; land it as the codified regression lock (per D4.B sequencing).
+   - AC-11: rebuild forge image from the new commit; re-run jarvis runbook §6.2+§7; verify `pipeline.build-started.*` envelope appears; flip RESULTS row 7.x ❌→✅; record new correlation_id in the completed task file. **Status:** partially satisfied — TASK-FIX-F010 verified live (composer bound, receipt-only stub gone, one outbound `build-failed` observed) but full lifecycle sequence still blocked by F010.A/B/C below.
+   - AC-12: resurrect TASK-FW10-011 from `tasks/completed/` to this folder with `dependencies: [TASK-FIX-F010]`, status `in_progress`; land it as the codified regression lock (per D4.B sequencing). **Should now also depend on F010.B** since FW10-011's success-path assertions cannot pass until the autobuild dispatcher's AttributeError is resolved.
+8. ~~**TASK-FORGE-FRR-F010A**~~ ✅ **completed** (2026-05-04 — code + tests landed, AC-6 operator runbook revalidation pending) — `bind_production_serve` now calls `apply_at_boot(connection)` after `connect_writer(...)` (Step 3.5 in the docstring pipeline). Boot log emits `[INFO] forge-serve: applied N SQLite migration(s) at boot`; idempotent re-bind logs `applied 0`. New tests in `tests/forge/test_serve_production_migrations.py` (3 passing); existing `test_cli_serve_production.py` (12 passing, AC-5 regression) and 72 sibling cli/serve tests still green. AC-2 narrowed to the 4 migration-managed tables (`builds` / `stage_log` / `sqlite_sequence` / `schema_version`); `async_tasks` is provisioned by `ensure_async_tasks_schema` at dispatcher-construction time (Step 7), out of `apply_at_boot`'s scope — see the completed task file for the full scope note. Reproducer that surfaced this: run 3 (`a55df422-…`) — `no such table: builds`. Code in working tree pending operator commit; jarvis runbook §6.2+§7 revalidation pending operator. See [tasks/completed/TASK-FORGE-FRR-F010A/](../../completed/TASK-FORGE-FRR-F010A/TASK-FORGE-FRR-F010A-apply-sqlite-migrations-on-daemon-boot.md) for full report.
+9. **TASK-FORGE-FRR-F010B** 📥 backlog (filed 2026-05-04) — Resolve `'SqliteLifecyclePersistence' object has no attribute 'get_approved_stage_entry'` in the autobuild dispatcher path. Wiring drift between FW10-005's fake persistence and the real facade — fix is either method-add on the facade or caller-rename. Reproducer: run 4 (`f876fd47-…`) — exception fires after the QUEUED row is persisted but before any `build-started` envelope is emitted.
+10. **TASK-FORGE-FRR-F010C** 📥 backlog (filed 2026-05-04) — Thread `inbound_envelope.correlation_id` into every outbound `pipeline.*` envelope from `pipeline_consumer` (and any caller in `pipeline.publisher` / `pipeline.lifecycle_emitter`). DDR-029 violation. Independent of F010.A/B; can land in parallel. Reproducer: runs 1+2 (`21df1258-…`, `b5c5e1e2-…`) — `pipeline.build-failed.FEAT-43DE` carried `correlation_id: null` instead of the threaded inbound value.
 
 The jarvis runbook
 (`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md`)
