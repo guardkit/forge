@@ -9101,11 +9101,75 @@ Next step: run /feature-build FEAT-DEA8 to drive the Player–Coach loop wave-by
 
 
 
-
-
-
-
 GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-DEA8 --verbose
+
+
+
+/task-review TASK-REV-F010 --mode=decision
+
+
+DECISION CHECKPOINT — TASK-REV-F010
+Review Results:
+
+Score: 72 / 100 (wiring sound; production caller missing; tests couple to no-op default)
+Findings: 5
+Recommendations: 5 (one per decision axis)
+Report: .claude/reviews/TASK-REV-F010-review-report.md
+Recommended decisions (full rationale in the report):
+
+Axis	Choice	One-liner
+D1 Wiring location	B — thin ops wrapper forge.cli._serve_production	Mirrors FW10-001 seams-and-wiring split; one monkeypatch surface for tests
+D2 SQLite pool source	A* — ServeConfig.db_path, reuse FORGE_DB_PATH, default ~/.forge/forge.db	Project already standardised on FORGE_DB_PATH (queue, status). Don't fragment.
+D2-bonus ForgeConfig source	Read ctx.obj; fall back to ./forge.yaml	main() already loads it — serve_cmd just isn't @click.pass_context-decorated
+D3 AsyncSubAgentMiddleware	A — eager in wrapper	DeepAgents is hard boot dep; fail-fast at boot beats fail-late after a stub-ack
+D4 Order vs FW10-011	B — fix first, FW10-011 second (regression lock)	jarvis runbook is already the deterministic red test; unblocks Phase 7 close immediately
+D5 Unit-test compatibility	A — testable helper is the D1.B wrapper	One-line monkeypatch.setattr(serve_module, "bind_production_serve", lambda *a, **kw: None) per test. No env-flag footgun.
+Key findings:
+
+F1 (HIGH) — serve_cmd never rebinds; _default_compose_dispatch_chain stays bound; receipt-only stub silently acks every envelope.
+F2 (MED) — ForgeConfig already plumbed via Click ctx.obj; serve_cmd ignores it. Pickup is ~2 lines.
+F3 (MED) — FORGE_DB_PATH already exists project-wide; the task's proposed FORGE_SQLITE_PATH would fragment. Reuse it.
+F4 (MED) — Smoke tests rely on the default no-op; the wrapper module from D1.B gives them one clean patch surface.
+F5 (LOW) — TASK-FW10-011 is design_approved and archived in tasks/completed/. D4.B sequencing requires resurrection after the fix lands.
+File impact: 10 items ranked by risk in the report — serve.py serve_cmd body is rank 1 (HIGH); new _serve_production.py rank 2; _serve_config.py db_path field rank 3; tests ranks 4-6; new TASK-FIX-F010 + guide updates ranks 7-9.
+
+Decision Options:
+
+[A]ccept — Approve findings; archive review (writes to Graphiti if available); ready to file TASK-FIX-F010 separately when you choose.
+[R]evise — Push back on a specific decision (name D1/D2/D3/D4/D5) and request deeper analysis.
+[I]mplement — Auto-create the implementation task and (optionally) start it. The recommended single subtask is TASK-FIX-F010, skeleton already drafted in the report. With one subtask, no parallel-execution Conductor groups are needed.
+[C]ancel — Discard review, return task to backlog.
+Your choice [A/R/I/C]:
+
+autobuild-FEAT-FORGE-010-fail-run-1-history.md
+[I]mplement and run it via /task-work
+Creating TASK-FIX-F010 from the review skeleton, then handing off to /task-work.
+
+
+
+Starting /task-work execution for TASK-FIX-F010.
+
+🎯 Development Mode: STANDARD (implementation + tests together)
+
+🔄 Workflow Mode: STANDARD (All phases)
+
+Auto-detected intensity per provenance rules: task has parent_review: TASK-REV-F010 and complexity: 4 → MINIMAL intensity (skip Phase 2 planning since the review IS the plan, skip arch review/checkpoint, run Phase 3+4+4.5+5).
+
+Let me find and move the task file, and check the in_progress conventions.
+
+
+Starting /task-work execution for TASK-FIX-F010.
+
+🎯 Development Mode: STANDARD (implementation + tests together)
+
+🔄 Workflow Mode: STANDARD (All phases)
+
+Auto-detected intensity per provenance rules: task has parent_review: TASK-REV-F010 and complexity: 4 → MINIMAL intensity (skip Phase 2 planning since the review IS the plan, skip arch review/checkpoint, run Phase 3+4+4.5+5).
+
+Let me find and move the task file, and check the in_progress conventions.
+
+
+
 
 
 
