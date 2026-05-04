@@ -1,16 +1,16 @@
 # Autobuild Review Summary: FEAT-FORGE-003
 
-**Status:** COMPLETED  
-**Generated:** 2026-04-25 17:32 UTC
+**Status:** PAUSED  
+**Generated:** 2026-05-04 14:21 UTC
 
 ## Metrics
 
 | Metric | Value |
 |--------|-------|
 | Total tasks | 12 |
-| Total turns | 12 |
+| Total turns | 1 |
 | Avg turns/task | 1.00 |
-| Waves executed | 5 |
+| Waves executed | 1 |
 | First-attempt pass rate | 100% |
 
 ## Per-Task Outcomes
@@ -18,22 +18,11 @@
 | Task | Wave | Turns | Outcome | Decision | Notes |
 |------|------|-------|---------|----------|-------|
 | TASK-SAD-001 | 1 | 1 | PASSED | approved |  |
-| TASK-SAD-002 | 2 | 1 | PASSED | approved |  |
-| TASK-SAD-003 | 2 | 1 | PASSED | approved |  |
-| TASK-SAD-004 | 2 | 1 | PASSED | approved |  |
-| TASK-SAD-005 | 2 | 1 | PASSED | approved |  |
-| TASK-SAD-006 | 3 | 1 | PASSED | approved |  |
-| TASK-SAD-007 | 4 | 1 | PASSED | approved |  |
-| TASK-SAD-008 | 4 | 1 | PASSED | approved |  |
-| TASK-SAD-009 | 4 | 1 | PASSED | approved |  |
-| TASK-SAD-010 | 4 | 1 | PASSED | approved |  |
-| TASK-SAD-011 | 5 | 1 | PASSED | approved |  |
-| TASK-SAD-012 | 5 | 1 | PASSED | approved |  |
 
 ## Quality Metrics
 
 - Task success rate: 100%
-- First-turn approvals: 12/12
+- First-turn approvals: 1/1
 - SDK ceiling hits: 0
 
 ## Turn Efficiency
@@ -41,10 +30,10 @@
 | Metric | Value |
 |--------|-------|
 | Avg turns/task | 1.0 |
-| Single-turn tasks | 12 |
+| Single-turn tasks | 1 |
 | Multi-turn tasks | 0 |
-| Avg SDK turns/invocation | 43.7 |
+| Avg SDK turns/invocation | 0.0 |
 
 ## Key Findings
 
-- All tasks completed cleanly with no issues.
+- No notable findings.

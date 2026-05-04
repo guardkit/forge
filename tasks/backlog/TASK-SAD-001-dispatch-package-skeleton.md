@@ -1,22 +1,47 @@
 ---
 id: TASK-SAD-001
-title: "Dispatch package skeleton: forge.dispatch models and __init__"
+title: 'Dispatch package skeleton: forge.dispatch models and __init__'
 task_type: declarative
-status: backlog
+status: in_review
 priority: high
-created: 2026-04-25T00:00:00Z
-updated: 2026-04-25T00:00:00Z
+created: 2026-04-25 00:00:00+00:00
+updated: 2026-04-25 00:00:00+00:00
 parent_review: TASK-REV-SAD3
 feature_id: FEAT-FORGE-003
 wave: 1
 implementation_mode: direct
 complexity: 2
 dependencies: []
-tags: [dispatch, declarative, pydantic, scaffolding-domain]
+tags:
+- dispatch
+- declarative
+- pydantic
+- scaffolding-domain
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 1
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FORGE-003
+  base_branch: main
+  started_at: '2026-05-04T14:18:43.769339'
+  last_updated: '2026-05-04T14:21:35.281943'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-04T14:18:43.769339'
+    player_summary: 'Created src/forge/dispatch/ as a pure-domain package with two
+      modules. __init__.py re-exports the public surface (AsyncPending, CorrelationKey,
+      Degraded, DispatchAttempt, DispatchError, DispatchOutcome, SyncResult). models.py
+      defines: (a) CorrelationKey as an opaque str alias - format validation deferred
+      to TASK-SAD-003 boundary; (b) DispatchAttempt(resolution_id, correlation_key,
+      matched_agent_id, attempt_no=1 ge=1, retry_of: str|None = None); (c) four outcome
+      variants SyncResult/AsyncPending/D'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Dispatch package skeleton — forge.dispatch models and __init__
