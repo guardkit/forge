@@ -431,18 +431,23 @@ class TestDispatchErrorIsContained:
     ``handle_message`` MUST:
 
     * NOT re-raise (so the fetch loop keeps running);
+    * Publish a terminal ``build-failed`` envelope (TASK-FORGE-FRR-F010F)
+      threading the inbound ``correlation_id`` so the operator's chat
+      session sees a terminal envelope instead of a silent drop;
     * Best-effort ack the inbound message (so ``max_ack_pending=1`` does
       not block the next delivery);
     * Log at WARNING for operator visibility.
 
-    We do NOT assert that ``handle_message`` publishes ``build-failed``
-    on this path — the state machine inside ``dispatch_build`` is the
-    source-of-truth for build-state transitions per ADR-ARCH-008.
-    Publishing from the consumer too would risk a duplicate event.
+    F010.F's contract narrowed ADR-ARCH-008's "no duplicate publish"
+    protection: the state machine only owns the publish *after* it has
+    started transitioning. When ``dispatch_build`` raises out to this
+    outer try/except, the state machine never started, so a consumer-
+    side terminal envelope cannot duplicate one — and is the only way
+    the operator's chat session learns the build dropped (DDR-030).
     """
 
     @pytest.mark.asyncio
-    async def test_dispatch_error_is_swallowed_and_message_is_acked(
+    async def test_dispatch_error_publishes_build_failed_and_acks(
         self,
         deps_factory,
         allowlist_root: Path,
@@ -469,9 +474,17 @@ class TestDispatchErrorIsContained:
         assert warning_records, "expected a WARNING log on dispatch error"
         # The inbound was acked — the next delivered build can be processed.
         msg.ack.assert_awaited_once()
-        # No ``build-failed`` was published from the consumer side: the
-        # state machine inside dispatch_build owns build-state events.
-        mocks["publish_build_failed"].assert_not_called()
+        # F010.F: a terminal ``build-failed`` envelope is published
+        # before the ack so the operator's chat session learns the
+        # build dropped. The reason carries the exception class for
+        # triage; per-class assertions and correlation_id threading
+        # are exercised in detail by
+        # ``tests/forge/test_pipeline_consumer_dispatch_failure_publish.py``.
+        mocks["publish_build_failed"].assert_awaited_once()
+        publish_args = mocks["publish_build_failed"].await_args
+        sent_payload = publish_args.args[0]
+        assert "RuntimeError" in sent_payload.failure_reason
+        assert sent_payload.recoverable is False
 
     @pytest.mark.asyncio
     async def test_dispatch_error_does_not_block_next_message(

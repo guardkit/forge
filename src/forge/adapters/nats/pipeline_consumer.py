@@ -475,24 +475,47 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         # next delivered build is processed. Approach:
         #
         #   1. Log at WARNING with the failed identity for triage.
-        #   2. Best-effort ack via the idempotent callback so JetStream
+        #   2. Publish a terminal ``build-failed`` envelope (TASK-FORGE-
+        #      FRR-F010F) threading the inbound ``correlation_id`` so the
+        #      operator's chat session sees a terminal envelope instead
+        #      of a silent drop.
+        #   3. Best-effort ack via the idempotent callback so JetStream
         #      releases the slot. If the state machine had already
         #      transitioned to a terminal state and acked, the second
         #      call is a no-op (see :func:`_build_ack_callback`).
-        #   3. Swallow the exception — the daemon stays running.
+        #   4. Swallow the exception — the daemon stays running.
         #
-        # We do NOT publish ``build-failed`` here: if the state machine
-        # got far enough to record any transition it owns the publish,
-        # and emitting a duplicate from the consumer would violate the
-        # single-source-of-truth contract (ADR-ARCH-008). Operators
-        # detect dispatch crashes via the WARNING log line.
+        # We *do* publish ``build-failed`` here when ``dispatch_build``
+        # raises before the running state machine takes ownership of
+        # the publish (TASK-FORGE-FRR-F010F). The no-duplicate
+        # guarantee from ADR-ARCH-008 still holds: raising out of
+        # ``dispatch_build`` to this outer try/except means the state
+        # machine never started transitioning, so it will never publish
+        # a competing terminal envelope. Empirically observed twice on
+        # 2026-05-04 (Gap F010.B and Gap F010.E); the silent-ack
+        # behaviour broke DDR-030's between-prompt notification
+        # contract for any class of dispatch error.
         logger.warning(
             "pipeline_consumer: dispatch_build raised (%s) for "
-            "feature_id=%s correlation_id=%s; acking and continuing so "
-            "the next build can be processed",
+            "feature_id=%s correlation_id=%s; publishing build-failed "
+            "and acking so the next build can be processed",
             exc,
             payload.feature_id,
             payload.correlation_id,
+        )
+        # Publish FIRST so a transport-level publish failure cannot leave
+        # the message acked-but-undelivered. ``_safe_publish_failure``
+        # already swallows publish errors and logs at WARNING, so a
+        # publish failure does not prevent the subsequent ack.
+        await _safe_publish_failure(
+            deps,
+            _failure_payload(
+                feature_id=payload.feature_id,
+                build_id=payload.feature_id,
+                reason=f"{exc.__class__.__name__}: {exc}",
+            ),
+            payload.feature_id,
+            correlation_id=envelope.correlation_id,
         )
         try:
             await ack_callback()
