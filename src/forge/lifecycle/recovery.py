@@ -108,6 +108,7 @@ from forge.lifecycle.state_machine import (
     BuildState,
     transition as compose_transition,
 )
+from forge.pipeline import attach_correlation_id
 
 if TYPE_CHECKING:  # pragma: no cover — import-time only
     pass
@@ -260,10 +261,20 @@ async def _handle_preparing(
     persistence.apply_transition(transition)
     report.interrupted_count += 1
 
+    # DDR-029 (TASK-FORGE-FRR-F010D): thread the originating correlation_id
+    # onto the v1 BuildFailedPayload so jarvis's forge_subscriber can route
+    # the recovery notification back to the originating chat session. The
+    # publisher's _publish_envelope reads correlation_id off the payload via
+    # ``getattr(payload, "correlation_id", None)``; without this the outbound
+    # envelope carries ``correlation_id: null`` (same shape as F010C's bug,
+    # different surface). Pattern mirrors forge.pipeline.__init__.emit_failed.
+    payload = _build_failed_payload(build)
+    attach_correlation_id(payload, build.correlation_id)
+
     # Emit build-failed AFTER the SQL transition committed — if the wire
     # publish raises, the SQL is still in the recovered state and a
     # follow-up boot will be a clean no-op against INTERRUPTED.
-    await publisher.publish_build_failed(_build_failed_payload(build))
+    await publisher.publish_build_failed(payload)
 
 
 async def _handle_running(

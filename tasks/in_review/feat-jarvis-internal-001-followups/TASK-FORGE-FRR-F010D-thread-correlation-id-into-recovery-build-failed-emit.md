@@ -1,9 +1,9 @@
 ---
 id: TASK-FORGE-FRR-F010D
 title: "Thread `correlation_id` into PREPARING-recovery `build-failed` emit (DDR-029, recovery surface)"
-status: backlog
+status: in_review
 created: 2026-05-04T11:25:00Z
-updated: 2026-05-04T11:25:00Z
+updated: 2026-05-04T12:30:00Z
 priority: high
 task_type: fix
 tags:
@@ -27,9 +27,10 @@ discovered_on:
   date: 2026-05-04
   context: "TASK-FORGE-FRR-F010C audit (AC-1) flagged this as the only out-of-scope publish site that fails the same DDR-029 invariant. Logged in F010C completion notes; this task closes the gap on the boot-recovery surface."
 test_results:
-  status: pending
-  coverage: null
-  last_run: null
+  status: passing
+  coverage: null  # skipped per MINIMAL intensity
+  last_run: 2026-05-04T12:30:00Z
+  notes: "tests/forge/ → 2151 passed, 1 deselected (pre-existing clock-hygiene at approval_subscriber.py:684, spec'd in AC-5). Wider tests/ run (excl. integration/docker) → 4086 passed, 1 deselected. New tests: tests/forge/test_recovery_correlation_id.py (2 tests: AC-3 happy-path threading + AC-4 AST lint guard)."
 ---
 
 # Task: Thread `correlation_id` into PREPARING-recovery `build-failed` emit (DDR-029, recovery surface)
@@ -288,3 +289,106 @@ runbook should exercise both surfaces:
 - **F010C tests to mirror**:
   - [`tests/forge/test_pipeline_consumer_correlation_id.py`](../../../tests/forge/test_pipeline_consumer_correlation_id.py)
     — pattern for AC-3 unit tests + AC-4 AST-based lint guard
+
+## Completion Notes (2026-05-04)
+
+### AC-1: recovery publish-site audit
+
+| Handler | Publish call | Threads `correlation_id`? | Notes |
+|---|---|---|---|
+| `_handle_preparing` (line 248) | `publisher.publish_build_failed(payload)` | ✅ **Now yes** | The F010D fix. `attach_correlation_id(payload, build.correlation_id)` mirrors the canonical pattern at `forge.pipeline.__init__.emit_failed` (line 538). |
+| `_handle_running` (line 269) | — | N/A | No wire publish; SQL-only INTERRUPTED transition. Re-pickup is via JetStream NACK on the next pull. |
+| `_handle_paused` (line 284) | `approval_publisher.publish_request(envelope)` | Out of scope | Envelope is constructed in `forge.adapters.nats.approval_publisher.build_recovery_approval_envelope` (separate module, AC-008 single-ownership). PAUSED-recovery re-issues the verbatim `request_id` (concern `sc_004`), and the responder correlates by `request_id` not `correlation_id`. Per F010D's "don't widen the fix beyond the audit" boundary, threading the envelope-level `correlation_id` in the approval_publisher module would be a separate follow-up if it ever becomes necessary — the current responder does not require it. |
+| `_handle_finalising` (line 316) | — | N/A | No wire publish; SQL-only INTERRUPTED transition + operator warning. PR reconciliation is manual via `forge history` (TASK-PSM-007). |
+| `_reconcile_one` (line 411) | — | N/A | Dispatcher only. |
+| `reconcile_on_boot` (line 342) | — | N/A | Top-level driver; failure-isolation try/except only. |
+
+**Conclusion**: `_handle_preparing` is the **only** publish site in
+`forge.lifecycle.recovery` that emits an outbound v1
+`pipeline.build-failed.*` envelope. The F010D fix at
+`recovery.py:269-271` is sufficient for the recovery surface.
+
+### AC-2 / AC-3 / AC-4: implementation summary
+
+- **AC-2 (PREPARING-recovery emit threading)**: applied at
+  `src/forge/lifecycle/recovery.py:264-271`. The fix constructs the v1
+  `BuildFailedPayload`, calls
+  `attach_correlation_id(payload, build.correlation_id)`, then publishes —
+  identical pattern to `forge.pipeline.__init__.emit_failed` (line 538).
+  `BuildRow.correlation_id` is a required (non-Optional) field per
+  `persistence.py:197`, so no None-handling is needed.
+- **AC-3 (PREPARING-recovery unit test)**:
+  `tests/forge/test_recovery_correlation_id.py::TestPreparingRecoveryThreadsCorrelationId::test_preparing_recovery_payload_carries_buildrow_correlation_id`.
+  Drives a real PREPARING build through `reconcile_on_boot` against an
+  in-memory SQLite db (using the same fixture shape as
+  `test_lifecycle_recovery.py`) and asserts the captured payload's
+  `getattr(payload, "correlation_id", None)` matches the seeded
+  `BuildRow.correlation_id`. Pre-fix this assertion would have read `None`.
+- **AC-4 (cross-cut lint guard)**:
+  `tests/forge/test_recovery_correlation_id.py::TestRecoveryPublishSitesThreadCorrelationId::test_every_publish_build_failed_call_in_recovery_threads_correlation_id`.
+  AST-walks `recovery.py`, finds every
+  `publisher.publish_build_failed(...)` call, and asserts each one is in a
+  function body that also contains an `attach_correlation_id` call. A
+  future PR adding a new recovery branch with a publish-without-thread
+  MUST fail this test.
+
+### AC-5: regression
+
+- `pytest tests/forge/` → **2151 passed, 1 deselected** (the pre-existing
+  clock-hygiene failure at
+  `src/forge/adapters/nats/approval_subscriber.py:684`, called out as
+  expected in AC-5).
+- `pytest tests/` (excluding `tests/integration/`) →
+  **4086 passed, 1 deselected**.
+- New tests: `tests/forge/test_recovery_correlation_id.py` — 2 passing.
+- Existing recovery suite: `tests/forge/test_lifecycle_recovery.py` —
+  15 passing (no behavioural regression from the F010D fix; the
+  PREPARING tests in that suite assert recoverable-flag and SQL state, not
+  envelope correlation_id, so they are orthogonal to this fix).
+- The F010C lint guard
+  (`tests/forge/test_pipeline_consumer_correlation_id.py`) still passes
+  (consumer-side surface unchanged).
+
+### AC-6: live-wire validation (deferred to operator, joint with F010C)
+
+Per the task spec, AC-6 is the joint live-wire runbook with F010C:
+rebuild the forge image with both fixes, rerun jarvis runbook §6.2 + §7
+with Scenarios A and B. This requires an operator-driven docker rebuild
++ runbook execution and is **not** covered by the unit-test suite — it
+is filed as the next operator follow-up. Recommended order from the spec
+(unchanged):
+
+1. ✅ Land F010D (this task).
+2. Rebuild forge image with F010C + F010D combined.
+3. Run joint AC-6 runbook scenarios:
+   - **Scenario A (F010C surface)**: queue a build with a path outside
+     the allowlist; assert outbound `pipeline.build-failed.*` carries
+     the inbound correlation_id.
+   - **Scenario B (F010D surface)**: queue a build, kill `forge serve`
+     while the build is in PREPARING (SQLite `builds` row has
+     `status=PREPARING`), restart `forge serve`; assert the
+     recovery-emitted `pipeline.build-failed.*` carries the original
+     `BuildRow.correlation_id`.
+4. Backfill F010C's deferred AC-6 in its completion notes by reference.
+
+### Files changed
+
+- `src/forge/lifecycle/recovery.py` (+12 / −1):
+  - +1 import: `from forge.pipeline import attach_correlation_id`
+  - +11 in `_handle_preparing`: extract payload to a local, attach
+    `correlation_id`, publish.
+- `tests/forge/test_recovery_correlation_id.py` (new, +247):
+  - `TestPreparingRecoveryThreadsCorrelationId` (AC-3, 1 test)
+  - `TestRecoveryPublishSitesThreadCorrelationId` (AC-4, 1 AST guard)
+
+### Follow-up filed
+
+None. The audit confirmed `_handle_preparing` is the only outbound
+publish site in `recovery.py`. The PAUSED-recovery envelope-construction
+question (whether `build_recovery_approval_envelope` should set
+`MessageEnvelope.correlation_id`) is intentionally not filed: the
+responder correlates by `request_id` (sc_004), not by `correlation_id`,
+so DDR-029's notification-thread contract is not violated by the
+current PAUSED-recovery shape. If a future change makes the responder
+correlate by `correlation_id`, file a follow-up against
+`forge.adapters.nats.approval_publisher` then.
