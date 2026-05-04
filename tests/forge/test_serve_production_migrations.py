@@ -30,10 +30,29 @@ import pytest
 
 
 class _FakeStartAsyncTaskTool:
-    """Minimal stand-in for the LangChain ``StructuredTool`` shape."""
+    """Minimal stand-in for the LangChain ``StructuredTool`` shape.
+
+    Carries ``.name`` (for the by-name lookup in
+    ``_resolve_async_task_starter``) and a no-op ``.func`` (for the
+    duck-type check in
+    :func:`forge.cli._serve_async_task_starter.build_async_task_starter`).
+    Tests in this module exercise the migrations boot path only and
+    never invoke the starter; the placeholder ``func`` raises if it
+    ever fires so a future refactor that does invoke it surfaces a
+    test failure rather than silently passing.
+    """
 
     def __init__(self, name: str = "start_async_task") -> None:
         self.name = name
+
+    def func(
+        self, *, description: str, subagent_type: str, runtime: Any
+    ) -> Any:  # pragma: no cover - placeholder, never invoked by these tests
+        raise AssertionError(
+            "_FakeStartAsyncTaskTool.func was invoked unexpectedly in "
+            "test_serve_production_migrations; these tests exercise the "
+            "boot-time migration path only"
+        )
 
 
 class _FakeMiddleware:

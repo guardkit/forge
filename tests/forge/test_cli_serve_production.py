@@ -28,10 +28,29 @@ import pytest
 
 
 class _FakeStartAsyncTaskTool:
-    """Minimal stand-in for the LangChain ``StructuredTool`` shape."""
+    """Minimal stand-in for the LangChain ``StructuredTool`` shape.
+
+    Exposes ``.name`` (used by ``_resolve_async_task_starter``'s
+    by-name lookup) and ``.func`` (used by
+    :func:`forge.cli._serve_async_task_starter.build_async_task_starter`'s
+    composition-time duck-type check). The ``.func`` is a no-op
+    placeholder — none of the tests in this module actually drive the
+    starter; they only assert composition-time behaviour. See
+    ``tests/forge/test_serve_async_task_starter.py`` for the unit
+    coverage of the adapter's translation behaviour.
+    """
 
     def __init__(self, name: str = "start_async_task") -> None:
         self.name = name
+
+    def func(
+        self, *, description: str, subagent_type: str, runtime: Any
+    ) -> Any:  # pragma: no cover - placeholder, never invoked by these tests
+        raise AssertionError(
+            "_FakeStartAsyncTaskTool.func was invoked unexpectedly; the "
+            "tests in this module exercise composition only, not the "
+            "adapter's translation path"
+        )
 
 
 class _FakeMiddleware:
@@ -422,7 +441,26 @@ class TestAsyncTaskStarterThreading:
 
         assert captured["forge_config"] is fake_forge_config
         assert captured["sqlite_pool"] is sentinel_pool
-        assert captured["async_task_starter"] is starter_tool
+        # TASK-FORGE-FRR-F010E: the resolver now wraps the raw
+        # StructuredTool in a _StructuredToolAsyncTaskStarter adapter
+        # before threading it through to bind_production_dispatch_chain.
+        # The threading invariant is that the adapter is shaped against
+        # the AsyncTaskStarter Protocol (so the dispatcher's call site
+        # at autobuild_async.py:473 succeeds) AND that the adapter wraps
+        # the very tool we put on the middleware (so the dispatch
+        # actually launches the resolved subagent, not some other
+        # arbitrary tool).
+        from forge.cli._serve_async_task_starter import (
+            _StructuredToolAsyncTaskStarter,
+        )
+        from forge.pipeline.dispatchers.autobuild_async import (
+            AsyncTaskStarter,
+        )
+
+        threaded = captured["async_task_starter"]
+        assert isinstance(threaded, _StructuredToolAsyncTaskStarter)
+        assert isinstance(threaded, AsyncTaskStarter)
+        assert threaded._tool is starter_tool
 
 
 # ---------------------------------------------------------------------------

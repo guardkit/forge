@@ -34,6 +34,8 @@ tracked in the jarvis repo separately.
 | [TASK-FORGE-FRR-F010A](../../completed/TASK-FORGE-FRR-F010A/TASK-FORGE-FRR-F010A-apply-sqlite-migrations-on-daemon-boot.md) | Apply SQLite migrations on daemon boot in `bind_production_serve` | high | 2 | ✅ completed (2026-05-04 — code + tests; AC-6 operator runbook revalidation pending) |
 | [TASK-FORGE-FRR-F010B](TASK-FORGE-FRR-F010B-resolve-get-approved-stage-entry-attribute-error.md) | Resolve `get_approved_stage_entry` AttributeError in autobuild dispatch path | high | 4 | 📥 backlog (filed 2026-05-04) |
 | [TASK-FORGE-FRR-F010C](TASK-FORGE-FRR-F010C-thread-correlation-id-into-outbound-envelopes.md) | Thread inbound `correlation_id` into outbound `pipeline.*` envelopes from `pipeline_consumer` | high | 3 | 📥 backlog (filed 2026-05-04) |
+| [TASK-FORGE-FRR-F010E](../../completed/TASK-FORGE-FRR-F010E/TASK-FORGE-FRR-F010E-resolve-structuredtool-start-async-task-attribute-error.md) | Resolve `'StructuredTool' object has no attribute 'start_async_task'` in autobuild dispatch path | high | 4 | ✅ completed (2026-05-04 — adapter wraps StructuredTool at composition seam; AC-6 operator runbook revalidation pending) |
+| [TASK-FORGE-FRR-F010F](TASK-FORGE-FRR-F010F-publish-build-failed-envelope-on-dispatch-error.md) | Publish terminal `build-failed` envelope when `dispatch_build` raises (instead of silently acking) | high | 3 | 📥 backlog (filed 2026-05-04) |
 
 > **Post-TASK-FIX-F010 follow-ups (2026-05-04 evening)**: TASK-FIX-F010
 > shipped and was verified live on the wire (correlation_id
@@ -56,6 +58,34 @@ tracked in the jarvis repo separately.
 > "Addendum: Same-day post-TASK-FIX-F010 rerun" section for the full
 > evidence (4 successive correlation_ids exercising progressively
 > deeper rejection / dispatch paths).
+
+> **Post-F010.A/B/C/D joint validation follow-ups (2026-05-04 late afternoon)**:
+> Once F010.A (migrations on boot), F010.B (StageLogReader adapter),
+> F010.C (correlation_id threading on rejection publishes), and
+> F010.D-forge (PREPARING-recovery threading) all landed, a joint
+> live-wire validation rerun (correlation_id
+> `dfad8e7f-92af-4b5f-896f-ca75ad8343bf`) verified all four fixes on
+> the wire — with one regression on the jarvis side that's tracked
+> separately as TASK-FRR-F010Db in the jarvis repo (Option A widening
+> to `pipeline.>` causes a workqueue-overlap rejection on the
+> PIPELINE stream; the fix is to switch to Option B — explicit
+> four-subject filter). On the forge side, F010.B's StageLogReader
+> fix unblocked the next layer of wiring drift: **F010.E**
+> (`'StructuredTool' object has no attribute 'start_async_task'` —
+> the autobuild dispatcher's `AsyncTaskStarter` Protocol expects a
+> named-method shape, but the production wrapper resolves a raw
+> LangChain `StructuredTool` from `middleware.tools` that exposes
+> `invoke()` / `ainvoke()` instead) is the next dispatch-time
+> blocker. **F010.F** is the safety-net companion: even when
+> `dispatch_build` raises, the consumer should publish a terminal
+> `build-failed` envelope so jarvis's chat REPL can render the
+> failure (today the consumer logs WARNING, acks, and silently drops
+> the chat thread — the same shape both F010.B and F010.E exposed
+> empirically). See
+> [`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md`](../../../../../jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md)
+> "Addendum 2: Joint live-wire validation rerun after F010.A–D"
+> section for the full evidence (chat-driven queue + synthetic
+> publish for the F010.C verification).
 
 > **Post-FEAT-DEA8 follow-up (2026-05-04)**: The 2026-05-04 rerun of the
 > jarvis first-real-run runbook (correlation_id
@@ -106,6 +136,8 @@ tracked in the jarvis repo separately.
 8. ~~**TASK-FORGE-FRR-F010A**~~ ✅ **completed** (2026-05-04 — code + tests landed, AC-6 operator runbook revalidation pending) — `bind_production_serve` now calls `apply_at_boot(connection)` after `connect_writer(...)` (Step 3.5 in the docstring pipeline). Boot log emits `[INFO] forge-serve: applied N SQLite migration(s) at boot`; idempotent re-bind logs `applied 0`. New tests in `tests/forge/test_serve_production_migrations.py` (3 passing); existing `test_cli_serve_production.py` (12 passing, AC-5 regression) and 72 sibling cli/serve tests still green. AC-2 narrowed to the 4 migration-managed tables (`builds` / `stage_log` / `sqlite_sequence` / `schema_version`); `async_tasks` is provisioned by `ensure_async_tasks_schema` at dispatcher-construction time (Step 7), out of `apply_at_boot`'s scope — see the completed task file for the full scope note. Reproducer that surfaced this: run 3 (`a55df422-…`) — `no such table: builds`. Code in working tree pending operator commit; jarvis runbook §6.2+§7 revalidation pending operator. See [tasks/completed/TASK-FORGE-FRR-F010A/](../../completed/TASK-FORGE-FRR-F010A/TASK-FORGE-FRR-F010A-apply-sqlite-migrations-on-daemon-boot.md) for full report.
 9. **TASK-FORGE-FRR-F010B** 📥 backlog (filed 2026-05-04) — Resolve `'SqliteLifecyclePersistence' object has no attribute 'get_approved_stage_entry'` in the autobuild dispatcher path. Wiring drift between FW10-005's fake persistence and the real facade — fix is either method-add on the facade or caller-rename. Reproducer: run 4 (`f876fd47-…`) — exception fires after the QUEUED row is persisted but before any `build-started` envelope is emitted.
 10. **TASK-FORGE-FRR-F010C** 📥 backlog (filed 2026-05-04) — Thread `inbound_envelope.correlation_id` into every outbound `pipeline.*` envelope from `pipeline_consumer` (and any caller in `pipeline.publisher` / `pipeline.lifecycle_emitter`). DDR-029 violation. Independent of F010.A/B; can land in parallel. Reproducer: runs 1+2 (`21df1258-…`, `b5c5e1e2-…`) — `pipeline.build-failed.FEAT-43DE` carried `correlation_id: null` instead of the threaded inbound value.
+11. **TASK-FORGE-FRR-F010E** 📥 backlog (filed 2026-05-04) — Resolve `'StructuredTool' object has no attribute 'start_async_task'` AttributeError in the autobuild dispatcher path (next-layer wiring drift exposed once F010.B's StageLogReader adapter unblocked the dispatcher's progression). The autobuild dispatcher's `AsyncTaskStarter` Protocol at `src/forge/pipeline/dispatchers/autobuild_async.py:155-189` declares a named-method shape (`start_async_task(subagent_name, context)`), but `_resolve_async_task_starter` at `src/forge/cli/_serve_production.py:139-142` returns the raw LangChain `StructuredTool` looked up by name from `middleware.tools` — `StructuredTool` exposes `tool.invoke({...})` / `tool.ainvoke({...})`, not the named method. Fix is either (A) change the caller to use `tool.invoke({...})` (LangChain-native) or (B) wrap the `StructuredTool` in a named-method adapter at the production-composition seam (symmetric with F010.B's adapter-wrapping strategy — likely the right answer). Reproducer: late-afternoon run 1 (`dfad8e7f-…`) — exception fires immediately after the QUEUED row is persisted but before any `build-started` envelope is emitted. Independent of F010.F; can land in either order.
+12. **TASK-FORGE-FRR-F010F** 📥 backlog (filed 2026-05-04) — Publish terminal `pipeline.build-failed.<feature_id>` envelope when `dispatch_build` raises an unhandled exception, **before** acking — instead of today's silent log+ack at `pipeline_consumer.py:470-506`. Re-uses F010.C's `_safe_publish_failure` / `_failure_payload` helpers so correlation_id-threading inherits transparently. Narrows ADR-ARCH-008's no-duplicate-publish protection to "when the state machine has started" (since pre-state-machine raises mean the state machine never gets to publish, and so there's no duplicate to guard against). Safety-net for *all* future dispatch failures, not just F010.E's StructuredTool case. Independent of F010.E; can land in either order. Recommended order is **F010.F first** — its AC-6 is verifiable today against the open F010.E failure mode (a chat-driven queue produces a visible `build-failed` envelope on the wire instead of a silent drop), and the implementation is small (one publish call + 3 unit tests). Reproducer (co-symptom): same late-afternoon run 1 (`dfad8e7f-…`) — `pipeline.>` tail captured zero outbound publishes from forge despite a known correlation_id and a logged WARNING.
 
 The jarvis runbook
 (`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md`)

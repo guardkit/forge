@@ -41,10 +41,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from forge.adapters.sqlite.connect import connect_writer
+from forge.cli._serve_async_task_starter import build_async_task_starter
 from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
 from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
 
 logger = logging.getLogger(__name__)
 
@@ -122,16 +124,28 @@ def _close_previous_connection_quietly(previous: _BoundResources) -> None:
         )
 
 
-def _resolve_async_task_starter(middleware: Any) -> Any:
-    """Return the ``start_async_task`` tool exposed by ``middleware``.
+def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
+    """Return an :class:`AsyncTaskStarter` adapter over ``middleware.tools``.
 
     The :class:`AsyncSubAgentMiddleware` exposes a ``tools`` attribute
     (sequence of LangChain :class:`StructuredTool`-shaped objects, each
     carrying a ``name``) per the FW10-008 wiring contract. This helper
-    looks up the ``start_async_task`` entry by name and returns the tool
-    object itself — the same surface
+    looks up the ``start_async_task`` entry by name and wraps it in the
+    :func:`build_async_task_starter` adapter so the autobuild dispatcher
+    sees the purpose-shaped
     :class:`forge.pipeline.dispatchers.autobuild_async.AsyncTaskStarter`
-    accepts at runtime.
+    Protocol surface (``start_async_task(subagent_name, context) -> str``)
+    rather than the raw LangChain tool-invocation shape.
+
+    The adapter is necessary because the middleware's
+    :class:`StructuredTool` exposes ``invoke({...})`` / ``ainvoke({...})``
+    against a ``(description, subagent_type, runtime)`` schema — not the
+    named-method ``start_async_task(...)`` surface the dispatcher's
+    Protocol declares. Returning the raw tool here was the cause of the
+    GB10 ``AttributeError: 'StructuredTool' object has no attribute
+    'start_async_task'`` regression on correlation_id
+    ``dfad8e7f-92af-4b5f-896f-ca75ad8343bf`` — see TASK-FORGE-FRR-F010E
+    for the investigation.
 
     A missing tool is an explicit fail-fast at boot rather than a
     deferred ``RuntimeError`` on the first inbound envelope (D3.A).
@@ -139,7 +153,7 @@ def _resolve_async_task_starter(middleware: Any) -> Any:
     tools = tuple(getattr(middleware, "tools", ()) or ())
     for tool in tools:
         if getattr(tool, "name", None) == "start_async_task":
-            return tool
+            return build_async_task_starter(tool)
     available = sorted({getattr(t, "name", "<unnamed>") for t in tools})
     raise RuntimeError(
         "bind_production_serve: AsyncSubAgentMiddleware did not expose a "
