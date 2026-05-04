@@ -577,15 +577,62 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         await _close_client_quietly(client)
 
 
+def _resolve_forge_config_for_serve(ctx: click.Context) -> Any:
+    """Pick :class:`ForgeConfig` from ``ctx.obj``; fall back to ``./forge.yaml``.
+
+    TASK-FIX-F010 — ``serve_cmd`` needs a validated :class:`ForgeConfig`
+    so :func:`forge.cli._serve_production.bind_production_serve` can
+    thread the ``approved_originators`` and ``permissions.filesystem``
+    rules into the consumer. The Click top-level group already loads
+    ``forge.yaml`` into ``ctx.obj`` for the queue / status / history
+    subcommands (see :func:`forge.cli.main._resolve_context_object`);
+    this helper reaches for that value and only re-loads from
+    ``./forge.yaml`` if the group decoration was bypassed (e.g. when
+    tests invoke ``serve_cmd`` directly).
+
+    A missing config is a usage error rather than a silent fallback —
+    the daemon refuses to start without one because the FEAT-FORGE-002
+    rejection rules are not optional.
+    """
+    # Local imports keep the module-level surface clean; this helper is
+    # only invoked at boot.
+    from pathlib import Path
+
+    from forge.config.loader import load_config
+    from forge.config.models import ForgeConfig
+
+    if isinstance(ctx.obj, ForgeConfig):
+        return ctx.obj
+    if Path("forge.yaml").exists():
+        return load_config(Path("forge.yaml"))
+    raise click.UsageError(
+        "forge serve requires a forge.yaml — pass --config <path> or run "
+        "from a directory containing ./forge.yaml."
+    )
+
+
 @click.command(name="serve")
-def serve_cmd() -> None:
+@click.pass_context
+def serve_cmd(ctx: click.Context) -> None:
     """Run the long-lived forge daemon (JetStream consumer + healthz)."""
+    # Lazy import to keep the module-level surface clean and to avoid an
+    # import cycle (the wrapper imports ``forge.cli.serve`` to rebind
+    # the seam at runtime).
+    from forge.cli._serve_production import bind_production_serve
+
     config = ServeConfig.from_env()
     # Attach the stderr handler BEFORE _run_serve schedules the daemon
     # / healthz coroutines, so their first ``logger.info`` lines reach
     # ``docker logs`` and ``journalctl`` instead of the silent root
     # logger. TASK-FORGE-FRR-002.
     _configure_logging(config.log_level)
+    forge_config = _resolve_forge_config_for_serve(ctx)
+    # Bind the production dispatch-chain composer (TASK-FIX-F010)
+    # before ``_run_serve`` enters its boot order. The wrapper opens
+    # the SQLite writer connection, builds the middleware, and rebinds
+    # ``compose_dispatch_chain`` so ``_run_serve``'s Step 3.5 awaits
+    # the production closure rather than the no-op default.
+    bind_production_serve(config, forge_config)
     state = SubscriptionState()
     asyncio.run(_run_serve(config, state))
 

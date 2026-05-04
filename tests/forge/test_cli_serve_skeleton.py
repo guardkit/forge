@@ -219,6 +219,7 @@ class TestServeCmdSmoke:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from forge.cli import _serve_daemon
+        from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
         from forge.cli.main import main
 
@@ -238,6 +239,17 @@ class TestServeCmdSmoke:
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+        # TASK-FIX-F010 — stub the production wrapper and the
+        # ForgeConfig resolver so the smoke test does not need a real
+        # SQLite pool / ./forge.yaml on disk.
+        monkeypatch.setattr(
+            serve_production, "bind_production_serve", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "_resolve_forge_config_for_serve",
+            lambda ctx: object(),
+        )
 
         runner = CliRunner()
         result = runner.invoke(main, ["serve"])
@@ -248,6 +260,7 @@ class TestServeCmdSmoke:
     ) -> None:
         """Assert ``serve_cmd`` schedules both coroutines concurrently."""
         from forge.cli import _serve_daemon
+        from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
 
         observed: list[str] = []
@@ -267,6 +280,16 @@ class TestServeCmdSmoke:
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+        # TASK-FIX-F010 — stub the production wrapper and ForgeConfig
+        # resolver (see sibling test above for rationale).
+        monkeypatch.setattr(
+            serve_production, "bind_production_serve", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "_resolve_forge_config_for_serve",
+            lambda ctx: object(),
+        )
 
         runner = CliRunner()
         result = runner.invoke(serve_module.serve_cmd, [])

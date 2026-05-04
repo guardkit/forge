@@ -67,6 +67,7 @@ class TestInfoLevelEmitsRecords:
         monkeypatch.setenv("FORGE_LOG_LEVEL", "info")
 
         from forge.cli import _serve_daemon
+        from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
 
         class _StubClient:
@@ -87,6 +88,16 @@ class TestInfoLevelEmitsRecords:
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+        # TASK-FIX-F010 — stub the production wrapper and ForgeConfig
+        # resolver so the smoke path returns 0 without a real DB.
+        monkeypatch.setattr(
+            serve_production, "bind_production_serve", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "_resolve_forge_config_for_serve",
+            lambda ctx: object(),
+        )
 
         # Act
         with caplog.at_level(logging.INFO):
@@ -241,6 +252,7 @@ class TestServeCmdInvokesConfigureLogging:
     ) -> None:
         # Arrange
         from forge.cli import _serve_daemon
+        from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
 
         class _StubClient:
@@ -261,6 +273,15 @@ class TestServeCmdInvokesConfigureLogging:
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+        # TASK-FIX-F010 — bypass production wiring + ForgeConfig load.
+        monkeypatch.setattr(
+            serve_production, "bind_production_serve", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "_resolve_forge_config_for_serve",
+            lambda ctx: object(),
+        )
         monkeypatch.setenv("FORGE_LOG_LEVEL", "warning")
 
         observed: list[str] = []

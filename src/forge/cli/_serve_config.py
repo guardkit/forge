@@ -20,15 +20,23 @@ needs at boot. Defaults are anchored to the contract constants above so
 running ``forge serve`` with zero flags and zero env vars still produces
 a healthy default configuration. Environment-variable overrides follow
 the ``FORGE_*`` convention used elsewhere in the codebase
-(``FORGE_NATS_URL``, ``FORGE_HEALTHZ_PORT``, ``FORGE_LOG_LEVEL``); they
-are resolved at construction time via the ``from_env`` classmethod so
-callers do not have to plumb ``os.environ`` reads through their own
-code.
+(``FORGE_NATS_URL``, ``FORGE_HEALTHZ_PORT``, ``FORGE_LOG_LEVEL``,
+``FORGE_DB_PATH``); they are resolved at construction time via the
+``from_env`` classmethod so callers do not have to plumb ``os.environ``
+reads through their own code.
+
+TASK-FIX-F010 — adds the ``db_path`` field plus ``FORGE_DB_PATH``
+environment override so :func:`forge.cli._serve_production.bind_production_serve`
+can resolve the SQLite writer path without a parallel knob. The default
+``~/.forge/forge.db`` matches the operator-friendly location already
+used by :mod:`forge.cli.queue` and :mod:`forge.cli.status`; no new env
+var name is introduced.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -54,6 +62,14 @@ DEFAULT_NATS_URL: str = "nats://127.0.0.1:4222"
 #: lower-case INFO level name.
 DEFAULT_LOG_LEVEL: str = "info"
 
+#: Default SQLite writer path for the daemon's lifecycle persistence.
+#: Matches :mod:`forge.cli.queue`'s ``DEFAULT_DB_PATH`` and the operator-
+#: friendly local default referenced by ADR-ARCH-001. Production
+#: deployments that mount writable storage at a non-home path override
+#: this via ``FORGE_DB_PATH`` (the same env var honoured by
+#: :mod:`forge.cli.status` / :mod:`forge.cli.queue`).
+DEFAULT_DB_PATH: Path = Path("~/.forge/forge.db")
+
 
 class ServeConfig(BaseModel):
     """Pydantic v2 settings model for the ``forge serve`` daemon.
@@ -67,6 +83,10 @@ class ServeConfig(BaseModel):
         healthz_port: Port the healthz HTTP server binds to (Contract B).
         durable_name: JetStream durable name (Contract C).
         log_level: Lower-case log level name passed to ``logging``.
+        db_path: Filesystem path to the SQLite lifecycle database
+            (TASK-FIX-F010). Defaults to ``~/.forge/forge.db`` (the
+            ``~`` is expanded eagerly by the default factory so tests
+            see a deterministic absolute path at instantiation time).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=False)
@@ -75,6 +95,12 @@ class ServeConfig(BaseModel):
     healthz_port: int = Field(default=DEFAULT_HEALTHZ_PORT, ge=1, le=65535)
     durable_name: str = Field(default=DEFAULT_DURABLE_NAME, min_length=1)
     log_level: str = Field(default=DEFAULT_LOG_LEVEL, min_length=1)
+    # ``default_factory`` keeps the expanduser() call lazy so the value
+    # is resolved at instantiation time (deterministic for tests that
+    # monkeypatch ``$HOME``) rather than at module import.
+    db_path: Path = Field(
+        default_factory=lambda: DEFAULT_DB_PATH.expanduser()
+    )
 
     @classmethod
     def from_env(
@@ -88,6 +114,8 @@ class ServeConfig(BaseModel):
         - ``FORGE_HEALTHZ_PORT`` → ``healthz_port`` (parsed as ``int``)
         - ``FORGE_DURABLE_NAME`` → ``durable_name``
         - ``FORGE_LOG_LEVEL``    → ``log_level``
+        - ``FORGE_DB_PATH``      → ``db_path`` (``~`` is expanded;
+          TASK-FIX-F010)
 
         Args:
             environ: Optional mapping to read from instead of
@@ -107,10 +135,16 @@ class ServeConfig(BaseModel):
             kwargs["durable_name"] = env["FORGE_DURABLE_NAME"]
         if "FORGE_LOG_LEVEL" in env:
             kwargs["log_level"] = env["FORGE_LOG_LEVEL"]
+        if "FORGE_DB_PATH" in env:
+            # Reuse the project-wide convention (forge queue / forge
+            # status both read FORGE_DB_PATH); never introduce a parallel
+            # FORGE_SQLITE_PATH (TASK-REV-F010 D2.A*).
+            kwargs["db_path"] = Path(env["FORGE_DB_PATH"]).expanduser()
         return cls(**kwargs)
 
 
 __all__ = [
+    "DEFAULT_DB_PATH",
     "DEFAULT_DURABLE_NAME",
     "DEFAULT_HEALTHZ_PORT",
     "DEFAULT_LOG_LEVEL",
