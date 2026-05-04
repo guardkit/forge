@@ -29,6 +29,23 @@ tracked in the jarvis repo separately.
 | [TASK-FORGE-FRR-001b](../../completed/TASK-FORGE-FRR-001b/TASK-FORGE-FRR-001b-publish-pipeline-lifecycle-from-autobuild-orchestrator.md) | Publish pipeline lifecycle events (build-started, stage-complete×N, build-complete) from the autobuild orchestrator | high | 7 | ⚠ superseded-by-feature (2026-05-02) |
 | [TASK-FORGE-FRR-002](../../completed/TASK-FORGE-FRR-002/TASK-FORGE-FRR-002-wire-logging-basicconfig-for-forge-log-level.md) | Wire `logging.basicConfig` in `forge serve` so `FORGE_LOG_LEVEL` actually produces visible logs | high | 2 | ✅ completed (b1da833, 2026-05-01) |
 | [TASK-FORGE-FRR-003](../../completed/TASK-FORGE-FRR-003/TASK-FORGE-FRR-003-fix-build-image-script-context-path.md) | Fix `scripts/build-image.sh` so `--build-context nats-core=../nats-core` resolves on the canonical sibling layout | high | 2 | ✅ completed (fc7fd9a, 2026-05-01) |
+| [TASK-REV-F010](TASK-REV-F010-bind-production-dispatch-chain-in-serve-cmd.md) | Decide how to bind `compose_dispatch_chain` to the production composer in `serve_cmd` (post-FEAT-DEA8 gap) | high | 5 | ✅ review_complete (2026-05-04 — see [.claude/reviews/TASK-REV-F010-review-report.md](../../../.claude/reviews/TASK-REV-F010-review-report.md)) |
+| [TASK-FIX-F010](../../completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md) | Bind `compose_dispatch_chain` to the production composer in `serve_cmd` via `_serve_production` wrapper | high | 4 | ✅ completed (2026-05-04 — post-merge follow-ups: runbook revalidation, FW10-011 housekeeping) |
+
+> **Post-FEAT-DEA8 follow-up (2026-05-04)**: The 2026-05-04 rerun of the
+> jarvis first-real-run runbook (correlation_id
+> `18036705-2bb7-4564-8363-315bf7716a48`) — executed once all four
+> jarvis-side FRR follow-ups (TASK-FRR-001..004) and FEAT-FORGE-010
+> (FEAT-DEA8) had merged — surfaced one remaining gap on the forge
+> side: even with FEAT-FORGE-010's `bind_production_dispatch_chain`
+> factory in place, `serve_cmd` does not actually call it, so the
+> daemon falls through to the receipt-only `_default_dispatch` stub
+> at `_serve_daemon.py:166`. **TASK-REV-F010** is a `task_type:review`
+> decision-mode review to choose the wiring shape; once it lands its
+> implementation companion will close the production-binding loop.
+> See
+> [`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md`](../../../../../jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md)
+> for the full rerun evidence.
 
 > **Supersession note (2026-05-02)**: FRR-001 + FRR-001b were both
 > closed as `superseded-by-feature` after the FRR-001 Phase 3
@@ -54,7 +71,13 @@ tracked in the jarvis repo separately.
 1. ~~**TASK-FORGE-FRR-003**~~ ✅ **shipped** (`fc7fd9a`, 2026-05-01) — `scripts/build-image.sh` now `cd`s into forge's parent directory before invoking buildx, so `--build-context nats-core=../nats-core` resolves correctly on the canonical sibling layout.
 2. ~~**TASK-FORGE-FRR-002**~~ ✅ **shipped** (`b1da833`, 2026-05-01) — `serve_cmd` now calls `logging.basicConfig(level=config.log_level, ...)` immediately after `ServeConfig.from_env()`. `docker logs forge-prod` now actually shows the `_serve_daemon` and `_serve_healthz` log lines that were silently dropped before.
 3. ~~**TASK-FORGE-FRR-001**~~ + ~~**TASK-FORGE-FRR-001b**~~ ⚠ **superseded** (2026-05-02) — see supersession note above. Subsumed by **FEAT-FORGE-010** (`forge-serve-orchestrator-wiring`). The runbook's Phase 7 close criterion ("real per-stage notifications render in the chat REPL") will be satisfied when FEAT-FORGE-010 ships.
-4. **Active: [FEAT-FORGE-010](../forge-serve-orchestrator-wiring/README.md)** — feature scoped, Wave 1-4 task plan filed in `tasks/backlog/forge-serve-orchestrator-wiring/`. Anchor decision: DDR-007 (emitter wiring path).
+4. ~~**FEAT-FORGE-010**~~ — code merged 2026-05-02 (`9a93808 Merge FEAT-DEA8: wire pipeline orchestrator into forge serve` + `9ef9138` finalize). All Wave 1-3 tasks completed; capstone TASK-FW10-011 is `design_approved` (not implemented). The **factory** for the production dispatch chain (`bind_production_dispatch_chain`) is shipped, but the **production binding** that calls it from `serve_cmd` is not — see TASK-REV-F010 below.
+5. ~~**TASK-REV-F010**~~ ✅ **review_complete** (2026-05-04) — decision-mode review chose wiring shape (5 decisions: D1.B wrapper module / D2.A* reuse `FORGE_DB_PATH` / D3.A eager middleware / D4.B fix first FW10-011 second / D5.A testable helper via wrapper). Report at [.claude/reviews/TASK-REV-F010-review-report.md](../../../.claude/reviews/TASK-REV-F010-review-report.md).
+6. ~~**TASK-FIX-F010**~~ ✅ **completed** (2026-05-04) — built `forge.cli._serve_production._serve_production` wrapper, extended `ServeConfig` with `db_path` (reuses `FORGE_DB_PATH`), decorated `serve_cmd` with `@click.pass_context`, and rebound `compose_dispatch_chain` at boot. 100/100 targeted tests pass; 2131/2132 in full forge suite (one pre-existing unrelated clock-hygiene failure). Code in working tree pending operator commit. See [tasks/completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md](../../completed/TASK-FIX-F010/TASK-FIX-F010-bind-production-dispatch-chain.md) for full report.
+7. **Post-merge follow-up (deferred from TASK-FIX-F010 ACs 10/11/12)**:
+   - AC-10: cross-link `tasks/completed/TASK-FW10-011-...md` frontmatter (`parent_review: TASK-REV-F010`, `production_binding_sibling: TASK-FIX-F010`).
+   - AC-11: rebuild forge image from the new commit; re-run jarvis runbook §6.2+§7; verify `pipeline.build-started.*` envelope appears; flip RESULTS row 7.x ❌→✅; record new correlation_id in the completed task file.
+   - AC-12: resurrect TASK-FW10-011 from `tasks/completed/` to this folder with `dependencies: [TASK-FIX-F010]`, status `in_progress`; land it as the codified regression lock (per D4.B sequencing).
 
 The jarvis runbook
 (`/home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md`)
