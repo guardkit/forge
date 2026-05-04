@@ -460,3 +460,336 @@ class TestModuleIndependence:
         assert "from forge.cli._serve_deps " not in source
         assert "import forge.cli._serve_deps " not in source
         # The composition module is owned by TASK-FW10-007.
+
+
+# ---------------------------------------------------------------------------
+# TASK-FORGE-FRR-F010B — SQLite-backed StageLogReader adapter
+# ---------------------------------------------------------------------------
+
+
+class TestSqliteStageLogReader:
+    """``_SqliteStageLogReader`` projects ``stage_log`` rows into ApprovedStageEntry.
+
+    Closes the wiring gap that the production composer surfaced as
+    ``AttributeError: 'SqliteLifecyclePersistence' object has no
+    attribute 'get_approved_stage_entry'`` — see TASK-FORGE-FRR-F010B
+    description for the empirical run-4 evidence.
+    """
+
+    @pytest.fixture
+    def real_persistence(self, tmp_path: Path):
+        """Real :class:`SqliteLifecyclePersistence` against a fresh tmp DB.
+
+        The schema is bootstrapped via :func:`apply_at_boot` so any
+        ``stage_log`` SELECT issued by the adapter executes against a
+        valid table. Mirrors the fixture posture in
+        ``tests/cli/test_serve_deps.py``.
+        """
+        from forge.adapters.sqlite import connect as sqlite_connect
+        from forge.lifecycle import migrations
+        from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+        db_path = tmp_path / "forge.db"
+        cx = sqlite_connect.connect_writer(db_path)
+        migrations.apply_at_boot(cx)
+        try:
+            yield SqliteLifecyclePersistence(connection=cx, db_path=db_path)
+        finally:
+            cx.close()
+
+    @staticmethod
+    def _seed_build(persistence, *, feature_id: str, correlation_id: str) -> str:
+        """Insert a parent ``builds`` row so ``stage_log`` FK constraint passes.
+
+        Returns the minted ``build_id`` so callers can thread it onto
+        their ``StageLogEntry`` writes.
+        """
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+
+        payload = SimpleNamespace(
+            feature_id=feature_id,
+            repo="guardkit/forge",
+            branch="main",
+            feature_yaml_path="features/test.yaml",
+            max_turns=5,
+            sdk_timeout_seconds=1800,
+            triggered_by="cli",
+            originating_adapter=None,
+            originating_user="test-user",
+            correlation_id=correlation_id,
+            parent_request_id=None,
+            queued_at=datetime(2026, 5, 4, 12, 0, 0, tzinfo=UTC),
+        )
+        return persistence.record_pending_build(payload)
+
+    def test_factory_rejects_non_persistence_input(self) -> None:
+        """The factory refuses duck-typed inputs at the boundary.
+
+        Mirrors :func:`build_autobuild_state_initialiser`'s posture —
+        a misuse surfaces here rather than as a confusing AttributeError
+        on the first ``build_for`` call.
+        """
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+
+        with pytest.raises(TypeError, match="SqliteLifecyclePersistence"):
+            build_stage_log_reader(object())  # type: ignore[arg-type]
+
+    def test_empty_stage_log_returns_none(self, real_persistence) -> None:
+        """A fresh build (no ``stage_log`` rows) returns ``None``.
+
+        This is the exact run-4 state — QUEUED row written, ``stage_log``
+        empty — that previously surfaced as AttributeError.
+        """
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+
+        reader = build_stage_log_reader(real_persistence)
+
+        result = reader.get_approved_stage_entry(
+            build_id="build-empty",
+            stage=StageClass.AUTOBUILD,
+            feature_id="FEAT-EMPTY",
+        )
+        assert result is None
+
+    def test_empty_stage_log_returns_empty_tuple_for_multi(
+        self, real_persistence
+    ) -> None:
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+
+        reader = build_stage_log_reader(real_persistence)
+
+        result = reader.get_all_approved_stage_entries(
+            build_id="build-empty",
+            stage=StageClass.AUTOBUILD,
+            feature_id="FEAT-EMPTY",
+        )
+        assert tuple(result) == ()
+
+    def test_unapproved_row_is_filtered_out(self, real_persistence) -> None:
+        """A row that lacks ``gate_decision='approved'`` is invisible.
+
+        The Protocol contract filters approval-state internally; a row
+        in any non-approved state must be indistinguishable from "no
+        row yet" to the builder.
+        """
+        from datetime import UTC, datetime
+
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+        from forge.lifecycle.persistence import StageLogEntry
+
+        build_id = self._seed_build(
+            real_persistence, feature_id="FEAT-X", correlation_id="corr-1"
+        )
+        now = datetime.now(UTC)
+        unapproved = StageLogEntry(
+            build_id=build_id,
+            stage_label=StageClass.PRODUCT_OWNER.value,
+            target_kind="local_tool",
+            target_identifier="po-tool",
+            status="PASSED",
+            gate_mode=None,
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.1,
+            details={"feature_id": "FEAT-X", "gate_decision": "rejected"},
+        )
+        real_persistence.record_stage(unapproved)
+
+        reader = build_stage_log_reader(real_persistence)
+
+        assert (
+            reader.get_approved_stage_entry(
+                build_id=build_id,
+                stage=StageClass.PRODUCT_OWNER,
+                feature_id="FEAT-X",
+            )
+            is None
+        )
+
+    def test_approved_row_is_projected_to_approved_stage_entry(
+        self, real_persistence
+    ) -> None:
+        """An approved row carrying artefact paths is surfaced to the builder."""
+        from datetime import UTC, datetime
+
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+        from forge.lifecycle.persistence import StageLogEntry
+
+        build_id = self._seed_build(
+            real_persistence, feature_id="FEAT-X", correlation_id="corr-2"
+        )
+        now = datetime.now(UTC)
+        approved = StageLogEntry(
+            build_id=build_id,
+            stage_label=StageClass.PRODUCT_OWNER.value,
+            target_kind="local_tool",
+            target_identifier="po-tool",
+            status="PASSED",
+            gate_mode="AUTO_APPROVE",
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.5,
+            details={
+                "feature_id": "FEAT-X",
+                "gate_decision": "approved",
+                "artefact_paths": [f"/work/{build_id}/charter.md"],
+            },
+        )
+        real_persistence.record_stage(approved)
+
+        reader = build_stage_log_reader(real_persistence)
+        entry = reader.get_approved_stage_entry(
+            build_id=build_id,
+            stage=StageClass.PRODUCT_OWNER,
+            feature_id="FEAT-X",
+        )
+
+        assert entry is not None
+        assert entry.gate_decision == "approved"
+        assert entry.artefact_paths == (f"/work/{build_id}/charter.md",)
+        assert entry.artefact_text is None
+
+    def test_text_artefact_is_projected(self, real_persistence) -> None:
+        """``"text"``-shaped producers populate ``artefact_text``."""
+        from datetime import UTC, datetime
+
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+        from forge.lifecycle.persistence import StageLogEntry
+
+        build_id = self._seed_build(
+            real_persistence, feature_id="FEAT-Y", correlation_id="corr-3"
+        )
+        now = datetime.now(UTC)
+        approved = StageLogEntry(
+            build_id=build_id,
+            stage_label=StageClass.ARCHITECT.value,
+            target_kind="local_tool",
+            target_identifier="arch-tool",
+            status="PASSED",
+            gate_mode="AUTO_APPROVE",
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.5,
+            details={
+                "feature_id": "FEAT-Y",
+                "gate_decision": "approved",
+                "artefact_text": "approved-charter-blob",
+            },
+        )
+        real_persistence.record_stage(approved)
+
+        reader = build_stage_log_reader(real_persistence)
+        entry = reader.get_approved_stage_entry(
+            build_id=build_id,
+            stage=StageClass.ARCHITECT,
+            feature_id="FEAT-Y",
+        )
+
+        assert entry is not None
+        assert entry.artefact_text == "approved-charter-blob"
+        assert entry.artefact_paths == ()
+
+    def test_feature_id_filter_excludes_other_features(
+        self, real_persistence
+    ) -> None:
+        """A row for a different ``feature_id`` is invisible.
+
+        Per-feature scoping must be exact — a build that has approved
+        rows for FEAT-A must not surface them when the builder asks
+        about FEAT-B.
+        """
+        from datetime import UTC, datetime
+
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+        from forge.lifecycle.persistence import StageLogEntry
+
+        build_id = self._seed_build(
+            real_persistence, feature_id="FEAT-A", correlation_id="corr-4"
+        )
+        now = datetime.now(UTC)
+        approved_a = StageLogEntry(
+            build_id=build_id,
+            stage_label=StageClass.PRODUCT_OWNER.value,
+            target_kind="local_tool",
+            target_identifier="po-tool",
+            status="PASSED",
+            gate_mode="AUTO_APPROVE",
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.5,
+            details={
+                "feature_id": "FEAT-A",
+                "gate_decision": "approved",
+                "artefact_paths": [f"/work/{build_id}/a.md"],
+            },
+        )
+        real_persistence.record_stage(approved_a)
+
+        reader = build_stage_log_reader(real_persistence)
+
+        assert (
+            reader.get_approved_stage_entry(
+                build_id=build_id,
+                stage=StageClass.PRODUCT_OWNER,
+                feature_id="FEAT-B",
+            )
+            is None
+        )
+        result_a = reader.get_approved_stage_entry(
+            build_id=build_id,
+            stage=StageClass.PRODUCT_OWNER,
+            feature_id="FEAT-A",
+        )
+        assert result_a is not None
+        assert result_a.artefact_paths == (f"/work/{build_id}/a.md",)
+
+    def test_get_all_returns_every_approved_row_in_order(
+        self, real_persistence
+    ) -> None:
+        """Mode C consumes every approved ``TASK_WORK`` row.
+
+        ``get_all_approved_stage_entries`` returns the full list in
+        ``read_stages`` insertion order — which the schema's
+        ``idx_stage_log_build`` index materialises as ``started_at``.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from forge.cli._serve_deps_forward_context import build_stage_log_reader
+        from forge.lifecycle.persistence import StageLogEntry
+
+        build_id = self._seed_build(
+            real_persistence, feature_id="FEAT-MULTI", correlation_id="corr-5"
+        )
+        base = datetime.now(UTC)
+        for offset, path in enumerate(["/w/a.md", "/w/b.md", "/w/c.md"]):
+            real_persistence.record_stage(
+                StageLogEntry(
+                    build_id=build_id,
+                    stage_label=StageClass.TASK_WORK.value,
+                    target_kind="subagent",
+                    target_identifier="task-runner",
+                    status="PASSED",
+                    gate_mode="AUTO_APPROVE",
+                    started_at=base + timedelta(seconds=offset),
+                    completed_at=base + timedelta(seconds=offset),
+                    duration_secs=0.1,
+                    details={
+                        "gate_decision": "approved",
+                        "artefact_paths": [path],
+                    },
+                )
+            )
+
+        reader = build_stage_log_reader(real_persistence)
+        entries = reader.get_all_approved_stage_entries(
+            build_id=build_id,
+            stage=StageClass.TASK_WORK,
+            feature_id=None,
+        )
+
+        assert tuple(e.artefact_paths[0] for e in entries) == (
+            "/w/a.md",
+            "/w/b.md",
+            "/w/c.md",
+        )

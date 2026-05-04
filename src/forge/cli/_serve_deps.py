@@ -83,7 +83,10 @@ import sqlite3
 from typing import TYPE_CHECKING, Any
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
-from forge.cli._serve_deps_forward_context import build_forward_context_builder
+from forge.cli._serve_deps_forward_context import (
+    build_forward_context_builder,
+    build_stage_log_reader,
+)
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
@@ -414,8 +417,17 @@ def build_pipeline_consumer_deps(
     #    and side-effect free apart from the ``async_tasks`` schema
     #    DDL applied by the state-channel initialiser (which uses
     #    ``CREATE TABLE IF NOT EXISTS``).
+    #
+    #    ``build_stage_log_reader`` wraps the shared pool in the narrow
+    #    :class:`StageLogReader` Protocol surface the forward-context
+    #    builder consumes (TASK-FORGE-FRR-F010B). Before this wrapper
+    #    existed, the bare facade was handed to the builder and the
+    #    first ``build_for`` call raised AttributeError because
+    #    :class:`SqliteLifecyclePersistence` does not expose
+    #    ``get_approved_stage_entry`` itself.
+    stage_log_reader = build_stage_log_reader(sqlite_pool)
     forward_context_builder = build_forward_context_builder(
-        sqlite_pool, forge_config
+        stage_log_reader, forge_config
     )
     stage_log_recorder = build_stage_log_recorder(sqlite_pool)
     state_channel = build_autobuild_state_initialiser(sqlite_pool)
