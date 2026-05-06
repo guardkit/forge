@@ -32,6 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langgraph.graph.state import CompiledStateGraph
@@ -50,6 +51,7 @@ from forge.subagents.autobuild_runner import (
     StateChannelWriter,
     SubagentEmitter,
     WorktreeConfinementError,
+    _build_runner_graph,
     _update_state,
     assert_within_worktree,
     graph,
@@ -554,3 +556,57 @@ def test_pipeline_lifecycle_emitter_threaded_through_context() -> None:
         "emitter.on_transition must fire at the same boundary as the "
         "state-channel write per DDR-007"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC-5: model spec is the local llama-swap workhorse (TASK-FORGE-FRR-F010L)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerModelSpec:
+    """``_build_runner_graph`` calls ``create_deep_agent`` with the local
+    workhorse model — not Anthropic Claude (TASK-FORGE-FRR-F010L).
+
+    The retarget closes the
+    ``Could not resolve authentication method`` TypeError observed in the
+    2026-05-04 first-real-run rerun (RESULTS Addendum 5): the
+    autobuild_runner's first node was calling Anthropic Claude in a
+    sidecar with no ``ANTHROPIC_API_KEY``. Per ADR-ARCH-001 (local-only
+    inference) the model now resolves to llama-swap's
+    ``qwen36-workhorse`` via the OpenAI-compatible binding — exactly the
+    role RUNBOOK-v3 Phase 5.2 designates for AutoBuild Player/Coach.
+    """
+
+    def test_build_runner_graph_uses_local_workhorse_model_spec(self) -> None:
+        """``_build_runner_graph`` passes ``model="openai:qwen36-workhorse"``."""
+        fake_graph = MagicMock(name="fake_compiled_graph")
+        with patch("deepagents.create_deep_agent", return_value=fake_graph) as m:
+            result = _build_runner_graph()
+
+        assert result is fake_graph
+        m.assert_called_once()
+        kwargs = m.call_args.kwargs
+        assert kwargs["model"] == "openai:qwen36-workhorse", (
+            "autobuild_runner must resolve to the local llama-swap "
+            "workhorse, not Anthropic Cloud — see ADR-ARCH-001 and "
+            "TASK-FORGE-FRR-F010L. Got: " + repr(kwargs.get("model"))
+        )
+        # Sanity-check the rest of the kwargs are unchanged from the
+        # original wiring so this test catches accidental drift.
+        assert kwargs["tools"] == []
+        assert kwargs["name"] == AUTOBUILD_RUNNER_NAME
+        assert "system_prompt" in kwargs and kwargs["system_prompt"]
+
+    def test_build_runner_graph_does_not_target_anthropic(self) -> None:
+        """Regression guard: the model spec must not regress to Anthropic."""
+        with patch("deepagents.create_deep_agent", return_value=MagicMock()) as m:
+            _build_runner_graph()
+
+        kwargs = m.call_args.kwargs
+        model_spec = kwargs.get("model", "")
+        assert not model_spec.startswith("anthropic:"), (
+            "autobuild_runner regressed to an Anthropic model spec — this "
+            "would re-introduce the 'Could not resolve authentication "
+            "method' TypeError observed in the 2026-05-04 first-real-run "
+            "rerun (RESULTS Addendum 5). Got: " + repr(model_spec)
+        )

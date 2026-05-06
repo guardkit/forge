@@ -799,7 +799,12 @@ def _build_runner_graph() -> Any:
 
     try:
         return create_deep_agent(
-            model="anthropic:claude-haiku-4-5",
+            # TASK-FORGE-FRR-F010L: retargeted from "anthropic:claude-haiku-4-5"
+            # to the local llama-swap workhorse per ADR-ARCH-001 (local-only
+            # ethos). qwen36-workhorse is the canonical /v1/models id served
+            # on :9000 and is the model the runbook designates for AutoBuild
+            # Player/Coach/Forge work — see RUNBOOK-v3 Phase 5.2.
+            model="openai:qwen36-workhorse",
             tools=[],
             system_prompt=_AUTOBUILD_RUNNER_SYSTEM_PROMPT,
             name=AUTOBUILD_RUNNER_NAME,
