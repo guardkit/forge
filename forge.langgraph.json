@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "autobuild_runner": "./src/forge/subagents/autobuild_runner.py:graph"
+    },
+    "env": ".env"
+}
