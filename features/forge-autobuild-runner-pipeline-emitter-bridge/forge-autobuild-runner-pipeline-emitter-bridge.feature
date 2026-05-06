@@ -29,6 +29,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # Why: The headline F010M gap — every state transition the autobuild reaches inside
   #      the sidecar must produce a wire-visible envelope (DDR-030 contract). Closes
   #      the silent-on-the-wire failure mode captured in RESULTS Addendum 5.
+  @task:TASK-FRR-PEB-003
   @key-example @smoke
   Scenario: An autobuild that runs to completion in the sidecar produces the full lifecycle envelope sequence on the wire
     Given a build-queued envelope is delivered for a feature
@@ -41,6 +42,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: An async failure inside the sidecar must produce build-failed on the wire —
   #      today's F010M gap. F010F covers sync-raise; this scenario covers async-raise.
+  @task:TASK-FRR-PEB-003
   @key-example @smoke @regression
   Scenario: An autobuild that fails asynchronously inside the sidecar produces build-failed on the wire
     Given a build-queued envelope is delivered for a feature
@@ -51,6 +53,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
     And the build-failed envelope should carry a human-readable failure reason
 
   # Why: F010C correlation-id contract — every envelope must thread the inbound correlation_id
+  @task:TASK-FRR-PEB-003
   @key-example @regression
   Scenario: Every envelope published for a sidecar autobuild threads the inbound correlation identifier
     Given a build-queued envelope is delivered with a known correlation identifier
@@ -60,6 +63,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: The supervisor must remain responsive while the autobuild runs in-sidecar —
   #      operator can ask "where's my build?" mid-flight and get an answer.
+  @task:TASK-FRR-PEB-004
   @key-example
   Scenario: The supervisor remains responsive while the autobuild runs in the sidecar
     Given an autobuild is in-flight inside the sidecar
@@ -68,6 +72,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
     And the supervisor's answer should not block until the autobuild completes
 
   # Why: F010F's sync-raise safety net stays valid; the bridge must not double-publish
+  @task:TASK-FRR-PEB-005
   @key-example @regression
   Scenario: A synchronous dispatch raise still uses F010F's safety-net publish, not the bridge
     Given a build-queued envelope is delivered for a feature
@@ -80,6 +85,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # ===========================================================================
 
   # Why: A minimal autobuild (one stage) still produces the canonical sequence
+  @task:TASK-FRR-PEB-003
   @boundary
   Scenario: A single-stage autobuild produces a build-started, exactly one stage-complete, and a terminal envelope
     Given a build-queued envelope is delivered for a feature whose plan resolves to one stage
@@ -94,6 +100,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # [ASSUMPTION: confidence=medium] (ASSUM-001) Restart per-stage tolerance: the wire
   #      replays in-window envelopes after restart, recovered from the sidecar's
   #      run-event buffer. Sub-option (b) from §Open questions Q2 of the scope doc.
+  @task:TASK-FRR-PEB-009
   @boundary
   Scenario: A forge daemon restart during an in-flight autobuild replays missed envelopes after the daemon resumes
     Given an autobuild is in-flight inside the sidecar
@@ -108,6 +115,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      finite; a restart window exceeding buffer retention loses per-stage envelopes
   #      irrecoverably, but terminal observability is preserved via the bridge's
   #      recovery sweep.
+  @task:TASK-FRR-PEB-009
   @boundary @edge-case
   Scenario: A forge daemon restart longer than the bridge's replay buffer still produces a terminal envelope
     Given an autobuild is in-flight inside the sidecar
@@ -118,6 +126,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: ADR-ARCH-014 — at most one in-flight build at a time. The bridge must not
   #      double-process if duplicate-detection lets a duplicate envelope through.
+  @task:TASK-FRR-PEB-001
   @boundary @regression
   Scenario: Duplicate dispatch attempts for the same in-flight build do not produce duplicate envelopes
     Given a build is already in-flight inside the sidecar for a feature
@@ -131,6 +140,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: ADR-ARCH-008 — SQLite is the source of truth; transient JetStream failures
   #      must not corrupt the build's recorded state.
+  @task:TASK-FRR-PEB-011
   @negative @regression
   Scenario: A NATS publish failure during the bridge's terminal envelope does not regress the recorded build state
     Given an autobuild has reached a successful terminal state inside the sidecar
@@ -140,6 +150,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: Sidecar unreachable mid-build — the bridge must not tear down state; it must
   #      reconnect and resume from where it left off.
+  @task:TASK-FRR-PEB-008
   @negative @edge-case
   Scenario: A transient sidecar disconnection mid-build does not produce a spurious build-failed envelope
     Given the lifecycle bridge is observing an in-flight autobuild
@@ -152,6 +163,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # [ASSUMPTION: confidence=low] (ASSUM-003) The bridge applies a bounded reconnect
   #      schedule before declaring the build failed; the exact bound (count, backoff
   #      shape) is deferred to /feature-plan.
+  @task:TASK-FRR-PEB-008
   @negative @edge-case
   Scenario: The lifecycle bridge declares a build failed if the sidecar remains unreachable beyond the reconnect schedule
     Given an autobuild is in-flight inside the sidecar
@@ -161,6 +173,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: F010M scope — async failure is the headline gap; failure reason must be
   #      operator-actionable, not raw exception spam.
+  @task:TASK-FRR-PEB-011
   @negative @regression
   Scenario: A build-failed envelope from an async sidecar failure carries an operator-readable failure reason
     Given an autobuild is in-flight inside the sidecar
@@ -179,6 +192,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      is deferred from dispatch return to terminal arrival. Sub-option (b) from
   #      §Open questions Q3 of the scope doc; matches DDR-019's no-wedge-the-queue
   #      contract while closing the redelivery storm.
+  @task:TASK-FRR-PEB-001
   @edge-case @regression
   Scenario: The inbound build-queued envelope is acked when the autobuild reaches a terminal state, not when the dispatch chain returns
     Given a build-queued envelope is delivered for a feature
@@ -194,6 +208,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      lifecycle bridge owns both build-paused and build-resumed emissions; the
   #      approval-subscriber's resume path is amended to skip its own emit when the
   #      bridge is wired. Sub-option (a) from §Open questions Q4 of the scope doc.
+  @task:TASK-FRR-PEB-006
   @edge-case @regression
   Scenario: A mandatory-approval pause inside the sidecar produces exactly one build-paused envelope
     Given an autobuild is in-flight inside the sidecar
@@ -201,6 +216,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
     Then exactly one build-paused envelope should be published for that feature
     And the build-paused envelope should carry the inbound correlation identifier
 
+  @task:TASK-FRR-PEB-006
   @edge-case @regression
   Scenario: An approval response for a paused build produces exactly one build-resumed envelope
     Given an autobuild is paused awaiting approval
@@ -214,6 +230,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      synthesises build-cancelled on observed sidecar terminal=interrupted; forge's
   #      cancel handler does not synthesise the envelope directly. Sub-option (b)
   #      from §Open questions Q7 of the scope doc.
+  @task:TASK-FRR-PEB-007
   @edge-case
   Scenario: An operator cancellation in-flight produces a build-cancelled envelope after the sidecar acknowledges interrupt
     Given an autobuild is in-flight inside the sidecar
@@ -228,6 +245,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      --in-flight surface in F010M's wave-plan, sourced from the same SQLite
   #      registry the bridge uses for recovery. Sub-option (a) from §Open questions
   #      Q6 of the scope doc.
+  @task:TASK-FRR-PEB-012
   @edge-case
   Scenario: forge status surfaces in-flight builds the bridge is currently observing
     Given an autobuild is in-flight inside the sidecar
@@ -236,6 +254,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: Multi-build recovery — daemon restart with N in-flight builds; each must be
   #      reconciled. ADR-ARCH-014 caps at one but defensive against future loosening.
+  @task:TASK-FRR-PEB-009
   @edge-case
   Scenario: A forge daemon restart with multiple in-flight builds reconciles every build's bridge
     Given multiple autobuilds are in-flight inside the sidecar
@@ -247,6 +266,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # [ASSUMPTION: confidence=medium] (ASSUM-008) F010M's wave-plan ships a separate
   #      sidecar-aware E2E integration test; FW10-011 remains as the in-process
   #      composition lock. Sub-option (a) from §Open questions Q8 of the scope doc.
+  @task:TASK-FRR-PEB-013
   @edge-case @regression
   Scenario: The sidecar-aware integration test asserts the canonical lifecycle sequence against a real sidecar spin-up
     Given a real langgraph-runner sidecar is started for the test
@@ -268,6 +288,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      Option C (recommended), the bridge runs in-forge and threading is trivial,
   #      making this scenario a no-op test that still locks the contract should the
   #      option choice flip later.
+  @task:TASK-FRR-PEB-014
   @edge-case @regression
   Scenario: An in-sidecar emit carrying a correlation identifier that does not match the registered build is rejected
     Given an autobuild is registered with a known correlation identifier
@@ -278,6 +299,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: F010F + F010M boundary regression — sync-raise and async-terminal must
   #      not double-publish if they happen close together.
+  @task:TASK-FRR-PEB-005
   @edge-case @regression
   Scenario: A synchronous dispatch raise concurrent with the bridge's terminal observation produces exactly one build-failed envelope
     Given the bridge is observing an in-flight autobuild that has just reached a terminal failure inside the sidecar
@@ -288,6 +310,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # Why: Idempotent first-wins (FEAT-FORGE-004 contract) extended to the cancel
   #      path — two cancel requests racing must not produce two build-cancelled
   #      envelopes.
+  @task:TASK-FRR-PEB-007
   @edge-case @regression
   Scenario: Two operator cancellation requests for the same in-flight build produce exactly one build-cancelled envelope
     Given an autobuild is in-flight inside the sidecar
@@ -298,6 +321,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   # Why: Recovery shape — if build-started has already been observed and published
   #      before a daemon restart, the post-restart bridge must not re-publish it
   #      after re-attaching to the run.
+  @task:TASK-FRR-PEB-009
   @edge-case @regression
   Scenario: A daemon restart after build-started has been published does not re-publish build-started after recovery
     Given an autobuild has progressed past the build-started transition
@@ -308,6 +332,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
 
   # Why: Defensive — the langgraph-runner SDK contract may evolve; a response that
   #      doesn't parse must not crash the daemon. Logs at WARNING and reconnects.
+  @task:TASK-FRR-PEB-008
   @edge-case
   Scenario: A malformed run-state response from the sidecar is logged and the bridge reconnects rather than crashing the daemon
     Given the lifecycle bridge is observing an in-flight autobuild
@@ -323,6 +348,7 @@ Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
   #      langgraph-api / langgraph-sdk version range at startup and fails fast
   #      with a diagnostic naming the version skew if the running sidecar reports
   #      an out-of-range version.
+  @task:TASK-FRR-PEB-010
   @edge-case @regression
   Scenario: A langgraph-runner version mismatch is detected at forge startup and fails the daemon with a diagnostic
     Given forge serve is starting against a sidecar reporting a langgraph-api version outside the bridge's declared support range

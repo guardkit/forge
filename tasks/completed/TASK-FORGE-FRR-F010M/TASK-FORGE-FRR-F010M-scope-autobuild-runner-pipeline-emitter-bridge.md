@@ -1,9 +1,11 @@
 ---
 id: TASK-FORGE-FRR-F010M
 title: "Scope the autobuild_runner ↔ pipeline-lifecycle-emitter bridge (produce context doc → /feature-spec → /feature-plan)"
-status: backlog
+status: completed
 created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+updated: 2026-05-06T17:53:00Z
+completed: 2026-05-06T17:53:00Z
+completed_location: tasks/completed/TASK-FORGE-FRR-F010M/
 priority: high
 task_type: scoping
 tags:
@@ -44,9 +46,15 @@ context_files:
   - src/forge/cli/_serve_dispatcher.py
   - src/forge/adapters/nats/pipeline_consumer.py
 test_results:
-  status: pending
+  status: not_applicable
   coverage: null
   last_run: null
+  notes: |
+    F010M is a scoping task (Phase 1 scope doc → Phase 2 /feature-spec
+    → Phase 3 /feature-plan → Phase 4 file wave-plan tasks) — no
+    runtime code was changed. Verification of the scoping output is
+    structural (file presence, frontmatter linking) and is captured in
+    completion-report.md.
 ---
 
 # Task: Scope the `autobuild_runner` ↔ pipeline-lifecycle-emitter bridge (produce context doc → `/feature-spec` → `/feature-plan`)
