@@ -118,36 +118,22 @@ def apply(connection: sqlite3.Connection) -> None:
     try:
         with connection:  # commit on success; rollback on any raise.
             connection.executescript(CREATE_TABLE_SQL)
-            _ensure_published_lifecycles_column(connection)
     except sqlite3.Error as exc:
         raise BridgeRegistryMigrationError(
             f"failed to apply {TABLE_NAME!r} migration: {exc}"
         ) from exc
 
+    # Apply the ``published_lifecycles`` column migration as a
+    # follow-up so legacy installs (created before TASK-FRR-PEB-009)
+    # pick up the recovery-cursor column on first boot under T9. The
+    # follow-up is idempotent; fresh installs short-circuit because
+    # the column already exists from the ``CREATE TABLE`` above.
+    # Imported lazily to avoid a circular import at module load time
+    # (the published_lifecycles module imports TABLE_NAME from here).
+    from forge.persistence.migrations import (
+        lifecycle_bridge_published_lifecycles as published_lifecycles_migration,
+    )
+
+    published_lifecycles_migration.apply(connection)
+
     logger.debug("applied %s migration", TABLE_NAME)
-
-
-def _ensure_published_lifecycles_column(connection: sqlite3.Connection) -> None:
-    """Idempotently add the ``published_lifecycles`` column (AC-2).
-
-    The original ``CREATE TABLE`` ships with this column, but a database
-    that was migrated under a previous schema (T2 baseline) needs an
-    ``ALTER TABLE ADD COLUMN`` to land the recovery-cursor column. The
-    function is a no-op when the column already exists — safe to call
-    on every boot.
-    """
-    rows = connection.execute(
-        f"PRAGMA table_info({TABLE_NAME})"
-    ).fetchall()
-    existing = {row[1] for row in rows}
-    if PUBLISHED_LIFECYCLES_COLUMN in existing:
-        return
-    connection.execute(
-        f"ALTER TABLE {TABLE_NAME} ADD COLUMN "
-        f"{PUBLISHED_LIFECYCLES_COLUMN} TEXT NOT NULL DEFAULT '[]'"
-    )
-    logger.info(
-        "applied %s migration: added %s column",
-        TABLE_NAME,
-        PUBLISHED_LIFECYCLES_COLUMN,
-    )
