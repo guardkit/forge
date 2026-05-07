@@ -1,13 +1,13 @@
 {
   "phase_4": {
-    "status": "passed",
-    "duration_seconds": 87.32201345800422,
-    "error": null,
-    "tests_run": 157,
+    "status": "skipped",
+    "duration_seconds": 0.0,
+    "error": "specialist_skipped: budget exhausted (post_player_remaining=500.59823170898017s)",
+    "tests_run": 0,
     "tests_failed": 0,
-    "coverage_pct": 75.0,
-    "output_summary": "157 passed, 0 failed; bridge 93%, translation 85%, coexistence 82%, wireup 83%, approval_subscriber 60%, _serve_handlers 100%; targeted modules 75%.",
-    "quality_gates_passed": true
+    "coverage_pct": 0.0,
+    "output_summary": "",
+    "quality_gates_passed": false
   },
   "phase_5": {
     "status": "passed",
