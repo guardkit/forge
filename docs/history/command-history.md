@@ -9169,6 +9169,471 @@ Auto-detected intensity per provenance rules: task has parent_review: TASK-REV-F
 Let me find and move the task file, and check the in_progress conventions.
 
 
+Re-ran the runbook:
+
+F010J wires the production autobuild dispatch path end-to-end live on the wire
+The headline log lines (correlation_id e9433033-ea80-449f-885d-b2d1bdfb839e):
+
+
+[INFO] dispatch_build: persisted QUEUED row build_id=build-FEAT-43DE-20260504201222 ...
+[INFO] httpx: HTTP Request: POST http://localhost:8124/threads "HTTP/1.1 200 OK"
+[INFO] httpx: HTTP Request: POST http://localhost:8124/threads/019df49e-.../runs "HTTP/1.1 200 OK"
+[INFO] dispatch_autobuild_async: launched task_id=019df49e-d419-79a2-9f9b-307a935b9157 ...
+Every NATS / SQLite / Protocol / transport layer between jarvis chat and the autobuild_runner graph is now demonstrably wired. The autobuild graph actually launched on the langgraph dev sidecar with a real task_id. This is the deepest layer of FEAT-FORGE-010 functioning correctly in production.
+
+Two ops steps were needed to bring up the sidecar (worth folding into TASK-FORGE-FRR-F010J's deferred AC-8 deployment doc):
+
+pip install langgraph-cli[inmem] into the forge venv (51 transitive packages including langgraph-api 0.8.5, langgraph-runtime-inmem 0.28.0)
+uv pip install deepagents>=0.5.3,<0.6 into the forge venv (uv auto-detected the wrong venv from this shell's cwd, needed explicit VIRTUAL_ENV=); without this the sidecar warns autobuild_runner: deepagents not importable — exporting placeholder graph
+New forge/forge.langgraph.json config registering only autobuild_runner (the default langgraph.json also registers orchestrator which fails import on No module named 'agents')
+Two sub-feature gaps remain (both downstream of F010J, both about what the autobuild does rather than getting it to start):
+
+Gap F010.L — the autobuild_runner's first node calls Anthropic Claude API. Sidecar logs: Could not resolve authentication method. Either provision ANTHROPIC_API_KEY (config) or retarget the autobuild_runner's model to llama-swap (openai:qwen36-workhorse, aligned with ADR-ARCH-001's local-only ethos that drove TASK-FRR-002).
+Gap F010.M — when the autobuild_runner's run completes on the sidecar, forge has no bridge to translate the result into pipeline.build-complete.* / pipeline.build-failed.* envelopes on the wire. F010F's safety-net only catches sync raises in dispatch_build; an async stall or async failure inside the sidecar produces no terminal envelope. May already be partially covered by FW10-009/010 — audit needed.
+Phase 7 chat REPL did NOT render this rerun — but importantly, this isn't a regression. It's a different failure mode: previously dispatch_build raised synchronously (F010F published a build-failed; chat rendered the line); now dispatch_build succeeds and the autobuild stalls async. F010F's contract is sync-raise-only by design. F010.M is the gap to close that loop.
+
+JetStream redelivery storm is loud-but-harmless per FW10-001's deferred-ack contract — every 30s the inbound message redelivers, every redelivery hits forge's duplicate-detection guard. This is exactly the optional sibling task F010K that F010J's body called out for daemon-restart-mid-build cleanup. Not a regression.
+
+Tally — final:
+
+7 same-day reruns
+6 implementation passes
+13 wiring gaps closed (FRR-001/2/3/4 → FIX-F010 → F010A/B/C/D-forge → F010Db-jarvis → F010E → F010F → F010G → F010J)
+2 sub-feature gaps remaining (F010.L + F010.M — both about autobuild behavior not wiring)
+Artefacts:
+
+docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-04.md — appended Addendum 5; document is now 848 lines covering all seven same-day reruns
+docs/history/command_history.md — late-evening entry with the full reproducer including the sidecar bring-up recipe
+~/.jarvis/transcripts/e9433033-...txt, ~/.jarvis/traces/e9433033-...json (FRR-003 still working through 7 reruns)
+forge/forge.langgraph.json — newly created for the sidecar (currently uncommitted)
+Full evidence under /tmp/runbook-evidence-canonical-final/ including the sidecar's full Anthropic auth traceback
+The runbook went from "publish + ack proven" (2026-05-01 single rerun) to "the autobuild graph actually launches on a sidecar with a real task_id" (2026-05-04 seven reruns) — the entire wire-and-protocol stack from jarvis chat to a running autobuild is now demonstrably functioning. The two remaining gaps (F010.L + F010.M) are the first work in this entire wave that isn't about wiring drift — they're about what the autobuild does and how its results bridge back. Different shape of work, fresh territory.
+
+Want me to file TASK-FORGE-FRR-F010L and TASK-FORGE-FRR-F010M?
+
+For Gap F010.L we want to use lama-swap with the qwen3 code Next model. For Gap F010.M we need to address this I guess we need to create a doc which we can then pass with --context plus existign docs to the /feature-spec and /feature-plan command pair?  please create the suggested tasks TASK-FORGE-FRR-F010L and TASK-FORGE-FRR-F010M and I'll implement them now and then we can re-run
+
+
+Both tasks filed plus the scoping-doc skeleton. Summary:
+
+✅ TASK-FORGE-FRR-F010L — filed (priority high, complexity 2, fix-task)
+forge/tasks/backlog/feat-jarvis-internal-001-followups/TASK-FORGE-FRR-F010L-retarget-autobuild-runner-to-llama-swap-qwen3-code-next.md
+
+Notable findings from the agent's research:
+
+The model wiring is one line at src/forge/subagents/autobuild_runner.py:802 — model="anthropic:claude-haiku-4-5" inside a create_deep_agent(...) call. Single-line change to model="openai:qwen3-code-next".
+forge.langgraph.json already declares "env": ".env", so the sidecar env handoff (OPENAI_BASE_URL=http://localhost:9000/v1 + OPENAI_API_KEY=<sentinel>) can ride that file — no new flag needed.
+Jarvis precedent at lifecycle.py:576-577 gives the canonical pattern to mirror.
+AC-1 is an escalation gate: implementer must curl http://localhost:9000/v1/models | jq and confirm qwen3-code-next is actually served before changing the spec.
+✅ TASK-FORGE-FRR-F010M — filed (priority high, complexity 6, scoping-task) + scoping-doc skeleton
+Task: forge/tasks/backlog/feat-jarvis-internal-001-followups/TASK-FORGE-FRR-F010M-scope-autobuild-runner-pipeline-emitter-bridge.md
+Scoping doc skeleton: forge/docs/research/forge-autobuild-runner-pipeline-emitter-bridge-scope.md
+Four-phase shape per the operator's intent:
+
+Phase 1 (in-task): implementer fills in the empty scoping-doc skeleton (Status, Problem, Existing wiring audit covering FW10-009/010/011 + F010F + the existing PipelineLifecycleEmitter, Design space with 5 candidate options A-E enumerated as starters, Cross-cutting concerns, Open questions, Recommended option, References).
+Phase 2: /feature-spec --context docs/research/forge-autobuild-runner-pipeline-emitter-bridge-scope.md — produces BDD scenarios.
+Phase 3: /feature-plan --context <same + BDD scenarios> — produces wave-plan.
+Phase 4: file each plan task as a child of F010M (parent_task: TASK-FORGE-FRR-F010M in their frontmatter), implement.
+Notable findings from the agent's research:
+
+F010M's task body explicitly tells the implementer to read FW10-011's design_approved spec in full during the audit — its embedded-NATS + mocked-AutobuildDispatcher.dispatch design may already commit to a bridge shape, in which case F010M reduces from "design from scratch" to "complete the deferred FW10-011 AC X.Y." That's a load-bearing audit step.
+Scoping-doc skeleton intentionally has empty sections — no design decisions pre-resolved. The 5 candidate architectures (Polling / Webhooks / Streaming / In-process emit / Hybrid) are listed as starters; the implementer can add F+. The 7 cross-cutting concerns (daemon-restart recovery, deferred-ack contract, FW10-010 pause-resume, correlation_id threading, observability of in-flight builds, retry semantics, cancellation paths) are pre-enumerated by name so the implementer's analysis is structured.
+Modeled on forge-orchestrator-wiring-gap.md precedent (which anchored FEAT-FORGE-010 itself — same shape worked then).
+Sequencing per task body recommendation: Land F010L first — smaller, validates independently against the runbook (the sidecar log will switch from Could not resolve authentication method to real qwen3-code-next responses), and gives F010M's implementer a working autobuild base to scope against. F010M then builds on that.
+
+forge-prod and the langgraph dev sidecar are still running on the GB10 from the post-F010J rerun, so once you implement F010L the next runbook re-run can verify the LLM call shape changes immediately. Just docker restart forge-prod + restart the sidecar with the new env vars and queue a build.
+
+
+
+
+/task-work TASK-FORGE-FRR-F010L
+
+
+/task-complete TASK-FORGE-FRR-F010L
+
+
+
+Task Completion Summary — TASK-FORGE-FRR-F010H                                                            
+                                       
+  Outcome: completed as investigation deliverable (no code change). Status in_review → completed.           
+                                                                                                            
+  File organization                                                                                         
+                                                                                                            
+  - tasks/in_review/feat-jarvis-internal-001-followups/TASK-FORGE-FRR-F010H-…md →                           
+  tasks/completed/TASK-FORGE-FRR-F010H/TASK-FORGE-FRR-F010H-…md
+  - Frontmatter updated: status: completed, completed: 2026-05-04T19:45:00Z, completed_location,            
+  organized_files, outcome: investigation_complete_implementation_deferred, follow_up_task:                 
+  TASK-FORGE-FRR-F010I
+  - No related artefact files (investigation-only task — zero code changes)                                 
+  - No docs/state/TASK-FORGE-FRR-F010H/ directory to commit                                                 
+  - No docs/state/TASK-FORGE-FRR-F010H/ directory to commit
+
+  Acceptance criteria
+
+  - AC-1 (investigation): ✅ done — findings documented in §Implementation Notes with file:line refs
+  - AC-2 (decision): ✅ done — Option A impossible; defer to F010I review with B.1/B.2/B.3 enumerated
+  - AC-3 (implementation): ⏭️  deferred to F010I implementation companion per AC-2
+  - AC-4 (test): ⏭️  deferred to F010I implementation companion per AC-2
+  - AC-5 (operator runbook revalidation): ⏳ pending — blocked behind F010I implementation
+  - AC-6 (F010F regression): ✅ done — 4/4 dispatch-failure + 26/26 starter tests pass
+  - AC-7 (full forge suite): ✅ done — 2182 passed, same pre-existing test_clock_hygiene exclusion F010G's
+  AC-7 carried
+
+  Graphiti knowledge capture
+
+  - ✅ Task outcome episode queued in guardkit__task_outcomes (no group override)
+  - ✅ Architectural decision episode (deepagents AsyncSubAgent has no in-process invocation API) queued in
+  guardkit__project_decisions (no group override)
+
+  Feature README updates
+
+  - F010H row → ✅ completed as investigation deliverable linked to tasks/completed/TASK-FORGE-FRR-F010H/
+  - Sequence note item 14 → struck through with completion summary
+  - Frontmatter updated: status: completed, completed: 2026-05-04T19:45:00Z, completed_location,
+  organized_files, outcome: investigation_complete_implementation_deferred, follow_up_task:
+  TASK-FORGE-FRR-F010I
+  - No related artefact files (investigation-only task — zero code changes)
+  - No docs/state/TASK-FORGE-FRR-F010H/ directory to commit
+  - No docs/state/TASK-FORGE-FRR-F010H/ directory to commit
+
+  Acceptance criteria
+
+  - AC-1 (investigation): ✅ done — findings documented in §Implementation Notes with file:line refs
+  - AC-2 (decision): ✅ done — Option A impossible; defer to F010I review with B.1/B.2/B.3 enumerated
+  - AC-3 (implementation): ⏭️  deferred to F010I implementation companion per AC-2
+  - AC-4 (test): ⏭️  deferred to F010I implementation companion per AC-2
+  - AC-5 (operator runbook revalidation): ⏳ pending — blocked behind F010I implementation
+  - AC-6 (F010F regression): ✅ done — 4/4 dispatch-failure + 26/26 starter tests pass
+  - AC-7 (full forge suite): ✅ done — 2182 passed, same pre-existing test_clock_hygiene exclusion F010G's
+  AC-7 carried
+
+  Graphiti knowledge capture
+
+  - ✅ Task outcome episode queued in guardkit__task_outcomes (no group override)
+  - ✅ Architectural decision episode (deepagents AsyncSubAgent has no in-process invocation API) queued in
+  guardkit__project_decisions (no group override)
+
+  Feature README updates
+
+  - F010H row → ✅ completed as investigation deliverable linked to tasks/completed/TASK-FORGE-FRR-F010H/
+  - Sequence note item 14 → struck through with completion summary
+  - F010I added as new row (filed in backlog by F010H investigation)
+
+  Working tree (not committed — awaiting your review)
+
+  - M tasks/backlog/feat-jarvis-internal-001-followups/README.md
+  - ?? tasks/backlog/feat-jarvis-internal-001-followups/TASK-FORGE-FRR-F010I-…md (new follow-up review task)
+  - ?? tasks/completed/TASK-FORGE-FRR-F010H/ (completed task subfolder)
+
+  Follow-up
+
+  TASK-FORGE-FRR-F010I is the open task — review-mode decision between B.1 sidecar URL / B.2 hand-rolled
+  in-process ASGI / B.3 add langgraph_api dep. Run /task-work TASK-FORGE-FRR-F010I --intensity=strict
+  (review tasks benefit from strict intensity) when ready to pick the deployment shape.
+
+✻ Sautéed for 2m 54s
+
+※ recap: Goal was closing TASK-FORGE-FRR-F010H to unblock forge's autobuild Phase 7 happy path.
+  Investigation falsified the one-line-fix hypothesis, so F010H is completed as an investigation deliverable
+   and follow-up review task F010I is filed. Next: run /task-work TASK-FORGE-FRR-F010I to pick the
+  deployment shape.
+
+
+
+
+/task-review TASK-FORGE-FRR-F010I
+
+
+═══════════════════════════════════════════════════════════════════════════
+  REVIEW COMPLETE: TASK-FORGE-FRR-F010I                                                   
+  ═══════════════════════════════════════════════════════════════════════════                               
+                                                                                                            
+  Mode: Decision · Depth: Standard                                                                          
+  Report: .claude/reviews/TASK-FORGE-FRR-F010I-review-report.md                                             
+                                                                                                            
+  Recommendation: B.1 — Sidecar langgraph dev                                                               
+                                                                                                            
+  Decisive evidence (new in this review, not in F010H):                                                     
+  - langgraph-api 0.8.5's own README states: "This package implements the LangGraph API for rapid 
+  development and testing… For production use, see the various deployment options." — a maintainer          
+  contraindication for B.3.                                                                       
+  - Elastic-2.0 license (not OSI) with managed-service restrictions.                                        
+  - 30-package transitive tree (grpcio, grpcio-tools, opentelemetry, cryptography, uvloop, uvicorn, …);
+  image growth ~150-250 MB.                                                                                 
+  - langgraph-runtime-inmem is langgraph-api's persistence backend — embedding it creates two stores of     
+  truth in the same process (forge async_tasks SQLite + langgraph-api inmem state).                         
+                                                                                                            
+  Elimination trail:                                              
+  1. B.2 ruled out on maintenance-burden cliff — re-implementing langgraph-sdk's threads/runs/assistants    
+  protocol is unbounded scope.                                                                              
+  2. B.3 ruled out on maintainer contraindication + licensing + transitive-dep cost.
+  3. B.1 remains — and it's the deployment shape deepagents and langgraph-sdk were designed for.            
+                                                                                                            
+  Tradeoff acknowledged: B.1 loses on the highest-priority criterion (operational simplicity — a sidecar).  
+  Cost is bounded — well-trodden pattern. Crash-recovery semantics (FW10-007's stage_log invariant) need ~30
+   lines of supervisor-side reconciliation, deferred to optional sibling task F010K.                        
+                                                                                                            
+  Score matrix (✅ wins / ➖ ties / ❌ loses):                                                              
+   
+  ┌─────┬─────────────────────────────┬─────┬─────┬─────┐                                                   
+  │  #  │          Criterion          │ B.1 │ B.2 │ B.3 │         
+  ├─────┼─────────────────────────────┼─────┼─────┼─────┤                                                   
+  │ 1   │ Operational simplicity      │ ❌  │ ✅  │ ✅  │         
+  ├─────┼─────────────────────────────┼─────┼─────┼─────┤
+  │ 2   │ Maintenance burden          │ ✅  │ ❌  │ ➖  │
+  ├─────┼─────────────────────────────┼─────┼─────┼─────┤                                                   
+  │ 3   │ Crash-recovery preservation │ ❌  │ ✅  │ ✅  │
+  ├─────┼─────────────────────────────┼─────┼─────┼─────┤                                                   
+  │ 4   │ State-channel coherence     │ ➖  │ ✅  │ ❌  │         
+  ├─────┼─────────────────────────────┼─────┼─────┼─────┤                                                   
+  │ 5   │ Dependency footprint        │ ✅  │ ✅  │ ❌  │         
+  └─────┴─────────────────────────────┴─────┴─────┴─────┘                                                   
+                                                                  
+  Companion task spec (AC-3 sketch):                                                                        
+  - _serve_config.py: add autobuild_runner_url: str | None field + FORGE_AUTOBUILD_RUNNER_URL env var (~10
+  lines)                                                                                                    
+  - serve.py:_build_async_subagent_middleware (260-299): thread URL into AsyncSubAgent registration
+  - _serve_production.py:bind_production_serve: fail-fast if URL missing, pass URL to factory               
+  - tests/forge/test_serve_async_task_starter.py: 3 new test classes + integration test booting langgraph   
+  dev subprocess                                                                                            
+  - F010F safety-net regression test continues to pass                                                      
+                                                                                                            
+  Operator runbook deltas (AC-4):                                                                           
+  - New forge-autobuild-runner sidecar service (compose/k8s) running langgraph dev --port 8124 with forge's
+  existing langgraph.json                                                                                   
+  - FORGE_AUTOBUILD_RUNNER_URL on the forge service               
+  - Sidecar healthcheck before forge healthz reports ready                                                  
+  - Runbook §Prerequisites: one-paragraph addition                                                          
+                                                                                                            
+  Acceptance criteria status:                                                                               
+  - AC-1 option-evaluation matrix                                                                           
+  - AC-2 decision + highest-weight reason + 2-of-3 elimination trail                                        
+  - AC-3 companion task spec with file:line landings                
+  - AC-4 operator runbook deltas enumerated                                                                 
+  - AC-5 file TASK-FORGE-FRR-F010J — pending your decision                                                  
+                                                                                                            
+  ═══════════════════════════════════════════════════════════════════════════                               
+  Decision options:                                                                                         
+  - [A]ccept — approve recommendation; I'll archive the report and update task to completed                 
+  - [R]evise — request deeper analysis (which criterion / sub-path?)                                        
+  - [I]mplement — file TASK-FORGE-FRR-F010J (B.1 wiring) + optional TASK-FORGE-FRR-F010K (reconciliation)   
+  and prepare them for /task-work                                                                           
+  - [C]ancel — discard review, return task to backlog                                                       
+  ═══════════════════════════════════════════════════════════════════════════                               
+                                                                                                            
+  Your choice?                                                                                              
+                                                                                                            
+✻ Crunched for 6m 18s                                                                                       
+                                                                                          
+❯ [I]mplement                          
+
+
+═══════════════════════════════════════════════════════════════════════════                               
+  [I]MPLEMENT — Done                                                                                        
+  ═══════════════════════════════════════════════════════════════════════════                               
+                                                                  
+  Filed:                                                                                                    
+  - tasks/backlog/feat-jarvis-internal-001-followups/TASK-FORGE-FRR-F010J-wire-langgraph-runner-sidecar-url-
+  into-async-subagent-registration.md — fix-mode, complexity 4, ~180 min, parent_review:                    
+  TASK-FORGE-FRR-F010I, correlation_id continuity preserved (bf697f49-…).                                   
+                                                                                                            
+  Updated:                                                        
+  - TASK-FORGE-FRR-F010I frontmatter → status: review_complete + review_results block linking the
+  recommendation, rationale, followup task, and report path.                                                
+  - tasks/backlog/feat-jarvis-internal-001-followups/README.md — F010I row flipped to ✅ review_complete,
+  F010J row added, sequence entries 15+16 rewritten with the decision summary and what F010J closes.        
+                                                                                                            
+  Already in place:
+  - Review report at .claude/reviews/TASK-FORGE-FRR-F010I-review-report.md (option matrix, AC-1..AC-5,      
+  per-cell justifications, recommendation rationale).                                                       
+                                                                                                            
+  F010J ACs (8 total) cover: config field (AC-1), middleware threading both ways (AC-2), fail-fast at boot  
+  (AC-3), loopback-dispatch integration test booting langgraph dev (AC-4), Phase 7 runbook revalidation     
+  (AC-5), F010F safety-net regression (AC-6), full forge suite green (AC-7), runbook deltas + sidecar
+  Dockerfile + build-script update filed in same PR (AC-8).                                                 
+                                                                  
+  Optional sibling F010K (supervisor-startup reconciliation for daemon-restart-mid-build) is not filed —    
+  surfaced inside F010J's "Optional sibling task" section with a fold-vs-defer recommendation (defer). Spawn
+   F010K with /task-create if/when you want it.                                                             
+                                                                  
+  Next step: /task-work TASK-FORGE-FRR-F010J whenever you're ready to land the wiring.                      
+   
+✻ Crunched for 3m 36s                                                                                       
+                                                                                          
+※ recap: Goal is closing the autobuild_runner in-process ASGI gap so the canonical Phase 7 happy-path build 
+  sequence renders. F010I review picked Option B.1 (sidecar langgraph dev) and filed F010J as the           
+  implementation companion. Next: run /task-work TASK-FORGE-FRR-F010J. (disable recaps in /config)          
+                                                                                                            
+❯ /task-work TASK-FORGE-FRR-F010J  
+
+
+
+Phase 1 status: audit ✅, problem ✅, design space ✅ (six options, A-F, each with
+  pros/cons/open-questions and concrete langgraph-sdk==0.3.13 endpoint refs). Three sections remain:
+  cross-cutting concerns × options, open questions for /feature-spec, recommended option.
+                                                                                                            
+  Quick summary of the design space written into the doc:                                                   
+                                                                                                            
+  - A — Polling (runs.get + threads.get_state): simplest plumbing, all in-forge, but per-stage diffing is   
+  fragile and high RPM on long builds.                            
+  - B — Webhooks (runs.create(webhook=...)): zero polling cost, but terminal-only by design; needs ASGI     
+  surface in forge (F010G's deferred concern).                                                              
+  - C — Streaming (runs.join_stream SSE with Last-Event-ID): real-time, native reconnect semantics; needs a
+  translation layer from StreamPart → typed payloads.                                                       
+  - D — In-sidecar emit (replace lifecycle_emitter with HTTP/NATS proxy): preserves FW10-010's call boundary
+   unchanged, but the sidecar gains a forge-side dep and the correlation-id invariant crosses the process   
+  boundary.                                                       
+  - E — Hybrid: per-stage in-sidecar (D) + terminal-via-observer (B or A); cleanest crash-recovery story,   
+  two paths to maintain.                                                                                    
+  - F — runs.join (blocking-await per build): degenerate A, terminal-only, useful only as E's terminal
+  observer.                                                                                                 
+                                                                  
+  Two key facts the design space surfaced:                                                                  
+                                                                  
+  1. runs.create(..., webhook=str|None) is first-class in 0.3.13 — Option B is feasible, no in-sidecar code 
+  change needed.                                                  
+  2. runs.join_stream supports Last-Event-ID resume — Option C's reconnect-after-restart story is           
+  structurally clean, no per-event diffing needed.                                                          
+   
+  What's next? Three sections to finish Phase 1:                                                            
+                                                                  
+  - (a) Cross-cutting concerns × options table (the seven concerns from the F010M task body × six options). 
+  - (b) Open questions for /feature-spec (5-10 questions whose answers split the design space into testable
+  behaviors).                                                                                               
+  - (c) Recommended option (F010I-shape: pick + rationale + dominant risk).
+                                                                                                            
+  Suggest writing all three in one pass — they're tightly coupled (the cross-cutting matrix often surfaces  
+  the right recommended pick, and the open questions for /feature-spec are exactly the cross-cutting        
+  questions whose answers depend on which option is chosen). Continue?                                      
+                                                                  
+✻ Churned for 4m 8s                 
+                                                                                          
+❯ go ahead                                                             
+
+
+Phase 1 of TASK-FORGE-FRR-F010M is complete —        
+  docs/research/forge-autobuild-runner-pipeline-emitter-bridge-scope.md is fully populated and ready for
+  /feature-spec.
+                                                                                                            
+
+  Acceptance criteria status:
+
+  - AC-1 (scoping doc with eight sections) — ✅ all sections populated.
+  - AC-2 (FW10 audit) — ✅ definitive finding written: FW10-010's design is structurally broken by F010J's
+  sidecar shape (the in-process emitter handle does not survive JSON serialization across the HTTP
+  boundary), FW10-009 and F010F are sync-only, FW10-011 deliberately short-circuits over the sidecar. F010M
+  remains real feature work.
+  - AC-3 (≥4 candidate architectures) — ✅ six options (A polling, B webhooks, C streaming, D in-sidecar
+  emit with HTTP/NATS sub-shapes, E hybrid, F runs.join).
+  - AC-4 (cross-cutting concerns enumerated) — ✅ all seven from the F010M task body × six options, plus a
+  summary matrix; #5 (forge status) and #7 (cancel) flagged as option-orthogonal.
+  - AC-5/AC-6/AC-7 — pending Phases 2-4 (/feature-spec, /feature-plan, child-task filing).
+  - AC-8 — explicitly deferred to wave-plan implementation.
+
+  Recommended pick: Option C (Streaming via runs.join_stream + Last-Event-ID), with Option E (Hybrid) as
+  named fallback. Highest-weight reason: C is the only option that captures every transition (per-stage AND
+  terminal) with a structurally clean crash-recovery story. Dominant risk: SSE StreamPart → typed payload
+  translation layer brittleness across langgraph-api version bumps; mitigation written into the doc.
+
+  Key facts surfaced for /feature-spec:
+
+  - langgraph-sdk==0.3.13 ships runs.create(webhook=...), runs.join_stream(last_event_id=...), runs.join,
+  runs.cancel(action="interrupt"|"rollback") — all design-space options are buildable today, no version
+  bumps needed.
+  - Q3 (deferred-ack contract) is a wave-plan structural concern independent of bridge option choice — the
+  consumer needs to hand off the ack callback to the bridge regardless.
+  - Q4 (pause/resume canonicalisation) introduces a real double-publish risk between any bridge option and
+  FW10-010's approval_subscriber.py resume site; F010M's wave-plan must pick one canonical site.
+
+  What's next? Three options for the next session:
+
+  - (a) Drive /feature-spec against this scope doc (Phase 2 — produces BDD scenarios under docs/design/).
+  - (b) Pause and let you read the populated scope doc / push back on any of the calls (FW10-010 fold, the
+  C-vs-E recommendation, Q4 canonicalisation choice).
+  - (c) Commit the current state of the scope doc + task transition to in_progress, then resume in a
+  separate session.
+
+  Lean (b) before launching /feature-spec — the recommended option (C) and the Q4/Q8 ratification calls in
+  §Recommended option are the ones /feature-spec will rest on, and a sanity check from you before committing
+   to those is cheap and high-information.
+
+
+Let me check the precedent for where /feature-spec output lands, then invoke the skill.    
+
+
+
+
+/feature-plan "Wire the autobuild_runner sidecar lifecycle bridge into forge serve" \                                                                                           --context features/forge-autobuild-runner-pipeline-emitter-bridge/forge-autobuild-runner-pipeline-emitter-bridge_summary.md
+
+
+
+Wave-plan complete. Summary:
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ FEATURE PLAN COMPLETE — FEAT-PEBR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Feature: Wire the autobuild_runner sidecar lifecycle bridge into forge serve
+Parent:  TASK-FORGE-FRR-F010M
+Review:  TASK-REV-F010M (score 78/100, ratified Option C)
+Pre-review verifications (Q3a/Q3b=V):
+
+✓ ASSUM-003 → backoff = 1.0s/30.0s/×2/no-max + 300s deadline (sourced from _serve_daemon.py:90-93,447,468)
+✓ ASSUM-009 → moot under Option C (single-process AST guard extends; T14 locks contract)
+Generated artefacts:
+
+tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/ — 14 task files + IMPLEMENTATION-GUIDE.md + README.md
+.guardkit/features/FEAT-PEBR.yaml — structured feature manifest
+.claude/reviews/TASK-REV-F010M-review-report.md — decision-mode review report
+tasks/backlog/feat-jarvis-internal-001-followups/TASK-REV-F010M-plan-autobuild-runner-pipeline-emitter-bridge.md — review task
+Wave-plan (8 topological waves, ~22.8h estimated):
+
+
+Wave 1  T1                         (defer ack)
+Wave 2  T2                         (bridge skeleton)
+Wave 3  T3, T10                    (SSE translator, version-mismatch diag)
+Wave 4  T4                         (wire-up) ← @smoke gate begins firing
+Wave 5  T5, T6, T7, T11, T14       (parallel: F010F, pause/resume, cancel, publish-fail, ASSUM-009 lock)
+Wave 6  T8                         (reconnect+deadline)
+Wave 7  T9                         (recovery)
+Wave 8  T12, T13                   (forge status, sidecar-aware E2E)
+Smoke gates (pytest tests/bdd -m smoke -x, paths verified): fires after waves 4, 5, 6, 7, 8.
+
+§4 Integration Contract: STREAM_EVENT_SCHEMA — T3 producer, T4 consumer; T4 ships seam test asserting Pydantic-typed PipelineEvent with non-empty correlation_id.
+
+BDD linking: 26 scenarios all tagged at confidence ≥ 0.82 (lowest 0.82, highest 0.95). T2 alone untagged (structural foundation, no BDD coverage by design).
+
+Pre-flight validations: ✓ smoke_gates.command paths OK · ✓ FEAT-PEBR feature valid.
+
+Next step: /feature-build FEAT-PEBR to drive the 14-task wave-plan autonomously, or /task-work TASK-FRR-PEB-001 to start Wave 1 manually.
+
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT- PEBR --verbose
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

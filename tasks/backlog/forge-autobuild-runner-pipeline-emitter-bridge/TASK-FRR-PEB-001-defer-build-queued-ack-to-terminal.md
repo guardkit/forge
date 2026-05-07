@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-001
-title: "Defer the inbound build-queued ack from dispatch return to terminal arrival"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: Defer the inbound build-queued ack from dispatch return to terminal arrival
+status: blocked
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: refactor
 parent_task: TASK-FORGE-FRR-F010M
@@ -15,15 +15,59 @@ complexity: 5
 estimated_minutes: 60
 dependencies: []
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - consumer-contract-refactor
-  - ack-deferral
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- consumer-contract-refactor
+- ack-deferral
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 3
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-06T20:34:36.691159'
+  last_updated: '2026-05-06T21:00:09.285200'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
+      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
+    timestamp: '2026-05-06T20:34:36.691159'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
+      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
+    timestamp: '2026-05-06T20:45:58.547066'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
+      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
+    timestamp: '2026-05-06T20:52:28.677058'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Defer the inbound build-queued ack from dispatch return to terminal arrival
