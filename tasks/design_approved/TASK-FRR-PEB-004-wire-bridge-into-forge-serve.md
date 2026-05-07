@@ -1,37 +1,41 @@
 ---
-id: TASK-FRR-PEB-004
-title: "Wire LifecycleBridge into forge serve startup + correlation-id threading"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: feature
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 2
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
-dependencies:
-  - TASK-FRR-PEB-003
-tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - bridge-wire-up
-  - correlation-id-threading
 consumer_context:
-  - task: TASK-FRR-PEB-003
-    consumes: STREAM_EVENT_SCHEMA
-    framework: "forge.pipeline payloads (Pydantic v1) + forge.adapters.nats publisher"
-    driver: "langgraph-sdk runs.join_stream → StreamEventTranslator (T3)"
-    format_note: "Each translator output is a typed PipelineEvent (BuildStartedPayload | StageCompletePayload | BuildCompletePayload | BuildFailedPayload | BuildPausedPayload | BuildResumedPayload | BuildCancelledPayload) with correlation_id always populated. Bridge MUST publish via the existing forge.adapters.nats.publisher path; MUST NOT construct payloads directly."
+- consumes: STREAM_EVENT_SCHEMA
+  driver: langgraph-sdk runs.join_stream → StreamEventTranslator (T3)
+  format_note: Each translator output is a typed PipelineEvent (BuildStartedPayload
+    | StageCompletePayload | BuildCompletePayload | BuildFailedPayload | BuildPausedPayload
+    | BuildResumedPayload | BuildCancelledPayload) with correlation_id always populated.
+    Bridge MUST publish via the existing forge.adapters.nats.publisher path; MUST
+    NOT construct payloads directly.
+  framework: forge.pipeline payloads (Pydantic v1) + forge.adapters.nats publisher
+  task: TASK-FRR-PEB-003
+created: 2026-05-06 00:00:00+00:00
+dependencies:
+- TASK-FRR-PEB-003
+documentation_level: standard
+estimated_minutes: 90
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-004
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
+tags:
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- bridge-wire-up
+- correlation-id-threading
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Wire LifecycleBridge into forge serve startup + correlation-id threading
+updated: 2026-05-06 00:00:00+00:00
+wave: 2
 ---
 
 # Task: Wire LifecycleBridge into forge serve startup + correlation-id threading

@@ -1,0 +1,7 @@
+{
+  "tests_run": 23,
+  "tests_failed": 0,
+  "coverage_pct": 81.0,
+  "output_summary": "23 passed, 0 failed; coverage 81% on src/forge/lifecycle_bridge/wireup.py (161 stmts, 30 missed) via pytest+pytest-cov",
+  "quality_gates_passed": true
+}
