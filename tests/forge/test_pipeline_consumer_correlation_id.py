@@ -487,3 +487,144 @@ class TestBridgeRegistryCallsThreadCorrelationId:
             "module restructured? Update this guard if the bridge's call "
             "site inventory legitimately changed."
         )
+
+
+# ---------------------------------------------------------------------------
+# AC-6 (TASK-FRR-PEB-003): the SSE translator's emit sites must thread
+# ``correlation_id`` onto every typed payload it constructs.
+#
+# ``forge.lifecycle_bridge.translation`` is the producer side of the §4
+# STREAM_EVENT_SCHEMA contract; T4 (the downstream emitter) calls into
+# this module's ``StreamEventTranslator`` to obtain typed envelopes
+# already populated with ``correlation_id``. DDR-029 / F010C requires
+# every emitted payload to carry the inbound id, so a future call site
+# in ``translation.py`` that constructs a payload without threading the
+# field would silently regress the contract.
+#
+# This AST guard mirrors the bridge / consumer guards above: walk the
+# translator module, find every ``BuildStartedPayload(...)``,
+# ``StageCompletePayload(...)``, etc. construction, and assert each one
+# either passes ``correlation_id=`` as a keyword OR is wrapped by
+# ``attach_correlation_id_to_v1_payload(...)`` immediately after.
+# ---------------------------------------------------------------------------
+
+
+#: Pipeline payload classes whose constructions the AC-6 guard tracks.
+#: A construction is "covered" if either:
+#:   1. ``correlation_id=`` is passed as a keyword (v2 payloads), or
+#:   2. ``attach_correlation_id_to_v1_payload(<payload>, ...)`` is called
+#:      somewhere in the same function (v1 payloads — they ignore unknown
+#:      kwargs at construction time, see ``ConfigDict(extra="ignore")``).
+PIPELINE_PAYLOAD_CLASSES: frozenset[str] = frozenset(
+    {
+        "BuildStartedPayload",
+        "StageCompletePayload",
+        "BuildCompletePayload",
+        "BuildFailedPayload",
+        "BuildPausedPayload",
+        "BuildResumedPayload",
+        "BuildCancelledPayload",
+    }
+)
+
+#: V1 lifecycle payloads — these silently drop ``correlation_id`` kwargs
+#: at construction time and rely on post-hoc ``attach_*`` to populate
+#: the field. Constructions of these classes are exempt from the
+#: keyword-argument check IFF the same function calls
+#: ``attach_correlation_id_to_v1_payload`` at least once.
+V1_PAYLOAD_CLASSES: frozenset[str] = frozenset(
+    {
+        "BuildStartedPayload",
+        "BuildCompletePayload",
+        "BuildFailedPayload",
+    }
+)
+
+
+class TestTranslatorEmitSitesThreadCorrelationId:
+    """AC-6 (TASK-FRR-PEB-003) — translator emit sites thread correlation_id.
+
+    The translator constructs every typed payload listed in §4
+    STREAM_EVENT_SCHEMA. Each construction MUST either pass
+    ``correlation_id=`` as a keyword (v2 payloads) or be paired with a
+    ``attach_correlation_id_to_v1_payload`` call in the same function
+    (v1 payloads). The walk below enforces both shapes.
+    """
+
+    def test_every_translator_payload_construction_threads_correlation_id(
+        self,
+    ) -> None:
+        source_path = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "forge"
+            / "lifecycle_bridge"
+            / "translation.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+        offenders: list[tuple[int, str]] = []
+        observed_classes: set[str] = set()
+
+        for func_node in ast.walk(tree):
+            if not isinstance(
+                func_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+
+            # Does this function attach correlation_id post-hoc anywhere?
+            attaches_v1 = any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "attach_correlation_id_to_v1_payload"
+                for call in ast.walk(func_node)
+            )
+
+            for node in ast.walk(func_node):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Name):
+                    continue
+                if func.id not in PIPELINE_PAYLOAD_CLASSES:
+                    continue
+                observed_classes.add(func.id)
+
+                keyword_names = {
+                    kw.arg for kw in node.keywords if kw.arg is not None
+                }
+                threaded = "correlation_id" in keyword_names
+                if not threaded and func.id in V1_PAYLOAD_CLASSES and attaches_v1:
+                    # v1 payload paired with attach_correlation_id_to_v1_payload.
+                    threaded = True
+                if not threaded:
+                    offenders.append((node.lineno, ast.unparse(node)))
+
+        assert not offenders, (
+            "Pipeline payload construction(s) in translation.py missing "
+            "correlation_id threading (DDR-029 / TASK-FRR-PEB-003 AC-6 — "
+            "every typed envelope produced by the SSE translator MUST "
+            "carry the inbound correlation_id, either via correlation_id= "
+            "keyword (v2 payloads) or via a paired "
+            "attach_correlation_id_to_v1_payload call (v1 payloads)).\n"
+            "Offending constructions:\n"
+            + "\n".join(f"  line {lineno}: {snippet}" for lineno, snippet in offenders)
+        )
+
+        # Sanity: confirm the AST walk found at least the success-path
+        # and failure-path payloads. A future module rewrite that
+        # legitimately removes a payload should update this guard
+        # explicitly rather than silently dropping the assertion floor.
+        expected_minimum = {
+            "BuildStartedPayload",
+            "StageCompletePayload",
+            "BuildCompletePayload",
+            "BuildFailedPayload",
+        }
+        assert expected_minimum.issubset(observed_classes), (
+            f"expected at least {sorted(expected_minimum)!r} payload "
+            f"constructions in translation.py; observed "
+            f"{sorted(observed_classes)!r} — module restructured? "
+            "Update this guard if the translator's payload inventory "
+            "legitimately changed."
+        )

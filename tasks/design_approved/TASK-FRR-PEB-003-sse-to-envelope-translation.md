@@ -1,31 +1,32 @@
 ---
-id: TASK-FRR-PEB-003
-title: "SSE → typed pipeline envelope translation layer (Option C primary; Option E fallback)"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: feature
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 2
-implementation_mode: task-work
 complexity: 7
-estimated_minutes: 120
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-002
+- TASK-FRR-PEB-002
+documentation_level: standard
+estimated_minutes: 120
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-003
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - sse-translation
-  - producer-stream-event-schema
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- sse-translation
+- producer-stream-event-schema
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: SSE → typed pipeline envelope translation layer (Option C primary; Option E
+  fallback)
+updated: 2026-05-06 00:00:00+00:00
+wave: 2
 ---
 
 # Task: SSE → typed pipeline envelope translation layer
