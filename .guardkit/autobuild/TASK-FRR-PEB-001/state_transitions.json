@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-FRR-PEB-001-defer-build-queued-ack-to-terminal.md",
     "timestamp": "2026-05-07T08:54:42.090340+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-FRR-PEB-001",
+    "pre_path": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-001-defer-build-queued-ack-to-terminal.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-001-defer-build-queued-ack-to-terminal.md",
+    "timestamp": "2026-05-07T09:06:35.155283+00:00",
+    "kind": "design_approved_transition"
   }
 ]

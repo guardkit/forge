@@ -1,22 +1,6 @@
 {
   "task_id": "TASK-FRR-PEB-001",
-  "timestamp": "2026-05-07T10:08:14.116155",
-  "completed": true,
-  "phases": {
-    "phase_3": {
-      "detected": true,
-      "text": "Implementation",
-      "completed": true
-    }
-  },
-  "quality_gates": {
-    "tests_passing": true,
-    "tests_passed": 15,
-    "tests_failed": 0,
-    "coverage": null,
-    "coverage_met": null,
-    "all_passed": true
-  },
+  "turn": 2,
   "files_modified": [
     ".claude/task-plans/TASK-FRR-PEB-001-implementation-plan.md",
     ".guardkit/autobuild/TASK-FRR-PEB-001/coach_turn_1.json",
@@ -56,43 +40,24 @@
     "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-001/player_turn_2.json"
   ],
   "tests_written": [],
-  "summary": "15 tests passed, all quality gates passed",
-  "sdk_turns": {
-    "turns_used": 5,
-    "max_turns": 150,
-    "ceiling_hit": false
-  },
-  "task_type": "feature",
-  "agent_invocations_validation": {
-    "status": "violation",
-    "expected_phases": 3,
-    "actual_invocations": 2,
-    "missing_phases": [
-      "3"
-    ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-  },
-  "plan_audit": {
-    "status": "skipped",
-    "severity": null,
-    "violations": 0,
-    "extra_files": [],
-    "missing_files": [],
-    "extra_modifications": [],
-    "missing_modifications": [],
-    "extra_dependencies": [],
-    "missing_dependencies": [],
-    "loc_variance_pct": null,
-    "discrepancies_count": 0,
-    "message": "no implementation plan on disk"
-  },
-  "unconfirmed_low_confidence_assumptions": {
-    "status": "ok",
-    "unconfirmed": [],
-    "files_scanned": 0,
-    "files_skipped": 0,
-    "message": null
-  },
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: dispatch path stores BuildAckHandle in registry keyed by (feature_id, correlation_id); no msg.ack on dispatch_build return when bridge wired",
+    "AC-002: BuildAckHandle Protocol exposes ack() + nak() in src/forge/pipeline/build_ack_handle.py with no MessageEnvelope back-references",
+    "AC-003: register_ack_handle=None default preserves F010F sync-raise fallback (66 pre-existing tests unchanged)",
+    "AC-004: duplicate-detection branch unchanged \u2014 acks-and-skips before reaching the new registration site",
+    "AC-005: every consumer emit site still threads correlation_id= explicitly; F010C AST guard green",
+    "AC-006: ruff check reports 'All checks passed!' on the four touched files"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 5,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 15,
   "completion_promises": [
     {
       "criterion_id": "AC-001",
@@ -158,22 +123,6 @@
         "src/forge/cli/_serve_deps.py",
         "tests/forge/adapters/nats/test_pipeline_consumer.py"
       ]
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 70.13271741697099
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 156.83674866706133
     }
   ]
 }

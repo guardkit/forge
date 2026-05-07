@@ -1,7 +1,7 @@
 {
-  "tests_run": 15,
+  "tests_run": 101,
   "tests_failed": 0,
-  "coverage_pct": 60.0,
-  "output_summary": "15 passed, 0 failed in 0.18s; coverage 60% (pipeline_consumer 55%, build_ack_handle 89%) on changed modules",
+  "coverage_pct": 90.0,
+  "output_summary": "101 passed, 0 failed in 0.39s; coverage 90% on changed modules (pipeline_consumer 92%, build_ack_handle 89%, _serve_deps 86%)",
   "quality_gates_passed": true
 }
