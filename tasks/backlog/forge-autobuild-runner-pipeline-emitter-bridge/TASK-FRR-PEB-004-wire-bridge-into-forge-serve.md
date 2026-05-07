@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -152,6 +153,18 @@ def test_stream_event_schema_format(canonical_stream_part_fixture, build_context
   stream is suspended; supervisor returns within 100ms.
 - Shutdown test: 3 in-flight builds; `LifecycleBridge.shutdown()`
   returns within 5s; `last_event_id` persisted for each build.
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/wireup.py`
+- `tests/forge/lifecycle_bridge/test_wireup.py`
+- `tests/forge/lifecycle_bridge/test_wireup_seam.py`
+
+## Files to Modify
+
+- `src/forge/cli/_serve_dispatcher.py`
+- `src/forge/cli/_serve_deps.py`
+- `tests/forge/test_pipeline_consumer_correlation_id.py`
 
 ## Implementation notes
 

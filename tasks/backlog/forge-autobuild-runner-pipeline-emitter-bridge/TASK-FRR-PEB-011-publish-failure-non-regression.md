@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: normal
-task_type: feature
+task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -76,6 +77,15 @@ failures must not corrupt build state.
   event with `RuntimeError("model output failed Pydantic validation")`;
   assert published `BuildFailedPayload.failure_reason` matches
   `RuntimeError: model output failed Pydantic validation`.
+
+## Files to Create
+
+- `tests/forge/lifecycle_bridge/test_publish_failure.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/wireup.py`
+- `src/forge/lifecycle_bridge/translation.py`
 
 ## Implementation notes
 

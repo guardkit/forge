@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
-task_type: testing
+task_type: integration-test
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -88,6 +89,15 @@ This task **is** a test — its acceptance criteria are the test it ships.
 - Failure path is forced via a stub feature definition that triggers a
   `RuntimeError` mid-stage; assert `build-failed` envelope arrives with
   operator-readable failure reason.
+
+## Files to Create
+
+- `tests/integration/test_lifecycle_bridge_sidecar_e2e.py`
+
+## Files to Modify
+
+- `tests/integration/conftest.py`
+- `pyproject.toml`
 
 ## Implementation notes
 

@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -79,6 +80,23 @@ so the schema must support read-only queries efficiently.
 - Concurrency test: two `attach()` calls for the same `feature_id`
   serialize correctly (second overwrites first or raises, design
   decision in implementation).
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/__init__.py`
+- `src/forge/lifecycle_bridge/bridge.py`
+- `src/forge/persistence/migrations/__init__.py`
+- `src/forge/persistence/migrations/lifecycle_bridge_registry.py`
+- `src/forge/persistence/repositories/__init__.py`
+- `src/forge/persistence/repositories/bridge_registry.py`
+- `tests/forge/lifecycle_bridge/__init__.py`
+- `tests/forge/lifecycle_bridge/test_bridge.py`
+- `tests/forge/persistence/__init__.py`
+- `tests/forge/persistence/test_bridge_registry.py`
+
+## Files to Modify
+
+- `tests/forge/test_pipeline_consumer_correlation_id.py`
 
 ## Implementation notes
 

@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -83,6 +84,16 @@ behaviour.
 - Resume emit test (bridge absent): FW10-010's subscriber path emits
   exactly one `build-resumed` (existing behaviour preserved).
 - FW10-010 regression suite passes (with amendments).
+
+## Files to Create
+
+- `tests/forge/lifecycle_bridge/test_pause_resume.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/translation.py`
+- `src/forge/cli/_approval_subscriber.py`
+- `tests/forge/test_approval_subscriber.py`
 
 ## Implementation notes
 

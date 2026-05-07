@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: normal
-task_type: feature
+task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -70,6 +71,15 @@ between chat-REPL prompts. ASSUM-007 / Q6 sub-option (a) commitment.
   to a list of dicts.
 - No-mutation test: invoke `--in-flight` 100 times; assert registry
   state unchanged.
+
+## Files to Create
+
+(none — surface uses `BridgeRegistry.list_active()` from T2)
+
+## Files to Modify
+
+- `src/forge/cli/status.py`
+- `tests/forge/cli/test_status.py`
 
 ## Implementation notes
 

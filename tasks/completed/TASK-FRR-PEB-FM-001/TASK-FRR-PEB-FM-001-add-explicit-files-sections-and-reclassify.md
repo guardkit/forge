@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-FM-001
 title: Add explicit Files-to-Create/Modify sections and reclassify task_type for FRR-PEB tasks
-status: backlog
+status: completed
 created: 2026-05-07 00:00:00+00:00
-updated: 2026-05-07 00:00:00+00:00
+updated: 2026-05-07 13:00:00+00:00
+completed: 2026-05-07 13:00:00+00:00
 priority: high
 priority_band: P1
 task_type: docs

@@ -5,7 +5,8 @@ status: blocked
 created: 2026-05-06 00:00:00+00:00
 updated: 2026-05-06 00:00:00+00:00
 priority: high
-task_type: refactor
+task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -126,6 +127,17 @@ via the SSE stream.
   nak on raise).
 - Regression test for duplicate-detection: second `build-queued` for the
   same `(feature_id, correlation_id)` is acked and skipped.
+
+## Files to Create
+
+- `src/forge/pipeline/build_ack_handle.py`
+- `tests/forge/adapters/nats/__init__.py`
+- `tests/forge/adapters/nats/test_pipeline_consumer.py`
+
+## Files to Modify
+
+- `src/forge/adapters/nats/pipeline_consumer.py`
+- `src/forge/cli/_serve_deps.py`
 
 ## Implementation notes
 

@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
-task_type: feature
+task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -82,6 +83,16 @@ contract extended to the cancel path).
   legacy path remains functional (preserves backward compatibility for
   test paths). Or: assert the legacy path is gone and tests must wire
   a bridge — design decision to make in implementation.
+
+## Files to Create
+
+- `tests/forge/lifecycle_bridge/test_cancel.py`
+- `src/forge/cli/_serve_handlers.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/bridge.py`
+- `src/forge/lifecycle_bridge/translation.py`
 
 ## Implementation notes
 

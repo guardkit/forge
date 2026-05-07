@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -98,6 +99,17 @@ in-flight builds).
   → 30.0s (cap) on consecutive failures.
 - Backoff reset test: succeed after 3 failures; next failure starts at
   1.0s (not 8.0s).
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/reconnect.py`
+- `tests/forge/lifecycle_bridge/test_reconnect.py`
+- `tests/forge/lifecycle_bridge/test_deadline.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/wireup.py`
+- `src/forge/lifecycle_bridge/bridge.py`
 
 ## Implementation notes
 

@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
-task_type: feature
+task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -76,6 +77,16 @@ startup rather than silently emitting malformed envelopes at runtime.
 - Sidecar unreachable at startup → version check uses a 5s timeout;
   on timeout, retry policy falls back to T8's reconnect rather than
   failing the daemon (so a slow-starting sidecar doesn't kill forge).
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/version_check.py`
+- `tests/forge/lifecycle_bridge/test_version_check.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/bridge.py`
+- `pyproject.toml`
 
 ## Implementation notes
 

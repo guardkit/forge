@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -101,6 +102,19 @@ in-flight builds before the operator's next prompt.
   recovery tasks run concurrently; assert all 3 complete within 30s.
 - Pre-startup-ordering test: `recover_in_flight()` completes before
   consumer starts processing new envelopes.
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/recovery.py`
+- `src/forge/persistence/migrations/lifecycle_bridge_published_lifecycles.py`
+- `tests/forge/lifecycle_bridge/test_recovery.py`
+- `tests/forge/lifecycle_bridge/test_recovery_idempotency.py`
+
+## Files to Modify
+
+- `src/forge/lifecycle_bridge/bridge.py`
+- `src/forge/cli/_serve_daemon.py`
+- `tests/forge/test_cli_serve_daemon.py`
 
 ## Implementation notes
 

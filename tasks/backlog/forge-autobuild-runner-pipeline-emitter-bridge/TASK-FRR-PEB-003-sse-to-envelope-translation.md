@@ -6,6 +6,7 @@ created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
 task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -113,6 +114,19 @@ Summary:
   the field.
 - Property test: every `StreamPart` in the canonical fixture produces
   exactly one envelope or `None` (no double-emits).
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/translation.py`
+- `tests/forge/lifecycle_bridge/test_translation.py`
+- `tests/forge/lifecycle_bridge/test_translation_contract.py`
+- `tests/forge/lifecycle_bridge/fixtures/__init__.py`
+- `tests/forge/lifecycle_bridge/fixtures/sse_stream_canonical.jsonl`
+
+## Files to Modify
+
+- `pyproject.toml`
+- `tests/forge/test_pipeline_consumer_correlation_id.py`
 
 ## Implementation notes
 

@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: high
-task_type: feature
+task_type: refactor
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -79,6 +80,15 @@ paths cannot double-publish even when they fire concurrently.
 - First-wins ordering test (AC-3) — three sub-cases: bridge wins,
   F010F wins, concurrent. All produce exactly one envelope.
 - F010F regression suite passes unchanged.
+
+## Files to Create
+
+- `src/forge/lifecycle_bridge/coexistence.py`
+- `tests/forge/lifecycle_bridge/test_coexistence.py`
+
+## Files to Modify
+
+- `src/forge/cli/_serve_deps.py`
 
 ## Implementation notes
 

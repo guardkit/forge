@@ -5,7 +5,8 @@ status: backlog
 created: 2026-05-06T00:00:00Z
 updated: 2026-05-06T00:00:00Z
 priority: low
-task_type: testing
+task_type: feature
+documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
 feature_id: FEAT-PEBR
@@ -89,6 +90,14 @@ This task **is** a test. The acceptance criteria are the test.
   correlation-id from the SSE event).
 - Test would fail if a future contributor added a fallback like
   `correlation_id = stream_part.event_data.get("correlation_id", context.correlation_id)`.
+
+## Files to Create
+
+- `tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py`
+
+## Files to Modify
+
+(none)
 
 ## Implementation notes
 
