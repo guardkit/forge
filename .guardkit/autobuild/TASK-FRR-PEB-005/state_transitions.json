@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
     "timestamp": "2026-05-07T12:42:49.075491+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-FRR-PEB-005",
+    "pre_path": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
+    "timestamp": "2026-05-07T12:59:30.875467+00:00",
+    "kind": "design_approved_transition"
   }
 ]
