@@ -391,3 +391,99 @@ class TestAllRejectionPathsThreadCorrelationId:
             "restructured? Update this guard if the rejection-path count "
             "legitimately changed."
         )
+
+
+# ---------------------------------------------------------------------------
+# AC-5 (TASK-FRR-PEB-002 extension): the lifecycle bridge's BridgeRegistry
+# call sites must thread ``correlation_id=`` as a keyword argument.
+#
+# The lifecycle bridge owns the SSE connection lifecycle (TASK-FRR-PEB-002)
+# and persists every active build's metadata via
+# :class:`forge.persistence.repositories.bridge_registry.BridgeRegistry`.
+# DDR-029 requires the ``correlation_id`` to be threaded through every
+# write so the bridge's audit trail can be reconstructed end-to-end.
+#
+# This AST guard mirrors :class:`TestAllRejectionPathsThreadCorrelationId`'s
+# ``test_every_safe_publish_failure_call_passes_correlation_id_kwarg`` and
+# is the AC-5 deliverable: a future PR adding a BridgeRegistry call site
+# in ``forge.lifecycle_bridge.bridge`` without threading the field MUST
+# fail this test.
+# ---------------------------------------------------------------------------
+
+
+#: Methods on :class:`BridgeRegistry` that the AC-5 guard tracks. Every
+#: call to one of these names from inside ``forge/lifecycle_bridge/bridge.py``
+#: must pass ``correlation_id=`` as a keyword argument.
+BRIDGE_REGISTRY_METHODS: frozenset[str] = frozenset(
+    {"record", "update_lifecycle", "get", "list_active", "delete"}
+)
+
+
+class TestBridgeRegistryCallsThreadCorrelationId:
+    """AC-5 (TASK-FRR-PEB-002) — BridgeRegistry call sites thread correlation_id.
+
+    The lifecycle bridge's primary writer (``LifecycleBridge.attach``)
+    and reader (``LifecycleBridge.recover_in_flight``) MUST thread the
+    inbound ``correlation_id`` through to every BridgeRegistry call.
+    The AST walk below identifies attribute calls of the form
+    ``self._registry.<method>(...)`` (or any local ``registry`` alias)
+    where ``<method>`` is in :data:`BRIDGE_REGISTRY_METHODS`, and
+    asserts each one passes ``correlation_id=`` as a keyword.
+
+    AST-based so a defensive refactor that wraps the calls in
+    intermediate helpers cannot silently regress the contract.
+    """
+
+    def test_every_bridge_registry_call_passes_correlation_id_kwarg(
+        self,
+    ) -> None:
+        source_path = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "forge"
+            / "lifecycle_bridge"
+            / "bridge.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+        offenders: list[tuple[int, str]] = []
+        bridge_calls: list[ast.Call] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # Match attribute calls like ``self._registry.record(...)``
+            # or ``registry.record(...)``.
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr not in BRIDGE_REGISTRY_METHODS:
+                continue
+            bridge_calls.append(node)
+            keyword_names = {kw.arg for kw in node.keywords if kw.arg is not None}
+            if "correlation_id" not in keyword_names:
+                offenders.append((node.lineno, ast.unparse(node)))
+
+        assert not offenders, (
+            "BridgeRegistry call site(s) missing correlation_id= kwarg "
+            "(DDR-029 / TASK-FRR-PEB-002 AC-5 — every BridgeRegistry "
+            "operation MUST thread the inbound correlation_id). "
+            "Offending call sites:\n"
+            + "\n".join(f"  line {lineno}: {snippet}" for lineno, snippet in offenders)
+        )
+
+        # Sanity check: confirm the AST walk found the expected call
+        # sites — at least ``record`` (attach), ``delete`` (detach), and
+        # ``list_active`` (recover_in_flight). Without this assertion the
+        # test would silently pass if the bridge module were renamed or
+        # emptied.
+        observed_methods = {
+            call.func.attr  # type: ignore[attr-defined]
+            for call in bridge_calls
+        }
+        expected_minimum = {"record", "delete", "list_active"}
+        assert expected_minimum.issubset(observed_methods), (
+            f"expected at least {sorted(expected_minimum)!r} BridgeRegistry "
+            f"call sites in bridge.py, observed {sorted(observed_methods)!r} — "
+            "module restructured? Update this guard if the bridge's call "
+            "site inventory legitimately changed."
+        )

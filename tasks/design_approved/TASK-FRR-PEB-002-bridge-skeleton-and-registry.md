@@ -1,31 +1,31 @@
 ---
-id: TASK-FRR-PEB-002
-title: "LifecycleBridge skeleton + SQLite in-flight registry"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: feature
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 1
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-001
+- TASK-FRR-PEB-001
+documentation_level: standard
+estimated_minutes: 90
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-002
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - bridge-skeleton
-  - sqlite-registry
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- bridge-skeleton
+- sqlite-registry
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: LifecycleBridge skeleton + SQLite in-flight registry
+updated: 2026-05-06 00:00:00+00:00
+wave: 1
 ---
 
 # Task: LifecycleBridge skeleton + SQLite in-flight registry

@@ -1,0 +1,173 @@
+{
+  "task_id": "TASK-FRR-PEB-002",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/lifecycle_bridge/test_bridge.py tests/forge/persistence/test_bridge_registry.py tests/forge/test_pipeline_consumer_correlation_id.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_pipeline_consumer_correlation_id.py::TestAllRejectionPathsThreadCorrelationId::test_malformed_payload_with_parseable_envelope_threads_correlation_id PASSED [ 93%]\ntests/forge/test_pipeline_consumer_correlation_id.py::TestAllRejectionPathsThreadCorrelationId::test_malformed_envelope_passes_none PASSED [ 95%]\ntests/forge/test_pipeline_consumer_correlation_id.py::TestAllRejectionPathsThreadCorrelationId::test_every_safe_publish_failure_call_passes_correlation_id_kwarg PASSED [ 97%]\ntests/forge/test_pipeline_consumer_correlation_id.py::TestBridgeRegistryCallsThreadCorrelationId::test_every_bridge_registry_call_passes_correlation_id_kwarg PASSED [100%]\n============================== 43 passed in 0.31s ==============================",
+      "duration_seconds": 1.0443620681762695
+    },
+    "requirements": {
+      "criteria_total": 6,
+      "criteria_met": 0,
+      "all_criteria_met": false,
+      "missing": [
+        "AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`",
+        "AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a",
+        "AC-3: A `BridgeRegistry` repository class exposes:",
+        "AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`",
+        "AC-5: F010C correlation-id contract: every `BridgeRegistry` operation",
+        "AC-6: All modified files pass project-configured lint/format checks"
+      ]
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-001",
+      "notes": "No completion promise for AC-001"
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-002",
+      "notes": "No completion promise for AC-002"
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "AC-3: A `BridgeRegistry` repository class exposes:",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-003",
+      "notes": "No completion promise for AC-003"
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-004",
+      "notes": "No completion promise for AC-004"
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "AC-5: F010C correlation-id contract: every `BridgeRegistry` operation",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-005",
+      "notes": "No completion promise for AC-005"
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "No completion promise for AC-006",
+      "notes": "No completion promise for AC-006"
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-001",
+        "notes": "No completion promise for AC-001"
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-002",
+        "notes": "No completion promise for AC-002"
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "AC-3: A `BridgeRegistry` repository class exposes:",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-003",
+        "notes": "No completion promise for AC-003"
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-004",
+        "notes": "No completion promise for AC-004"
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "AC-5: F010C correlation-id contract: every `BridgeRegistry` operation",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-005",
+        "notes": "No completion promise for AC-005"
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "No completion promise for AC-006",
+        "notes": "No completion promise for AC-006"
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "missing_requirement",
+      "description": "Not all acceptance criteria met",
+      "missing_criteria": [
+        "AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`",
+        "AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a",
+        "AC-3: A `BridgeRegistry` repository class exposes:",
+        "AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`",
+        "AC-5: F010C correlation-id contract: every `BridgeRegistry` operation",
+        "AC-6: All modified files pass project-configured lint/format checks"
+      ]
+    }
+  ],
+  "rationale": "Missing 6 acceptance criteria: AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`, AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a, AC-3: A `BridgeRegistry` repository class exposes:, AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`, AC-5: F010C correlation-id contract: every `BridgeRegistry` operation, AC-6: All modified files pass project-configured lint/format checks",
+  "context_used": "## Job-Specific Context\n\nBudget: 1719/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- INSTRUCTS_USER_TO_START\n- IS_USED_FOR\n- ASSIGNS_TASK_TO\n- HAS_SEQUENCE_STEP\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- REQUIRES_USE_OF\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- IS_CREATED_FOR\n- DELEGATES_TO\n- MUST_CREATE\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false,
+  "environment_conditional_approval": false,
+  "honesty_verification": {
+    "verified": true,
+    "honesty_score": 1.0,
+    "discrepancy_count": 0,
+    "resolved_paths": []
+  }
+}
