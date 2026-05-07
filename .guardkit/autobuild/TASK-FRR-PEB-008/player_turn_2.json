@@ -1,22 +1,6 @@
 {
   "task_id": "TASK-FRR-PEB-008",
-  "timestamp": "2026-05-07T15:43:25.407395",
-  "completed": true,
-  "phases": {
-    "phase_3": {
-      "detected": true,
-      "text": "Implementation",
-      "completed": true
-    }
-  },
-  "quality_gates": {
-    "tests_passing": true,
-    "tests_passed": 185,
-    "tests_failed": 0,
-    "coverage": null,
-    "coverage_met": null,
-    "all_passed": true
-  },
+  "turn": 2,
   "files_modified": [
     ".claude/task-plans/TASK-FRR-PEB-008-implementation-plan.md",
     ".guardkit/autobuild/TASK-FRR-PEB-006/checkpoints.json",
@@ -47,43 +31,27 @@
   "tests_written": [
     "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/tests/forge/lifecycle_bridge/test_reconnect.py"
   ],
-  "summary": "185 tests passed, all quality gates passed",
-  "sdk_turns": {
-    "turns_used": 18,
-    "max_turns": 160,
-    "ceiling_hit": false
-  },
-  "task_type": "feature",
-  "agent_invocations_validation": {
-    "status": "violation",
-    "expected_phases": 3,
-    "actual_invocations": 2,
-    "missing_phases": [
-      "3"
-    ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-  },
-  "plan_audit": {
-    "status": "passed",
-    "severity": "low",
-    "violations": 0,
-    "extra_files": [],
-    "missing_files": [],
-    "extra_modifications": [],
-    "missing_modifications": [],
-    "extra_dependencies": [],
-    "missing_dependencies": [],
-    "loc_variance_pct": null,
-    "discrepancies_count": 0,
-    "message": "no plan on disk; all 5 task-body-declared file(s) present"
-  },
-  "unconfirmed_low_confidence_assumptions": {
-    "status": "ok",
-    "unconfirmed": [],
-    "files_scanned": 0,
-    "files_skipped": 0,
-    "message": null
-  },
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-1 ReconnectPolicy class with module-level constants and exponential schedule",
+    "AC-2 Observer reconnect loop wired into wireup with transient error handling and no fixed max-retry",
+    "AC-3 Per-build deadline timer with handler invocation, detach/shutdown cancellation",
+    "AC-4 Malformed SSE responses logged at WARNING + reconnect-as-attempt + no daemon crash",
+    "AC-5 Monkey-patchable constants for fast tests (both reconnect and deadline)",
+    "AC-6 BuildContext (with correlation_id) is delivered to the deadline handler",
+    "AC-7 Ruff lint passes on all 3 modified source files"
+  ],
+  "requirements_remaining": [
+    "Wireup-side production wiring: construct a deadline_handler closure in _serve_production.bind_production_serve and pass it to the LifecycleBridge constructor \u2014 the bridge accepts deadline_handler= but production composition is a follow-up step (small, mechanical change in the serve factory)."
+  ],
+  "sdk_turns_used": 18,
+  "sdk_max_turns": 160,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 185,
   "completion_promises": [
     {
       "criterion_id": "AC-1",
@@ -158,22 +126,6 @@
         "src/forge/lifecycle_bridge/bridge.py",
         "src/forge/lifecycle_bridge/wireup.py"
       ]
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 68.9643172500655
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 262.9281457499601
     }
   ]
 }

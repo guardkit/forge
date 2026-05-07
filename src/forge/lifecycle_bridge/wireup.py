@@ -64,6 +64,7 @@ deployment finishes (TASK-FORGE-FRR-F010I/J).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -85,11 +86,46 @@ from forge.lifecycle_bridge.bridge import (
     BuildContext,
     LifecycleBridge,
 )
+from forge.lifecycle_bridge.reconnect import ReconnectPolicy
 from forge.lifecycle_bridge.translation import (
     PipelineEvent,
     StreamEventTranslator,
 )
 from forge.pipeline.build_ack_handle import BuildAckHandle
+
+
+def _build_transient_stream_errors() -> tuple[type[BaseException], ...]:
+    """Resolve the set of stream-level errors that trigger reconnect.
+
+    AC-2 / AC-4 (TASK-FRR-PEB-008): the observer reconnects on
+    ``httpx.ConnectError``, ``httpx.ReadError``, and malformed JSON
+    raised during SSE consumption. ``httpx`` is a runtime dependency
+    of the production sidecar transport but is imported defensively so
+    unit tests that exercise the wireup with an in-memory async
+    generator do not require it.
+    """
+    errors: list[type[BaseException]] = [json.JSONDecodeError]
+    try:
+        import httpx  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - production always has httpx
+        return tuple(errors)
+    errors.extend([httpx.ConnectError, httpx.ReadError])
+    return tuple(errors)
+
+
+#: Tuple of exception types treated as "transient stream error" by the
+#: observer's reconnect loop (AC-2 / AC-4). On one of these, the
+#: observer logs at WARNING, sleeps the current
+#: :class:`ReconnectPolicy` backoff, and re-opens the stream. Any
+#: other exception is non-transient and exits the observer.
+#:
+#: Tests that need to inject a transient error without taking a
+#: dependency on ``httpx`` can monkey-patch this tuple — e.g.
+#: ``monkeypatch.setattr(wireup, "TRANSIENT_STREAM_ERRORS",
+#: (json.JSONDecodeError, MyConnectError))``.
+TRANSIENT_STREAM_ERRORS: tuple[type[BaseException], ...] = (
+    _build_transient_stream_errors()
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +136,7 @@ __all__ = [
     "LifecycleBridgeWireup",
     "StreamSource",
     "TERMINAL_PAYLOAD_TYPES",
+    "TRANSIENT_STREAM_ERRORS",
 ]
 
 
@@ -528,69 +565,33 @@ class LifecycleBridgeWireup:
             identity = await self._wait_for_identity(feature_id)
             thread_id, run_id = identity if identity is not None else (None, None)
 
-            stream_iter = self._stream_source(
-                feature_id=feature_id,
+            # AC-2 / AC-4 (TASK-FRR-PEB-008): wrap the SSE iteration
+            # in a reconnect loop driven by :class:`ReconnectPolicy`.
+            # On any transient stream error the loop logs WARNING,
+            # sleeps the current backoff, and re-opens a fresh stream.
+            # On clean stream end (no transient error) the loop exits
+            # and the consumer falls back to JetStream redelivery.
+            terminal_seen = await self._consume_with_reconnect(
+                context=context,
+                handle=handle,
                 thread_id=thread_id,
                 run_id=run_id,
             )
-            terminal_seen = False
-            async for stream_part in stream_iter:
-                try:
-                    event = self._translator.translate(stream_part, context)
-                except Exception as exc:  # noqa: BLE001
-                    # A translator bug must not break the observer loop —
-                    # log and skip the offending part. The fallback path
-                    # is JetStream ``ack_wait`` redelivery if the build
-                    # never reaches terminal.
-                    logger.warning(
-                        "wireup._observer_loop: translator raised (%s) for "
-                        "feature_id=%s; skipping stream part",
-                        exc,
-                        feature_id,
-                    )
-                    continue
-                if event is None:
-                    continue
-                published_ok = await self._publish_event(event, feature_id)
-                if isinstance(event, TERMINAL_PAYLOAD_TYPES):
-                    if published_ok:
-                        terminal_seen = True
-                        await self._on_terminal(
-                            handle, feature_id, correlation_id
-                        )
-                        break
-                    # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope publish
-                    # failed (transient broker error / network blip). Do
-                    # NOT mark the build "terminal-published" in SQLite,
-                    # do NOT ack the inbound build-queued message — the
-                    # JetStream consumer will redeliver and the bridge's
-                    # T9 recovery cycle will retry the publish on the
-                    # next observation. ADR-ARCH-008: SQLite is
-                    # source-of-truth; transient broker failures must
-                    # NOT corrupt build state.
-                    logger.warning(
-                        "wireup._observer_loop: terminal envelope publish "
-                        "failed for feature_id=%s correlation_id=%s "
-                        "payload_type=%s; leaving SQLite registry row "
-                        "intact and inbound build-queued un-acked "
-                        "(JetStream redelivery + recover_in_flight will "
-                        "retry — no spurious ack)",
-                        feature_id,
-                        correlation_id,
-                        type(event).__name__,
-                    )
-                    break
 
             if not terminal_seen:
                 # Stream closed without a terminal envelope — the
                 # build's outcome is unknown to the bridge. Do NOT ack:
                 # JetStream ``ack_wait`` will redeliver and the consumer
-                # will re-register. Log so operators see the orphaned
-                # observer.
+                # will re-register. The per-build deadline timer (in
+                # :class:`LifecycleBridge`) will eventually publish
+                # ``pipeline.build-failed`` if the sidecar stays
+                # unreachable past the 300s budget (AC-3).
                 logger.warning(
                     "wireup._observer_loop: stream for feature_id=%s "
                     "ended without a terminal envelope; leaving inbound "
-                    "queued message un-acked (JetStream will redeliver)",
+                    "queued message un-acked (JetStream will redeliver, "
+                    "deadline timer will publish build-failed if the "
+                    "sidecar stays unreachable)",
                     feature_id,
                 )
         except asyncio.CancelledError:
@@ -624,6 +625,194 @@ class LifecycleBridgeWireup:
             # registration for the same feature_id can succeed.
             self._observers.pop(feature_id, None)
             self._handles.pop(feature_id, None)
+
+    # ------------------------------------------------------------------
+    # SSE consumption with reconnect (TASK-FRR-PEB-008 AC-2 / AC-4)
+    # ------------------------------------------------------------------
+
+    async def _consume_with_reconnect(
+        self,
+        *,
+        context: BuildContext,
+        handle: BuildAckHandle,
+        thread_id: str | None,
+        run_id: str | None,
+    ) -> bool:
+        """Drive the SSE stream with :class:`ReconnectPolicy` retry semantics.
+
+        AC-2 / AC-4 (TASK-FRR-PEB-008):
+
+        * On each iteration, open a fresh ``StreamSource`` and drive
+          it via :meth:`_drive_stream_session`.
+        * If the session returns a terminal envelope, return ``True``
+          — the observer is done.
+        * If the session ends cleanly (StopAsyncIteration with no
+          terminal), return ``False`` — let the supervisor surface the
+          orphaned-stream warning and rely on JetStream redelivery.
+        * If the session raises one of :data:`TRANSIENT_STREAM_ERRORS`
+          (``httpx.ConnectError``, ``httpx.ReadError``,
+          :class:`json.JSONDecodeError`), log at WARNING, sleep the
+          current backoff, and reconnect. **No fixed maximum retry
+          count** — the loop terminates only on
+          :class:`asyncio.CancelledError` (operator cancel / shutdown)
+          or on the per-build deadline timer (AC-3) firing in the
+          background.
+        * Any other exception is non-transient: log loudly and exit
+          the observer (the bridge's deadline timer remains the
+          backstop).
+
+        ``policy.reset()`` fires on a healthy event yield from the
+        session (AC-1: backoff resets on successful reconnection).
+        """
+        feature_id = context.feature_id
+        policy = ReconnectPolicy()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                stream_iter = self._stream_source(
+                    feature_id=feature_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
+            except TRANSIENT_STREAM_ERRORS as exc:
+                # AC-4: malformed source-construction (rare, but
+                # possible if the langgraph-runner returns a
+                # malformed connection-init response). Same WARNING +
+                # backoff path as in-stream errors; the failed open
+                # counts as an attempt.
+                backoff = policy.next_backoff()
+                logger.warning(
+                    "wireup._consume_with_reconnect: transient SSE error "
+                    "opening stream (%s: %s) for feature_id=%s "
+                    "attempt=%d; reconnecting in %.2fs",
+                    type(exc).__name__,
+                    exc,
+                    feature_id,
+                    attempt,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            try:
+                terminal_seen, ended_cleanly = await self._drive_stream_session(
+                    stream_iter=stream_iter,
+                    context=context,
+                    handle=handle,
+                    policy=policy,
+                )
+            except TRANSIENT_STREAM_ERRORS as exc:
+                # AC-2 / AC-4: transient mid-stream error. Log and
+                # reconnect after the backoff sleep. The reconnect
+                # counts as an attempt (policy.next_backoff() advances
+                # the schedule).
+                backoff = policy.next_backoff()
+                logger.warning(
+                    "wireup._consume_with_reconnect: transient SSE error "
+                    "(%s: %s) for feature_id=%s attempt=%d; "
+                    "reconnecting in %.2fs (Last-Event-ID persistence "
+                    "is owned by the registry)",
+                    type(exc).__name__,
+                    exc,
+                    feature_id,
+                    attempt,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            if terminal_seen:
+                return True
+            if ended_cleanly:
+                return False
+            # Defensive — should not be reachable; the session always
+            # returns one of (terminal_seen, ended_cleanly) or raises.
+            return False  # pragma: no cover
+
+    async def _drive_stream_session(
+        self,
+        *,
+        stream_iter: AsyncIterator[Any],
+        context: BuildContext,
+        handle: BuildAckHandle,
+        policy: ReconnectPolicy,
+    ) -> tuple[bool, bool]:
+        """Drive one SSE session to terminal arrival or clean exhaustion.
+
+        Returns ``(terminal_seen, ended_cleanly)``:
+
+        * ``(True, True)`` — terminal envelope observed and published;
+          ack/detach completed.
+        * ``(False, True)`` — stream iterator exhausted with no
+          terminal; the caller decides whether to redeliver.
+        * ``(False, False)`` — terminal envelope observed but publish
+          failed; the caller treats it as session-ended (no retry,
+          per the existing TASK-FRR-PEB-011 AC-2/AC-3 contract).
+
+        Raises any exception in :data:`TRANSIENT_STREAM_ERRORS` so
+        the caller can run the reconnect path. Translator-level
+        exceptions (per-part malformed data) are caught locally and
+        logged at WARNING — they do **not** trigger reconnect because
+        they are envelope-shape bugs, not transport failures.
+        """
+        feature_id = context.feature_id
+        correlation_id = context.correlation_id
+        terminal_seen = False
+        first_event_observed = False
+        async for stream_part in stream_iter:
+            # AC-1: a successful event yield resets the backoff so a
+            # later transient failure starts again from
+            # RECONNECT_INITIAL_BACKOFF.
+            if not first_event_observed:
+                policy.reset()
+                first_event_observed = True
+            try:
+                event = self._translator.translate(stream_part, context)
+            except Exception as exc:  # noqa: BLE001
+                # AC-4: a malformed part is logged at WARNING and
+                # skipped (the observer continues iterating; per-part
+                # translator errors are not transport failures so they
+                # do not trigger the reconnect-with-backoff path).
+                logger.warning(
+                    "wireup._drive_stream_session: translator raised (%s) "
+                    "for feature_id=%s; skipping stream part",
+                    exc,
+                    feature_id,
+                )
+                continue
+            if event is None:
+                continue
+            published_ok = await self._publish_event(event, feature_id)
+            if isinstance(event, TERMINAL_PAYLOAD_TYPES):
+                if published_ok:
+                    terminal_seen = True
+                    await self._on_terminal(
+                        handle, feature_id, correlation_id
+                    )
+                    return (True, True)
+                # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope
+                # publish failed (transient broker error / network
+                # blip). Do NOT mark the build "terminal-published",
+                # do NOT ack the inbound build-queued message — the
+                # JetStream consumer will redeliver and the bridge's
+                # T9 recovery cycle will retry the publish on the
+                # next observation. ADR-ARCH-008: SQLite is
+                # source-of-truth; transient broker failures must
+                # NOT corrupt build state.
+                logger.warning(
+                    "wireup._drive_stream_session: terminal envelope "
+                    "publish failed for feature_id=%s correlation_id=%s "
+                    "payload_type=%s; leaving SQLite registry row "
+                    "intact and inbound build-queued un-acked "
+                    "(JetStream redelivery + recover_in_flight will "
+                    "retry — no spurious ack)",
+                    feature_id,
+                    correlation_id,
+                    type(event).__name__,
+                )
+                return (False, False)
+        return (terminal_seen, True)
 
     # ------------------------------------------------------------------
     # Publisher dispatch
