@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-004
-title: "Wire LifecycleBridge into forge serve startup + correlation-id threading"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: Wire LifecycleBridge into forge serve startup + correlation-id threading
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: feature
 documentation_level: standard
@@ -15,23 +15,55 @@ implementation_mode: task-work
 complexity: 6
 estimated_minutes: 90
 dependencies:
-  - TASK-FRR-PEB-003
+- TASK-FRR-PEB-003
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - bridge-wire-up
-  - correlation-id-threading
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- bridge-wire-up
+- correlation-id-threading
 consumer_context:
-  - task: TASK-FRR-PEB-003
-    consumes: STREAM_EVENT_SCHEMA
-    framework: "forge.pipeline payloads (Pydantic v1) + forge.adapters.nats publisher"
-    driver: "langgraph-sdk runs.join_stream → StreamEventTranslator (T3)"
-    format_note: "Each translator output is a typed PipelineEvent (BuildStartedPayload | StageCompletePayload | BuildCompletePayload | BuildFailedPayload | BuildPausedPayload | BuildResumedPayload | BuildCancelledPayload) with correlation_id always populated. Bridge MUST publish via the existing forge.adapters.nats.publisher path; MUST NOT construct payloads directly."
+- task: TASK-FRR-PEB-003
+  consumes: STREAM_EVENT_SCHEMA
+  framework: forge.pipeline payloads (Pydantic v1) + forge.adapters.nats publisher
+  driver: "langgraph-sdk runs.join_stream \u2192 StreamEventTranslator (T3)"
+  format_note: Each translator output is a typed PipelineEvent (BuildStartedPayload
+    | StageCompletePayload | BuildCompletePayload | BuildFailedPayload | BuildPausedPayload
+    | BuildResumedPayload | BuildCancelledPayload) with correlation_id always populated.
+    Bridge MUST publish via the existing forge.adapters.nats.publisher path; MUST
+    NOT construct payloads directly.
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 2
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T12:47:22.341545'
+  last_updated: '2026-05-07T13:12:46.189975'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit\
+      \ detected high-severity discrepancies \u2014 1 missing file(s): tests/forge/lifecycle_bridge/test_wireup_seam.py"
+    timestamp: '2026-05-07T12:47:22.341545'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T13:02:23.738252'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Wire LifecycleBridge into forge serve startup + correlation-id threading

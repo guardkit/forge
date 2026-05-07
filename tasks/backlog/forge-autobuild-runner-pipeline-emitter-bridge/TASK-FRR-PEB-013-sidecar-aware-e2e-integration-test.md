@@ -1,11 +1,11 @@
 ---
 id: TASK-FRR-PEB-013
-title: "Sidecar-aware E2E integration test (separate from FW10-011)"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: Sidecar-aware E2E integration test (separate from FW10-011)
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
-task_type: integration-test
+task_type: integration
 documentation_level: standard
 parent_task: TASK-FORGE-FRR-F010M
 parent_review: TASK-REV-F010M
@@ -15,18 +15,34 @@ implementation_mode: task-work
 complexity: 7
 estimated_minutes: 120
 dependencies:
-  - TASK-FRR-PEB-009
-  - TASK-FRR-PEB-010
+- TASK-FRR-PEB-009
+- TASK-FRR-PEB-010
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - sidecar-aware-e2e
-  - regression-lock
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- sidecar-aware-e2e
+- regression-lock
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T16:21:54.555297'
+  last_updated: '2026-05-07T16:55:13.892260'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T16:21:54.555297'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Sidecar-aware E2E integration test (separate from FW10-011)

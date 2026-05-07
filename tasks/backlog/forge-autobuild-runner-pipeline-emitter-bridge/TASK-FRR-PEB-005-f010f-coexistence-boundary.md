@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-005
-title: "F010F coexistence — sync-raise still uses safety-net publish, not the bridge"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: "F010F coexistence \u2014 sync-raise still uses safety-net publish, not the\
+  \ bridge"
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: refactor
 documentation_level: standard
@@ -15,17 +16,42 @@ implementation_mode: task-work
 complexity: 5
 estimated_minutes: 60
 dependencies:
-  - TASK-FRR-PEB-004
+- TASK-FRR-PEB-004
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - boundary-regression
-  - f010f-coexistence
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- boundary-regression
+- f010f-coexistence
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 2
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T13:42:44.804810'
+  last_updated: '2026-05-07T14:10:25.819968'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: '- AC names test file(s) that don''t exist on disk: tests/forge/test_safety_net_publish.py.
+      The independent-test gate cannot run honestly while AC-cited tests are absent.'
+    timestamp: '2026-05-07T13:42:44.804810'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T13:59:30.868584'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: F010F coexistence — sync-raise still uses safety-net publish, not the bridge

@@ -1,12 +1,12 @@
 id: FEAT-PEBR
 name: Forge autobuild_runner pipeline-emitter bridge
-description: 'Wire the autobuild_runner sidecar lifecycle bridge into forge serve.
-  Closes F010J → F010M wire gap so every state transition the autobuild reaches inside
-  the langgraph-runner sidecar (success, async failure, pause, resume, cancel) produces
-  a wire-visible pipeline.* envelope on JetStream. Approach: Option C (Streaming via
-  runs.join_stream + Last-Event-ID), Option E (Hybrid) as named fallback.'
+description: "Wire the autobuild_runner sidecar lifecycle bridge into forge serve.\
+  \ Closes F010J \u2192 F010M wire gap so every state transition the autobuild reaches\
+  \ inside the langgraph-runner sidecar (success, async failure, pause, resume, cancel)\
+  \ produces a wire-visible pipeline.* envelope on JetStream. Approach: Option C (Streaming\
+  \ via runs.join_stream + Last-Event-ID), Option E (Hybrid) as named fallback."
 created: '2026-05-06T17:39:06.069807'
-status: planned
+status: completed
 complexity: 8
 estimated_tasks: 14
 tasks:
@@ -15,120 +15,228 @@ tasks:
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-001-defer-build-queued-ack-to-terminal.md
   complexity: 5
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T09:54:40.330388'
+  completed_at: '2026-05-07T10:12:12.247715'
 - id: TASK-FRR-PEB-002
   name: Bridge skeleton and SQLite registry
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-002-bridge-skeleton-and-registry.md
   complexity: 6
   dependencies:
   - TASK-FRR-PEB-001
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T10:12:12.275587'
+  completed_at: '2026-05-07T10:35:22.973043'
 - id: TASK-FRR-PEB-003
   name: SSE to typed envelope translator
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-003-sse-to-envelope-translation.md
   complexity: 7
   dependencies:
   - TASK-FRR-PEB-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T12:39:37.109328'
+  completed_at: '2026-05-07T12:47:22.297948'
 - id: TASK-FRR-PEB-004
   name: Wire bridge into forge serve
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-004-wire-bridge-into-forge-serve.md
   complexity: 6
   dependencies:
   - TASK-FRR-PEB-003
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T12:47:22.328356'
+  completed_at: '2026-05-07T13:12:46.193231'
 - id: TASK-FRR-PEB-005
   name: F010F coexistence boundary
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-005-f010f-coexistence-boundary.md
   complexity: 5
   dependencies:
   - TASK-FRR-PEB-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T13:42:44.746149'
+  completed_at: '2026-05-07T14:24:24.796357'
 - id: TASK-FRR-PEB-006
   name: Pause resume canonicalisation
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-006-pause-resume-canonicalisation.md
   complexity: 6
   dependencies:
   - TASK-FRR-PEB-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-05-07T14:46:54.107597'
+  completed_at: '2026-05-07T15:20:45.601318'
 - id: TASK-FRR-PEB-007
   name: Cancel emit ownership
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-007-cancel-emit-ownership.md
   complexity: 5
   dependencies:
   - TASK-FRR-PEB-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T13:42:44.759944'
+  completed_at: '2026-05-07T14:24:24.809366'
 - id: TASK-FRR-PEB-008
   name: Reconnect with backoff and deadline
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md
   complexity: 6
   dependencies:
   - TASK-FRR-PEB-007
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T15:20:47.500256'
+  completed_at: '2026-05-07T15:49:11.833062'
 - id: TASK-FRR-PEB-009
   name: Restart recovery replay and sweep
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-009-restart-recovery-replay-and-sweep.md
   complexity: 7
   dependencies:
   - TASK-FRR-PEB-008
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T15:49:13.447031'
+  completed_at: '2026-05-07T16:21:52.457711'
 - id: TASK-FRR-PEB-010
   name: Version mismatch diagnostic
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-010-version-mismatch-diagnostic.md
   complexity: 4
   dependencies:
   - TASK-FRR-PEB-002
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 2
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 2
+  current_turn: 0
+  started_at: '2026-05-07T10:35:23.005426'
+  completed_at: '2026-05-07T11:17:09.347385'
 - id: TASK-FRR-PEB-011
   name: Publish failure non regression
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-011-publish-failure-non-regression.md
   complexity: 4
   dependencies:
   - TASK-FRR-PEB-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T13:42:44.767367'
+  completed_at: '2026-05-07T14:24:24.816446'
 - id: TASK-FRR-PEB-012
   name: forge status in-flight surface
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-012-forge-status-in-flight-surface.md
   complexity: 4
   dependencies:
   - TASK-FRR-PEB-009
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T16:21:54.529662'
+  completed_at: '2026-05-07T16:55:13.895359'
 - id: TASK-FRR-PEB-013
   name: Sidecar aware E2E integration test
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-013-sidecar-aware-e2e-integration-test.md
@@ -136,20 +244,38 @@ tasks:
   dependencies:
   - TASK-FRR-PEB-009
   - TASK-FRR-PEB-010
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T16:21:54.538333'
+  completed_at: '2026-05-07T16:55:13.902937'
 - id: TASK-FRR-PEB-014
   name: ASSUM 009 contract lock test
   file_path: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-014-assum-009-contract-lock-test.md
   complexity: 3
   dependencies:
   - TASK-FRR-PEB-004
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-05-07T13:42:44.774014'
+  completed_at: '2026-05-07T14:24:24.824036'
 orchestration:
   parallel_groups:
   - - TASK-FRR-PEB-001
@@ -169,9 +295,37 @@ orchestration:
   estimated_duration_minutes: 1370
   recommended_parallel: 4
 smoke_gates:
-  after_wave: [4, 5, 6, 7, 8]
-  command: |
-    set -e
+  after_wave:
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  command: 'set -e
+
     PYTHONPATH=src python -m pytest tests/bdd -m smoke -x
+
+    '
   expected_exit: 0
   timeout: 300
+  exit5_is_hard_fail: false
+execution:
+  started_at: '2026-05-07T09:54:40.298677'
+  completed_at: '2026-05-07T16:55:15.615223'
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  total_turns: 23
+  tasks_completed: 14
+  tasks_failed: 0
+  current_wave: 8
+  completed_waves:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  last_updated: '2026-05-07T16:55:13.910354'
+  archived_at: null
+  archived_to: null

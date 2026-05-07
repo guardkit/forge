@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-012
-title: "forge status --in-flight surface from the lifecycle bridge registry"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: forge status --in-flight surface from the lifecycle bridge registry
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: normal
 task_type: refactor
 documentation_level: standard
@@ -15,17 +15,37 @@ implementation_mode: direct
 complexity: 4
 estimated_minutes: 45
 dependencies:
-  - TASK-FRR-PEB-009
+- TASK-FRR-PEB-009
 tags:
-  - forge-serve
-  - forge-status
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - operator-observability
+- forge-serve
+- forge-status
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- operator-observability
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T16:21:54.555831'
+  last_updated: '2026-05-07T16:29:42.983508'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T16:21:54.555831'
+    player_summary: 'Added a `--in-flight` flag to `forge status` (cli/status.py).
+      The new surface opens a short-lived read-only connection to forge.db (`read_only_connect`)
+      and reads the `lifecycle_bridge_registry` table via `BridgeRegistry.list_active(correlation_id=''cli-status:in-flight'')`.
+      New helpers: `_read_in_flight_entries`, `_build_in_flight_table`, `_serialise_in_flight_entry`,
+      `_emit_in_flight_json`, plus the `_IN_FLIGHT_CORRELATION_ID` constant. Routing
+      logic in `status_cmd`: when `--in-flight` is set, t'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: `forge status --in-flight` surface from the lifecycle bridge registry

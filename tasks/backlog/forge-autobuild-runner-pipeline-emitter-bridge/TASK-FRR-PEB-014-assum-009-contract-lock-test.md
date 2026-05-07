@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-014
-title: "ASSUM-009 contract-lock test (no-op under Option C; insurance against option flip)"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: ASSUM-009 contract-lock test (no-op under Option C; insurance against option
+  flip)
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: low
 task_type: feature
 documentation_level: standard
@@ -15,17 +16,37 @@ implementation_mode: direct
 complexity: 3
 estimated_minutes: 30
 dependencies:
-  - TASK-FRR-PEB-004
+- TASK-FRR-PEB-004
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - assum-009-contract-lock
-  - option-flip-insurance
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- assum-009-contract-lock
+- option-flip-insurance
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T13:42:44.806022'
+  last_updated: '2026-05-07T13:46:17.462457'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T13:42:44.806022'
+    player_summary: Added a single contract-lock test at tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py
+      per the task spec. The test (a) constructs a BuildContext(correlation_id='A')
+      and a StreamPart whose data dict carries different correlation_id values at
+      the top level ('B-from-sse-event') AND inside the AutobuildState snapshot ('C-from-snapshot')
+      -- if any code path ever read from the event, the dynamic assertion would surface
+      a non-'A' value; (b) calls StreamEventTranslator.translate(stream_p
+    player_success: true
+    coach_success: true
 ---
 
 # Task: ASSUM-009 contract-lock test (no-op under Option C; insurance against option flip)

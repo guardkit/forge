@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-006
-title: "Pause/resume canonicalisation — bridge owns both, FW10-010 resume site amended out"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: "Pause/resume canonicalisation \u2014 bridge owns both, FW10-010 resume site\
+  \ amended out"
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: refactor
 documentation_level: standard
@@ -15,17 +16,59 @@ implementation_mode: task-work
 complexity: 6
 estimated_minutes: 90
 dependencies:
-  - TASK-FRR-PEB-005
+- TASK-FRR-PEB-005
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - pause-resume
-  - fw10-010-amendment
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- pause-resume
+- fw10-010-amendment
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 3
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T14:46:54.122095'
+  last_updated: '2026-05-07T15:20:45.597915'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit\
+      \ detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py,\
+      \ tests/forge/test_approval_subscriber.py"
+    timestamp: '2026-05-07T14:46:54.122095'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit\
+      \ detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py,\
+      \ tests/forge/test_approval_subscriber.py"
+    timestamp: '2026-05-07T14:56:34.043047'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T15:04:24.535740'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Pause/resume canonicalisation — bridge owns both, FW10-010 resume site amended out

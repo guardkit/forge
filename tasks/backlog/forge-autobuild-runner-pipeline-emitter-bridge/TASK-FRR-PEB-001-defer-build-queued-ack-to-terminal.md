@@ -1,7 +1,7 @@
 ---
 id: TASK-FRR-PEB-001
 title: Defer the inbound build-queued ack from dispatch return to terminal arrival
-status: blocked
+status: in_review
 created: 2026-05-06 00:00:00+00:00
 updated: 2026-05-06 00:00:00+00:00
 priority: high
@@ -26,45 +26,34 @@ test_results:
   coverage: null
   last_run: null
 autobuild_state:
-  current_turn: 3
+  current_turn: 2
   max_turns: 5
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
   base_branch: main
-  started_at: '2026-05-06T20:34:36.691159'
-  last_updated: '2026-05-06T21:00:09.285200'
+  started_at: '2026-05-07T09:54:40.344758'
+  last_updated: '2026-05-07T10:12:12.244555'
   turns:
   - turn: 1
     decision: feedback
     feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
       \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
       \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
-      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
-      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
-    timestamp: '2026-05-06T20:34:36.691159'
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance\
+      \ criteria met:\n  \u2022 AC-1: `pipeline_consumer.py`'s dispatch path no longer\
+      \ calls `msg.ack()`\n  \u2022 AC-2: A new `BuildAckHandle` interface exposes\
+      \ `ack()` and `nak()`\n  \u2022 AC-3: When no bridge is wired (e.g. unit-test\
+      \ path), the consumer falls\n  \u2022 AC-4: Duplicate-detection from the existing\
+      \ consumer is unchanged \u2014\n  \u2022 AC-5: F010C correlation-id AST guard\
+      \ remains green \u2014 every emit site\n  (1 more)"
+    timestamp: '2026-05-07T09:54:40.344758'
     player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
       actual: 0'
     player_success: true
     coach_success: true
   - turn: 2
-    decision: feedback
-    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
-      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
-      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
-      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
-      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
-    timestamp: '2026-05-06T20:45:58.547066'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 3
-    decision: feedback
-    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
-      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
-      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
-      \ 3: `python-api-specialist` (Implementation)\n- Plan audit detected high-severity\
-      \ discrepancies \u2014 1 missing file(s): pipeline_consumer.py"
-    timestamp: '2026-05-06T20:52:28.677058'
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T10:06:35.145435'
     player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
       actual: 0'
     player_success: true

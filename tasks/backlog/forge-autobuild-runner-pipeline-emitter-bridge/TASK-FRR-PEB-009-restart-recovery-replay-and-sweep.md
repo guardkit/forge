@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-009
-title: "Restart recovery — Last-Event-ID replay + recovery sweep"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: "Restart recovery \u2014 Last-Event-ID replay + recovery sweep"
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: feature
 documentation_level: standard
@@ -15,17 +15,46 @@ implementation_mode: task-work
 complexity: 7
 estimated_minutes: 120
 dependencies:
-  - TASK-FRR-PEB-008
+- TASK-FRR-PEB-008
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - restart-recovery
-  - last-event-id
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- restart-recovery
+- last-event-id
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 2
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T15:49:13.459099'
+  last_updated: '2026-05-07T16:21:52.454035'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit\
+      \ detected high-severity discrepancies \u2014 2 missing file(s): src/forge/persistence/migrations/lifecycle_bridge_published_lifecycles.py,\
+      \ tests/forge/lifecycle_bridge/test_recovery_idempotency.py"
+    timestamp: '2026-05-07T15:49:13.459099'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T16:11:00.338399'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: Restart recovery — Last-Event-ID replay + recovery sweep

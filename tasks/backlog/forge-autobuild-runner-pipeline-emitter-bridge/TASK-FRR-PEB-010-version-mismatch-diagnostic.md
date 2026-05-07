@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-010
-title: "langgraph-runner version-mismatch diagnostic at startup (fail-fast)"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: langgraph-runner version-mismatch diagnostic at startup (fail-fast)
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: refactor
 documentation_level: standard
@@ -15,17 +15,49 @@ implementation_mode: task-work
 complexity: 4
 estimated_minutes: 60
 dependencies:
-  - TASK-FRR-PEB-002
+- TASK-FRR-PEB-002
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - version-skew-diagnostic
-  - sdk-volatility-mitigation
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- version-skew-diagnostic
+- sdk-volatility-mitigation
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 2
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T10:35:23.020407'
+  last_updated: '2026-05-07T10:49:19.366920'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance\
+      \ criteria met:\n  \u2022 AC-1: A new `src/forge/lifecycle_bridge/version_check.py`\
+      \ declares a\n  \u2022 AC-2: At `LifecycleBridge` initialisation (before `recover_in_flight`),\n\
+      \  \u2022 AC-3: On out-of-range version, the bridge raises\n  \u2022 AC-4: The\
+      \ diagnostic is also printed to stderr (in addition to\n  \u2022 AC-5: On in-range\
+      \ version, startup proceeds silently (no INFO log\n  (1 more)"
+    timestamp: '2026-05-07T10:35:23.020407'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T10:44:09.558150'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: langgraph-runner version-mismatch diagnostic at startup (fail-fast)

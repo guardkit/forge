@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-011
-title: "NATS publish-failure non-regression — SQLite state preserved, no spurious ack"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: "NATS publish-failure non-regression \u2014 SQLite state preserved, no spurious\
+  \ ack"
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: normal
 task_type: refactor
 documentation_level: standard
@@ -15,17 +16,38 @@ implementation_mode: direct
 complexity: 4
 estimated_minutes: 45
 dependencies:
-  - TASK-FRR-PEB-004
+- TASK-FRR-PEB-004
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - publish-failure
-  - sqlite-source-of-truth
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- publish-failure
+- sqlite-source-of-truth
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T13:42:44.803706'
+  last_updated: '2026-05-07T13:52:28.446158'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T13:42:44.803706'
+    player_summary: "Implemented NATS publish-failure non-regression in two surgical\
+      \ changes:\n\n1. wireup.py: Refactored _publish_event() to return bool (True\
+      \ on publish success, False on failure). The observer loop now branches on the\
+      \ bool: when isinstance(event, TERMINAL_PAYLOAD_TYPES) AND publish failed, it\
+      \ logs WARNING with payload subject + correlation_id and exits the loop WITHOUT\
+      \ calling _on_terminal \u2014 preserving (a) the SQLite registry row (no detach)\
+      \ and (b) the inbound build-queued ack handle (no ack). JetS"
+    player_success: true
+    coach_success: true
 ---
 
 # Task: NATS publish-failure non-regression — SQLite state preserved, no spurious ack

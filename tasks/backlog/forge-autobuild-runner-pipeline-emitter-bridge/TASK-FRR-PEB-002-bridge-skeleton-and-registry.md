@@ -1,9 +1,9 @@
 ---
 id: TASK-FRR-PEB-002
-title: "LifecycleBridge skeleton + SQLite in-flight registry"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+title: LifecycleBridge skeleton + SQLite in-flight registry
+status: in_review
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: feature
 documentation_level: standard
@@ -15,17 +15,50 @@ implementation_mode: task-work
 complexity: 6
 estimated_minutes: 90
 dependencies:
-  - TASK-FRR-PEB-001
+- TASK-FRR-PEB-001
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - bridge-skeleton
-  - sqlite-registry
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- bridge-skeleton
+- sqlite-registry
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 2
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR
+  base_branch: main
+  started_at: '2026-05-07T10:12:12.287213'
+  last_updated: '2026-05-07T10:35:22.970183'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Advisory (non-blocking): task-work produced a report with 2 of 3\
+      \ expected agent invocations. Missing phases: 3 (Implementation). Consider invoking\
+      \ these agents via the Task tool to strengthen stack-specific quality:\n- Phase\
+      \ 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance\
+      \ criteria met:\n  \u2022 AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes\
+      \ a `LifecycleBridge`\n  \u2022 AC-2: A new `lifecycle_bridge_registry` SQLite\
+      \ table is created via a\n  \u2022 AC-3: A `BridgeRegistry` repository class\
+      \ exposes:\n  \u2022 AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`\n\
+      \  \u2022 AC-5: F010C correlation-id contract: every `BridgeRegistry` operation\n\
+      \  (1 more)"
+    timestamp: '2026-05-07T10:12:12.287213'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-07T10:25:54.968204'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: LifecycleBridge skeleton + SQLite in-flight registry
