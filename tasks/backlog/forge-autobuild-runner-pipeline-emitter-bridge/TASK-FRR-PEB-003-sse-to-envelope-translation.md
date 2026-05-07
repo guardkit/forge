@@ -1,9 +1,10 @@
 ---
 id: TASK-FRR-PEB-003
-title: "SSE → typed pipeline envelope translation layer (Option C primary; Option E fallback)"
+title: "SSE \u2192 typed pipeline envelope translation layer (Option C primary; Option\
+  \ E fallback)"
 status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
+created: 2026-05-06 00:00:00+00:00
+updated: 2026-05-06 00:00:00+00:00
 priority: high
 task_type: feature
 documentation_level: standard
@@ -15,13 +16,13 @@ implementation_mode: task-work
 complexity: 7
 estimated_minutes: 120
 dependencies:
-  - TASK-FRR-PEB-002
+- TASK-FRR-PEB-002
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - sse-translation
-  - producer-stream-event-schema
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- sse-translation
+- producer-stream-event-schema
 test_results:
   status: pending
   coverage: null
@@ -133,10 +134,6 @@ Summary:
 - Touchpoints: `src/forge/lifecycle_bridge/translation.py` (primary);
   `tests/forge/lifecycle_bridge/fixtures/` (new fixtures);
   `pyproject.toml` (version bounds).
-- Reference: `src/forge/dispatch/autobuild_async.py`'s existing
-  `LifecycleEmitterAdapter` does the analogous in-process mapping
-  (lifecycle string → emit method); this task replicates that shape
-  out-of-process on raw `StreamPart` events.
 - The `stream_mode="values"` mode carries full `AutobuildState` channel
   snapshots; the translator detects state transitions by comparing
   consecutive snapshots. Reuse `AutobuildState` types from
