@@ -28,9 +28,10 @@ semantics: a stale row is overwritten without leaving dangling state.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final
 
@@ -118,6 +119,11 @@ class BridgeRegistryEntry:
     current_lifecycle: str
     updated_at: datetime
     last_event_id: str | None = None
+    #: Subjects (e.g. ``"build-started"``, ``"stage-complete"``) already
+    #: published for this build. Recovery uses this set to skip a
+    #: replayed envelope that was already on the wire pre-restart
+    #: (TASK-FRR-PEB-009 AC-2). Persisted as JSON-encoded TEXT.
+    published_lifecycles: frozenset[str] = field(default_factory=frozenset)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +134,39 @@ class BridgeRegistryEntry:
 def _now_iso() -> str:
     """Return the current UTC timestamp in ISO-8601 format."""
     return datetime.now(UTC).isoformat()
+
+
+def _decode_published_lifecycles(raw: str | None) -> frozenset[str]:
+    """Decode the JSON-encoded ``published_lifecycles`` column.
+
+    A missing / empty value yields an empty frozenset — older registry
+    rows written before the AC-2 column landed default to "nothing
+    published" so the recovery sweep can re-publish from scratch.
+    """
+    if not raw:
+        return frozenset()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "bridge_registry: published_lifecycles column contained invalid "
+            "JSON (%r); treating as empty set",
+            raw,
+        )
+        return frozenset()
+    if not isinstance(decoded, list):
+        logger.warning(
+            "bridge_registry: published_lifecycles JSON not a list (%r); "
+            "treating as empty set",
+            decoded,
+        )
+        return frozenset()
+    return frozenset(str(item) for item in decoded)
+
+
+def _encode_published_lifecycles(subjects: frozenset[str] | set[str]) -> str:
+    """Encode the ``published_lifecycles`` set for storage."""
+    return json.dumps(sorted(subjects))
 
 
 def _row_to_entry(row: sqlite3.Row | tuple) -> BridgeRegistryEntry:
@@ -146,6 +185,7 @@ def _row_to_entry(row: sqlite3.Row | tuple) -> BridgeRegistryEntry:
             "attached_at",
             "current_lifecycle",
             "updated_at",
+            "published_lifecycles",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -160,6 +200,9 @@ def _row_to_entry(row: sqlite3.Row | tuple) -> BridgeRegistryEntry:
         attached_at=datetime.fromisoformat(data["attached_at"]),
         current_lifecycle=data["current_lifecycle"],
         updated_at=datetime.fromisoformat(data["updated_at"]),
+        published_lifecycles=_decode_published_lifecycles(
+            data.get("published_lifecycles")
+        ),
     )
 
 
@@ -236,6 +279,7 @@ class BridgeRegistry:
                 f"{entry.current_lifecycle!r}; allowed={sorted(ALLOWED_LIFECYCLES)!r}"
             )
 
+        published_json = _encode_published_lifecycles(entry.published_lifecycles)
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
             self._cx.execute(
@@ -243,18 +287,20 @@ class BridgeRegistry:
                 INSERT INTO {TABLE_NAME} (
                     feature_id, thread_id, run_id, correlation_id,
                     last_event_id, ack_handle_token, deadline_at,
-                    attached_at, current_lifecycle, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    attached_at, current_lifecycle, updated_at,
+                    published_lifecycles
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(feature_id) DO UPDATE SET
-                    thread_id        = excluded.thread_id,
-                    run_id           = excluded.run_id,
-                    correlation_id   = excluded.correlation_id,
-                    last_event_id    = excluded.last_event_id,
-                    ack_handle_token = excluded.ack_handle_token,
-                    deadline_at      = excluded.deadline_at,
-                    attached_at      = excluded.attached_at,
-                    current_lifecycle= excluded.current_lifecycle,
-                    updated_at       = excluded.updated_at
+                    thread_id            = excluded.thread_id,
+                    run_id               = excluded.run_id,
+                    correlation_id       = excluded.correlation_id,
+                    last_event_id        = excluded.last_event_id,
+                    ack_handle_token     = excluded.ack_handle_token,
+                    deadline_at          = excluded.deadline_at,
+                    attached_at          = excluded.attached_at,
+                    current_lifecycle    = excluded.current_lifecycle,
+                    updated_at           = excluded.updated_at,
+                    published_lifecycles = excluded.published_lifecycles
                 """,
                 (
                     entry.feature_id,
@@ -267,6 +313,7 @@ class BridgeRegistry:
                     entry.attached_at.isoformat(),
                     entry.current_lifecycle,
                     entry.updated_at.isoformat(),
+                    published_json,
                 ),
             )
             self._cx.execute("COMMIT;")
@@ -394,7 +441,8 @@ class BridgeRegistry:
             f"""
             SELECT feature_id, thread_id, run_id, correlation_id,
                    last_event_id, ack_handle_token, deadline_at,
-                   attached_at, current_lifecycle, updated_at
+                   attached_at, current_lifecycle, updated_at,
+                   published_lifecycles
               FROM {TABLE_NAME}
              WHERE feature_id = ?
             """,
@@ -436,12 +484,106 @@ class BridgeRegistry:
             f"""
             SELECT feature_id, thread_id, run_id, correlation_id,
                    last_event_id, ack_handle_token, deadline_at,
-                   attached_at, current_lifecycle, updated_at
+                   attached_at, current_lifecycle, updated_at,
+                   published_lifecycles
               FROM {TABLE_NAME}
              ORDER BY attached_at ASC
             """,
         ).fetchall()
         return [_row_to_entry(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Write API — mark_published (TASK-FRR-PEB-009 AC-2)
+    # ------------------------------------------------------------------
+
+    def mark_published(
+        self,
+        feature_id: str,
+        subject: str,
+        *,
+        correlation_id: str,
+        last_event_id: str | None = None,
+    ) -> frozenset[str]:
+        """Append ``subject`` to the row's ``published_lifecycles`` set.
+
+        The publisher path appends BEFORE invoking the actual NATS
+        publish so a concurrent recovery sweep cannot re-publish a
+        subject already on the wire (TASK-FRR-PEB-009 AC-2). The set is
+        stored as JSON-encoded TEXT — the column is never overwritten in
+        place; we always read-modify-write atomically inside a
+        ``BEGIN IMMEDIATE`` transaction.
+
+        Args:
+            feature_id: Primary key of the row to update.
+            subject: Lifecycle subject segment (e.g. ``"build-started"``).
+            correlation_id: F010C correlation-id of the calling envelope;
+                logged for traceability.
+            last_event_id: Optional SSE event id observed alongside the
+                publish. Persisted via ``COALESCE`` so passing ``None``
+                preserves the existing cursor.
+
+        Returns:
+            The new ``published_lifecycles`` frozenset after the append.
+
+        Raises:
+            ValueError: If any required argument is empty.
+            BridgeRegistryNotFoundError: If no row matches ``feature_id``.
+            sqlite3.Error: For any database error.
+        """
+        if not feature_id:
+            raise ValueError(
+                "BridgeRegistry.mark_published: feature_id must be non-empty"
+            )
+        if not subject:
+            raise ValueError(
+                "BridgeRegistry.mark_published: subject must be non-empty"
+            )
+        if not correlation_id:
+            raise ValueError(
+                "BridgeRegistry.mark_published: correlation_id must be non-empty"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            row = self._cx.execute(
+                f"""
+                SELECT published_lifecycles
+                  FROM {TABLE_NAME}
+                 WHERE feature_id = ?
+                """,
+                (feature_id,),
+            ).fetchone()
+            if row is None:
+                self._cx.execute("ROLLBACK;")
+                raise BridgeRegistryNotFoundError(feature_id)
+            current = _decode_published_lifecycles(row[0] if not isinstance(row, sqlite3.Row) else row["published_lifecycles"])
+            updated = frozenset(current | {subject})
+            payload = _encode_published_lifecycles(updated)
+            updated_at_iso = _now_iso()
+            self._cx.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                   SET published_lifecycles = ?,
+                       last_event_id = COALESCE(?, last_event_id),
+                       updated_at = ?
+                 WHERE feature_id = ?
+                """,
+                (payload, last_event_id, updated_at_iso, feature_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            self._safe_rollback()
+            raise
+
+        logger.debug(
+            "bridge_registry.mark_published feature_id=%s subject=%s "
+            "correlation_id=%s set_size=%d",
+            feature_id,
+            subject,
+            correlation_id,
+            len(updated),
+        )
+        return updated
 
     # ------------------------------------------------------------------
     # Write API — delete

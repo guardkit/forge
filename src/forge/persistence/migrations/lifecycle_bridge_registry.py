@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CREATE_TABLE_SQL",
+    "PUBLISHED_LIFECYCLES_COLUMN",
     "TABLE_NAME",
     "BridgeRegistryMigrationError",
     "apply",
@@ -48,6 +49,14 @@ __all__ = [
 
 
 TABLE_NAME: Final[str] = "lifecycle_bridge_registry"
+
+#: Name of the JSON-encoded column tracking the lifecycle subjects
+#: already published for each in-flight build (TASK-FRR-PEB-009 AC-2).
+#: Stored as TEXT containing a JSON-encoded list of strings (e.g.
+#: ``'["build-started"]'``). The publisher path appends to this set
+#: BEFORE invoking the actual NATS publish so a daemon-restart recovery
+#: never re-publishes a transition that was already on the wire.
+PUBLISHED_LIFECYCLES_COLUMN: Final[str] = "published_lifecycles"
 
 
 CREATE_TABLE_SQL: Final[str] = f"""
@@ -63,7 +72,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     current_lifecycle TEXT NOT NULL CHECK (
         current_lifecycle IN ('queued', 'running', 'paused')
     ),
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    {PUBLISHED_LIFECYCLES_COLUMN} TEXT NOT NULL DEFAULT '[]'
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_lifecycle
@@ -108,9 +118,36 @@ def apply(connection: sqlite3.Connection) -> None:
     try:
         with connection:  # commit on success; rollback on any raise.
             connection.executescript(CREATE_TABLE_SQL)
+            _ensure_published_lifecycles_column(connection)
     except sqlite3.Error as exc:
         raise BridgeRegistryMigrationError(
             f"failed to apply {TABLE_NAME!r} migration: {exc}"
         ) from exc
 
     logger.debug("applied %s migration", TABLE_NAME)
+
+
+def _ensure_published_lifecycles_column(connection: sqlite3.Connection) -> None:
+    """Idempotently add the ``published_lifecycles`` column (AC-2).
+
+    The original ``CREATE TABLE`` ships with this column, but a database
+    that was migrated under a previous schema (T2 baseline) needs an
+    ``ALTER TABLE ADD COLUMN`` to land the recovery-cursor column. The
+    function is a no-op when the column already exists — safe to call
+    on every boot.
+    """
+    rows = connection.execute(
+        f"PRAGMA table_info({TABLE_NAME})"
+    ).fetchall()
+    existing = {row[1] for row in rows}
+    if PUBLISHED_LIFECYCLES_COLUMN in existing:
+        return
+    connection.execute(
+        f"ALTER TABLE {TABLE_NAME} ADD COLUMN "
+        f"{PUBLISHED_LIFECYCLES_COLUMN} TEXT NOT NULL DEFAULT '[]'"
+    )
+    logger.info(
+        "applied %s migration: added %s column",
+        TABLE_NAME,
+        PUBLISHED_LIFECYCLES_COLUMN,
+    )
