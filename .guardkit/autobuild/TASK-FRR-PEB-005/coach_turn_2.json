@@ -1,0 +1,164 @@
+{
+  "task_id": "TASK-FRR-PEB-005",
+  "turn": 2,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/lifecycle_bridge/test_cancel.py tests/forge/lifecycle_bridge/test_coexistence.py tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/lifecycle_bridge/test_publish_failure.py tests/forge/lifecycle_bridge/test_translation.py tests/forge/test_pause_resume_publish.py tests/forge/test_safety_net_publish.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_safety_net_publish.py::TestDispatchRaisePublishesBuildFailed::test_dispatch_raise_publishes_build_failed_with_correlation_id[attribute_error_f010e_shape] PASSED [ 96%]\ntests/forge/test_safety_net_publish.py::TestDispatchRaisePublishesBuildFailed::test_dispatch_raise_publishes_build_failed_with_correlation_id[runtime_error_cross_cut] PASSED [ 97%]\ntests/forge/test_safety_net_publish.py::TestHappyPathDoesNotPublish::test_dispatch_success_does_not_publish_build_failed PASSED [ 98%]\ntests/forge/test_safety_net_publish.py::TestPublishFailureStillAcks::test_publish_build_failed_raises_does_not_block_ack PASSED [100%]\n======================== 90 passed, 1 warning in 2.44s =========================",
+      "duration_seconds": 4.744745969772339
+    },
+    "requirements": {
+      "criteria_total": 6,
+      "criteria_met": 6,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "AC-1: When `dispatch_build` raises synchronously, the bridge's",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestSyncRaiseUsesSafetyNetNotBridge.test_sync_raise_publishes_build_failed_and_does_not_attach_bridge (in tests/forge/lifecycle_bridge/test_coexistence.py) drives a real handle_message call with an AsyncMock dispatch_build that raises AttributeError. Asserts: (a) publisher.publish_build_failed.assert_awaited_once with feature_id matching the inbound envelope, (b) attach_spy.assert_not_called on a MagicMock-wrapped LifecycleBridge.attach, (c) registry.list_active(...) returns [] proving no bridge row was written, (d) msg.ack.assert_awaited_once. handle_message's exception branch only ever calls publish_build_failed \u2014 no build-started publish path exists there.",
+      "notes": "TestSyncRaiseUsesSafetyNetNotBridge.test_sync_raise_publishes_build_failed_and_does_not_attach_bridge (in tests/forge/lifecycle_bridge/test_coexistence.py) drives a real handle_message call with an AsyncMock dispatch_build that raises AttributeError. Asserts: (a) publisher.publish_build_failed.assert_awaited_once with feature_id matching the inbound envelope, (b) attach_spy.assert_not_called on a MagicMock-wrapped LifecycleBridge.attach, (c) registry.list_active(...) returns [] proving no bridge row was written, (d) msg.ack.assert_awaited_once. handle_message's exception branch only ever calls publish_build_failed \u2014 no build-started publish path exists there."
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "AC-2: When the bridge has already observed a terminal failure via SSE",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestBridgeFirstThenSyncRaiseSkipsSafetyNet.test_bridge_claim_then_safety_net_skip \u2014 calls ledger.claim(claimed_by=CLAIMER_BRIDGE_TERMINAL) (returns True), then awaits the production wrapper _build_publish_build_failed(publisher, terminal_publish_ledger=ledger). The wrapper consults TerminalPublishLedger.claim, observes False, and short-circuits. Asserts publisher.publish_build_failed.assert_not_awaited() and the ledger row's claimed_by remains CLAIMER_BRIDGE_TERMINAL. Production wiring lives in src/forge/cli/_serve_deps.py: _build_publish_build_failed accepts an optional terminal_publish_ledger and runs claim() before attach_correlation_id+publish.",
+      "notes": "TestBridgeFirstThenSyncRaiseSkipsSafetyNet.test_bridge_claim_then_safety_net_skip \u2014 calls ledger.claim(claimed_by=CLAIMER_BRIDGE_TERMINAL) (returns True), then awaits the production wrapper _build_publish_build_failed(publisher, terminal_publish_ledger=ledger). The wrapper consults TerminalPublishLedger.claim, observes False, and short-circuits. Asserts publisher.publish_build_failed.assert_not_awaited() and the ledger row's claimed_by remains CLAIMER_BRIDGE_TERMINAL. Production wiring lives in src/forge/cli/_serve_deps.py: _build_publish_build_failed accepts an optional terminal_publish_ledger and runs claim() before attach_correlation_id+publish."
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "AC-3: A **first-wins** invariant test asserts no race condition can",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestFirstWinsInvariant has three sub-tests covering all orderings: test_bridge_first_then_safety_net_publishes_zero (bridge wins \u2192 wrapper skips), test_safety_net_first_then_bridge_claim_loses (F010F wins \u2192 bridge's later claim returns False so it would skip), test_concurrent_gather_produces_exactly_one_envelope (asyncio.gather on bridge_publish + f010f_publish; envelope counts from both paths sum to exactly 1; SQL COUNT(*) over the ledger asserts a single row). The atomic BEGIN IMMEDIATE + INSERT OR IGNORE in TerminalPublishLedger.claim plus the composite PRIMARY KEY (feature_id, correlation_id) make rowcount==1 only for the winner.",
+      "notes": "TestFirstWinsInvariant has three sub-tests covering all orderings: test_bridge_first_then_safety_net_publishes_zero (bridge wins \u2192 wrapper skips), test_safety_net_first_then_bridge_claim_loses (F010F wins \u2192 bridge's later claim returns False so it would skip), test_concurrent_gather_produces_exactly_one_envelope (asyncio.gather on bridge_publish + f010f_publish; envelope counts from both paths sum to exactly 1; SQL COUNT(*) over the ledger asserts a single row). The atomic BEGIN IMMEDIATE + INSERT OR IGNORE in TerminalPublishLedger.claim plus the composite PRIMARY KEY (feature_id, correlation_id) make rowcount==1 only for the winner."
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "AC-4: F010F's existing test suite (`tests/forge/test_safety_net_publish.py`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Coach-feedback fix: tests/forge/test_safety_net_publish.py now exists on disk as a re-export module that imports the F010F test classes (TestDispatchRaisePublishesBuildFailed, TestHappyPathDoesNotPublish, TestPublishFailureStillAcks) and their fixtures from the canonical test_pipeline_consumer_dispatch_failure_publish.py. pytest collects all 4 F010F tests under the AC-cited filename and runs them against the production code; all pass. No F010F production code is touched: src/forge/adapters/nats/pipeline_consumer.py is byte-for-byte unchanged; the new ledger plumbing is opt-in via _build_publish_build_failed's keyword-only terminal_publish_ledger param defaulting to None (TestF010fRegressionStillPasses.test_no_ledger_publishes_unconditionally pins the legacy bridge-less behaviour). The original test_pipeline_consumer_dispatch_failure_publish.py is also unchanged \u2014 both paths now collect 4 passing tests each.",
+      "notes": "Coach-feedback fix: tests/forge/test_safety_net_publish.py now exists on disk as a re-export module that imports the F010F test classes (TestDispatchRaisePublishesBuildFailed, TestHappyPathDoesNotPublish, TestPublishFailureStillAcks) and their fixtures from the canonical test_pipeline_consumer_dispatch_failure_publish.py. pytest collects all 4 F010F tests under the AC-cited filename and runs them against the production code; all pass. No F010F production code is touched: src/forge/adapters/nats/pipeline_consumer.py is byte-for-byte unchanged; the new ledger plumbing is opt-in via _build_publish_build_failed's keyword-only terminal_publish_ledger param defaulting to None (TestF010fRegressionStillPasses.test_no_ledger_publishes_unconditionally pins the legacy bridge-less behaviour). The original test_pipeline_consumer_dispatch_failure_publish.py is also unchanged \u2014 both paths now collect 4 passing tests each."
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "AC-5: F010C correlation-id AST guard remains green.",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "All 9 tests in tests/forge/test_pipeline_consumer_correlation_id.py pass \u2014 including TestAllRejectionPathsThreadCorrelationId.test_every_safe_publish_failure_call_passes_correlation_id_kwarg (the AST guard) and TestBridgeRegistryCallsThreadCorrelationId.test_every_bridge_registry_call_passes_correlation_id_kwarg. The implementation preserves every existing correlation_id= kwarg and the new TerminalPublishLedger.claim call inside _build_publish_build_failed threads correlation_id explicitly. No new BridgeRegistry call sites were introduced (the ledger uses its own table), so the bridge-registry AST guard is unaffected.",
+      "notes": "All 9 tests in tests/forge/test_pipeline_consumer_correlation_id.py pass \u2014 including TestAllRejectionPathsThreadCorrelationId.test_every_safe_publish_failure_call_passes_correlation_id_kwarg (the AST guard) and TestBridgeRegistryCallsThreadCorrelationId.test_every_bridge_registry_call_passes_correlation_id_kwarg. The implementation preserves every existing correlation_id= kwarg and the new TerminalPublishLedger.claim call inside _build_publish_build_failed threads correlation_id explicitly. No new BridgeRegistry call sites were introduced (the ledger uses its own table), so the bridge-registry AST guard is unaffected."
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ruff check src/forge/lifecycle_bridge/coexistence.py src/forge/cli/_serve_deps.py tests/forge/lifecycle_bridge/test_coexistence.py tests/forge/test_safety_net_publish.py \u2192 'All checks passed!' (zero errors). The new alias test file uses 'ruff: noqa: F401,F403' on the wildcard re-export to keep the noise out without disabling the rule globally.",
+      "notes": "ruff check src/forge/lifecycle_bridge/coexistence.py src/forge/cli/_serve_deps.py tests/forge/lifecycle_bridge/test_coexistence.py tests/forge/test_safety_net_publish.py \u2192 'All checks passed!' (zero errors). The new alias test file uses 'ruff: noqa: F401,F403' on the wildcard re-export to keep the noise out without disabling the rule globally."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-1",
+        "criterion_text": "AC-1: When `dispatch_build` raises synchronously, the bridge's",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestSyncRaiseUsesSafetyNetNotBridge.test_sync_raise_publishes_build_failed_and_does_not_attach_bridge (in tests/forge/lifecycle_bridge/test_coexistence.py) drives a real handle_message call with an AsyncMock dispatch_build that raises AttributeError. Asserts: (a) publisher.publish_build_failed.assert_awaited_once with feature_id matching the inbound envelope, (b) attach_spy.assert_not_called on a MagicMock-wrapped LifecycleBridge.attach, (c) registry.list_active(...) returns [] proving no bridge row was written, (d) msg.ack.assert_awaited_once. handle_message's exception branch only ever calls publish_build_failed \u2014 no build-started publish path exists there.",
+        "notes": "TestSyncRaiseUsesSafetyNetNotBridge.test_sync_raise_publishes_build_failed_and_does_not_attach_bridge (in tests/forge/lifecycle_bridge/test_coexistence.py) drives a real handle_message call with an AsyncMock dispatch_build that raises AttributeError. Asserts: (a) publisher.publish_build_failed.assert_awaited_once with feature_id matching the inbound envelope, (b) attach_spy.assert_not_called on a MagicMock-wrapped LifecycleBridge.attach, (c) registry.list_active(...) returns [] proving no bridge row was written, (d) msg.ack.assert_awaited_once. handle_message's exception branch only ever calls publish_build_failed \u2014 no build-started publish path exists there."
+      },
+      {
+        "criterion_id": "AC-2",
+        "criterion_text": "AC-2: When the bridge has already observed a terminal failure via SSE",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestBridgeFirstThenSyncRaiseSkipsSafetyNet.test_bridge_claim_then_safety_net_skip \u2014 calls ledger.claim(claimed_by=CLAIMER_BRIDGE_TERMINAL) (returns True), then awaits the production wrapper _build_publish_build_failed(publisher, terminal_publish_ledger=ledger). The wrapper consults TerminalPublishLedger.claim, observes False, and short-circuits. Asserts publisher.publish_build_failed.assert_not_awaited() and the ledger row's claimed_by remains CLAIMER_BRIDGE_TERMINAL. Production wiring lives in src/forge/cli/_serve_deps.py: _build_publish_build_failed accepts an optional terminal_publish_ledger and runs claim() before attach_correlation_id+publish.",
+        "notes": "TestBridgeFirstThenSyncRaiseSkipsSafetyNet.test_bridge_claim_then_safety_net_skip \u2014 calls ledger.claim(claimed_by=CLAIMER_BRIDGE_TERMINAL) (returns True), then awaits the production wrapper _build_publish_build_failed(publisher, terminal_publish_ledger=ledger). The wrapper consults TerminalPublishLedger.claim, observes False, and short-circuits. Asserts publisher.publish_build_failed.assert_not_awaited() and the ledger row's claimed_by remains CLAIMER_BRIDGE_TERMINAL. Production wiring lives in src/forge/cli/_serve_deps.py: _build_publish_build_failed accepts an optional terminal_publish_ledger and runs claim() before attach_correlation_id+publish."
+      },
+      {
+        "criterion_id": "AC-3",
+        "criterion_text": "AC-3: A **first-wins** invariant test asserts no race condition can",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestFirstWinsInvariant has three sub-tests covering all orderings: test_bridge_first_then_safety_net_publishes_zero (bridge wins \u2192 wrapper skips), test_safety_net_first_then_bridge_claim_loses (F010F wins \u2192 bridge's later claim returns False so it would skip), test_concurrent_gather_produces_exactly_one_envelope (asyncio.gather on bridge_publish + f010f_publish; envelope counts from both paths sum to exactly 1; SQL COUNT(*) over the ledger asserts a single row). The atomic BEGIN IMMEDIATE + INSERT OR IGNORE in TerminalPublishLedger.claim plus the composite PRIMARY KEY (feature_id, correlation_id) make rowcount==1 only for the winner.",
+        "notes": "TestFirstWinsInvariant has three sub-tests covering all orderings: test_bridge_first_then_safety_net_publishes_zero (bridge wins \u2192 wrapper skips), test_safety_net_first_then_bridge_claim_loses (F010F wins \u2192 bridge's later claim returns False so it would skip), test_concurrent_gather_produces_exactly_one_envelope (asyncio.gather on bridge_publish + f010f_publish; envelope counts from both paths sum to exactly 1; SQL COUNT(*) over the ledger asserts a single row). The atomic BEGIN IMMEDIATE + INSERT OR IGNORE in TerminalPublishLedger.claim plus the composite PRIMARY KEY (feature_id, correlation_id) make rowcount==1 only for the winner."
+      },
+      {
+        "criterion_id": "AC-4",
+        "criterion_text": "AC-4: F010F's existing test suite (`tests/forge/test_safety_net_publish.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Coach-feedback fix: tests/forge/test_safety_net_publish.py now exists on disk as a re-export module that imports the F010F test classes (TestDispatchRaisePublishesBuildFailed, TestHappyPathDoesNotPublish, TestPublishFailureStillAcks) and their fixtures from the canonical test_pipeline_consumer_dispatch_failure_publish.py. pytest collects all 4 F010F tests under the AC-cited filename and runs them against the production code; all pass. No F010F production code is touched: src/forge/adapters/nats/pipeline_consumer.py is byte-for-byte unchanged; the new ledger plumbing is opt-in via _build_publish_build_failed's keyword-only terminal_publish_ledger param defaulting to None (TestF010fRegressionStillPasses.test_no_ledger_publishes_unconditionally pins the legacy bridge-less behaviour). The original test_pipeline_consumer_dispatch_failure_publish.py is also unchanged \u2014 both paths now collect 4 passing tests each.",
+        "notes": "Coach-feedback fix: tests/forge/test_safety_net_publish.py now exists on disk as a re-export module that imports the F010F test classes (TestDispatchRaisePublishesBuildFailed, TestHappyPathDoesNotPublish, TestPublishFailureStillAcks) and their fixtures from the canonical test_pipeline_consumer_dispatch_failure_publish.py. pytest collects all 4 F010F tests under the AC-cited filename and runs them against the production code; all pass. No F010F production code is touched: src/forge/adapters/nats/pipeline_consumer.py is byte-for-byte unchanged; the new ledger plumbing is opt-in via _build_publish_build_failed's keyword-only terminal_publish_ledger param defaulting to None (TestF010fRegressionStillPasses.test_no_ledger_publishes_unconditionally pins the legacy bridge-less behaviour). The original test_pipeline_consumer_dispatch_failure_publish.py is also unchanged \u2014 both paths now collect 4 passing tests each."
+      },
+      {
+        "criterion_id": "AC-5",
+        "criterion_text": "AC-5: F010C correlation-id AST guard remains green.",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All 9 tests in tests/forge/test_pipeline_consumer_correlation_id.py pass \u2014 including TestAllRejectionPathsThreadCorrelationId.test_every_safe_publish_failure_call_passes_correlation_id_kwarg (the AST guard) and TestBridgeRegistryCallsThreadCorrelationId.test_every_bridge_registry_call_passes_correlation_id_kwarg. The implementation preserves every existing correlation_id= kwarg and the new TerminalPublishLedger.claim call inside _build_publish_build_failed threads correlation_id explicitly. No new BridgeRegistry call sites were introduced (the ledger uses its own table), so the bridge-registry AST guard is unaffected.",
+        "notes": "All 9 tests in tests/forge/test_pipeline_consumer_correlation_id.py pass \u2014 including TestAllRejectionPathsThreadCorrelationId.test_every_safe_publish_failure_call_passes_correlation_id_kwarg (the AST guard) and TestBridgeRegistryCallsThreadCorrelationId.test_every_bridge_registry_call_passes_correlation_id_kwarg. The implementation preserves every existing correlation_id= kwarg and the new TerminalPublishLedger.claim call inside _build_publish_build_failed threads correlation_id explicitly. No new BridgeRegistry call sites were introduced (the ledger uses its own table), so the bridge-registry AST guard is unaffected."
+      },
+      {
+        "criterion_id": "AC-6",
+        "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ruff check src/forge/lifecycle_bridge/coexistence.py src/forge/cli/_serve_deps.py tests/forge/lifecycle_bridge/test_coexistence.py tests/forge/test_safety_net_publish.py \u2192 'All checks passed!' (zero errors). The new alias test file uses 'ruff: noqa: F401,F403' on the wildcard re-export to keep the noise out without disabling the rule globally.",
+        "notes": "ruff check src/forge/lifecycle_bridge/coexistence.py src/forge/cli/_serve_deps.py tests/forge/lifecycle_bridge/test_coexistence.py tests/forge/test_safety_net_publish.py \u2192 'All checks passed!' (zero errors). The new alias test file uses 'ruff: noqa: F401,F403' on the wildcard re-export to keep the noise out without disabling the rule globally."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "consider",
+      "category": "seam_test_recommendation",
+      "description": "No seam tests detected for cross-boundary feature. Consider adding seam/contract/boundary tests to validate technology boundary interactions. This is a recommendation, not a blocking gate."
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 724 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1908/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- PROVIDES_BENEFIT\n- CALLED_BY\n- ASSIGNS_TASK_TO\n- USES_FUNCTION\n\n### \u26a0\ufe0f Warnings\n- USES\n- IS_IMPLEMENTED_AS\n- HAS_PROJECT_ID\n- ALTERNATIVE_TO\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- IS_CREATED_FOR\n- DELEGATES_TO\n- MONITORS_RESULTS_FROM\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_STATE_RECOVERY_STRATEGY\n- APPLIES_TO\n\n\n## Previous Turn Summary (Turn 1)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - AC names test file(s) that don't exist on disk: tests/forge/test_safety_net_publish.py. The independent-test gate cannot run honestly while AC-cited tests are absent.",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false,
+  "environment_conditional_approval": false,
+  "honesty_verification": {
+    "verified": true,
+    "honesty_score": 1.0,
+    "discrepancy_count": 0,
+    "resolved_paths": [
+      {
+        "claimed": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-006-pause-resume-canonicalisation.md",
+        "resolved_to": "tasks/design_approved/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
+        "task_id": "TASK-FRR-PEB-005"
+      }
+    ]
+  }
+}
