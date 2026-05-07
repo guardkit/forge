@@ -1,22 +1,6 @@
 {
   "task_id": "TASK-FRR-PEB-002",
-  "timestamp": "2026-05-07T10:28:54.634975",
-  "completed": true,
-  "phases": {
-    "phase_3": {
-      "detected": true,
-      "text": "Implementation",
-      "completed": true
-    }
-  },
-  "quality_gates": {
-    "tests_passing": true,
-    "tests_passed": 35,
-    "tests_failed": 0,
-    "coverage": null,
-    "coverage_met": null,
-    "all_passed": true
-  },
+  "turn": 2,
   "files_modified": [
     ".claude/task-plans/TASK-FRR-PEB-002-implementation-plan.md",
     ".guardkit/autobuild/TASK-FRR-PEB-001/checkpoints.json",
@@ -50,43 +34,27 @@
     "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-002/player_turn_2.json"
   ],
   "tests_written": [],
-  "summary": "35 tests passed, all quality gates passed",
-  "sdk_turns": {
-    "turns_used": 8,
-    "max_turns": 160,
-    "ceiling_hit": false
-  },
-  "task_type": "feature",
-  "agent_invocations_validation": {
-    "status": "violation",
-    "expected_phases": 3,
-    "actual_invocations": 2,
-    "missing_phases": [
-      "3"
-    ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-  },
-  "plan_audit": {
-    "status": "skipped",
-    "severity": null,
-    "violations": 0,
-    "extra_files": [],
-    "missing_files": [],
-    "extra_modifications": [],
-    "missing_modifications": [],
-    "extra_dependencies": [],
-    "missing_dependencies": [],
-    "loc_variance_pct": null,
-    "discrepancies_count": 0,
-    "message": "no implementation plan on disk"
-  },
-  "unconfirmed_low_confidence_assumptions": {
-    "status": "ok",
-    "unconfirmed": [],
-    "files_scanned": 0,
-    "files_skipped": 0,
-    "message": null
-  },
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-1: LifecycleBridge surface (attach, detach, recover_in_flight, shutdown) \u2014 verified by 11 tests in tests/forge/lifecycle_bridge/test_bridge.py",
+    "AC-2: lifecycle_bridge_registry table migration with full schema \u2014 verified by 3 tests in TestMigrationCreatesTable",
+    "AC-3: BridgeRegistry repository (record, update_lifecycle, get, list_active, delete) \u2014 verified by 8 tests in TestBridgeRegistryOperations",
+    "AC-4: attach writes, detach deletes, list_active returns rows without SSE leakage \u2014 verified by 5 tests across TestAttachDetachRoundTrip and TestBridgeRegistryListActive",
+    "AC-5: correlation_id threaded through every BridgeRegistry op + AST guard fixture \u2014 verified by 5 parametrised tests in TestCorrelationIdContract and the TestBridgeRegistryCallsThreadCorrelationId AST guard",
+    "AC-6: ruff clean on all modified files \u2014 verified by `ruff check src/forge/lifecycle_bridge/ src/forge/persistence/` returning 'All checks passed!'",
+    "Test requirement: unit tests for each BridgeRegistry operation against in-memory sqlite \u2014 covered by TestBridgeRegistryOperations",
+    "Test requirement: migration test asserting fresh-DB table creation \u2014 covered by TestMigrationCreatesTable::test_apply_creates_lifecycle_bridge_registry_table",
+    "Test requirement: concurrency test for parallel attach() calls \u2014 covered by TestRecordConcurrency::test_second_record_overwrites_first and test_parallel_records_serialise_without_corruption (the latter uses threading.Barrier and two distinct writer connections)"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 8,
+  "sdk_max_turns": 160,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 35,
   "completion_promises": [
     {
       "criterion_id": "AC-001",
@@ -160,22 +128,6 @@
         "src/forge/persistence/repositories/bridge_registry.py",
         "tests/forge/test_pipeline_consumer_correlation_id.py"
       ]
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 68.47189495898783
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 308.93858166597784
     }
   ]
 }

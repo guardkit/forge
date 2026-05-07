@@ -1,17 +1,17 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 50.633935874910094,
+    "duration_seconds": 68.47189495898783,
     "error": null,
     "tests_run": 43,
     "tests_failed": 0,
-    "coverage_pct": 82.16,
-    "output_summary": "43 passed, 0 failed in 0.44s; coverage 82% across lifecycle_bridge + persistence (bridge.py 88%, registry 77%, migration 83%).",
+    "coverage_pct": 81.36,
+    "output_summary": "43 passed, 0 failed in 0.43s; coverage 81% (bridge.py 88%, migration 83%, registry 77%) across lifecycle_bridge + persistence + correlation-id tests.",
     "quality_gates_passed": true
   },
   "phase_5": {
     "status": "passed",
-    "duration_seconds": 237.6347632909892,
+    "duration_seconds": 308.93858166597784,
     "error": null,
     "issues": [],
     "quality_score": 0.0,
