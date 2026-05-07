@@ -2,6 +2,6 @@
   "tests_run": 67,
   "tests_failed": 0,
   "coverage_pct": 83.0,
-  "output_summary": "67 passed, 0 failed; coverage 83% across forge.lifecycle_bridge (translation 84%, bridge 89%, version_check 75%, __init__ 100%).",
+  "output_summary": "67 passed, 0 failed; coverage 83% across forge.lifecycle_bridge (translation 84%, bridge 89%, version_check 75%, __init__ 100%) via pytest 9.0.2",
   "quality_gates_passed": true
 }
