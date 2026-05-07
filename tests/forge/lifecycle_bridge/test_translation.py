@@ -334,6 +334,91 @@ class TestLifecycleTransitions:
 
 
 # ---------------------------------------------------------------------------
+# TASK-FRR-PEB-011 AC-4: operator-readable failure_reason format
+# ---------------------------------------------------------------------------
+
+
+class TestFailureReasonFormat:
+    """AC-4 (TASK-FRR-PEB-011): ``failure_reason = "{ExceptionClass}: {message}"``.
+
+    When the SSE stream's failed-lifecycle snapshot carries
+    ``error_class`` + ``error_message`` (T3 runner forwards the
+    originating exception), the translator's :class:`BuildFailedPayload`
+    must surface it in the form ``RuntimeError: model output failed
+    Pydantic validation``.
+    """
+
+    @staticmethod
+    def _failed_part_with_error(
+        feature_id: str,
+        *,
+        error_class: str | None,
+        error_message: str | None,
+    ) -> StreamPart:
+        snap: dict[str, object] = {
+            "feature_id": feature_id,
+            "build_id": f"build-{feature_id}-x",
+            "lifecycle": "failed",
+            "wave_total": 1,
+            "wave_index": 0,
+            "task_index": 0,
+            "tasks_completed": 0,
+            "tasks_failed": 1,
+            "waiting_for": None,
+            "last_coach_score": None,
+        }
+        if error_class is not None:
+            snap["error_class"] = error_class
+        if error_message is not None:
+            snap["error_message"] = error_message
+        return StreamPart(
+            event=VALUES_STREAM_EVENT,
+            data={"async_tasks": {feature_id: snap}},
+            id=None,
+        )
+
+    def test_failure_reason_is_class_colon_message_when_metadata_present(
+        self,
+    ) -> None:
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        # Prime with a running_wave snapshot so the translator has prior state.
+        translator.translate(
+            _state_part(ctx.feature_id, lifecycle="running_wave"), ctx
+        )
+        out = translator.translate(
+            self._failed_part_with_error(
+                ctx.feature_id,
+                error_class="RuntimeError",
+                error_message="model output failed Pydantic validation",
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildFailedPayload)
+        assert (
+            out.failure_reason
+            == "RuntimeError: model output failed Pydantic validation"
+        )
+
+    def test_failure_reason_falls_back_when_metadata_absent(self) -> None:
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        translator.translate(
+            _state_part(ctx.feature_id, lifecycle="running_wave"), ctx
+        )
+        out = translator.translate(
+            self._failed_part_with_error(
+                ctx.feature_id,
+                error_class=None,
+                error_message=None,
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildFailedPayload)
+        assert out.failure_reason == "autobuild failed (sse)"
+
+
+# ---------------------------------------------------------------------------
 # Property: every StreamPart produces ≤ 1 envelope (no double-emits)
 # ---------------------------------------------------------------------------
 

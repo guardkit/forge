@@ -99,6 +99,76 @@ class BuildContext:
 
 
 @dataclass(frozen=True, slots=True)
+class CancelResult:
+    """Outcome of :meth:`LifecycleBridge.request_cancel`.
+
+    The serve-side cancel handler uses this to distinguish a freshly
+    issued SDK cancel ("we just told the sidecar to interrupt the run")
+    from an idempotent no-op ("a cancel for this feature is already in
+    flight; the sidecar has been told already and we won't double-up")
+    from a no-registry-row no-op ("there is no live build for this id").
+
+    Attributes:
+        feature_id: Build the cancel was directed at.
+        invoked: ``True`` when this call issued the SDK
+            ``runs.cancel(...)``; ``False`` for any short-circuit path.
+        reason: Short categorical label suitable for structured
+            logging. One of ``"invoked"`` (SDK issued),
+            ``"already-cancelling"`` (cancel-in-flight idempotency
+            guard short-circuited), ``"no-registry-row"`` (no live
+            build found for this feature_id).
+        thread_id: DeepAgents thread id pulled from the registry row,
+            or ``None`` when no registry row was found at request time.
+        run_id: LangGraph run id pulled from the registry row, or
+            ``None`` when no registry row was found at request time.
+    """
+
+    feature_id: str
+    invoked: bool
+    reason: str = "invoked"
+    thread_id: str | None = None
+    run_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# SDK Protocol — kept narrow so production wires the real
+# ``langgraph_sdk.client.LangGraphClient`` while tests pass a fake.
+# ---------------------------------------------------------------------------
+
+
+class RunsCancelClient(Protocol):
+    """Subset of ``langgraph_sdk.client.RunsClient`` the bridge depends on.
+
+    Only :meth:`cancel` is consumed in the cancel path — keeping the
+    Protocol narrow means tests can pass a one-method fake without
+    constructing a full SDK client, and a future SDK addition does not
+    silently widen the bridge's surface.
+    """
+
+    async def cancel(
+        self,
+        thread_id: str,
+        run_id: str,
+        *,
+        action: str = "interrupt",
+    ) -> None: ...
+
+
+class LangGraphCancelClient(Protocol):
+    """Subset of ``langgraph_sdk.client.LangGraphClient`` for cancel.
+
+    Production wires the real
+    :class:`langgraph_sdk.client.LangGraphClient`; tests substitute a
+    fake whose ``runs`` attribute exposes the
+    :class:`RunsCancelClient` Protocol. This keeps the bridge's
+    constructor signature stable across both paths.
+    """
+
+    @property
+    def runs(self) -> RunsCancelClient: ...
+
+
+@dataclass(frozen=True, slots=True)
 class AckHandle:
     """Opaque ack-handle wrapper.
 
@@ -147,6 +217,7 @@ class LifecycleBridge:
         *,
         registry: BridgeRegistry,
         sidecar_url: str | None = None,
+        sdk_client: LangGraphCancelClient | None = None,
     ) -> None:
         if not isinstance(registry, BridgeRegistry):
             raise TypeError(
@@ -165,6 +236,18 @@ class LifecycleBridge:
         # Internal book-keeping for the SSE-attached features. T3 will
         # populate this map with live SSE clients keyed by feature_id.
         self._attached: dict[str, AckHandle] = {}
+        # SDK client for ``runs.cancel`` — TASK-FRR-PEB-007. Optional so
+        # T2-era callers (and unit tests that exercise attach/detach
+        # only) can construct the bridge without a live SDK.
+        self._sdk_client: LangGraphCancelClient | None = sdk_client
+        # Cancel-in-flight idempotency guard (AC-5). Tracked in-memory
+        # rather than as a registry column because the only consumer is
+        # ``request_cancel`` and the in-memory set is reset on process
+        # restart anyway — a cancel that was issued before a crash is
+        # re-issued by the operator on the new daemon, and the SDK side
+        # is already idempotent against repeat ``runs.cancel`` calls
+        # against an already-interrupted run.
+        self._cancel_in_flight: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API — attach
@@ -262,6 +345,9 @@ class LifecycleBridge:
 
         self._registry.delete(feature_id, correlation_id=correlation_id)
         self._attached.pop(feature_id, None)
+        # Clear cancel-in-flight tracking so a future re-attach of the
+        # same feature_id is not treated as still-being-cancelled.
+        self._cancel_in_flight.discard(feature_id)
         logger.info(
             "lifecycle_bridge.detach feature_id=%s correlation_id=%s",
             feature_id,
@@ -313,6 +399,149 @@ class LifecycleBridge:
         return active
 
     # ------------------------------------------------------------------
+    # Public API — request_cancel  (TASK-FRR-PEB-007)
+    # ------------------------------------------------------------------
+
+    async def request_cancel(self, feature_id: str) -> CancelResult:
+        """Ask the langgraph-runner sidecar to interrupt the in-flight build.
+
+        This implements AC-1 of TASK-FRR-PEB-007: it calls
+        ``runs.cancel(thread_id, run_id, action="interrupt")`` on the
+        injected SDK client and returns immediately. It does **not**
+        publish a ``pipeline.build-cancelled`` envelope synchronously —
+        envelope emission is deferred to the SSE translator (T3) when
+        the sidecar reports ``terminal=interrupted``. This keeps the
+        cancel emit site singular and idempotent: two concurrent cancel
+        requests for the same build always produce exactly one
+        ``build-cancelled`` envelope (FEAT-FORGE-004 contract extended
+        to the cancel path).
+
+        Idempotency (AC-5): the bridge tracks a per-feature
+        cancel-in-flight set; the second ``request_cancel`` for the same
+        ``feature_id`` is a no-op (logged at INFO, no SDK call) and
+        returns ``CancelResult(invoked=False)`` so the caller can
+        distinguish the freshly-issued cancel from the duplicate.
+
+        Args:
+            feature_id: Primary key of the build to cancel. Must match
+                a row currently held by the registry — when no row is
+                found we still record the cancel-in-flight flag and
+                return ``invoked=False`` so a second request races
+                against the same no-op state. The serve handler treats
+                "no registry row" as "operator-cancel of an unknown
+                build" and surfaces the diagnostic separately.
+
+        Returns:
+            :class:`CancelResult` describing whether the SDK call was
+            issued and the registry-derived ``thread_id`` /``run_id``
+            (when available — useful for structured logging on the
+            cancelling side).
+
+        Raises:
+            ValueError: If ``feature_id`` is empty — same stance as
+                :meth:`detach` against an empty primary key.
+            RuntimeError: If no SDK client has been wired into the
+                bridge but a cancel is requested. Surfaced as a
+                ``RuntimeError`` rather than silently no-opping because
+                an unwired SDK is a daemon misconfiguration; the serve
+                handler logs it and exits non-zero.
+        """
+        if not feature_id:
+            raise ValueError(
+                "LifecycleBridge.request_cancel: feature_id must be non-empty"
+            )
+
+        # AC-5: idempotency. The second request for the same feature is
+        # a no-op. We check *before* the registry lookup so a missing
+        # row on the second request can't trip the "no SDK client"
+        # branch below — once we've sent one cancel for a feature we
+        # are committed to that single emit, even if the registry row
+        # has been swept by detach in between.
+        if feature_id in self._cancel_in_flight:
+            logger.info(
+                "lifecycle_bridge.request_cancel feature_id=%s status=no-op "
+                "reason=cancel-in-flight",
+                feature_id,
+            )
+            return CancelResult(
+                feature_id=feature_id,
+                invoked=False,
+                reason="already-cancelling",
+            )
+
+        # Use the registry's correlation_id for traceability — the
+        # registry is the canonical source of truth for the ids tied to
+        # this build. We use a synthetic correlation id for the read
+        # itself (the cancel handler's correlation context) and then
+        # surface the row's stored correlation_id in the structured log.
+        cancel_correlation = f"cancel:{feature_id}"
+        entry = self._registry.get(feature_id, correlation_id=cancel_correlation)
+
+        if entry is None:
+            # No row → there is no live SDK run to cancel. We still
+            # mark the feature as cancel-in-flight so a follow-up
+            # cancel for the same id is a recognised no-op rather than
+            # bouncing off the registry twice.
+            self._cancel_in_flight.add(feature_id)
+            logger.info(
+                "lifecycle_bridge.request_cancel feature_id=%s status=no-op "
+                "reason=no-registry-row",
+                feature_id,
+            )
+            return CancelResult(
+                feature_id=feature_id,
+                invoked=False,
+                reason="no-registry-row",
+            )
+
+        if self._sdk_client is None:
+            raise RuntimeError(
+                "LifecycleBridge.request_cancel: no SDK client wired; "
+                "construct the bridge with sdk_client= to enable operator "
+                f"cancel (feature_id={feature_id!r})"
+            )
+
+        # Mark cancel-in-flight *before* the SDK call so a concurrent
+        # second request that wins the race short-circuits without
+        # duplicating the SDK side. The SDK call itself is idempotent
+        # against an already-interrupted run, but we still avoid the
+        # extra round-trip.
+        self._cancel_in_flight.add(feature_id)
+        logger.info(
+            "lifecycle_bridge.request_cancel feature_id=%s status=invoking "
+            "thread_id=%s run_id=%s correlation_id=%s",
+            feature_id,
+            entry.thread_id,
+            entry.run_id,
+            entry.correlation_id,
+        )
+        try:
+            await self._sdk_client.runs.cancel(
+                entry.thread_id,
+                entry.run_id,
+                action="interrupt",
+            )
+        except Exception:
+            # SDK transport / sidecar errors must not leave the
+            # cancel-in-flight flag set, otherwise the operator cannot
+            # retry the cancel after fixing the sidecar. Roll the flag
+            # back and let the exception propagate to the caller.
+            self._cancel_in_flight.discard(feature_id)
+            logger.exception(
+                "lifecycle_bridge.request_cancel feature_id=%s "
+                "sdk_cancel_failed", feature_id,
+            )
+            raise
+
+        return CancelResult(
+            feature_id=feature_id,
+            invoked=True,
+            reason="invoked",
+            thread_id=entry.thread_id,
+            run_id=entry.run_id,
+        )
+
+    # ------------------------------------------------------------------
     # Public API — shutdown
     # ------------------------------------------------------------------
 
@@ -330,6 +559,7 @@ class LifecycleBridge:
         """
         in_flight = len(self._attached)
         self._attached.clear()
+        self._cancel_in_flight.clear()
         logger.info(
             "lifecycle_bridge.shutdown drained_in_memory_attachments=%d",
             in_flight,

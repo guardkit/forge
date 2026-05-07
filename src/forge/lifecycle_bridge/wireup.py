@@ -143,6 +143,34 @@ _PUBLISH_METHOD_TABLE: dict[type, str] = {
 }
 
 
+#: Subject-segment fragment per typed payload class. Mirrors
+#: :attr:`forge.adapters.nats.pipeline_publisher.PipelinePublisher._EVENT_TABLE`
+#: so the WARNING log for a publish failure (TASK-FRR-PEB-011 AC-1)
+#: surfaces the same subject string the publisher would have written
+#: to JetStream.
+_SUBJECT_SEGMENT_TABLE: dict[type, str] = {
+    BuildStartedPayload: "build-started",
+    StageCompletePayload: "stage-complete",
+    BuildCompletePayload: "build-complete",
+    BuildFailedPayload: "build-failed",
+    BuildPausedPayload: "build-paused",
+    BuildResumedPayload: "build-resumed",
+    BuildCancelledPayload: "build-cancelled",
+}
+
+
+def _subject_for_payload_type(payload_type: type, feature_id: str) -> str:
+    """Return the canonical ``pipeline.{event}.{feature_id}`` subject.
+
+    Used only by the WARNING log path on a publish failure (AC-1) so an
+    operator reading the log line can grep the JetStream consumer for
+    the corresponding redelivery without having to introspect the
+    payload type to subject mapping themselves.
+    """
+    segment = _SUBJECT_SEGMENT_TABLE.get(payload_type, "unknown")
+    return f"pipeline.{segment}.{feature_id}"
+
+
 class StreamSource(Protocol):
     """Async stream factory: ``feature_id → AsyncIterator[StreamPart]``.
 
@@ -523,10 +551,34 @@ class LifecycleBridgeWireup:
                     continue
                 if event is None:
                     continue
-                await self._publish_event(event, feature_id)
+                published_ok = await self._publish_event(event, feature_id)
                 if isinstance(event, TERMINAL_PAYLOAD_TYPES):
-                    terminal_seen = True
-                    await self._on_terminal(handle, feature_id, correlation_id)
+                    if published_ok:
+                        terminal_seen = True
+                        await self._on_terminal(
+                            handle, feature_id, correlation_id
+                        )
+                        break
+                    # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope publish
+                    # failed (transient broker error / network blip). Do
+                    # NOT mark the build "terminal-published" in SQLite,
+                    # do NOT ack the inbound build-queued message — the
+                    # JetStream consumer will redeliver and the bridge's
+                    # T9 recovery cycle will retry the publish on the
+                    # next observation. ADR-ARCH-008: SQLite is
+                    # source-of-truth; transient broker failures must
+                    # NOT corrupt build state.
+                    logger.warning(
+                        "wireup._observer_loop: terminal envelope publish "
+                        "failed for feature_id=%s correlation_id=%s "
+                        "payload_type=%s; leaving SQLite registry row "
+                        "intact and inbound build-queued un-acked "
+                        "(JetStream redelivery + recover_in_flight will "
+                        "retry — no spurious ack)",
+                        feature_id,
+                        correlation_id,
+                        type(event).__name__,
+                    )
                     break
 
             if not terminal_seen:
@@ -577,7 +629,7 @@ class LifecycleBridgeWireup:
     # Publisher dispatch
     # ------------------------------------------------------------------
 
-    async def _publish_event(self, event: PipelineEvent, feature_id: str) -> None:
+    async def _publish_event(self, event: PipelineEvent, feature_id: str) -> bool:
         """Dispatch ``event`` to the matching :class:`PipelinePublisher` method.
 
         AC-2: this method is the **only** publish site in the wireup.
@@ -589,7 +641,11 @@ class LifecycleBridgeWireup:
 
         Publish failures are logged at WARNING; they do not interrupt
         the observer loop so a transient broker hiccup on a mid-build
-        ``stage-complete`` cannot orphan the build.
+        ``stage-complete`` cannot orphan the build. The return value
+        signals success (``True``) or failure (``False``) so the
+        observer's terminal-arrival path (TASK-FRR-PEB-011 AC-2/AC-3)
+        can refuse to ack / detach when the *terminal* envelope failed
+        to publish — preserving SQLite state for the T9 recovery cycle.
         """
         method_name = _PUBLISH_METHOD_TABLE.get(type(event))
         if method_name is None:
@@ -599,7 +655,7 @@ class LifecycleBridgeWireup:
                 type(event).__name__,
                 feature_id,
             )
-            return
+            return False
         publish = getattr(self._publisher, method_name, None)
         if publish is None:
             logger.warning(
@@ -608,21 +664,29 @@ class LifecycleBridgeWireup:
                 method_name,
                 feature_id,
             )
-            return
+            return False
         try:
             await publish(event)
+            return True
         except Exception as exc:  # noqa: BLE001
             # PublishFailure (or transport-level error) must not crash
-            # the observer. The ack remains deferred until terminal
-            # arrival, so a missed mid-stream publish at most leaves
-            # one envelope unobserved on the wire.
+            # the observer. AC-1: log WARNING with subject + correlation_id
+            # so operators can correlate the failure with the inbound
+            # envelope. For mid-stream events the loop continues; for
+            # terminal events the caller refuses to ack/detach (AC-2/AC-3).
+            subject = _subject_for_payload_type(type(event), feature_id)
+            cid = getattr(event, "correlation_id", None)
             logger.warning(
                 "wireup._publish_event: publish via %s raised (%s) for "
-                "feature_id=%s; observer continues",
+                "feature_id=%s subject=%s correlation_id=%s; observer "
+                "continues (caller decides whether to ack)",
                 method_name,
                 exc,
                 feature_id,
+                subject,
+                cid,
             )
+            return False
 
     # ------------------------------------------------------------------
     # Terminal handling

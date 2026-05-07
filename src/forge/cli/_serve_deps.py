@@ -93,6 +93,10 @@ from forge.cli._serve_deps_state_channel import build_autobuild_state_initialise
 from forge.config.models import ForgeConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
+from forge.lifecycle_bridge.coexistence import (
+    CLAIMER_F010F_SAFETY_NET,
+    TerminalPublishLedger,
+)
 from forge.pipeline.build_ack_handle import InFlightAckRegistry
 from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
@@ -307,7 +311,11 @@ def _build_dispatch_build(
     return dispatch_build
 
 
-def _build_publish_build_failed(publisher):
+def _build_publish_build_failed(
+    publisher,
+    *,
+    terminal_publish_ledger: TerminalPublishLedger | None = None,
+):
     """Return an ``async (failure_payload, feature_id, *, correlation_id)`` wrapper.
 
     The consumer's
@@ -328,6 +336,28 @@ def _build_publish_build_failed(publisher):
     accepted on the malformed-envelope path where no source value is
     available; every other rejection path threads the inbound value
     explicitly.
+
+    TASK-FRR-PEB-005 — F010F coexistence boundary
+    ---------------------------------------------
+
+    When a :class:`TerminalPublishLedger` is wired (production boot path
+    for ``forge serve``), the wrapper consults
+    :meth:`TerminalPublishLedger.claim` **before** invoking the
+    publisher. If the bridge's async-terminal observation already
+    claimed the slot for the same ``(feature_id, correlation_id)``,
+    ``claim`` returns ``False`` and the wrapper short-circuits without
+    publishing. This pins the no-double-emit invariant for every
+    ordering: bridge-first, F010F-first, and concurrent.
+
+    The ledger is **optional** so paths that never wire the bridge
+    (legacy unit tests, ``forge dispatch`` shell-out) keep their
+    F010F-only semantics: the wrapper publishes unconditionally and
+    F010F's existing test suite passes unchanged (AC-4).
+
+    The ``correlation_id=None`` malformed-envelope path is exempt from
+    the claim check — without a real correlation_id there is nothing
+    to coordinate against, and the bridge would never have observed
+    such an envelope to begin with.
     """
 
     from forge.pipeline import attach_correlation_id
@@ -363,6 +393,32 @@ def _build_publish_build_failed(publisher):
                 failure_payload.feature_id,
                 feature_id,
             )
+
+        # TASK-FRR-PEB-005 AC-2 / AC-3 — first-wins terminal-publish
+        # claim. Skip the publish only when a ledger is wired AND the
+        # caller has a real ``correlation_id`` (the malformed-envelope
+        # path threads ``None`` and is exempt: there is no
+        # ``(feature_id, correlation_id)`` pair to coordinate against
+        # so the bridge could not possibly have observed it).
+        if (
+            terminal_publish_ledger is not None
+            and correlation_id is not None
+        ):
+            won = terminal_publish_ledger.claim(
+                feature_id=failure_payload.feature_id,
+                correlation_id=correlation_id,
+                claimed_by=CLAIMER_F010F_SAFETY_NET,
+            )
+            if not won:
+                logger.info(
+                    "publish_build_failed: terminal-publish slot already "
+                    "claimed for feature_id=%s correlation_id=%s; "
+                    "skipping F010F safety-net emit (TASK-FRR-PEB-005)",
+                    failure_payload.feature_id,
+                    correlation_id,
+                )
+                return
+
         if correlation_id is not None:
             attach_correlation_id(failure_payload, correlation_id)
         await publisher.publish_build_failed(failure_payload)
@@ -377,6 +433,7 @@ def build_pipeline_consumer_deps(
     *,
     async_task_starter: AsyncTaskStarter | None = None,
     register_ack_handle: InFlightAckRegistry | None = None,
+    terminal_publish_ledger: TerminalPublishLedger | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -486,7 +543,10 @@ def build_pipeline_consumer_deps(
         lifecycle_emitter=emitter,
         async_task_starter=async_task_starter,
     )
-    publish_build_failed = _build_publish_build_failed(publisher)
+    publish_build_failed = _build_publish_build_failed(
+        publisher,
+        terminal_publish_ledger=terminal_publish_ledger,
+    )
 
     deps = PipelineConsumerDeps(
         forge_config=forge_config,
@@ -497,8 +557,13 @@ def build_pipeline_consumer_deps(
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "
-        "(async_task_starter=%s, ack_bridge=%s)",
+        "(async_task_starter=%s, ack_bridge=%s, terminal_publish_ledger=%s)",
         "wired" if async_task_starter is not None else "deferred (TASK-FW10-008)",
         "wired" if register_ack_handle is not None else "deferred (TASK-FRR-PEB-002)",
+        (
+            "wired"
+            if terminal_publish_ledger is not None
+            else "deferred (TASK-FRR-PEB-005)"
+        ),
     )
     return deps

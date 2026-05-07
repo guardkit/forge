@@ -168,6 +168,55 @@ class _Snapshot:
     tasks_failed: int
     last_coach_score: float | None
     waiting_for: str | None
+    #: Operator-readable async-failure metadata (TASK-FRR-PEB-011 AC-4).
+    #: When the SSE stream reports a failed lifecycle, the runner forwards
+    #: the originating exception's class name and message so the typed
+    #: :class:`BuildFailedPayload` can carry a ``failure_reason`` of the
+    #: form ``"{ExceptionClass}: {message}"``. Both fields are ``None``
+    #: when the snapshot does not include exception metadata (e.g.
+    #: pre-T3-runner builds, deterministic-failure paths).
+    error_class: str | None
+    error_message: str | None
+
+
+def _extract_error_metadata(
+    snap: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Pull async-failure metadata out of an ``AutobuildState`` snapshot.
+
+    Supports two shapes for forward-compatibility with the T3 runner's
+    error-propagation contract:
+
+    1. **Flat fields**: ``snap["error_class"]`` / ``snap["error_message"]``
+       — the canonical shape. Used by the runner when the failure
+       originates inside a deterministic step (Pydantic validation,
+       schema check, etc.).
+    2. **Nested ``last_error``**: ``snap["last_error"] = {"class": ...,
+       "message": ...}`` (or ``"type"`` instead of ``"class"``) — the
+       legacy shape carried by older runner builds. Accepted as a
+       fallback so a mixed-version fleet does not lose the failure
+       context across the SSE bridge.
+
+    Returns ``(error_class, error_message)`` with either / both
+    components ``None`` when the snapshot does not carry the field.
+    The translator's :meth:`StreamEventTranslator._build_failed` formats
+    a ``failure_reason`` of ``"{class}: {message}"`` when both are set,
+    or falls back to the legacy ``"autobuild failed (sse)"`` string when
+    neither is present (TASK-FRR-PEB-011 AC-4).
+    """
+    error_class = snap.get("error_class")
+    error_message = snap.get("error_message")
+
+    if error_class is None and error_message is None:
+        last_error = snap.get("last_error")
+        if isinstance(last_error, Mapping):
+            error_class = last_error.get("class") or last_error.get("type")
+            error_message = last_error.get("message")
+
+    return (
+        str(error_class) if error_class else None,
+        str(error_message) if error_message else None,
+    )
 
 
 def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None:
@@ -197,6 +246,8 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
     if snap is None:
         return None
 
+    error_class, error_message = _extract_error_metadata(snap)
+
     try:
         return _Snapshot(
             feature_id=str(snap.get("feature_id", feature_id)),
@@ -217,6 +268,8 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
                 if snap.get("waiting_for") is not None
                 else None
             ),
+            error_class=error_class,
+            error_message=error_message,
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.debug(
@@ -371,8 +424,16 @@ class StreamEventTranslator:
         # 1) Terminal states.
         if snap.lifecycle == "failed" and (prev is None or prev.lifecycle != "failed"):
             return self._build_failed(snap, cid)
-        if snap.lifecycle == "cancelled" and (
-            prev is None or prev.lifecycle != "cancelled"
+        # AC-2 (TASK-FRR-PEB-007): operator-cancel via the SDK surfaces
+        # over SSE as a terminal lifecycle of either "cancelled" (the
+        # canonical autobuild lifecycle) or "interrupted" (the
+        # langgraph-runner label for an SDK
+        # ``runs.cancel(action="interrupt")``). Both map to a single
+        # ``BuildCancelledPayload`` so downstream consumers see exactly
+        # one cancel envelope per operator-cancel — even if the runner
+        # emits the lifecycle under either label.
+        if snap.lifecycle in ("cancelled", "interrupted") and (
+            prev is None or prev.lifecycle not in ("cancelled", "interrupted")
         ):
             return self._build_cancelled(snap, cid)
         if snap.lifecycle == "completed" and (
@@ -452,10 +513,22 @@ class StreamEventTranslator:
         return payload
 
     def _build_failed(self, snap: _Snapshot, correlation_id: str) -> BuildFailedPayload:
+        # TASK-FRR-PEB-011 AC-4: format ``failure_reason`` as
+        # ``"{ExceptionClass}: {message}"`` when the runner forwards
+        # async-failure metadata; fall back to a generic legacy string
+        # for snapshots that do not carry it.
+        if snap.error_class and snap.error_message:
+            failure_reason = f"{snap.error_class}: {snap.error_message}"
+        elif snap.error_class:
+            failure_reason = snap.error_class
+        elif snap.error_message:
+            failure_reason = snap.error_message
+        else:
+            failure_reason = "autobuild failed (sse)"
         payload = BuildFailedPayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
-            failure_reason="autobuild failed (sse)",
+            failure_reason=failure_reason,
             recoverable=False,
             failed_task_id=None,
         )

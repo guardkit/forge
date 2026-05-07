@@ -1,0 +1,139 @@
+{
+  "task_id": "TASK-FRR-PEB-005",
+  "turn": 1,
+  "files_modified": [
+    ".claude/task-plans/TASK-FRR-PEB-005-implementation-plan.md",
+    ".claude/task-plans/TASK-FRR-PEB-006-implementation-plan.md",
+    ".claude/task-plans/TASK-FRR-PEB-007-implementation-plan.md",
+    ".guardkit/autobuild/TASK-FRR-PEB-004/checkpoints.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-005/state_transitions.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-005/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/state_transitions.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-007/state_transitions.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-007/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-011/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/player_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/task_work_results.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/turn_state_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/src/forge/cli/_serve_deps.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/tests/forge/lifecycle_bridge/test_coexistence.py",
+    "src/forge/adapters/nats/approval_subscriber.py",
+    "src/forge/cli/_serve_deps.py",
+    "src/forge/lifecycle_bridge/bridge.py",
+    "src/forge/lifecycle_bridge/translation.py",
+    "src/forge/lifecycle_bridge/wireup.py",
+    "tasks/design_approved/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
+    "tasks/design_approved/TASK-FRR-PEB-006-pause-resume-canonicalisation.md",
+    "tasks/design_approved/TASK-FRR-PEB-007-cancel-emit-ownership.md",
+    "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+    "tests/forge/lifecycle_bridge/test_translation.py",
+    "tests/forge/test_pause_resume_publish.py"
+  ],
+  "files_created": [
+    ".guardkit/autobuild/TASK-FRR-PEB-005/player_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-005/task_work_results.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-014/checkpoints.json",
+    ".guardkit/bdd/TASK-FRR-PEB-005_junit.xml",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-005/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/src/forge/lifecycle_bridge/coexistence.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/tests/forge/lifecycle_bridge/test_coexistence.py",
+    "src/forge/cli/_serve_handlers.py",
+    "src/forge/lifecycle_bridge/coexistence.py",
+    "tests/forge/lifecycle_bridge/test_cancel.py",
+    "tests/forge/lifecycle_bridge/test_coexistence.py",
+    "tests/forge/lifecycle_bridge/test_pause_resume.py",
+    "tests/forge/lifecycle_bridge/test_publish_failure.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/tests/forge/lifecycle_bridge/test_coexistence.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-1 sync-raise still uses safety-net publish, no bridge attach",
+    "AC-2 bridge-first sync-raise-second produces single envelope via ledger claim",
+    "AC-3 first-wins invariant across bridge-first / F010F-first / concurrent orderings",
+    "AC-4 F010F regression suite unchanged + opt-in ledger preserves legacy semantics",
+    "AC-5 F010C correlation-id AST guard remains green",
+    "AC-6 ruff lint zero errors"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 44,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 14,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "When dispatch_build raises synchronously, the bridge's attach() call is never made (the registry has no entry); F010F's safety-net publish path fires exactly one build-failed envelope. No build-started envelope is published.",
+      "status": "complete",
+      "evidence": "TestSyncRaiseUsesSafetyNetNotBridge.test_sync_raise_publishes_build_failed_and_does_not_attach_bridge drives a real handle_message call with an AsyncMock dispatch_build that raises AttributeError. The test asserts (a) publisher.publish_build_failed.assert_awaited_once with feature_id matching the inbound envelope, (b) attach_spy.assert_not_called on a MagicMock-wrapped LifecycleBridge.attach, (c) registry.list_active(...) returns [] proving no bridge row was written, (d) msg.ack.assert_awaited_once. No build-started publish path exists in handle_message's exception branch \u2014 the wrapper only ever publishes build-failed.",
+      "test_file": "tests/forge/lifecycle_bridge/test_coexistence.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/coexistence.py",
+        "src/forge/cli/_serve_deps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "When the bridge has already observed a terminal failure via SSE AND a delayed sync-raise fires for the same (feature_id, correlation_id) shortly after, exactly one build-failed envelope is published. Implementation: the bridge's terminal-observation path marks the build 'terminal-published' in the registry before invoking ack; F010F's safety-net checks the registry and skips its emit if the flag is set.",
+      "status": "complete",
+      "evidence": "TestBridgeFirstThenSyncRaiseSkipsSafetyNet.test_bridge_claim_then_safety_net_skip \u2014 first calls ledger.claim(claimed_by=CLAIMER_BRIDGE_TERMINAL) (returns True), then awaits the production wrapper _build_publish_build_failed(publisher, terminal_publish_ledger=ledger). The wrapper consults the ledger via TerminalPublishLedger.claim and observes claim()==False, so it short-circuits without invoking publisher.publish_build_failed. Test asserts publisher.publish_build_failed.assert_not_awaited() and that the ledger row's claimed_by is still CLAIMER_BRIDGE_TERMINAL. Production wiring: _build_publish_build_failed in src/forge/cli/_serve_deps.py now accepts terminal_publish_ledger and runs the claim before attach_correlation_id+publish.",
+      "test_file": "tests/forge/lifecycle_bridge/test_coexistence.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/coexistence.py",
+        "src/forge/cli/_serve_deps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "A first-wins invariant test asserts no race condition can produce two terminal envelopes for the same build, regardless of ordering: bridge-first / F010F-first / concurrent.",
+      "status": "complete",
+      "evidence": "TestFirstWinsInvariant has three sub-tests: test_bridge_first_then_safety_net_publishes_zero (bridge wins \u2192 wrapper skips, publisher.publish_build_failed not awaited), test_safety_net_first_then_bridge_claim_loses (F010F wins \u2192 wrapper publishes once, subsequent ledger.claim returns False so the bridge would skip), test_concurrent_gather_produces_exactly_one_envelope (asyncio.gather on bridge_publish + f010f_publish coroutines; total envelopes from both paths summed to exactly 1, plus a SQL COUNT(*) over the ledger asserts a single row). The first-wins invariant rests on the atomic BEGIN IMMEDIATE + INSERT OR IGNORE in TerminalPublishLedger.claim \u2014 the row's composite PRIMARY KEY (feature_id, correlation_id) means SQLite enforces uniqueness at insert time and rowcount==1 only for the winner.",
+      "test_file": "tests/forge/lifecycle_bridge/test_coexistence.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/coexistence.py",
+        "src/forge/cli/_serve_deps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "F010F's existing test suite (tests/forge/test_safety_net_publish.py or equivalent \u2014 verify path during implementation) continues to pass unchanged. No F010F production code is touched.",
+      "status": "complete",
+      "evidence": "F010F's regression suite lives at tests/forge/test_pipeline_consumer_dispatch_failure_publish.py (verified during implementation \u2014 no test_safety_net_publish.py exists; the file referenced by the task is the dispatch_failure_publish test). All 4 tests pass after the change: TestDispatchRaisePublishesBuildFailed (parametrised attribute_error_f010e_shape + runtime_error_cross_cut), TestPublishFailureStillAcks, TestHappyPathDoesNotPublish. The F010F production code in src/forge/adapters/nats/pipeline_consumer.py is byte-for-byte unchanged. The new ledger plumbing is opt-in via _build_publish_build_failed's keyword-only terminal_publish_ledger param defaulting to None \u2014 F010F tests construct the wrapper without the param and the new claim branch is skipped entirely. TestF010fRegressionStillPasses.test_no_ledger_publishes_unconditionally pins this contract directly.",
+      "test_file": "tests/forge/test_pipeline_consumer_dispatch_failure_publish.py",
+      "implementation_files": [
+        "src/forge/cli/_serve_deps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "F010C correlation-id AST guard remains green.",
+      "status": "complete",
+      "evidence": "All 9 tests in tests/forge/test_pipeline_consumer_correlation_id.py pass \u2014 including TestAllRejectionPathsThreadCorrelationId.test_every_safe_publish_failure_call_passes_correlation_id_kwarg (the AST guard) and TestBridgeRegistryCallsThreadCorrelationId.test_every_bridge_registry_call_passes_correlation_id_kwarg. The implementation preserves every existing correlation_id= kwarg and the new TerminalPublishLedger.claim call inside _build_publish_build_failed threads correlation_id explicitly. No new BridgeRegistry call sites were introduced (the ledger uses its own table), so the bridge-registry AST guard is unaffected.",
+      "test_file": "tests/forge/test_pipeline_consumer_correlation_id.py",
+      "implementation_files": [
+        "src/forge/cli/_serve_deps.py",
+        "src/forge/lifecycle_bridge/coexistence.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "ruff check src/forge/lifecycle_bridge/coexistence.py src/forge/cli/_serve_deps.py tests/forge/lifecycle_bridge/test_coexistence.py \u2192 'All checks passed!' (zero errors). One initial F401 unused-import was fixed in the test file (removed AckHandle from imports).",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/coexistence.py",
+        "src/forge/cli/_serve_deps.py",
+        "tests/forge/lifecycle_bridge/test_coexistence.py"
+      ]
+    }
+  ]
+}
