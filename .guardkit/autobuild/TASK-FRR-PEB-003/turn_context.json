@@ -1,8 +1,8 @@
 {
   "task_id": "TASK-FRR-PEB-003",
-  "turn": 4,
+  "turn": 5,
   "max_turns": 5,
-  "turns_remaining": 1,
+  "turns_remaining": 0,
   "approaching_limit": true,
   "escape_hatch_active": true,
   "instructions": "If approaching_limit is true and you cannot complete the task, include a 'blocked_report' field in your player report JSON. See autobuild-player.md for the blocked_report schema.",

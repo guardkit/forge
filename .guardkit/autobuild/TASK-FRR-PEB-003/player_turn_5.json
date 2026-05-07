@@ -1,22 +1,6 @@
 {
   "task_id": "TASK-FRR-PEB-003",
-  "timestamp": "2026-05-07T11:12:08.623737",
-  "completed": true,
-  "phases": {
-    "phase_3": {
-      "detected": true,
-      "text": "Implementation",
-      "completed": true
-    }
-  },
-  "quality_gates": {
-    "tests_passing": true,
-    "tests_passed": 67,
-    "tests_failed": 0,
-    "coverage": null,
-    "coverage_met": null,
-    "all_passed": true
-  },
+  "turn": 5,
   "files_modified": [
     ".claude/task-plans/TASK-FRR-PEB-003-implementation-plan.md",
     ".claude/task-plans/TASK-FRR-PEB-010-implementation-plan.md",
@@ -75,45 +59,25 @@
     "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-003/player_turn_5.json"
   ],
   "tests_written": [],
-  "summary": "67 tests passed, all quality gates passed",
-  "sdk_turns": {
-    "turns_used": 9,
-    "max_turns": 170,
-    "ceiling_hit": false
-  },
-  "task_type": "feature",
-  "agent_invocations_validation": {
-    "status": "violation",
-    "expected_phases": 3,
-    "actual_invocations": 2,
-    "missing_phases": [
-      "3"
-    ],
-    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-  },
-  "plan_audit": {
-    "status": "violation",
-    "severity": "high",
-    "violations": 1,
-    "extra_files": [],
-    "missing_files": [
-      "src/forge/dispatch/autobuild_async.py"
-    ],
-    "extra_modifications": [],
-    "missing_modifications": [],
-    "extra_dependencies": [],
-    "missing_dependencies": [],
-    "loc_variance_pct": null,
-    "discrepancies_count": 1,
-    "message": "no plan on disk; AC names file path(s) that do not exist on disk: src/forge/dispatch/autobuild_async.py"
-  },
-  "unconfirmed_low_confidence_assumptions": {
-    "status": "ok",
-    "unconfirmed": [],
-    "files_scanned": 0,
-    "files_skipped": 0,
-    "message": null
-  },
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: StreamEventTranslator surface (verified turns 2, 3, 4, 5)",
+    "AC-002: unknown events return None + DEBUG log, not WARNING (verified)",
+    "AC-003: MissingCorrelationIdError on missing correlation_id (verified)",
+    "AC-004: contract test with success and failure path JSONL fixtures (verified)",
+    "AC-005: pyproject.toml pins for langgraph-sdk~=0.3.13 and langgraph-api~=0.8.0 (verified)",
+    "AC-006: AST guard extended with translator emit sites (verified)",
+    "AC-007: ruff lint passes (verified)"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 9,
+  "sdk_max_turns": 170,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 67,
   "completion_promises": [
     {
       "criterion_id": "AC-001",
@@ -186,22 +150,6 @@
       "implementation_files": [
         "src/forge/lifecycle_bridge/translation.py"
       ]
-    }
-  ],
-  "agent_invocations": [
-    {
-      "phase": "4",
-      "agent": "test-orchestrator",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 52.653129791026004
-    },
-    {
-      "phase": "5",
-      "agent": "code-reviewer",
-      "status": "completed",
-      "source": "orchestrator",
-      "duration_seconds": 245.94720795808826
     }
   ]
 }
