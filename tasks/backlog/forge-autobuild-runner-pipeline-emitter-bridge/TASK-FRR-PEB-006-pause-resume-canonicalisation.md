@@ -55,7 +55,7 @@ behaviour.
   to `BuildPausedPayload` and `running_wave-after-awaiting_approval`
   events to `BuildResumedPayload`. T3's translator is extended; no new
   translator class.
-- AC-2: `src/forge/cli/_approval_subscriber.py` (or wherever FW10-010's
+- AC-2: `src/forge/adapters/nats/approval_subscriber.py` (or wherever FW10-010's
   resume emit lives — verify path during implementation) is amended:
   before publishing `build-resumed`, it queries the
   `lifecycle_bridge_registry` for the `(feature_id, correlation_id)`;
@@ -92,14 +92,14 @@ behaviour.
 ## Files to Modify
 
 - `src/forge/lifecycle_bridge/translation.py`
-- `src/forge/cli/_approval_subscriber.py`
-- `tests/forge/test_approval_subscriber.py`
+- `src/forge/adapters/nats/approval_subscriber.py`
+- `tests/forge/adapters/test_approval_subscriber.py`
 
 ## Implementation notes
 
 - Touchpoints: `src/forge/lifecycle_bridge/translation.py` (extend);
-  `src/forge/cli/_approval_subscriber.py` (amend);
-  `tests/forge/test_approval_subscriber.py` (update, do not delete).
+  `src/forge/adapters/nats/approval_subscriber.py` (amend);
+  `tests/forge/adapters/test_approval_subscriber.py` (update, do not delete).
 - Reference: FW10-010 task file in `tasks/completed/`.
 - The "bridge wired" check is a registry lookup: if
   `BridgeRegistry.get(feature_id)` returns a non-None entry, bridge is
@@ -109,7 +109,7 @@ behaviour.
 
 ```bash
 PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py -x -v
-PYTHONPATH=src python -m pytest tests/forge/test_approval_subscriber.py -x -v
+PYTHONPATH=src python -m pytest tests/forge/adapters/test_approval_subscriber.py -x -v
 PYTHONPATH=src python -m pytest tests/forge/test_pipeline_consumer_correlation_id.py -x -v
-ruff check src/forge/lifecycle_bridge/translation.py src/forge/cli/_approval_subscriber.py
+ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py
 ```

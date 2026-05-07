@@ -79,7 +79,7 @@ between chat-REPL prompts. ASSUM-007 / Q6 sub-option (a) commitment.
 ## Files to Modify
 
 - `src/forge/cli/status.py`
-- `tests/forge/cli/test_status.py`
+- `tests/forge/test_cli_status.py`
 
 ## Implementation notes
 
@@ -92,7 +92,7 @@ between chat-REPL prompts. ASSUM-007 / Q6 sub-option (a) commitment.
 ## Coach validation commands
 
 ```bash
-PYTHONPATH=src python -m pytest tests/forge/cli/test_status.py -x -v -k in_flight
+PYTHONPATH=src python -m pytest tests/forge/test_cli_status.py -x -v -k in_flight
 ruff check src/forge/cli/status.py
 forge status --in-flight  # smoke check against running daemon (manual)
 ```
