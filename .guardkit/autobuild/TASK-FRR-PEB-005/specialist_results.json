@@ -1,12 +1,12 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 77.90678329195362,
+    "duration_seconds": 81.58499508304521,
     "error": null,
-    "tests_run": 86,
+    "tests_run": 8,
     "tests_failed": 0,
-    "coverage_pct": 70.0,
-    "output_summary": "pytest: 86 passed, 0 failed in 3.17s; coverage 70% across changed lifecycle_bridge/cli/adapter modules",
+    "coverage_pct": 54.0,
+    "output_summary": "pytest: 8 passed in 0.16s (AC-4 alias + canonical F010F safety-net publish suite); pipeline_consumer.py line coverage 54%",
     "quality_gates_passed": true
   },
   "phase_5": {

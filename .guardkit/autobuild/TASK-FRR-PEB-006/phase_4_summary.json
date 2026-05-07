@@ -1,7 +1,7 @@
 {
-  "tests_run": 86,
+  "tests_run": 126,
   "tests_failed": 0,
-  "coverage_pct": 33.0,
-  "output_summary": "86 passed, 0 failed; lifecycle_bridge: bridge.py 88%, translation.py 85%, wireup.py 73%, coexistence.py 82%; overall package coverage 33%.",
+  "coverage_pct": 59.0,
+  "output_summary": "126 passed, 0 failed; approval_subscriber.py 97%, bridge.py 88%, translation.py 85%, coexistence.py 82%, wireup.py 73%; targeted-modules coverage 59%.",
   "quality_gates_passed": true
 }
