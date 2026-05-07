@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-FRR-PEB-013",
-    "pre_path": "tasks/backlog/TASK-FRR-PEB-013-sidecar-aware-e2e-integration-test.md",
-    "post_path": "tasks/design_approved/TASK-FRR-PEB-013-sidecar-aware-e2e-integration-test.md",
-    "timestamp": "2026-05-07T15:21:55.734489+00:00",
-    "kind": "design_approved_transition"
-  }
-]

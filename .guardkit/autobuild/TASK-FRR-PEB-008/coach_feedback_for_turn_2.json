@@ -1,9 +1,0 @@
-{
-  "turn": 2,
-  "feedback_from_turn": 1,
-  "feedback_summary": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-2: The bridge's SSE observer task wraps its connection loop in\n  \u2022 AC-4: Malformed SSE responses are logged at WARNING with the parse",
-  "must_fix": [],
-  "should_fix": [],
-  "validation_results": {},
-  "raw_feedback": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-2: The bridge's SSE observer task wraps its connection loop in\n  \u2022 AC-4: Malformed SSE responses are logged at WARNING with the parse"
-}

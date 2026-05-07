@@ -1,7 +1,0 @@
-{
-  "tests_run": 147,
-  "tests_failed": 0,
-  "coverage_pct": 85.19,
-  "output_summary": "pytest 147 passed (lifecycle_bridge + cancel + correlation-id) — 85% line coverage on modified modules; serve_handlers 100%, bridge 93%, translation 85%",
-  "quality_gates_passed": true
-}

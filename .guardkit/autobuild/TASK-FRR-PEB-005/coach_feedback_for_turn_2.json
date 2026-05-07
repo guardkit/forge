@@ -1,9 +1,0 @@
-{
-  "turn": 2,
-  "feedback_from_turn": 1,
-  "feedback_summary": "- AC names test file(s) that don't exist on disk: tests/forge/test_safety_net_publish.py. The independent-test gate cannot run honestly while AC-cited tests are absent.",
-  "must_fix": [],
-  "should_fix": [],
-  "validation_results": {},
-  "raw_feedback": "- AC names test file(s) that don't exist on disk: tests/forge/test_safety_net_publish.py. The independent-test gate cannot run honestly while AC-cited tests are absent."
-}

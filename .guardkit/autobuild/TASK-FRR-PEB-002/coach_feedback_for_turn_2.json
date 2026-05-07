@@ -1,9 +1,0 @@
-{
-  "turn": 2,
-  "feedback_from_turn": 1,
-  "feedback_summary": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`\n  \u2022 AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a\n  \u2022 AC-3: A `BridgeRegistry` repository class exposes:\n  \u2022 AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`\n  \u2022 AC-5: F010C correlation-id contract: every `BridgeRegistry` operation\n  (1 more)",
-  "must_fix": [],
-  "should_fix": [],
-  "validation_results": {},
-  "raw_feedback": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-1: `src/forge/lifecycle_bridge/bridge.py` exposes a `LifecycleBridge`\n  \u2022 AC-2: A new `lifecycle_bridge_registry` SQLite table is created via a\n  \u2022 AC-3: A `BridgeRegistry` repository class exposes:\n  \u2022 AC-4: `attach()` writes a row; `detach()` deletes it; `list_active()`\n  \u2022 AC-5: F010C correlation-id contract: every `BridgeRegistry` operation\n  (1 more)"
-}

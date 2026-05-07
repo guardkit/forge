@@ -1,7 +1,0 @@
-{
-  "tests_run": 43,
-  "tests_failed": 0,
-  "coverage_pct": 81.36,
-  "output_summary": "43 passed, 0 failed in 0.43s; coverage 81% (bridge.py 88%, migration 83%, registry 77%) across lifecycle_bridge + persistence + correlation-id tests.",
-  "quality_gates_passed": true
-}

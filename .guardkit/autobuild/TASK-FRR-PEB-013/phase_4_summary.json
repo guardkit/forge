@@ -1,7 +1,0 @@
-{
-  "tests_run": 32,
-  "tests_failed": 0,
-  "coverage_pct": 84.32,
-  "output_summary": "30 passed, 2 skipped (langgraph sidecar env-gated); src/forge/cli/status.py line coverage 84.3%; ruff clean",
-  "quality_gates_passed": true
-}
