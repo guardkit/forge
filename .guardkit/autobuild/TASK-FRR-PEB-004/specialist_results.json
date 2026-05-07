@@ -1,17 +1,17 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 57.1101529590087,
+    "duration_seconds": 177.3383985409746,
     "error": null,
-    "tests_run": 23,
+    "tests_run": 26,
     "tests_failed": 0,
     "coverage_pct": 81.0,
-    "output_summary": "23 passed, 0 failed; coverage 81% on src/forge/lifecycle_bridge/wireup.py (161 stmts, 30 missed) via pytest+pytest-cov",
+    "output_summary": "26 passed, 0 failed; coverage 81% on forge.lifecycle_bridge.wireup (161 stmts, 30 missed) via pytest+pytest-cov on test_wireup.py + test_wireup_seam.py",
     "quality_gates_passed": true
   },
   "phase_5": {
     "status": "passed",
-    "duration_seconds": 223.61248308396898,
+    "duration_seconds": 253.33108749997336,
     "error": null,
     "issues": [],
     "quality_score": 0.0,

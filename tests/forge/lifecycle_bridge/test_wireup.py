@@ -24,15 +24,15 @@ Acceptance-criteria coverage map:
   the configured timeout (default 5s):
   :class:`TestShutdownDrainsObservers`.
 
-Plus a seam test that pins the §4 ``STREAM_EVENT_SCHEMA`` contract at
-the boundary with TASK-FRR-PEB-003: :class:`TestStreamEventSchemaSeam`.
+The §4 ``STREAM_EVENT_SCHEMA`` contract seam test lives in the
+sibling :mod:`tests.forge.lifecycle_bridge.test_wireup_seam` file.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -43,16 +43,11 @@ from nats_core.events import (
     BuildCancelledPayload,
     BuildCompletePayload,
     BuildFailedPayload,
-    BuildPausedPayload,
-    BuildResumedPayload,
-    BuildStartedPayload,
-    StageCompletePayload,
 )
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.lifecycle_bridge.bridge import (
-    BuildContext,
     LifecycleBridge,
 )
 from forge.lifecycle_bridge.translation import (
@@ -742,54 +737,8 @@ class TestShutdownDrainsObservers:
 
 
 # ---------------------------------------------------------------------------
-# Seam test — STREAM_EVENT_SCHEMA contract with TASK-FRR-PEB-003
+# Note: STREAM_EVENT_SCHEMA seam test lives in test_wireup_seam.py
 # ---------------------------------------------------------------------------
-
-
-class TestStreamEventSchemaSeam:
-    """Verify the §4 STREAM_EVENT_SCHEMA contract at the wireup boundary.
-
-    Producer: TASK-FRR-PEB-003 — :class:`StreamEventTranslator`.
-    Consumer: TASK-FRR-PEB-004 — :class:`LifecycleBridgeWireup`.
-    """
-
-    @pytest.mark.seam
-    def test_stream_event_schema_format(self, translator) -> None:
-        # Build a canonical "values" StreamPart at the running_wave edge.
-        feature_id = "FEAT-SEAM-001"
-        context = BuildContext(
-            feature_id=feature_id,
-            thread_id="thread-seam",
-            run_id="run-seam",
-            correlation_id="corr-seam",
-            deadline_at=datetime.now(UTC) + timedelta(seconds=300),
-        )
-        # Prime translator with a starting snapshot so the next part
-        # is the build-start edge.
-        translator.translate(
-            _state_part(feature_id, lifecycle="starting"), context
-        )
-        event = translator.translate(
-            _state_part(feature_id, lifecycle="running_wave"), context
-        )
-
-        # Consumer-side contract verification:
-        assert event is not None
-        assert isinstance(
-            event,
-            (
-                BuildStartedPayload,
-                StageCompletePayload,
-                BuildCompletePayload,
-                BuildFailedPayload,
-                BuildPausedPayload,
-                BuildResumedPayload,
-                BuildCancelledPayload,
-            ),
-        )
-        # §4 contract: correlation_id always populated on the typed
-        # payload, matches BuildContext.
-        assert getattr(event, "correlation_id", None) == "corr-seam"
 
 
 # ---------------------------------------------------------------------------
