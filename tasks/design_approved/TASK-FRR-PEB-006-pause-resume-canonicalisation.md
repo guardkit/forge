@@ -92,15 +92,26 @@ behaviour.
 
 ## Files to Modify
 
+<!-- Path verification (per AC-2): the stale draft paths
+     `src/forge/cli/_approval_subscriber.py` and
+     `tests/forge/test_approval_subscriber.py` do not exist in this
+     repository. The actual FW10-010 resume-emit site lives at
+     `src/forge/adapters/nats/approval_subscriber.py` and the
+     FW10-010 regression suite (the "approval-resume publish" tests)
+     lives at `tests/forge/test_pause_resume_publish.py`. Paths
+     below have been corrected to match. -->
+
 - `src/forge/lifecycle_bridge/translation.py`
-- `src/forge/cli/_approval_subscriber.py`
-- `tests/forge/test_approval_subscriber.py`
+- `src/forge/adapters/nats/approval_subscriber.py`
+- `tests/forge/test_pause_resume_publish.py`
 
 ## Implementation notes
 
 - Touchpoints: `src/forge/lifecycle_bridge/translation.py` (extend);
-  `src/forge/cli/_approval_subscriber.py` (amend);
-  `tests/forge/test_approval_subscriber.py` (update, do not delete).
+  `src/forge/adapters/nats/approval_subscriber.py` (amend — verified
+  per AC-2 as the actual FW10-010 resume-emit site);
+  `tests/forge/test_pause_resume_publish.py` (update, do not delete —
+  this is the FW10-010 regression suite).
 - Reference: FW10-010 task file in `tasks/completed/`.
 - The "bridge wired" check is a registry lookup: if
   `BridgeRegistry.get(feature_id)` returns a non-None entry, bridge is
@@ -110,7 +121,7 @@ behaviour.
 
 ```bash
 PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py -x -v
-PYTHONPATH=src python -m pytest tests/forge/test_approval_subscriber.py -x -v
+PYTHONPATH=src python -m pytest tests/forge/test_pause_resume_publish.py -x -v
 PYTHONPATH=src python -m pytest tests/forge/test_pipeline_consumer_correlation_id.py -x -v
-ruff check src/forge/lifecycle_bridge/translation.py src/forge/cli/_approval_subscriber.py
+ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py
 ```

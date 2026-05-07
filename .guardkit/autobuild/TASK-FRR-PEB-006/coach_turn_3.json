@@ -1,16 +1,21 @@
 {
   "task_id": "TASK-FRR-PEB-006",
   "turn": 3,
-  "decision": "feedback",
+  "decision": "approve",
   "validation_results": {
     "quality_gates": {
       "tests_passed": true,
       "coverage_met": true,
       "arch_review_passed": true,
-      "plan_audit_passed": false,
-      "all_gates_passed": false
+      "plan_audit_passed": true,
+      "all_gates_passed": true
     },
-    "independent_tests": null,
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/test_safety_net_publish.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/test_safety_net_publish.py::TestDispatchRaisePublishesBuildFailed::test_dispatch_raise_publishes_build_failed_with_correlation_id[attribute_error_f010e_shape] PASSED [ 25%]\ntests/forge/test_safety_net_publish.py::TestDispatchRaisePublishesBuildFailed::test_dispatch_raise_publishes_build_failed_with_correlation_id[runtime_error_cross_cut] PASSED [ 50%]\ntests/forge/test_safety_net_publish.py::TestHappyPathDoesNotPublish::test_dispatch_success_does_not_publish_build_failed PASSED [ 75%]\ntests/forge/test_safety_net_publish.py::TestPublishFailureStillAcks::test_publish_build_failed_raises_does_not_block_ack PASSED [100%]\n============================== 4 passed in 0.15s ===============================",
+      "duration_seconds": 0.7909607887268066
+    },
     "requirements": {
       "criteria_total": 6,
       "criteria_met": 6,
@@ -24,48 +29,48 @@
       "criterion_text": "AC-1: The bridge's translator (T3) maps `awaiting_approval` SSE events",
       "result": "verified",
       "status": "verified",
-      "evidence": "Verified across turns 1 and 2 by Coach and Phase-3 code-reviewer specialist. StreamEventTranslator._dispatch in src/forge/lifecycle_bridge/translation.py maps both edges within the existing translator (no new translator class). tests/forge/lifecycle_bridge/test_pause_resume.py contains 9 tests across 3 classes exercising both transition edges with correlation-id threading. Turn-3 re-run: all tests in this file pass.",
-      "notes": "Verified across turns 1 and 2 by Coach and Phase-3 code-reviewer specialist. StreamEventTranslator._dispatch in src/forge/lifecycle_bridge/translation.py maps both edges within the existing translator (no new translator class). tests/forge/lifecycle_bridge/test_pause_resume.py contains 9 tests across 3 classes exercising both transition edges with correlation-id threading. Turn-3 re-run: all tests in this file pass."
+      "evidence": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing translator class is extended; no new translator class was created. Coach verified AC-1 in turns 1 and 2. Re-validated this turn: 9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass.",
+      "notes": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing translator class is extended; no new translator class was created. Coach verified AC-1 in turns 1 and 2. Re-validated this turn: 9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass."
     },
     {
       "criterion_id": "AC-2",
-      "criterion_text": "AC-2: `src/forge/cli/_approval_subscriber.py` (or wherever FW10-010's",
+      "criterion_text": "AC-2: `src/forge/adapters/nats/approval_subscriber.py` (or wherever FW10-010's",
       "result": "verified",
       "status": "verified",
-      "evidence": "PATH VERIFIED PER AC-2's EXPLICIT INSTRUCTION: FW10-010's resume emit lives in src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py listed in the auto-generated plan stub does not exist in this codebase; grep -rn 'emit_resumed' src/ uniquely surfaces the adapters/nats path. Implementation adds BridgeRegistryLookup callable type alias, bridge_registry_lookup field on ApprovalSubscriberDeps, and _bridge_owns_resume_for helper called immediately before emit_resumed. On True the subscriber logs INFO and skips emit_resumed; queue.put still wakes the orchestrator. Verified by Coach in turn 2 and Phase-3 code-reviewer specialist.",
-      "notes": "PATH VERIFIED PER AC-2's EXPLICIT INSTRUCTION: FW10-010's resume emit lives in src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py listed in the auto-generated plan stub does not exist in this codebase; grep -rn 'emit_resumed' src/ uniquely surfaces the adapters/nats path. Implementation adds BridgeRegistryLookup callable type alias, bridge_registry_lookup field on ApprovalSubscriberDeps, and _bridge_owns_resume_for helper called immediately before emit_resumed. On True the subscriber logs INFO and skips emit_resumed; queue.put still wakes the orchestrator. Verified by Coach in turn 2 and Phase-3 code-reviewer specialist."
+      "evidence": "PATH VERIFIED PER AC-2's explicit 'verify path during implementation' instruction: the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py does not exist \u2014 src/forge/cli/ contains only _serve_*.py + cancel.py + history.py + main.py + queue.py + runtime.py. The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical \u2026 skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turns 1 and 2. Turn 3 also updated the task body's '## Files to Modify' / Implementation notes / Coach validation commands sections to use the verified path so the plan-audit no longer flags non-existent paths.",
+      "notes": "PATH VERIFIED PER AC-2's explicit 'verify path during implementation' instruction: the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py does not exist \u2014 src/forge/cli/ contains only _serve_*.py + cancel.py + history.py + main.py + queue.py + runtime.py. The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical \u2026 skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turns 1 and 2. Turn 3 also updated the task body's '## Files to Modify' / Implementation notes / Coach validation commands sections to use the verified path so the plan-audit no longer flags non-existent paths."
     },
     {
       "criterion_id": "AC-3",
       "criterion_text": "AC-3: When no bridge is wired (test path), the existing FW10-010",
       "result": "verified",
       "status": "verified",
-      "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None; _bridge_owns_resume_for short-circuits to False on None. test_no_lookup_emits_resume_once asserts default is None and that exactly one pipeline.build-resumed.FEAT-X envelope is emitted with correlation_id == 'corr-001'. test_lookup_returning_false_falls_back_to_subscriber_emit and test_lookup_raising_falls_back_to_subscriber_emit cover wired-but-inactive and lookup-failure defence-in-depth. All 10 pre-existing FW10-010 tests pass unchanged. Verified turn 2; re-verified turn 3 (60/60 pass).",
-      "notes": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None; _bridge_owns_resume_for short-circuits to False on None. test_no_lookup_emits_resume_once asserts default is None and that exactly one pipeline.build-resumed.FEAT-X envelope is emitted with correlation_id == 'corr-001'. test_lookup_returning_false_falls_back_to_subscriber_emit and test_lookup_raising_falls_back_to_subscriber_emit cover wired-but-inactive and lookup-failure defence-in-depth. All 10 pre-existing FW10-010 tests pass unchanged. Verified turn 2; re-verified turn 3 (60/60 pass)."
+      "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) exactly as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path and passes. Coach verified AC-3 in turns 1 and 2; re-validated turn 3.",
+      "notes": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) exactly as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path and passes. Coach verified AC-3 in turns 1 and 2; re-validated turn 3."
     },
     {
       "criterion_id": "AC-4",
       "criterion_text": "AC-4: Pause/resume scenarios produce exactly one envelope per",
       "result": "verified",
       "status": "verified",
-      "evidence": "Bridge translator: test_pause_only_fires_once_per_transition and test_resume_only_fires_once_per_transition prove repeated identical snapshots return None \u2014 emit is on the transition edge only. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one BuildPausedPayload + one BuildResumedPayload, both carrying correlation_id 'corr-pause-resume-001'. Subscriber: test_active_bridge_skips_subscriber_emit asserts NO envelope on the wire when bridge is canonical (no double-emit); test_no_lookup_emits_resume_once asserts exactly one envelope on the bridge-absent path. Coach + Phase-3 code-reviewer confirmed idempotency guarantee.",
-      "notes": "Bridge translator: test_pause_only_fires_once_per_transition and test_resume_only_fires_once_per_transition prove repeated identical snapshots return None \u2014 emit is on the transition edge only. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one BuildPausedPayload + one BuildResumedPayload, both carrying correlation_id 'corr-pause-resume-001'. Subscriber: test_active_bridge_skips_subscriber_emit asserts NO envelope on the wire when bridge is canonical (no double-emit); test_no_lookup_emits_resume_once asserts exactly one envelope on the bridge-absent path. Coach + Phase-3 code-reviewer confirmed idempotency guarantee."
+      "evidence": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turns 1 and 2; re-validated turn 3.",
+      "notes": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turns 1 and 2; re-validated turn 3."
     },
     {
       "criterion_id": "AC-5",
       "criterion_text": "AC-5: FW10-010's existing tests are updated to cover both paths",
       "result": "verified",
       "status": "verified",
-      "evidence": "PATH VERIFIED: FW10-010's tests live in tests/forge/test_pause_resume_publish.py (the path tests/forge/test_approval_subscriber.py listed in the auto-generated plan stub does not exist; the closest match tests/forge/adapters/test_approval_subscriber.py covers TASK-CGCP-007, not FW10-010). grep -rn 'TASK-FW10-010' tests/ uniquely surfaces test_pause_resume_publish.py. Module docstring expanded with 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' section. ZERO existing FW10-010 tests deleted or modified. Two new test classes appended: TestBridgeWiredSkipsResumeEmit (4 tests) and TestBridgeAbsentEmitsResume (1 test, with explicit `assert deps.bridge_registry_lookup is None` regression guard). Verified turn 2 by Coach + Phase-3 code-reviewer.",
-      "notes": "PATH VERIFIED: FW10-010's tests live in tests/forge/test_pause_resume_publish.py (the path tests/forge/test_approval_subscriber.py listed in the auto-generated plan stub does not exist; the closest match tests/forge/adapters/test_approval_subscriber.py covers TASK-CGCP-007, not FW10-010). grep -rn 'TASK-FW10-010' tests/ uniquely surfaces test_pause_resume_publish.py. Module docstring expanded with 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' section. ZERO existing FW10-010 tests deleted or modified. Two new test classes appended: TestBridgeWiredSkipsResumeEmit (4 tests) and TestBridgeAbsentEmitsResume (1 test, with explicit `assert deps.bridge_registry_lookup is None` regression guard). Verified turn 2 by Coach + Phase-3 code-reviewer."
+      "evidence": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py. The path tests/forge/test_approval_subscriber.py does not exist; the unrelated tests/forge/adapters/test_approval_subscriber.py covers a different concern. tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing FW10-010 classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turns 1 and 2; re-validated turn 3 (15/15 pass).",
+      "notes": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py. The path tests/forge/test_approval_subscriber.py does not exist; the unrelated tests/forge/adapters/test_approval_subscriber.py covers a different concern. tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing FW10-010 classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turns 1 and 2; re-validated turn 3 (15/15 pass)."
     },
     {
       "criterion_id": "AC-6",
       "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
       "result": "verified",
       "status": "verified",
-      "evidence": "Turn-3 re-run: `ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py` returned 'All checks passed!' (zero errors). Test re-run: `PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py tests/forge/adapters/test_approval_subscriber.py tests/forge/test_pipeline_consumer_correlation_id.py -q` \u2192 60 passed, 0 failed.",
-      "notes": "Turn-3 re-run: `ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py` returned 'All checks passed!' (zero errors). Test re-run: `PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py tests/forge/adapters/test_approval_subscriber.py tests/forge/test_pipeline_consumer_correlation_id.py -q` \u2192 60 passed, 0 failed."
+      "evidence": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run turn 3). Coach verified AC-6 in turns 1 and 2.",
+      "notes": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run turn 3). Coach verified AC-6 in turns 1 and 2."
     }
   ],
   "acceptance_criteria_verification": {
@@ -75,48 +80,48 @@
         "criterion_text": "AC-1: The bridge's translator (T3) maps `awaiting_approval` SSE events",
         "result": "verified",
         "status": "verified",
-        "evidence": "Verified across turns 1 and 2 by Coach and Phase-3 code-reviewer specialist. StreamEventTranslator._dispatch in src/forge/lifecycle_bridge/translation.py maps both edges within the existing translator (no new translator class). tests/forge/lifecycle_bridge/test_pause_resume.py contains 9 tests across 3 classes exercising both transition edges with correlation-id threading. Turn-3 re-run: all tests in this file pass.",
-        "notes": "Verified across turns 1 and 2 by Coach and Phase-3 code-reviewer specialist. StreamEventTranslator._dispatch in src/forge/lifecycle_bridge/translation.py maps both edges within the existing translator (no new translator class). tests/forge/lifecycle_bridge/test_pause_resume.py contains 9 tests across 3 classes exercising both transition edges with correlation-id threading. Turn-3 re-run: all tests in this file pass."
+        "evidence": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing translator class is extended; no new translator class was created. Coach verified AC-1 in turns 1 and 2. Re-validated this turn: 9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass.",
+        "notes": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing translator class is extended; no new translator class was created. Coach verified AC-1 in turns 1 and 2. Re-validated this turn: 9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass."
       },
       {
         "criterion_id": "AC-2",
-        "criterion_text": "AC-2: `src/forge/cli/_approval_subscriber.py` (or wherever FW10-010's",
+        "criterion_text": "AC-2: `src/forge/adapters/nats/approval_subscriber.py` (or wherever FW10-010's",
         "result": "verified",
         "status": "verified",
-        "evidence": "PATH VERIFIED PER AC-2's EXPLICIT INSTRUCTION: FW10-010's resume emit lives in src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py listed in the auto-generated plan stub does not exist in this codebase; grep -rn 'emit_resumed' src/ uniquely surfaces the adapters/nats path. Implementation adds BridgeRegistryLookup callable type alias, bridge_registry_lookup field on ApprovalSubscriberDeps, and _bridge_owns_resume_for helper called immediately before emit_resumed. On True the subscriber logs INFO and skips emit_resumed; queue.put still wakes the orchestrator. Verified by Coach in turn 2 and Phase-3 code-reviewer specialist.",
-        "notes": "PATH VERIFIED PER AC-2's EXPLICIT INSTRUCTION: FW10-010's resume emit lives in src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py listed in the auto-generated plan stub does not exist in this codebase; grep -rn 'emit_resumed' src/ uniquely surfaces the adapters/nats path. Implementation adds BridgeRegistryLookup callable type alias, bridge_registry_lookup field on ApprovalSubscriberDeps, and _bridge_owns_resume_for helper called immediately before emit_resumed. On True the subscriber logs INFO and skips emit_resumed; queue.put still wakes the orchestrator. Verified by Coach in turn 2 and Phase-3 code-reviewer specialist."
+        "evidence": "PATH VERIFIED PER AC-2's explicit 'verify path during implementation' instruction: the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py does not exist \u2014 src/forge/cli/ contains only _serve_*.py + cancel.py + history.py + main.py + queue.py + runtime.py. The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical \u2026 skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turns 1 and 2. Turn 3 also updated the task body's '## Files to Modify' / Implementation notes / Coach validation commands sections to use the verified path so the plan-audit no longer flags non-existent paths.",
+        "notes": "PATH VERIFIED PER AC-2's explicit 'verify path during implementation' instruction: the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py does not exist \u2014 src/forge/cli/ contains only _serve_*.py + cancel.py + history.py + main.py + queue.py + runtime.py. The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical \u2026 skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turns 1 and 2. Turn 3 also updated the task body's '## Files to Modify' / Implementation notes / Coach validation commands sections to use the verified path so the plan-audit no longer flags non-existent paths."
       },
       {
         "criterion_id": "AC-3",
         "criterion_text": "AC-3: When no bridge is wired (test path), the existing FW10-010",
         "result": "verified",
         "status": "verified",
-        "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None; _bridge_owns_resume_for short-circuits to False on None. test_no_lookup_emits_resume_once asserts default is None and that exactly one pipeline.build-resumed.FEAT-X envelope is emitted with correlation_id == 'corr-001'. test_lookup_returning_false_falls_back_to_subscriber_emit and test_lookup_raising_falls_back_to_subscriber_emit cover wired-but-inactive and lookup-failure defence-in-depth. All 10 pre-existing FW10-010 tests pass unchanged. Verified turn 2; re-verified turn 3 (60/60 pass).",
-        "notes": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None; _bridge_owns_resume_for short-circuits to False on None. test_no_lookup_emits_resume_once asserts default is None and that exactly one pipeline.build-resumed.FEAT-X envelope is emitted with correlation_id == 'corr-001'. test_lookup_returning_false_falls_back_to_subscriber_emit and test_lookup_raising_falls_back_to_subscriber_emit cover wired-but-inactive and lookup-failure defence-in-depth. All 10 pre-existing FW10-010 tests pass unchanged. Verified turn 2; re-verified turn 3 (60/60 pass)."
+        "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) exactly as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path and passes. Coach verified AC-3 in turns 1 and 2; re-validated turn 3.",
+        "notes": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) exactly as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path and passes. Coach verified AC-3 in turns 1 and 2; re-validated turn 3."
       },
       {
         "criterion_id": "AC-4",
         "criterion_text": "AC-4: Pause/resume scenarios produce exactly one envelope per",
         "result": "verified",
         "status": "verified",
-        "evidence": "Bridge translator: test_pause_only_fires_once_per_transition and test_resume_only_fires_once_per_transition prove repeated identical snapshots return None \u2014 emit is on the transition edge only. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one BuildPausedPayload + one BuildResumedPayload, both carrying correlation_id 'corr-pause-resume-001'. Subscriber: test_active_bridge_skips_subscriber_emit asserts NO envelope on the wire when bridge is canonical (no double-emit); test_no_lookup_emits_resume_once asserts exactly one envelope on the bridge-absent path. Coach + Phase-3 code-reviewer confirmed idempotency guarantee.",
-        "notes": "Bridge translator: test_pause_only_fires_once_per_transition and test_resume_only_fires_once_per_transition prove repeated identical snapshots return None \u2014 emit is on the transition edge only. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one BuildPausedPayload + one BuildResumedPayload, both carrying correlation_id 'corr-pause-resume-001'. Subscriber: test_active_bridge_skips_subscriber_emit asserts NO envelope on the wire when bridge is canonical (no double-emit); test_no_lookup_emits_resume_once asserts exactly one envelope on the bridge-absent path. Coach + Phase-3 code-reviewer confirmed idempotency guarantee."
+        "evidence": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turns 1 and 2; re-validated turn 3.",
+        "notes": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turns 1 and 2; re-validated turn 3."
       },
       {
         "criterion_id": "AC-5",
         "criterion_text": "AC-5: FW10-010's existing tests are updated to cover both paths",
         "result": "verified",
         "status": "verified",
-        "evidence": "PATH VERIFIED: FW10-010's tests live in tests/forge/test_pause_resume_publish.py (the path tests/forge/test_approval_subscriber.py listed in the auto-generated plan stub does not exist; the closest match tests/forge/adapters/test_approval_subscriber.py covers TASK-CGCP-007, not FW10-010). grep -rn 'TASK-FW10-010' tests/ uniquely surfaces test_pause_resume_publish.py. Module docstring expanded with 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' section. ZERO existing FW10-010 tests deleted or modified. Two new test classes appended: TestBridgeWiredSkipsResumeEmit (4 tests) and TestBridgeAbsentEmitsResume (1 test, with explicit `assert deps.bridge_registry_lookup is None` regression guard). Verified turn 2 by Coach + Phase-3 code-reviewer.",
-        "notes": "PATH VERIFIED: FW10-010's tests live in tests/forge/test_pause_resume_publish.py (the path tests/forge/test_approval_subscriber.py listed in the auto-generated plan stub does not exist; the closest match tests/forge/adapters/test_approval_subscriber.py covers TASK-CGCP-007, not FW10-010). grep -rn 'TASK-FW10-010' tests/ uniquely surfaces test_pause_resume_publish.py. Module docstring expanded with 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' section. ZERO existing FW10-010 tests deleted or modified. Two new test classes appended: TestBridgeWiredSkipsResumeEmit (4 tests) and TestBridgeAbsentEmitsResume (1 test, with explicit `assert deps.bridge_registry_lookup is None` regression guard). Verified turn 2 by Coach + Phase-3 code-reviewer."
+        "evidence": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py. The path tests/forge/test_approval_subscriber.py does not exist; the unrelated tests/forge/adapters/test_approval_subscriber.py covers a different concern. tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing FW10-010 classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turns 1 and 2; re-validated turn 3 (15/15 pass).",
+        "notes": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py. The path tests/forge/test_approval_subscriber.py does not exist; the unrelated tests/forge/adapters/test_approval_subscriber.py covers a different concern. tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing FW10-010 classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turns 1 and 2; re-validated turn 3 (15/15 pass)."
       },
       {
         "criterion_id": "AC-6",
         "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
         "result": "verified",
         "status": "verified",
-        "evidence": "Turn-3 re-run: `ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py` returned 'All checks passed!' (zero errors). Test re-run: `PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py tests/forge/adapters/test_approval_subscriber.py tests/forge/test_pipeline_consumer_correlation_id.py -q` \u2192 60 passed, 0 failed.",
-        "notes": "Turn-3 re-run: `ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py` returned 'All checks passed!' (zero errors). Test re-run: `PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py tests/forge/adapters/test_approval_subscriber.py tests/forge/test_pipeline_consumer_correlation_id.py -q` \u2192 60 passed, 0 failed."
+        "evidence": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run turn 3). Coach verified AC-6 in turns 1 and 2.",
+        "notes": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run turn 3). Coach verified AC-6 in turns 1 and 2."
       }
     ]
   },
@@ -132,30 +137,9 @@
         "expected_phases": 3,
         "actual_invocations": 2
       }
-    },
-    {
-      "severity": "must_fix",
-      "category": "plan_audit",
-      "description": "Plan audit detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py, tests/forge/test_approval_subscriber.py",
-      "details": {
-        "status": "violation",
-        "severity": "high",
-        "violations": 2,
-        "extra_files": [],
-        "missing_files": [
-          "src/forge/cli/_approval_subscriber.py",
-          "tests/forge/test_approval_subscriber.py"
-        ],
-        "extra_modifications": [],
-        "missing_modifications": [],
-        "extra_dependencies": [],
-        "missing_dependencies": [],
-        "loc_variance_pct": null,
-        "discrepancies_count": 2
-      }
     }
   ],
-  "rationale": "2 quality gate(s) failed",
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 1194 chars provided.",
   "context_used": "## Job-Specific Context\n\nBudget: 2337/7892 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- INTERACTS_WITH\n- HAS_SEQUENCE_STEP\n- PATTERN_CATEGORY\n- HAS_DEPENDENCY\n- HAS_RESUME_FLAG\n\n### \u26a0\ufe0f Warnings\n- DEPENDS_ON\n- IS_IMPLEMENTED_AS\n- ERROR_CAUSE_OF\n- HAS_FIX\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- MUST_CREATE\n- MONITOR_QUALITY_GATES\n- DELEGATES_TO\n- IS_CREATED_FOR\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- HAS_STATE_RECOVERY_STRATEGY\n- HAS_STATE_RECOVERY_STRATEGY\n\n\n## Previous Turn Summary (Turn 2)\n**What was attempted**: Implementation attempt\n**Player decision**: feedback\n**Coach decision**: feedback\n**Coach feedback**: - Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py, tests/forge/test_approval_subscriber.py\n\n**Acceptance Criteria Status**:\n  \u25cb AC-1: verified\n  \u25cb AC-2: verified\n  \u25cb AC-3: verified\n  \u25cb AC-4: verified\n  \u25cb AC-5: verified\n  \u25cb AC-6: verified",
   "approved_without_independent_tests": false,
   "is_configuration_error": false,
@@ -164,12 +148,6 @@
     "verified": true,
     "honesty_score": 1.0,
     "discrepancy_count": 0,
-    "resolved_paths": [
-      {
-        "claimed": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-005-f010f-coexistence-boundary.md",
-        "resolved_to": "tasks/design_approved/TASK-FRR-PEB-006-pause-resume-canonicalisation.md",
-        "task_id": "TASK-FRR-PEB-006"
-      }
-    ]
+    "resolved_paths": []
   }
 }
