@@ -1,0 +1,15 @@
+{
+  "task_id": "TASK-FRR-PEB-003",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "e59aa59dbf588746056d9c6abd98621908960cc4",
+      "timestamp": "2026-05-07T10:49:07.431879",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false
+    }
+  ],
+  "last_updated": "2026-05-07T10:49:07.432078"
+}
