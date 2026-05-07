@@ -663,7 +663,277 @@ class TestStatusCommandShape:
         runner = CliRunner()
         result = runner.invoke(status_cmd, ["--help"])
         assert result.exit_code == 0
-        for flag in ("--watch", "--full", "--json"):
+        for flag in ("--watch", "--full", "--json", "--in-flight"):
             assert (
                 flag in result.output
             ), f"--help output missing {flag}: {result.output!r}"
+
+
+# ---------------------------------------------------------------------------
+# TASK-FRR-PEB-012: ``forge status --in-flight`` surface
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightSurface:
+    """``forge status --in-flight`` queries the lifecycle bridge registry.
+
+    Acceptance-criteria coverage:
+
+    * AC-1: ``forge status --in-flight`` queries the registry.
+    * AC-2: Output format matches the existing table style.
+    * AC-3: Empty registry → ``No in-flight builds.``.
+    * AC-4: Combines cleanly with ``--db-path``, ``--json`` and the
+      positional ``feature_id`` filter; rejects ``--watch`` / ``--full``.
+    * AC-5: Read-only — the surface MUST NOT mutate the registry.
+    """
+
+    @pytest.fixture()
+    def bridge_registry(self, db_path: Path):
+        """Apply the bridge migration and yield a writeable registry.
+
+        Tests that need to seed the in-flight registry use this fixture
+        so the table exists; tests that exercise the empty-table branch
+        deliberately skip seeding rather than skipping the fixture.
+        """
+        from forge.persistence.migrations import (
+            lifecycle_bridge_registry as bridge_migration,
+        )
+        from forge.persistence.repositories.bridge_registry import (
+            BridgeRegistry,
+        )
+
+        cx = sqlite_connect.connect_writer(db_path)
+        bridge_migration.apply(cx)
+        registry = BridgeRegistry(connection=cx)
+        try:
+            yield registry
+        finally:
+            cx.close()
+
+    def _seed_entry(
+        self,
+        registry,
+        *,
+        feature_id: str,
+        thread_id: str = "thread-001",
+        run_id: str = "run-001",
+        correlation_id: str = "corr-001",
+        attached_at: datetime | None = None,
+        deadline_secs: int = 300,
+        current_lifecycle: str = "running",
+    ) -> None:
+        from forge.persistence.repositories.bridge_registry import (
+            BridgeRegistryEntry,
+        )
+
+        if attached_at is None:
+            attached_at = datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC)
+        deadline_at = attached_at + timedelta(seconds=deadline_secs)
+        entry = BridgeRegistryEntry(
+            feature_id=feature_id,
+            thread_id=thread_id,
+            run_id=run_id,
+            correlation_id=correlation_id,
+            ack_handle_token=f"ack-{feature_id}",
+            deadline_at=deadline_at,
+            attached_at=attached_at,
+            current_lifecycle=current_lifecycle,
+            updated_at=attached_at,
+            last_event_id=None,
+        )
+        registry.record(entry, correlation_id=correlation_id)
+
+    # ------------------------------------------------------------------
+    # AC-1: queries the registry
+    # ------------------------------------------------------------------
+
+    def test_in_flight_returns_registry_rows(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        self._seed_entry(
+            bridge_registry,
+            feature_id="FEAT-IF-1",
+            thread_id="thread-IF-1",
+            run_id="run-IF-1",
+            correlation_id="corr-IF-1",
+        )
+        runner = CliRunner()
+        result = runner.invoke(status_cmd, ["--in-flight", "--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert "FEAT-IF-1" in result.output
+        assert "thread-IF-1" in result.output
+        assert "run-IF-1" in result.output
+
+    # ------------------------------------------------------------------
+    # AC-2: table style matches existing forge status output
+    # ------------------------------------------------------------------
+
+    def test_in_flight_renders_table_with_canonical_columns(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        self._seed_entry(bridge_registry, feature_id="FEAT-COLS")
+        runner = CliRunner()
+        result = runner.invoke(status_cmd, ["--in-flight", "--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        for header in ("FEATURE", "LIFECYCLE", "THREAD", "RUN", "ATTACHED", "DEADLINE"):
+            assert (
+                header in result.output
+            ), f"--in-flight table missing header {header!r}: {result.output!r}"
+        # The view shares Rich-table styling with the default status
+        # table — the title prefix is stable across both.
+        assert "Forge in-flight builds" in result.output
+
+    # ------------------------------------------------------------------
+    # AC-3: empty registry → "No in-flight builds."
+    # ------------------------------------------------------------------
+
+    def test_in_flight_empty_registry_emits_canonical_line(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        runner = CliRunner()
+        result = runner.invoke(status_cmd, ["--in-flight", "--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert "No in-flight builds." in result.output
+
+    def test_in_flight_no_bridge_table_renders_empty_message(
+        self, db_path: Path
+    ) -> None:
+        # No bridge migration applied — table missing, treat as empty.
+        runner = CliRunner()
+        result = runner.invoke(status_cmd, ["--in-flight", "--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert "No in-flight builds." in result.output
+
+    # ------------------------------------------------------------------
+    # AC-4: combines cleanly with existing flags
+    # ------------------------------------------------------------------
+
+    def test_in_flight_with_json_emits_json_array(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        self._seed_entry(
+            bridge_registry,
+            feature_id="FEAT-JSON",
+            thread_id="thread-JSON",
+            run_id="run-JSON",
+            correlation_id="corr-JSON",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            status_cmd,
+            ["--in-flight", "--json", "--db-path", str(db_path)],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert isinstance(payload, list)
+        assert len(payload) == 1
+        row = payload[0]
+        assert row["feature_id"] == "FEAT-JSON"
+        assert row["thread_id"] == "thread-JSON"
+        assert row["run_id"] == "run-JSON"
+        assert row["correlation_id"] == "corr-JSON"
+        # ack_handle_token is internal book-keeping — must not leak.
+        assert "ack_handle_token" not in row
+
+    def test_in_flight_empty_with_json_emits_empty_array(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            status_cmd,
+            ["--in-flight", "--json", "--db-path", str(db_path)],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload == []
+
+    def test_in_flight_with_feature_filter_returns_only_match(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        self._seed_entry(bridge_registry, feature_id="FEAT-A")
+        self._seed_entry(
+            bridge_registry,
+            feature_id="FEAT-B",
+            attached_at=datetime(2026, 4, 27, 12, 1, 0, tzinfo=UTC),
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            status_cmd, ["--in-flight", "--db-path", str(db_path), "FEAT-A"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "FEAT-A" in result.output
+        assert "FEAT-B" not in result.output
+
+    def test_in_flight_with_watch_raises_usage_error(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            status_cmd, ["--in-flight", "--watch", "--db-path", str(db_path)]
+        )
+        assert result.exit_code != 0
+        assert "--in-flight" in result.output
+        assert "--watch" in result.output
+
+    def test_in_flight_with_full_raises_usage_error(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            status_cmd, ["--in-flight", "--full", "--db-path", str(db_path)]
+        )
+        assert result.exit_code != 0
+        assert "--in-flight" in result.output
+        assert "--full" in result.output
+
+    # ------------------------------------------------------------------
+    # AC-5: read-only — registry is unchanged after the CLI surface runs.
+    # ------------------------------------------------------------------
+
+    def test_in_flight_does_not_mutate_registry(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        self._seed_entry(bridge_registry, feature_id="FEAT-RO-1")
+        self._seed_entry(
+            bridge_registry,
+            feature_id="FEAT-RO-2",
+            attached_at=datetime(2026, 4, 27, 12, 5, 0, tzinfo=UTC),
+        )
+        before = bridge_registry.list_active(correlation_id="cli-test:before")
+
+        runner = CliRunner()
+        # Run multiple variants — table, json, filter — to be sure the
+        # CLI does not write through any branch.
+        for argv in (
+            ["--in-flight", "--db-path", str(db_path)],
+            ["--in-flight", "--json", "--db-path", str(db_path)],
+            ["--in-flight", "--db-path", str(db_path), "FEAT-RO-1"],
+        ):
+            result = runner.invoke(status_cmd, argv)
+            assert result.exit_code == 0, result.output
+
+        # Re-read with a fresh registry against the same writer. The set
+        # of feature ids and the recorded attachment metadata must be
+        # byte-for-byte identical.
+        after = bridge_registry.list_active(correlation_id="cli-test:after")
+        assert [e.feature_id for e in after] == [e.feature_id for e in before]
+        assert [e.thread_id for e in after] == [e.thread_id for e in before]
+        assert [e.run_id for e in after] == [e.run_id for e in before]
+        assert [e.attached_at for e in after] == [e.attached_at for e in before]
+
+    def test_in_flight_uses_read_only_connection(
+        self, bridge_registry, db_path: Path
+    ) -> None:
+        # Defence-in-depth: confirm the cli/status.py module routes
+        # through ``read_only_connect``. The function-name check guards
+        # against a future refactor that swapped the read path for a
+        # writer connection.
+        import forge.cli.status as status_mod
+
+        assert hasattr(status_mod, "read_only_connect")
+        # The helper function we added uses read_only_connect; assert
+        # the import is present rather than a writer connection helper.
+        src = Path(status_mod.__file__).read_text(encoding="utf-8")
+        assert "_read_in_flight_entries" in src
+        assert "read_only_connect" in src
+        assert "connect_writer" not in src

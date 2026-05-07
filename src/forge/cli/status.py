@@ -59,6 +59,10 @@ from forge.lifecycle.persistence import (
     StageLogEntry,
 )
 from forge.lifecycle.state_machine import BuildState
+from forge.persistence.repositories.bridge_registry import (
+    BridgeRegistry,
+    BridgeRegistryEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +102,14 @@ _FORGE_DB_PATH_ENV: Final[str] = "FORGE_DB_PATH"
 
 #: Default location of the forge database (relative to the cwd).
 _DEFAULT_DB_PATH: Final[Path] = Path(".forge") / "forge.db"
+
+#: Synthetic correlation-id used when the CLI reads the
+#: ``lifecycle_bridge_registry`` table for the ``--in-flight`` view
+#: (TASK-FRR-PEB-012). The registry's read API requires a non-empty
+#: ``correlation_id`` for traceability — the CLI is not driven by a
+#: build envelope, so we mint a stable label that operators can grep
+#: for in the structured logs.
+_IN_FLIGHT_CORRELATION_ID: Final[str] = "cli-status:in-flight"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +332,43 @@ def _read_full_payload(
         cx.close()
 
 
+def _read_in_flight_entries(
+    db_path: Path,
+    feature_id_filter: str | None,
+) -> list[BridgeRegistryEntry]:
+    """Open a fresh ro connection and read the in-flight registry.
+
+    AC-001 / AC-005 (TASK-FRR-PEB-012): the read uses a short-lived
+    ``mode=ro`` URI handle so the CLI cannot mutate the registry. The
+    bridge migration may not yet have been applied (e.g. brand-new
+    install where ``forge serve`` has never run); in that case the
+    table does not exist and we surface the result as an empty list,
+    so the caller can render the "No in-flight builds." line.
+    """
+    cx = read_only_connect(db_path)
+    cx.row_factory = sqlite3.Row
+    try:
+        try:
+            registry = BridgeRegistry(connection=cx)
+            entries = registry.list_active(correlation_id=_IN_FLIGHT_CORRELATION_ID)
+        except sqlite3.OperationalError as exc:
+            # Bridge migration has not run against this database yet —
+            # treat as "no in-flight builds" rather than raising.
+            if "no such table" in str(exc).lower():
+                logger.debug(
+                    "lifecycle_bridge_registry table missing; "
+                    "rendering empty in-flight view (db_path=%s)",
+                    db_path,
+                )
+                return []
+            raise
+        if feature_id_filter:
+            entries = [e for e in entries if e.feature_id == feature_id_filter]
+        return entries
+    finally:
+        cx.close()
+
+
 def _all_terminal(views: Iterable[BuildStatusView]) -> bool:
     """Return True iff every view's status is terminal.
 
@@ -399,6 +448,64 @@ def _build_table(
         )
 
     return table
+
+
+def _build_in_flight_table(entries: list[BridgeRegistryEntry]) -> Table:
+    """Build a Rich table for the ``--in-flight`` view (TASK-FRR-PEB-012).
+
+    Mirrors the column layout of :func:`_build_table` so operators
+    reading both views back-to-back see a consistent visual style.
+    The columns are tailored to the registry's identifying fields —
+    no STATE / ELAPSED / MODE because those live on the ``builds``
+    projection, not the in-flight registry.
+    """
+    table = Table(title="Forge in-flight builds")
+    table.add_column("FEATURE", overflow="fold")
+    table.add_column("LIFECYCLE")
+    table.add_column("THREAD", overflow="fold")
+    table.add_column("RUN", overflow="fold")
+    table.add_column("ATTACHED")
+    table.add_column("DEADLINE")
+    for entry in entries:
+        table.add_row(
+            entry.feature_id,
+            entry.current_lifecycle,
+            entry.thread_id,
+            entry.run_id,
+            _format_dt(entry.attached_at),
+            _format_dt(entry.deadline_at),
+        )
+    return table
+
+
+def _serialise_in_flight_entry(entry: BridgeRegistryEntry) -> dict[str, Any]:
+    """Project a :class:`BridgeRegistryEntry` to a JSON-friendly dict.
+
+    Excludes the opaque ``ack_handle_token`` because it is internal
+    book-keeping for the bridge's in-memory ack callback map; surfacing
+    it in CLI output would invite consumers to depend on what is
+    deliberately a private contract.
+    """
+    return {
+        "feature_id": entry.feature_id,
+        "thread_id": entry.thread_id,
+        "run_id": entry.run_id,
+        "correlation_id": entry.correlation_id,
+        "current_lifecycle": entry.current_lifecycle,
+        "attached_at": entry.attached_at.isoformat(),
+        "deadline_at": entry.deadline_at.isoformat(),
+        "updated_at": entry.updated_at.isoformat(),
+        "last_event_id": entry.last_event_id,
+        "published_lifecycles": sorted(entry.published_lifecycles),
+    }
+
+
+def _emit_in_flight_json(entries: list[BridgeRegistryEntry], *, out: Console) -> None:
+    """Emit the in-flight registry payload as a JSON array to stdout."""
+    rows = [_serialise_in_flight_entry(e) for e in entries]
+    out.file.write(json.dumps(rows, indent=2, default=str))
+    out.file.write("\n")
+    out.file.flush()
 
 
 def _serialise_view(view: BuildStatusView) -> dict[str, Any]:
@@ -534,12 +641,26 @@ def _watch_loop(
         f"{_FORGE_DB_PATH_ENV} env var or ./.forge/forge.db."
     ),
 )
+@click.option(
+    "--in-flight",
+    "in_flight",
+    is_flag=True,
+    default=False,
+    help=(
+        "Show the lifecycle bridge in-flight registry instead of the "
+        "builds table. Read-only — no mutations to the registry. The "
+        "view lists every build currently attached to the langgraph-"
+        "runner sidecar. Combine with --json to pipe into tooling, "
+        "or pass a positional FEATURE_ID to filter to one build."
+    ),
+)
 def status_cmd(
     feature_id: str | None,
     watch: bool,
     full: bool,
     as_json: bool,
     db_path_opt: str | None,
+    in_flight: bool,
 ) -> None:
     """Show current and recent Forge builds.
 
@@ -553,6 +674,10 @@ def status_cmd(
     * ``--watch``: poll every 2s and re-render via ``rich.live``.
     * ``--full``: include up to 5 ``stage_log`` entries per build.
     * ``--json``: emit a JSON array suitable for piping.
+    * ``--in-flight`` (TASK-FRR-PEB-012): replace the builds-table view
+      with the lifecycle bridge in-flight registry. Read-only; combines
+      cleanly with ``--json``, ``--db-path`` and a positional
+      ``feature_id`` filter; rejects ``--watch`` and ``--full``.
     """
     db_path = _resolve_db_path(db_path_opt)
     if not db_path.exists():
@@ -569,6 +694,38 @@ def status_cmd(
     console = Console(width=160)
 
     try:
+        if in_flight:
+            # AC-001 (TASK-FRR-PEB-012): the --in-flight surface reads
+            # from the lifecycle_bridge_registry rather than the builds
+            # table. AC-004: combine with existing flags by rejecting
+            # contradictory ones (--watch / --full do not apply to the
+            # registry projection); --json and --db-path compose. The
+            # positional feature_id still filters.
+            if watch:
+                raise click.UsageError(
+                    "--in-flight is not compatible with --watch; the "
+                    "registry view is a snapshot and does not require "
+                    "polling."
+                )
+            if full:
+                raise click.UsageError(
+                    "--in-flight is not compatible with --full; --full "
+                    "augments the builds table with stage_log entries, "
+                    "which do not apply to the bridge registry."
+                )
+            entries = _read_in_flight_entries(db_path, feature_id)
+            if as_json:
+                _emit_in_flight_json(entries, out=console)
+                return
+            if not entries:
+                # AC-003: when no builds are in-flight, emit the
+                # canonical "No in-flight builds." line so operator
+                # scripts can grep the output without parsing a table.
+                console.print("No in-flight builds.")
+                return
+            console.print(_build_in_flight_table(entries))
+            return
+
         if watch:
             if as_json:
                 # JSON + watch is contradictory — refuse so we don't
