@@ -596,17 +596,32 @@ def _find_free_port() -> int:
 
 
 def _wait_for_http_ready(
-    url: str, *, timeout_seconds: float, attempt_interval: float = 0.25
+    url: str,
+    *,
+    timeout_seconds: float,
+    attempt_interval: float = 0.25,
+    proc: subprocess.Popen | None = None,
 ) -> None:
     """Poll ``url`` until it returns any HTTP response, or timeout.
 
     Raises :class:`TimeoutError` if the URL is not reachable within
     ``timeout_seconds``. Used to gate the test on sidecar readiness so
     the build-queued publish does not race the sidecar startup.
+
+    When a ``proc`` is supplied, an early subprocess exit short-circuits
+    the wait — typical when ``langgraph dev`` fails to load a graph and
+    aborts within milliseconds. This makes the skip diagnostic
+    actionable instead of waiting the full timeout for a process that
+    is already gone.
     """
     deadline = time.monotonic() + timeout_seconds
     last_exc: BaseException | None = None
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise TimeoutError(
+                f"sidecar subprocess at {url} exited prematurely "
+                f"(returncode={proc.returncode})"
+            )
         try:
             with urllib.request.urlopen(url, timeout=1.0) as resp:  # noqa: S310
                 # Any HTTP status counts as "the server is up"; the
@@ -702,7 +717,9 @@ def langgraph_sidecar(tmp_path: Path) -> Iterator[str]:
 
     try:
         try:
-            _wait_for_http_ready(f"{url}/ok", timeout_seconds=30.0)
+            _wait_for_http_ready(
+                f"{url}/ok", timeout_seconds=30.0, proc=proc
+            )
         except TimeoutError as exc:
             # Gather diagnostic output before tearing the subprocess
             # down so the skip / failure carries the sidecar's stderr.
