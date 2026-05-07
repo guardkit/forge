@@ -1,0 +1,16 @@
+[
+  {
+    "task_id": "TASK-FRR-PEB-008",
+    "pre_path": "tasks/backlog/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md",
+    "timestamp": "2026-05-07T14:20:48.196575+00:00",
+    "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-FRR-PEB-008",
+    "pre_path": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md",
+    "timestamp": "2026-05-07T14:36:32.484247+00:00",
+    "kind": "design_approved_transition"
+  }
+]

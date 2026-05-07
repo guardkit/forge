@@ -1,0 +1,9 @@
+{
+  "turn": 2,
+  "feedback_from_turn": 1,
+  "feedback_summary": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-1: `pipeline_consumer.py`'s dispatch path no longer calls `msg.ack()`\n  \u2022 AC-2: A new `BuildAckHandle` interface exposes `ack()` and `nak()`\n  \u2022 AC-3: When no bridge is wired (e.g. unit-test path), the consumer falls\n  \u2022 AC-4: Duplicate-detection from the existing consumer is unchanged \u2014\n  \u2022 AC-5: F010C correlation-id AST guard remains green \u2014 every emit site\n  (1 more)",
+  "must_fix": [],
+  "should_fix": [],
+  "validation_results": {},
+  "raw_feedback": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Not all acceptance criteria met:\n  \u2022 AC-1: `pipeline_consumer.py`'s dispatch path no longer calls `msg.ack()`\n  \u2022 AC-2: A new `BuildAckHandle` interface exposes `ack()` and `nak()`\n  \u2022 AC-3: When no bridge is wired (e.g. unit-test path), the consumer falls\n  \u2022 AC-4: Duplicate-detection from the existing consumer is unchanged \u2014\n  \u2022 AC-5: F010C correlation-id AST guard remains green \u2014 every emit site\n  (1 more)"
+}

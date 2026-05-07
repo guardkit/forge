@@ -1,0 +1,107 @@
+{
+  "task_id": "TASK-FRR-PEB-014",
+  "turn": 1,
+  "files_modified": [],
+  "files_created": [
+    "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+  ],
+  "tests_written": [
+    "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "1 new test passes (test_translate_sources_correlation_id_from_build_context_not_event); full lifecycle_bridge suite remains green (85 passed in 0.39s). ruff check passes with no errors; ruff format reformatted the file once (whitespace only) and the test re-passed afterwards.",
+  "implementation_notes": "Added a single contract-lock test at tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py per the task spec. The test (a) constructs a BuildContext(correlation_id='A') and a StreamPart whose data dict carries different correlation_id values at the top level ('B-from-sse-event') AND inside the AutobuildState snapshot ('C-from-snapshot') -- if any code path ever read from the event, the dynamic assertion would surface a non-'A' value; (b) calls StreamEventTranslator.translate(stream_part, context) which yields a BuildStartedPayload (running_wave first observation) and asserts envelope.correlation_id == 'A'; (c) uses inspect.getsource() on StreamEventTranslator.translate, the class as a whole, and the translation module to assert that no forbidden substrings appear (correlation_id=stream_part., data.get('correlation_id'), stream_part.event_data.get('correlation_id'), snap.correlation_id, snapshot.correlation_id); (d) belt-and-braces assertion that 'context.correlation_id' is the canonical source still present in class source. The module-level docstring contains the exact verbatim Option-C contract notice required by AC-2. ruff check passes; project does not vendor black, but ruff format normalised whitespace once.",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-1",
+    "AC-2",
+    "AC-3",
+    "AC-4"
+  ],
+  "requirements_remaining": [],
+  "implementation_mode": "direct",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "AC-1: A new test file tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py contains a single test that (1) constructs BuildContext correlation-id 'A', (2) constructs a StreamPart event the translator would normally accept, (3) asserts translate() produces an envelope with correlation_id == 'A' sourced from BuildContext, and (4) asserts there is no code path in the bridge that would accept a correlation-id from the SSE event itself.",
+      "status": "complete",
+      "evidence": "Created tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py with a single test function `test_translate_sources_correlation_id_from_build_context_not_event`. It constructs `BuildContext(... correlation_id='A' ...)` and a `StreamPart(event=VALUES_STREAM_EVENT, data={...})` carrying a running_wave AutobuildState snapshot (which the translator accepts and converts to a `BuildStartedPayload`). The data dict additionally carries a top-level `correlation_id='B-from-sse-event'` and a snapshot-level `correlation_id='C-from-snapshot'` so any future code path that reads from the event would surface those values instead. The test asserts `envelope is not None` and `envelope.correlation_id == 'A'` (sourced from BuildContext), then performs a static-source check (see AC-003) verifying no code path reads correlation-id from the StreamPart.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Constructs a `BuildContext` with correlation-id `\"A\"`.",
+      "status": "complete",
+      "evidence": "The test arranges a `BuildContext(feature_id='FEAT-ASSUM-009', thread_id='thread-assum-009', run_id='run-assum-009', correlation_id='A', deadline_at=datetime.now(UTC) + timedelta(seconds=300))` -- correlation_id is exactly the literal 'A' as required.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Constructs a `StreamPart` event that the translator (T3) would normally accept.",
+      "status": "complete",
+      "evidence": "The test arranges `StreamPart(event=VALUES_STREAM_EVENT, data={'async_tasks': {'FEAT-ASSUM-009': {feature_id, build_id, lifecycle='running_wave', wave_total=1, wave_index=0, task_index=0, tasks_completed=0, tasks_failed=0, ...}}})`. This is the canonical shape the translator's `_extract_state` reader accepts (per `tests/forge/lifecycle_bridge/test_translation.py::_state_part`); it dispatches via `_dispatch` rule 4 (first running_wave entry with prev=None) and yields a non-None `BuildStartedPayload`. The `envelope is not None` assertion confirms acceptance.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Asserts that `StreamEventTranslator.translate()` produces an envelope with `correlation_id == \"A\"` (sourced from `BuildContext`, not from the event).",
+      "status": "complete",
+      "evidence": "After calling `envelope = translator.translate(stream_part, context)`, the test asserts `getattr(envelope, 'correlation_id', None) == 'A'` with a failure message that explicitly cites the Option C contract regression. Since the data dict contains differing correlation_id values ('B-from-sse-event' top-level and 'C-from-snapshot' nested), this assertion would catch any regression that started reading from the event payload.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Asserts that there is no code path in the bridge that would accept a correlation-id from the SSE event itself (the translator reads from `BuildContext` only).",
+      "status": "complete",
+      "evidence": "The test calls `inspect.getsource(StreamEventTranslator.translate)`, `inspect.getsource(StreamEventTranslator)`, and `inspect.getsource(translation_module)`, then asserts that none of the forbidden substrings appear: `correlation_id=stream_part.`, `data.get(\"correlation_id\"`, `data.get('correlation_id'`, `stream_part.event_data.get(\"correlation_id\"`, `stream_part.event_data.get('correlation_id'`, `snap.correlation_id`, `snapshot.correlation_id`. A belt-and-braces check confirms `context.correlation_id` is still present as the canonical source in the class body. Together with AC-004's dynamic assertion, this proves no path in the translator (the bridge's only translator surface) reads correlation-id from the SSE event.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "AC-2: A docstring at the top of the file explicitly notes: 'Under the ratified Option C, the bridge runs in-forge and the correlation-id source is BuildContext, not the SSE event. This test locks that contract. If a future review flips the option to D or E, this test must be upgraded to a real cross-process validator that rejects in-receive emits whose correlation-id does not match the registered build.'",
+      "status": "complete",
+      "evidence": "The module-level docstring (lines 1-50 of test_correlation_id_contract_lock.py) opens with verbatim text: 'Under the ratified Option C, the bridge runs in-forge and the correlation-id source is :class:`BuildContext`, not the SSE event. This test locks that contract. If a future review flips the option to D or E, this test must be upgraded to a real cross-process validator that rejects in-receive emits whose correlation-id does not match the registered build.' followed by an AC-coverage map and a 'Why this test is a no-op under Option C' explanation.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "AC-3: The test uses `inspect.getsource()` on `StreamEventTranslator.translate()` and asserts that no occurrence of `correlation_id=stream_part.` (or similar pattern reading from the event) appears in the source. This is a static-analysis invariant equivalent to the F010C AST guard, scoped to the translator.",
+      "status": "complete",
+      "evidence": "The test imports `inspect`, then calls `inspect.getsource(StreamEventTranslator.translate)` (the exact spec request) AND additionally `inspect.getsource(StreamEventTranslator)` and `inspect.getsource(translation_module)` to extend the invariant to the helper methods that translate() dispatches into. It asserts seven forbidden patterns are absent, including the literal `correlation_id=stream_part.` named in the criterion plus variants covering `data.get('correlation_id')`, `stream_part.event_data.get('correlation_id')`, and `snap[shot].correlation_id`. This is the static-analysis invariant equivalent to the F010C AST guard.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "AC-4: All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "`ruff check tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py` reports 'All checks passed!'. `ruff format tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py` was applied; the file is now in the project-canonical format. The full lifecycle_bridge test suite (`PYTHONPATH=src python -m pytest tests/forge/lifecycle_bridge/`) runs 85 tests, 0 failures.",
+      "test_file": "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/test_correlation_id_contract_lock.py"
+      ]
+    }
+  ],
+  "success": true
+}

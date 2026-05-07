@@ -54,6 +54,11 @@ from nats_core.events import (
 from pydantic import ValidationError
 
 from forge.config.models import ForgeConfig
+from forge.pipeline.build_ack_handle import (
+    BuildAckHandle,
+    InFlightAckRegistry,
+    make_msg_ack_handle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,12 +160,40 @@ class PipelineConsumerDeps:
     Keeping these on a frozen dataclass means the consumer can be unit-tested
     with simple async callables and re-wired in production without touching
     the validation logic itself.
+
+    Attributes:
+        forge_config: Validated :class:`ForgeConfig`.
+        is_duplicate_terminal: Async predicate, ``(feature_id,
+            correlation_id) -> bool``. ``True`` short-circuits dispatch
+            on a known-terminal build (idempotent ack-and-skip).
+        dispatch_build: State-machine entry point. Receives the
+            validated :class:`BuildQueuedPayload` plus an idempotent
+            :data:`AckCallback`. The callback is the same primitive
+            wrapped by the registered :class:`BuildAckHandle` so legacy
+            callers and the Wave-1 bridge end up acking the same
+            JetStream message exactly once.
+        publish_build_failed: Async wrapper that publishes
+            ``pipeline.build-failed.{feature_id}`` with the inbound
+            ``correlation_id`` threaded onto the outbound envelope
+            (DDR-029).
+        register_ack_handle: Optional :data:`InFlightAckRegistry` —
+            when wired (Wave-1 bridge), the consumer registers a
+            :class:`BuildAckHandle` keyed by ``(feature_id,
+            correlation_id)`` *before* invoking ``dispatch_build`` so
+            the bridge can ack on terminal SSE arrival. ``None``
+            (default) preserves the F010F sync-raise fallback used by
+            unit tests that don't exercise the bridge: ``dispatch_build``
+            still receives an idempotent ack callback bound to
+            ``msg.ack`` and ack timing is the state machine's
+            responsibility (the existing AC-009 contract from
+            TASK-NFI-007).
     """
 
     forge_config: ForgeConfig
     is_duplicate_terminal: IsDuplicateTerminal
     dispatch_build: DispatchBuild
     publish_build_failed: PublishBuildFailed
+    register_ack_handle: InFlightAckRegistry | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -457,13 +490,59 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         return
 
     # --- 5. Accepted build — dispatch with deferred ack ------------------
-    ack_callback = _build_ack_callback(msg)
+    # Build a single idempotent ack handle for this msg. Two consumers
+    # of the handle exist:
+    #
+    #   1. ``ack_callback`` — the legacy F010F primitive handed to
+    #      ``dispatch_build``. The state machine (or the dispatch
+    #      closure under unit-test stubs) calls it on terminal
+    #      transition; calling it more than once is a no-op via the
+    #      handle's idempotency.
+    #   2. The Wave-1 lifecycle bridge — when ``register_ack_handle``
+    #      is wired, the consumer registers the same handle keyed by
+    #      ``(feature_id, correlation_id)`` so the bridge can
+    #      ``ack()`` (or ``nak()``) when it observes terminal on the
+    #      SSE stream. Both consumers share state through the handle's
+    #      flags so ``msg.ack()`` fires exactly once regardless of
+    #      whether the bridge or the legacy callback wins the race
+    #      (TASK-FRR-PEB-001 AC-1 + AC-2).
+    #
+    # When ``register_ack_handle`` is ``None`` (no bridge wired — unit
+    # tests, legacy code paths) the handle is created but never
+    # registered; the legacy ``ack_callback`` is the only path to
+    # ``msg.ack()`` and the F010F sync-raise fallback in the
+    # ``except`` branch below ensures the message is acked on
+    # ``dispatch_build`` raise. This is AC-3 in the task brief.
+    ack_handle = make_msg_ack_handle(msg)
+    ack_callback = _ack_callback_from_handle(ack_handle)
+
+    if deps.register_ack_handle is not None:
+        try:
+            await deps.register_ack_handle(
+                payload.feature_id,
+                payload.correlation_id,
+                ack_handle,
+            )
+        except Exception as reg_exc:
+            # Registration failure is non-fatal: the bridge owns its
+            # own observability, and the legacy ack_callback path is
+            # still wired. Log at WARNING and continue with dispatch.
+            logger.warning(
+                "pipeline_consumer: register_ack_handle raised (%s) for "
+                "feature_id=%s correlation_id=%s; continuing with "
+                "legacy ack_callback fallback",
+                reg_exc,
+                payload.feature_id,
+                payload.correlation_id,
+            )
+
     logger.info(
         "pipeline_consumer: dispatching build feature_id=%s correlation_id=%s "
-        "originating_adapter=%s",
+        "originating_adapter=%s bridge=%s",
         payload.feature_id,
         payload.correlation_id,
         payload.originating_adapter,
+        "wired" if deps.register_ack_handle is not None else "fallback",
     )
     try:
         await deps.dispatch_build(payload, ack_callback)
@@ -532,6 +611,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
 def _build_ack_callback(msg: _MsgLike) -> AckCallback:
     """Return an idempotent ack closure bound to ``msg.ack``.
 
+    Retained for crash-recovery (:func:`_reconcile_one_redelivery`)
+    where the bridge is not in scope — paused/in-flight redelivery
+    branches mark INTERRUPTED and call ``dispatch_build`` directly
+    with this callback, bypassing the bridge registry so reconciliation
+    keeps the same ack semantics it has had since TASK-NFI-007.
+
     The state machine may invoke the callback more than once across a long
     build (e.g. once on terminal transition, again on retry-from-scratch
     crash recovery). JetStream tolerates double-ack but we prefer to log
@@ -550,6 +635,25 @@ def _build_ack_callback(msg: _MsgLike) -> AckCallback:
             return
         state["acked"] = True
         await msg.ack()
+
+    return _ack
+
+
+def _ack_callback_from_handle(handle: BuildAckHandle) -> AckCallback:
+    """Return an :data:`AckCallback` that delegates to ``handle.ack``.
+
+    The legacy state-machine seam still receives a plain
+    ``async () -> None`` callable (the :data:`AckCallback` type alias),
+    so we adapt the new :class:`BuildAckHandle` Protocol back to that
+    shape. Because the handle is itself idempotent, the returned
+    closure inherits the "ack exactly once" guarantee — calling
+    ``ack_callback()`` after the bridge has already invoked
+    ``handle.ack()`` is a logged no-op rather than a second
+    ``msg.ack()`` round-trip.
+    """
+
+    async def _ack() -> None:
+        await handle.ack()
 
     return _ack
 
@@ -961,9 +1065,11 @@ __all__ = [
     "ACK_WAIT_SECONDS",
     "BUILD_FAILED_SUBJECT_PREFIX",
     "BUILD_QUEUE_SUBJECT",
+    "BuildAckHandle",
     "DURABLE_NAME",
     "FORGE_SOURCE_ID",
     "IN_FLIGHT_BUILD_STATES",
+    "InFlightAckRegistry",
     "PAUSED_BUILD_STATE",
     "PausedBuildSnapshot",
     "PipelineConsumerDeps",

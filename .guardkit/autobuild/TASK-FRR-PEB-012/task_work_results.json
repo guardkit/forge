@@ -1,0 +1,110 @@
+{
+  "task_id": "TASK-FRR-PEB-012",
+  "timestamp": "2026-05-07T16:29:29.917293",
+  "completed": true,
+  "success": true,
+  "implementation_mode": "direct",
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 1,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": true,
+    "quality_gates_relaxed": true,
+    "all_passed": true
+  },
+  "files_modified": [
+    "src/forge/cli/status.py",
+    "tests/forge/test_cli_status.py"
+  ],
+  "files_created": [],
+  "tests_written": [
+    "tests/forge/test_cli_status.py"
+  ],
+  "requirements_addressed": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006"
+  ],
+  "requirements_met": [
+    "AC-001",
+    "AC-002",
+    "AC-003",
+    "AC-004",
+    "AC-005",
+    "AC-006"
+  ],
+  "summary": "Direct mode implementation completed successfully",
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "AC-1: `forge status --in-flight` queries",
+      "status": "complete",
+      "evidence": "Added the `--in-flight` Click flag plus `_read_in_flight_entries(db_path, feature_id)` which composes `BridgeRegistry.list_active(correlation_id=_IN_FLIGHT_CORRELATION_ID)` over a `read_only_connect` handle. Verified by `TestInFlightSurface.test_in_flight_returns_registry_rows`, which seeds a registry row and asserts the rendered output contains the feature/thread/run identifiers.",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "AC-2: Output format matches existing `forge status` table style",
+      "status": "complete",
+      "evidence": "`_build_in_flight_table` reuses the same `rich.table.Table` style and column-overflow conventions as the canonical `_build_table`, with FEATURE/LIFECYCLE/THREAD/RUN/ATTACHED/DEADLINE columns suited to the registry projection. `TestInFlightSurface.test_in_flight_renders_table_with_canonical_columns` asserts the headers and the `Forge in-flight builds` title.",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "AC-3: When no builds are in-flight, output is `No in-flight builds.`",
+      "status": "complete",
+      "evidence": "When `_read_in_flight_entries` returns `[]`, `status_cmd` prints `No in-flight builds.` via the Rich console. Covered by both `test_in_flight_empty_registry_emits_canonical_line` (table exists, no rows) and `test_in_flight_no_bridge_table_renders_empty_message` (table missing \u2014 OperationalError swallowed and treated as empty).",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "AC-4: The flag combines cleanly with existing `forge status` flags",
+      "status": "complete",
+      "evidence": "`--in-flight` accepts the positional `feature_id` filter, `--db-path`, and `--json` (covered by test_in_flight_with_feature_filter_returns_only_match, test_in_flight_with_json_emits_json_array, test_in_flight_empty_with_json_emits_empty_array). It rejects `--watch` and `--full` with a `click.UsageError` because those flags are scoped to the builds-table projection (covered by test_in_flight_with_watch_raises_usage_error and test_in_flight_with_full_raises_usage_error).",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "AC-5: Read-only \u2014 no mutations to the registry from this surface.",
+      "status": "complete",
+      "evidence": "`_read_in_flight_entries` opens the database via `read_only_connect`, which uses the `file:<path>?mode=ro` URI form so SQLite refuses any write at the engine level. `test_in_flight_does_not_mutate_registry` runs the table, json, and feature-filter variants and asserts the registry contents are byte-identical before vs after; `test_in_flight_uses_read_only_connection` adds a static-analysis guard that the source uses `read_only_connect` and never imports `connect_writer`.",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "AC-6: All modified files pass project-configured lint/format checks",
+      "status": "complete",
+      "evidence": "`python -m ruff check src/forge/cli/status.py tests/forge/test_cli_status.py` reports `All checks passed!`. `python -m black --check src/forge/cli/status.py tests/forge/test_cli_status.py` reports `2 files would be left unchanged`.",
+      "test_file": "tests/forge/test_cli_status.py",
+      "implementation_files": [
+        "src/forge/cli/status.py",
+        "tests/forge/test_cli_status.py"
+      ]
+    }
+  ]
+}

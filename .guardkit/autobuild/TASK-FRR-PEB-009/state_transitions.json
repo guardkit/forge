@@ -1,0 +1,16 @@
+[
+  {
+    "task_id": "TASK-FRR-PEB-009",
+    "pre_path": "tasks/backlog/TASK-FRR-PEB-009-restart-recovery-replay-and-sweep.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-009-restart-recovery-replay-and-sweep.md",
+    "timestamp": "2026-05-07T14:49:14.166051+00:00",
+    "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-FRR-PEB-009",
+    "pre_path": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-009-restart-recovery-replay-and-sweep.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-009-restart-recovery-replay-and-sweep.md",
+    "timestamp": "2026-05-07T15:11:00.366152+00:00",
+    "kind": "design_approved_transition"
+  }
+]

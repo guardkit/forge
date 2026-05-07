@@ -1,0 +1,110 @@
+{
+  "task_id": "TASK-FRR-PEB-003",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/autobuild/TASK-FRR-PEB-003/checkpoints.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-003/player_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-003/task_work_results.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-003/turn_context.json",
+    ".guardkit/bdd/TASK-FRR-PEB-003_junit.xml",
+    ".guardkit/bootstrap_state.json",
+    "`pyproject.toml"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-003/player_turn_1.json",
+    "`src/forge/lifecycle_bridge/translation.py"
+  ],
+  "tests_written": [],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-1: StreamEventTranslator.translate signature",
+    "AC-2: unknown StreamPart events return None at DEBUG",
+    "AC-3: MissingCorrelationIdError on missing correlation_id",
+    "AC-4: round-trip contract test against recorded SSE fixture (success + failure)",
+    "AC-5: pyproject.toml minor-version pins on langgraph-sdk and langgraph-api",
+    "AC-6: F010C AST guard extended with translator emit sites",
+    "AC-7: ruff check clean"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 26,
+  "sdk_max_turns": 170,
+  "sdk_ceiling_hit": false,
+  "tests_passed_count": 33,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "src/forge/lifecycle_bridge/translation.py exposes a StreamEventTranslator class with method translate(stream_part: StreamPart, context: BuildContext) -> PipelineEvent | None.",
+      "status": "complete",
+      "evidence": "src/forge/lifecycle_bridge/translation.py defines StreamEventTranslator with translate(stream_part, context) returning PipelineEvent | None. Verified by TestTranslatorSurface::test_class_is_importable and test_translate_signature in tests/forge/lifecycle_bridge/test_translation.py \u2014 both pass.",
+      "test_file": "tests/forge/lifecycle_bridge/test_translation.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "The translator handles every documented StreamPart.event value the langgraph-runner sidecar emits during an autobuild run; unknown events return None and are logged at DEBUG (not WARNING \u2014 unknown events are routine during langgraph-api minor bumps).",
+      "status": "complete",
+      "evidence": "translate() returns None for any event != VALUES_STREAM_EVENT and logs only at logger.debug. Verified by TestUnknownEventBehaviour suite (3 tests including test_unknown_event_logs_at_debug_not_warning which asserts no WARNING-level records for events 'metadata', 'messages', 'updates', 'events', 'end', 'custom').",
+      "test_file": "tests/forge/lifecycle_bridge/test_translation.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "Each typed payload constructed by the translator carries correlation_id from BuildContext.correlation_id (no fallback; raises if missing).",
+      "status": "complete",
+      "evidence": "_require_correlation_id(context) raises MissingCorrelationIdError on empty/None correlation_id. All v2 payloads pass correlation_id= directly; v1 payloads (BuildStarted/Complete/Failed) use attach_correlation_id_to_v1_payload via object.__setattr__ to bypass extra='ignore'. Verified by TestCorrelationIdRequired and per-transition assertions on correlation_id in TestLifecycleTransitions.",
+      "test_file": "tests/forge/lifecycle_bridge/test_translation.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "A contract test round-trips a known AutobuildState mutation sequence through a recorded SSE stream fixture and validates the emitted pipeline.* envelopes against the nats_core.events Pydantic schemas. Fixture lives at tests/forge/lifecycle_bridge/fixtures/sse_stream_canonical.jsonl (records both success and failure paths).",
+      "status": "complete",
+      "evidence": "tests/forge/lifecycle_bridge/test_translation_contract.py replays tests/forge/lifecycle_bridge/fixtures/sse_stream_canonical.jsonl (9 lines covering success path starting\u2192planning_waves\u2192running_wave\u2192stage\u2192completed AND failure path starting\u2192running_wave\u2192failed). Validates each emitted PipelineEvent against expected envelope class and runs Pydantic model_validate(model_dump()) round-trip. All TestSuccessPathRoundTrip, TestFailurePathRoundTrip, TestNoDoubleEmits, TestSchemaContract tests pass.",
+      "test_file": "tests/forge/lifecycle_bridge/test_translation_contract.py",
+      "implementation_files": [
+        "tests/forge/lifecycle_bridge/fixtures/sse_stream_canonical.jsonl",
+        "tests/forge/lifecycle_bridge/fixtures/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "pyproject.toml is updated with explicit upper bounds on langgraph-sdk and langgraph-api (e.g. ~=0.3.13 for sdk; check current version and lock minor). Bumps require a new contract test fixture re-record.",
+      "status": "complete",
+      "evidence": "pyproject.toml lines 15-23 contain a comment block referencing TASK-FRR-PEB-003 AC-5 and dependency pins 'langgraph-sdk~=0.3.13' and 'langgraph-api~=0.8.0' with PEP 440 compatible-release operators that lock the minor version.",
+      "test_file": null,
+      "implementation_files": [
+        "pyproject.toml"
+      ]
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "F010C correlation-id AST guard fixture extended with the new emit sites the translator introduces (via downstream emitter calls in T4 \u2014 coordinate with T4 author on the call-site list).",
+      "status": "complete",
+      "evidence": "tests/forge/test_pipeline_consumer_correlation_id.py contains TestTranslatorEmitSitesThreadCorrelationId::test_every_translator_payload_construction_threads_correlation_id which AST-walks src/forge/lifecycle_bridge/translation.py to assert every payload constructor either receives correlation_id= as a keyword OR calls attach_correlation_id_to_v1_payload \u2014 fails the suite at lint time if a future refactor adds an emit site without threading the field. Test passes.",
+      "test_file": "tests/forge/test_pipeline_consumer_correlation_id.py",
+      "implementation_files": [
+        "tests/forge/test_pipeline_consumer_correlation_id.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-7",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "`ruff check src/forge/lifecycle_bridge/translation.py` returns 'All checks passed!' with zero diagnostics.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py"
+      ]
+    }
+  ]
+}

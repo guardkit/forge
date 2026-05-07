@@ -1,0 +1,9 @@
+{
+  "turn": 4,
+  "feedback_from_turn": 3,
+  "feedback_summary": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py, tests/forge/test_approval_subscriber.py",
+  "must_fix": [],
+  "should_fix": [],
+  "validation_results": {},
+  "raw_feedback": "- Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)\n- Plan audit detected high-severity discrepancies \u2014 2 missing file(s): src/forge/cli/_approval_subscriber.py, tests/forge/test_approval_subscriber.py"
+}

@@ -1,0 +1,7 @@
+{
+  "tests_run": 58,
+  "tests_failed": 0,
+  "coverage_pct": 83.0,
+  "output_summary": "58 passed in 0.22s; lifecycle_bridge package coverage 83% (version_check.py 75%, bridge.py 89%, translation.py 84%, __init__.py 100%).",
+  "quality_gates_passed": true
+}

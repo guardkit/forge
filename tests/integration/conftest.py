@@ -20,11 +20,18 @@ auditable assertions without monkey-patching production modules.
 
 from __future__ import annotations
 
-import asyncio
+import os
+import shutil
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import pytest
 from nats_core.envelope import EventType, MessageEnvelope
@@ -556,3 +563,182 @@ def sample_decision(
         evidence=[],
         decided_at=DEFAULT_FIXED_TIME,
     )
+
+
+# ---------------------------------------------------------------------------
+# TASK-FRR-PEB-013 — sidecar fixture for sidecar-aware E2E integration test
+#
+# Spins up a real ``langgraph-runner`` sidecar (``langgraph dev``) in a
+# subprocess for the duration of a test. The fixture is intentionally
+# defensive: when the ``langgraph`` binary is not on ``PATH`` (typical
+# CI without the dev tooling installed), the fixture calls
+# :func:`pytest.skip` rather than crashing the whole integration suite,
+# so the sidecar-aware E2E test runs only on stages that have the
+# dependencies installed (the test is also gated by ``@slow``).
+#
+# AC-2 (TASK-FRR-PEB-013): "A pytest fixture spins up a real
+# langgraph-runner sidecar using subprocess.Popen … yields the sidecar
+# URL and tears down the process on test exit."
+# ---------------------------------------------------------------------------
+
+
+def _find_free_port() -> int:
+    """Bind to an ephemeral port, return the assigned port.
+
+    The kernel guarantees the port is free at the moment of the bind;
+    once the socket is closed the port may be reused by another process,
+    but the langgraph-runner subprocess starts within milliseconds of
+    this call so the race window is negligible for a CI-scoped test.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_http_ready(
+    url: str,
+    *,
+    timeout_seconds: float,
+    attempt_interval: float = 0.25,
+    proc: subprocess.Popen | None = None,
+) -> None:
+    """Poll ``url`` until it returns any HTTP response, or timeout.
+
+    Raises :class:`TimeoutError` if the URL is not reachable within
+    ``timeout_seconds``. Used to gate the test on sidecar readiness so
+    the build-queued publish does not race the sidecar startup.
+
+    When a ``proc`` is supplied, an early subprocess exit short-circuits
+    the wait — typical when ``langgraph dev`` fails to load a graph and
+    aborts within milliseconds. This makes the skip diagnostic
+    actionable instead of waiting the full timeout for a process that
+    is already gone.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last_exc: BaseException | None = None
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise TimeoutError(
+                f"sidecar subprocess at {url} exited prematurely "
+                f"(returncode={proc.returncode})"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as resp:  # noqa: S310
+                # Any HTTP status counts as "the server is up"; the
+                # specific endpoint shape is not the contract under test.
+                resp.read(0)
+                return
+        except (urllib.error.URLError, ConnectionError, OSError) as exc:
+            last_exc = exc
+            time.sleep(attempt_interval)
+    raise TimeoutError(
+        f"sidecar at {url} did not respond within {timeout_seconds:.1f}s "
+        f"(last error: {last_exc!r})"
+    )
+
+
+@pytest.fixture
+def langgraph_sidecar(tmp_path: Path) -> Iterator[str]:
+    """Spin up a real ``langgraph dev`` sidecar in a subprocess.
+
+    Yields the sidecar's base URL (``http://127.0.0.1:<port>``) and
+    tears the process down on test exit.
+
+    Skips the test when:
+
+    * The ``langgraph`` CLI is not on ``PATH`` (lightweight CI runners),
+    * The langgraph_api package is not importable (the dev server cannot
+      start without it), or
+    * The sidecar fails to become reachable inside its startup budget.
+
+    The subprocess is launched with the project's repository root as
+    its working directory so ``langgraph.json`` is discovered without
+    extra configuration.
+    """
+    binary = shutil.which("langgraph")
+    if binary is None:
+        pytest.skip(
+            "langgraph CLI not available on PATH; sidecar-aware E2E "
+            "test requires `pip install langgraph-cli[dev]` (or the "
+            "matching extra) to be installed in the test environment"
+        )
+
+    # The langgraph dev command requires langgraph_api at runtime; if
+    # the package is missing the subprocess exits immediately. We probe
+    # the import here so the skip reason is actionable.
+    try:
+        import importlib
+
+        importlib.import_module("langgraph_api")
+    except ImportError:
+        pytest.skip(
+            "langgraph_api not importable; sidecar-aware E2E test "
+            "requires the langgraph dev runtime in the test venv"
+        )
+
+    # Anchor the subprocess at the worktree root so the langgraph.json
+    # the sidecar discovers is the one shipped with this checkout.
+    here = Path(__file__).resolve()
+    repo_root = here.parents[2]
+    if not (repo_root / "langgraph.json").exists():
+        pytest.skip(
+            f"langgraph.json not found at expected repo root "
+            f"{repo_root!r}; sidecar fixture cannot launch the runner"
+        )
+
+    port = _find_free_port()
+    url = f"http://127.0.0.1:{port}"
+
+    env = os.environ.copy()
+    # Disable browser auto-open and tunnel features so the sidecar
+    # exits cleanly when the test SIGTERMs it (no orphan browser tabs,
+    # no LangSmith tunnel registration).
+    env.setdefault("LANGGRAPH_CLI_NO_BROWSER", "1")
+    env.setdefault("LANGSMITH_TRACING", "false")
+
+    cmd = [
+        binary,
+        "dev",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--no-browser",
+    ]
+
+    proc = subprocess.Popen(  # noqa: S603 — binary path resolved via shutil.which
+        cmd,
+        cwd=str(repo_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    try:
+        try:
+            _wait_for_http_ready(
+                f"{url}/ok", timeout_seconds=30.0, proc=proc
+            )
+        except TimeoutError as exc:
+            # Gather diagnostic output before tearing the subprocess
+            # down so the skip / failure carries the sidecar's stderr.
+            try:
+                proc.terminate()
+                stdout, _ = proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, _ = proc.communicate(timeout=5.0)
+            pytest.skip(
+                f"langgraph-runner sidecar failed to become ready: "
+                f"{exc}\n--- subprocess output ---\n{stdout}"
+            )
+        yield url
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)

@@ -1,0 +1,161 @@
+{
+  "task_id": "TASK-FRR-PEB-006",
+  "timestamp": "2026-05-07T15:16:50.291648",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 33,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".guardkit/autobuild/TASK-FRR-PEB-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/coach_turn_2.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/phase_4_summary.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/player_turn_3.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/specialist_results.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/task_work_results.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/turn_state_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/turn_state_turn_2.json",
+    ".guardkit/bdd/TASK-FRR-PEB-006_junit.xml",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/tasks/design_approved/TASK-FRR-PEB-006-pause-resume-canonicalisation.md",
+    "tasks/design_approved/TASK-FRR-PEB-006-pause-resume-canonicalisation.md"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.claude/task-plans/TASK-FRR-PEB-006-implementation-plan.md",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-006/player_turn_3.json"
+  ],
+  "tests_written": [],
+  "summary": "33 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 35,
+    "max_turns": 160,
+    "ceiling_hit": false
+  },
+  "task_type": "refactor",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "passed",
+    "severity": "low",
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no plan on disk; all 4 task-body-declared file(s) present"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "AC-1: The bridge's translator (T3) maps `awaiting_approval` SSE events to `BuildPausedPayload` and `running_wave-after-awaiting_approval` events to `BuildResumedPayload`. T3's translator is extended; no new translator class.",
+      "status": "complete",
+      "evidence": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing translator class is extended; no new translator class was created. Coach verified AC-1 in turns 1 and 2. Re-validated this turn: 9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass.",
+      "test_file": "tests/forge/lifecycle_bridge/test_pause_resume.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "AC-2: `src/forge/cli/_approval_subscriber.py` (or wherever FW10-010's resume emit lives \u2014 verify path during implementation) is amended: before publishing `build-resumed`, it queries the `lifecycle_bridge_registry` for the `(feature_id, correlation_id)`; if the registry has an active entry, the subscriber skips its emit and logs at INFO that the bridge is canonical.",
+      "status": "complete",
+      "evidence": "PATH VERIFIED PER AC-2's explicit 'verify path during implementation' instruction: the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py. The path src/forge/cli/_approval_subscriber.py does not exist \u2014 src/forge/cli/ contains only _serve_*.py + cancel.py + history.py + main.py + queue.py + runtime.py. The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical \u2026 skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turns 1 and 2. Turn 3 also updated the task body's '## Files to Modify' / Implementation notes / Coach validation commands sections to use the verified path so the plan-audit no longer flags non-existent paths.",
+      "test_file": "tests/forge/test_pause_resume_publish.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/approval_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "AC-3: When no bridge is wired (test path), the existing FW10-010 resume emit continues to fire \u2014 preserving backward compatibility for tests that don't exercise the bridge.",
+      "status": "complete",
+      "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) exactly as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path and passes. Coach verified AC-3 in turns 1 and 2; re-validated turn 3.",
+      "test_file": "tests/forge/test_pause_resume_publish.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/approval_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "AC-4: Pause/resume scenarios produce exactly one envelope per transition; correlation-id is threaded through both.",
+      "status": "complete",
+      "evidence": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turns 1 and 2; re-validated turn 3.",
+      "test_file": "tests/forge/lifecycle_bridge/test_pause_resume.py",
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py",
+        "src/forge/adapters/nats/approval_subscriber.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "AC-5: FW10-010's existing tests are updated to cover both paths (bridge-wired skips, bridge-absent emits). No FW10-010 test is deleted; the file is annotated with a header comment referencing TASK-FRR-PEB-006 as the amendment task.",
+      "status": "complete",
+      "evidence": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py. The path tests/forge/test_approval_subscriber.py does not exist; the unrelated tests/forge/adapters/test_approval_subscriber.py covers a different concern. tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing FW10-010 classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turns 1 and 2; re-validated turn 3 (15/15 pass).",
+      "test_file": "tests/forge/test_pause_resume_publish.py",
+      "implementation_files": [
+        "tests/forge/test_pause_resume_publish.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "AC-6: All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run turn 3). Coach verified AC-6 in turns 1 and 2.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/lifecycle_bridge/translation.py",
+        "src/forge/adapters/nats/approval_subscriber.py",
+        "tests/forge/lifecycle_bridge/test_pause_resume.py",
+        "tests/forge/test_pause_resume_publish.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 52.000810582889244
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 171.43197145906743
+    }
+  ]
+}

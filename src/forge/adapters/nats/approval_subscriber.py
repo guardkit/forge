@@ -102,6 +102,29 @@ neither envelope construction nor the publisher state, so this callback
 delegates to the :class:`ApprovalPublisher` (TASK-CGCP-006)."""
 
 
+BridgeRegistryLookup = Callable[[str, str], bool]
+"""``(feature_id, correlation_id) -> bool`` — returns ``True`` when the
+lifecycle bridge has an active registry entry for this build.
+
+TASK-FRR-PEB-006: when the bridge is wired into ``forge serve``, the
+bridge's SSE-translator owns the canonical ``pipeline.build-resumed``
+emit. The subscriber MUST defer to the bridge to avoid two competing
+emit sites; this lookup is the "is the bridge wired and tracking this
+build?" probe.
+
+Production wiring binds this callback to a thin wrapper around
+:meth:`forge.persistence.repositories.bridge_registry.BridgeRegistry.get`
+that returns ``True`` iff the registry returns a non-``None`` entry.
+Tests pass a fake callable to drive both the bridge-wired and
+bridge-absent paths.
+
+The callable is **synchronous** by design: the registry is a SQLite
+read on the same process; the call site is in the subscriber's hot path
+where ``await``ing a sync I/O bound op would only add overhead. A
+production implementation that needs to defer the lookup off the event
+loop should wrap the callable in :func:`asyncio.to_thread` itself."""
+
+
 @runtime_checkable
 class Clock(Protocol):
     """Monotonic clock injected for deterministic dedup TTL.
@@ -217,6 +240,14 @@ class ApprovalSubscriberDeps:
             :class:`_MonotonicClock`; tests inject a fake.
         dedup_ttl_seconds: Short TTL on the dedup buffer (seconds).
             Defaults to :data:`DEFAULT_DEDUP_TTL_SECONDS`.
+        bridge_registry_lookup: Optional :data:`BridgeRegistryLookup`
+            probe consulted before publishing ``build-resumed``. When
+            the callable returns ``True`` the subscriber **skips** its
+            own emit and logs at INFO that the bridge is canonical
+            (TASK-FRR-PEB-006 AC-2). ``None`` (the default) preserves
+            FW10-010 behaviour: the subscriber emits ``build-resumed``
+            itself (AC-3 — backward compatibility for tests / deploys
+            that do not wire the bridge).
     """
 
     nats_client: Any
@@ -226,6 +257,7 @@ class ApprovalSubscriberDeps:
     project: str | None = None
     clock: Clock = field(default_factory=_MonotonicClock)
     dedup_ttl_seconds: int = DEFAULT_DEDUP_TTL_SECONDS
+    bridge_registry_lookup: BridgeRegistryLookup | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -673,35 +705,117 @@ class ApprovalSubscriber:
         # and swallowed (DDR-007 §Failure-mode contract, ADR-ARCH-008):
         # SQLite remains authoritative; the build does not regress on
         # a transient publish hiccup.
+        #
+        # TASK-FRR-PEB-006 AC-2/AC-3: When the lifecycle bridge is wired
+        # AND has an active registry entry for this build, the bridge's
+        # SSE-translator is the canonical ``build-resumed`` emit site
+        # (Q4 sub-option (a) — single-emit-site canonicalisation). The
+        # subscriber detects this via :data:`BridgeRegistryLookup` and
+        # **skips** its own emit when the bridge is active. When the
+        # bridge is not wired (no lookup configured, or the lookup
+        # returns ``False``), the subscriber's emit fires — preserving
+        # FW10-010's behaviour for tests/deploys that don't run the
+        # bridge.
         if publish_ctx is not None:
             emitter, ctx, _expected_corr, stage_label = publish_ctx
-            try:
-                await emitter.emit_resumed(
-                    ctx,
-                    stage_label=stage_label,
-                    decision=payload.decision,
-                    responder=payload.decided_by,
-                    resumed_at=datetime.now(timezone.utc).isoformat(),
-                )
+            if self._bridge_owns_resume_for(
+                feature_id=ctx.feature_id,
+                correlation_id=ctx.correlation_id,
+                build_id=build_id,
+                request_id=payload.request_id,
+            ):
+                # AC-2: bridge is canonical — skip the subscriber's
+                # emit. The queue.put below still wakes the
+                # orchestrator's wait loop so the PAUSED → RUNNING
+                # transition proceeds; the bridge's translator emits
+                # the wire envelope when its SSE stream observes the
+                # ``awaiting_approval → running_wave`` transition.
                 logger.info(
-                    "approval_subscriber: published build-resumed "
-                    "build_id=%s feature_id=%s request_id=%s decision=%s",
-                    build_id,
+                    "approval_subscriber: bridge canonical for "
+                    "feature_id=%s correlation_id=%s build_id=%s "
+                    "request_id=%s — skipping subscriber's "
+                    "build-resumed emit (TASK-FRR-PEB-006)",
                     ctx.feature_id,
-                    payload.request_id,
-                    payload.decision,
-                )
-            except Exception as exc:  # noqa: BLE001 — DDR-007 swallow+log
-                logger.warning(
-                    "approval_subscriber: emit_resumed failed "
-                    "build_id=%s request_id=%s err=%s "
-                    "— SQLite remains authoritative (ADR-ARCH-008)",
+                    ctx.correlation_id,
                     build_id,
                     payload.request_id,
-                    exc,
                 )
+            else:
+                try:
+                    await emitter.emit_resumed(
+                        ctx,
+                        stage_label=stage_label,
+                        decision=payload.decision,
+                        responder=payload.decided_by,
+                        resumed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    logger.info(
+                        "approval_subscriber: published build-resumed "
+                        "build_id=%s feature_id=%s request_id=%s decision=%s",
+                        build_id,
+                        ctx.feature_id,
+                        payload.request_id,
+                        payload.decision,
+                    )
+                except Exception as exc:  # noqa: BLE001 — DDR-007 swallow+log
+                    logger.warning(
+                        "approval_subscriber: emit_resumed failed "
+                        "build_id=%s request_id=%s err=%s "
+                        "— SQLite remains authoritative (ADR-ARCH-008)",
+                        build_id,
+                        payload.request_id,
+                        exc,
+                    )
 
         await queue.put(payload)
+
+    # ------------------------------------------------------------------
+    # Bridge-canonical detection (TASK-FRR-PEB-006)
+    # ------------------------------------------------------------------
+
+    def _bridge_owns_resume_for(
+        self,
+        *,
+        feature_id: str,
+        correlation_id: str,
+        build_id: str,
+        request_id: str,
+    ) -> bool:
+        """Return ``True`` when the bridge owns the canonical resume emit.
+
+        AC-2: queries :attr:`ApprovalSubscriberDeps.bridge_registry_lookup`
+        for the ``(feature_id, correlation_id)`` pair. A truthy result
+        means the bridge has an active registry entry for this build
+        and will emit ``pipeline.build-resumed`` itself when the SSE
+        stream's ``awaiting_approval → running_wave`` transition is
+        observed.
+
+        Failures of the lookup callable are logged at WARNING and
+        treated as **bridge-absent** — the subscriber's emit then fires
+        as a defence-in-depth fallback. Swallowing is deliberate: a
+        transient SQLite hiccup must not silently drop the resume
+        envelope; the subscriber is the older, more battle-tested emit
+        site and is the safer fallback.
+        """
+        lookup = self._deps.bridge_registry_lookup
+        if lookup is None:
+            # AC-3: no bridge wired — subscriber's emit fires.
+            return False
+        try:
+            return bool(lookup(feature_id, correlation_id))
+        except Exception as exc:  # noqa: BLE001 — defence-in-depth
+            logger.warning(
+                "approval_subscriber: bridge_registry_lookup raised "
+                "(%s) for feature_id=%s correlation_id=%s build_id=%s "
+                "request_id=%s — falling back to subscriber emit "
+                "(TASK-FRR-PEB-006)",
+                exc,
+                feature_id,
+                correlation_id,
+                build_id,
+                request_id,
+            )
+            return False
 
 
 __all__ = [
@@ -710,6 +824,7 @@ __all__ = [
     "SOURCE_ID",
     "ApprovalSubscriber",
     "ApprovalSubscriberDeps",
+    "BridgeRegistryLookup",
     "Clock",
     "InvalidDecisionError",
     "PublishRefreshCallback",

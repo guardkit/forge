@@ -1,0 +1,34 @@
+{
+  "id": "TURN-FEAT-PEBR-1",
+  "feature_id": "FEAT-PEBR",
+  "task_id": "TASK-FRR-PEB-012",
+  "turn_number": 1,
+  "player_summary": "Implementation attempt",
+  "player_decision": "approve",
+  "coach_decision": "approve",
+  "coach_feedback": null,
+  "mode": "fresh_start",
+  "blockers_found": [],
+  "progress_summary": "Turn 1: approve",
+  "acceptance_criteria_status": {
+    "AC-1": "verified",
+    "AC-2": "verified",
+    "AC-3": "verified",
+    "AC-4": "verified",
+    "AC-5": "verified",
+    "AC-6": "verified"
+  },
+  "files_modified": [
+    "src/forge/cli/status.py",
+    "tests/forge/test_cli_status.py"
+  ],
+  "tests_passed": null,
+  "tests_failed": null,
+  "coverage": null,
+  "arch_score": null,
+  "started_at": "2026-05-07T16:29:42.863983",
+  "completed_at": "2026-05-07T16:29:42.863983",
+  "duration_seconds": null,
+  "lessons_from_turn": [],
+  "what_to_try_next": null
+}

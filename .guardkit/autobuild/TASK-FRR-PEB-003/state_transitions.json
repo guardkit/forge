@@ -1,0 +1,16 @@
+[
+  {
+    "task_id": "TASK-FRR-PEB-003",
+    "pre_path": "tasks/backlog/TASK-FRR-PEB-003-sse-to-envelope-translation.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-003-sse-to-envelope-translation.md",
+    "timestamp": "2026-05-07T09:35:24.130901+00:00",
+    "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-FRR-PEB-003",
+    "pre_path": "tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FRR-PEB-003-sse-to-envelope-translation.md",
+    "post_path": "tasks/design_approved/TASK-FRR-PEB-003-sse-to-envelope-translation.md",
+    "timestamp": "2026-05-07T09:49:07.440389+00:00",
+    "kind": "design_approved_transition"
+  }
+]

@@ -1,0 +1,181 @@
+{
+  "task_id": "TASK-FRR-PEB-008",
+  "turn": 1,
+  "decision": "feedback",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/lifecycle_bridge/test_deadline.py tests/forge/lifecycle_bridge/test_reconnect.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/forge/lifecycle_bridge/test_reconnect.py::TestMonkeyPatchedConstantsAreObserved::test_reset_observes_patched_initial PASSED [ 91%]\ntests/forge/lifecycle_bridge/test_reconnect.py::TestSleepThenAdvance::test_sleep_then_advance_uses_injected_sleeper PASSED [ 94%]\ntests/forge/lifecycle_bridge/test_reconnect.py::TestSleepThenAdvance::test_sleep_then_advance_with_patched_constants PASSED [ 97%]\ntests/forge/lifecycle_bridge/test_reconnect.py::TestSleepThenAdvance::test_sleep_then_advance_default_is_asyncio_sleep PASSED [100%]\n============================== 34 passed in 1.68s ==============================",
+      "duration_seconds": 2.5213968753814697
+    },
+    "requirements": {
+      "criteria_total": 7,
+      "criteria_met": 5,
+      "all_criteria_met": false,
+      "missing": [
+        "AC-2: The bridge's SSE observer task wraps its connection loop in",
+        "AC-4: Malformed SSE responses are logged at WARNING with the parse"
+      ]
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "AC-1: A new `src/forge/lifecycle_bridge/reconnect.py` exposes a",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created src/forge/lifecycle_bridge/reconnect.py with module-level constants RECONNECT_INITIAL_BACKOFF=1.0 and RECONNECT_MAX_BACKOFF=30.0 (verbatim from forge.cli._serve_daemon). ReconnectPolicy class implements next_backoff() that returns the current value and doubles for the next call (1.0->2.0->4.0->8.0->16.0->30.0->30.0 capped), reset() that returns the schedule to RECONNECT_INITIAL_BACKOFF, and current_backoff property for peek-without-advance. The constants are read on every call so monkeypatch.setattr applied after construction is honored. Tests TestReconnectPolicySchedule, TestReconnectPolicyResetOnSuccess, TestReconnectPolicyConstants all pass.",
+      "notes": "Created src/forge/lifecycle_bridge/reconnect.py with module-level constants RECONNECT_INITIAL_BACKOFF=1.0 and RECONNECT_MAX_BACKOFF=30.0 (verbatim from forge.cli._serve_daemon). ReconnectPolicy class implements next_backoff() that returns the current value and doubles for the next call (1.0->2.0->4.0->8.0->16.0->30.0->30.0 capped), reset() that returns the schedule to RECONNECT_INITIAL_BACKOFF, and current_backoff property for peek-without-advance. The constants are read on every call so monkeypatch.setattr applied after construction is honored. Tests TestReconnectPolicySchedule, TestReconnectPolicyResetOnSuccess, TestReconnectPolicyConstants all pass."
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "AC-2: The bridge's SSE observer task wraps its connection loop in",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "Promise status: uncertain",
+      "notes": "Promise status: uncertain"
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "AC-3: A new per-build deadline timer is started by `LifecycleBridge.attach()`",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Extended LifecycleBridge constructor with optional deadline_handler: DeadlineHandler and deadline_seconds parameters. attach() now spawns an asyncio task via _start_deadline_timer that sleeps for the budget then invokes deadline_handler(build_context). detach() and shutdown() cancel the timer cleanly so the terminal envelope path does not race the deadline. cancel_deadline(feature_id) is exposed for the wireup to stop the timer the moment a terminal arrives. The deadline_handler is the seam where the wireup will publish pipeline.build-failed (the bridge does NOT directly call the publisher to keep the AC-2-style contract that the wireup owns publishing). Note: the literal lifecycle_bridge_registry.terminal_published = true column update is omitted because that column does not exist in the current BridgeRegistry schema; the registry entry is removed via detach() in the deadline handler path which is the practical equivalent. Tests TestDeadlineFiresWhenNoTerminalObserved, TestDeadlineCancelledOnTerminal, TestShutdownCancelsDeadlines, TestDeadlineHandlerErrorIsLoggedNotRaised all pass.",
+      "notes": "Extended LifecycleBridge constructor with optional deadline_handler: DeadlineHandler and deadline_seconds parameters. attach() now spawns an asyncio task via _start_deadline_timer that sleeps for the budget then invokes deadline_handler(build_context). detach() and shutdown() cancel the timer cleanly so the terminal envelope path does not race the deadline. cancel_deadline(feature_id) is exposed for the wireup to stop the timer the moment a terminal arrives. The deadline_handler is the seam where the wireup will publish pipeline.build-failed (the bridge does NOT directly call the publisher to keep the AC-2-style contract that the wireup owns publishing). Note: the literal lifecycle_bridge_registry.terminal_published = true column update is omitted because that column does not exist in the current BridgeRegistry schema; the registry entry is removed via detach() in the deadline handler path which is the practical equivalent. Tests TestDeadlineFiresWhenNoTerminalObserved, TestDeadlineCancelledOnTerminal, TestShutdownCancelsDeadlines, TestDeadlineHandlerErrorIsLoggedNotRaised all pass."
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "AC-4: Malformed SSE responses are logged at WARNING with the parse",
+      "result": "rejected",
+      "status": "rejected",
+      "evidence": "Promise status: uncertain",
+      "notes": "Promise status: uncertain"
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "AC-5: Tests monkey-patch `RECONNECT_INITIAL_BACKOFF` and",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "TestMonkeyPatchedConstantsAreObserved in test_reconnect.py contains four tests that monkey-patch RECONNECT_INITIAL_BACKOFF and RECONNECT_MAX_BACKOFF via monkeypatch.setattr(reconnect_module, ...) and verifies the policy honors patched values immediately (no re-instantiation needed). TestDeadlineMonkeyPatchedToFastValue::test_monkey_patched_module_constant_takes_effect verifies DEADLINE_SECONDS can be patched to 0.05s. The bridge constructor also accepts an explicit deadline_seconds= parameter for per-instance overrides. All four monkey-patch tests pass.",
+      "notes": "TestMonkeyPatchedConstantsAreObserved in test_reconnect.py contains four tests that monkey-patch RECONNECT_INITIAL_BACKOFF and RECONNECT_MAX_BACKOFF via monkeypatch.setattr(reconnect_module, ...) and verifies the policy honors patched values immediately (no re-instantiation needed). TestDeadlineMonkeyPatchedToFastValue::test_monkey_patched_module_constant_takes_effect verifies DEADLINE_SECONDS can be patched to 0.05s. The bridge constructor also accepts an explicit deadline_seconds= parameter for per-instance overrides. All four monkey-patch tests pass."
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "AC-6: Build-failed envelopes from the deadline path carry the",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "The deadline timer invokes deadline_handler(build_context) where BuildContext carries the inbound correlation_id (pre-existing field set in attach()). Test TestDeadlineHandlerReceivesBuildContext::test_handler_can_read_correlation_id explicitly verifies the handler receives the original correlation_id (corr-XYZ-123) when the deadline fires. Test test_multiple_in_flight_each_get_own_handler_invocation verifies each in-flight build gets its own context delivered to the handler. The wireup-side handler implementation will pass build_context.correlation_id onto the BuildFailedPayload's envelope.",
+      "notes": "The deadline timer invokes deadline_handler(build_context) where BuildContext carries the inbound correlation_id (pre-existing field set in attach()). Test TestDeadlineHandlerReceivesBuildContext::test_handler_can_read_correlation_id explicitly verifies the handler receives the original correlation_id (corr-XYZ-123) when the deadline fires. Test test_multiple_in_flight_each_get_own_handler_invocation verifies each in-flight build gets its own context delivered to the handler. The wireup-side handler implementation will pass build_context.correlation_id onto the BuildFailedPayload's envelope."
+    },
+    {
+      "criterion_id": "AC-7",
+      "criterion_text": "AC-7: All modified files pass project-configured lint/format checks",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ruff check src/forge/lifecycle_bridge/reconnect.py src/forge/lifecycle_bridge/bridge.py reports 'All checks passed!' with zero errors. Code follows project conventions: from __future__ import annotations, type hints throughout, Black-compatible 88-char lines, docstrings on every public symbol, snake_case functions, PascalCase classes, UPPER_CASE constants.",
+      "notes": "ruff check src/forge/lifecycle_bridge/reconnect.py src/forge/lifecycle_bridge/bridge.py reports 'All checks passed!' with zero errors. Code follows project conventions: from __future__ import annotations, type hints throughout, Black-compatible 88-char lines, docstrings on every public symbol, snake_case functions, PascalCase classes, UPPER_CASE constants."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-1",
+        "criterion_text": "AC-1: A new `src/forge/lifecycle_bridge/reconnect.py` exposes a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created src/forge/lifecycle_bridge/reconnect.py with module-level constants RECONNECT_INITIAL_BACKOFF=1.0 and RECONNECT_MAX_BACKOFF=30.0 (verbatim from forge.cli._serve_daemon). ReconnectPolicy class implements next_backoff() that returns the current value and doubles for the next call (1.0->2.0->4.0->8.0->16.0->30.0->30.0 capped), reset() that returns the schedule to RECONNECT_INITIAL_BACKOFF, and current_backoff property for peek-without-advance. The constants are read on every call so monkeypatch.setattr applied after construction is honored. Tests TestReconnectPolicySchedule, TestReconnectPolicyResetOnSuccess, TestReconnectPolicyConstants all pass.",
+        "notes": "Created src/forge/lifecycle_bridge/reconnect.py with module-level constants RECONNECT_INITIAL_BACKOFF=1.0 and RECONNECT_MAX_BACKOFF=30.0 (verbatim from forge.cli._serve_daemon). ReconnectPolicy class implements next_backoff() that returns the current value and doubles for the next call (1.0->2.0->4.0->8.0->16.0->30.0->30.0 capped), reset() that returns the schedule to RECONNECT_INITIAL_BACKOFF, and current_backoff property for peek-without-advance. The constants are read on every call so monkeypatch.setattr applied after construction is honored. Tests TestReconnectPolicySchedule, TestReconnectPolicyResetOnSuccess, TestReconnectPolicyConstants all pass."
+      },
+      {
+        "criterion_id": "AC-2",
+        "criterion_text": "AC-2: The bridge's SSE observer task wraps its connection loop in",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "Promise status: uncertain",
+        "notes": "Promise status: uncertain"
+      },
+      {
+        "criterion_id": "AC-3",
+        "criterion_text": "AC-3: A new per-build deadline timer is started by `LifecycleBridge.attach()`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Extended LifecycleBridge constructor with optional deadline_handler: DeadlineHandler and deadline_seconds parameters. attach() now spawns an asyncio task via _start_deadline_timer that sleeps for the budget then invokes deadline_handler(build_context). detach() and shutdown() cancel the timer cleanly so the terminal envelope path does not race the deadline. cancel_deadline(feature_id) is exposed for the wireup to stop the timer the moment a terminal arrives. The deadline_handler is the seam where the wireup will publish pipeline.build-failed (the bridge does NOT directly call the publisher to keep the AC-2-style contract that the wireup owns publishing). Note: the literal lifecycle_bridge_registry.terminal_published = true column update is omitted because that column does not exist in the current BridgeRegistry schema; the registry entry is removed via detach() in the deadline handler path which is the practical equivalent. Tests TestDeadlineFiresWhenNoTerminalObserved, TestDeadlineCancelledOnTerminal, TestShutdownCancelsDeadlines, TestDeadlineHandlerErrorIsLoggedNotRaised all pass.",
+        "notes": "Extended LifecycleBridge constructor with optional deadline_handler: DeadlineHandler and deadline_seconds parameters. attach() now spawns an asyncio task via _start_deadline_timer that sleeps for the budget then invokes deadline_handler(build_context). detach() and shutdown() cancel the timer cleanly so the terminal envelope path does not race the deadline. cancel_deadline(feature_id) is exposed for the wireup to stop the timer the moment a terminal arrives. The deadline_handler is the seam where the wireup will publish pipeline.build-failed (the bridge does NOT directly call the publisher to keep the AC-2-style contract that the wireup owns publishing). Note: the literal lifecycle_bridge_registry.terminal_published = true column update is omitted because that column does not exist in the current BridgeRegistry schema; the registry entry is removed via detach() in the deadline handler path which is the practical equivalent. Tests TestDeadlineFiresWhenNoTerminalObserved, TestDeadlineCancelledOnTerminal, TestShutdownCancelsDeadlines, TestDeadlineHandlerErrorIsLoggedNotRaised all pass."
+      },
+      {
+        "criterion_id": "AC-4",
+        "criterion_text": "AC-4: Malformed SSE responses are logged at WARNING with the parse",
+        "result": "rejected",
+        "status": "rejected",
+        "evidence": "Promise status: uncertain",
+        "notes": "Promise status: uncertain"
+      },
+      {
+        "criterion_id": "AC-5",
+        "criterion_text": "AC-5: Tests monkey-patch `RECONNECT_INITIAL_BACKOFF` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "TestMonkeyPatchedConstantsAreObserved in test_reconnect.py contains four tests that monkey-patch RECONNECT_INITIAL_BACKOFF and RECONNECT_MAX_BACKOFF via monkeypatch.setattr(reconnect_module, ...) and verifies the policy honors patched values immediately (no re-instantiation needed). TestDeadlineMonkeyPatchedToFastValue::test_monkey_patched_module_constant_takes_effect verifies DEADLINE_SECONDS can be patched to 0.05s. The bridge constructor also accepts an explicit deadline_seconds= parameter for per-instance overrides. All four monkey-patch tests pass.",
+        "notes": "TestMonkeyPatchedConstantsAreObserved in test_reconnect.py contains four tests that monkey-patch RECONNECT_INITIAL_BACKOFF and RECONNECT_MAX_BACKOFF via monkeypatch.setattr(reconnect_module, ...) and verifies the policy honors patched values immediately (no re-instantiation needed). TestDeadlineMonkeyPatchedToFastValue::test_monkey_patched_module_constant_takes_effect verifies DEADLINE_SECONDS can be patched to 0.05s. The bridge constructor also accepts an explicit deadline_seconds= parameter for per-instance overrides. All four monkey-patch tests pass."
+      },
+      {
+        "criterion_id": "AC-6",
+        "criterion_text": "AC-6: Build-failed envelopes from the deadline path carry the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "The deadline timer invokes deadline_handler(build_context) where BuildContext carries the inbound correlation_id (pre-existing field set in attach()). Test TestDeadlineHandlerReceivesBuildContext::test_handler_can_read_correlation_id explicitly verifies the handler receives the original correlation_id (corr-XYZ-123) when the deadline fires. Test test_multiple_in_flight_each_get_own_handler_invocation verifies each in-flight build gets its own context delivered to the handler. The wireup-side handler implementation will pass build_context.correlation_id onto the BuildFailedPayload's envelope.",
+        "notes": "The deadline timer invokes deadline_handler(build_context) where BuildContext carries the inbound correlation_id (pre-existing field set in attach()). Test TestDeadlineHandlerReceivesBuildContext::test_handler_can_read_correlation_id explicitly verifies the handler receives the original correlation_id (corr-XYZ-123) when the deadline fires. Test test_multiple_in_flight_each_get_own_handler_invocation verifies each in-flight build gets its own context delivered to the handler. The wireup-side handler implementation will pass build_context.correlation_id onto the BuildFailedPayload's envelope."
+      },
+      {
+        "criterion_id": "AC-7",
+        "criterion_text": "AC-7: All modified files pass project-configured lint/format checks",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ruff check src/forge/lifecycle_bridge/reconnect.py src/forge/lifecycle_bridge/bridge.py reports 'All checks passed!' with zero errors. Code follows project conventions: from __future__ import annotations, type hints throughout, Black-compatible 88-char lines, docstrings on every public symbol, snake_case functions, PascalCase classes, UPPER_CASE constants.",
+        "notes": "ruff check src/forge/lifecycle_bridge/reconnect.py src/forge/lifecycle_bridge/bridge.py reports 'All checks passed!' with zero errors. Code follows project conventions: from __future__ import annotations, type hints throughout, Black-compatible 88-char lines, docstrings on every public symbol, snake_case functions, PascalCase classes, UPPER_CASE constants."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "must_fix",
+      "category": "missing_requirement",
+      "description": "Not all acceptance criteria met",
+      "missing_criteria": [
+        "AC-2: The bridge's SSE observer task wraps its connection loop in",
+        "AC-4: Malformed SSE responses are logged at WARNING with the parse"
+      ]
+    }
+  ],
+  "rationale": "Missing 2 acceptance criteria: AC-2: The bridge's SSE observer task wraps its connection loop in, AC-4: Malformed SSE responses are logged at WARNING with the parse",
+  "context_used": "## Job-Specific Context\n\nBudget: 1654/5200 tokens\n\n### \ud83c\udfa8 Relevant Patterns\n- APPLIES_TO\n- CREATED_AT\n- ASSIGNS_TASK_TO\n- SOURCE_PATTERN\n\n### \u26a0\ufe0f Warnings\n- USES_ENDPOINT\n- DEPENDS_ON\n- ERROR_CAUSE_OF\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- HAS_ROLE_MUST_DO\n- HAS_ROLE\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- WHEN_TO_USE\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false,
+  "environment_conditional_approval": false,
+  "honesty_verification": {
+    "verified": true,
+    "honesty_score": 1.0,
+    "discrepancy_count": 0,
+    "resolved_paths": []
+  }
+}
