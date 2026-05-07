@@ -1,31 +1,32 @@
 ---
-id: TASK-FRR-PEB-006
-title: "Pause/resume canonicalisation — bridge owns both, FW10-010 resume site amended out"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: refactor
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 3
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-005
+- TASK-FRR-PEB-005
+documentation_level: standard
+estimated_minutes: 90
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-006
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - pause-resume
-  - fw10-010-amendment
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- pause-resume
+- fw10-010-amendment
+task_type: refactor
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Pause/resume canonicalisation — bridge owns both, FW10-010 resume site amended
+  out
+updated: 2026-05-06 00:00:00+00:00
+wave: 3
 ---
 
 # Task: Pause/resume canonicalisation — bridge owns both, FW10-010 resume site amended out

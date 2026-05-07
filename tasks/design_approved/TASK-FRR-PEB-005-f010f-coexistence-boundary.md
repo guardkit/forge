@@ -1,31 +1,31 @@
 ---
-id: TASK-FRR-PEB-005
-title: "F010F coexistence — sync-raise still uses safety-net publish, not the bridge"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: refactor
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 2
-implementation_mode: task-work
 complexity: 5
-estimated_minutes: 60
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-004
+- TASK-FRR-PEB-004
+documentation_level: standard
+estimated_minutes: 60
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-005
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - boundary-regression
-  - f010f-coexistence
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- boundary-regression
+- f010f-coexistence
+task_type: refactor
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: F010F coexistence — sync-raise still uses safety-net publish, not the bridge
+updated: 2026-05-06 00:00:00+00:00
+wave: 2
 ---
 
 # Task: F010F coexistence — sync-raise still uses safety-net publish, not the bridge

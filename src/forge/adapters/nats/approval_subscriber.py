@@ -102,6 +102,29 @@ neither envelope construction nor the publisher state, so this callback
 delegates to the :class:`ApprovalPublisher` (TASK-CGCP-006)."""
 
 
+BridgeRegistryLookup = Callable[[str, str], bool]
+"""``(feature_id, correlation_id) -> bool`` — returns ``True`` when the
+lifecycle bridge has an active registry entry for this build.
+
+TASK-FRR-PEB-006: when the bridge is wired into ``forge serve``, the
+bridge's SSE-translator owns the canonical ``pipeline.build-resumed``
+emit. The subscriber MUST defer to the bridge to avoid two competing
+emit sites; this lookup is the "is the bridge wired and tracking this
+build?" probe.
+
+Production wiring binds this callback to a thin wrapper around
+:meth:`forge.persistence.repositories.bridge_registry.BridgeRegistry.get`
+that returns ``True`` iff the registry returns a non-``None`` entry.
+Tests pass a fake callable to drive both the bridge-wired and
+bridge-absent paths.
+
+The callable is **synchronous** by design: the registry is a SQLite
+read on the same process; the call site is in the subscriber's hot path
+where ``await``ing a sync I/O bound op would only add overhead. A
+production implementation that needs to defer the lookup off the event
+loop should wrap the callable in :func:`asyncio.to_thread` itself."""
+
+
 @runtime_checkable
 class Clock(Protocol):
     """Monotonic clock injected for deterministic dedup TTL.
@@ -217,6 +240,14 @@ class ApprovalSubscriberDeps:
             :class:`_MonotonicClock`; tests inject a fake.
         dedup_ttl_seconds: Short TTL on the dedup buffer (seconds).
             Defaults to :data:`DEFAULT_DEDUP_TTL_SECONDS`.
+        bridge_registry_lookup: Optional :data:`BridgeRegistryLookup`
+            probe consulted before publishing ``build-resumed``. When
+            the callable returns ``True`` the subscriber **skips** its
+            own emit and logs at INFO that the bridge is canonical
+            (TASK-FRR-PEB-006 AC-2). ``None`` (the default) preserves
+            FW10-010 behaviour: the subscriber emits ``build-resumed``
+            itself (AC-3 — backward compatibility for tests / deploys
+            that do not wire the bridge).
     """
 
     nats_client: Any
@@ -226,6 +257,7 @@ class ApprovalSubscriberDeps:
     project: str | None = None
     clock: Clock = field(default_factory=_MonotonicClock)
     dedup_ttl_seconds: int = DEFAULT_DEDUP_TTL_SECONDS
+    bridge_registry_lookup: BridgeRegistryLookup | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,11 @@
-"""``LifecycleBridge`` — structural skeleton (TASK-FRR-PEB-002).
+"""``LifecycleBridge`` — SSE-attached lifecycle owner (TASK-FRR-PEB-002 / -007).
 
 The bridge owns the SSE connection lifecycle to the langgraph-runner
-sidecar. T2 establishes the structural foundation only:
+sidecar. T2 established the structural foundation; later waves layer in
+the active behaviours:
 
 * Public method surface: ``attach``, ``detach``, ``recover_in_flight``,
-  ``shutdown``.
+  ``shutdown``, ``request_cancel`` (TASK-FRR-PEB-007).
 * SQLite-backed in-flight registry persistence via
   :class:`forge.persistence.repositories.bridge_registry.BridgeRegistry`.
 
@@ -13,6 +14,14 @@ across the follow-up tasks:
 
 * T3 — SSE envelope translation layer (consumes the registry).
 * T4 — ``forge serve`` startup wiring (calls :meth:`attach`/:meth:`shutdown`).
+* T7 — operator cancellation: :meth:`request_cancel` calls
+  ``runs.cancel(thread_id, run_id, action="interrupt")`` on the
+  langgraph-runner sidecar via the SDK and returns immediately. The
+  bridge does **not** synthesise the ``pipeline.build-cancelled``
+  envelope from this method — it waits for the sidecar to confirm
+  ``terminal=interrupted`` over SSE and lets the translator emit the
+  envelope (single emit site, FEAT-FORGE-004 contract extended to the
+  cancel path).
 * T9 — crash-recovery handshake (extends :meth:`recover_in_flight`).
 
 The registry doubles as the source for ``forge status --in-flight``
@@ -37,6 +46,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 from forge.lifecycle_bridge.version_check import check_langgraph_runner_version
 from forge.persistence.repositories.bridge_registry import (
@@ -50,7 +60,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AckHandle",
     "BuildContext",
+    "CancelResult",
+    "LangGraphCancelClient",
     "LifecycleBridge",
+    "RunsCancelClient",
 ]
 
 

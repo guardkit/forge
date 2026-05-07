@@ -1,30 +1,30 @@
 ---
-id: TASK-FRR-PEB-007
-title: "Cancel emit ownership — bridge synthesises build-cancelled on observed terminal=interrupted"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: refactor
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 3
-implementation_mode: task-work
 complexity: 5
-estimated_minutes: 60
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-005
+- TASK-FRR-PEB-005
+documentation_level: standard
+estimated_minutes: 60
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-007
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - cancel-ownership
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- cancel-ownership
+task_type: refactor
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Cancel emit ownership — bridge synthesises build-cancelled on observed terminal=interrupted
+updated: 2026-05-06 00:00:00+00:00
+wave: 3
 ---
 
 # Task: Cancel emit ownership — bridge synthesises build-cancelled on observed terminal=interrupted
