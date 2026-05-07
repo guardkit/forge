@@ -1,6 +1,6 @@
 {
   "task_id": "TASK-FRR-PEB-006",
-  "timestamp": "2026-05-07T14:50:30.795011",
+  "timestamp": "2026-05-07T14:58:17.190709",
   "completed": true,
   "phases": {
     "phase_3": {
@@ -19,18 +19,23 @@
   },
   "files_modified": [
     ".guardkit/autobuild/TASK-FRR-PEB-006/checkpoints.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/coach_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/phase_4_summary.json",
     ".guardkit/autobuild/TASK-FRR-PEB-006/player_turn_1.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/player_turn_2.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/specialist_results.json",
     ".guardkit/autobuild/TASK-FRR-PEB-006/task_work_results.json",
     ".guardkit/autobuild/TASK-FRR-PEB-006/turn_context.json",
+    ".guardkit/autobuild/TASK-FRR-PEB-006/turn_state_turn_1.json",
     ".guardkit/bdd/TASK-FRR-PEB-006_junit.xml"
   ],
   "files_created": [
-    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-006/player_turn_1.json"
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-PEBR/.guardkit/autobuild/TASK-FRR-PEB-006/player_turn_2.json"
   ],
   "tests_written": [],
   "summary": "60 tests passed, all quality gates passed",
   "sdk_turns": {
-    "turns_used": 24,
+    "turns_used": 5,
     "max_turns": 160,
     "ceiling_hit": false
   },
@@ -73,7 +78,7 @@
       "criterion_id": "AC-1",
       "criterion_text": "The bridge's translator (T3) maps awaiting_approval SSE events to BuildPausedPayload and running_wave-after-awaiting_approval events to BuildResumedPayload. T3's translator is extended; no new translator class.",
       "status": "complete",
-      "evidence": "src/forge/lifecycle_bridge/translation.py defines _build_paused and _build_resumed payload constructors; the _dispatch method (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload. The single StreamEventTranslator class is extended (no new translator).",
+      "evidence": "src/forge/lifecycle_bridge/translation.py: StreamEventTranslator._dispatch (lines 444-456) maps awaiting_approval entry to BuildPausedPayload and awaiting_approval -> running_wave to BuildResumedPayload via _build_paused / _build_resumed. The single existing class is extended; no new translator. Coach already verified AC-1 in turn 1; re-validated this turn (9/9 tests in tests/forge/lifecycle_bridge/test_pause_resume.py pass).",
       "test_file": "tests/forge/lifecycle_bridge/test_pause_resume.py",
       "implementation_files": [
         "src/forge/lifecycle_bridge/translation.py"
@@ -83,7 +88,7 @@
       "criterion_id": "AC-2",
       "criterion_text": "approval_subscriber.py is amended: before publishing build-resumed, it queries the lifecycle_bridge_registry for (feature_id, correlation_id); if active, the subscriber skips its emit and logs at INFO that the bridge is canonical.",
       "status": "complete",
-      "evidence": "src/forge/adapters/nats/approval_subscriber.py introduces ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable) and ApprovalSubscriber._bridge_owns_resume_for(...) (lines 776-818). _on_envelope (lines 719-742) calls _bridge_owns_resume_for(feature_id, correlation_id, ...) before emit_resumed; when True, it logs INFO 'bridge canonical ... skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' and skips the emit while still putting the payload on the queue to wake the wait loop.",
+      "evidence": "PATH VERIFIED PER AC-2's explicit instruction ('or wherever FW10-010's resume emit lives \u2014 verify path during implementation'): the actual subscriber lives at src/forge/adapters/nats/approval_subscriber.py, NOT src/forge/cli/_approval_subscriber.py (that path does not exist in this repo). The amendment is in place: ApprovalSubscriberDeps.bridge_registry_lookup (BridgeRegistryLookup callable, line 260) + ApprovalSubscriber._bridge_owns_resume_for (lines 776-818). _on_envelope (lines 719-742) calls the probe before emit_resumed and, when True, logs 'bridge canonical ... skipping subscriber's build-resumed emit (TASK-FRR-PEB-006)' at INFO and skips the emit. Coach verified AC-2 in turn 1; re-validated this turn.",
       "test_file": "tests/forge/test_pause_resume_publish.py",
       "implementation_files": [
         "src/forge/adapters/nats/approval_subscriber.py"
@@ -93,7 +98,7 @@
       "criterion_id": "AC-3",
       "criterion_text": "When no bridge is wired (test path), the existing FW10-010 resume emit continues to fire \u2014 preserving backward compatibility for tests that don't exercise the bridge.",
       "status": "complete",
-      "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None; _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) as before \u2014 the FW10-010 emit continues to fire when bridge is absent. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py exercises this path.",
+      "evidence": "ApprovalSubscriberDeps.bridge_registry_lookup defaults to None (line 260). _bridge_owns_resume_for returns False when the lookup is None or raises (defence-in-depth). _on_envelope's else branch (lines 743-768) calls emitter.emit_resumed(...) as in FW10-010. TestBridgeAbsentEmitsResume in tests/forge/test_pause_resume_publish.py (line 741) exercises this path. Coach verified AC-3 in turn 1.",
       "test_file": "tests/forge/test_pause_resume_publish.py",
       "implementation_files": [
         "src/forge/adapters/nats/approval_subscriber.py"
@@ -103,7 +108,7 @@
       "criterion_id": "AC-4",
       "criterion_text": "Pause/resume scenarios produce exactly one envelope per transition; correlation-id is threaded through both.",
       "status": "complete",
-      "evidence": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval and resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is set on BuildPausedPayload/BuildResumedPayload via the Pydantic constructor. test_full_sequence_emits_paused_then_resumed_with_correlation in tests/forge/lifecycle_bridge/test_pause_resume.py drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with corr-pause-resume-001.",
+      "evidence": "Translator dispatch is edge-triggered: pause fires only when prev.lifecycle != awaiting_approval; resume fires only when prev.lifecycle == awaiting_approval AND snap.lifecycle == running_wave. Steady-state snapshots return None. correlation_id is constructor-set on BuildPausedPayload/BuildResumedPayload. test_full_sequence_emits_paused_then_resumed_with_correlation drives 5 snapshots and asserts exactly one paused + one resumed payload, both threaded with the inbound correlation_id. Coach verified AC-4 in turn 1.",
       "test_file": "tests/forge/lifecycle_bridge/test_pause_resume.py",
       "implementation_files": [
         "src/forge/lifecycle_bridge/translation.py",
@@ -114,7 +119,7 @@
       "criterion_id": "AC-5",
       "criterion_text": "FW10-010's existing tests are updated to cover both paths (bridge-wired skips, bridge-absent emits). No FW10-010 test is deleted; the file is annotated with a header comment referencing TASK-FRR-PEB-006 as the amendment task.",
       "status": "complete",
-      "evidence": "tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing test classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths.",
+      "evidence": "PATH VERIFIED: the FW10-010 test file is tests/forge/test_pause_resume_publish.py (NOT tests/forge/test_approval_subscriber.py \u2014 that path does not exist; the existing approval_subscriber test file lives at tests/forge/adapters/test_approval_subscriber.py and is unrelated). tests/forge/test_pause_resume_publish.py docstring header begins 'AMENDED BY TASK-FRR-PEB-006 \u2014 pause/resume canonicalisation' and lists the new test classes. Existing classes (TestPausePublishAwaitingApproval, TestResumePublishOnApproval, TestMismatchedCorrelationIdRejected, TestFirstResponseWins, TestPublishFailureContract) are preserved unchanged. New TestBridgeWiredSkipsResumeEmit (line 523) and TestBridgeAbsentEmitsResume (line 741) cover the two amended paths. Coach verified AC-5 in turn 1.",
       "test_file": "tests/forge/test_pause_resume_publish.py",
       "implementation_files": [
         "tests/forge/test_pause_resume_publish.py"
@@ -124,7 +129,7 @@
       "criterion_id": "AC-6",
       "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
       "status": "complete",
-      "evidence": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!'",
+      "evidence": "ruff check src/forge/lifecycle_bridge/translation.py src/forge/adapters/nats/approval_subscriber.py tests/forge/lifecycle_bridge/test_pause_resume.py tests/forge/test_pause_resume_publish.py -> 'All checks passed!' (re-run this turn). Coach verified AC-6 in turn 1.",
       "test_file": null,
       "implementation_files": [
         "src/forge/lifecycle_bridge/translation.py",
@@ -140,14 +145,14 @@
       "agent": "test-orchestrator",
       "status": "completed",
       "source": "orchestrator",
-      "duration_seconds": 110.89522695890628
+      "duration_seconds": 63.540447292034514
     },
     {
       "phase": "5",
       "agent": "code-reviewer",
       "status": "completed",
       "source": "orchestrator",
-      "duration_seconds": 250.0779665419832
+      "duration_seconds": 301.538793124957
     }
   ]
 }
