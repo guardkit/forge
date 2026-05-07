@@ -1,0 +1,7 @@
+{
+  "tests_run": 15,
+  "tests_failed": 0,
+  "coverage_pct": 60.0,
+  "output_summary": "15 passed, 0 failed in 0.18s; coverage 60% (pipeline_consumer 55%, build_ack_handle 89%) on changed modules",
+  "quality_gates_passed": true
+}

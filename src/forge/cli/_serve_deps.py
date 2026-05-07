@@ -93,6 +93,7 @@ from forge.cli._serve_deps_state_channel import build_autobuild_state_initialise
 from forge.config.models import ForgeConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
+from forge.pipeline.build_ack_handle import InFlightAckRegistry
 from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
     dispatch_autobuild_async,
@@ -375,6 +376,7 @@ def build_pipeline_consumer_deps(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
     async_task_starter: AsyncTaskStarter | None = None,
+    register_ack_handle: InFlightAckRegistry | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -491,10 +493,12 @@ def build_pipeline_consumer_deps(
         is_duplicate_terminal=is_duplicate_terminal,
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
+        register_ack_handle=register_ack_handle,
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "
-        "(async_task_starter=%s)",
+        "(async_task_starter=%s, ack_bridge=%s)",
         "wired" if async_task_starter is not None else "deferred (TASK-FW10-008)",
+        "wired" if register_ack_handle is not None else "deferred (TASK-FRR-PEB-002)",
     )
     return deps
