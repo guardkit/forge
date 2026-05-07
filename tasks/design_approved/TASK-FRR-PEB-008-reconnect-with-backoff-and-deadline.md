@@ -1,31 +1,31 @@
 ---
-id: TASK-FRR-PEB-008
-title: "Reconnect with exponential backoff + 300s per-build deadline timer"
-status: backlog
-created: 2026-05-06T00:00:00Z
-updated: 2026-05-06T00:00:00Z
-priority: high
-task_type: feature
-documentation_level: standard
-parent_task: TASK-FORGE-FRR-F010M
-parent_review: TASK-REV-F010M
-feature_id: FEAT-PEBR
-wave: 4
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
+created: 2026-05-06 00:00:00+00:00
 dependencies:
-  - TASK-FRR-PEB-007
+- TASK-FRR-PEB-007
+documentation_level: standard
+estimated_minutes: 90
+feature_id: FEAT-PEBR
+id: TASK-FRR-PEB-008
+implementation_mode: task-work
+parent_review: TASK-REV-F010M
+parent_task: TASK-FORGE-FRR-F010M
+priority: high
+status: design_approved
 tags:
-  - forge-serve
-  - autobuild-runner
-  - pipeline-lifecycle-emitter
-  - reconnect-backoff
-  - sla-deadline
+- forge-serve
+- autobuild-runner
+- pipeline-lifecycle-emitter
+- reconnect-backoff
+- sla-deadline
+task_type: feature
 test_results:
-  status: pending
   coverage: null
   last_run: null
+  status: pending
+title: Reconnect with exponential backoff + 300s per-build deadline timer
+updated: 2026-05-06 00:00:00+00:00
+wave: 4
 ---
 
 # Task: Reconnect with exponential backoff + 300s per-build deadline timer

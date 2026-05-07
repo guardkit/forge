@@ -1,0 +1,7 @@
+{
+  "tests_run": 172,
+  "tests_failed": 0,
+  "coverage_pct": 86.0,
+  "output_summary": "172 lifecycle_bridge tests passed in 2.28s; coverage 86% (reconnect.py 100%, bridge.py 92%); all quality gates green.",
+  "quality_gates_passed": true
+}

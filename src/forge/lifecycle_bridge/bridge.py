@@ -43,10 +43,11 @@ fails the test suite at lint time, before any runtime regression.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 from forge.lifecycle_bridge.version_check import check_langgraph_runner_version
 from forge.persistence.repositories.bridge_registry import (
@@ -61,10 +62,32 @@ __all__ = [
     "AckHandle",
     "BuildContext",
     "CancelResult",
+    "DEADLINE_SECONDS",
+    "DeadlineHandler",
     "LangGraphCancelClient",
     "LifecycleBridge",
     "RunsCancelClient",
 ]
+
+
+#: Per-build deadline (seconds). ASSUM-003: 300s. Once a build is
+#: attached, if no terminal envelope is observed within this budget the
+#: bridge invokes :data:`DeadlineHandler` so it can publish
+#: ``pipeline.build-failed`` with reason ``sidecar-unreachable``.
+#:
+#: Tests monkey-patch this to a small value (e.g. 1.0s) per
+#: TASK-FRR-PEB-008 AC-5 — the constant is read at attach() time so a
+#: ``monkeypatch.setattr`` is honoured for every subsequent attach.
+DEADLINE_SECONDS: float = 300.0
+
+
+#: ``async (build_context) -> None`` — called when the per-build
+#: deadline expires without a terminal envelope. Implementations are
+#: expected to publish ``pipeline.build-failed``, ack the inbound
+#: message handle, and detach the registry row (TASK-FRR-PEB-008 AC-3).
+#: Wired by :class:`forge.lifecycle_bridge.wireup.LifecycleBridgeWireup`
+#: in production; tests pass an :class:`unittest.mock.AsyncMock`.
+DeadlineHandler = Callable[["BuildContext"], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +241,8 @@ class LifecycleBridge:
         registry: BridgeRegistry,
         sidecar_url: str | None = None,
         sdk_client: LangGraphCancelClient | None = None,
+        deadline_handler: DeadlineHandler | None = None,
+        deadline_seconds: float | None = None,
     ) -> None:
         if not isinstance(registry, BridgeRegistry):
             raise TypeError(
@@ -248,6 +273,21 @@ class LifecycleBridge:
         # is already idempotent against repeat ``runs.cancel`` calls
         # against an already-interrupted run.
         self._cancel_in_flight: set[str] = set()
+        # TASK-FRR-PEB-008 AC-3: per-build deadline timer. The handler
+        # is invoked when the timer expires without a terminal envelope
+        # being observed; ``detach`` and ``shutdown`` cancel any live
+        # timer so a normal terminal does not race the deadline path.
+        # Optional — tests / T2-era callers that exercise attach/detach
+        # without an event loop construct the bridge without a handler
+        # and the timer is silently skipped.
+        self._deadline_handler: DeadlineHandler | None = deadline_handler
+        # ``deadline_seconds`` overrides the module-level
+        # :data:`DEADLINE_SECONDS` default. ``None`` means "read the
+        # module global at attach() time", which makes
+        # ``monkeypatch.setattr(bridge, "DEADLINE_SECONDS", 1.0)`` work
+        # without re-instantiating the bridge (AC-5).
+        self._deadline_seconds_override: float | None = deadline_seconds
+        self._deadline_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
     # Public API — attach
@@ -312,6 +352,128 @@ class LifecycleBridge:
             build_context.thread_id,
             build_context.run_id,
         )
+        # AC-3 (TASK-FRR-PEB-008): start the per-build deadline timer.
+        # Skipped when no handler is wired (T2/T3 test paths) or when
+        # there is no running event loop (synchronous unit tests).
+        self._start_deadline_timer(build_context)
+
+    # ------------------------------------------------------------------
+    # Internal — deadline timer  (TASK-FRR-PEB-008 AC-3)
+    # ------------------------------------------------------------------
+
+    def _start_deadline_timer(self, build_context: BuildContext) -> None:
+        """Spawn the per-build deadline asyncio task, if conditions allow.
+
+        The timer is only meaningful when (a) a deadline handler was
+        wired into the constructor and (b) ``attach()`` is called from
+        an async context. Outside those conditions the timer is a no-op
+        — :meth:`detach` and :meth:`shutdown` remain safe to call
+        either way.
+        """
+        if self._deadline_handler is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # ``attach()`` was invoked outside an event loop. The timer
+            # has no host to run on — log at DEBUG and move on. The
+            # production wireup always calls attach() inside an async
+            # context (register_ack_handle is ``async def``), so this
+            # branch only fires in unit tests of attach() in isolation.
+            logger.debug(
+                "lifecycle_bridge.deadline feature_id=%s no event loop; "
+                "skipping deadline timer",
+                build_context.feature_id,
+            )
+            return
+        seconds = self._resolve_deadline_seconds()
+        task = loop.create_task(
+            self._run_deadline_timer(build_context, seconds),
+            name=f"lifecycle-bridge-deadline-{build_context.feature_id}",
+        )
+        # Replace any previous timer (defensive — re-attach for the same
+        # feature_id should not stack timers). ``pop`` keeps the bridge
+        # AST guard happy: the registry-method names ``get`` /
+        # ``list_active`` MUST appear only on registry call sites.
+        previous = self._deadline_tasks.pop(build_context.feature_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._deadline_tasks[build_context.feature_id] = task
+
+    def _resolve_deadline_seconds(self) -> float:
+        """Return the active deadline budget (seconds).
+
+        Constructor override beats the module-level constant so callers
+        can pin a specific deadline per bridge instance; otherwise the
+        module global is read at call time so monkey-patches apply.
+        """
+        if self._deadline_seconds_override is not None:
+            return self._deadline_seconds_override
+        return DEADLINE_SECONDS
+
+    async def _run_deadline_timer(
+        self, build_context: BuildContext, seconds: float
+    ) -> None:
+        """Sleep ``seconds`` then invoke the deadline handler.
+
+        On normal terminal arrival :meth:`detach` cancels this task
+        and the ``CancelledError`` propagates without invoking the
+        handler — that is the load-bearing race-free contract. Any
+        exception raised by the handler is logged so it cannot crash
+        the daemon supervisor.
+        """
+        feature_id = build_context.feature_id
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            # detach() cancelled the timer — terminal envelope arrived
+            # in time. Drop the entry from book-keeping and propagate
+            # so the gather() in shutdown() unblocks.
+            self._deadline_tasks.pop(feature_id, None)
+            raise
+        # Past the sleep — no terminal observed within the budget.
+        handler = self._deadline_handler
+        if handler is None:  # pragma: no cover - guarded by attach()
+            self._deadline_tasks.pop(feature_id, None)
+            return
+        logger.warning(
+            "lifecycle_bridge.deadline feature_id=%s correlation_id=%s "
+            "expired after %.2fs; invoking deadline handler",
+            feature_id,
+            build_context.correlation_id,
+            seconds,
+        )
+        try:
+            await handler(build_context)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The handler is responsible for the publish + ack + detach
+            # sequence. Any failure inside it is logged but must not
+            # propagate to the supervisor — the JetStream redelivery
+            # path will retry on the next boot.
+            logger.exception(
+                "lifecycle_bridge.deadline feature_id=%s deadline_handler "
+                "raised; supervisor proceeding",
+                feature_id,
+            )
+        finally:
+            self._deadline_tasks.pop(feature_id, None)
+
+    def cancel_deadline(self, feature_id: str) -> bool:
+        """Cancel the deadline timer for ``feature_id`` if one is live.
+
+        Returns ``True`` if a live timer was cancelled, ``False`` if no
+        timer was present (already terminal, never started, or already
+        fired). Exposed so the wireup can stop the timer the moment a
+        terminal envelope is observed — independently of detach(), which
+        also clears the registry row.
+        """
+        task = self._deadline_tasks.pop(feature_id, None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     # ------------------------------------------------------------------
     # Public API — detach
@@ -348,6 +510,12 @@ class LifecycleBridge:
         # Clear cancel-in-flight tracking so a future re-attach of the
         # same feature_id is not treated as still-being-cancelled.
         self._cancel_in_flight.discard(feature_id)
+        # AC-3 (TASK-FRR-PEB-008): detach is the canonical "terminal
+        # observed" signal. Cancel the deadline timer so it does not
+        # race the terminal envelope and double-publish.
+        deadline_task = self._deadline_tasks.pop(feature_id, None)
+        if deadline_task is not None and not deadline_task.done():
+            deadline_task.cancel()
         logger.info(
             "lifecycle_bridge.detach feature_id=%s correlation_id=%s",
             feature_id,
@@ -560,6 +728,13 @@ class LifecycleBridge:
         in_flight = len(self._attached)
         self._attached.clear()
         self._cancel_in_flight.clear()
+        # Cancel every live deadline timer so daemon shutdown does not
+        # leave dangling asyncio tasks. The wireup's gather() catches
+        # the CancelledError per-task.
+        for task in list(self._deadline_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._deadline_tasks.clear()
         logger.info(
             "lifecycle_bridge.shutdown drained_in_memory_attachments=%d",
             in_flight,
