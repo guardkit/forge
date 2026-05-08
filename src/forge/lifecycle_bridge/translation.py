@@ -360,10 +360,13 @@ class StreamEventTranslator:
 
         event_name = getattr(stream_part, "event", None)
         if event_name != VALUES_STREAM_EVENT:
-            # Unknown / unhandled event — DEBUG so a langgraph-api
-            # minor bump that adds a new event type does not flood
-            # WARNING (AC-2).
-            logger.debug(
+            # FOLLOWUP-B trace: temporary INFO (was DEBUG) so the
+            # forge-prod log captures whether non-values events are
+            # arriving and being silently dropped. Revert to DEBUG on
+            # AC-5 cleanup. (Original comment: AC-2 — DEBUG so a
+            # langgraph-api minor bump that adds a new event type does
+            # not flood WARNING.)
+            logger.info(
                 "translation: ignoring StreamPart event=%r (only %r is "
                 "actioned by this translator)",
                 event_name,
