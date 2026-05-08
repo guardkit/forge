@@ -33,16 +33,38 @@ ac_status:
   AC-8: done    # TestLifecycleBridgeWireupComposition class with 2 seam tests
   AC-9: done    # existing tests pass (test_cli_serve_production fixture upgrade was required and is documented)
   AC-10: done   # ruff check + black --check both clean on touched files
-  AC-11: partially-unblocked  # 2026-05-08T12:30Z — FOLLOWUP-A landed (code in working tree, completion archived to tasks/completed/forge-autobuild-runner-pipeline-emitter-bridge/); remaining gate is operator runbook re-run against the rebuilt image
+  AC-11: partially-unblocked  # 2026-05-08T14:16Z — FOLLOWUP-A live in production (commit 55f7804) and runbook re-run confirmed migration applies cleanly (0 no-such-table warnings across 12 dispatches). Remaining gate: no pipeline.build-started.FEAT-* envelope captured on the wire (FOLLOWUP-B is the active translator-shape mismatch gap).
 ac_11_blocked_on:
-  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B   # post-FOLLOWUP-A: bridge attaches, SSE GET 200, but translator stays silent — 90-min spike to differentiate Path 1 (placeholder thread_id rebind) vs Path 2 (translator shape mismatch). NOTE: per ac_11_promotion_gate, FOLLOWUP-B is NOT hard-blocking for promotion; runbook gate is.
+  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B   # 2026-05-08T14:16Z runbook narrowed surface to Path 2 (translator-shape mismatch on deepagents event='values' parts; parts_received=30, event_types={'values'} during cycle 1). Path 1 (SSE unreachability / placeholder thread_id rebind) eliminated — autobuild_runner IS streaming state updates. NOTE: per ac_11_promotion_gate, FOLLOWUP-B is NOT hard-blocking for promotion; the runbook envelope-on-wire gate is.
 ac_11_resolved:
-  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A   # 2026-05-08T12:30Z — landed via /task-work → /task-complete (light intensity). Single-line wireup at _serve_production.py Step 3.5b + regression test in TestLifecycleBridgeWireupComposition (sqlite_master assertion on both bridge tables). Reverse-test confirmed FAIL→PASS. Code uncommitted in working tree at this update; commit pending.
-ac_11_runbook_revalidation_doc: docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-post-pebr-wireup.md
+  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A   # 2026-05-08T12:30Z code via /task-work → /task-complete (light intensity); committed 2026-05-08T~12:50Z as 55f7804; AC-5 (operator handoff) satisfied 2026-05-08T14:16Z via outcome-(b) clause when post-rebuild runbook re-run confirmed the migration applies cleanly with no fallback to legacy ack_callback.
+ac_11_runbook_revalidation_doc: docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-fresh-followup-b-instrumented.md
+ac_11_runbook_revalidation_outcome:
+  ran_at: 2026-05-08T14:16:00Z
+  correlation_id: 1506e6c4-cc6a-4591-8dc0-d9258b231b11
+  forge_image_head: 1b82236+55f7804  # parent fix HEAD plus FOLLOWUP-A commit; rebuilt and redeployed before this run
+  followup_a_validation: passed       # 0 no-such-table warnings across 12 dispatches
+  consumer_state:
+    delivered: 12
+    ack_floor: 0       # canonical AC-11 fail fingerprint — no envelope on wire → consumer never advances
+    redelivered: 1
+  outbound_envelopes_observed: 0
+  followup_b_surface_narrowed_to: |
+    Path 2 (translator-shape mismatch) confirmed active. Path 1
+    (SSE unreachability / placeholder thread_id rebind) eliminated
+    by parts_received=30, event_types={'values'} on cycle 1: the
+    autobuild_runner IS streaming state updates; the bridge
+    translator does not recognise deepagents' event='values' parts
+    as stage transitions.
+  side_observation: |
+    Deadline path is gated on stream unreachability, not silence
+    — 5-min observer deadline passed without build-failed envelope
+    emit. Worth filing as a separate concern if silence-triggered
+    timeouts were expected.
 ac_11_promotion_gate: |
   This task remains in tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/ (NOT promoted to tasks/completed/) until at minimum FOLLOWUP-A lands and Phase 7 of the runbook captures a real pipeline.build-started.FEAT-* envelope on the wire. FOLLOWUP-B may land post-hoc if its spike escalates to a wider scope, but FOLLOWUP-A is hard-blocking. FOLLOWUP-C is independent of this gate.
 
-  Status 2026-05-08T12:30Z: FOLLOWUP-A complete. Remaining gate is the runbook re-run — capture results in the doc named under ac_11_runbook_revalidation_doc and switch AC-11 to 'done' before promoting this file to completed/.
+  Status 2026-05-08T14:16Z: FOLLOWUP-A complete and validated live in production (zero migration-drift warnings, bridge attaches cleanly). Runbook re-run did NOT capture a pipeline.build-started.FEAT-* envelope on the wire (the canonical envelope-on-wire gate). FOLLOWUP-B (translator-shape mismatch on deepagents event='values' parts) is the active gap. Promotion to completed/ remains blocked on the runbook capturing the build-started envelope; this happens after FOLLOWUP-B lands and the runbook is re-run a third time.
 code_review:
   verdict: APPROVED
   critical_findings: 0

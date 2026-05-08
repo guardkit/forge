@@ -3,11 +3,14 @@ id: TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A
 title: Apply lifecycle_bridge_registry migration in bind_production_serve Step 3.5b
 status: completed
 created: 2026-05-08T11:30:00Z
-updated: 2026-05-08T12:30:00Z
+updated: 2026-05-08T14:30:00Z
 completed: 2026-05-08T12:30:00Z
+ac_5_satisfied_at: 2026-05-08T14:16:00Z
 previous_state: in_review
-state_transition_reason: All code-track ACs satisfied (AC-1, AC-2, AC-4); AC-3 SKIPPED-optional; AC-5 deferred to post-merge operator runbook re-run (matches parent task pattern)
+state_transition_reason: All code-track ACs satisfied (AC-1, AC-2, AC-4); AC-3 SKIPPED-optional; AC-5 satisfied via outcome (b) on 2026-05-08T14:16Z — runbook revalidation confirmed FOLLOWUP-A live (0 migration-drift warnings across 12 dispatches), FOLLOWUP-B confirmed as next gap with surface narrowed to translator shape mismatch on deepagents event='values' parts.
 completed_location: tasks/completed/forge-autobuild-runner-pipeline-emitter-bridge/
+runbook_revalidation_doc: docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-fresh-followup-b-instrumented.md
+runbook_revalidation_correlation_id: 1506e6c4-cc6a-4591-8dc0-d9258b231b11
 priority: high
 task_type: fix
 parent_review: TASK-REV-PEBR-004
@@ -81,11 +84,11 @@ The migration source [src/forge/persistence/migrations/lifecycle_bridge_registry
 
 - [x] **AC-4** — **Lint + format clean** on touched files (`ruff check`, `black --check`).
 
-- [ ] **AC-5** *(deferred to operator post-merge — matches parent task pattern; resolves once image rebuilt and runbook re-run)* — **Runbook re-validation handoff.** After this task lands and is built into a forge image, an operator re-runs Phase 7 of `RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md` and captures:
-  - The `register_ack_handle raised (no such table: lifecycle_bridge_registry)` line is **gone** from forge logs;
-  - JetStream `ack_floor` advances past the inbound (`>=12`);
-  - Either: (a) a real `pipeline.build-started.FEAT-*` envelope appears on the wire (FOLLOWUP-B is also resolved or never applied), OR (b) the bridge attaches but the translator is still silent (FOLLOWUP-B is the active gap).
-  - Outcome captured in a new `RESULTS-…-post-followup-A.md` runbook results doc; this AC is satisfied when **either** (a) is observed (FOLLOWUP-B vacuous) **or** (b) is observed and FOLLOWUP-B is confirmed as the next gap.
+- [x] **AC-5** *(satisfied via outcome (b) on 2026-05-08T14:16Z — bridge attached, FOLLOWUP-B confirmed as active gap)* — **Runbook re-validation handoff.** After this task lands and is built into a forge image, an operator re-runs Phase 7 of `RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md` and captures:
+  - ✅ The `register_ack_handle raised (no such table: lifecycle_bridge_registry)` line is **gone** from forge logs (0 occurrences across 12 dispatches);
+  - ⚠️ JetStream `ack_floor` did NOT advance — final state delivered=12, ack_floor=0, redelivered=1 (canonical AC-11 fail fingerprint, expected since FOLLOWUP-B is unresolved);
+  - **Outcome (b) observed**: bridge attached cleanly (no fallback to legacy ack_callback), but the translator is still silent. FOLLOWUP-B is the active gap. New instrumentation narrowed FOLLOWUP-B to Path 2 (translator-shape mismatch on deepagents `event='values'` parts; parts_received=30, event_types={'values'} during cycle 1 — eliminates Path 1 / SSE unreachability).
+  - Outcome captured in `docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-fresh-followup-b-instrumented.md`. This AC is satisfied per the outcome-(b) clause: bridge attaches and FOLLOWUP-B is confirmed as the next gap.
 
 ## Implementation Notes
 
@@ -127,9 +130,24 @@ Completed via `/task-work` (light intensity) → `/task-complete` on 2026-05-08,
 - Reverse-test: temporary revert of the source edit reproduces the failure (`'lifecycle_bridge_registry' not in {builds, lifecycle_bridge_terminal_publishes, schema_version, sqlite_sequence, stage_log}`); restoring the edit returns to green. Regression-protection seam is genuine.
 - Lint: `ruff check` clean, `black --check` clean.
 
-### AC-5 handoff (deferred)
+### AC-5 handoff — satisfied 2026-05-08T14:16Z (outcome b)
 
-Post-merge operator action remains required to satisfy AC-5: re-run Phase 7 of `RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md` against the rebuilt image and capture results in `RESULTS-…-post-followup-A.md`. Outcome decides whether `TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B` (silent translator spike) is the active gap or vacuous.
+Operator re-ran Phase 7 of `RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md` against rebuilt image (forge-prod healthy on fresh boot). Results in [`docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-fresh-followup-b-instrumented.md`](../../../docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-fresh-followup-b-instrumented.md).
+
+FOLLOWUP-A confirmed live in production:
+
+- ✅ 0 `no such table: lifecycle_bridge_registry` warnings across 12 dispatches.
+- ✅ Bridge attached cleanly — no fallback to legacy `ack_callback` redelivery-storm path.
+- ⚠️ Final consumer state: `delivered=12, ack_floor=0, redelivered=1` — canonical AC-11 fail fingerprint, expected since FOLLOWUP-B is the active gap.
+
+**Outcome (b)** per AC-5's text: bridge attaches but translator stays silent → FOLLOWUP-B is the next gap. New instrumentation evidence (cycle 1: `parts_received=30, event_types={'values'}`) narrows FOLLOWUP-B's surface materially:
+
+- ❌ Path 1 (placeholder thread_id rebind / SSE unreachability) — **eliminated**. The autobuild_runner IS streaming state updates.
+- ✅ Path 2 (translator-shape mismatch) — **confirmed active**. The bridge translator does not recognize deepagents' `event='values'` parts as stage transitions.
+
+Side observation worth filing if expected: the deadline path is gated on stream **unreachability**, not silence — 5-min observer deadline passed without `build-failed` envelope emit.
+
+Wire-tap correlation_id (this run): `1506e6c4-cc6a-4591-8dc0-d9258b231b11`.
 
 ### Plan-audit notes (light = ±50% variance)
 
