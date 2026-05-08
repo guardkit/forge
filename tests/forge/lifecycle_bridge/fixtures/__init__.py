@@ -7,6 +7,17 @@ relative to ``__file__``. The canonical fixture
 paths for the AutobuildState lifecycle — see the contract test module
 for the full schema.
 
+The ``sse_stream_deepagents_runner.jsonl`` fixture
+(TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX, AC-2) records the same
+lifecycle progression but with the production-shape values projection:
+``data`` carries top-level ``messages`` / ``todos`` / ``files`` channels
+alongside the ``async_tasks`` channel that
+:class:`forge.subagents.autobuild_runner.AutobuildRunnerState`
+exposes. This is the shape a real ``forge serve`` daemon will surface
+once the FOLLOWUP-B-FIX runner reaches production; the contract test
+guarantees the translator continues to recognise the snapshot under
+the additional channels.
+
 When the ``langgraph-api`` minor version is bumped (per AC-5 of
 TASK-FRR-PEB-003), the fixture MUST be re-recorded against the new
 sidecar — silent SSE-shape drift is the Option C risk this contract
@@ -18,5 +29,8 @@ from __future__ import annotations
 from pathlib import Path
 
 CANONICAL_FIXTURE: Path = Path(__file__).parent / "sse_stream_canonical.jsonl"
+DEEPAGENTS_RUNNER_FIXTURE: Path = (
+    Path(__file__).parent / "sse_stream_deepagents_runner.jsonl"
+)
 
-__all__ = ["CANONICAL_FIXTURE"]
+__all__ = ["CANONICAL_FIXTURE", "DEEPAGENTS_RUNNER_FIXTURE"]

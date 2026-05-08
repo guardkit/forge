@@ -564,14 +564,6 @@ class LifecycleBridgeWireup:
         try:
             identity = await self._wait_for_identity(feature_id)
             thread_id, run_id = identity if identity is not None else (None, None)
-            # FOLLOWUP-B trace: identity resolution outcome (TEMP — AC-5 cleanup).
-            logger.info(
-                "wireup._observer_loop: identity resolved feature_id=%s "
-                "thread_id=%s run_id=%s",
-                feature_id,
-                thread_id,
-                run_id,
-            )
 
             # AC-2 / AC-4 (TASK-FRR-PEB-008): wrap the SSE iteration
             # in a reconnect loop driven by :class:`ReconnectPolicy`.
@@ -768,15 +760,6 @@ class LifecycleBridgeWireup:
         correlation_id = context.correlation_id
         terminal_seen = False
         first_event_observed = False
-        # FOLLOWUP-B trace: stream session opened (TEMP — AC-5 cleanup).
-        logger.info(
-            "wireup._drive_stream_session: stream session open "
-            "feature_id=%s correlation_id=%s",
-            feature_id,
-            correlation_id,
-        )
-        parts_received = 0
-        event_types_seen: dict[str, int] = {}
         async for stream_part in stream_iter:
             # AC-1: a successful event yield resets the backoff so a
             # later transient failure starts again from
@@ -784,26 +767,6 @@ class LifecycleBridgeWireup:
             if not first_event_observed:
                 policy.reset()
                 first_event_observed = True
-            # FOLLOWUP-B trace: per-part observation (TEMP — AC-5 cleanup).
-            parts_received += 1
-            _event_name = getattr(stream_part, "event", None)
-            event_types_seen[str(_event_name)] = (
-                event_types_seen.get(str(_event_name), 0) + 1
-            )
-            _data = getattr(stream_part, "data", None)
-            _data_keys = (
-                sorted(list(_data.keys()))
-                if hasattr(_data, "keys")
-                else type(_data).__name__
-            )
-            logger.info(
-                "wireup._drive_stream_session: stream_part received "
-                "feature_id=%s n=%d event=%r data_keys=%s",
-                feature_id,
-                parts_received,
-                _event_name,
-                _data_keys,
-            )
             try:
                 event = self._translator.translate(stream_part, context)
             except Exception as exc:  # noqa: BLE001
@@ -849,17 +812,6 @@ class LifecycleBridgeWireup:
                     type(event).__name__,
                 )
                 return (False, False)
-        # FOLLOWUP-B trace: stream exhausted via StopAsyncIteration
-        # (TEMP — AC-5 cleanup).
-        logger.info(
-            "wireup._drive_stream_session: stream exhausted "
-            "feature_id=%s parts_received=%d event_types=%s "
-            "terminal_seen=%s",
-            feature_id,
-            parts_received,
-            event_types_seen,
-            terminal_seen,
-        )
         return (terminal_seen, True)
 
     # ------------------------------------------------------------------

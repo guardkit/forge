@@ -51,7 +51,9 @@ from forge.subagents.autobuild_runner import (
     StateChannelWriter,
     SubagentEmitter,
     WorktreeConfinementError,
+    _async_tasks_reducer,
     _build_runner_graph,
+    _extract_launch_payload,
     _update_state,
     assert_within_worktree,
     graph,
@@ -559,54 +561,241 @@ def test_pipeline_lifecycle_emitter_threaded_through_context() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC-5: model spec is the local llama-swap workhorse (TASK-FORGE-FRR-F010L)
+# Graph construction (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX)
 # ---------------------------------------------------------------------------
+#
+# The previous test class ``TestRunnerModelSpec`` (TASK-FORGE-FRR-F010L)
+# locked the ``create_deep_agent(model=...)`` retarget to the local
+# llama-swap workhorse. FOLLOWUP-B-FIX retired the
+# ``create_deep_agent``-based graph in favour of a purpose-shaped
+# :class:`langgraph.graph.StateGraph` carrying the DDR-006
+# ``async_tasks`` channel — see :class:`AutobuildRunnerState` and
+# :func:`_build_runner_graph` for the contract.
+#
+# The replacement test class below locks the new graph shape:
+#
+# 1. The compiled graph carries the four lifecycle nodes the bridge
+#    translator depends on (``starting`` / ``planning_waves`` /
+#    ``running_wave`` / ``completed``).
+# 2. The state schema exposes both ``messages`` (preserves the
+#    AsyncSubAgentMiddleware launch contract) and ``async_tasks`` (the
+#    DDR-006 channel the SSE values projection now surfaces).
+# 3. End-to-end invocation populates ``async_tasks[feature_id]`` with a
+#    ``completed`` snapshot — i.e. the lifecycle progresses without an
+#    LLM call (placeholder bodies, by design — see
+#    TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX scope).
+#
+# When richer node bodies are wired in (follow-up after this fix), a
+# new regression guard locking the LLM model spec can be reintroduced —
+# the model-spec retarget rationale (ADR-ARCH-001 — no Anthropic
+# Cloud) still applies for any future LLM call inside the runner.
 
 
-class TestRunnerModelSpec:
-    """``_build_runner_graph`` calls ``create_deep_agent`` with the local
-    workhorse model — not Anthropic Claude (TASK-FORGE-FRR-F010L).
+class TestRunnerGraphConstruction:
+    """Graph construction contract post-FOLLOWUP-B-FIX.
 
-    The retarget closes the
-    ``Could not resolve authentication method`` TypeError observed in the
-    2026-05-04 first-real-run rerun (RESULTS Addendum 5): the
-    autobuild_runner's first node was calling Anthropic Claude in a
-    sidecar with no ``ANTHROPIC_API_KEY``. Per ADR-ARCH-001 (local-only
-    inference) the model now resolves to llama-swap's
-    ``qwen36-workhorse`` via the OpenAI-compatible binding — exactly the
-    role RUNBOOK-v3 Phase 5.2 designates for AutoBuild Player/Coach.
+    Replaces the obsolete ``TestRunnerModelSpec`` class. Locks the
+    StateGraph topology + state schema that the bridge translator
+    depends on for AC-3 (real ``pipeline.build-started.*`` envelopes
+    on the wire) and AC-2 (translator finds the snapshot under
+    ``async_tasks``).
     """
 
-    def test_build_runner_graph_uses_local_workhorse_model_spec(self) -> None:
-        """``_build_runner_graph`` passes ``model="openai:qwen36-workhorse"``."""
-        fake_graph = MagicMock(name="fake_compiled_graph")
-        with patch("deepagents.create_deep_agent", return_value=fake_graph) as m:
-            result = _build_runner_graph()
+    def test_build_runner_graph_returns_compiled_state_graph(self) -> None:
+        """``_build_runner_graph`` returns a real CompiledStateGraph."""
+        from langgraph.graph.state import CompiledStateGraph
 
-        assert result is fake_graph
-        m.assert_called_once()
-        kwargs = m.call_args.kwargs
-        assert kwargs["model"] == "openai:qwen36-workhorse", (
-            "autobuild_runner must resolve to the local llama-swap "
-            "workhorse, not Anthropic Cloud — see ADR-ARCH-001 and "
-            "TASK-FORGE-FRR-F010L. Got: " + repr(kwargs.get("model"))
+        result = _build_runner_graph()
+        assert isinstance(result, CompiledStateGraph), (
+            "post-FOLLOWUP-B-FIX runner graph must compile to a "
+            "CompiledStateGraph so AsyncSubAgentMiddleware can resolve "
+            "graph_id='autobuild_runner'. Got: " + type(result).__name__
         )
-        # Sanity-check the rest of the kwargs are unchanged from the
-        # original wiring so this test catches accidental drift.
-        assert kwargs["tools"] == []
-        assert kwargs["name"] == AUTOBUILD_RUNNER_NAME
-        assert "system_prompt" in kwargs and kwargs["system_prompt"]
 
-    def test_build_runner_graph_does_not_target_anthropic(self) -> None:
-        """Regression guard: the model spec must not regress to Anthropic."""
-        with patch("deepagents.create_deep_agent", return_value=MagicMock()) as m:
-            _build_runner_graph()
+    def test_build_runner_graph_exposes_lifecycle_node_names(self) -> None:
+        """Graph topology carries the four lifecycle nodes (AC-2 contract)."""
+        graph = _build_runner_graph()
+        nodes = set(graph.get_graph().nodes.keys())
+        for required in ("starting", "planning_waves", "running_wave", "completed"):
+            assert required in nodes, (
+                f"runner graph missing required lifecycle node {required!r}; "
+                "the bridge translator depends on the values projection "
+                "carrying these transitions in order. Found: "
+                f"{sorted(nodes)!r}"
+            )
 
-        kwargs = m.call_args.kwargs
-        model_spec = kwargs.get("model", "")
-        assert not model_spec.startswith("anthropic:"), (
-            "autobuild_runner regressed to an Anthropic model spec — this "
-            "would re-introduce the 'Could not resolve authentication "
-            "method' TypeError observed in the 2026-05-04 first-real-run "
-            "rerun (RESULTS Addendum 5). Got: " + repr(model_spec)
+    def test_runner_graph_invocation_populates_async_tasks(self) -> None:
+        """End-to-end: invoke the graph and assert ``async_tasks`` is populated.
+
+        The translator needs ``async_tasks[feature_id]`` to surface the
+        AutobuildState snapshot. This test exercises the full graph
+        without an LLM (placeholder bodies, by design) and asserts the
+        terminal snapshot lands on the channel with the correct
+        identifiers threaded from the launch description.
+        """
+        from langchain_core.messages import HumanMessage
+
+        graph = _build_runner_graph()
+        description = (
+            'RUN_AUTOBUILD subagent=autobuild_runner '
+            'payload={"build_id": "build-FEAT-Z-1", '
+            '"feature_id": "FEAT-Z", '
+            '"correlation_id": "corr-Z", '
+            '"wave_total": 2, "task_total": 3}'
         )
+        result = graph.invoke({"messages": [HumanMessage(content=description)]})
+
+        assert "async_tasks" in result, (
+            "runner graph terminal state must include async_tasks; "
+            "without it the bridge translator's _extract_state returns "
+            "None for every part on the wire. Got keys: "
+            f"{sorted(result.keys())!r}"
+        )
+        snap = result["async_tasks"].get("FEAT-Z")
+        assert snap is not None, (
+            "async_tasks must be keyed by feature_id with a snapshot dict; "
+            f"got {result['async_tasks']!r}"
+        )
+        assert snap["lifecycle"] == "completed"
+        assert snap["build_id"] == "build-FEAT-Z-1"
+        assert snap["feature_id"] == "FEAT-Z"
+        assert snap["correlation_id"] == "corr-Z"
+
+    def test_runner_graph_values_stream_surfaces_each_lifecycle(self) -> None:
+        """``stream_mode='values'`` surfaces every lifecycle transition.
+
+        AC-2 closes only if the bridge translator (which consumes
+        ``stream_mode='values'``) sees ``starting`` / ``planning_waves``
+        / ``running_wave`` / ``completed`` in order. This test invokes
+        the values stream and asserts each transition lands as a
+        distinct projection.
+        """
+        from langchain_core.messages import HumanMessage
+
+        graph = _build_runner_graph()
+        description = (
+            'RUN_AUTOBUILD subagent=autobuild_runner '
+            'payload={"build_id": "build-FEAT-Y-1", '
+            '"feature_id": "FEAT-Y", '
+            '"correlation_id": "corr-Y"}'
+        )
+        lifecycles_seen: list[str] = []
+        for chunk in graph.stream(
+            {"messages": [HumanMessage(content=description)]},
+            stream_mode="values",
+        ):
+            ats = chunk.get("async_tasks") if isinstance(chunk, dict) else None
+            if not ats:
+                continue
+            snap = ats.get("FEAT-Y")
+            if snap and snap.get("lifecycle") not in lifecycles_seen:
+                lifecycles_seen.append(snap.get("lifecycle"))
+
+        assert lifecycles_seen == [
+            "starting",
+            "planning_waves",
+            "running_wave",
+            "completed",
+        ], (
+            "values stream must surface every lifecycle in order; "
+            f"got {lifecycles_seen!r}"
+        )
+
+
+class TestLaunchPayloadParser:
+    """Defensive-path coverage for ``_extract_launch_payload``.
+
+    The runner nodes call this helper at every boundary; if it raises
+    on a malformed launch description, the LangGraph thread crashes
+    and the daemon loses an in-flight autobuild. The defensive paths
+    below MUST always return ``{}`` rather than raise.
+    """
+
+    def test_empty_messages_returns_empty(self) -> None:
+        assert _extract_launch_payload([]) == {}
+
+    def test_message_without_string_content_returns_empty(self) -> None:
+        """A message whose ``content`` is neither str nor a dict yields ``{}``."""
+
+        class _NotAMessage:
+            content = 12345  # not a string, not a Mapping
+
+        assert _extract_launch_payload([_NotAMessage()]) == {}
+
+    def test_dict_message_with_content_extracts_payload(self) -> None:
+        """Dict-shaped first messages are also accepted (langgraph variant)."""
+        msg = {
+            "role": "user",
+            "content": (
+                'RUN_AUTOBUILD subagent=autobuild_runner '
+                'payload={"feature_id": "FEAT-X", "build_id": "b-1", '
+                '"correlation_id": "c-1"}'
+            ),
+        }
+        payload = _extract_launch_payload([msg])
+        assert payload["feature_id"] == "FEAT-X"
+        assert payload["build_id"] == "b-1"
+
+    def test_content_without_payload_marker_returns_empty(self) -> None:
+        """Content lacking the ``payload=...`` marker is a benign no-op."""
+
+        class _PlainMsg:
+            content = "Hello world — no RUN_AUTOBUILD prefix here."
+
+        assert _extract_launch_payload([_PlainMsg()]) == {}
+
+    def test_malformed_json_payload_returns_empty(self) -> None:
+        """A JSONDecodeError is logged at WARNING and yields ``{}``."""
+
+        class _BrokenMsg:
+            content = "RUN_AUTOBUILD subagent=autobuild_runner payload={not valid json}"
+
+        assert _extract_launch_payload([_BrokenMsg()]) == {}
+
+    def test_non_dict_json_payload_returns_empty(self) -> None:
+        """A JSON value that parses to a list (not dict) yields ``{}``."""
+
+        class _ListMsg:
+            content = 'RUN_AUTOBUILD subagent=autobuild_runner payload=["a","b"]'
+
+        assert _extract_launch_payload([_ListMsg()]) == {}
+
+
+class TestAsyncTasksReducer:
+    """``_async_tasks_reducer`` keeps multi-build state isolated per feature_id.
+
+    The reducer is the load-bearing piece behind the
+    ``async_tasks`` channel — without these properties a forge daemon
+    running multiple builds in parallel would clobber siblings on
+    every transition.
+    """
+
+    def test_none_inputs_yield_empty_dict(self) -> None:
+        assert _async_tasks_reducer(None, None) == {}
+
+    def test_none_update_preserves_current(self) -> None:
+        current = {"FEAT-X": {"feature_id": "FEAT-X", "lifecycle": "starting"}}
+        result = _async_tasks_reducer(current, None)
+        assert result == current
+        # Result is a fresh dict — caller can mutate without aliasing.
+        assert result is not current
+
+    def test_update_overwrites_only_named_feature(self) -> None:
+        """Last-write-wins per ``feature_id``, no sibling clobber."""
+        current = {
+            "FEAT-X": {"feature_id": "FEAT-X", "lifecycle": "starting"},
+            "FEAT-Y": {"feature_id": "FEAT-Y", "lifecycle": "running_wave"},
+        }
+        update = {"FEAT-X": {"feature_id": "FEAT-X", "lifecycle": "completed"}}
+        result = _async_tasks_reducer(current, update)
+        assert result["FEAT-X"]["lifecycle"] == "completed"
+        # FEAT-Y untouched — multi-build isolation property.
+        assert result["FEAT-Y"]["lifecycle"] == "running_wave"
+
+    def test_non_mapping_snapshot_in_update_is_skipped(self) -> None:
+        """Defensive: a malformed snapshot does not corrupt the channel."""
+        current = {"FEAT-X": {"lifecycle": "starting"}}
+        # A node that returns a non-dict snapshot for FEAT-X is treated
+        # as a no-op for that key (the existing entry is preserved).
+        result = _async_tasks_reducer(current, {"FEAT-X": "not-a-dict"})  # type: ignore[arg-type]
+        assert result == current

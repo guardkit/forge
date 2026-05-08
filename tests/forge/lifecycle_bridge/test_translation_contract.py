@@ -46,7 +46,10 @@ from forge.lifecycle_bridge.translation import (
     StreamEventTranslator,
 )
 
-from tests.forge.lifecycle_bridge.fixtures import CANONICAL_FIXTURE
+from tests.forge.lifecycle_bridge.fixtures import (
+    CANONICAL_FIXTURE,
+    DEEPAGENTS_RUNNER_FIXTURE,
+)
 
 
 _ENVELOPE_BY_NAME: dict[str, type] = {
@@ -57,10 +60,17 @@ _ENVELOPE_BY_NAME: dict[str, type] = {
 }
 
 
-def _load_fixture() -> list[dict]:
-    """Load the JSONL fixture as a list of dicts (one per line)."""
+def _load_fixture(path=CANONICAL_FIXTURE) -> list[dict]:
+    """Load a JSONL fixture as a list of dicts (one per line).
+
+    Defaults to :data:`CANONICAL_FIXTURE` so existing test classes
+    that pre-date the deepagents-runner fixture continue to read the
+    canonical (DDR-006-shape) lines unchanged. Pass
+    :data:`DEEPAGENTS_RUNNER_FIXTURE` for the production-shape lines
+    (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX, AC-2).
+    """
     lines: list[dict] = []
-    text = CANONICAL_FIXTURE.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
     for raw in text.splitlines():
         if not raw.strip():
             continue
@@ -240,3 +250,153 @@ class TestSchemaContract:
         # correlation_id is non-empty.
         cid = getattr(found, "correlation_id", None)
         assert isinstance(cid, str) and cid
+
+
+# ---------------------------------------------------------------------------
+# AC-2 (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX):
+# deepagents-runner-shape contract — values projection carries the
+# ``async_tasks`` channel alongside ``messages`` / ``todos`` / ``files``.
+# ---------------------------------------------------------------------------
+
+
+class TestDeepagentsRunnerShape:
+    """Verify the translator handles the production runner shape.
+
+    The post-fix autobuild_runner graph (see
+    :class:`forge.subagents.autobuild_runner.AutobuildRunnerState`) emits
+    a values projection whose top-level keys include ``messages``,
+    ``todos``, ``files``, **and** ``async_tasks``. The translator's
+    :func:`forge.lifecycle_bridge.translation._extract_state` looks up
+    the snapshot via ``data["async_tasks"][feature_id]`` — extra
+    siblings on ``data`` (the deepagents framework channels) MUST NOT
+    cause the lookup to miss.
+
+    These tests are the contract lock for AC-2 of
+    TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX. They read from
+    ``sse_stream_deepagents_runner.jsonl``, which records the same
+    success / failure progressions as ``sse_stream_canonical.jsonl``
+    but with the production shape on every line. If a future
+    langgraph-api / deepagents bump silently changes the shape such
+    that ``async_tasks`` moves under a different key (or disappears
+    from the values projection altogether), this test class fails
+    loudly and the FOLLOWUP-B-FIX runner needs to be re-shaped against
+    the new contract.
+    """
+
+    def test_extract_state_finds_snapshot_under_deepagents_channels(self) -> None:
+        """``_extract_state`` returns a non-None snapshot for the production shape.
+
+        This is the single regression test that exists *because* the
+        FOLLOWUP-B spike showed `_extract_state` returning ``None`` for
+        every part on the wire — the very failure mode this fix
+        closes. It directly imports the private helper to assert the
+        shape contract independent of the dispatch / payload-construction
+        paths exercised by the broader round-trip tests below.
+        """
+        from forge.lifecycle_bridge.translation import _extract_state
+
+        records = _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
+        # First non-metadata, non-pre-state record carrying async_tasks.
+        first_with_state = next(
+            r for r in records
+            if r.get("event") == "values"
+            and isinstance(r.get("data"), dict)
+            and "async_tasks" in r["data"]
+        )
+        snap = _extract_state(first_with_state["data"], "FEAT-DA-OK")
+        assert snap is not None, (
+            "translator's _extract_state returned None for a "
+            "deepagents-shaped values projection — this is the "
+            "FOLLOWUP-B regression. Shape on disk: "
+            f"{sorted(first_with_state['data'].keys())!r}"
+        )
+        assert snap.feature_id == "FEAT-DA-OK"
+        assert snap.lifecycle == "starting"
+
+    def test_pre_state_record_returns_none(self) -> None:
+        """Pre-state ``messages`` / ``todos`` / ``files`` parts emit None.
+
+        Before the runner writes its first ``async_tasks`` snapshot,
+        the deepagents framework can emit ``event="values"`` parts
+        whose only top-level keys are ``messages``/``todos``/``files``.
+        These parts MUST be silently ignored — they do not represent
+        a lifecycle transition and must not produce a spurious envelope.
+        """
+        records = _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
+        translator = StreamEventTranslator()
+        ctx = _make_context("FEAT-DA-OK", correlation_id="corr-da-ok")
+
+        pre_state_records = [
+            r for r in records if r.get("_path") == "deepagents-pre-state"
+        ]
+        assert pre_state_records, (
+            "fixture must include at least one pre-state record so we "
+            "lock the no-op contract for the framework-only shape"
+        )
+        for record in pre_state_records:
+            out = translator.translate(_stream_part_from_record(record), ctx)
+            assert out is None, (
+                f"pre-state record produced unexpected envelope "
+                f"{type(out).__name__}; expected None"
+            )
+
+    def test_deepagents_success_path_emits_expected_envelopes(self) -> None:
+        """Success-path round-trip on the deepagents shape (AC-2)."""
+        records = [
+            r for r in _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
+            if r.get("_path") in ("deepagents-success", "deepagents-pre-state", "common")
+        ]
+        translator = StreamEventTranslator()
+        ctx = _make_context("FEAT-DA-OK", correlation_id="corr-da-ok")
+
+        emitted: list[tuple[str | None, PipelineEvent | None]] = []
+        for record in records:
+            part = _stream_part_from_record(record)
+            out = translator.translate(part, ctx)
+            emitted.append((record.get("_expected_envelope"), out))
+
+        for expected_name, payload in emitted:
+            if expected_name is None:
+                assert payload is None, (
+                    f"deepagents-shape: fixture marked no-op but "
+                    f"translator emitted {type(payload).__name__}"
+                )
+                continue
+            expected_cls = _ENVELOPE_BY_NAME[expected_name]
+            assert isinstance(payload, expected_cls), (
+                f"deepagents-shape: expected {expected_name}; "
+                f"got {type(payload).__name__}"
+            )
+            cid = getattr(payload, "correlation_id", None)
+            assert isinstance(cid, str) and cid
+            assert cid == ctx.correlation_id
+
+    def test_deepagents_failure_path_emits_build_failed(self) -> None:
+        """Failure-path round-trip on the deepagents shape (AC-2)."""
+        records = [
+            r for r in _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
+            if r.get("_path") == "deepagents-failure"
+        ]
+        translator = StreamEventTranslator()
+        ctx = _make_context("FEAT-DA-FAIL", correlation_id="corr-da-fail")
+
+        terminal: PipelineEvent | None = None
+        for record in records:
+            out = translator.translate(_stream_part_from_record(record), ctx)
+            if isinstance(out, BuildFailedPayload):
+                terminal = out
+        assert terminal is not None, (
+            "deepagents-shape failure path did not yield a "
+            "BuildFailedPayload — the translator dropped the failed "
+            "lifecycle transition"
+        )
+        assert getattr(terminal, "correlation_id", None) == "corr-da-fail"
+        # AC-2 also locks: error_class + error_message from the snapshot
+        # propagate into ``failure_reason`` per TASK-FRR-PEB-011 AC-4.
+        # The fixture carries
+        # ``error_class="BuildOrchestrationError"`` /
+        # ``error_message="wave 0 task 0 failed"`` so the formatted
+        # reason is the canonical ``"<class>: <message>"`` shape.
+        assert terminal.failure_reason == (
+            "BuildOrchestrationError: wave 0 task 0 failed"
+        )

@@ -73,13 +73,18 @@ flips this contract.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, get_args, runtime_checkable
 
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
+from typing_extensions import NotRequired, Required, TypedDict
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from forge.pipeline import BuildContext, PipelineLifecycleEmitter
@@ -734,86 +739,351 @@ class LifecycleEmitterAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Compiled graph — exported for langgraph.json
+# AutobuildRunnerState — graph state schema (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX)
+# ---------------------------------------------------------------------------
+#
+# The autobuild_runner is launched by the supervisor's
+# ``AsyncSubAgentMiddleware.start_async_task`` and runs in a separate
+# LangGraph thread. The :class:`forge.lifecycle_bridge.LifecycleBridge`
+# attaches an SSE consumer against that thread and reads the
+# ``stream_mode="values"`` projection.
+#
+# Pre-fix history (FOLLOWUP-B spike): the runner graph was built via
+# ``deepagents.create_deep_agent(...)``. That builder fixes the state
+# schema at ``langchain.agents.middleware.types.AgentState`` plus the
+# deepagents middleware extensions (``messages``/``todos``/``files``).
+# The DDR-006 ``async_tasks`` channel is **not** in that schema, so a
+# values projection of the runner's run never carried an ``async_tasks``
+# key. The bridge's translator (``_extract_state`` in
+# :mod:`forge.lifecycle_bridge.translation`) looks first for
+# ``data["async_tasks"][feature_id]`` — found nothing on the wire,
+# returned ``None`` for every part, and dropped 30/30 incoming
+# ``event="values"`` parts on a real run. AC-3 envelopes never made it
+# to the wire; ``ack_floor`` stuck at 11.
+#
+# This module now builds the runner graph via :class:`langgraph.graph.StateGraph`
+# directly, with a state TypedDict that carries:
+#
+# 1. ``messages`` — preserves the
+#    ``AsyncSubAgentMiddleware.start_async_task`` launch contract; the
+#    middleware threads the launch description as the first user message.
+#    Without this field the middleware's ``runs.create`` input shape is
+#    rejected at thread-creation time.
+# 2. ``async_tasks`` — the DDR-006 channel keyed by ``feature_id``. The
+#    channel uses an additive merge reducer so successive transitions
+#    update one entry per build without overwriting siblings (a forge
+#    daemon may run multiple autobuild_runner threads in parallel).
+#
+# The lifecycle nodes drive a placeholder progression
+# ``starting → planning_waves → running_wave → completed`` so the
+# translator sees real transitions on the wire. Each node returns a
+# state update with the new ``AutobuildState`` snapshot under
+# ``async_tasks[feature_id]`` — a real LangGraph state mutation, surfaced
+# in the values projection. The placeholder bodies are deliberate: this
+# fix's scope is the state-shape contract between the runner and the
+# bridge translator (TASK-FORGE-FRR-PEBR-WIREUP::AC-11). Wiring real
+# autobuild work into these node bodies is a follow-up — the lifecycle
+# state-machine apparatus (``_update_state``,
+# :class:`LifecycleEmitterAdapter`, :class:`AutobuildState`) is fully
+# defined above and can be invoked from richer node bodies without
+# changing the graph shape exposed to ``langgraph.json``.
+
+
+def _async_tasks_reducer(
+    current: dict[str, dict[str, Any]] | None,
+    update: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Merge ``async_tasks`` channel updates keyed by ``feature_id``.
+
+    LangGraph state-channel reducer for the ``async_tasks`` field of
+    :class:`AutobuildRunnerState`. The semantics are last-write-wins per
+    ``feature_id``: a node returning
+    ``{"async_tasks": {"FEAT-X": {...new_state}}}`` overwrites the
+    ``"FEAT-X"`` entry while leaving any other in-flight ``feature_id``
+    entries untouched. This is the same posture
+    :class:`AsyncSubAgentMiddleware` uses on the supervisor's parent
+    graph (its ``Command(update={"async_tasks": ...})`` shape merges the
+    same way), so the runner's reducer matches operator expectations
+    when reading either graph's values projection.
+
+    A ``None`` ``update`` is a no-op — used by short-circuit paths that
+    return state without an ``async_tasks`` change.
+
+    Args:
+        current: The current ``async_tasks`` value (``None`` on the
+            first state mutation).
+        update: The patch returned by the most recent node.
+
+    Returns:
+        The merged ``async_tasks`` mapping. The result is a fresh
+        dict; callers do not need to copy.
+    """
+    merged: dict[str, dict[str, Any]] = dict(current or {})
+    if update:
+        for feature_id, snapshot in update.items():
+            if isinstance(snapshot, Mapping):
+                merged[feature_id] = dict(snapshot)
+    return merged
+
+
+class AutobuildRunnerState(TypedDict):
+    """LangGraph state schema for the autobuild_runner subagent.
+
+    Two channels:
+
+    * ``messages`` — Required. Preserves the launch contract used by
+      :class:`deepagents.middleware.async_subagents.AsyncSubAgentMiddleware`.
+      The middleware's ``start_async_task`` tool passes the launch
+      ``description`` as the first user message; the runner reads
+      ``state["messages"][0].content`` to extract the dispatch payload
+      (``build_id``, ``feature_id``, ``correlation_id``).
+    * ``async_tasks`` — NotRequired. The DDR-006 lifecycle channel keyed
+      by ``feature_id``. Lifecycle nodes write the
+      :class:`AutobuildState` snapshot here; the
+      :mod:`forge.lifecycle_bridge.translation` translator's
+      ``_extract_state`` finds the snapshot via
+      ``data["async_tasks"][feature_id]`` and emits the matching
+      ``pipeline.*`` envelope.
+    """
+
+    messages: Required[Annotated[list[Any], add_messages]]
+    async_tasks: NotRequired[Annotated[dict[str, dict[str, Any]], _async_tasks_reducer]]
+
+
+# ---------------------------------------------------------------------------
+# Launch-payload parsing
 # ---------------------------------------------------------------------------
 
 
-_AUTOBUILD_RUNNER_SYSTEM_PROMPT = """\
-You are the **autobuild_runner** AsyncSubAgent.
+#: Regex extracting the JSON payload from the launch description. The
+#: description shape is owned by
+#: :func:`forge.cli._serve_async_task_starter._synthesise_description`
+#: and looks like ``"RUN_AUTOBUILD subagent=<name> payload={...json...}"``.
+#: A grouped ``payload=(...)`` capture is sufficient because the dispatch
+#: payload always JSON-serialises (the ``lifecycle_emitter`` field is
+#: stripped before serialisation, so no in-process Python objects leak).
+_LAUNCH_PAYLOAD_PATTERN: re.Pattern[str] = re.compile(
+    r"payload=(?P<payload>\{.*\})\s*$",
+    flags=re.DOTALL,
+)
 
-You are launched by the supervisor's ``start_async_task`` and execute the
-long-running autobuild for one feature plan. Drive the lifecycle through
-the DDR-006 transitions:
 
-    starting → planning_waves → running_wave → awaiting_approval
-              → pushing_pr → completed | cancelled | failed
+def _extract_launch_payload(messages: list[Any]) -> dict[str, Any]:
+    """Pull the dispatch payload out of the launch description.
 
-On every lifecycle change the runtime calls ``_update_state`` which
-writes the ``async_tasks`` state channel AND emits to the
-``PipelineLifecycleEmitter`` at the same boundary (DDR-006 + DDR-007).
-A transition that writes the channel without emitting (or vice versa)
-is a contract violation.
+    The :class:`AsyncSubAgentMiddleware.start_async_task` tool threads
+    the launch description as ``state["messages"][0]``. The
+    :class:`forge.cli._serve_async_task_starter._StructuredToolAsyncTaskStarter`
+    formats that description as
+    ``"RUN_AUTOBUILD subagent=<name> payload=<json>"``. This helper
+    extracts the JSON payload and parses it.
 
-Confine all filesystem writes to the build's worktree allowlist
-(``forward_context.worktree_path``). Reject paths that escape the
-allowlist (Group E security scenario).
+    Returns the empty dict on any parse failure — the lifecycle nodes
+    fall back to defaults so a malformed launch does not crash the
+    runner thread (the daemon would lose the AutobuildState transitions
+    but keep the LangGraph thread healthy).
 
-When you emit ``stage_complete`` from inside this subagent, set
-``target_kind="subagent"`` and ``target_identifier`` to your own
-``task_id`` (ASSUM-018).
+    Args:
+        messages: The launched thread's ``messages`` channel.
 
-If the emitter raises (NATS publish failure, broker outage), log at
-WARNING and continue — SQLite remains authoritative (ADR-ARCH-008,
-DDR-007 §Failure-mode contract).
-"""
+    Returns:
+        The parsed payload dict, or ``{}`` if the launch description
+        cannot be parsed.
+    """
+    if not messages:
+        return {}
+    first = messages[0]
+    content = getattr(first, "content", None)
+    if not isinstance(content, str):
+        # Some langgraph versions deliver the first message as a dict.
+        if isinstance(first, Mapping):
+            content = first.get("content")
+    if not isinstance(content, str):
+        return {}
+    match = _LAUNCH_PAYLOAD_PATTERN.search(content)
+    if match is None:
+        return {}
+    try:
+        payload = json.loads(match.group("payload"))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "autobuild_runner: launch payload JSON decode failed (%s) — "
+            "falling back to empty payload; lifecycle transitions will "
+            "use placeholder identifiers",
+            exc,
+        )
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _build_snapshot(
+    payload: Mapping[str, Any],
+    *,
+    lifecycle: str,
+    wave_index: int = 0,
+    task_index: int = 0,
+    tasks_completed: int = 0,
+    tasks_failed: int = 0,
+) -> dict[str, Any]:
+    """Construct an :class:`AutobuildState` snapshot dict for the channel.
+
+    The snapshot mirrors the DDR-006 schema and matches the shape the
+    bridge translator's ``_extract_state`` expects. We construct a
+    Pydantic :class:`AutobuildState` first (so the ``Literal`` lifecycle
+    validation runs and any future schema drift surfaces as a
+    :class:`pydantic.ValidationError`), then ``model_dump`` to a plain
+    dict for the LangGraph state channel — channels are JSON-shaped, not
+    Pydantic-shaped.
+
+    Args:
+        payload: Parsed launch payload (``build_id``, ``feature_id``,
+            ``correlation_id`` keys consulted; missing keys fall back
+            to placeholder strings so the runner never crashes on a
+            malformed launch).
+        lifecycle: Target lifecycle for this snapshot. Must be a member
+            of :data:`LIFECYCLE_VALUES`.
+        wave_index: 0-indexed wave the runner is currently in.
+        task_index: 0-indexed task within the current wave.
+        tasks_completed: Cumulative completed task count.
+        tasks_failed: Cumulative failed task count.
+
+    Returns:
+        A JSON-serialisable dict mirroring
+        :class:`AutobuildState.model_dump(mode="json")` — safe to write
+        into the ``async_tasks`` LangGraph channel.
+    """
+    feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+    build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
+    correlation_id = payload.get("correlation_id")
+    state = AutobuildState(
+        task_id=str(payload.get("task_id") or build_id),
+        build_id=build_id,
+        feature_id=feature_id,
+        lifecycle=lifecycle,  # type: ignore[arg-type] - validated by AutobuildState's Literal
+        wave_index=wave_index,
+        wave_total=int(payload.get("wave_total") or 1),
+        task_index=task_index,
+        task_total=int(payload.get("task_total") or 1),
+        tasks_completed=tasks_completed,
+        tasks_failed=tasks_failed,
+        correlation_id=str(correlation_id) if correlation_id else None,
+    )
+    return state.model_dump(mode="json")
+
+
+def _snapshot_update(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a snapshot into the ``async_tasks`` reducer-shaped update."""
+    return {"async_tasks": {snapshot["feature_id"]: snapshot}}
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle nodes — placeholder bodies (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX)
+# ---------------------------------------------------------------------------
+#
+# Each node returns a state update writing the next AutobuildState to
+# ``async_tasks[feature_id]``. The bodies are deliberately empty of real
+# autobuild work: the contract this fix closes is the state-shape one,
+# not the autobuild-orchestration one. Real wave/task execution is
+# wired into these nodes in a follow-up; the LangGraph topology and
+# state schema established here remain stable across that follow-up.
+
+
+def _node_starting(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Emit the ``starting`` snapshot — entry point of the runner."""
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    snapshot = _build_snapshot(payload, lifecycle="starting")
+    return _snapshot_update(snapshot)
+
+
+def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Transition to ``planning_waves``."""
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    snapshot = _build_snapshot(payload, lifecycle="planning_waves")
+    return _snapshot_update(snapshot)
+
+
+def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Transition to ``running_wave`` — first wave begins."""
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    snapshot = _build_snapshot(
+        payload,
+        lifecycle="running_wave",
+        wave_index=0,
+        task_index=0,
+    )
+    return _snapshot_update(snapshot)
+
+
+def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Transition to ``completed`` — terminal lifecycle."""
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    snapshot = _build_snapshot(
+        payload,
+        lifecycle="completed",
+        wave_index=int(payload.get("wave_total") or 1) - 1,
+        task_index=int(payload.get("task_total") or 1) - 1,
+        tasks_completed=int(payload.get("task_total") or 1),
+    )
+    return _snapshot_update(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Compiled graph — exported for langgraph.json
+# ---------------------------------------------------------------------------
 
 
 def _build_runner_graph() -> Any:
     """Compile the autobuild_runner graph for ``langgraph.json``.
 
-    Production: builds via :func:`deepagents.create_deep_agent` so the
-    addressable surface DeepAgents ``AsyncSubAgentMiddleware`` looks up
-    by ``graph_id="autobuild_runner"`` is a real
-    :class:`langgraph.graph.state.CompiledStateGraph`.
+    Builds a :class:`langgraph.graph.StateGraph` with the
+    :class:`AutobuildRunnerState` schema and four lifecycle nodes
+    chained linearly. The graph compiles to a
+    :class:`CompiledStateGraph` addressable by
+    ``AsyncSubAgentMiddleware`` as
+    ``graph_id="autobuild_runner"``.
 
-    Fallback: if DeepAgents is unimportable in the current environment
-    (rare — only seen during partially-installed dev shells) or
-    construction raises, a minimal :class:`StateGraph` is compiled and
-    returned so ``langgraph.json`` parsing still succeeds. The fallback
-    is a safety net, not a production path; the warning log surfaces
-    the regression at startup.
+    Why not :func:`deepagents.create_deep_agent`?
+        ``create_deep_agent`` fixes the state schema at
+        ``AgentState`` + middleware extensions (``messages``, ``todos``,
+        ``files``); it does not expose a ``state_schema`` parameter (see
+        deepagents 0.5.3 ``graph.py:218``). Without ``async_tasks`` in
+        the state schema, the runner's ``stream_mode="values"``
+        projection has no channel for the bridge translator's
+        ``_extract_state`` to read — every transition is silently
+        dropped (FOLLOWUP-B spike, exit branch (b)). Building a
+        purpose-shaped ``StateGraph`` directly is the smallest-blast-radius
+        fix that closes that contract.
+
+    Fallback: any unexpected construction error returns a minimal
+    placeholder graph so ``langgraph.json`` parsing still succeeds. The
+    fallback is a safety net for partially-installed dev shells, not a
+    production path; the warning log surfaces the regression at startup.
 
     Returns:
         A compiled state graph addressable as
         ``./src/forge/subagents/autobuild_runner.py:graph``.
     """
     try:
-        from deepagents import create_deep_agent
-    except ImportError as exc:  # pragma: no cover - dev-only fallback
-        logger.warning(
-            "autobuild_runner: deepagents not importable (%s) — exporting "
-            "placeholder graph; production wiring requires deepagents>=0.5.3",
-            exc,
-        )
-        return _build_placeholder_graph()
+        from langgraph.graph import END, START, StateGraph
 
-    try:
-        return create_deep_agent(
-            # TASK-FORGE-FRR-F010L: retargeted from "anthropic:claude-haiku-4-5"
-            # to the local llama-swap workhorse per ADR-ARCH-001 (local-only
-            # ethos). qwen36-workhorse is the canonical /v1/models id served
-            # on :9000 and is the model the runbook designates for AutoBuild
-            # Player/Coach/Forge work — see RUNBOOK-v3 Phase 5.2.
-            model="openai:qwen36-workhorse",
-            tools=[],
-            system_prompt=_AUTOBUILD_RUNNER_SYSTEM_PROMPT,
-            name=AUTOBUILD_RUNNER_NAME,
-        )
+        sg: StateGraph[AutobuildRunnerState] = StateGraph(AutobuildRunnerState)
+        sg.add_node("starting", _node_starting)
+        sg.add_node("planning_waves", _node_planning_waves)
+        sg.add_node("running_wave", _node_running_wave)
+        sg.add_node("completed", _node_completed)
+        sg.add_edge(START, "starting")
+        sg.add_edge("starting", "planning_waves")
+        sg.add_edge("planning_waves", "running_wave")
+        sg.add_edge("running_wave", "completed")
+        sg.add_edge("completed", END)
+        return sg.compile()
     except Exception as exc:  # noqa: BLE001 - construction-time safety net
         logger.warning(
-            "autobuild_runner: create_deep_agent raised %s — exporting "
-            "placeholder graph so langgraph.json still parses; investigate "
-            "the underlying cause before relying on the subagent",
+            "autobuild_runner: StateGraph construction raised %s — "
+            "exporting placeholder graph so langgraph.json still "
+            "parses; investigate before relying on the subagent",
             exc,
         )
         return _build_placeholder_graph()
@@ -822,11 +1092,10 @@ def _build_runner_graph() -> Any:
 def _build_placeholder_graph() -> Any:
     """Return a trivial compiled :class:`StateGraph`.
 
-    Used only when :func:`deepagents.create_deep_agent` cannot
-    construct the production graph. The graph compiles, addresses, and
-    invokes (returning state unchanged) so ``langgraph.json`` parse and
-    LangGraph dev-server import paths still work; production behaviour
-    is delegated to the real DeepAgents-built graph.
+    Used only when the production graph cannot be constructed. The
+    graph compiles, addresses, and invokes (returning state unchanged)
+    so ``langgraph.json`` parse and LangGraph dev-server import paths
+    still work; production behaviour is delegated to the real graph.
     """
     from langgraph.graph import END, START, StateGraph
 
@@ -847,6 +1116,7 @@ graph = _build_runner_graph()
 __all__ = [
     "AUTOBUILD_RUNNER_NAME",
     "AutobuildLifecycle",
+    "AutobuildRunnerState",
     "AutobuildState",
     "LIFECYCLE_TO_PIPELINE_EMIT",
     "LIFECYCLE_VALUES",
@@ -855,6 +1125,7 @@ __all__ = [
     "SubagentEmitter",
     "TERMINAL_LIFECYCLES",
     "WorktreeConfinementError",
+    "_async_tasks_reducer",
     "_update_state",
     "assert_within_worktree",
     "build_stage_complete_kwargs",

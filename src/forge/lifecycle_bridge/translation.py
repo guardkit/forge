@@ -23,6 +23,40 @@ deltas, etc.). The ``stream_mode="values"`` SSE channel carries full
 diffing against the prior snapshot is the canonical detection mechanism
 (see :mod:`forge.subagents.autobuild_runner`).
 
+State-shape contract with the runner (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B-FIX, AC-4)
+--------------------------------------------------------------------------------------
+
+The translator's :func:`_extract_state` requires ``AutobuildState``
+snapshots to arrive in the LangGraph values projection under the
+``async_tasks`` key, keyed by ``feature_id``:
+
+.. code-block:: text
+
+    StreamPart(event="values", data={
+        "messages": [...],         # deepagents message channel
+        "todos":    [...],         # deepagents todo channel
+        "files":    {...},         # deepagents files channel
+        "async_tasks": {           # ← THIS channel is the contract
+            "FEAT-X": {<AutobuildState dict>},
+        },
+    })
+
+The contract source is :class:`forge.subagents.autobuild_runner.AutobuildRunnerState`:
+the runner graph's state schema MUST include ``async_tasks`` as a
+top-level field with the
+:func:`forge.subagents.autobuild_runner._async_tasks_reducer` reducer.
+Without that channel in the schema, the values projection emits no
+``async_tasks`` key and the translator silently drops every part — the
+exact failure mode FOLLOWUP-B's spike diagnosed (translator returned
+``None`` for 30/30 parts on the GB10 dry-run, zero outbound
+``pipeline.*`` envelopes).
+
+The translator also tolerates a flat-snapshot fallback (a ``data``
+mapping carrying ``lifecycle`` + ``build_id`` directly) for legacy
+test fixtures (``sse_stream_canonical.jsonl``); this fallback is **not**
+the production shape and exists only to keep older recorded fixtures
+compatible.
+
 Acceptance-criteria mapping
 ---------------------------
 
@@ -360,13 +394,10 @@ class StreamEventTranslator:
 
         event_name = getattr(stream_part, "event", None)
         if event_name != VALUES_STREAM_EVENT:
-            # FOLLOWUP-B trace: temporary INFO (was DEBUG) so the
-            # forge-prod log captures whether non-values events are
-            # arriving and being silently dropped. Revert to DEBUG on
-            # AC-5 cleanup. (Original comment: AC-2 — DEBUG so a
-            # langgraph-api minor bump that adds a new event type does
-            # not flood WARNING.)
-            logger.info(
+            # Unknown / unhandled event — DEBUG so a langgraph-api
+            # minor bump that adds a new event type does not flood
+            # WARNING (AC-2).
+            logger.debug(
                 "translation: ignoring StreamPart event=%r (only %r is "
                 "actioned by this translator)",
                 event_name,
