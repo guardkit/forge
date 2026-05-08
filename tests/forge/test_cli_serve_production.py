@@ -933,3 +933,75 @@ class TestLifecycleBridgeWireupComposition:
             "terminal_publish_ledger is not wired by bind_production_serve "
             "— Gap PEBR-WIREUP regression"
         )
+
+    def test_bind_production_serve_creates_lifecycle_bridge_registry_table(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_db_path: Path,
+        serve_config,
+        fake_forge_config,
+    ) -> None:
+        """Step 3.5b applies the ``lifecycle_bridge_registry`` migration.
+
+        Pinned by the 2026-05-08 PEBR-WIREUP runbook revalidation
+        (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A). Before the fix, Step
+        3.5b applied only the coexistence migration so a fresh
+        ``FORGE_DB_PATH`` volume shipped without the
+        ``lifecycle_bridge_registry`` table; the first
+        ``BridgeRegistry.register_ack_handle`` call raised ``no such
+        table: lifecycle_bridge_registry`` and the wireup silently
+        fell back to the legacy ``ack_callback`` ack-on-dispatch-
+        return path — exactly the redelivery-storm closure the
+        bridge was built to replace. This test pins that BOTH
+        bridge tables exist in ``sqlite_master`` after a fresh
+        ``bind_production_serve`` so the migration cannot regress
+        without the suite catching it.
+        """
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
+        )
+        # The composer factory itself is not under test here — we
+        # only need ``bind_production_serve`` to drive the Step 3.5b
+        # migration block end-to-end against a real on-disk DB.
+        monkeypatch.setattr(
+            serve_module,
+            "bind_production_dispatch_chain",
+            lambda **kw: (lambda client: None),
+        )
+
+        serve_production.bind_production_serve(serve_config, fake_forge_config)
+
+        # Open an independent connection to the on-disk DB and
+        # confirm BOTH bridge tables exist in ``sqlite_master``. The
+        # writer connection is still held by ``_bound_resources``;
+        # SQLite supports multiple-readers + single-writer so this
+        # introspection query is safe alongside the live writer.
+        inspector = sqlite3.connect(tmp_db_path)
+        try:
+            tables = {
+                row[0]
+                for row in inspector.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table';"
+                ).fetchall()
+            }
+        finally:
+            inspector.close()
+
+        assert "lifecycle_bridge_terminal_publishes" in tables, (
+            "Step 3.5b must apply the coexistence migration "
+            "(TASK-FORGE-FRR-PEBR-WIREUP); table missing — got: "
+            f"{sorted(tables)!r}"
+        )
+        assert "lifecycle_bridge_registry" in tables, (
+            "Step 3.5b must apply the registry migration "
+            "(TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A); without this "
+            "the first BridgeRegistry SQL touch raises 'no such "
+            "table' and the wireup silently falls back to the "
+            "legacy ack_callback redelivery-storm path — got: "
+            f"{sorted(tables)!r}"
+        )

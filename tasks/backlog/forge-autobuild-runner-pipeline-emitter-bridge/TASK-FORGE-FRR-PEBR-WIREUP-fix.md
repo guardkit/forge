@@ -33,7 +33,16 @@ ac_status:
   AC-8: done    # TestLifecycleBridgeWireupComposition class with 2 seam tests
   AC-9: done    # existing tests pass (test_cli_serve_production fixture upgrade was required and is documented)
   AC-10: done   # ruff check + black --check both clean on touched files
-  AC-11: deferred  # post-merge: re-run jarvis runbook §6.2+§7 against rebuilt forge image; capture new correlation_id
+  AC-11: partially-unblocked  # 2026-05-08T12:30Z — FOLLOWUP-A landed (code in working tree, completion archived to tasks/completed/forge-autobuild-runner-pipeline-emitter-bridge/); remaining gate is operator runbook re-run against the rebuilt image
+ac_11_blocked_on:
+  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B   # post-FOLLOWUP-A: bridge attaches, SSE GET 200, but translator stays silent — 90-min spike to differentiate Path 1 (placeholder thread_id rebind) vs Path 2 (translator shape mismatch). NOTE: per ac_11_promotion_gate, FOLLOWUP-B is NOT hard-blocking for promotion; runbook gate is.
+ac_11_resolved:
+  - TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A   # 2026-05-08T12:30Z — landed via /task-work → /task-complete (light intensity). Single-line wireup at _serve_production.py Step 3.5b + regression test in TestLifecycleBridgeWireupComposition (sqlite_master assertion on both bridge tables). Reverse-test confirmed FAIL→PASS. Code uncommitted in working tree at this update; commit pending.
+ac_11_runbook_revalidation_doc: docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-post-pebr-wireup.md
+ac_11_promotion_gate: |
+  This task remains in tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/ (NOT promoted to tasks/completed/) until at minimum FOLLOWUP-A lands and Phase 7 of the runbook captures a real pipeline.build-started.FEAT-* envelope on the wire. FOLLOWUP-B may land post-hoc if its spike escalates to a wider scope, but FOLLOWUP-A is hard-blocking. FOLLOWUP-C is independent of this gate.
+
+  Status 2026-05-08T12:30Z: FOLLOWUP-A complete. Remaining gate is the runbook re-run — capture results in the doc named under ac_11_runbook_revalidation_doc and switch AC-11 to 'done' before promoting this file to completed/.
 code_review:
   verdict: APPROVED
   critical_findings: 0

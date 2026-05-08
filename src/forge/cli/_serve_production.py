@@ -55,6 +55,9 @@ from forge.lifecycle_bridge import (
     langgraph_stream_source,
 )
 from forge.lifecycle_bridge import coexistence as _bridge_coexistence
+from forge.persistence.migrations import (
+    lifecycle_bridge_registry as _bridge_registry_migration,
+)
 from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
 
@@ -466,6 +469,19 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # migration ladder so it travels with the consumer (see
     # ``coexistence.py:140-175`` for the rationale).
     _bridge_coexistence.apply_migration(connection)
+
+    # Also apply the ``lifecycle_bridge_registry`` migration so the
+    # registry table required by :class:`BridgeRegistry` exists at
+    # boot (TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A). Without this, on
+    # a fresh ``FORGE_DB_PATH`` volume the first call to
+    # ``register_ack_handle`` raises ``no such table:
+    # lifecycle_bridge_registry`` and the wireup silently falls back
+    # to the legacy ``ack_callback`` ack-on-dispatch-return path —
+    # exactly the redelivery-storm closure the bridge was built to
+    # replace. Idempotent (``CREATE TABLE IF NOT EXISTS``); migration
+    # is co-located with the bridge code for the same reason as the
+    # coexistence migration above.
+    _bridge_registry_migration.apply(connection)
 
     # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
