@@ -14,9 +14,21 @@ from forge.lifecycle_bridge.bridge import (
     BuildContext,
     LifecycleBridge,
 )
+from forge.lifecycle_bridge.coexistence import TerminalPublishLedger
+from forge.lifecycle_bridge.stream_source import langgraph_stream_source
+from forge.lifecycle_bridge.translation import StreamEventTranslator
+from forge.lifecycle_bridge.wireup import (
+    LifecycleBridgeWireup,
+    StreamSource,
+)
 
 __all__ = [
     "AckHandle",
     "BuildContext",
     "LifecycleBridge",
+    "LifecycleBridgeWireup",
+    "StreamEventTranslator",
+    "StreamSource",
+    "TerminalPublishLedger",
+    "langgraph_stream_source",
 ]

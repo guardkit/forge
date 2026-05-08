@@ -77,6 +77,7 @@ from forge.pipeline.dispatchers.autobuild_async import (
 from forge.pipeline.supervisor import Supervisor
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
+    from forge.cli._serve_production import LifecycleBridgeWireupParts
     from forge.pipeline import PipelineLifecycleEmitter
     from forge.pipeline.forward_context_builder import ForwardContextBuilder
 
@@ -192,6 +193,7 @@ def bind_production_dispatch_chain(
     forge_config: Any,
     sqlite_pool: Any,
     async_task_starter: Any | None = None,
+    bridge_wireup_parts: "LifecycleBridgeWireupParts | None" = None,
 ) -> ComposeDispatchChainFn:
     """Return a :data:`ComposeDispatchChainFn` bound to the production deps.
 
@@ -199,13 +201,21 @@ def bind_production_dispatch_chain(
     :data:`compose_dispatch_chain` seam (TASK-FW10-007). The returned
     closure:
 
-    1. calls :func:`forge.cli._serve_deps.build_pipeline_consumer_deps`
-       with the captured ``forge_config``, ``sqlite_pool``, and
-       optional ``async_task_starter`` (TASK-FW10-008 wires the
-       supervisor's ``start_async_task`` middleware tool here);
-    2. wraps the resulting :class:`PipelineConsumerDeps` in a
+    1. calls :func:`forge.cli._serve_deps.build_publisher_and_emitter`
+       to construct the shared :class:`PipelinePublisher` against the
+       NATS client (TASK-FORGE-FRR-PEBR-WIREUP — finalised here rather
+       than inside ``build_pipeline_consumer_deps`` so the bridge
+       wireup shares the same publisher instance);
+    2. when ``bridge_wireup_parts`` is provided, finalises the
+       :class:`LifecycleBridgeWireup` using that publisher and threads
+       its ``register_ack_handle`` plus the parts'
+       ``terminal_publish_ledger`` into
+       :func:`forge.cli._serve_deps.build_pipeline_consumer_deps`
+       (Gap PEBR-WIREUP — closes the ack-bridge / terminal-publish
+       ledger composition that was previously deferred);
+    3. wraps the resulting :class:`PipelineConsumerDeps` in a
        :func:`make_handle_message_dispatcher` closure; and
-    3. rebinds :data:`_serve_daemon.dispatch_payload` to the
+    4. rebinds :data:`_serve_daemon.dispatch_payload` to the
        dispatcher before returning. After this returns the
        receipt-only ``_default_dispatch`` stub is no longer reachable
        on the production code path (TASK-FW10-007 AC: "receipt-only
@@ -222,6 +232,18 @@ def bind_production_dispatch_chain(
             by TASK-FW10-008 via the
             :class:`AsyncSubAgentMiddleware` tool surface; tests pass
             a deterministic fake.
+        bridge_wireup_parts: Optional
+            :class:`~forge.cli._serve_production.LifecycleBridgeWireupParts`
+            carrying the SQLite-bound dependencies for the lifecycle
+            bridge wireup (bridge, translator, stream_source,
+            identity_provider, terminal_publish_ledger). Production
+            wiring (``bind_production_serve``) constructs the parts in
+            its Step 6.5 and threads them in. When ``None`` (legacy
+            unit-test / smoke-test path), the deps composer logs
+            ``ack_bridge=deferred (TASK-FRR-PEB-002)`` and
+            ``terminal_publish_ledger=deferred (TASK-FRR-PEB-005)`` —
+            the pre-PEBR-WIREUP behaviour, preserved for backwards
+            compatibility.
 
     Returns:
         An ``async (client) -> None`` closure suitable for assignment
@@ -229,13 +251,41 @@ def bind_production_dispatch_chain(
     """
 
     from forge.cli._serve_deps import build_pipeline_consumer_deps
+    from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 
     async def _compose(client: Any) -> None:
+        # TASK-FORGE-FRR-PEBR-WIREUP — hoist publisher construction up
+        # to the closure so the bridge wireup can share the same
+        # publisher instance as ``publish_build_failed`` (no-double-
+        # emit invariant). The emitter is rebuilt against the same
+        # publisher inside ``build_pipeline_consumer_deps``.
+        publisher, _emitter = build_publisher_and_emitter(
+            client, config=forge_config.pipeline
+        )
+
+        register_ack_handle: Any = None
+        terminal_publish_ledger: Any = None
+        if bridge_wireup_parts is not None:
+            from forge.lifecycle_bridge.wireup import LifecycleBridgeWireup
+
+            wireup = LifecycleBridgeWireup(
+                bridge=bridge_wireup_parts.bridge,
+                translator=bridge_wireup_parts.translator,
+                publisher=publisher,
+                stream_source=bridge_wireup_parts.stream_source,
+                identity_provider=bridge_wireup_parts.identity_provider,
+            )
+            register_ack_handle = wireup.register_ack_handle
+            terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
+
         deps = build_pipeline_consumer_deps(
             client,
             forge_config,
             sqlite_pool,
             async_task_starter=async_task_starter,
+            register_ack_handle=register_ack_handle,
+            terminal_publish_ledger=terminal_publish_ledger,
+            publisher=publisher,
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first
@@ -259,9 +309,7 @@ def bind_production_dispatch_chain(
 # ---------------------------------------------------------------------------
 
 
-def _build_async_subagent_middleware(
-    *, autobuild_runner_url: str | None = None
-) -> Any:
+def _build_async_subagent_middleware(*, autobuild_runner_url: str | None = None) -> Any:
     """Return a configured :class:`AsyncSubAgentMiddleware` for autobuild.
 
     The middleware exposes the five tools (``start_async_task``,

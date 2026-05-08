@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from forge.adapters.sqlite.connect import connect_writer
 from forge.cli._serve_async_task_starter import build_async_task_starter
@@ -46,7 +46,20 @@ from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
 from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.lifecycle_bridge import (
+    LifecycleBridge,
+    LifecycleBridgeWireup,  # noqa: F401  (re-exported via wireup parts contract)
+    StreamEventTranslator,
+    StreamSource,
+    TerminalPublishLedger,
+    langgraph_stream_source,
+)
+from forge.lifecycle_bridge import coexistence as _bridge_coexistence
+from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
+
+if TYPE_CHECKING:  # pragma: no cover - import-time only
+    from forge.lifecycle_bridge.wireup import IdentityProvider
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +137,178 @@ def _close_previous_connection_quietly(previous: _BoundResources) -> None:
         )
 
 
+@dataclass(frozen=True)
+class LifecycleBridgeWireupParts:
+    """SQLite-bound dependencies for :class:`LifecycleBridgeWireup`.
+
+    The wireup itself cannot be constructed in
+    :func:`bind_production_serve` because it requires the
+    :class:`PipelinePublisher`, which is only available inside the
+    closure returned by
+    :func:`forge.cli.serve.bind_production_dispatch_chain` (where the
+    NATS client has been opened). This struct carries the parts that
+    DO depend on the SQLite pool / runner_url so they can be threaded
+    through ``bind_production_dispatch_chain`` into its closure.
+
+    TASK-FORGE-FRR-PEBR-WIREUP — closes Gap PEBR-WIREUP surfaced by the
+    2026-05-08 jarvis runbook walkthrough on GB10
+    (correlation_id=5673965b-e302-4a10-89cb-ceb430e64995).
+    """
+
+    bridge: LifecycleBridge
+    translator: StreamEventTranslator
+    stream_source: StreamSource
+    identity_provider: "IdentityProvider"
+    terminal_publish_ledger: TerminalPublishLedger
+
+
+def _build_async_tasks_identity_provider(
+    *,
+    sqlite_pool: SqliteLifecyclePersistence,
+    autobuild_runner_url: str,
+) -> "IdentityProvider":
+    """Return an :data:`IdentityProvider` resolving ``(thread_id, run_id)``.
+
+    Two-step hybrid resolution (TASK-REV-PEBR-003 §AC-3 — chosen over
+    schema-migration because the ``async_tasks`` SQLite mirror does not
+    carry a ``run_id`` column and one HTTP round-trip per identity
+    poll fits comfortably within the wireup's per-poll budget):
+
+    1. SQLite read: ``SELECT task_id FROM async_tasks WHERE feature_id
+       = ? LIMIT 1``. ``task_id`` equals ``thread_id`` per
+       :mod:`forge.cli._serve_async_task_starter` (line 148-149: the
+       state-channel command writes one entry keyed by the
+       just-launched task's ``thread_id``). The dispatcher writes
+       this row inside :func:`dispatch_autobuild_async` BEFORE
+       :meth:`start_async_task` returns; the wireup's
+       :meth:`register_ack_handle` runs BEFORE
+       :func:`dispatch_autobuild_async`, so the row is not yet present
+       at the first poll. Returns ``None`` on miss; the wireup retries
+       per its ``identity_resolution_attempts`` budget.
+
+    2. ``langgraph_sdk`` fetch: once ``thread_id`` is known, call
+       ``client.runs.list(thread_id, limit=1)`` (verified against
+       installed ``langgraph_sdk`` 0.3.13: ``list(thread_id, *,
+       limit=10, ...) -> list[Run]``) and return
+       ``(thread_id, runs[0].run_id)``. Empty list → ``None``;
+       transport errors are caught and downgraded to ``None`` so the
+       observer's reconnect loop can exit cleanly to JetStream
+       redelivery.
+
+    Args:
+        sqlite_pool: Shared writer connection facade for the
+            ``async_tasks`` read.
+        autobuild_runner_url: URL of the langgraph-runner sidecar.
+            Validated by :class:`ServeConfig`'s fail-fast guard so it
+            is non-empty here.
+
+    Returns:
+        An ``async (feature_id) -> tuple[str, str] | None`` callable
+        conforming to :data:`IdentityProvider`.
+    """
+
+    async def _provider(feature_id: str) -> tuple[str, str] | None:
+        # Step 1 — SQLite lookup against the shared writer connection.
+        try:
+            row = sqlite_pool.connection.execute(
+                "SELECT task_id FROM async_tasks WHERE feature_id = ? " "LIMIT 1",
+                (feature_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "_async_tasks_identity_provider: SQLite read failed for "
+                "feature_id=%s (%s); treating as None",
+                feature_id,
+                exc,
+            )
+            return None
+        if row is None:
+            return None
+        thread_id: str = row[0] if not hasattr(row, "keys") else row["task_id"]
+
+        # Step 2 — langgraph_sdk lookup for run_id.
+        try:
+            from langgraph_sdk import get_client
+
+            client = get_client(url=autobuild_runner_url)
+            runs = await client.runs.list(thread_id, limit=1)
+            if not runs:
+                return None
+            run_id = (
+                runs[0].get("run_id")
+                if isinstance(runs[0], dict)
+                else getattr(runs[0], "run_id", None)
+            )
+            if run_id is None:
+                return None
+            return (thread_id, run_id)
+        except Exception as exc:  # noqa: BLE001 - downgrade transport / SDK errors
+            logger.warning(
+                "_async_tasks_identity_provider: failed to resolve "
+                "run_id for feature_id=%s thread_id=%s (%s); treating "
+                "as None",
+                feature_id,
+                thread_id,
+                exc,
+            )
+            return None
+
+    return _provider
+
+
+def _build_lifecycle_bridge_wireup_parts(
+    *,
+    sqlite_pool: SqliteLifecyclePersistence,
+    autobuild_runner_url: str,
+) -> LifecycleBridgeWireupParts:
+    """Construct the SQLite-bound dependencies for :class:`LifecycleBridgeWireup`.
+
+    Pipeline (TASK-FORGE-FRR-PEBR-WIREUP §1):
+
+    1. :class:`BridgeRegistry` against the writer connection.
+    2. :class:`LifecycleBridge` wrapping the registry — no SDK client
+       and no deadline handler are wired here (operator-cancel and
+       deadline enforcement are out of scope for the PEBR-WIREUP
+       fix; the wireup itself is the canonical deadline handler, but
+       its construction site is the closure inside
+       :func:`bind_production_dispatch_chain`).
+    3. :class:`StreamEventTranslator` — zero-arg.
+    4. :func:`langgraph_stream_source(runner_url=...)` — production
+       SSE adapter.
+    5. ``_build_async_tasks_identity_provider(...)`` — hybrid SQLite +
+       ``langgraph_sdk`` identity resolver.
+    6. :class:`TerminalPublishLedger` against the same writer
+       connection (the migration that creates its table is invoked at
+       Step 3.5 of :func:`bind_production_serve`).
+
+    Args:
+        sqlite_pool: Shared :class:`SqliteLifecyclePersistence`.
+        autobuild_runner_url: Validated sidecar URL.
+
+    Returns:
+        A frozen :class:`LifecycleBridgeWireupParts`.
+    """
+    connection = sqlite_pool.connection
+
+    registry = BridgeRegistry(connection=connection)
+    bridge = LifecycleBridge(registry=registry)
+    translator = StreamEventTranslator()
+    stream_source = langgraph_stream_source(runner_url=autobuild_runner_url)
+    identity_provider = _build_async_tasks_identity_provider(
+        sqlite_pool=sqlite_pool,
+        autobuild_runner_url=autobuild_runner_url,
+    )
+    terminal_publish_ledger = TerminalPublishLedger(connection=connection)
+
+    return LifecycleBridgeWireupParts(
+        bridge=bridge,
+        translator=translator,
+        stream_source=stream_source,
+        identity_provider=identity_provider,
+        terminal_publish_ledger=terminal_publish_ledger,
+    )
+
+
 def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
     """Return an :class:`AsyncTaskStarter` adapter over ``middleware.tools``.
 
@@ -165,9 +350,7 @@ def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
     )
 
 
-def bind_production_serve(
-    config: ServeConfig, forge_config: ForgeConfig
-) -> None:
+def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> None:
     """Wire :data:`forge.cli.serve.compose_dispatch_chain` to production deps.
 
     Idempotent — safe to call multiple times. On a re-bind the previous
@@ -272,9 +455,17 @@ def bind_production_serve(
     schema_version_before = _current_schema_version(connection)
     schema_version_after = apply_at_boot(connection)
     applied = max(0, schema_version_after - schema_version_before)
-    logger.info(
-        "forge-serve: applied %d SQLite migration(s) at boot", applied
-    )
+    logger.info("forge-serve: applied %d SQLite migration(s) at boot", applied)
+
+    # Step 3.5b (TASK-FORGE-FRR-PEBR-WIREUP) — apply the lifecycle-
+    # bridge coexistence migration so the
+    # ``lifecycle_bridge_terminal_publishes`` table required by
+    # :class:`TerminalPublishLedger` exists at boot. Idempotent
+    # (``CREATE TABLE IF NOT EXISTS``); the migration is co-located
+    # with the bridge code rather than folded into the canonical
+    # migration ladder so it travels with the consumer (see
+    # ``coexistence.py:140-175`` for the rationale).
+    _bridge_coexistence.apply_migration(connection)
 
     # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
@@ -301,11 +492,23 @@ def bind_production_serve(
     # surface (per TASK-FW10-008 contract).
     async_task_starter = _resolve_async_task_starter(middleware)
 
+    # Step 6.5 (TASK-FORGE-FRR-PEBR-WIREUP) — construct the
+    # SQLite-bound dependencies for the lifecycle-bridge wireup. The
+    # wireup itself is finalised inside the closure returned by
+    # ``bind_production_dispatch_chain`` (where the publisher is in
+    # scope); this step builds the parts that depend on the SQLite
+    # pool / runner_url so they can be threaded through.
+    bridge_wireup_parts = _build_lifecycle_bridge_wireup_parts(
+        sqlite_pool=sqlite_pool,
+        autobuild_runner_url=config.autobuild_runner_url,
+    )
+
     # Step 7 — build the production composer and rebind the seam.
     composer = serve_module.bind_production_dispatch_chain(
         forge_config=forge_config,
         sqlite_pool=sqlite_pool,
         async_task_starter=async_task_starter,
+        bridge_wireup_parts=bridge_wireup_parts,
     )
     serve_module.compose_dispatch_chain = composer
 
@@ -321,4 +524,4 @@ def bind_production_serve(
     )
 
 
-__all__ = ["bind_production_serve"]
+__all__ = ["LifecycleBridgeWireupParts", "bind_production_serve"]

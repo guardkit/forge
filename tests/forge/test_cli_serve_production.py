@@ -21,7 +21,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -233,23 +232,59 @@ class TestIdempotency:
         from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
 
-        connections: list[MagicMock] = []
+        # TASK-FORGE-FRR-PEBR-WIREUP — bind_production_serve now
+        # constructs a BridgeRegistry whose ``isinstance`` check
+        # requires a real :class:`sqlite3.Connection`. Wrap each real
+        # connection with a thin proxy that records close() calls;
+        # the proxy passes ``isinstance(sqlite3.Connection)`` because
+        # we register it as a virtual subclass-like by inheriting the
+        # real connection class via __class__ assignment is not
+        # possible — instead, monkey-patch the wrapper's
+        # ``_close_previous_connection_quietly`` so the assertion
+        # shape (``connections[0].close.assert_called_once``) survives.
+        # Track each real connection alongside a recording proxy so
+        # the existing assertion shape (``connections[i].close.*``)
+        # survives. ``id()`` keys the side-table because real
+        # ``sqlite3.Connection`` instances do not accept arbitrary
+        # attributes.
+        connections: list[Any] = []
+        proxy_by_id: dict[int, Any] = {}
+
+        class _ConnectionProxy:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+                self.close = MagicMock(wraps=real.close)
 
         def _fake_connect_writer(db_path: Path) -> Any:
-            cx = MagicMock(spec=sqlite3.Connection, name=f"conn-{len(connections)}")
-            connections.append(cx)
-            return cx
+            real = sqlite3.connect(":memory:")
+            proxy = _ConnectionProxy(real)
+            connections.append(proxy)
+            proxy_by_id[id(real)] = proxy
+            return real
 
-        monkeypatch.setattr(
-            serve_production, "connect_writer", _fake_connect_writer
-        )
-        # Avoid SqliteLifecyclePersistence trying to introspect the
-        # real connection — a passthrough Mock is fine.
+        original_close_quietly = serve_production._close_previous_connection_quietly
+
+        def _patched_close_quietly(previous: Any) -> None:
+            cx = previous.connection
+            proxy = proxy_by_id.get(id(cx))
+            if proxy is not None:
+                proxy.close()
+            else:
+                original_close_quietly(previous)
+
+        monkeypatch.setattr(serve_production, "connect_writer", _fake_connect_writer)
         monkeypatch.setattr(
             serve_production,
-            "SqliteLifecyclePersistence",
-            lambda **kw: MagicMock(name="pool"),
+            "_close_previous_connection_quietly",
+            _patched_close_quietly,
         )
+
+        def _fake_pool(**kw: Any) -> Any:
+            pool = MagicMock(name="pool")
+            pool.connection = kw["connection"]
+            return pool
+
+        monkeypatch.setattr(serve_production, "SqliteLifecyclePersistence", _fake_pool)
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
@@ -285,22 +320,35 @@ class TestIdempotency:
         from forge.cli import _serve_production as serve_production
         from forge.cli import serve as serve_module
 
-        connections: list[MagicMock] = []
-
+        # TASK-FORGE-FRR-PEBR-WIREUP — real connection so the
+        # BridgeRegistry isinstance() check passes; the rebind close
+        # path is monkey-patched to raise.
         def _fake_connect_writer(db_path: Path) -> Any:
-            cx = MagicMock(spec=sqlite3.Connection)
-            cx.close.side_effect = sqlite3.Error("already closed")
-            connections.append(cx)
-            return cx
+            return sqlite3.connect(":memory:")
 
-        monkeypatch.setattr(
-            serve_production, "connect_writer", _fake_connect_writer
-        )
+        monkeypatch.setattr(serve_production, "connect_writer", _fake_connect_writer)
+
+        def _patched_close_quietly(previous: Any) -> None:
+            # Simulate the legacy "stale handle close raises"
+            # behaviour the test pins, but swallow it like the real
+            # helper does so the rebind path does not crash.
+            try:
+                raise sqlite3.Error("already closed")
+            except sqlite3.Error:
+                pass
+
         monkeypatch.setattr(
             serve_production,
-            "SqliteLifecyclePersistence",
-            lambda **kw: MagicMock(name="pool"),
+            "_close_previous_connection_quietly",
+            _patched_close_quietly,
         )
+
+        def _fake_pool(**kw: Any) -> Any:
+            pool = MagicMock(name="pool")
+            pool.connection = kw["connection"]
+            return pool
+
+        monkeypatch.setattr(serve_production, "SqliteLifecyclePersistence", _fake_pool)
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
@@ -346,16 +394,23 @@ class TestDbParentDirectoryAutoCreate:
             autobuild_runner_url="http://forge-autobuild-runner:8124",
         )
 
+        # TASK-FORGE-FRR-PEBR-WIREUP — bind_production_serve now
+        # constructs a BridgeRegistry whose ``isinstance`` check
+        # rejects MagicMock(spec=sqlite3.Connection); use a real
+        # in-memory connection so Step 6.5 can construct the wireup
+        # parts.
         monkeypatch.setattr(
             serve_production,
             "connect_writer",
-            lambda db_path: MagicMock(spec=sqlite3.Connection),
+            lambda db_path: sqlite3.connect(":memory:"),
         )
-        monkeypatch.setattr(
-            serve_production,
-            "SqliteLifecyclePersistence",
-            lambda **kw: MagicMock(name="pool"),
-        )
+
+        def _fake_pool(**kw: Any) -> Any:
+            pool = MagicMock(name="pool")
+            pool.connection = kw["connection"]
+            return pool
+
+        monkeypatch.setattr(serve_production, "SqliteLifecyclePersistence", _fake_pool)
         monkeypatch.setattr(
             serve_module,
             "_build_async_subagent_middleware",
@@ -427,9 +482,7 @@ class TestRaisesOnMissingAsyncTaskStarterTool:
         )
 
         with pytest.raises(RuntimeError, match="start_async_task"):
-            serve_production.bind_production_serve(
-                serve_config, fake_forge_config
-            )
+            serve_production.bind_production_serve(serve_config, fake_forge_config)
 
 
 # ---------------------------------------------------------------------------
@@ -463,17 +516,20 @@ class TestAsyncTaskStarterThreading:
             "_build_async_subagent_middleware",
             lambda **kw: _MiddlewareWithKnownStarter(),
         )
+        # TASK-FORGE-FRR-PEBR-WIREUP — real connection so the
+        # BridgeRegistry isinstance() check inside Step 6.5 passes.
         monkeypatch.setattr(
             serve_production,
             "connect_writer",
-            lambda db_path: MagicMock(spec=sqlite3.Connection),
+            lambda db_path: sqlite3.connect(":memory:"),
         )
         sentinel_pool = MagicMock(name="pool")
-        monkeypatch.setattr(
-            serve_production,
-            "SqliteLifecyclePersistence",
-            lambda **kw: sentinel_pool,
-        )
+
+        def _fake_pool(**kw: Any) -> Any:
+            sentinel_pool.connection = kw["connection"]
+            return sentinel_pool
+
+        monkeypatch.setattr(serve_production, "SqliteLifecyclePersistence", _fake_pool)
 
         captured: dict[str, Any] = {}
 
@@ -481,9 +537,7 @@ class TestAsyncTaskStarterThreading:
             captured.update(kwargs)
             return lambda client: None
 
-        monkeypatch.setattr(
-            serve_module, "bind_production_dispatch_chain", _capture
-        )
+        monkeypatch.setattr(serve_module, "bind_production_dispatch_chain", _capture)
 
         serve_production.bind_production_serve(serve_config, fake_forge_config)
 
@@ -691,7 +745,8 @@ class TestF010JBindProductionServeThreadsAutobuildRunnerUrl:
         captured: dict[str, Any] = {}
 
         def _recording_factory(
-            *, autobuild_runner_url: str | None = None,
+            *,
+            autobuild_runner_url: str | None = None,
         ) -> Any:
             captured["autobuild_runner_url"] = autobuild_runner_url
             return _FakeMiddleware(tool_names=("start_async_task",))
@@ -711,7 +766,170 @@ class TestF010JBindProductionServeThreadsAutobuildRunnerUrl:
 
         # The fixture sets autobuild_runner_url to the stub sidecar URL;
         # the wrapper MUST thread it through to the factory.
-        assert (
-            captured["autobuild_runner_url"]
-            == "http://forge-autobuild-runner:8124"
+        assert captured["autobuild_runner_url"] == "http://forge-autobuild-runner:8124"
+
+
+# ---------------------------------------------------------------------------
+# TASK-FORGE-FRR-PEBR-WIREUP — Gap PEBR-WIREUP regression-protection seam tests
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleBridgeWireupComposition:
+    """Gap PEBR-WIREUP regression-protection seam tests.
+
+    Pinned by the 2026-05-08 jarvis runbook walkthrough on GB10
+    (correlation_id=5673965b-e302-4a10-89cb-ceb430e64995). Before the
+    fix, ``bind_production_serve`` did not compose any LifecycleBridge /
+    LifecycleBridgeWireup / TerminalPublishLedger; the daemon's deps
+    composer logged ``ack_bridge=deferred (TASK-FRR-PEB-002)``,
+    ``terminal_publish_ledger=deferred (TASK-FRR-PEB-005)`` on every
+    boot, no outbound lifecycle envelopes reached JetStream, and the
+    inbound build-queued message was redelivered every 30s without
+    ever being acked. See TASK-REV-PEBR-003 for the full diagnosis.
+
+    Two complementary tests:
+
+    * threading-capture: kwargs into ``bind_production_dispatch_chain``
+      include ``bridge_wireup_parts``, and that the parts carry a
+      :class:`TerminalPublishLedger` and an
+      :class:`IdentityProvider`.
+    * boot-log: drive the rebound ``compose_dispatch_chain(client)``
+      with a fake NATS client and assert the deps composer's log line
+      reports ``ack_bridge=wired`` and ``terminal_publish_ledger=wired``
+      (NOT ``deferred``).
+    """
+
+    def test_bind_production_serve_threads_register_ack_handle_and_terminal_publish_ledger(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        serve_config,
+        fake_forge_config,
+    ) -> None:
+        """Threading-capture: bridge_wireup_parts reach the composer."""
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
+        )
+        monkeypatch.setattr(
+            serve_production,
+            "connect_writer",
+            lambda db_path: sqlite3.connect(":memory:"),
+        )
+
+        def _fake_pool(**kw: Any) -> Any:
+            pool = MagicMock(name="pool")
+            pool.connection = kw["connection"]
+            return pool
+
+        monkeypatch.setattr(serve_production, "SqliteLifecyclePersistence", _fake_pool)
+
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any):
+            captured.update(kwargs)
+            return lambda client: None
+
+        monkeypatch.setattr(serve_module, "bind_production_dispatch_chain", _capture)
+
+        serve_production.bind_production_serve(serve_config, fake_forge_config)
+
+        # bridge_wireup_parts must be threaded through with ALL the
+        # SQLite-bound dependencies the closure needs to finalise the
+        # LifecycleBridgeWireup.
+        from forge.cli._serve_production import LifecycleBridgeWireupParts
+        from forge.lifecycle_bridge import (
+            LifecycleBridge,
+            StreamEventTranslator,
+            TerminalPublishLedger,
+        )
+
+        parts = captured["bridge_wireup_parts"]
+        assert isinstance(parts, LifecycleBridgeWireupParts)
+        assert isinstance(parts.bridge, LifecycleBridge)
+        assert isinstance(parts.translator, StreamEventTranslator)
+        assert isinstance(parts.terminal_publish_ledger, TerminalPublishLedger)
+        # stream_source / identity_provider are callables.
+        assert callable(parts.stream_source)
+        assert callable(parts.identity_provider)
+
+    def test_bind_production_serve_logs_wired_not_deferred(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tmp_path: Path,
+        fake_forge_config,
+    ) -> None:
+        """Boot-log assertion: deps composer reports ack_bridge=wired."""
+        import asyncio
+        import logging
+
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+
+        # Use a real on-disk DB so SqliteLifecyclePersistence (which
+        # we now do NOT mock) can derive a non-None db_path via
+        # ``PRAGMA database_list`` — ``build_pipeline_consumer_deps``
+        # composes the wave-2 collaborators against a real persistence
+        # facade, so we let the real construction run.
+        config = ServeConfig(
+            db_path=tmp_path / "forge.db",
+            autobuild_runner_url="http://forge-autobuild-runner:8124",
+        )
+
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            lambda **kw: _FakeMiddleware(tool_names=("start_async_task",)),
+        )
+
+        # Build a real ForgeConfig-shape — ``build_pipeline_consumer_deps``
+        # reads ``forge_config.pipeline`` AND
+        # ``forge_config.permissions.filesystem.allowlist`` (via the
+        # forward-context builder). The MagicMock auto-generates
+        # those attributes; the fake_forge_config fixture is enough.
+        from forge.config.models import PipelineConfig
+
+        fake_forge_config.pipeline = PipelineConfig()
+
+        # Fake NATS client passed into the composed
+        # ``compose_dispatch_chain(client)`` closure. The
+        # PipelinePublisher only uses the client lazily inside its
+        # ``publish_*`` methods, so a MagicMock is fine here — we
+        # never reach a real publish in this test.
+        fake_client = MagicMock(name="nats-client")
+
+        # Run the production binding (invokes the real
+        # ``bind_production_dispatch_chain``).
+        serve_production.bind_production_serve(config, fake_forge_config)
+
+        # Drive the rebound composer with the fake client. The
+        # composer is async, so ``asyncio.run``.
+        composer = serve_module.compose_dispatch_chain
+        with caplog.at_level(logging.INFO, logger="forge.cli._serve_deps"):
+            asyncio.run(composer(fake_client))
+
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+
+        assert "ack_bridge=wired" in log_text, (
+            "expected 'ack_bridge=wired' in deps composer log; "
+            "Gap PEBR-WIREUP regression — got:\n" + log_text
+        )
+        assert "terminal_publish_ledger=wired" in log_text, (
+            "expected 'terminal_publish_ledger=wired' in deps composer "
+            "log; Gap PEBR-WIREUP regression — got:\n" + log_text
+        )
+        # Negative assertions — the legacy 'deferred' markers MUST NOT
+        # appear after the fix.
+        assert "deferred (TASK-FRR-PEB-002)" not in log_text, (
+            "ack_bridge is not wired by bind_production_serve "
+            "— Gap PEBR-WIREUP regression"
+        )
+        assert "deferred (TASK-FRR-PEB-005)" not in log_text, (
+            "terminal_publish_ledger is not wired by bind_production_serve "
+            "— Gap PEBR-WIREUP regression"
         )

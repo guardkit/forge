@@ -83,6 +83,7 @@ import sqlite3
 from typing import TYPE_CHECKING, Any
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
+from forge.adapters.nats.pipeline_publisher import PipelinePublisher
 from forge.cli._serve_deps_forward_context import (
     build_forward_context_builder,
     build_stage_log_reader,
@@ -90,13 +91,14 @@ from forge.cli._serve_deps_forward_context import (
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
-from forge.config.models import ForgeConfig
+from forge.config.models import ForgeConfig, PipelineConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 from forge.lifecycle_bridge.coexistence import (
     CLAIMER_F010F_SAFETY_NET,
     TerminalPublishLedger,
 )
+from forge.pipeline import PipelineLifecycleEmitter
 from forge.pipeline.build_ack_handle import InFlightAckRegistry
 from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
@@ -159,9 +161,7 @@ def _build_is_duplicate_terminal(
     lock for the read alone (no transaction).
     """
 
-    async def is_duplicate_terminal(
-        feature_id: str, correlation_id: str
-    ) -> bool:
+    async def is_duplicate_terminal(feature_id: str, correlation_id: str) -> bool:
         """Return True when a terminal ``builds`` row matches the pair."""
         if not feature_id or not correlation_id:
             # The consumer should not call this with empty identifiers
@@ -400,10 +400,7 @@ def _build_publish_build_failed(
         # path threads ``None`` and is exempt: there is no
         # ``(feature_id, correlation_id)`` pair to coordinate against
         # so the bridge could not possibly have observed it).
-        if (
-            terminal_publish_ledger is not None
-            and correlation_id is not None
-        ):
+        if terminal_publish_ledger is not None and correlation_id is not None:
             won = terminal_publish_ledger.claim(
                 feature_id=failure_payload.feature_id,
                 correlation_id=correlation_id,
@@ -434,6 +431,7 @@ def build_pipeline_consumer_deps(
     async_task_starter: AsyncTaskStarter | None = None,
     register_ack_handle: InFlightAckRegistry | None = None,
     terminal_publish_ledger: TerminalPublishLedger | None = None,
+    publisher: PipelinePublisher | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -494,13 +492,9 @@ def build_pipeline_consumer_deps(
             "with None."
         )
     if forge_config is None:
-        raise ValueError(
-            "build_pipeline_consumer_deps: 'forge_config' is required"
-        )
+        raise ValueError("build_pipeline_consumer_deps: 'forge_config' is required")
     if sqlite_pool is None:
-        raise ValueError(
-            "build_pipeline_consumer_deps: 'sqlite_pool' is required"
-        )
+        raise ValueError("build_pipeline_consumer_deps: 'sqlite_pool' is required")
 
     # 1. Compose the three Wave-2 Protocol collaborators against the
     #    shared SQLite pool + ForgeConfig. Each factory is idempotent
@@ -529,9 +523,30 @@ def build_pipeline_consumer_deps(
     #    ``start_async_task`` context payload) so the runner's
     #    lifecycle transitions (starting → planning_waves → ...) emit
     #    on the same NATS connection that wrote the ``stage_log`` row.
-    publisher, emitter = build_publisher_and_emitter(
-        client, config=forge_config.pipeline
-    )
+    #
+    #    TASK-FORGE-FRR-PEBR-WIREUP — when the caller injects a
+    #    ``publisher`` (the production path: ``bind_production_dispatch_chain``
+    #    constructs the publisher inside its closure so the
+    #    :class:`LifecycleBridgeWireup` shares the SAME publisher
+    #    instance as ``publish_build_failed`` — necessary for the
+    #    no-double-emit invariant), use the injected publisher and
+    #    construct an emitter wrapping it. When ``publisher is None``
+    #    (legacy / unit-test path), fall back to the original factory
+    #    for both.
+    if publisher is not None:
+        pipeline_config = (
+            forge_config.pipeline
+            if forge_config.pipeline is not None
+            else PipelineConfig()
+        )
+        emitter = PipelineLifecycleEmitter(
+            publisher=publisher,
+            config=pipeline_config,
+        )
+    else:
+        publisher, emitter = build_publisher_and_emitter(
+            client, config=forge_config.pipeline
+        )
 
     # 3. Build the four field closures.
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
