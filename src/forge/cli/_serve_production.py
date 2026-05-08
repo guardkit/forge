@@ -49,9 +49,11 @@ from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle_bridge import (
     LifecycleBridge,
     LifecycleBridgeWireup,  # noqa: F401  (re-exported via wireup parts contract)
+    RunStateFetcher,
     StreamEventTranslator,
     StreamSource,
     TerminalPublishLedger,
+    langgraph_run_state_fetcher,
     langgraph_stream_source,
 )
 from forge.lifecycle_bridge import coexistence as _bridge_coexistence
@@ -162,6 +164,7 @@ class LifecycleBridgeWireupParts:
     translator: StreamEventTranslator
     stream_source: StreamSource
     identity_provider: "IdentityProvider"
+    run_state_fetcher: RunStateFetcher
     terminal_publish_ledger: TerminalPublishLedger
 
 
@@ -301,6 +304,15 @@ def _build_lifecycle_bridge_wireup_parts(
         sqlite_pool=sqlite_pool,
         autobuild_runner_url=autobuild_runner_url,
     )
+    # TASK-REV-PEBR-005 (FOLLOWUP-C-RACE) — fetch-on-empty fallback for
+    # the join_stream race against fast-completing runs. The fetcher is
+    # consulted by ``LifecycleBridgeWireup._observer_loop`` after the
+    # SSE iterator closes empty; on a terminal run it replays the
+    # final state through the existing translator so the canonical
+    # envelope shape lands without subscribe-before-dispatch
+    # restructuring (which would require modifying deepagents'
+    # AsyncSubAgentMiddleware — out of forge's modify-able surface).
+    run_state_fetcher = langgraph_run_state_fetcher(runner_url=autobuild_runner_url)
     terminal_publish_ledger = TerminalPublishLedger(connection=connection)
 
     return LifecycleBridgeWireupParts(
@@ -308,6 +320,7 @@ def _build_lifecycle_bridge_wireup_parts(
         translator=translator,
         stream_source=stream_source,
         identity_provider=identity_provider,
+        run_state_fetcher=run_state_fetcher,
         terminal_publish_ledger=terminal_publish_ledger,
     )
 

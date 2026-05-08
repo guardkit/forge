@@ -9613,6 +9613,822 @@ GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT- PEBR --verbose
 
 
 
+/task-create please create a review task to address gaps identified in the latest runbook run:
+Forge-side (3 tasks):
+
+FOLLOWUP-A — migration wireup (the AC-11 catch). Add lifecycle_bridge_registry.apply(connection) to forge/src/forge/cli/_serve_production.py Step 3.5b alongside the existing _bridge_coexistence.apply_migration() call. ~5 lines.
+FOLLOWUP-B — bridge attaches but emits nothing. Investigate why the SSE→envelope translator stays silent. Likely candidates: placeholder thread_id=pending-FEAT-43DE not getting re-bound to the real task_id after dispatch; or the autobuild_runner's _update_state shape doesn't match what the translator expects. Needs forge-internal tracing.
+FOLLOWUP-C (new, not in original list) — langgraph.json orchestrator graph import broken. from agents import create_orchestrator in forge/src/forge/agent.py fails: No module named 'agents'. This forced me to start the sidecar with a stripped config containing only autobuild_runner. Forge-side fix.
+
+Summary
+End-to-end runbook walkthrough complete. Phases 0–6 green, Phase 7 FAIL — and the failure is exactly the kind AC-11 was designed to catch.
+
+What worked:
+
+Image rebuilt from 1b82236 (PEBR-WIREUP) — composer log line confirms wiring landed: forge-serve: dispatch chain composed; _serve_daemon.dispatch_payload rebound to handle_message dispatcher (receipt-only stub no longer reachable)
+Jarvis chat boot: clean — TASK-FRR-001 reconciliation has landed (none of the documented "expected boot warnings" reproduce)
+queue_build published two real envelopes; correlation_ids af772739-… and 7657ed5a-…; PIPELINE last_seq advanced 19→21
+What failed (Phase 7 — two distinct gaps):
+
+The AC-11 catch — migration drift. bind_production_serve ships apply_at_boot() + _bridge_coexistence.apply_migration() at boot but does not apply forge.persistence.migrations.lifecycle_bridge_registry.apply(). Every dispatch logs register_ack_handle raised (no such table: lifecycle_bridge_registry); continuing with legacy ack_callback fallback. Hot-fixed via docker exec + persistent volume mount → bridge then attaches cleanly per its own logs.
+The surprise — bridge attaches but emits nothing. Even after migration is fixed, wire-tap captures only the inbound pipeline.build-queued.FEAT-43DE envelopes — zero outbound. The autobuild_runner ran a 13+ min deepagents tool loop against llama-swap; bridge logged lifecycle_bridge.attach … observer task scheduled and SSE GET 200, but never produced a build-started envelope. JetStream ack_floor stuck at 11.
+Deliverables:
+
+docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-post-pebr-wireup.md — full per-phase RESULTS, two-gap deep dive, six runbook gap-folds, three recommended follow-up tasks
+docs/history/command_history.md — appended runbook entry pointing to RESULTS + evidence
+/tmp/jarvis-runbook-evidence/ — wire-tap, forge logs, sidecar logs, stream/consumer info pre/post, DDR-019 traces
+Six runbook gaps caught (need source-level update before next operator runs): forge serve requires --config, FORGE_AUTOBUILD_RUNNER_URL + langgraph-runner sidecar, /home/forge/.forge host mount, supervisor's queue_build output is markdown not JSON, §5.1 expected-warnings table is stale, §4.2 graphiti probe collides with open-webui on :8080.
+
+Recommended follow-ups: TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A (wire the missing migration — ~5 lines), -FOLLOWUP-B (investigate bridge↔runner state-update contract), TASK-FRR-RUNBOOK-002 (gap-fold the runbook for the new topology). AC-11 of TASK-FORGE-FRR-PEBR-WIREUP NOT met — the task should not be moved to completed/ until -A lands and the wire shows a real pipeline.build-started.FEAT-*.
+
+I will create a seperate review in jarvis repo for the jarvis specific gaps
+Bash List tasks directory structure
+IN
+ls -la /home/richardwoollcott/Projects/appmilla_github/forge/tasks/ 2>/dev/null && echo "---" && ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/ 2>/dev/null | head -20
+
+OUT
+total 28
+drwxrwxr-x  7 richardwoollcott richardwoollcott 4096 Apr 29 16:09 .
+drwxrwxr-x 19 richardwoollcott richardwoollcott 4096 May  8 06:42 ..
+drwxrwxr-x 16 richardwoollcott richardwoollcott 4096 May  6 17:28 backlog
+drwxrwxr-x 52 richardwoollcott richardwoollcott 4096 May  8 06:42 completed
+drwxrwxr-x  2 richardwoollcott richardwoollcott 4096 Apr 28 06:28 design_approved
+drwxrwxr-x  3 richardwoollcott richardwoollcott 4096 May  7 06:46 in_progress
+drwxrwxr-x  7 richardwoollcott richardwoollcott 4096 May  7 06:49 in_review
+---
+confidence-gated-checkpoint-protocol
+feat-f8-validation-fixes
+feat-jarvis-internal-001-followups
+forge-autobuild-runner-pipeline-emitter-bridge
+forge-serve-orchestrator-wiring
+forge-v2-doc-alignment
+guardkit-command-invocation-engine
+infrastructure-coordination
+langchain-1x-pin-alignment
+mode-a-greenfield-end-to-end
+mode-b-feature-and-mode-c-review-fix
+nats-fleet-integration
+pipeline-state-machine-and-configuration
+specialist-agent-delegation
+TASK-CGCP-001-define-gating-module-structure.md
+TASK-CGCP-002-add-approval-config.md
+TASK-CGCP-003-request-id-derivation-helper.md
+TASK-CGCP-012-bdd-scenario-task-linking.md
+TASK-FIX-F09A2-guardkit-uv-sources-detection.md
+TASK-FIX-F0E6b-republish-nats-core-wheel.md
+Bash Find related FRR/PEBR tasks
+IN
+find /home/richardwoollcott/Projects/appmilla_github/forge/tasks -name "TASK-FORGE-FRR-PEBR-WIREUP*" -o -name "*FRR*" -o -name "*PEBR*" 2>/dev/null | head -20
+
+OUT
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-007-cancel-emit-ownership.md
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-003
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010F
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-012-forge-status-in-flight-surface.md
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010M
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010G
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-004-wire-bridge-into-forge-serve.md
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-FM-001
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010L
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-002
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010H
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010E
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-013-sidecar-aware-e2e-integration-test.md
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010C
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-FM-002
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-001b
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-003-sse-to-envelope-translation.md
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FORGE-FRR-F010J
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-FM-003
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/completed/TASK-FRR-PEB-008-reconnect-with-backoff-and-deadline.md
+Bash Check existing followups and in_review tasks
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/feat-jarvis-internal-001-followups/ 2>/dev/null && echo "---" && ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/in_review/ 2>/dev/null
+
+OUT
+README.md
+TASK-FORGE-FRR-F010I-decide-langgraph-deployment-shape-for-autobuild-runner.md
+TASK-REV-F010-bind-production-dispatch-chain-in-serve-cmd.md
+TASK-REV-F010M-plan-autobuild-runner-pipeline-emitter-bridge.md
+---
+feat-jarvis-internal-001-followups
+project-scaffold
+TASK-FIX-DEA8-001-drop-tests-cli-from-feat-dea8-smoke-gate.md
+TASK-FIX-F0E8-forge-build-stale-module-ref.md
+TASK-REV-3EEE-plan-pipeline-state-machine-and-configuration.md
+TASK-REV-F1B8
+TASK-REV-FW10-plan-forge-serve-orchestrator-wiring.md
+TASK-REV-IC8B-plan-infrastructure-coordination.md
+TASK-REV-SAD3-plan-specialist-agent-delegation.md
+TASK-SPIKE-C1E9
+TASK-SPIKE-D2F7
+Bash Locate PEBR-WIREUP task
+IN
+find /home/richardwoollcott/Projects/appmilla_github/forge/tasks -name "TASK-FORGE-FRR-PEBR-WIREUP*" 2>/dev/null
+
+OUT
+/home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FORGE-FRR-PEBR-WIREUP-fix.md
+Bash List runbooks directory
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/ 2>/dev/null | head -20
+
+OUT
+RESULTS-FEAT-FORGE-008-validation.md
+RESULTS-FEAT-FORGE-008-validation-rerun.md
+RUNBOOK-FEAT-FORGE-008-finproxy-first-run.md
+RUNBOOK-FEAT-FORGE-008-validation.md
+RUNBOOK-FEAT-FORGE-009-nats-core-symlink-fix.md
+Bash List jarvis-internal-001-followups tasks
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/in_review/feat-jarvis-internal-001-followups/ 2>/dev/null
+
+OUT
+TASK-FORGE-FRR-F010D-thread-correlation-id-into-recovery-build-failed-emit.md
+Read TASK-FORGE-FRR-PEBR-WIREUP-fix.md
+Bash Find results and runbook docs
+IN
+find /home/richardwoollcott/Projects/appmilla_github/forge/docs -name "RESULTS-FEAT-JARVIS*" 2>/dev/null; find /home/richardwoollcott/Projects/appmilla_github/forge/docs -name "*post-pebr*" 2>/dev/null
+
+OUT
+(Bash completed with no output)
+Bash Find runbooks and any RESULTS file
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/in_review/feat-jarvis-internal-001-followups/ 2>/dev/null && echo "---" && find /home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks -type f 2>/dev/null && echo "---" && find /home/richardwoollcott/Projects/appmilla_github/forge -name "RESULTS-FEAT-JARVIS*" 2>/dev/null
+
+OUT
+TASK-FORGE-FRR-F010D-thread-correlation-id-into-recovery-build-failed-emit.md
+---
+/home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/RUNBOOK-FEAT-FORGE-009-nats-core-symlink-fix.md
+/home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/RESULTS-FEAT-FORGE-008-validation-rerun.md
+/home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/RUNBOOK-FEAT-FORGE-008-finproxy-first-run.md
+/home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/RUNBOOK-FEAT-FORGE-008-validation.md
+/home/richardwoollcott/Projects/appmilla_github/forge/docs/runbooks/RESULTS-FEAT-FORGE-008-validation.md
+---
+Bash Look at review task structure
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/in_review/TASK-REV-F1B8/ 2>/dev/null; echo "---"; ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/ 2>/dev/null | head -40
+
+OUT
+TASK-REV-F1B8-analyse-claude-desktop-feedback-on-adr-arch-031.md
+---
+IMPLEMENTATION-GUIDE.md
+README.md
+TASK-FORGE-FRR-PEBR-WIREUP-fix.md
+TASK-REV-PEBR-001-analyse-autobuild-failed-run-1.md
+TASK-REV-PEBR-002-analyse-autobuild-failed-run-2.md
+TASK-REV-PEBR-003-analyse-bind-production-serve-wireup-gap.md
+Read TASK-REV-PEBR-003-analyse-bind-production-serve-wireup-gap.md
+Bash List feat-jarvis-internal-001-followups dirs
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/feat-jarvis-internal-001-followups/ 2>/dev/null; echo "---"; ls /home/richardwoollcott/Projects/appmilla_github/forge/tasks/in_review/feat-jarvis-internal-001-followups/ 2>/dev/null
+
+OUT
+README.md
+TASK-FORGE-FRR-F010I-decide-langgraph-deployment-shape-for-autobuild-runner.md
+TASK-REV-F010-bind-production-dispatch-chain-in-serve-cmd.md
+TASK-REV-F010M-plan-autobuild-runner-pipeline-emitter-bridge.md
+---
+TASK-FORGE-FRR-F010D-thread-correlation-id-into-recovery-build-failed-emit.md
+Read README.md
+Bash Find existing FOLLOWUP tasks and migration file
+IN
+grep -l "FOLLOWUP" /home/richardwoollcott/Projects/appmilla_github/forge/tasks/**/*.md 2>/dev/null | head -10; echo "---"; grep -lE "lifecycle_bridge_registry" /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/*.py 2>/dev/null
+
+OUT
+---
+/home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/__init__.py
+/home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/lifecycle_bridge_published_lifecycles.py
+/home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/lifecycle_bridge_registry.py
+Bash Check migration files and serve production
+IN
+ls /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/ 2>/dev/null; echo "---"; grep -n "apply_at_boot\|apply_migration\|lifecycle_bridge_registry" /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/cli/_serve_production.py 2>/dev/null | head -20
+
+OUT
+__init__.py
+lifecycle_bridge_published_lifecycles.py
+lifecycle_bridge_registry.py
+__pycache__
+---
+47:from forge.lifecycle.migrations import apply_at_boot
+72:    (``after - before``) — :func:`apply_at_boot` itself returns the
+368:    3.5. Apply any pending SQLite migrations via :func:`apply_at_boot`
+456:    schema_version_after = apply_at_boot(connection)
+468:    _bridge_coexistence.apply_migration(connection)
+Read _serve_production.py (lines 441-530)
+Bash Inspect lifecycle_bridge_registry migration shape
+IN
+grep -n "def apply\|def __\|^from\|^import" /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/lifecycle_bridge_registry.py 2>/dev/null | head -10; echo "---"; cat /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/persistence/migrations/__init__.py 2>/dev/null
+
+OUT
+33:from __future__ import annotations
+35:import logging
+36:import sqlite3
+37:from typing import Final
+95:def apply(connection: sqlite3.Connection) -> None:
+---
+"""Schema migrations for the :mod:`forge.persistence` substrate.
+
+Each module in this package exposes a top-level ``apply(connection)``
+function that materialises (or upgrades) a single auxiliary table.
+Migrations here are deliberately additive and idempotent — re-running
+them against an already-migrated database is a no-op.
+
+Boot wiring (TASK-FRR-PEB-004) will compose these helpers after
+:func:`forge.lifecycle.migrations.apply_at_boot` so the auxiliary
+tables share the same writer connection and transactional discipline
+as the canonical ``builds`` / ``stage_log`` substrate.
+"""
+
+from __future__ import annotations
+
+from forge.persistence.migrations import lifecycle_bridge_registry
+
+__all__ = ["lifecycle_bridge_registry"]
+Read agent.py
+Bash Confirm registry migration usage in serve production
+IN
+grep -rn "lifecycle_bridge_registry\|register_ack_handle" /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/cli/_serve_production.py 2>/dev/null | head -20; echo "---"; grep -n "from forge.persistence.migrations" /home/richardwoollcott/Projects/appmilla_github/forge/src/forge/cli/_serve_production.py 2>/dev/null
+
+OUT
+/home/richardwoollcott/Projects/appmilla_github/forge/src/forge/cli/_serve_production.py:184:       :meth:`register_ack_handle` runs BEFORE
+---
+Bash Find langgraph.json files
+IN
+find /home/richardwoollcott/Projects/appmilla_github/forge -name "langgraph.json" 2>/dev/null | head -5
+
+OUT
+/home/richardwoollcott/Projects/appmilla_github/forge/langgraph.json
+/home/richardwoollcott/Projects/appmilla_github/forge/spikes/deepagents-053/langgraph.json
+Read langgraph.json
+I have enough context. Let me create the review task. Since this bundles three discovered Forge-side gaps surfaced by the post-PEBR-WIREUP runbook revalidation (and AC-11 of the parent task), it fits as TASK-REV-PEBR-004 alongside its peers in the FEAT-PEBR review series.
+
+Write TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md
+191 lines
+---
+id: TASK-REV-PEBR-004
+title: Triage three Forge-side gaps surfaced by post-PEBR-WIREUP runbook revalidation (AC-11 catch + bridge silent + langgraph.json orchestrator import)
+status: backlog
+created: 2026-05-08T11:00:00Z
+updated: 2026-05-08T11:00:00Z
+priority: high
+task_type: review
+review_mode: gap-analysis
+review_depth: standard
+decision_required: true
+parent_feature: FEAT-PEBR
+parent_task: TASK-FORGE-FRR-PEBR-WIREUP
+companion_to:
+  - TASK-REV-PEBR-001
+  - TASK-REV-PEBR-002
+  - TASK-REV-PEBR-003
+discovered_during: jarvis runbook RUNBOOK-FEAT-JARVIS-INTERNAL-001-first-real-run.md walkthrough on GB10 (post-PEBR-WIREUP rebuild)
+discovered_at: 2026-05-08T10:30:00Z
+forge_head_at_discovery: 1b82236
+runbook_results_doc: docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-post-pebr-wireup.md
+runbook_evidence_dir: /tmp/jarvis-runbook-evidence/
+parent_ac_blocked: TASK-FORGE-FRR-PEBR-WIREUP::AC-11 (deferred runbook revalidation) — NOT met until FOLLOWUP-A lands and the wire shows a real pipeline.build-started.FEAT-*
+gaps_in_scope:
+  - FOLLOWUP-A   # migration wireup (lifecycle_bridge_registry.apply not invoked at boot)
+  - FOLLOWUP-B   # bridge attaches but emits nothing (SSE→envelope translator silent)
+  - FOLLOWUP-C   # langgraph.json orchestrator graph import broken (from agents import create_orchestrator)
+out_of_scope:
+  - jarvis-side gaps (separate review created in jarvis repo)
+  - the six runbook gap-folds (tracked separately as TASK-FRR-RUNBOOK-002)
+tags:
+  - forge-serve
+  - lifecycle-bridge
+  - production-binding
+  - migration-wireup
+  - langgraph-deployment
+  - feat-pebr
+  - pebr-wireup-followup
+  - first-real-run-followup
+  - regression-protection
+estimated_review_minutes: 60
+estimated_implementation_minutes_after_review: 90  # FOLLOWUP-A ~5min, FOLLOWUP-B ~60min spike, FOLLOWUP-C ~25min
+test_results:
+  status: pending
+  coverage: null
+  last_run: null
+---
+
+# Task: Triage three Forge-side gaps surfaced by post-PEBR-WIREUP runbook revalidation
+
+## TL;DR
+
+The 2026-05-08 runbook revalidation of [TASK-FORGE-FRR-PEBR-WIREUP](TASK-FORGE-FRR-PEBR-WIREUP-fix.md) AC-11 (rebuilt forge image at `1b82236`) confirmed Phases 0–6 green and the dispatch-chain composer line landed cleanly:
+
+```
+forge-serve: dispatch chain composed; _serve_daemon.dispatch_payload rebound to handle_message dispatcher
+```
+
+But Phase 7 **failed** with two distinct gaps — and a third gap (langgraph.json orchestrator graph) blocked the operator from running with the canonical sidecar config. All three are Forge-side. This review triages them, scopes the fix shape for each, and decides which spawn standalone implementation tasks.
+
+**No code changes in this task — analysis + decision + spawn implementation tasks only.**
+
+## Why
+
+**Parent AC-11 is the gate.** [TASK-FORGE-FRR-PEBR-WIREUP](TASK-FORGE-FRR-PEBR-WIREUP-fix.md) AC-11 (deferred at merge) requires the rebuilt image to publish a real `pipeline.build-started.FEAT-*` envelope and JetStream `ack_floor` to advance past the inbound. Until FOLLOWUP-A lands, every dispatch logs:
+
+```
+register_ack_handle raised (no such table: lifecycle_bridge_registry); continuing with legacy ack_callback fallback
+```
+
+The legacy `ack_callback` fallback acks-on-dispatch-return — exactly the redelivery-storm closure the bridge was built to replace — so even on a green migration the wire stays empty.
+
+**The parent task must NOT be moved to `tasks/completed/` until at minimum FOLLOWUP-A lands and Phase 7 of the runbook captures a real `pipeline.build-started.FEAT-*` envelope.**
+
+## Background
+
+### Discovery context (operator narrative)
+
+End-to-end runbook walkthrough on GB10 against:
+
+- **forge HEAD** `1b82236` (PEBR-WIREUP — `fix(FEAT-PEBR): compose LifecycleBridgeWireup in bind_production_serve`)
+- **Phases 0–6** all green; jarvis chat boot clean (TASK-FRR-001 reconciliation has landed)
+- **Phase 7** FAIL — the failure is exactly the kind AC-11 was designed to catch
+
+Two real envelopes published by `queue_build` with correlation_ids `af772739-…` and `7657ed5a-…`; PIPELINE last_seq advanced 19→21. Inbound side worked. Outbound side did not.
+
+### Operator-facing evidence on the rebuilt image
+
+| Symptom | Evidence file | One-line |
+|---|---|---|
+| Migration drift on every dispatch | forge prod logs | `register_ack_handle raised (no such table: lifecycle_bridge_registry); continuing with legacy ack_callback fallback` |
+| Bridge attaches but emits nothing (post hot-fix) | wire-tap pre/post + sidecar logs | `lifecycle_bridge.attach … observer task scheduled`; `SSE GET 200`; **zero outbound** envelopes; deepagents tool loop ran 13+ min against llama-swap |
+| Sidecar boot can't load orchestrator graph | sidecar logs | `from agents import create_orchestrator` ⇒ `No module named 'agents'`; operator forced to start sidecar with stripped `langgraph.json` containing only `autobuild_runner` |
+
+Hot-fix during the walkthrough: `docker exec` + persistent volume mount applied `lifecycle_bridge_registry.apply()` manually; bridge then attached cleanly per its own logs — but the silent-bridge gap (FOLLOWUP-B) remained. JetStream `ack_floor` stuck at 11.
+
+### The three gaps in scope
+
+| Gap | One-line | Estimated fix shape |
+|---|---|---|
+| **FOLLOWUP-A** | `bind_production_serve` Step 3.5b applies `_bridge_coexistence.apply_migration(connection)` but does **not** apply `forge.persistence.migrations.lifecycle_bridge_registry.apply(connection)`. ~5 lines. | Trivial — extend the existing Step 3.5b block with one extra `apply()` call. |
+| **FOLLOWUP-B** | After FOLLOWUP-A's hot-fix the bridge attaches and the SSE GET returns 200, but the SSE→envelope translator stays silent. Likely candidates: placeholder `thread_id=pending-FEAT-43DE` not getting re-bound to the real task_id after dispatch; or the `autobuild_runner._update_state` shape doesn't match what the translator expects. | Investigation/spike task — needs forge-internal tracing. |
+| **FOLLOWUP-C** | `langgraph.json` declares two graphs (`orchestrator` + `autobuild_runner`); `forge.agent` does `from agents import create_orchestrator` which fails: `No module named 'agents'`. Forced operator to start the sidecar with a stripped config containing only `autobuild_runner`. | Forge-side import resolution — likely a missing `src/forge/agents/__init__.py` re-export or a path-shim issue, or langgraph.json should point at a different module. |
+
+## Acceptance Criteria
+
+- [ ] **AC-1** — **FOLLOWUP-A diagnosis & spawn.** Confirm the missing-migration root cause by reading [_serve_production.py:445-468](../../../src/forge/cli/_serve_production.py#L445) Step 3.5/3.5b and verifying:
+  - `_bridge_coexistence.apply_migration(connection)` IS invoked (line 468);
+  - `lifecycle_bridge_registry.apply(connection)` is NOT;
+  - `BridgeRegistry` (the class that owns `lifecycle_bridge_registry`) instantiates fine but its first SQL touch raises because the table doesn't exist on a fresh DB.
+
+  Spawn implementation task **TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A** with:
+  - Single AC: extend `_serve_production.py` Step 3.5b to call `lifecycle_bridge_registry.apply(connection)` after the existing `_bridge_coexistence.apply_migration(connection)` line.
+  - Idempotent (`CREATE TABLE IF NOT EXISTS`).
+  - One regression test: extend `tests/forge/test_cli_serve_production.py::TestLifecycleBridgeWireupComposition` (or a sibling class) to assert that on a fresh writer connection both tables (`lifecycle_bridge_terminal_publishes` AND `lifecycle_bridge_registry`) exist after `bind_production_serve()` returns. Test must fail on pre-fix HEAD `1b82236` and pass after the fix.
+  - Lint + format clean on touched files.
+
+- [ ] **AC-2** — **FOLLOWUP-B scope decision.** Decide which of the two suspected root causes to investigate first. Document the decision and the rationale:
+
+  - **Path 1 — placeholder thread_id rebind.** The hot-fix evidence shows `lifecycle_bridge.attach` happening on `pipeline.build-queued.FEAT-43DE` BEFORE the dispatcher writes the real `task_id` to the `async_tasks` mirror. The wireup's `register_ack_handle` runs before `dispatch_autobuild_async`, so the `IdentityProvider` is polled with `feature_id=FEAT-43DE` and (per the parent task's AC-3 wiring) returns `None` until the dispatcher writes the row, then resolves `(thread_id, run_id)`. **Verify with tracing**: log every IdentityProvider invocation, log the resolved `(thread_id, run_id)`, log every `langgraph_sdk.client.runs.join_stream` call's args.
+
+  - **Path 2 — translator state-update shape mismatch.** The bridge logged `observer task scheduled` and `SSE GET 200`, so the stream IS open. But [TASK-FRR-PEB-003](../../completed/TASK-FRR-PEB-003-sse-to-envelope-translation.md) defines what `StreamPart` shapes the translator recognises. `autobuild_runner._update_state` in [src/forge/subagents/autobuild_runner.py](../../../src/forge/subagents/autobuild_runner.py) emits `Command(update={...})` whose payload shape may not match. **Verify with tracing**: log every event yielded by `runs.join_stream`; cross-reference against the translator's `_translate_event` switch.
+
+  Spawn investigation task **TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B** with:
+  - Mode: `direct` (spike) — instrument with logging, capture the wire trace, then decide between fix-here vs. spawn-followup-fix.
+  - Time-box: 90 minutes of tracing on a local rebuild before escalating.
+  - Out-of-band: capture trace logs to `/tmp/runbook-evidence-FOLLOWUP-B/` for handover if the spike doesn't conclude in one session.
+  - Exit criteria: either (a) one targeted fix task spawned with a clear root-cause; or (b) a documented "translator shape contract" PR proposal handed back to FEAT-PEBR.
+
+- [ ] **AC-3** — **FOLLOWUP-C scope decision.** Read [src/forge/agent.py:23](../../../src/forge/agent.py#L23) and [langgraph.json](../../../langgraph.json) and decide between:
+
+  - **Option (i) — fix the import.** `from agents import create_orchestrator` looks like a relative-to-`src/` import. Confirm whether `src/forge/agents/__init__.py` exists and whether the langgraph-runner sidecar's PYTHONPATH includes `src/`. If the agents module ships under `src/forge/agents/` not top-level `agents/`, change the import to `from forge.agents import create_orchestrator`; if `agents/` is a separate top-level package, ensure it's on the deployment path.
+
+  - **Option (ii) — re-point langgraph.json.** If the orchestrator graph is not actually meant to load inside the sidecar at production deploy time (only `autobuild_runner` is the production graph), narrow `langgraph.json` "graphs" to `{"autobuild_runner": "./src/forge/subagents/autobuild_runner.py:graph"}` and move the orchestrator entry to a separate `langgraph-dev.json` or similar.
+
+  - **Option (iii) — split the file.** Keep both graphs in `langgraph.json` for `langgraph dev` (template-style), but ship a production override at deploy time.
+
+  Spawn implementation task **TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-C** with the decision recorded, plus:
+  - Single AC matching the chosen option.
+  - One sidecar boot test: stand up the langgraph-runner with the canonical (un-stripped) config and confirm both graphs load cleanly.
+  - Document in the task body why the chosen option was preferred over the others.
+
+- [ ] **AC-4** — **Parent AC-11 status.** Update [TASK-FORGE-FRR-PEBR-WIREUP](TASK-FORGE-FRR-PEBR-WIREUP-fix.md) frontmatter to record:
+  - `ac_status.AC-11`: `blocked_on: [TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A, TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B]`
+  - A note in the body that the parent task remains in `in_review/` (NOT `completed/`) until at minimum FOLLOWUP-A lands and the runbook captures a real `pipeline.build-started.FEAT-*` envelope on the wire (FOLLOWUP-B may follow-up post-hoc if its scope expands).
+
+- [ ] **AC-5** — **Cross-link integrity.** This task references three implementation tasks it spawns. After spawning, update this task's `spawned_tasks` frontmatter list and verify each spawned task's `parent_review` field points back to `TASK-REV-PEBR-004`.
+
+- [ ] **AC-6** — **Out-of-scope confirmation.** Explicitly confirm in the review notes that:
+  - Six runbook gap-folds (forge serve `--config` requirement, FORGE_AUTOBUILD_RUNNER_URL + langgraph-runner sidecar, `/home/forge/.forge` host mount, supervisor's `queue_build` markdown-vs-JSON output, §5.1 stale expected-warnings table, §4.2 graphiti probe vs. open-webui :8080 collision) are **out of scope** for this review and are tracked under the runbook gap-fold task (TASK-FRR-RUNBOOK-002).
+  - Jarvis-side gaps are **out of scope** for this review and tracked in a separate review in the jarvis repo.
+
+## Inputs / Evidence
+
+- **Runbook results doc**: `docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08-post-pebr-wireup.md` — full per-phase RESULTS, two-gap deep dive, six runbook gap-folds.
+- **Runbook evidence dir**: `/tmp/jarvis-runbook-evidence/` — wire-tap, forge logs, sidecar logs, stream/consumer info pre/post hot-fix, DDR-019 traces.
+- **Command history**: `docs/history/command_history.md` — appended runbook entry pointing to RESULTS + evidence.
+- **Parent task**: [TASK-FORGE-FRR-PEBR-WIREUP](TASK-FORGE-FRR-PEBR-WIREUP-fix.md) — the work whose AC-11 surfaced these gaps.
+- **Migration source**: [src/forge/persistence/migrations/lifecycle_bridge_registry.py](../../../src/forge/persistence/migrations/lifecycle_bridge_registry.py) — the `apply(connection)` function that needs invoking at boot.
+- **Boot composer**: [src/forge/cli/_serve_production.py:445-468](../../../src/forge/cli/_serve_production.py#L445) — the existing Step 3.5/3.5b block where FOLLOWUP-A lands.
+- **Orchestrator entrypoint**: [src/forge/agent.py:23](../../../src/forge/agent.py#L23) — the `from agents import create_orchestrator` line that fails.
+- **Deployment config**: [langgraph.json](../../../langgraph.json) — declares both graphs.
+
+## Decision Checkpoint
+
+After review, present the operator with the three implementation-task scopes and confirm:
+
+1. **[A]ccept all three** — spawn FOLLOWUP-A, -B, -C as described.
+2. **[M]odify scopes** — adjust before spawning (e.g. expand FOLLOWUP-B's time-box, fold FOLLOWUP-C into a runbook gap-fold instead).
+3. **[D]efer one or more** — leave a gap unfixed if the operator judges priority lower than other in-flight work.
+4. **[C]ancel review** — discard if the operator finds the diagnosis flawed.
+
+Default recommendation: **[A]ccept** — FOLLOWUP-A is the AC-11 catch and a 5-line fix; FOLLOWUP-C unblocks the canonical sidecar config; FOLLOWUP-B is the only one with genuine scope ambiguity and is therefore framed as a 90-min spike.
+
+## References
+
+- [TASK-FORGE-FRR-PEBR-WIREUP](TASK-FORGE-FRR-PEBR-WIREUP-fix.md) — parent fix whose AC-11 is blocked by this review's spawned tasks.
+- [TASK-REV-PEBR-003](TASK-REV-PEBR-003-analyse-bind-production-serve-wireup-gap.md) — predecessor review that defined the wireup composition shape (Option B helper-factory).
+- [TASK-FRR-PEB-002](../../completed/TASK-FRR-PEB-002-bridge-skeleton-and-registry.md) — bridge skeleton + `BridgeRegistry` (the consumer of the missing migration).
+- [TASK-FRR-PEB-003](../../completed/TASK-FRR-PEB-003-sse-to-envelope-translation.md) — SSE→envelope translator whose silence FOLLOWUP-B investigates.
+- [TASK-FRR-PEB-013](../../completed/TASK-FRR-PEB-013-sidecar-aware-e2e-integration-test.md) — sidecar-aware E2E (audited as bypassing `bind_production_serve`, so does NOT exercise FOLLOWUP-A's migration path).
+- `forge.persistence.migrations.lifecycle_bridge_registry.apply(connection)` — the missing `apply()` call.
+- `forge.lifecycle_bridge.coexistence.apply_migration(connection)` — the existing call FOLLOWUP-A sits beside.
+
+## Notes for the Reviewer
+
+- **Trust the evidence.** The composer log line confirms PEBR-WIREUP wiring landed. Two operator-facing log lines confirm the migration drift (`no such table: lifecycle_bridge_registry`) and the silent translator (`observer task scheduled` + `SSE GET 200` + zero outbound). FOLLOWUP-A's diagnosis is unambiguous; FOLLOWUP-B's is genuinely between two candidates.
+- **FOLLOWUP-A is the AC-11 catch.** This is exactly the failure mode AC-11 was scoped to detect, and it did. Treat as a clean validation of the parent task's deferred-AC discipline — the gap was caught before promotion, not after.
+- **FOLLOWUP-C is independent.** It surfaced as collateral during sidecar boot; it does not block the bridge happy-path once FOLLOWUP-A + FOLLOWUP-B land — it blocks the **canonical** sidecar config from loading. The runbook revalidation worked around it with a stripped config; the production deploy cannot.
+- **Don't bundle.** Resist the temptation to ship one large fix. FOLLOWUP-A is 5 lines + 1 test; FOLLOWUP-B is a spike; FOLLOWUP-C is an import/deployment-config decision. Three tasks keep the blast radius and the review trail clean.
+Task created.
+
+Created: tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md
+
+Shape: review task (task_type: review, review_mode: gap-analysis, decision_required: true) bundling triage of all three Forge-side gaps surfaced by the post-PEBR-WIREUP runbook revalidation. Single review → spawns three implementation tasks rather than fixing inline, so each fix lands with its own scope and test:
+
+FOLLOWUP-A (AC-1): trivial 5-line lifecycle_bridge_registry.apply(connection) add to _serve_production.py:445-468 Step 3.5b + one regression test that fails on 1b82236.
+FOLLOWUP-B (AC-2): 90-min tracing spike between two candidate root causes (placeholder thread_id rebind vs. translator state-update shape mismatch) — exit criteria force either a targeted fix or a translator-shape contract handoff.
+FOLLOWUP-C (AC-3): three-option import-resolution decision for from agents import create_orchestrator in src/forge/agent.py:23 vs. langgraph.json.
+Parent gating (AC-4): records that TASK-FORGE-FRR-PEBR-WIREUP AC-11 is blocked on FOLLOWUP-A and stays in in_review/ (not completed/) until the wire shows a real pipeline.build-started.FEAT-*.
+
+Out-of-scope explicitly noted (AC-6): six runbook gap-folds (TASK-FRR-RUNBOOK-002) and Jarvis-side gaps (separate review in jarvis repo).
+
+Per /task-create instructions I've stopped here — run /task-review TASK-REV-PEBR-004 when you're ready to execute the analysis and spawn the three follow-up tasks.
+
+did you create a review task? there is no output?
+Bash Verify task file exists
+IN
+ls -la /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004*.md 2>&1
+
+OUT
+-rw-rw-r-- 1 richardwoollcott richardwoollcott 16986 May  8 12:24 /home/richardwoollcott/Projects/appmilla_github/forge/tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md
+Yes, the task was created. The file is at:
+
+tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md (17 KB, created 12:24)
+
+Here's the standard /task-create output I should have shown more prominently:
+
+✅ Task Created: TASK-REV-PEBR-004
+
+📋 Task Details
+
+Title: Triage three Forge-side gaps surfaced by post-PEBR-WIREUP runbook revalidation (AC-11 catch + bridge silent + langgraph.json orchestrator import)
+Status: backlog
+Priority: high
+Type: review (review_mode: gap-analysis, decision_required: true)
+Parent feature: FEAT-PEBR
+Parent task: TASK-FORGE-FRR-PEBR-WIREUP (AC-11 blocked on this review's spawned tasks)
+🎯 Scope (3 gaps in scope, 6 runbook gap-folds + jarvis-side gaps explicitly out of scope)
+
+FOLLOWUP-A — missing lifecycle_bridge_registry.apply(connection) at boot (the AC-11 catch, ~5 lines)
+FOLLOWUP-B — bridge attaches but emits nothing (90-min tracing spike between two candidates)
+FOLLOWUP-C — from agents import create_orchestrator import broken (3-option decision)
+📁 File Location
+tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md
+
+Next Steps:
+
+Review task body — /task-review TASK-REV-PEBR-004
+The review will analyse each gap, decide fix shapes, and spawn three implementation tasks (FOLLOWUP-A/B/C).
+The parent TASK-FORGE-FRR-PEBR-WIREUP must remain in in_review/ until at least FOLLOWUP-A lands and the wire captures a real pipeline.build-started.FEAT-*.
+Sorry for the confusion — the file was written successfully on the first turn; I just buried the confirmation under the design rationale.
+
+
+
+Yes, the task was created. The file is at:
+
+tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md (17 KB, created 12:24)
+
+Here's the standard /task-create output I should have shown more prominently:
+
+✅ Task Created: TASK-REV-PEBR-004
+
+📋 Task Details
+
+Title: Triage three Forge-side gaps surfaced by post-PEBR-WIREUP runbook revalidation (AC-11 catch + bridge silent + langgraph.json orchestrator import)
+Status: backlog
+Priority: high
+Type: review (review_mode: gap-analysis, decision_required: true)
+Parent feature: FEAT-PEBR
+Parent task: TASK-FORGE-FRR-PEBR-WIREUP (AC-11 blocked on this review's spawned tasks)
+🎯 Scope (3 gaps in scope, 6 runbook gap-folds + jarvis-side gaps explicitly out of scope)
+
+FOLLOWUP-A — missing lifecycle_bridge_registry.apply(connection) at boot (the AC-11 catch, ~5 lines)
+FOLLOWUP-B — bridge attaches but emits nothing (90-min tracing spike between two candidates)
+FOLLOWUP-C — from agents import create_orchestrator import broken (3-option decision)
+📁 File Location
+tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-REV-PEBR-004-pebr-wireup-runbook-revalidation-followups.md
+
+Next Steps:
+
+Review task body — /task-review TASK-REV-PEBR-004
+The review will analyse each gap, decide fix shapes, and spawn three implementation tasks (FOLLOWUP-A/B/C).
+The parent TASK-FORGE-FRR-PEBR-WIREUP must remain in in_review/ until at least FOLLOWUP-A lands and the wire captures a real pipeline.build-started.FEAT-*.
+Sorry for the confusion — the file was written successfully on the first turn; I just buried the confirmation under the design rationale.
+
+
+
+/task-review TASK-REV-PEBR-004
+
+All three diagnoses verified against the actual code. Here is the review summary and decision checkpoint.
+
+Review Findings: TASK-REV-PEBR-004
+FOLLOWUP-A — Migration wireup gap [CONFIRMED, trivial]
+Evidence at src/forge/cli/_serve_production.py:445-468 (Step 3.5/3.5b block):
+
+✅ Line 458: canonical migration ladder runs (apply_at_boot)
+✅ Line 468: _bridge_coexistence.apply_migration(connection) IS invoked
+❌ forge.persistence.migrations.lifecycle_bridge_registry.apply(connection) is NOT invoked
+The migration source src/forge/persistence/migrations/lifecycle_bridge_registry.py:95-139 exposes a clean idempotent apply(connection) (uses CREATE TABLE IF NOT EXISTS, also chains published_lifecycles follow-up migration). It just needs to be called. Diagnosis is unambiguous.
+
+Regression test target exists: tests/forge/test_cli_serve_production.py:777 already has TestLifecycleBridgeWireupComposition — the new test sits naturally alongside.
+
+Spawn: TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A per the parent task's AC-1 (one-line fix + one regression test).
+
+FOLLOWUP-B — Silent translator [CONFIRMED ambiguous, spike-shaped]
+The bridge attaches and the SSE GET returns 200, but no envelopes flow. Two candidate root causes (pre-existing in the parent task, both genuine):
+
+Path 1: placeholder thread_id=pending-FEAT-43DE not rebound after dispatcher writes async_tasks row → IdentityProvider returns stale (thread_id, run_id) to runs.join_stream.
+Path 2: autobuild_runner._update_state Command shape mismatches what forge.lifecycle_bridge.translation._translate_event expects.
+I confirmed forge/lifecycle_bridge/{translation.py, wireup.py, stream_source.py} all exist as targeted by the parent — so the spike is well-scoped. 90-minute time-box is appropriate; the differential (Path 1 vs Path 2) can be settled in one trace pass.
+
+Spawn: TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B as mode: direct spike, time-boxed at 90 min, with handover dir /tmp/runbook-evidence-FOLLOWUP-B/.
+
+FOLLOWUP-C — langgraph.json orchestrator import [CONFIRMED, recommend Option (ii)]
+Evidence at src/forge/agent.py:23: from agents import create_orchestrator.
+
+Searched the entire workspace:
+
+❌ No agents/ package at top level
+❌ No src/agents/
+❌ No src/forge/agents/
+❌ def create_orchestrator is not defined anywhere in the codebase (only matches in .venv/)
+pyproject.toml declares [tool.setuptools.packages.find] where = ["src"] — only packages under src/ ship. There is no create_orchestrator factory in Forge to import.
+
+This is template carry-over: agent.py is the langchain-deepagents template's reference orchestrator entrypoint. Forge's actual production graph is autobuild_runner only (FEAT-PEBR routes builds through autobuild_runner, not through a deepagents orchestrator). The orchestrator graph in langgraph.json has never been able to load.
+
+Recommendation: Option (ii) — narrow langgraph.json to production graphs only
+
+{
+    "dependencies": ["."],
+    "graphs": {
+        "autobuild_runner": "./src/forge/subagents/autobuild_runner.py:graph"
+    },
+    "env": ".env"
+}
+Why (ii) over (i) and (iii):
+
+(i) "fix the import" would require manufacturing a create_orchestrator factory and an agents/ package. There is no production caller for it; building it would be net-new work outside the scope of unblocking the canonical sidecar boot.
+(iii) "split the file" assumes the orchestrator graph has a real consumer in dev. It does not — there's no working factory at all. Splitting preserves a broken artifact.
+(ii) is minimal, ships only what works, and matches reality (Forge production = autobuild_runner only). If a deepagents orchestrator graph is wanted later, it can be re-introduced once create_orchestrator actually exists.
+Caveat for the implementer: before deleting the orchestrator entry, grep for any test/dev tooling that loads it (langgraph dev, integration harness configs). If any consumer exists, fall back to Option (iii) (move the orchestrator to langgraph-dev.json) and additionally add a TODO marker in agent.py documenting that create_orchestrator does not exist.
+
+Spawn: TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-C with Option (ii) as the chosen path, the implementer-side grep gate, and the sidecar-boot regression test.
+
+Out-of-scope confirmed (AC-6)
+Six runbook gap-folds (forge serve --config, FORGE_AUTOBUILD_RUNNER_URL, /home/forge/.forge mount, supervisor markdown-vs-JSON, §5.1 stale warnings, §4.2 graphiti probe vs open-webui :8080) → tracked under TASK-FRR-RUNBOOK-002.
+Jarvis-side gaps → separate review in jarvis repo.
+Parent AC-11 status (AC-4)
+TASK-FORGE-FRR-PEBR-WIREUP-fix.md frontmatter to be updated:
+
+ac_status.AC-11: blocked_on: [TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A, TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B]
+Body note: parent stays in current location (currently still tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/, ready for promotion to in_review/ per the recent merge commits) until at minimum FOLLOWUP-A lands and the runbook captures a real pipeline.build-started.FEAT-* envelope on the wire.
+Decision Checkpoint
+Default recommendation: [A]ccept — three tasks, three blast-radii, clean review trail.
+
+Task	Shape	Time
+FOLLOWUP-A	Add 1 line + 1 regression test	task-work	~5 min
+FOLLOWUP-B	90-min tracing spike	direct (spike)	~90 min
+FOLLOWUP-C	Narrow langgraph.json (Option ii) + sidecar boot test	task-work	~25 min
+Choose:
+
+[A]ccept — spawn FOLLOWUP-A, -B, -C as scoped above (with FOLLOWUP-C taking Option ii).
+[M]odify — adjust scopes before spawning (e.g. force FOLLOWUP-C → Option iii, expand FOLLOWUP-B time-box, etc.).
+[D]efer — leave one or more unspawned.
+[C]ancel — discard.
+AskUserQuestion
+OUT
+User has answered your questions: "Decision on the three FOLLOWUP scopes — proceed how?"="Accept all three". You can now continue with the user's answers in mind.
+[A]ccept selected. Spawning the three implementation tasks and updating the parent + this review's frontmatter. First, sampling existing task conventions.
+
+
+
+
+Spawned three implementation tasks (all in tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/):
+
+TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-A — single-line fix in _serve_production.py Step 3.5b + one regression test in TestLifecycleBridgeWireupComposition. Wave 1, ~5 min.
+TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-B — 90-min spike, depends on FOLLOWUP-A, four exit branches (Path 1 / Path 2 / neither / time-box exhausted), trace evidence to /tmp/runbook-evidence-FOLLOWUP-B/. Wave 2.
+TASK-FORGE-FRR-PEBR-WIREUP-FOLLOWUP-C — Option (ii): narrow langgraph.json to autobuild_runner only, AC-1 pre-flight grep gates the deletion in case any consumer of the broken orchestrator graph exists. Wave 1, ~25 min.
+Updated parent TASK-FORGE-FRR-PEBR-WIREUP-fix.md — ac_status.AC-11 flipped from deferred → blocked; added ac_11_blocked_on: [FOLLOWUP-A, FOLLOWUP-B]; promotion gate documented (FOLLOWUP-C is not on the AC-11 critical path).
+
+Updated this review TASK-REV-PEBR-004 — status: review_complete, spawned_tasks cross-link populated, per-followup diagnosis state captured. AC-1 through AC-6 of the review are satisfied; cross-link integrity (AC-5) is bidirectional via each spawned task's parent_review: TASK-REV-PEBR-004.
+
+No code touched (per the review's "analysis + decision + spawn implementation tasks only" scope). Skipped the optional [Phase 4.5] Graphiti knowledge-capture write — --capture-knowledge was not requested. Recommend running FOLLOWUP-A first (unblocks FOLLOWUP-B); FOLLOWUP-C can land in parallel.
+
+
+/task-review TASK-REV-PEBR-003 --mode=gap-analysis
+
+
+All six ACs satisfied. The review task is updated and the implementation task is spawned. Now Phase 5: present the decision checkpoint.
+
+Review complete: TASK-REV-PEBR-003
+Mode: gap-analysis · Depth: standard · Status: review_complete
+
+Findings summary
+AC	Status	Outcome
+AC-1 Diagnosis	✅	Confirmed. _serve_production.bind_production_serve does not compose the wireup; deps composer logs deferred on every boot. wireup.py:277-283 self-documents bind_production_serve as the canonical composition site, which is currently empty.
+AC-2 PEB-013 audit	✅	tests/integration/test_lifecycle_bridge_sidecar_e2e.py:613-617 monkeypatch.setattr(serve_module, "compose_dispatch_chain", _compose_with_sidecar_aware_dispatch) — replaces the production composer with a hand-rolled PipelineConsumerDeps that has no register_ack_handle. Lifecycle envelopes flow through the emitter direct path, not the bridge. PEB-013 calls _run_serve directly — bind_production_serve is never invoked. This is the test gap that let PEBR-WIREUP ship.
+AC-3 Wiring map	✅	Two missing factories flagged as fix-scope expansions: langgraph_stream_source(runner_url=…) (only docstring reference at wireup.py:52) and a production IdentityProvider reading the async_tasks SQLite mirror (only _default_identity_provider() no-op exists at wireup.py:254). Plus: coexistence.apply_migration(connection) not called at boot; bind_production_dispatch_chain signature must extend additively.
+AC-4 Fix shape	✅	Option B (helper factory _build_lifecycle_bridge_wireup_parts(...)) — mirrors the existing _resolve_async_task_starter precedent at _serve_production.py:127. Lower blast radius than C, more testable than A.
+AC-5 Seam test	✅	Two tests at tests/forge/test_cli_serve_production.py under new class TestLifecycleBridgeWireupComposition: threading-capture (mirrors F010's TestAsyncTaskStarterThreading) + caplog-based boot-log assertion (operator-meaningful, exact failure-shape from the runbook walkthrough).
+AC-6 Spawned task	✅	tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FORGE-FRR-PEBR-WIREUP-fix.md — 11 ACs, ~120 min implementation effort.
+Estimate revision
+The review's frontmatter said estimated_implementation_minutes_after_review: 60. The two AC-3 fix-scope expansions push the spawned task to ~120 min. Reflected in the spawned task's frontmatter.
+
+Decision checkpoint
+The review is complete and a single implementation task has been spawned (no further subtask decomposition needed — this is one fix, not a feature).
+
+Options:
+
+[A]ccept — keep the review at review_complete, the spawned task at backlog, ready for /task-work TASK-FORGE-FRR-PEBR-WIREUP whenever you're ready to implement.
+[R]evise — request deeper analysis on a specific area (e.g. dig into langgraph_sdk.client.runs.join_stream API surface to firm up the langgraph_stream_source shape; or audit FW10-011 to see if it could double as the wireup-composition lock instead of adding a new test class).
+[I]mplement — start /task-work TASK-FORGE-FRR-PEBR-WIREUP immediately.
+[C]ancel — discard the review (delete the spawned task and revert frontmatter).
+What's your call?
+
+[R]evise please dig deeper trace the execution flow across system and technology boundaries, read any logs from the jarvis runbook /results and generate C4 sequence diagrams to validate your findings. We ant to 100% sure about the root cause of the issue and the fix see /home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08.md
+
+
+All six ACs satisfied. The review task is updated and the implementation task is spawned. Now Phase 5: present the decision checkpoint.
+
+Review complete: TASK-REV-PEBR-003
+Mode: gap-analysis · Depth: standard · Status: review_complete
+
+Findings summary
+AC	Status	Outcome
+AC-1 Diagnosis	✅	Confirmed. _serve_production.bind_production_serve does not compose the wireup; deps composer logs deferred on every boot. wireup.py:277-283 self-documents bind_production_serve as the canonical composition site, which is currently empty.
+AC-2 PEB-013 audit	✅	tests/integration/test_lifecycle_bridge_sidecar_e2e.py:613-617 monkeypatch.setattr(serve_module, "compose_dispatch_chain", _compose_with_sidecar_aware_dispatch) — replaces the production composer with a hand-rolled PipelineConsumerDeps that has no register_ack_handle. Lifecycle envelopes flow through the emitter direct path, not the bridge. PEB-013 calls _run_serve directly — bind_production_serve is never invoked. This is the test gap that let PEBR-WIREUP ship.
+AC-3 Wiring map	✅	Two missing factories flagged as fix-scope expansions: langgraph_stream_source(runner_url=…) (only docstring reference at wireup.py:52) and a production IdentityProvider reading the async_tasks SQLite mirror (only _default_identity_provider() no-op exists at wireup.py:254). Plus: coexistence.apply_migration(connection) not called at boot; bind_production_dispatch_chain signature must extend additively.
+AC-4 Fix shape	✅	Option B (helper factory _build_lifecycle_bridge_wireup_parts(...)) — mirrors the existing _resolve_async_task_starter precedent at _serve_production.py:127. Lower blast radius than C, more testable than A.
+AC-5 Seam test	✅	Two tests at tests/forge/test_cli_serve_production.py under new class TestLifecycleBridgeWireupComposition: threading-capture (mirrors F010's TestAsyncTaskStarterThreading) + caplog-based boot-log assertion (operator-meaningful, exact failure-shape from the runbook walkthrough).
+AC-6 Spawned task	✅	tasks/backlog/forge-autobuild-runner-pipeline-emitter-bridge/TASK-FORGE-FRR-PEBR-WIREUP-fix.md — 11 ACs, ~120 min implementation effort.
+Estimate revision
+The review's frontmatter said estimated_implementation_minutes_after_review: 60. The two AC-3 fix-scope expansions push the spawned task to ~120 min. Reflected in the spawned task's frontmatter.
+
+Decision checkpoint
+The review is complete and a single implementation task has been spawned (no further subtask decomposition needed — this is one fix, not a feature).
+
+Options:
+
+[A]ccept — keep the review at review_complete, the spawned task at backlog, ready for /task-work TASK-FORGE-FRR-PEBR-WIREUP whenever you're ready to implement.
+[R]evise — request deeper analysis on a specific area (e.g. dig into langgraph_sdk.client.runs.join_stream API surface to firm up the langgraph_stream_source shape; or audit FW10-011 to see if it could double as the wireup-composition lock instead of adding a new test class).
+[I]mplement — start /task-work TASK-FORGE-FRR-PEBR-WIREUP immediately.
+[C]ancel — discard the review (delete the spawned task and revert frontmatter).
+What's your call?
+
+[R]evise please dig deeper trace the execution flow across system and technology boundaries, read any logs from the jarvis runbook /results and generate C4 sequence diagrams to validate your findings. We ant to 100% sure about the root cause of the issue and the fix see /home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-INTERNAL-001-first-real-run-2026-05-08.md
+
+
+TASK-FORGE-FRR-PEBR-WIREUP — Implementation complete
+State: in_progress → in_review
+Intensity: LIGHT (auto-detected from parent_review=TASK-REV-PEBR-003, complexity 5, no high-risk keywords)
+
+Phases executed
+Phase	Outcome
+2 (Planning)	Skipped — plan was the spawned task spec itself (LIGHT mode + parent_review)
+2.5A (Pattern MCP)	Skipped (LIGHT)
+2.5B (Arch Review)	Skipped — review already validated Option B
+2.7 (Complexity)	Skipped — already known
+3 (Implementation)	✅ Delegated to general-purpose agent
+4 (Testing)	✅ Same agent — 2481 tests passed first run
+4.5 (Fix Loop)	Not needed — no failures
+5 (Code Review)	✅ APPROVED, 0 critical findings, 2 cosmetic recommendations
+5.5 (Plan Audit)	✅ PASSED (severity: low)
+What was changed
+Files modified (5):
+
+src/forge/cli/_serve_production.py — +219 (LifecycleBridgeWireupParts dataclass, two helper factories, Step 3.5b coexistence migration, Step 6.5 wireup-parts construction, Step 7 threading)
+src/forge/cli/serve.py — +66 (additive bridge_wireup_parts kwarg; closure finalises LifecycleBridgeWireup with publisher in scope)
+src/forge/cli/_serve_deps.py — +49 (additive publisher kwarg)
+src/forge/lifecycle_bridge/init.py — +12 (re-exports for LifecycleBridgeWireup, StreamEventTranslator, StreamSource, langgraph_stream_source, TerminalPublishLedger)
+tests/forge/test_cli_serve_production.py — +310 (TestLifecycleBridgeWireupComposition + fixture upgrade to real sqlite3.connect(":memory:"))
+Files created (3):
+
+src/forge/lifecycle_bridge/stream_source.py — langgraph_stream_source(*, runner_url) factory
+tests/forge/lifecycle_bridge/test_stream_source.py — 5 tests, all pass
+tests/forge/test_serve_identity_provider.py — 7 tests, all pass
+Total diff: +577 / -79
+
+Key verification points (from code review)
+✅ LifecycleBridgeWireup finalised inside the closure with publisher in scope (serve.py:269-279)
+✅ register_ack_handle and terminal_publish_ledger threaded into build_pipeline_consumer_deps (serve.py:282-289)
+✅ coexistence.apply_migration(connection) called in Step 3.5b (_serve_production.py:468)
+✅ langgraph_sdk 0.3.13 API used correctly (get_client(url=...), runs.list(thread_id, limit=1), runs.join_stream(thread_id, run_id, stream_mode="values"))
+✅ Backwards compatible: legacy callers passing bridge_wireup_parts=None and publisher=None see unchanged behaviour
+✅ Error handling: IdentityProvider swallows SDK errors → None + WARNING; stream_source iterator does NOT swallow transport errors (so wireup's TRANSIENT_STREAM_ERRORS reconnect loop catches them)
+Test results
+Targeted seam tests: 2/2 passed (TestLifecycleBridgeWireupComposition)
+New helper unit tests: 12/12 passed (5 stream_source + 7 identity_provider)
+test_cli_serve_production.py (full): 19/19 passed (was 17 pre-fix; +2 new)
+tests/forge/lifecycle_bridge/ (full): 220/220 passed
+Full forge unit suite: 2481 passed, 1 pre-existing unrelated failure (TestClockHygiene flagging approval_subscriber.py:684 — confirmed pre-existing on HEAD e50241e)
+ruff: clean · black: clean
+What's left
+AC-11 — Post-merge runbook revalidation: rebuild forge image, re-run jarvis runbook §6.2+§7 on GB10, verify pipeline.build-started.FEAT-* reaches JetStream and ack_floor advances. Capture new correlation_id. (Operator step; not in this task's automated scope.)
+Commit / PR: I have not committed the changes — your call. Five files modified, three new files, no destructive operations queued. Run git diff to inspect, or tell me to commit on a feature branch.
+Cosmetic recommendations (non-blocking, from code reviewer)
+stream_source.py:80-103 — annotation comment polish on _source (synchronous def returning AsyncIterator[Any] value)
+_serve_deps.py:535-551 — inline imports inside the publisher is not None branch could be lifted to module level
+Want me to apply the cosmetic recommendations, commit on a feature branch, open a PR, or hand control back?
+
+yes please proceed with the Cosmetic recommendations
+
+
+Both cosmetic recommendations applied
+Edits
+1. src/forge/cli/_serve_deps.py — lifted inline imports to module level
+
+Added PipelineConfig to existing from forge.config.models import ForgeConfig, ...
+Added new from forge.pipeline import PipelineLifecycleEmitter in correct alphabetical position (between forge.lifecycle_bridge.coexistence and forge.pipeline.build_ack_handle)
+Removed the two lazy import lines from inside the if publisher is not None: branch at line 535
+Verified: no circular import (top-level forge.pipeline.__init__ only depends on forge.adapters.nats and forge.config.models, both of which are already imported before forge.pipeline resolves)
+2. src/forge/lifecycle_bridge/stream_source.py — annotation/comment polish on _source
+
+Added a 7-line comment block at the top of the function body explaining that _source is a sync def by design, returning an async-iterator object (not a coroutine), matching the StreamSource Protocol shape at wireup.py. Names the wireup's iteration pattern (async for event in self._stream_source(...), never await) so a future reader doesn't accidentally try to make it async def.
+Verification
+Targeted seam tests: 19/19 still pass (test_cli_serve_production.py)
+Helper unit tests: 12/12 still pass (5 stream_source + 7 identity_provider)
+Broader sweep: 309/309 pass across lifecycle_bridge/ + skeleton + logging + correlation_id contract
+Ruff: clean
+Black: clean (no reformatting needed)
+Import smoke: from forge.cli import _serve_deps; _serve_deps.PipelineConfig and _serve_deps.PipelineLifecycleEmitter both resolve at module scope
+Final diff stat (unchanged in shape, slight LoC delta)
+
+ src/forge/cli/_serve_deps.py             |  49 +++--   (was 49 +++-- — net 0; -2 lazy imports + 2 module-level imports)
+ src/forge/cli/_serve_production.py       | 219 +++++
+ src/forge/cli/serve.py                   |  66 ++++
+ src/forge/lifecycle_bridge/__init__.py   |  12 ++
+ tests/forge/test_cli_serve_production.py | 310 ++++
+ 5 files changed, 576 insertions(+), 80 deletions(-)
+Plus 3 new files (stream_source.py, test_stream_source.py, test_serve_identity_provider.py).
+
+Task state
+Task remains in in_review with code_review.recommendations_applied: 2 recorded in the frontmatter audit trail.
+
+What's next
+Same options as before — your call:
+
+Commit on a feature branch (recommended): I'd suggest fix/pebr-wireup to mirror the feat/pebr precedent.
+Open a PR: with the review's boundary trace + spawned task as the PR description backbone.
+Hand back: leave the working tree as-is for you to inspect / commit yourself.
+please commit /merge directly to main
+
+
+
+
+/task-review TASK-REV-PEBR-005 --mode=gap-analysis
+
+
+Summary
+Diagnosis (TASK-REV-PEBR-005 review):
+
+Signature C (join_stream race) confirmed via code reading + SDK 0.3.13 inspection. Smoking gun: runs.join_stream docstring states "Output is not buffered, so any output produced before this call will not be received here."
+Original fix shapes (a/b/a'/c) all turned out to require modifying deepagents 0.5.6 AsyncSubAgentMiddleware.astart_async_task — which calls runs.create with no resumability passthrough — outside forge's modify-able surface.
+Fix landed (option (e) bridge-side fetch-on-empty):
+
+New run_state_source.py with RunStateFetcher Protocol + langgraph_run_state_fetcher factory (runs.get + threads.get_state).
+wireup.py extended with run_state_fetcher kwarg + _fetch_and_replay_on_empty + _replay_run_state_snapshot + _project_running_wave_state. On empty SSE iterator, the observer fetches the run's terminal state and replays it through the existing translator — emitting BuildStartedPayload then the terminal payload (canonical 2-envelope sequence).
+Production composition wired in _serve_production.py and serve.py.
+7 new regression tests in test_fetch_on_empty.py cover AC-FETCH-1..7 (success replay, still-running, fetcher-None, failed replay, fetcher-raises, live-SSE-precedence regression lock, default-no-op).
+Verification:
+
+Targeted: 7/7 fetch-on-empty pass
+Lifecycle bridge + serve-production + identity-provider sweep: 299/299 pass
+Full forge unit suite (2505 tests, ignoring integration + the pre-existing clock-hygiene allowlist violation flagged by the parent task): clean
+ruff + black clean on all 6 touched files
+Frontmatter updates:
+
+Parent TASK-FORGE-FRR-PEBR-WIREUP-fix.md: ac_status.AC-11 extended; ac_11_blocked_on rewritten to RUNBOOK-RE-RUN-4; ac_11_resolved appended FOLLOWUP-B-FIX + TASK-REV-PEBR-005; ac_11_promotion_gate paragraph 3 added.
+This review's TASK-REV-PEBR-005-…md: status: review_complete; full review_results block populated; spawned_tasks_target retained as superseded for traceability (no FOLLOWUP-C-RACE task spawned).
+Remaining gate for AC-11: rebuild forge image from this HEAD and re-run jarvis runbook §6.2+§7 — the runbook should now capture pipeline.build-started.FEAT-* on the wire (synthesized from the fetched terminal state) and ack_floor should advance.
+
+
+
+
 
 
 

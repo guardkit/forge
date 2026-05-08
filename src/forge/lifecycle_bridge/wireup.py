@@ -68,7 +68,8 @@ import json
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Protocol
 
 from nats_core.events import (
     BuildCancelledPayload,
@@ -87,9 +88,14 @@ from forge.lifecycle_bridge.bridge import (
     LifecycleBridge,
 )
 from forge.lifecycle_bridge.reconnect import ReconnectPolicy
+from forge.lifecycle_bridge.run_state_source import (
+    RunStateFetcher,
+    RunStateSnapshot,
+)
 from forge.lifecycle_bridge.translation import (
     PipelineEvent,
     StreamEventTranslator,
+    VALUES_STREAM_EVENT,
 )
 from forge.pipeline.build_ack_handle import BuildAckHandle
 
@@ -134,6 +140,8 @@ __all__ = [
     "DEFAULT_DEADLINE_SECONDS",
     "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS",
     "LifecycleBridgeWireup",
+    "RunStateFetcher",
+    "RunStateSnapshot",
     "StreamSource",
     "TERMINAL_PAYLOAD_TYPES",
     "TRANSIENT_STREAM_ERRORS",
@@ -266,6 +274,30 @@ def _default_identity_provider() -> IdentityProvider:
     return _provider
 
 
+def _default_run_state_fetcher() -> RunStateFetcher:
+    """Return a no-op :class:`RunStateFetcher` used when one is not injected.
+
+    Pre-existing wireup callers (unit tests, in-process integration tests)
+    that did not opt into the TASK-REV-PEBR-005 fetch-on-empty fallback
+    keep their existing behaviour — the observer's "stream closed without
+    a terminal envelope" branch fires unchanged because the fetcher
+    always reports "no terminal state available". Production composition
+    in :func:`forge.cli._serve_production.bind_production_serve` injects
+    :func:`forge.lifecycle_bridge.run_state_source.langgraph_run_state_fetcher`
+    so the fallback is live on the daemon.
+    """
+
+    async def _fetcher(
+        *,
+        feature_id: str,
+        thread_id: str | None,
+        run_id: str | None,
+    ) -> RunStateSnapshot | None:
+        return None
+
+    return _fetcher
+
+
 # ---------------------------------------------------------------------------
 # LifecycleBridgeWireup
 # ---------------------------------------------------------------------------
@@ -304,6 +336,18 @@ class LifecycleBridgeWireup:
             to a no-op provider that yields ``None`` — sufficient for
             unit tests that drive the observer with a pre-built
             ``stream_source`` ignoring the identity arguments.
+        run_state_fetcher: A :class:`RunStateFetcher` callable used as
+            the fetch-on-empty fallback (TASK-REV-PEBR-005). When the
+            stream closes without yielding a terminal envelope (the
+            Signature C race: the placeholder run finished in ~16 ms
+            before the observer could open ``runs.join_stream``), the
+            observer asks this fetcher whether the run has terminated
+            and — if so — replays the run's final state values through
+            the translator so the canonical envelope shape is preserved.
+            Defaults to a no-op fetcher that always reports "no terminal
+            state available", which preserves pre-FOLLOWUP-C-RACE
+            behaviour for callers that have not opted in. Production
+            wires :func:`forge.lifecycle_bridge.run_state_source.langgraph_run_state_fetcher`.
         deadline_seconds: Per-build deadline written to the registry
             row's ``deadline_at`` column. Defaults to
             :data:`DEFAULT_DEADLINE_SECONDS` (300s).
@@ -332,6 +376,7 @@ class LifecycleBridgeWireup:
         publisher: PipelinePublisher,
         stream_source: StreamSource,
         identity_provider: IdentityProvider | None = None,
+        run_state_fetcher: RunStateFetcher | None = None,
         deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
         identity_resolution_attempts: int = 3,
         identity_poll_interval_seconds: float = 1.0,
@@ -356,13 +401,9 @@ class LifecycleBridgeWireup:
                 "publisher is the only emit site)"
             )
         if stream_source is None:
-            raise ValueError(
-                "LifecycleBridgeWireup: stream_source is required"
-            )
+            raise ValueError("LifecycleBridgeWireup: stream_source is required")
         if deadline_seconds <= 0:
-            raise ValueError(
-                "LifecycleBridgeWireup: deadline_seconds must be positive"
-            )
+            raise ValueError("LifecycleBridgeWireup: deadline_seconds must be positive")
 
         self._bridge = bridge
         self._translator = translator
@@ -373,16 +414,17 @@ class LifecycleBridgeWireup:
             if identity_provider is not None
             else _default_identity_provider()
         )
-        self._deadline_seconds = deadline_seconds
-        self._identity_resolution_attempts = max(
-            1, int(identity_resolution_attempts)
+        self._run_state_fetcher = (
+            run_state_fetcher
+            if run_state_fetcher is not None
+            else _default_run_state_fetcher()
         )
+        self._deadline_seconds = deadline_seconds
+        self._identity_resolution_attempts = max(1, int(identity_resolution_attempts))
         self._identity_poll_interval_seconds = max(
             0.0, float(identity_poll_interval_seconds)
         )
-        self._shutdown_timeout_seconds = max(
-            0.0, float(shutdown_timeout_seconds)
-        )
+        self._shutdown_timeout_seconds = max(0.0, float(shutdown_timeout_seconds))
         self._clock = clock if clock is not None else self._default_clock
         # Per-feature observer tasks. Keyed on ``feature_id`` (AC-5);
         # supervisor queries answered from the bridge's in-memory dict
@@ -484,9 +526,7 @@ class LifecycleBridgeWireup:
         # (AC-5); the observer task overwrites them via
         # :meth:`BridgeRegistry.update_lifecycle` once
         # ``identity_provider`` resolves.
-        deadline_at = self._clock() + timedelta(
-            seconds=self._deadline_seconds
-        )
+        deadline_at = self._clock() + timedelta(seconds=self._deadline_seconds)
         ack_handle_token = self._mint_ack_handle_token()
         bridge_ack_handle = AckHandle(token=ack_handle_token)
         # Placeholder identifiers so the registry row is well-formed.
@@ -579,6 +619,28 @@ class LifecycleBridgeWireup:
             )
 
             if not terminal_seen:
+                # TASK-REV-PEBR-005 Signature C fetch-on-empty fallback:
+                # the SSE iterator may have closed empty because the run
+                # finished BEFORE the bridge could open
+                # ``runs.join_stream`` (placeholder bodies finish in
+                # ~16 ms; ``join_stream`` against a finished run is a
+                # live subscription that returns empty per the
+                # langgraph-sdk 0.3.13 docstring). Ask the run-state
+                # fetcher whether the run has terminated; if so, replay
+                # its final state values through the translator so the
+                # canonical envelope shape lands without ad-hoc payload
+                # synthesis. The fetcher returns ``None`` for runs that
+                # are still running (or on transport error / SDK shape
+                # drift) — in that case fall through to the original
+                # "leave un-acked, JetStream will redeliver" branch.
+                terminal_seen = await self._fetch_and_replay_on_empty(
+                    context=context,
+                    handle=handle,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
+
+            if not terminal_seen:
                 # Stream closed without a terminal envelope — the
                 # build's outcome is unknown to the bridge. Do NOT ack:
                 # JetStream ``ack_wait`` will redeliver and the consumer
@@ -588,10 +650,12 @@ class LifecycleBridgeWireup:
                 # unreachable past the 300s budget (AC-3).
                 logger.warning(
                     "wireup._observer_loop: stream for feature_id=%s "
-                    "ended without a terminal envelope; leaving inbound "
-                    "queued message un-acked (JetStream will redeliver, "
-                    "deadline timer will publish build-failed if the "
-                    "sidecar stays unreachable)",
+                    "ended without a terminal envelope and "
+                    "run-state fetch did not surface a terminal state; "
+                    "leaving inbound queued message un-acked "
+                    "(JetStream will redeliver, deadline timer will "
+                    "publish build-failed if the sidecar stays "
+                    "unreachable)",
                     feature_id,
                 )
         except asyncio.CancelledError:
@@ -730,6 +794,321 @@ class LifecycleBridgeWireup:
             # returns one of (terminal_seen, ended_cleanly) or raises.
             return False  # pragma: no cover
 
+    # ------------------------------------------------------------------
+    # Fetch-on-empty fallback (TASK-REV-PEBR-005 Signature C)
+    # ------------------------------------------------------------------
+
+    async def _fetch_and_replay_on_empty(
+        self,
+        *,
+        context: BuildContext,
+        handle: BuildAckHandle,
+        thread_id: str | None,
+        run_id: str | None,
+    ) -> bool:
+        """Replay a finished run's terminal state through the translator.
+
+        Called from :meth:`_observer_loop` when
+        :meth:`_consume_with_reconnect` returns
+        ``terminal_seen=False, ended_cleanly=True`` — the canonical
+        Signature C symptom (``runs.join_stream`` against a finished
+        run is a live subscription that returns empty per the
+        ``langgraph_sdk`` 0.3.13 docstring; placeholder bodies finish
+        in ~16 ms before the bridge can subscribe).
+
+        Workflow:
+
+        1. If identity has not resolved (``thread_id`` or ``run_id`` is
+           ``None``), there is nothing to fetch; return ``False`` so the
+           observer falls through to the un-acked branch.
+        2. Ask the injected :class:`RunStateFetcher` for the run's
+           terminal status + thread state values. The fetcher returns
+           ``None`` for non-terminal runs (still running / pending) and
+           on transport error / SDK shape drift. ``None`` ⇒ fall
+           through.
+        3. If the fetcher returns a :class:`RunStateSnapshot`, wrap the
+           values in a synthetic ``StreamPart(event="values", data=...)``
+           and feed it to the existing translator. The translator's
+           transition detection emits whatever payload(s) the final
+           state implies (typically ``BuildStartedPayload`` followed by
+           a terminal ``BuildCompletePayload`` or ``BuildFailedPayload``).
+        4. Publish each emitted payload via :meth:`_publish_event` and,
+           on terminal arrival, ack + detach via :meth:`_on_terminal`
+           — exactly the same path the live SSE branch uses.
+
+        Returns:
+            ``True`` if a terminal envelope was published and the
+            inbound was acked; ``False`` otherwise (no identity, no
+            terminal state available, or terminal publish failed —
+            same retry semantics as the live SSE path).
+        """
+        feature_id = context.feature_id
+        if thread_id is None or run_id is None:
+            return False
+
+        try:
+            snapshot = await self._run_state_fetcher(
+                feature_id=feature_id,
+                thread_id=thread_id,
+                run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — fetcher contract: never raise
+            # Defensive: a fetcher implementation that breaks contract
+            # MUST NOT crash the observer. Log loudly and treat as no
+            # snapshot — JetStream redelivery is the recovery path.
+            logger.warning(
+                "wireup._fetch_and_replay_on_empty: run_state_fetcher "
+                "raised (%s) for feature_id=%s thread_id=%s run_id=%s; "
+                "treating as no-snapshot",
+                exc,
+                feature_id,
+                thread_id,
+                run_id,
+            )
+            return False
+
+        if snapshot is None:
+            return False
+
+        return await self._replay_run_state_snapshot(
+            snapshot=snapshot,
+            context=context,
+            handle=handle,
+        )
+
+    async def _replay_run_state_snapshot(
+        self,
+        *,
+        snapshot: RunStateSnapshot,
+        context: BuildContext,
+        handle: BuildAckHandle,
+    ) -> bool:
+        """Replay a terminal state snapshot through the translator.
+
+        Two ``translate(...)`` calls reconstitute the canonical
+        BuildStarted → terminal sequence the live SSE path would have
+        emitted — matching the 2-envelope guarantee in the
+        FOLLOWUP-C-RACE out-of-scope guard rail (parent task's TL;DR:
+        "expect 2 envelopes from the placeholder bodies"):
+
+        1. **Synthetic ``running_wave`` projection.** Reuses the
+           feature's own snapshot fields (``feature_id``, ``build_id``,
+           ``wave_total``) but forces ``lifecycle="running_wave"`` and
+           zeroes the per-stage counters. With ``prev=None`` this
+           triggers the translator's
+           :meth:`StreamEventTranslator._build_started` rule (precedence
+           4) and emits :class:`BuildStartedPayload`.
+        2. **Actual terminal state.** The real values dict the fetcher
+           returned. With ``prev.lifecycle="running_wave"`` this
+           triggers the translator's terminal rule (precedence 1) and
+           emits :class:`BuildCompletePayload` /
+           :class:`BuildFailedPayload` / :class:`BuildCancelledPayload`
+           per the snapshot's ``lifecycle`` field.
+
+        On step 2's terminal arrival, the canonical ack+detach path
+        (:meth:`_on_terminal`) runs.
+
+        If the snapshot's ``async_tasks[feature_id]`` mapping cannot be
+        located (the run has no usable AutobuildState — possible for
+        non-autobuild-shaped runs), the replay falls back to a single
+        translator call against the raw values. Result: still race-free
+        (a terminal envelope lands if the translator can produce one),
+        just without the synthetic BuildStarted preface.
+
+        Returns ``True`` iff a terminal envelope was published and
+        ``_on_terminal`` (ack + detach) ran cleanly.
+        """
+        feature_id = context.feature_id
+        running_values = self._project_running_wave_state(snapshot.values, feature_id)
+
+        # Step 1 — synthetic running_wave projection (best-effort
+        # BuildStarted preface). If we cannot project, skip — the
+        # terminal-only call still satisfies AC-11's ack_floor advance,
+        # but the operator does NOT see a build-started envelope on
+        # the wire. The warning log makes this visible.
+        if running_values is not None:
+            await self._translate_and_publish(
+                values=running_values,
+                context=context,
+                feature_id=feature_id,
+                stage="running_wave",
+                snapshot_status=snapshot.status,
+            )
+        else:
+            logger.warning(
+                "wireup._replay_run_state_snapshot: cannot synthesise "
+                "running_wave projection for feature_id=%s status=%s "
+                "(async_tasks[%s] missing or non-Mapping); replay will "
+                "attempt terminal-only emit (no BuildStarted envelope "
+                "on the wire — AC-11 build-started gate may not be met "
+                "for this run)",
+                feature_id,
+                snapshot.status,
+                feature_id,
+            )
+
+        # Step 2 — actual terminal state.
+        terminal_event = await self._translate_and_publish(
+            values=snapshot.values,
+            context=context,
+            feature_id=feature_id,
+            stage="terminal",
+            snapshot_status=snapshot.status,
+        )
+
+        if terminal_event is None:
+            logger.info(
+                "wireup._replay_run_state_snapshot: terminal state did "
+                "not produce an envelope for feature_id=%s status=%s — "
+                "translator returned None (likely a partial "
+                "AutobuildState or unknown lifecycle); leaving inbound "
+                "un-acked",
+                feature_id,
+                snapshot.status,
+            )
+            return False
+
+        if not isinstance(terminal_event, TERMINAL_PAYLOAD_TYPES):
+            logger.info(
+                "wireup._replay_run_state_snapshot: terminal-stage emit "
+                "is non-terminal (%s) for feature_id=%s status=%s — "
+                "translator did not detect a terminal transition from "
+                "the fetched state; leaving inbound un-acked",
+                type(terminal_event).__name__,
+                feature_id,
+                snapshot.status,
+            )
+            return False
+
+        await self._on_terminal(handle, feature_id, context.correlation_id)
+        logger.info(
+            "wireup._replay_run_state_snapshot: synthesised terminal "
+            "envelope (%s) from run_status=%s for feature_id=%s "
+            "(TASK-REV-PEBR-005 fetch-on-empty fallback)",
+            type(terminal_event).__name__,
+            snapshot.status,
+            feature_id,
+        )
+        return True
+
+    async def _translate_and_publish(
+        self,
+        *,
+        values: Mapping[str, Any],
+        context: BuildContext,
+        feature_id: str,
+        stage: str,
+        snapshot_status: str,
+    ) -> PipelineEvent | None:
+        """Translate one synthetic ``StreamPart`` and publish if non-``None``.
+
+        Helper for :meth:`_replay_run_state_snapshot`. Wraps ``values``
+        in a minimal dict matching the ``StreamPart`` TypedDict shape
+        (``event``, ``data``, ``id``) and runs the canonical translator
+        path. Publish failures and translator exceptions are logged at
+        WARNING and downgraded to ``None`` so a bad partial state does
+        not break the second-stage replay attempt.
+
+        ``stage`` is "running_wave" or "terminal" — used in the WARNING
+        log line so an operator triaging a fetch-on-empty event can
+        distinguish which projection failed.
+        """
+        # Construct an attribute-access object the translator can drive
+        # via ``getattr(part, "event")`` and ``part.data`` — the same
+        # surface ``langgraph_sdk.schema.StreamPart`` (a NamedTuple)
+        # exposes. ``SimpleNamespace`` keeps wireup's "no runtime
+        # langgraph_sdk dependency" discipline (mirrors the lazy-import
+        # pattern in :mod:`forge.lifecycle_bridge.stream_source`).
+        synthetic_part = SimpleNamespace(
+            event=VALUES_STREAM_EVENT,
+            data=dict(values),
+            id=None,
+        )
+        try:
+            event = self._translator.translate(synthetic_part, context)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "wireup._translate_and_publish: translator raised (%s) "
+                "for feature_id=%s stage=%s status=%s; skipping this "
+                "replay step",
+                exc,
+                feature_id,
+                stage,
+                snapshot_status,
+            )
+            return None
+        if event is None:
+            return None
+        published_ok = await self._publish_event(event, feature_id)
+        if not published_ok:
+            logger.warning(
+                "wireup._translate_and_publish: synthesised event "
+                "publish failed for feature_id=%s stage=%s "
+                "payload_type=%s; replay continues but inbound will "
+                "remain un-acked (JetStream redelivery + "
+                "recover_in_flight retry path)",
+                feature_id,
+                stage,
+                type(event).__name__,
+            )
+            return None
+        return event
+
+    @staticmethod
+    def _project_running_wave_state(
+        values: Mapping[str, Any], feature_id: str
+    ) -> Mapping[str, Any] | None:
+        """Project a ``running_wave`` snapshot from a terminal state values dict.
+
+        The translator detects "build started" via a transition to
+        ``lifecycle="running_wave"`` with ``prev=None`` (or
+        ``prev.lifecycle in {"starting", "planning_waves"}``). To
+        reconstitute a BuildStarted preface during fetch-on-empty
+        replay, we project the original ``async_tasks[feature_id]``
+        dict but override ``lifecycle="running_wave"`` and zero the
+        per-stage counters so the projection looks like a fresh build
+        start.
+
+        Returns ``None`` when ``async_tasks`` is missing or when
+        ``async_tasks[feature_id]`` is not a ``Mapping`` — the replay
+        path then logs a WARNING and continues with the terminal call
+        only.
+        """
+        if not isinstance(values, Mapping):
+            return None
+        async_tasks = values.get("async_tasks")
+        if not isinstance(async_tasks, Mapping):
+            return None
+        snapshot = async_tasks.get(feature_id)
+        if not isinstance(snapshot, Mapping):
+            return None
+
+        running_snapshot: dict[str, Any] = dict(snapshot)
+        running_snapshot["lifecycle"] = "running_wave"
+        # Zero per-stage counters so the projection looks like a fresh
+        # start. ``wave_total`` is preserved — BuildStartedPayload
+        # surfaces it to downstream consumers.
+        running_snapshot["wave_index"] = 0
+        running_snapshot["task_index"] = 0
+        running_snapshot["tasks_completed"] = 0
+        running_snapshot["tasks_failed"] = 0
+        running_snapshot["waiting_for"] = None
+        running_snapshot["last_coach_score"] = None
+
+        # Build a values dict that preserves siblings of async_tasks
+        # (messages / todos / files) so the translator's _extract_state
+        # path sees the same outer shape it does on the live SSE
+        # channel.
+        projected: dict[str, Any] = {
+            k: v for k, v in values.items() if k != "async_tasks"
+        }
+        projected_async_tasks: dict[str, Any] = {
+            k: v for k, v in async_tasks.items() if k != feature_id
+        }
+        projected_async_tasks[feature_id] = running_snapshot
+        projected["async_tasks"] = projected_async_tasks
+        return projected
+
     async def _drive_stream_session(
         self,
         *,
@@ -787,9 +1166,7 @@ class LifecycleBridgeWireup:
             if isinstance(event, TERMINAL_PAYLOAD_TYPES):
                 if published_ok:
                     terminal_seen = True
-                    await self._on_terminal(
-                        handle, feature_id, correlation_id
-                    )
+                    await self._on_terminal(handle, feature_id, correlation_id)
                     return (True, True)
                 # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope
                 # publish failed (transient broker error / network
@@ -928,9 +1305,7 @@ class LifecycleBridgeWireup:
     # Identity resolution
     # ------------------------------------------------------------------
 
-    async def _wait_for_identity(
-        self, feature_id: str
-    ) -> tuple[str, str] | None:
+    async def _wait_for_identity(self, feature_id: str) -> tuple[str, str] | None:
         """Poll :data:`IdentityProvider` until it returns a non-``None`` pair.
 
         Returns ``None`` when ``identity_resolution_attempts`` polls
