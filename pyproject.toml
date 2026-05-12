@@ -23,7 +23,7 @@ dependencies = [
     "langgraph-api~=0.8.0",
     "langchain-community>=0.4,<0.5",
     "langchain-anthropic>=1.4,<2",
-    "nats-core>=0.3.0,<0.4",
+    "nats-core>=0.3.0,<0.5",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     # TASK-FIX-F09A1 (per TASK-REV-F09A §Reproduction C): `click` and `rich`
