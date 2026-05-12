@@ -74,7 +74,18 @@ class TestInfoLevelEmitsRecords:
             async def close(self) -> None:
                 return None
 
+            async def register_agent(self, manifest: object) -> None:
+                return None
+
+            async def deregister_agent(
+                self, agent_id: str, reason: str = "shutdown"
+            ) -> None:
+                return None
+
         async def _fake_connect(servers: str) -> object:
+            return _StubClient()
+
+        async def _fake_open_fleet(nats_url: str) -> object:
             return _StubClient()
 
         async def _fake_daemon(
@@ -86,6 +97,7 @@ class TestInfoLevelEmitsRecords:
             return None
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
         # TASK-FIX-F010 — stub the production wrapper and ForgeConfig
@@ -259,7 +271,18 @@ class TestServeCmdInvokesConfigureLogging:
             async def close(self) -> None:
                 return None
 
+            async def register_agent(self, manifest: object) -> None:
+                return None
+
+            async def deregister_agent(
+                self, agent_id: str, reason: str = "shutdown"
+            ) -> None:
+                return None
+
         async def _fake_connect(servers: str) -> object:
+            return _StubClient()
+
+        async def _fake_open_fleet(nats_url: str) -> object:
             return _StubClient()
 
         async def _fake_daemon(
@@ -271,6 +294,7 @@ class TestServeCmdInvokesConfigureLogging:
             return None
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
         # TASK-FIX-F010 — bypass production wiring + ForgeConfig load.
