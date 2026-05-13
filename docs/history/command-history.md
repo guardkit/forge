@@ -10428,11 +10428,97 @@ Remaining gate for AC-11: rebuild forge image from this HEAD and re-run jarvis r
 
 
 
+please review the runbook results which show that the forge agent isn't running and let's get it working /home/richardwoollcott/Projects/appmilla_github/jarvis/docs/runbooks/RESULTS-FEAT-JARVIS-006-serve-nats-first-run-2026-05-12-rerun-post-J006-009-010.md
+
+
+Found two key issues:
+
+NATS is healthy ✅
+autobuild_runner at port 8124 is NOT running ❌ — this is the hard dep forge needs (it streams build runs from localhost:8124)
+Port 8080 is occupied (probably open-webui) — but forge's FORGE_HEALTHZ_PORT=8088 so that's only a healthcheck quirk
+Let me check forge's autobuild_runner setup.
 
 
 
+I have the full picture. Here's what I found:
+
+Why it died: The container hit a join-stream race that loops forever on a stuck FEAT-43DE JetStream message. It went silent at 13:49:09 on May 10, then died ~6 min later (code 255, not OOM — likely killed externally or daemon restart).
+
+What's still wedged:
+
+PIPELINE stream still has that stuck message (sequence #23, redelivered 5,411 times to the forge-serve consumer, ack-pending)
+Image is from May 8 17:33 — 2 hours before commit 20f53a8 "fix race" (TASK-REV-PEBR-005, which patches exactly this stream-join race)
+autobuild_runner sidecar (port 8124) isn't running on the host
+What the jarvis runbook needs: just forge alive in fleet KV — the chat-handler drain path is already wired and works with 0 notifications.
+
+AskUserQuestion
+OUT
+User has answered your questions: "How thoroughly do you want forge back online?"="Solid: rebuild + start full stack". You can now continue with the user's answers in mind.
+Going with solid rebuild. Let me update todos and prep.
 
 
+Forge is back online. Summary:
+
+Root cause of the May 10 exit: stuck FEAT-43DE JetStream message (PIPELINE seq #23, redelivered 5,411× to the forge-serve consumer) caused the silent-stream loop visible in the May 10 logs. Container went silent at 13:49 and died at 13:55 (exit 255 — most likely killed externally, not OOM). The fix for exactly this race landed in commit 20f53a8 "fix race" ~2 hours after the running image was built.
+
+What I did:
+
+Purged the stuck PIPELINE message (nats stream rmm PIPELINE 23 -f) — consumer ack-floor auto-advanced.
+Widened forge's nats-core constraint from <0.4 to <0.5 in pyproject.toml:26 — sibling was bumped to 0.4.0 on May 8. Uncommitted, ready for you to review/commit.
+Rebuilt forge:latest via scripts/build-image.sh (image id fb3f176d7d91).
+Started the autobuild_runner LangGraph sidecar on 127.0.0.1:8124 (detached nohup process, logs at /home/richardwoollcott/forge-prod-state/sidecar-logs/autobuild_runner.log) — returns HTTP 200 on /info.
+Removed the dead container, recreated with same env/volumes + added --restart unless-stopped so it survives daemon restarts.
+Current state:
+
+forge-prod — healthy, /healthz → 200, 1 waiting pull on consumer PIPELINE > forge-serve, 0 outstanding acks
+NATS — 3 connections (2 specialists + forge)
+Sidecar — listening on 127.0.0.1:8124
+Caveats:
+
+I added --restart unless-stopped (the original was no). Easy to revert if you'd rather it stay down on failure.
+forge.adapters.nats.fleet_publisher.register_on_boot is defined but I could not find it called from forge.cli.serve — so forge does not publish itself to the agent-registry KV bucket on boot. That's a pre-existing gap, not regressed by anything I did. For the jarvis runbook's AC-005-06, the notification-drain path doesn't need fleet-KV registration — it just needs forge to publish stage-complete notifications when a build finishes, which the now-running daemon will do.
+The langgraph sidecar runs as a detached process under your user (PID 1532674). It'll survive this terminal session but won't auto-restart on reboot — let me know if you want me to write a systemd user unit for it.
+
+
+Stack is still green — see my previous message for the full summary of what was done. Nothing left to do unless you want me to (a) commit the pyproject.toml constraint widening, (b) write a systemd user unit for the sidecar, or (c) wire register_on_boot into forge.cli.serve so forge actually appears in agent-registry KV.
+
+please do all three follow-ups, a,b and c
+I'll handle them in this order: (c) code change first (since it needs rebuild + container restart), then (a) commits for both code changes, then (b) systemd unit (independent).
+
+Update Todos
+
+Wire register_on_boot into forge.cli.serve startup flow
+
+Add tests for fleet registration wireup
+
+Rebuild image and restart container with fleet wireup
+
+Verify forge in agent-registry KV
+
+Commit (a) pyproject.toml constraint widening
+
+Commit (c) fleet registration wireup + tests
+
+(b) Write systemd user unit for autobuild_runner sidecar
+
+
+All three follow-ups landed. Final state:
+
+(a) pyproject.toml constraint widening — committed as 94598bf chore(deps): widen nats-core constraint to <0.5.
+
+(b) systemd user unit — ~/.config/systemd/user/forge-autobuild-runner.service written, daemon-reloaded, enable --now done. Currently active (PID 1765783 owned by systemd). Restart-on-failure with 5s backoff; survives daemon restarts because user has Linger=yes. Useful commands:
+
+journalctl --user -u forge-autobuild-runner -f — tail the sidecar
+systemctl --user restart forge-autobuild-runner — bounce it
+(c) fleet registration wireup — committed as e9dfec0 feat(fleet): publish forge to agent-registry KV on serve startup. Key design points:
+
+_run_serve now opens a second NATSClient via the new rebindable open_fleet_client seam (raw nats-py client stays for the daemon; fleet client is dedicated to register/deregister)
+Register runs before the reconciles (same ordering invariant as reconcile-before-attach)
+Deregister runs in the finally block — even on daemon exception — so a crash doesn't leave a stale KV entry
+4 new tests in TestRunServeFleetRegistration plus updates to existing serve-flow tests to stub the new seam
+Verification: nats kv ls agent-registry now shows jarvis, architect-agent, product-owner-agent, gcse-tutor, forge (forge at revision 727). Test suite green: 2565 pass, 1 pre-existing clock-hygiene failure in approval_subscriber.py:750 unrelated to these changes.
+
+Continue: check on forge image rebuild (bvkybo15c), then cut over the langgraph sidecar to systemd, restart forge container, verify agent-registry, and commit changes.
 
 
 
