@@ -1,15 +1,32 @@
 ---
+id: TASK-ABW-001
+title: Wire up _node_running_wave to invoke guardkit autobuild
+task_type: feature
+parent_feature: autobuild-runner-wireup
+feature_id: FEAT-ABW1
+wave: 1
+implementation_mode: task-work
 complexity: 6
 dependencies: []
 estimated_minutes: 180
-feature_id: FEAT-ABW1
-id: TASK-ABW-001
-implementation_mode: task-work
-parent_feature: autobuild-runner-wireup
-status: design_approved
-task_type: feature
-title: Wire up _node_running_wave to invoke guardkit autobuild
-wave: 1
+status: completed
+completed_at: '2026-05-14T17:23:15.868599'
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-ABW1
+  base_branch: main
+  started_at: '2026-05-14T17:04:26.931902'
+  last_updated: '2026-05-14T17:23:15.866933'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-05-14T17:04:26.931902'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-ABW-001 — Wire up `_node_running_wave` to invoke guardkit autobuild

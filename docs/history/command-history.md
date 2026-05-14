@@ -10539,10 +10539,83 @@ Continue: check on forge image rebuild (bvkybo15c), then cut over the langgraph 
 
 
 
+/feature-plan @please wireup the autobuild runner@ --from /home/richardwoollcott/Projects/appmilla_github/forge/docs/research/ideas/autobuild-runner-wireup-plan.md
 
 
 
+Done. Validation passed and the feature is AutoBuild-ready.
 
+Summary
+Generated FEAT-ABW1 — autobuild-runner wireup with the streamlined approach you chose:
+
+Files created:
+
+tasks/backlog/autobuild-runner-wireup/README.md
+tasks/backlog/autobuild-runner-wireup/IMPLEMENTATION-GUIDE.md — includes §1 data-flow + §2 subprocess-sequence + §3 dependency Mermaid diagrams, plus §4 integration contracts
+tasks/backlog/autobuild-runner-wireup/TASK-ABW-001-wire-up-running-wave-node.md — task_type: feature, complexity 6, ~180 min
+tasks/backlog/autobuild-runner-wireup/TASK-ABW-OPS-operator-handoff.md — task_type: operator_handoff, complexity 2, AutoBuild skips it
+.guardkit/features/FEAT-ABW1.yaml — validated (guardkit feature validate FEAT-ABW1 → ✓)
+Operator follow-up tasks: 1 (TASK-ABW-OPS — surfaced by /feature-complete post-merge)
+
+Wave plan:
+
+Wave 1: TASK-ABW-001 — resolver (payload.repo → cwd, _path_inside_allowlist reuse from pipeline_consumer.py:248), async subprocess invocation, _node_failed + conditional edge, stdout streaming for stage_complete (with single-emit fallback), 60-min timeout, two integration tests at tests/integration/test_autobuild_runner_subprocess.py.
+Wave 2: TASK-ABW-OPS — allowlist edit on GB10, forge-prod restart, sidecar restart (pkill -f "langgraph dev" && rm -rf .langgraph_api/), runbook update, FEAT-9E59 rehearsal.
+Note on R3 smoke-gates: nudge fired but I left smoke-gates off — Wave 2 is operator_handoff so there is no between-wave smoke check that would meaningfully gate anything. Add smoke_gates: to the YAML if you want a Wave-1 post-test gate.
+
+Next: /feature-build FEAT-ABW1 (autonomous) or /task-work TASK-ABW-001 (interactive).
+
+
+
+GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-ABW1 --verbose
+
+
+════════════════════════════════════════════════════════════
+FEATURE RESULT: SUCCESS
+════════════════════════════════════════════════════════════
+
+Feature: FEAT-ABW1 - autobuild-runner wireup
+Status: COMPLETED
+Tasks: 2/2 completed
+Total Turns: 1
+Duration: 18m 48s
+
+                                  Wave Summary                                   
+╭────────┬──────────┬────────────┬──────────┬──────────┬──────────┬─────────────╮
+│  Wave  │  Tasks   │   Status   │  Passed  │  Failed  │  Turns   │  Recovered  │
+├────────┼──────────┼────────────┼──────────┼──────────┼──────────┼─────────────┤
+│   1    │    1     │   ✓ PASS   │    1     │    -     │    1     │      -      │
+│   2    │    1     │   ✓ PASS   │    1     │    -     │    0     │      -      │
+╰────────┴──────────┴────────────┴──────────┴──────────┴──────────┴─────────────╯
+
+Execution Quality:
+  Clean executions: 2/2 (100%)
+
+SDK Turn Ceiling:
+  Invocations: 1
+  Ceiling hits: 0/1 (0%)
+
+                                  Task Details                                   
+╭──────────────────────┬────────────┬──────────┬─────────────────┬──────────────╮
+│ Task                 │ Status     │  Turns   │ Decision        │  SDK Turns   │
+├──────────────────────┼────────────┼──────────┼─────────────────┼──────────────┤
+│ TASK-ABW-001         │ SUCCESS    │    1     │ approved        │      57      │
+│ TASK-ABW-OPS         │ SKIPPED    │    -     │ -               │      -       │
+╰──────────────────────┴────────────┴──────────┴─────────────────┴──────────────╯
+
+Worktree: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-ABW1
+Branch: autobuild/FEAT-ABW1
+
+Next Steps:
+  1. Review: cd /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-ABW1
+  2. Diff: git diff main
+  3. Merge: git checkout main && git merge autobuild/FEAT-ABW1
+  4. Cleanup: guardkit worktree cleanup FEAT-ABW1
+INFO:guardkit.cli.display:Final summary rendered: FEAT-ABW1 - completed
+INFO:guardkit.orchestrator.review_summary:Review summary written to /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/autobuild/FEAT-ABW1/review-summary.md
+✓ Review summary: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/autobuild/FEAT-ABW1/review-summary.md
+INFO:guardkit.orchestrator.feature_orchestrator:Feature orchestration complete: FEAT-ABW1, status=completed, completed=2/2
+richardwoollcott@promaxgb10-41b1:~/Projects/appmilla_github/forge$ 
 
 
 

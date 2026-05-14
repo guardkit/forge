@@ -1,7 +1,0 @@
-{
-  "tests_run": 45,
-  "tests_failed": 0,
-  "coverage_pct": 65.08,
-  "output_summary": "pytest: 45 passed, 0 failed; coverage on forge.subagents.autobuild_runner = 65.08% (246/378 stmts).",
-  "quality_gates_passed": true
-}
