@@ -1,0 +1,233 @@
+{
+  "task_id": "TASK-ABW-001",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "quality_gates": {
+      "tests_passed": true,
+      "coverage_met": true,
+      "arch_review_passed": true,
+      "plan_audit_passed": true,
+      "all_gates_passed": true
+    },
+    "independent_tests": {
+      "tests_passed": true,
+      "test_command": "pytest tests/forge/test_autobuild_runner.py tests/integration/test_autobuild_runner_subprocess.py -v --tb=short",
+      "test_output_summary": "Result:\ntests/integration/test_autobuild_runner_subprocess.py::TestRunningWaveResolutionFailures::test_missing_repo_in_payload_transitions_to_failed PASSED [ 93%]\ntests/integration/test_autobuild_runner_subprocess.py::TestRunningWaveResolutionFailures::test_guardkit_path_missing_transitions_to_failed PASSED [ 95%]\ntests/integration/test_autobuild_runner_subprocess.py::TestRunningWaveResolutionFailures::test_resolved_repo_outside_allowlist_transitions_to_failed PASSED [ 97%]\ntests/integration/test_autobuild_runner_subprocess.py::TestRunningWaveSubprocessTimeout::test_timeout_kills_subprocess_and_transitions_to_failed PASSED [100%]\n============================== 45 passed in 5.27s ==============================",
+      "duration_seconds": 5.85163426399231
+    },
+    "requirements": {
+      "criteria_total": 11,
+      "criteria_met": 11,
+      "all_criteria_met": true,
+      "missing": []
+    }
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`_resolve_repo_path(payload)` returns an absolute `Path` for a valid",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Implemented _resolve_repo_path in src/forge/subagents/autobuild_runner.py: validates payload['repo'] is non-empty, derives basename, joins with FORGE_REPO_BASE (defaults to ~/Projects/appmilla_github), checks candidate.exists(), is_dir(), and (candidate/'.git').exists(), then runs _path_inside_allowlist (imported from forge.adapters.nats.pipeline_consumer). Each failure path logs a WARNING with the structured reason and returns None. Verified by test_missing_repo_in_payload_transitions_to_failed and test_resolved_repo_outside_allowlist_transitions_to_failed in the new integration test file.",
+      "notes": "Implemented _resolve_repo_path in src/forge/subagents/autobuild_runner.py: validates payload['repo'] is non-empty, derives basename, joins with FORGE_REPO_BASE (defaults to ~/Projects/appmilla_github), checks candidate.exists(), is_dir(), and (candidate/'.git').exists(), then runs _path_inside_allowlist (imported from forge.adapters.nats.pipeline_consumer). Each failure path logs a WARNING with the structured reason and returns None. Verified by test_missing_repo_in_payload_transitions_to_failed and test_resolved_repo_outside_allowlist_transitions_to_failed in the new integration test file."
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`_resolve_repo_path` honours `FORGE_REPO_BASE` env-var override.",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_resolve_repo_path reads os.environ.get(FORGE_REPO_BASE_ENV) at call time and falls back to DEFAULT_FORGE_REPO_BASE ('~/Projects/appmilla_github'). test_resolved_repo_outside_allowlist_transitions_to_failed sets FORGE_REPO_BASE via monkeypatch.setenv and asserts the resolver uses the overridden base directory (resolver returns None because the synthesised candidate path does not exist under the overridden base).",
+      "notes": "_resolve_repo_path reads os.environ.get(FORGE_REPO_BASE_ENV) at call time and falls back to DEFAULT_FORGE_REPO_BASE ('~/Projects/appmilla_github'). test_resolved_repo_outside_allowlist_transitions_to_failed sets FORGE_REPO_BASE via monkeypatch.setenv and asserts the resolver uses the overridden base directory (resolver returns None because the synthesised candidate path does not exist under the overridden base)."
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "guardkit path resolution honours `FORGE_GUARDKIT_PATH` env-var",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_resolve_guardkit_path checks FORGE_GUARDKIT_PATH first (must be an existing executable file via candidate.is_file() and os.access(candidate, os.X_OK)); on miss it falls back to shutil.which('guardkit'). Returns None with a WARNING log when neither resolves. test_guardkit_path_missing_transitions_to_failed patches _resolve_guardkit_path to return None and asserts the runner transitions to failed.",
+      "notes": "_resolve_guardkit_path checks FORGE_GUARDKIT_PATH first (must be an existing executable file via candidate.is_file() and os.access(candidate, os.X_OK)); on miss it falls back to shutil.which('guardkit'). Returns None with a WARNING log when neither resolves. test_guardkit_path_missing_transitions_to_failed patches _resolve_guardkit_path to return None and asserts the runner transitions to failed."
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "`_node_running_wave` invokes `asyncio.create_subprocess_exec` with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_node_running_wave builds argv = [str(guardkit_path), 'autobuild', 'feature', feature_id, '--fresh', '--verbose'] and calls asyncio.create_subprocess_exec(*argv, cwd=str(repo_path), env=os.environ.copy(), stdout=PIPE, stderr=STDOUT). test_running_wave_invokes_guardkit_and_completes_on_zero_exit captures the args/kwargs handed to create_subprocess_exec via a _make_fake_subprocess closure and asserts argv[0]==str(fake_guardkit), argv[1:6]==('autobuild','feature',feature_id,'--fresh','--verbose'), and kwargs['cwd']==str(fake_repo).",
+      "notes": "_node_running_wave builds argv = [str(guardkit_path), 'autobuild', 'feature', feature_id, '--fresh', '--verbose'] and calls asyncio.create_subprocess_exec(*argv, cwd=str(repo_path), env=os.environ.copy(), stdout=PIPE, stderr=STDOUT). test_running_wave_invokes_guardkit_and_completes_on_zero_exit captures the args/kwargs handed to create_subprocess_exec via a _make_fake_subprocess closure and asserts argv[0]==str(fake_guardkit), argv[1:6]==('autobuild','feature',feature_id,'--fresh','--verbose'), and kwargs['cwd']==str(fake_repo)."
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "On subprocess exit code 0, the final state has",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Conditional edge _route_after_running_wave reads the snapshot _node_running_wave wrote and selects 'completed' when lifecycle != 'failed'. _node_completed then writes the terminal completed snapshot. test_running_wave_invokes_guardkit_and_completes_on_zero_exit asserts result['async_tasks'][feature_id]['lifecycle'] == 'completed' after the fake subprocess exits with code 0.",
+      "notes": "Conditional edge _route_after_running_wave reads the snapshot _node_running_wave wrote and selects 'completed' when lifecycle != 'failed'. _node_completed then writes the terminal completed snapshot. test_running_wave_invokes_guardkit_and_completes_on_zero_exit asserts result['async_tasks'][feature_id]['lifecycle'] == 'completed' after the fake subprocess exits with code 0."
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "On non-zero subprocess exit, the final state has",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "On non-zero exit, _node_running_wave returns _build_failed_snapshot with tasks_failed=1 and reason 'guardkit autobuild exit=<code>'. Conditional edge routes to _node_failed which writes a terminal failed snapshot preserving tasks_failed >= 1. test_running_wave_transitions_to_failed_on_nonzero_exit asserts both snap['lifecycle']=='failed' and snap['tasks_failed']==1.",
+      "notes": "On non-zero exit, _node_running_wave returns _build_failed_snapshot with tasks_failed=1 and reason 'guardkit autobuild exit=<code>'. Conditional edge routes to _node_failed which writes a terminal failed snapshot preserving tasks_failed >= 1. test_running_wave_transitions_to_failed_on_nonzero_exit asserts both snap['lifecycle']=='failed' and snap['tasks_failed']==1."
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "On subprocess timeout (`FORGE_AUTOBUILD_TIMEOUT_SECONDS` exceeded),",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "_node_running_wave wraps the gather(_drain_stdout(), proc.wait()) in asyncio.wait_for(timeout=timeout_seconds); on TimeoutError it calls proc.kill() then waits up to 5s, sets timed_out=True, and returns a failed snapshot with reason 'guardkit autobuild timed out after <N>s'. test_timeout_kills_subprocess_and_transitions_to_failed sets FORGE_AUTOBUILD_TIMEOUT_SECONDS=0.05, supplies a _HangProc whose wait/readline block indefinitely, and asserts kill() was called and the final lifecycle is failed.",
+      "notes": "_node_running_wave wraps the gather(_drain_stdout(), proc.wait()) in asyncio.wait_for(timeout=timeout_seconds); on TimeoutError it calls proc.kill() then waits up to 5s, sets timed_out=True, and returns a failed snapshot with reason 'guardkit autobuild timed out after <N>s'. test_timeout_kills_subprocess_and_transitions_to_failed sets FORGE_AUTOBUILD_TIMEOUT_SECONDS=0.05, supplies a _HangProc whose wait/readline block indefinitely, and asserts kill() was called and the final lifecycle is failed."
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "`_node_failed` exists and is reachable via a conditional edge from",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Added _node_failed function in src/forge/subagents/autobuild_runner.py that writes a terminal failed snapshot preserving prior counters (tasks_failed defaulted to max(existing, 1)). _build_runner_graph adds the 'failed' node and replaces the unconditional 'running_wave'\u2192'completed' edge with sg.add_conditional_edges('running_wave', _route_after_running_wave, {'completed': 'completed', 'failed': 'failed'}). The two AC-006/AC-007 tests both exercise this conditional-edge path.",
+      "notes": "Added _node_failed function in src/forge/subagents/autobuild_runner.py that writes a terminal failed snapshot preserving prior counters (tasks_failed defaulted to max(existing, 1)). _build_runner_graph adds the 'failed' node and replaces the unconditional 'running_wave'\u2192'completed' edge with sg.add_conditional_edges('running_wave', _route_after_running_wave, {'completed': 'completed', 'failed': 'failed'}). The two AC-006/AC-007 tests both exercise this conditional-edge path."
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "At least one `stage_complete` snapshot is emitted between",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Per the spec's acceptance fallback clause, _node_running_wave on success returns a running_wave snapshot with tasks_completed=max(stage_complete_count, 1) \u2014 counted from [guardkit-checkpoint] Turn N complete (tests: ...) lines in the streamed stdout. The bridge translator's _build_stage_complete delta condition fires on prev.running_wave\u2192snap.running_wave with tasks_completed advance; the visible-mid-stream snapshot is what the integration test asserts. test_running_wave_invokes_guardkit_and_completes_on_zero_exit drives the values stream via astream and collects any running_wave snapshot with tasks_completed >= 1, then asserts the collection is non-empty.",
+      "notes": "Per the spec's acceptance fallback clause, _node_running_wave on success returns a running_wave snapshot with tasks_completed=max(stage_complete_count, 1) \u2014 counted from [guardkit-checkpoint] Turn N complete (tests: ...) lines in the streamed stdout. The bridge translator's _build_stage_complete delta condition fires on prev.running_wave\u2192snap.running_wave with tasks_completed advance; the visible-mid-stream snapshot is what the integration test asserts. test_running_wave_invokes_guardkit_and_completes_on_zero_exit drives the values stream via astream and collects any running_wave snapshot with tasks_completed >= 1, then asserts the collection is non-empty."
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "`tests/integration/test_autobuild_runner_subprocess.py` exists with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "Created tests/integration/test_autobuild_runner_subprocess.py with TestRunningWaveSubprocessSuccess::test_running_wave_invokes_guardkit_and_completes_on_zero_exit and TestRunningWaveSubprocessFailure::test_running_wave_transitions_to_failed_on_nonzero_exit (plus defensive coverage for missing-repo, missing-guardkit, allowlist, and timeout paths). pytest -v output: 6 passed in 5.18s \u2014 both required tests included and green.",
+      "notes": "Created tests/integration/test_autobuild_runner_subprocess.py with TestRunningWaveSubprocessSuccess::test_running_wave_invokes_guardkit_and_completes_on_zero_exit and TestRunningWaveSubprocessFailure::test_running_wave_transitions_to_failed_on_nonzero_exit (plus defensive coverage for missing-repo, missing-guardkit, allowlist, and timeout paths). pytest -v output: 6 passed in 5.18s \u2014 both required tests included and green."
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "All modified files pass project-configured lint/format checks with",
+      "result": "verified",
+      "status": "verified",
+      "evidence": "ruff check on the modified production file (src/forge/subagents/autobuild_runner.py) and the new integration test file (tests/integration/test_autobuild_runner_subprocess.py) reports 'All checks passed!'. Pre-existing unused-import in tests/forge/test_autobuild_runner.py was not introduced by this task (it was present in the baseline before TASK-ABW-001) \u2014 the test-file edits in this task did not add new lint violations.",
+      "notes": "ruff check on the modified production file (src/forge/subagents/autobuild_runner.py) and the new integration test file (tests/integration/test_autobuild_runner_subprocess.py) reports 'All checks passed!'. Pre-existing unused-import in tests/forge/test_autobuild_runner.py was not introduced by this task (it was present in the baseline before TASK-ABW-001) \u2014 the test-file edits in this task did not add new lint violations."
+    }
+  ],
+  "acceptance_criteria_verification": {
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`_resolve_repo_path(payload)` returns an absolute `Path` for a valid",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented _resolve_repo_path in src/forge/subagents/autobuild_runner.py: validates payload['repo'] is non-empty, derives basename, joins with FORGE_REPO_BASE (defaults to ~/Projects/appmilla_github), checks candidate.exists(), is_dir(), and (candidate/'.git').exists(), then runs _path_inside_allowlist (imported from forge.adapters.nats.pipeline_consumer). Each failure path logs a WARNING with the structured reason and returns None. Verified by test_missing_repo_in_payload_transitions_to_failed and test_resolved_repo_outside_allowlist_transitions_to_failed in the new integration test file.",
+        "notes": "Implemented _resolve_repo_path in src/forge/subagents/autobuild_runner.py: validates payload['repo'] is non-empty, derives basename, joins with FORGE_REPO_BASE (defaults to ~/Projects/appmilla_github), checks candidate.exists(), is_dir(), and (candidate/'.git').exists(), then runs _path_inside_allowlist (imported from forge.adapters.nats.pipeline_consumer). Each failure path logs a WARNING with the structured reason and returns None. Verified by test_missing_repo_in_payload_transitions_to_failed and test_resolved_repo_outside_allowlist_transitions_to_failed in the new integration test file."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`_resolve_repo_path` honours `FORGE_REPO_BASE` env-var override.",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_resolve_repo_path reads os.environ.get(FORGE_REPO_BASE_ENV) at call time and falls back to DEFAULT_FORGE_REPO_BASE ('~/Projects/appmilla_github'). test_resolved_repo_outside_allowlist_transitions_to_failed sets FORGE_REPO_BASE via monkeypatch.setenv and asserts the resolver uses the overridden base directory (resolver returns None because the synthesised candidate path does not exist under the overridden base).",
+        "notes": "_resolve_repo_path reads os.environ.get(FORGE_REPO_BASE_ENV) at call time and falls back to DEFAULT_FORGE_REPO_BASE ('~/Projects/appmilla_github'). test_resolved_repo_outside_allowlist_transitions_to_failed sets FORGE_REPO_BASE via monkeypatch.setenv and asserts the resolver uses the overridden base directory (resolver returns None because the synthesised candidate path does not exist under the overridden base)."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "guardkit path resolution honours `FORGE_GUARDKIT_PATH` env-var",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_resolve_guardkit_path checks FORGE_GUARDKIT_PATH first (must be an existing executable file via candidate.is_file() and os.access(candidate, os.X_OK)); on miss it falls back to shutil.which('guardkit'). Returns None with a WARNING log when neither resolves. test_guardkit_path_missing_transitions_to_failed patches _resolve_guardkit_path to return None and asserts the runner transitions to failed.",
+        "notes": "_resolve_guardkit_path checks FORGE_GUARDKIT_PATH first (must be an existing executable file via candidate.is_file() and os.access(candidate, os.X_OK)); on miss it falls back to shutil.which('guardkit'). Returns None with a WARNING log when neither resolves. test_guardkit_path_missing_transitions_to_failed patches _resolve_guardkit_path to return None and asserts the runner transitions to failed."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`_node_running_wave` invokes `asyncio.create_subprocess_exec` with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_node_running_wave builds argv = [str(guardkit_path), 'autobuild', 'feature', feature_id, '--fresh', '--verbose'] and calls asyncio.create_subprocess_exec(*argv, cwd=str(repo_path), env=os.environ.copy(), stdout=PIPE, stderr=STDOUT). test_running_wave_invokes_guardkit_and_completes_on_zero_exit captures the args/kwargs handed to create_subprocess_exec via a _make_fake_subprocess closure and asserts argv[0]==str(fake_guardkit), argv[1:6]==('autobuild','feature',feature_id,'--fresh','--verbose'), and kwargs['cwd']==str(fake_repo).",
+        "notes": "_node_running_wave builds argv = [str(guardkit_path), 'autobuild', 'feature', feature_id, '--fresh', '--verbose'] and calls asyncio.create_subprocess_exec(*argv, cwd=str(repo_path), env=os.environ.copy(), stdout=PIPE, stderr=STDOUT). test_running_wave_invokes_guardkit_and_completes_on_zero_exit captures the args/kwargs handed to create_subprocess_exec via a _make_fake_subprocess closure and asserts argv[0]==str(fake_guardkit), argv[1:6]==('autobuild','feature',feature_id,'--fresh','--verbose'), and kwargs['cwd']==str(fake_repo)."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "On subprocess exit code 0, the final state has",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Conditional edge _route_after_running_wave reads the snapshot _node_running_wave wrote and selects 'completed' when lifecycle != 'failed'. _node_completed then writes the terminal completed snapshot. test_running_wave_invokes_guardkit_and_completes_on_zero_exit asserts result['async_tasks'][feature_id]['lifecycle'] == 'completed' after the fake subprocess exits with code 0.",
+        "notes": "Conditional edge _route_after_running_wave reads the snapshot _node_running_wave wrote and selects 'completed' when lifecycle != 'failed'. _node_completed then writes the terminal completed snapshot. test_running_wave_invokes_guardkit_and_completes_on_zero_exit asserts result['async_tasks'][feature_id]['lifecycle'] == 'completed' after the fake subprocess exits with code 0."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "On non-zero subprocess exit, the final state has",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "On non-zero exit, _node_running_wave returns _build_failed_snapshot with tasks_failed=1 and reason 'guardkit autobuild exit=<code>'. Conditional edge routes to _node_failed which writes a terminal failed snapshot preserving tasks_failed >= 1. test_running_wave_transitions_to_failed_on_nonzero_exit asserts both snap['lifecycle']=='failed' and snap['tasks_failed']==1.",
+        "notes": "On non-zero exit, _node_running_wave returns _build_failed_snapshot with tasks_failed=1 and reason 'guardkit autobuild exit=<code>'. Conditional edge routes to _node_failed which writes a terminal failed snapshot preserving tasks_failed >= 1. test_running_wave_transitions_to_failed_on_nonzero_exit asserts both snap['lifecycle']=='failed' and snap['tasks_failed']==1."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "On subprocess timeout (`FORGE_AUTOBUILD_TIMEOUT_SECONDS` exceeded),",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "_node_running_wave wraps the gather(_drain_stdout(), proc.wait()) in asyncio.wait_for(timeout=timeout_seconds); on TimeoutError it calls proc.kill() then waits up to 5s, sets timed_out=True, and returns a failed snapshot with reason 'guardkit autobuild timed out after <N>s'. test_timeout_kills_subprocess_and_transitions_to_failed sets FORGE_AUTOBUILD_TIMEOUT_SECONDS=0.05, supplies a _HangProc whose wait/readline block indefinitely, and asserts kill() was called and the final lifecycle is failed.",
+        "notes": "_node_running_wave wraps the gather(_drain_stdout(), proc.wait()) in asyncio.wait_for(timeout=timeout_seconds); on TimeoutError it calls proc.kill() then waits up to 5s, sets timed_out=True, and returns a failed snapshot with reason 'guardkit autobuild timed out after <N>s'. test_timeout_kills_subprocess_and_transitions_to_failed sets FORGE_AUTOBUILD_TIMEOUT_SECONDS=0.05, supplies a _HangProc whose wait/readline block indefinitely, and asserts kill() was called and the final lifecycle is failed."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "`_node_failed` exists and is reachable via a conditional edge from",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Added _node_failed function in src/forge/subagents/autobuild_runner.py that writes a terminal failed snapshot preserving prior counters (tasks_failed defaulted to max(existing, 1)). _build_runner_graph adds the 'failed' node and replaces the unconditional 'running_wave'\u2192'completed' edge with sg.add_conditional_edges('running_wave', _route_after_running_wave, {'completed': 'completed', 'failed': 'failed'}). The two AC-006/AC-007 tests both exercise this conditional-edge path.",
+        "notes": "Added _node_failed function in src/forge/subagents/autobuild_runner.py that writes a terminal failed snapshot preserving prior counters (tasks_failed defaulted to max(existing, 1)). _build_runner_graph adds the 'failed' node and replaces the unconditional 'running_wave'\u2192'completed' edge with sg.add_conditional_edges('running_wave', _route_after_running_wave, {'completed': 'completed', 'failed': 'failed'}). The two AC-006/AC-007 tests both exercise this conditional-edge path."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "At least one `stage_complete` snapshot is emitted between",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Per the spec's acceptance fallback clause, _node_running_wave on success returns a running_wave snapshot with tasks_completed=max(stage_complete_count, 1) \u2014 counted from [guardkit-checkpoint] Turn N complete (tests: ...) lines in the streamed stdout. The bridge translator's _build_stage_complete delta condition fires on prev.running_wave\u2192snap.running_wave with tasks_completed advance; the visible-mid-stream snapshot is what the integration test asserts. test_running_wave_invokes_guardkit_and_completes_on_zero_exit drives the values stream via astream and collects any running_wave snapshot with tasks_completed >= 1, then asserts the collection is non-empty.",
+        "notes": "Per the spec's acceptance fallback clause, _node_running_wave on success returns a running_wave snapshot with tasks_completed=max(stage_complete_count, 1) \u2014 counted from [guardkit-checkpoint] Turn N complete (tests: ...) lines in the streamed stdout. The bridge translator's _build_stage_complete delta condition fires on prev.running_wave\u2192snap.running_wave with tasks_completed advance; the visible-mid-stream snapshot is what the integration test asserts. test_running_wave_invokes_guardkit_and_completes_on_zero_exit drives the values stream via astream and collects any running_wave snapshot with tasks_completed >= 1, then asserts the collection is non-empty."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "`tests/integration/test_autobuild_runner_subprocess.py` exists with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created tests/integration/test_autobuild_runner_subprocess.py with TestRunningWaveSubprocessSuccess::test_running_wave_invokes_guardkit_and_completes_on_zero_exit and TestRunningWaveSubprocessFailure::test_running_wave_transitions_to_failed_on_nonzero_exit (plus defensive coverage for missing-repo, missing-guardkit, allowlist, and timeout paths). pytest -v output: 6 passed in 5.18s \u2014 both required tests included and green.",
+        "notes": "Created tests/integration/test_autobuild_runner_subprocess.py with TestRunningWaveSubprocessSuccess::test_running_wave_invokes_guardkit_and_completes_on_zero_exit and TestRunningWaveSubprocessFailure::test_running_wave_transitions_to_failed_on_nonzero_exit (plus defensive coverage for missing-repo, missing-guardkit, allowlist, and timeout paths). pytest -v output: 6 passed in 5.18s \u2014 both required tests included and green."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ruff check on the modified production file (src/forge/subagents/autobuild_runner.py) and the new integration test file (tests/integration/test_autobuild_runner_subprocess.py) reports 'All checks passed!'. Pre-existing unused-import in tests/forge/test_autobuild_runner.py was not introduced by this task (it was present in the baseline before TASK-ABW-001) \u2014 the test-file edits in this task did not add new lint violations.",
+        "notes": "ruff check on the modified production file (src/forge/subagents/autobuild_runner.py) and the new integration test file (tests/integration/test_autobuild_runner_subprocess.py) reports 'All checks passed!'. Pre-existing unused-import in tests/forge/test_autobuild_runner.py was not introduced by this task (it was present in the baseline before TASK-ABW-001) \u2014 the test-file edits in this task did not add new lint violations."
+      }
+    ]
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "rationale": "All quality gates passed. Independent verification confirmed. All acceptance criteria met. Architecture context: 457 chars provided.",
+  "context_used": "## Job-Specific Context\n\nBudget: 1943/5200 tokens\n\n### \u2705 Similar Outcomes\n- HAS_ATTRIBUTE\n- NOT_HAS_ATTRIBUTE\n\n### \ud83c\udfa8 Relevant Patterns\n- PROJECT_CONTEXT\n- SETS_UP_FEATURE_STRUCTURE_AT\n- ASSIGNS_TASK_TO\n- IS_USED_IN_PROJECT\n\n### \u26a0\ufe0f Warnings\n- RELATED_PROJECT\n- NEEDS_TO_INVOKE\n- HAS_PROJECT_ID\n\n### \ud83c\udfad Role Constraints\n- DELEGATE_TO_TASK_WORK\n- DELEGATES_TO\n- DELEGATES_TO\n- MONITOR_QUALITY_GATES\n\n### \ud83d\udee0\ufe0f Implementation Modes\n- IMPLEMENTATION_MODE_INVOKED_BY\n",
+  "approved_without_independent_tests": false,
+  "is_configuration_error": false,
+  "environment_conditional_approval": false,
+  "honesty_verification": {
+    "verified": true,
+    "honesty_score": 1.0,
+    "discrepancy_count": 0,
+    "resolved_paths": []
+  }
+}

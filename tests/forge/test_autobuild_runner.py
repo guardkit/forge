@@ -627,23 +627,64 @@ class TestRunnerGraphConstruction:
     def test_runner_graph_invocation_populates_async_tasks(self) -> None:
         """End-to-end: invoke the graph and assert ``async_tasks`` is populated.
 
-        The translator needs ``async_tasks[feature_id]`` to surface the
-        AutobuildState snapshot. This test exercises the full graph
-        without an LLM (placeholder bodies, by design) and asserts the
-        terminal snapshot lands on the channel with the correct
-        identifiers threaded from the launch description.
+        TASK-ABW-001 — ``_node_running_wave`` is now async and shells out
+        to ``guardkit autobuild``. The test monkey-patches the resolvers
+        + subprocess at the module surface so the graph drives end-to-end
+        without a real guardkit / repo checkout (matching the strategy
+        spelled out in TASK-ABW-001 §Implementation notes).
         """
+        import asyncio as _asyncio
+        from pathlib import Path as _Path
+
         from langchain_core.messages import HumanMessage
 
-        graph = _build_runner_graph()
-        description = (
-            'RUN_AUTOBUILD subagent=autobuild_runner '
-            'payload={"build_id": "build-FEAT-Z-1", '
-            '"feature_id": "FEAT-Z", '
-            '"correlation_id": "corr-Z", '
-            '"wave_total": 2, "task_total": 3}'
-        )
-        result = graph.invoke({"messages": [HumanMessage(content=description)]})
+        from forge.subagents import autobuild_runner as _ar_mod
+
+        async def _fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> Any:
+            class _FakeStdout:
+                def __init__(self) -> None:
+                    self._lines = [
+                        b"starting guardkit autobuild\n",
+                        b"[guardkit-checkpoint] Turn 1 complete (tests: pass)\n",
+                        b"all done\n",
+                        b"",  # EOF
+                    ]
+
+                async def readline(self) -> bytes:
+                    return self._lines.pop(0) if self._lines else b""
+
+            class _FakeProc:
+                pid = 12345
+                returncode = 0
+                stdout = _FakeStdout()
+
+                async def wait(self) -> int:
+                    return 0
+
+                def kill(self) -> None:
+                    return None
+
+            return _FakeProc()
+
+        with patch.object(
+            _ar_mod, "_resolve_repo_path", lambda payload: _Path("/tmp/fake-repo")
+        ), patch.object(
+            _ar_mod, "_resolve_guardkit_path", lambda: _Path("/usr/bin/guardkit")
+        ), patch.object(
+            _asyncio, "create_subprocess_exec", _fake_create_subprocess_exec
+        ):
+            graph = _build_runner_graph()
+            description = (
+                'RUN_AUTOBUILD subagent=autobuild_runner '
+                'payload={"build_id": "build-FEAT-Z-1", '
+                '"feature_id": "FEAT-Z", '
+                '"repo": "appmilla/api_test", '
+                '"correlation_id": "corr-Z", '
+                '"wave_total": 2, "task_total": 3}'
+            )
+            result = _asyncio.run(
+                graph.ainvoke({"messages": [HumanMessage(content=description)]})
+            )
 
         assert "async_tasks" in result, (
             "runner graph terminal state must include async_tasks; "
@@ -664,32 +705,71 @@ class TestRunnerGraphConstruction:
     def test_runner_graph_values_stream_surfaces_each_lifecycle(self) -> None:
         """``stream_mode='values'`` surfaces every lifecycle transition.
 
-        AC-2 closes only if the bridge translator (which consumes
-        ``stream_mode='values'``) sees ``starting`` / ``planning_waves``
-        / ``running_wave`` / ``completed`` in order. This test invokes
-        the values stream and asserts each transition lands as a
-        distinct projection.
+        TASK-ABW-001 — with the subprocess wiring stubbed, the values
+        stream still surfaces ``starting`` / ``planning_waves`` /
+        ``running_wave`` / ``completed`` in order (the AC-2 contract).
         """
+        import asyncio as _asyncio
+        from pathlib import Path as _Path
+
         from langchain_core.messages import HumanMessage
 
-        graph = _build_runner_graph()
-        description = (
-            'RUN_AUTOBUILD subagent=autobuild_runner '
-            'payload={"build_id": "build-FEAT-Y-1", '
-            '"feature_id": "FEAT-Y", '
-            '"correlation_id": "corr-Y"}'
-        )
-        lifecycles_seen: list[str] = []
-        for chunk in graph.stream(
-            {"messages": [HumanMessage(content=description)]},
-            stream_mode="values",
-        ):
-            ats = chunk.get("async_tasks") if isinstance(chunk, dict) else None
-            if not ats:
-                continue
-            snap = ats.get("FEAT-Y")
-            if snap and snap.get("lifecycle") not in lifecycles_seen:
-                lifecycles_seen.append(snap.get("lifecycle"))
+        from forge.subagents import autobuild_runner as _ar_mod
+
+        async def _fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> Any:
+            class _FakeStdout:
+                def __init__(self) -> None:
+                    self._lines = [
+                        b"[guardkit-checkpoint] Turn 1 complete (tests: pass)\n",
+                        b"",
+                    ]
+
+                async def readline(self) -> bytes:
+                    return self._lines.pop(0) if self._lines else b""
+
+            class _FakeProc:
+                pid = 1
+                returncode = 0
+                stdout = _FakeStdout()
+
+                async def wait(self) -> int:
+                    return 0
+
+                def kill(self) -> None:
+                    return None
+
+            return _FakeProc()
+
+        async def _run_stream() -> list[str]:
+            seen: list[str] = []
+            with patch.object(
+                _ar_mod, "_resolve_repo_path", lambda payload: _Path("/tmp/fake-repo")
+            ), patch.object(
+                _ar_mod, "_resolve_guardkit_path", lambda: _Path("/usr/bin/guardkit")
+            ), patch.object(
+                _asyncio, "create_subprocess_exec", _fake_create_subprocess_exec
+            ):
+                graph = _build_runner_graph()
+                description = (
+                    'RUN_AUTOBUILD subagent=autobuild_runner '
+                    'payload={"build_id": "build-FEAT-Y-1", '
+                    '"feature_id": "FEAT-Y", '
+                    '"repo": "appmilla/api_test", '
+                    '"correlation_id": "corr-Y"}'
+                )
+                async for chunk in graph.astream(
+                    {"messages": [HumanMessage(content=description)]},
+                    stream_mode="values",
+                ):
+                    ats = chunk.get("async_tasks") if isinstance(chunk, dict) else None
+                    if not ats:
+                        continue
+                    snap = ats.get("FEAT-Y")
+                    if snap and snap.get("lifecycle") not in seen:
+                        seen.append(snap.get("lifecycle"))
+            return seen
+
+        lifecycles_seen = _asyncio.run(_run_stream())
 
         assert lifecycles_seen == [
             "starting",

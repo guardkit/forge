@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-ABW-001",
+    "pre_path": "tasks/backlog/TASK-ABW-001-wire-up-running-wave-node.md",
+    "post_path": "tasks/design_approved/TASK-ABW-001-wire-up-running-wave-node.md",
+    "timestamp": "2026-05-14T16:04:28.252066+00:00",
+    "kind": "design_approved_transition"
+  }
+]

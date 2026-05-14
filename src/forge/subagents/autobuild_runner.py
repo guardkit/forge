@@ -77,6 +77,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1004,14 +1005,450 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
     return _snapshot_update(snapshot)
 
 
-def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
-    """Transition to ``running_wave`` — first wave begins."""
+# ---------------------------------------------------------------------------
+# guardkit subprocess wiring (TASK-ABW-001)
+# ---------------------------------------------------------------------------
+#
+# The runner shells out to ``guardkit autobuild feature <feature_id> --fresh
+# --verbose`` against a resolved local checkout of the target repo. The
+# helpers below resolve the repo and guardkit binary paths from the launch
+# payload + environment, and the rewritten ``_node_running_wave`` body
+# orchestrates the subprocess with timeout + exit-code mapping.
+
+
+#: Environment override for the base directory containing local repo
+#: checkouts. The resolver expects ``<FORGE_REPO_BASE>/<basename>`` to be a
+#: cloned checkout of ``payload["repo"]``. Defaults to
+#: ``~/Projects/appmilla_github`` per the source plan's single-host layout.
+FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
+
+#: Environment override for the absolute path to the ``guardkit`` binary.
+#: When unset, :func:`_resolve_guardkit_path` falls back to
+#: :func:`shutil.which("guardkit")`.
+FORGE_GUARDKIT_PATH_ENV: str = "FORGE_GUARDKIT_PATH"
+
+#: Environment override for the autobuild subprocess timeout, in seconds.
+#: Defaults to ``3600`` (60 minutes) per TASK-ABW-001 §Scope item 5.
+FORGE_AUTOBUILD_TIMEOUT_ENV: str = "FORGE_AUTOBUILD_TIMEOUT_SECONDS"
+
+#: Default subprocess timeout (seconds). Operators may override via
+#: :data:`FORGE_AUTOBUILD_TIMEOUT_ENV`.
+DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 3600
+
+#: Default base directory for repo checkouts when
+#: :data:`FORGE_REPO_BASE_ENV` is unset. Resolved at call time via
+#: :meth:`Path.expanduser` so a different ``$HOME`` in the sidecar still
+#: works.
+DEFAULT_FORGE_REPO_BASE: str = "~/Projects/appmilla_github"
+
+#: Regex matching one ``[guardkit-checkpoint] Turn N complete (tests: ...)``
+#: line in guardkit's verbose stdout. The runner counts these to drive the
+#: stage_complete fallback (TASK-ABW-001 §Scope item 3).
+_GUARDKIT_CHECKPOINT_PATTERN: re.Pattern[str] = re.compile(
+    r"\[guardkit-checkpoint\]\s+Turn\s+\d+\s+complete\s+\(tests:\s+(pass|fail)",
+    flags=re.IGNORECASE,
+)
+
+
+def _resolve_guardkit_path() -> Path | None:
+    """Resolve the absolute path of the ``guardkit`` executable.
+
+    Resolution order (TASK-ABW-001 §Scope item 2):
+
+    1. :data:`FORGE_GUARDKIT_PATH_ENV` env var, if it points to an existing
+       executable file.
+    2. :func:`shutil.which("guardkit")`.
+
+    Returns ``None`` and logs a WARNING when no executable resolves; the
+    caller (``_node_running_wave``) treats this as a ``failed`` transition.
+    The return type is :class:`Path` so the subprocess wiring can pass
+    ``str(path)`` to :func:`asyncio.create_subprocess_exec` without any
+    further coercion.
+    """
+    override = os.environ.get(FORGE_GUARDKIT_PATH_ENV, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+        logger.warning(
+            "autobuild_runner: %s=%r does not resolve to an executable file "
+            "— falling back to shutil.which('guardkit')",
+            FORGE_GUARDKIT_PATH_ENV,
+            override,
+        )
+
+    which_result = shutil.which("guardkit")
+    if which_result:
+        return Path(which_result).resolve()
+
+    logger.warning(
+        "autobuild_runner: guardkit binary not found on PATH and "
+        "%s is unset — _node_running_wave will transition to 'failed'",
+        FORGE_GUARDKIT_PATH_ENV,
+    )
+    return None
+
+
+def _load_filesystem_allowlist() -> list[Path] | None:
+    """Best-effort loader for ``forge_config.permissions.filesystem.allowlist``.
+
+    The runner subagent does not receive ``ForgeConfig`` directly (it is a
+    LangGraph thread launched by the supervisor). For the allowlist gate,
+    we attempt to load ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``) lazily;
+    on any failure we return ``None`` and the resolver falls back to a
+    permissive base-dir-only check. The integration tests bypass this
+    entirely by monkey-patching :func:`_resolve_repo_path` at the module
+    surface.
+
+    Returns:
+        A list of allowlisted :class:`Path` roots, or ``None`` when no
+        config could be loaded.
+    """
+    config_path_env = os.environ.get("FORGE_CONFIG_PATH", "").strip()
+    candidate_paths: list[Path] = []
+    if config_path_env:
+        candidate_paths.append(Path(config_path_env).expanduser())
+    candidate_paths.append(Path("forge.yaml"))
+
+    for cfg_path in candidate_paths:
+        if not cfg_path.is_file():
+            continue
+        try:
+            # Local import keeps the module import-light when no config exists.
+            from forge.config.loader import load_config  # type: ignore[import-not-found]
+
+            cfg = load_config(cfg_path)
+        except Exception as exc:  # noqa: BLE001 — best-effort loader
+            logger.warning(
+                "autobuild_runner: failed to load forge config from %s: %s",
+                cfg_path,
+                exc,
+            )
+            return None
+        try:
+            return list(cfg.permissions.filesystem.allowlist)
+        except AttributeError:
+            return None
+    return None
+
+
+def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
+    """Resolve the absolute local checkout for ``payload['repo']``.
+
+    Maps ``payload["repo"]`` (e.g. ``"appmilla/api_test"``) to
+    ``<FORGE_REPO_BASE>/<basename>`` and validates that the resolved path:
+
+    1. Exists on disk.
+    2. Is a git repo (``.git/`` present as a directory or file — git
+       worktrees use a ``.git`` file).
+    3. Is inside the configured filesystem allowlist (when discoverable
+       via :func:`_load_filesystem_allowlist`).
+
+    On any failure, returns ``None`` and logs a WARNING with the structured
+    reason. The caller transitions to ``failed`` with that reason on the
+    snapshot.
+
+    Args:
+        payload: Parsed launch payload — must carry the ``repo`` key
+            shaped as ``"<org>/<repo>"``.
+
+    Returns:
+        Resolved absolute :class:`Path` on success, or ``None`` on any
+        validation failure (missing key, non-existent path, not a git
+        repo, outside allowlist).
+    """
+    repo_raw = payload.get("repo")
+    if not isinstance(repo_raw, str) or not repo_raw.strip():
+        logger.warning(
+            "autobuild_runner: missing or empty 'repo' in launch payload — "
+            "cannot resolve checkout path"
+        )
+        return None
+
+    # Accept ``org/repo`` and bare ``repo`` (defensive — the BuildQueuedPayload
+    # field is loosely shaped; only the basename matters for the local layout).
+    basename = repo_raw.strip().split("/")[-1]
+    if not basename:
+        logger.warning(
+            "autobuild_runner: repo=%r has empty basename after split — "
+            "cannot resolve checkout path",
+            repo_raw,
+        )
+        return None
+
+    base_dir_raw = os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
+    base_dir = Path(base_dir_raw).expanduser().resolve()
+    candidate = (base_dir / basename).resolve()
+
+    if not candidate.exists():
+        logger.warning(
+            "autobuild_runner: resolved repo path %s does not exist on disk "
+            "(repo=%r, base=%s)",
+            candidate,
+            repo_raw,
+            base_dir,
+        )
+        return None
+
+    if not candidate.is_dir():
+        logger.warning(
+            "autobuild_runner: resolved repo path %s is not a directory "
+            "(repo=%r)",
+            candidate,
+            repo_raw,
+        )
+        return None
+
+    git_marker = candidate / ".git"
+    if not git_marker.exists():
+        logger.warning(
+            "autobuild_runner: resolved repo path %s is not a git repo "
+            "(missing .git marker, repo=%r)",
+            candidate,
+            repo_raw,
+        )
+        return None
+
+    # Allowlist gate. When no config is discoverable we fall back to
+    # FORGE_REPO_BASE itself — the resolver convention already constrains
+    # paths to that root, so a bare base-dir check is equivalent to the
+    # default permissions and avoids hard-failing test environments that
+    # ship without a forge.yaml.
+    allowlist = _load_filesystem_allowlist()
+    if allowlist is None:
+        allowlist = [base_dir]
+
+    # Local import to avoid a hard adapter→subagent dep at module load.
+    from forge.adapters.nats.pipeline_consumer import _path_inside_allowlist
+
+    if not _path_inside_allowlist(str(candidate), allowlist):
+        logger.warning(
+            "autobuild_runner: resolved repo path %s is outside the "
+            "configured filesystem allowlist (repo=%r)",
+            candidate,
+            repo_raw,
+        )
+        return None
+
+    return candidate
+
+
+def _resolve_autobuild_timeout_seconds() -> float:
+    """Read :data:`FORGE_AUTOBUILD_TIMEOUT_ENV` with a safe default fallback.
+
+    Malformed values fall back to :data:`DEFAULT_AUTOBUILD_TIMEOUT_SECONDS`
+    rather than raising — the subagent must not crash on a stray env-var
+    typo. Non-positive values are also coerced to the default because a
+    zero/negative timeout would short-circuit every autobuild before the
+    subprocess could even start.
+    """
+    raw = os.environ.get(FORGE_AUTOBUILD_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return float(DEFAULT_AUTOBUILD_TIMEOUT_SECONDS)
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning(
+            "autobuild_runner: %s=%r is not a number — using default %s",
+            FORGE_AUTOBUILD_TIMEOUT_ENV,
+            raw,
+            DEFAULT_AUTOBUILD_TIMEOUT_SECONDS,
+        )
+        return float(DEFAULT_AUTOBUILD_TIMEOUT_SECONDS)
+    if parsed <= 0:
+        return float(DEFAULT_AUTOBUILD_TIMEOUT_SECONDS)
+    return parsed
+
+
+def _build_failed_snapshot(payload: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
+    """Construct a ``failed`` snapshot carrying a structured reason.
+
+    The bridge translator's :func:`_build_failed`
+    (``forge.lifecycle_bridge.translation``) publishes the snapshot's
+    failure metadata; the reason we set here ends up on the wire via the
+    ``pipeline.build-failed.<feature_id>`` envelope. We always set
+    ``tasks_failed=1`` so the bridge's stage_complete delta also fires
+    where applicable.
+
+    Args:
+        payload: Parsed launch payload (consulted for ``feature_id``,
+            ``build_id``, ``correlation_id``).
+        reason: Free-form failure reason — written into the runner log
+            and surfaced to operators reading the snapshot.
+
+    Returns:
+        A snapshot dict suitable for :func:`_snapshot_update`.
+    """
+    logger.warning("autobuild_runner: transitioning to failed: %s", reason)
+    return _build_snapshot(
+        payload,
+        lifecycle="failed",
+        wave_index=0,
+        task_index=0,
+        tasks_completed=0,
+        tasks_failed=1,
+    )
+
+
+async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Invoke ``guardkit autobuild`` against the resolved local checkout.
+
+    TASK-ABW-001 — replaces the previous lifecycle-stub body with the
+    real subprocess wiring. Responsibilities:
+
+    1. Extract ``repo`` + ``feature_id`` from the launch payload.
+    2. Resolve the local checkout via :func:`_resolve_repo_path` and the
+       ``guardkit`` binary via :func:`_resolve_guardkit_path`.
+    3. On any validation/resolution failure, return a ``failed`` snapshot
+       carrying a structured reason — the conditional edge then routes
+       the graph to :func:`_node_failed`.
+    4. On success, invoke
+       ``asyncio.create_subprocess_exec(guardkit_path, "autobuild",
+       "feature", feature_id, "--fresh", "--verbose",
+       cwd=resolved_repo_path, env=os.environ.copy())`` and stream the
+       combined stdout/stderr line-by-line. Each
+       ``[guardkit-checkpoint] Turn N complete (tests: pass|fail)`` line
+       bumps an internal counter so the returned ``running_wave``
+       snapshot carries ``tasks_completed=1`` (stage_complete fallback).
+    5. On exit code 0, return a ``running_wave`` snapshot with
+       ``tasks_completed=1`` — the conditional edge then routes to
+       :func:`_node_completed`.
+    6. On non-zero exit, signal, or timeout, kill any surviving process
+       and return a ``failed`` snapshot with ``tasks_failed=1`` and
+       ``"guardkit autobuild exit=<code>"`` as the reason — the
+       conditional edge routes to :func:`_node_failed`.
+    """
     payload = _extract_launch_payload(list(state.get("messages", [])))
+
+    feature_id_raw = payload.get("feature_id")
+    if not isinstance(feature_id_raw, str) or not feature_id_raw.strip():
+        return _snapshot_update(
+            _build_failed_snapshot(payload, reason="missing feature_id in launch payload")
+        )
+    feature_id = feature_id_raw.strip()
+
+    if not isinstance(payload.get("repo"), str) or not str(payload.get("repo")).strip():
+        return _snapshot_update(
+            _build_failed_snapshot(payload, reason="missing repo in launch payload")
+        )
+
+    repo_path = _resolve_repo_path(payload)
+    if repo_path is None:
+        return _snapshot_update(
+            _build_failed_snapshot(
+                payload,
+                reason=f"unable to resolve repo path for repo={payload.get('repo')!r}",
+            )
+        )
+
+    guardkit_path = _resolve_guardkit_path()
+    if guardkit_path is None:
+        return _snapshot_update(
+            _build_failed_snapshot(
+                payload,
+                reason="guardkit binary not found (PATH lookup + "
+                f"{FORGE_GUARDKIT_PATH_ENV} both failed)",
+            )
+        )
+
+    timeout_seconds = _resolve_autobuild_timeout_seconds()
+    argv: list[str] = [
+        str(guardkit_path),
+        "autobuild",
+        "feature",
+        feature_id,
+        "--fresh",
+        "--verbose",
+    ]
+
+    logger.info(
+        "autobuild_runner: launching subprocess feature_id=%s cwd=%s timeout=%ss",
+        feature_id,
+        repo_path,
+        timeout_seconds,
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(repo_path),
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        return _snapshot_update(
+            _build_failed_snapshot(
+                payload,
+                reason=f"failed to spawn guardkit subprocess: {exc!r}",
+            )
+        )
+
+    stage_complete_count = 0
+
+    async def _drain_stdout() -> None:
+        nonlocal stage_complete_count
+        if proc.stdout is None:  # defensive — PIPE was requested above
+            return
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            if _GUARDKIT_CHECKPOINT_PATTERN.search(decoded):
+                stage_complete_count += 1
+            logger.debug("autobuild_runner[stdout]: %s", decoded)
+
+    timed_out = False
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(_drain_stdout(), proc.wait()),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        logger.warning(
+            "autobuild_runner: subprocess timeout after %.1fs feature_id=%s "
+            "— killing process",
+            timeout_seconds,
+            feature_id,
+        )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "autobuild_runner: subprocess did not exit after kill() — "
+                "leaking pid=%s feature_id=%s",
+                proc.pid,
+                feature_id,
+            )
+
+    exit_code = proc.returncode if proc.returncode is not None else -1
+
+    if timed_out or exit_code != 0:
+        reason = (
+            f"guardkit autobuild timed out after {timeout_seconds}s"
+            if timed_out
+            else f"guardkit autobuild exit={exit_code}"
+        )
+        return _snapshot_update(_build_failed_snapshot(payload, reason=reason))
+
+    # Success — return a running_wave snapshot with tasks_completed=1 so
+    # the bridge translator's stage_complete delta can fire (and so the
+    # state-channel visibly carries a stage_complete-shaped snapshot for
+    # the integration test's mid-stream assertion).
+    tasks_completed = max(stage_complete_count, 1)
     snapshot = _build_snapshot(
         payload,
         lifecycle="running_wave",
         wave_index=0,
         task_index=0,
+        tasks_completed=tasks_completed,
+        tasks_failed=0,
     )
     return _snapshot_update(snapshot)
 
@@ -1027,6 +1464,59 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         tasks_completed=int(payload.get("task_total") or 1),
     )
     return _snapshot_update(snapshot)
+
+
+def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Terminal ``failed`` node (TASK-ABW-001).
+
+    Reachable via the conditional edge from ``running_wave`` when the
+    subprocess exits non-zero, times out, or any preconditions fail.
+    The body refreshes the snapshot timestamp so observers see the
+    transition land as a fresh state-channel write; the lifecycle is
+    already ``failed`` from :func:`_node_running_wave`'s return value,
+    so this node simply ensures the channel carries a terminal-shaped
+    snapshot with ``tasks_failed >= 1``.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    # Preserve any tasks_failed already on the channel; default to 1 so
+    # the bridge translator's _build_failed has a non-trivial counter.
+    existing = (
+        state.get("async_tasks", {}).get(
+            str(payload.get("feature_id") or "FEAT-UNKNOWN"), {}
+        )
+        if isinstance(state.get("async_tasks"), Mapping)
+        else {}
+    )
+    tasks_failed = max(int(existing.get("tasks_failed") or 0), 1)
+    snapshot = _build_snapshot(
+        payload,
+        lifecycle="failed",
+        wave_index=int(existing.get("wave_index") or 0),
+        task_index=int(existing.get("task_index") or 0),
+        tasks_completed=int(existing.get("tasks_completed") or 0),
+        tasks_failed=tasks_failed,
+    )
+    return _snapshot_update(snapshot)
+
+
+def _route_after_running_wave(state: AutobuildRunnerState) -> str:
+    """Conditional-edge resolver: ``running_wave`` → ``completed`` | ``failed``.
+
+    Reads ``async_tasks[feature_id].lifecycle`` (the snapshot that
+    :func:`_node_running_wave` just wrote) and selects the matching
+    terminal node. Returns the key strings registered with
+    :meth:`StateGraph.add_conditional_edges`.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+    async_tasks = state.get("async_tasks") or {}
+    snapshot = async_tasks.get(feature_id) if isinstance(async_tasks, Mapping) else None
+    lifecycle = (
+        snapshot.get("lifecycle") if isinstance(snapshot, Mapping) else None
+    )
+    if lifecycle == "failed":
+        return "failed"
+    return "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -1073,11 +1563,21 @@ def _build_runner_graph() -> Any:
         sg.add_node("planning_waves", _node_planning_waves)
         sg.add_node("running_wave", _node_running_wave)
         sg.add_node("completed", _node_completed)
+        sg.add_node("failed", _node_failed)
         sg.add_edge(START, "starting")
         sg.add_edge("starting", "planning_waves")
         sg.add_edge("planning_waves", "running_wave")
-        sg.add_edge("running_wave", "completed")
+        # TASK-ABW-001: ``running_wave`` may write either a
+        # ``running_wave`` snapshot (success) or a ``failed`` snapshot
+        # (resolution / subprocess failure). The conditional edge below
+        # routes to the matching terminal node.
+        sg.add_conditional_edges(
+            "running_wave",
+            _route_after_running_wave,
+            {"completed": "completed", "failed": "failed"},
+        )
         sg.add_edge("completed", END)
+        sg.add_edge("failed", END)
         return sg.compile()
     except Exception as exc:  # noqa: BLE001 - construction-time safety net
         logger.warning(
@@ -1115,6 +1615,11 @@ graph = _build_runner_graph()
 
 __all__ = [
     "AUTOBUILD_RUNNER_NAME",
+    "DEFAULT_AUTOBUILD_TIMEOUT_SECONDS",
+    "DEFAULT_FORGE_REPO_BASE",
+    "FORGE_AUTOBUILD_TIMEOUT_ENV",
+    "FORGE_GUARDKIT_PATH_ENV",
+    "FORGE_REPO_BASE_ENV",
     "AutobuildLifecycle",
     "AutobuildRunnerState",
     "AutobuildState",
@@ -1126,6 +1631,11 @@ __all__ = [
     "TERMINAL_LIFECYCLES",
     "WorktreeConfinementError",
     "_async_tasks_reducer",
+    "_node_failed",
+    "_node_running_wave",
+    "_resolve_guardkit_path",
+    "_resolve_repo_path",
+    "_route_after_running_wave",
     "_update_state",
     "assert_within_worktree",
     "build_stage_complete_kwargs",
