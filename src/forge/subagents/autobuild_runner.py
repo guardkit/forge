@@ -1159,11 +1159,26 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     """
     repo_raw = payload.get("repo")
     if not isinstance(repo_raw, str) or not repo_raw.strip():
-        logger.warning(
-            "autobuild_runner: missing or empty 'repo' in launch payload — "
-            "cannot resolve checkout path"
-        )
-        return None
+        # TEMP HOTFIX (TASK-ABW-002 tracked): the upstream dispatcher closure
+        # (forge.cli.serve.dispatcher) only forwards build_id/feature_id/
+        # rationale to dispatch_autobuild_async, so payload.repo is absent
+        # in production launches. Fall back to FORGE_DEFAULT_REPO until the
+        # upstream contract is widened to plumb the BuildQueuedPayload
+        # repo/branch/feature_yaml_path through to launch_payload.
+        env_repo = os.environ.get("FORGE_DEFAULT_REPO", "").strip()
+        if env_repo:
+            logger.info(
+                "autobuild_runner: payload.repo missing; using "
+                "FORGE_DEFAULT_REPO=%s",
+                env_repo,
+            )
+            repo_raw = env_repo
+        else:
+            logger.warning(
+                "autobuild_runner: missing or empty 'repo' in launch payload "
+                "and FORGE_DEFAULT_REPO unset — cannot resolve checkout path"
+            )
+            return None
 
     # Accept ``org/repo`` and bare ``repo`` (defensive — the BuildQueuedPayload
     # field is loosely shaped; only the basename matters for the local layout).
@@ -1327,10 +1342,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         )
     feature_id = feature_id_raw.strip()
 
-    if not isinstance(payload.get("repo"), str) or not str(payload.get("repo")).strip():
-        return _snapshot_update(
-            _build_failed_snapshot(payload, reason="missing repo in launch payload")
-        )
+    # TEMP HOTFIX (TASK-ABW-002): the early guard previously short-circuited
+    # before _resolve_repo_path's FORGE_DEFAULT_REPO fallback could fire.
+    # Delegate the missing-repo decision entirely to the resolver so the
+    # fallback path is reachable.
 
     repo_path = _resolve_repo_path(payload)
     if repo_path is None:
