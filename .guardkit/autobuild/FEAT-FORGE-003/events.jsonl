@@ -1,0 +1,4 @@
+{"run_id":"run-TASK-SAD-001-20260504141320","feature_id":null,"task_id":"TASK-SAD-001","agent_role":"player","attempt":1,"timestamp":"2026-05-04T14:13:20.241005","schema_version":"1.0.0"}
+{"run_id":"run-TASK-SAD-001-20260504141614","feature_id":null,"task_id":"TASK-SAD-001","agent_role":"player","attempt":1,"timestamp":"2026-05-04T14:16:14.455299","schema_version":"1.0.0","turn_count":1,"diff_stats":"+1 turns","verification_status":"approve","prompt_profile":"digest+rules_bundle"}
+{"run_id":"run-TASK-SAD-001-20260504141843","feature_id":null,"task_id":"TASK-SAD-001","agent_role":"player","attempt":1,"timestamp":"2026-05-04T14:18:43.766100","schema_version":"1.0.0"}
+{"run_id":"run-TASK-SAD-001-20260504142135","feature_id":null,"task_id":"TASK-SAD-001","agent_role":"player","attempt":1,"timestamp":"2026-05-04T14:21:35.283070","schema_version":"1.0.0","turn_count":1,"diff_stats":"+1 turns","verification_status":"approve","prompt_profile":"digest+rules_bundle"}
