@@ -58,6 +58,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import click
 
+from forge.adapters.nats.fleet_publisher import (
+    AGENT_ID,
+    deregister,
+    register_on_boot,
+)
 from forge.cli import _serve_daemon
 from forge.cli._serve_config import (
     DEFAULT_DURABLE_NAME,
@@ -186,6 +191,52 @@ async def _default_compose_dispatch_chain(client: Any) -> None:
 
 #: Module-level rebindable seam: orchestrator-chain composer.
 compose_dispatch_chain: ComposeDispatchChainFn = _default_compose_dispatch_chain
+
+
+# ---------------------------------------------------------------------------
+# Fleet-client seam — opens the dedicated nats_core.NATSClient that
+# ``register_on_boot`` / ``deregister`` need. The forge daemon's primary
+# NATS handle comes from ``_serve_daemon.nats_connect`` and is a raw
+# ``nats.aio.client.Client`` (no ``register_agent`` / ``deregister_agent``
+# helpers). Rather than refactor every downstream consumer onto the
+# higher-level wrapper, we open a second connection scoped exclusively
+# to fleet lifecycle events. The connection cost is one extra TCP
+# socket per ``forge serve`` process.
+# ---------------------------------------------------------------------------
+
+
+FleetClientOpenerFn = Callable[[str], Awaitable[Any]]
+"""``async (nats_url: str) -> NATSClient`` — opens the fleet lifecycle client.
+
+The default implementation constructs a ``nats_core.client.NATSClient``
+with ``name='forge-serve-fleet'`` against the same broker as the daemon
+client. Tests rebind this seam to return a stub so they do not need a
+live broker.
+"""
+
+
+async def _default_open_fleet_client(nats_url: str) -> Any:
+    """Open and connect the dedicated NATSClient used for fleet lifecycle.
+
+    Args:
+        nats_url: Broker URL — typically ``config.nats_url``.
+
+    Returns:
+        A connected :class:`nats_core.client.NATSClient` exposing
+        ``register_agent`` and ``deregister_agent``.
+    """
+    from nats_core.client import NATSClient
+    from nats_core.config import NATSConfig
+
+    fleet_client = NATSClient(
+        NATSConfig(url=nats_url, name="forge-serve-fleet"),
+    )
+    await fleet_client.connect()
+    return fleet_client
+
+
+#: Module-level rebindable seam: fleet lifecycle client opener.
+open_fleet_client: FleetClientOpenerFn = _default_open_fleet_client
 
 
 def bind_production_dispatch_chain(
@@ -575,6 +626,12 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
     1. ``nats_connect(config.nats_url)`` — exactly one connect call on
        the startup path (AC-006). All downstream collaborators share
        this client.
+    1.5. ``register_on_boot(client)`` — publish :data:`FORGE_MANIFEST`
+       to ``fleet.register`` + ``agent-registry`` KV so the fleet
+       supervisor sees forge before any pipeline event is consumed.
+       Runs before the reconciles so a registry watcher fired by the
+       new entry cannot race the consumer attach in a way that hides
+       forge from the fleet view.
     2. ``recovery_reconcile_on_boot(client)`` — SQLite-side recovery
        (PREPARING / RUNNING / PAUSED / FINALISING reconciliation).
     3. ``consumer_reconcile_on_boot(client)`` — JetStream-side redelivery
@@ -584,6 +641,11 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
     5. Schedule ``run_daemon(config, state, client=client)`` and
        ``run_healthz_server(config, state)``; first to complete cancels
        the other.
+
+    On teardown, the ``finally`` block calls ``deregister(client,
+    reason="shutdown")`` before closing the client so the agent-registry
+    KV reflects the shutdown without waiting for staleness eviction.
+    ``deregister`` is idempotent and swallows transport errors.
 
     The daemon receives the shared client so its **first** attach does
     not call ``nats.connect(...)`` (the AC restricts the startup path
@@ -600,7 +662,28 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             read by the healthz handler.
     """
     client: Any = await _serve_daemon.nats_connect(config.nats_url)
+    # Open a dedicated NATSClient wrapper for fleet lifecycle ops. The
+    # daemon's ``client`` above is the raw ``nats.aio.client.Client`` and
+    # does not expose ``register_agent`` / ``deregister_agent``. The
+    # fleet client is short-lived from the daemon's perspective — only
+    # the register + deregister calls go through it, and it is closed
+    # in the finally block alongside the daemon client.
+    fleet_client: Any = await open_fleet_client(config.nats_url)
     try:
+        # Step 1.5 — fleet self-registration. Publishes FORGE_MANIFEST
+        # to ``fleet.register`` and stores it in the ``agent-registry``
+        # KV bucket so the fleet supervisor (jarvis) sees forge in its
+        # capability index. Registration runs BEFORE the reconciles so
+        # any registry watcher that fires on the new entry can race
+        # the consumer attach without missing forge's manifest. Per
+        # the fleet_publisher docstring, a publish failure here is
+        # fatal — the daemon should never start "invisible" to the
+        # fleet supervisor.
+        await register_on_boot(fleet_client)
+        logger.info(
+            "forge-serve: fleet registration published agent_id=%s", AGENT_ID
+        )
+
         # Step 2 + 3 — ASSUM-009 / F1: BOTH reconciliations must run
         # before the durable consumer attaches, so a redelivered
         # envelope cannot land on an unreconciled history view.
@@ -648,6 +731,16 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             if exc is not None:
                 raise exc
     finally:
+        # Best-effort fleet deregistration so the agent-registry KV
+        # reflects shutdown promptly rather than waiting for jarvis to
+        # mark forge stale. ``deregister`` is idempotent and swallows
+        # transport errors internally, so this call cannot prevent the
+        # client-close that follows. Runs even if registration failed
+        # earlier — deregister against a non-existent KV entry is a
+        # no-op by design.
+        await deregister(fleet_client, reason="shutdown")
+        await _close_client_quietly(fleet_client)
+
         # ``run_daemon`` already closes the client on its own
         # iteration's ``finally`` block. This second close is
         # defensive: if the daemon never reached the iteration finally
@@ -717,9 +810,11 @@ def serve_cmd(ctx: click.Context) -> None:
 
 
 __all__ = [
+    "AGENT_ID",
     "ComposeDispatchChainFn",
     "DEFAULT_DURABLE_NAME",
     "DEFAULT_HEALTHZ_PORT",
+    "FleetClientOpenerFn",
     "ReconcileFn",
     "ServeConfig",
     "SubscriptionState",
@@ -727,8 +822,11 @@ __all__ = [
     "build_supervisor",
     "compose_dispatch_chain",
     "consumer_reconcile_on_boot",
+    "deregister",
     "make_handle_message_dispatcher",
+    "open_fleet_client",
     "recovery_reconcile_on_boot",
+    "register_on_boot",
     "run_daemon",
     "run_healthz_server",
     "serve_cmd",

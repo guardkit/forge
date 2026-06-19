@@ -234,13 +234,28 @@ class TestSubscriptionState:
 
 
 class _StubNatsClient:
-    """Minimal client used by smoke tests — exposes only what _run_serve uses."""
+    """Minimal client used by smoke tests — exposes only what _run_serve uses.
+
+    Records every ``register_agent`` / ``deregister_agent`` / ``close``
+    call so the fleet-registration wireup tests can assert the call
+    sequence without needing a real broker.
+    """
 
     def __init__(self) -> None:
         self.closed = False
+        self.register_calls: list = []
+        self.deregister_calls: list[tuple[str, str]] = []
 
     async def close(self) -> None:
         self.closed = True
+
+    async def register_agent(self, manifest: object) -> None:
+        self.register_calls.append(manifest)
+
+    async def deregister_agent(
+        self, agent_id: str, reason: str = "shutdown"
+    ) -> None:
+        self.deregister_calls.append((agent_id, reason))
 
 
 class TestServeCmdSmoke:
@@ -276,7 +291,11 @@ class TestServeCmdSmoke:
         async def _fake_healthz(config: object, state: object) -> None:
             return None
 
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
         # TASK-FIX-F010 — stub the production wrapper and the
@@ -317,7 +336,11 @@ class TestServeCmdSmoke:
         async def _fake_healthz(config: object, state: object) -> None:
             observed.append("healthz")
 
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
         # TASK-FIX-F010 — stub the production wrapper and ForgeConfig
@@ -375,7 +398,11 @@ class TestRunServeBootOrder:
         async def _fake_healthz(config: object, state: object) -> None:
             return None
 
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -427,7 +454,11 @@ class TestRunServeBootOrder:
         async def _fake_healthz(config: object, state: object) -> None:
             events.append("healthz_started")
 
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(
             serve_module, "recovery_reconcile_on_boot", _fake_recovery
         )
@@ -492,7 +523,11 @@ class TestRunServeBootOrder:
         async def _fake_healthz(config: object, state_arg: object) -> None:
             return None
 
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(
             serve_module, "recovery_reconcile_on_boot", _fake_recovery
         )
@@ -539,6 +574,250 @@ class TestRunServeBootOrder:
         _asyncio.run(
             serve_module.consumer_reconcile_on_boot(_StubNatsClient())
         )
+
+
+# ---------------------------------------------------------------------------
+# Fleet registration wireup: register_on_boot / deregister threaded into
+# the _run_serve lifecycle so forge appears in the ``agent-registry`` KV
+# bucket and removes itself on graceful shutdown.
+# ---------------------------------------------------------------------------
+
+
+class TestRunServeFleetRegistration:
+    """``_run_serve`` publishes fleet registration on boot and deregisters in finally."""
+
+    def test_register_on_boot_called_with_shared_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AC: ``register_on_boot`` is awaited with the same client
+        # ``nats_connect`` returned, so the manifest publish reuses the
+        # one startup connection rather than opening a second.
+        import asyncio as _asyncio
+
+        from forge.cli import _serve_daemon
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+        from forge.cli._serve_state import SubscriptionState
+
+        stub_client = _StubNatsClient()
+
+        async def _fake_connect(servers: str) -> object:
+            return stub_client
+
+        async def _fake_recovery(client: object) -> None:
+            return None
+
+        async def _fake_consumer(client: object) -> None:
+            return None
+
+        async def _fake_daemon(
+            config: object, state: object, *, client: object = None
+        ) -> None:
+            return None
+
+        async def _fake_healthz(config: object, state: object) -> None:
+            return None
+
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
+        monkeypatch.setattr(
+            serve_module, "recovery_reconcile_on_boot", _fake_recovery
+        )
+        monkeypatch.setattr(
+            serve_module, "consumer_reconcile_on_boot", _fake_consumer
+        )
+        monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
+        monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+
+        config = ServeConfig()
+        state = SubscriptionState()
+        _asyncio.run(serve_module._run_serve(config, state))
+
+        # Exactly one register call, carrying FORGE_MANIFEST.
+        assert len(stub_client.register_calls) == 1
+        registered_manifest = stub_client.register_calls[0]
+        assert registered_manifest.agent_id == "forge"
+
+    def test_register_fires_before_reconciles(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AC: registration runs BEFORE both reconciles so any registry
+        # watcher fired by the new KV entry can observe forge before
+        # the durable consumer attaches. This is the same ordering
+        # invariant that protects the reconcile-before-attach guarantee.
+        import asyncio as _asyncio
+
+        from forge.cli import _serve_daemon
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+        from forge.cli._serve_state import SubscriptionState
+
+        stub_client = _StubNatsClient()
+        events: list[str] = []
+
+        async def _fake_connect(servers: str) -> object:
+            events.append("connect")
+            return stub_client
+
+        async def _fake_register(manifest: object) -> None:
+            events.append("register")
+            await _StubNatsClient.register_agent(stub_client, manifest)
+
+        async def _fake_recovery(client: object) -> None:
+            events.append("recovery_reconcile")
+
+        async def _fake_consumer(client: object) -> None:
+            events.append("consumer_reconcile")
+
+        async def _fake_daemon(
+            config: object, state: object, *, client: object = None
+        ) -> None:
+            events.append("daemon_started")
+
+        async def _fake_healthz(config: object, state: object) -> None:
+            events.append("healthz_started")
+
+        # Rebind the module-level ``register_on_boot`` import so the
+        # call inside ``_run_serve`` is observable without monkeypatching
+        # ``client.register_agent`` (which would skip the wireup proof).
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
+        monkeypatch.setattr(serve_module, "register_on_boot", _fake_register)
+        monkeypatch.setattr(
+            serve_module, "recovery_reconcile_on_boot", _fake_recovery
+        )
+        monkeypatch.setattr(
+            serve_module, "consumer_reconcile_on_boot", _fake_consumer
+        )
+        monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
+        monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+
+        config = ServeConfig()
+        state = SubscriptionState()
+        _asyncio.run(serve_module._run_serve(config, state))
+
+        connect_idx = events.index("connect")
+        register_idx = events.index("register")
+        recovery_idx = events.index("recovery_reconcile")
+        consumer_idx = events.index("consumer_reconcile")
+
+        # Ordering: connect → register → both reconciles → daemon/healthz.
+        assert connect_idx < register_idx < recovery_idx
+        assert register_idx < consumer_idx
+
+    def test_deregister_called_in_finally_on_clean_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AC: ``deregister`` runs in the finally block before client
+        # close, so the agent-registry KV reflects shutdown without
+        # waiting for jarvis to mark forge stale.
+        import asyncio as _asyncio
+
+        from forge.cli import _serve_daemon
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+        from forge.cli._serve_state import SubscriptionState
+
+        stub_client = _StubNatsClient()
+
+        async def _fake_connect(servers: str) -> object:
+            return stub_client
+
+        async def _fake_recovery(client: object) -> None:
+            return None
+
+        async def _fake_consumer(client: object) -> None:
+            return None
+
+        async def _fake_daemon(
+            config: object, state: object, *, client: object = None
+        ) -> None:
+            return None
+
+        async def _fake_healthz(config: object, state: object) -> None:
+            return None
+
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
+        monkeypatch.setattr(
+            serve_module, "recovery_reconcile_on_boot", _fake_recovery
+        )
+        monkeypatch.setattr(
+            serve_module, "consumer_reconcile_on_boot", _fake_consumer
+        )
+        monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
+        monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+
+        config = ServeConfig()
+        state = SubscriptionState()
+        _asyncio.run(serve_module._run_serve(config, state))
+
+        assert stub_client.deregister_calls == [("forge", "shutdown")]
+
+    def test_deregister_runs_even_if_daemon_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # AC: deregister must run even when the daemon exits with an
+        # exception, so a crash does not leave a stale agent-registry
+        # entry that fools the fleet supervisor into routing work to a
+        # dead forge.
+        import asyncio as _asyncio
+
+        from forge.cli import _serve_daemon
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+        from forge.cli._serve_state import SubscriptionState
+
+        stub_client = _StubNatsClient()
+
+        async def _fake_connect(servers: str) -> object:
+            return stub_client
+
+        async def _fake_recovery(client: object) -> None:
+            return None
+
+        async def _fake_consumer(client: object) -> None:
+            return None
+
+        async def _fake_daemon(
+            config: object, state: object, *, client: object = None
+        ) -> None:
+            raise RuntimeError("simulated daemon failure")
+
+        async def _fake_healthz(config: object, state: object) -> None:
+            # Healthz never returns on its own so the wait surfaces the
+            # daemon's exception via FIRST_COMPLETED semantics.
+            await _asyncio.Event().wait()
+
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
+        monkeypatch.setattr(
+            serve_module, "recovery_reconcile_on_boot", _fake_recovery
+        )
+        monkeypatch.setattr(
+            serve_module, "consumer_reconcile_on_boot", _fake_consumer
+        )
+        monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
+        monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
+
+        config = ServeConfig()
+        state = SubscriptionState()
+        with pytest.raises(RuntimeError, match="simulated daemon failure"):
+            _asyncio.run(serve_module._run_serve(config, state))
+
+        assert stub_client.deregister_calls == [("forge", "shutdown")]
 
 
 # ---------------------------------------------------------------------------
