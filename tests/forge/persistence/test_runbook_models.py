@@ -11,7 +11,7 @@ Acceptance-criteria coverage map:
 * AC-3: Constructing a ``Runbook`` with an empty ``steps`` tuple raises
   ``RunbookValidationError`` (ASSUM-002) — :class:`TestRunbookValidation`.
 * AC-4: Constructing a ``Runbook`` with ``current_step_index`` outside
-  ``[0, len(steps)-1]`` raises ``RunbookValidationError`` (ASSUM-004) —
+  ``[0, len(steps)]`` raises ``RunbookValidationError`` (ASSUM-004, R1) —
   :class:`TestRunbookValidation`.
 * AC-5: Constructing a ``Step`` with an empty ``step_type`` raises
   ``RunbookValidationError`` (ASSUM-005) — :class:`TestStepValidation`.
@@ -124,8 +124,13 @@ class TestRunbookValidation:
             )
         assert "current_step_index" in str(exc_info.value).lower()
 
-    def test_current_step_index_beyond_steps_raises_validation_error(self) -> None:
-        """Constructing a Runbook with current_step_index >= len(steps) raises."""
+    def test_current_step_index_beyond_terminal_raises_validation_error(self) -> None:
+        """Constructing a Runbook with current_step_index > len(steps) raises.
+
+        R1 (reconciled with FEAT-RBX): the terminal position len(steps) is
+        valid; only an index strictly beyond it is rejected. For a one-step
+        runbook the valid range is [0, 1]; index 2 is beyond terminal.
+        """
         step = Step(
             step_type="test",
             params={},
@@ -137,11 +142,36 @@ class TestRunbookValidation:
                 runbook_id="rb-001",
                 target="test-target",
                 steps=(step,),
-                current_step_index=1,  # Only one step, index 0 is max
+                current_step_index=2,  # one step → valid [0, 1]; 2 is beyond terminal
                 status=StepStatus.pending,
                 created_at=datetime.now(UTC),
             )
         assert "current_step_index" in str(exc_info.value).lower()
+
+    def test_current_step_index_at_terminal_position_is_valid(self) -> None:
+        """current_step_index == len(steps) (the completion marker) is valid.
+
+        R1 (reconciled with FEAT-RBX): the resume pointer may rest one past the
+        last step to mark the runbook complete.
+        """
+        steps = tuple(
+            Step(
+                step_type=f"step{i}",
+                params={},
+                status=StepStatus.passed,
+                sequence_index=i,
+            )
+            for i in range(3)
+        )
+        runbook = Runbook(
+            runbook_id="rb-terminal",
+            target="test-target",
+            steps=steps,
+            current_step_index=3,  # == len(steps): terminal/complete
+            status=StepStatus.passed,
+            created_at=datetime.now(UTC),
+        )
+        assert runbook.current_step_index == len(runbook.steps)
 
 
 # ---------------------------------------------------------------------------

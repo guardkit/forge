@@ -92,15 +92,16 @@ class RunbookStepNotFoundError(RuntimeError):
 
 
 class RunbookAdvanceError(RuntimeError):
-    """Raised when attempting to advance past the final step.
+    """Raised when attempting to advance beyond the terminal position.
 
-    Per ASSUM-004, current_step_index must always point to a valid step.
-    Advancing from the final step is refused (TASK-RSP-004).
+    Per ASSUM-004 (R1), current_step_index may rest at the terminal position
+    len(steps) (the completion marker); advancing beyond it is refused
+    (TASK-RSP-004, reconciled with FEAT-RBX).
     """
 
     def __init__(self, runbook_id: str, current_index: int) -> None:
         super().__init__(
-            f"cannot advance runbook_id={runbook_id!r} past final step "
+            f"cannot advance runbook_id={runbook_id!r} beyond terminal position "
             f"(current_step_index={current_index})"
         )
         self.runbook_id = runbook_id
@@ -488,8 +489,10 @@ class RunbookRepository:
     ) -> None:
         """Advance the runbook's resume pointer to the next step.
 
-        Increments current_step_index by one. Refuses to advance past the
-        final step (ASSUM-004). The advance is atomic via BEGIN IMMEDIATE.
+        Increments current_step_index by one. Advancing from the final step to
+        the terminal position (current_step_index == step_count, the completion
+        marker) is allowed; advancing beyond the terminal position is refused
+        (ASSUM-004, R1). The advance is atomic via BEGIN IMMEDIATE.
 
         Args:
             runbook_id: Primary key of the runbook.
@@ -498,7 +501,7 @@ class RunbookRepository:
         Raises:
             ValueError: If correlation_id is empty.
             RunbookNotFoundError: If the runbook does not exist.
-            RunbookAdvanceError: If already at the final step.
+            RunbookAdvanceError: If already at the terminal position.
             sqlite3.Error: For any database error. The transaction is
                 rolled back so no partial writes remain.
         """
@@ -528,8 +531,10 @@ class RunbookRepository:
             current_index = row[0]
             step_count = row[1]
 
-            # Refuse if already at the final step
-            if current_index >= step_count - 1:
+            # Refuse only at the terminal position — advancing from the final
+            # step to current_step_index == step_count (the completion marker)
+            # is allowed (ASSUM-004, R1, reconciled with FEAT-RBX).
+            if current_index >= step_count:
                 self._safe_rollback()
                 raise RunbookAdvanceError(runbook_id, current_index)
 

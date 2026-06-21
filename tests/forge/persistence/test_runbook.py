@@ -589,6 +589,46 @@ class TestAdvanceRunbook:
         assert loaded is not None
         assert loaded.current_step_index == 1
 
+    def test_advancing_through_all_steps_reaches_terminal_position(
+        self, repository: RunbookRepository
+    ) -> None:
+        """R1: advancing from the final step rests the pointer at len(steps).
+
+        The terminal position (current_step_index == step_count) is the
+        runbook's completion marker (reconciled with FEAT-RBX).
+        """
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=1,
+            ),
+        )
+        runbook = _make_runbook(
+            runbook_id="rb-terminal-advance",
+            steps=steps,
+            current_step_index=0,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        repository.advance("rb-terminal-advance", correlation_id="corr-002")  # 0 -> 1
+        repository.advance(
+            "rb-terminal-advance", correlation_id="corr-003"
+        )  # 1 -> 2 (terminal)
+
+        loaded = repository.load_runbook(
+            "rb-terminal-advance", correlation_id="corr-004"
+        )
+        assert loaded is not None
+        assert loaded.current_step_index == 2  # == len(steps): terminal/complete
+
 
 # ---------------------------------------------------------------------------
 # AC-003: A step set to `awaiting_approval` persists and reloads
@@ -718,14 +758,19 @@ class TestStepResultRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# AC-006: Resume pointer can occupy positions 0..2 across a three-step runbook
+# AC-006: Resume pointer can occupy positions 0..3 across a three-step runbook
+# (0..2 on the steps, 3 at the terminal/complete position — R1)
 # ---------------------------------------------------------------------------
 
 
 class TestResumePointerPositions:
-    """The resume pointer can occupy all valid positions and survives reload."""
+    """The resume pointer can occupy all valid positions and survives reload.
 
-    @pytest.mark.parametrize("position", [0, 1, 2])
+    R1 (reconciled with FEAT-RBX): for a three-step runbook the valid positions
+    are 0..3, where 3 == len(steps) is the terminal/complete position.
+    """
+
+    @pytest.mark.parametrize("position", [0, 1, 2, 3])
     def test_resume_pointer_at_each_position(
         self, repository: RunbookRepository, position: int
     ) -> None:
@@ -880,14 +925,19 @@ class TestUnrecognisedStatusRejected:
 
 
 # ---------------------------------------------------------------------------
-# AC-010: Advancing past final step raises RunbookAdvanceError
+# AC-010: Advancing beyond the terminal position raises RunbookAdvanceError (R1)
 # ---------------------------------------------------------------------------
 
 
-class TestAdvancePastFinalStepRejected:
-    """Advancing past the final step raises error, pointer and status unchanged."""
+class TestAdvanceBeyondTerminalRejected:
+    """Advancing beyond the terminal position raises; pointer + status unchanged.
 
-    def test_advancing_past_final_step_raises_error(
+    R1 (reconciled with FEAT-RBX): advancing *from* the final step reaches the
+    terminal position (current_step_index == len(steps)); only an advance
+    attempted *from* the terminal position is refused.
+    """
+
+    def test_advancing_beyond_terminal_position_raises_error(
         self, repository: RunbookRepository
     ) -> None:
         steps = (
@@ -905,13 +955,17 @@ class TestAdvancePastFinalStepRejected:
         )
         repository.create_runbook(runbook, correlation_id="corr-001")
 
-        with pytest.raises(RunbookAdvanceError):
-            repository.advance("rb-final-step", correlation_id="corr-002")
+        # R1: advancing from the final step reaches the terminal position (== 1).
+        repository.advance("rb-final-step", correlation_id="corr-002")
 
-        # Verify pointer and status unchanged
-        loaded = repository.load_runbook("rb-final-step", correlation_id="corr-003")
+        # A second advance, now from the terminal position, is refused.
+        with pytest.raises(RunbookAdvanceError):
+            repository.advance("rb-final-step", correlation_id="corr-003")
+
+        # Verify the pointer rests at the terminal position and status unchanged.
+        loaded = repository.load_runbook("rb-final-step", correlation_id="corr-004")
         assert loaded is not None
-        assert loaded.current_step_index == 0
+        assert loaded.current_step_index == 1  # terminal == len(steps)
         assert loaded.steps[0].status == StepStatus.pending
 
 

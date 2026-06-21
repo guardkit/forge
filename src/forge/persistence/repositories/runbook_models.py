@@ -11,8 +11,9 @@ Relevant assumptions:
   step status, so both reuse :class:`StepStatus` (no separate enum).
 - **ASSUM-002**: A runbook must have at least one step — empty ``steps``
   tuple raises :class:`RunbookValidationError`.
-- **ASSUM-004**: The ``current_step_index`` must always point to a valid
-  step: ``0 <= current_step_index <= len(steps) - 1``.
+- **ASSUM-004** (R1, reconciled with FEAT-RBX): ``current_step_index`` points
+  to a valid step or to the terminal position ``len(steps)`` (one past the last
+  step, the completion marker): ``0 <= current_step_index <= len(steps)``.
 - **ASSUM-005**: The ``step_type`` must be a non-empty string (free-form
   this phase — no closed enum).
 - **ASSUM-007**: A step has no result until one is recorded — ``Step.result``
@@ -161,9 +162,11 @@ class Runbook:
                 "Runbook must have at least one step (ASSUM-002)"
             )
 
-        # ASSUM-004: current_step_index must point to a valid step
-        if not (0 <= self.current_step_index <= len(self.steps) - 1):
+        # ASSUM-004 (R1, reconciled with FEAT-RBX): current_step_index points
+        # to a valid step OR to the terminal position len(steps) (one past the
+        # last step), which is the runbook's completion marker.
+        if not (0 <= self.current_step_index <= len(self.steps)):
             raise RunbookValidationError(
-                f"current_step_index must be in [0, {len(self.steps) - 1}], "
-                f"got {self.current_step_index} (ASSUM-004)"
+                f"current_step_index must be in [0, {len(self.steps)}], "
+                f"got {self.current_step_index} (ASSUM-004, R1)"
             )
