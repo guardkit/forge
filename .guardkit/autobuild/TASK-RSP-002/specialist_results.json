@@ -1,7 +1,7 @@
 {
   "phase_4": {
     "status": "passed",
-    "duration_seconds": 0.9985237079672515,
+    "duration_seconds": 0.8606024170294404,
     "error": null,
     "tests_run": 30,
     "tests_failed": 0,
@@ -10,9 +10,9 @@
     "quality_gates_passed": true
   },
   "phase_5": {
-    "status": "passed",
-    "duration_seconds": 187.91493858298054,
-    "error": null,
+    "status": "failed",
+    "duration_seconds": 65.23958566703368,
+    "error": "SDKTimeoutError: Agent invocation exceeded 60s timeout",
     "issues": [],
     "quality_score": 0.0,
     "recommendations": [],
