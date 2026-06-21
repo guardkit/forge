@@ -1,0 +1,143 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": false,
+    "coverage_required": false,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": false
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": false,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "skipped",
+    "test_output_summary": "Independent test verification skipped (tests not required for testing tasks)",
+    "duration_seconds": 0.0,
+    "raw_output": null,
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 6,
+    "criteria_met": 6,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Adversarial `<identifier>`/`<target>`/`<step_type>` examples from",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented comprehensive parametrized tests covering path-traversal (../../../etc/passwd), SQL injection ('; DROP TABLE runbooks; --), JNDI injection (${jndi:ldap://evil}), null-byte injection (dynamically constructed chr(0)), backtick command injection (`rm -rf /`), unicode characters, and percent-encoded payloads. All adversarial strings round-trip byte-identical through create\u2192load as verified by TestAdversarialIdentifiersRoundTrip with 7 passing test cases."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Adversarial `params` (newline/tab/quote/nested mapping) reload",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestAdversarialParamsRoundTrip with two test methods: test_params_with_newline_tab_quote_nested_mapping_round_trip covering newlines, tabs, single quotes, double quotes, nested mappings, unicode, backslashes, and JSON characters; and test_params_with_sql_injection_payloads_round_trip covering SQL injection payloads in params. Both tests verify params reload identical via equality assertion."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "A 1,000,000-char `captured_output` reloads with the same length and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestLargeCapturedOutputRoundTrip.test_one_million_char_output_reloads_intact that constructs a 1,000,000-character string with a recognizable repeating pattern (0123456789 \u00d7 100 \u00d7 1000), persists it as StepResult.captured_output, and verifies: (1) length equals 1,000,000, (2) full string equality, (3) pattern integrity at start, middle (500,000), and end positions."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "A status update refused mid-write (simulated store-unavailable)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestStatusUpdateRollbackAtomicity.test_status_update_failure_preserves_prior_status that: (1) creates a runbook with pending status, (2) updates to running status and commits, (3) simulates store unavailability by creating a repository with a closed connection, (4) attempts update with the broken repository (fails with ProgrammingError), (5) reloads with original repository and verifies status remains running, demonstrating rollback atomicity."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Re-applying `runbook.apply()` to a populated, already-migrated store",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestMigrationIdempotence with two test methods: test_reapplying_migration_preserves_existing_data creates a runbook with 2 steps, re-applies the migration, and verifies all runbook and step fields remain identical (runbook_id, target, current_step_index, status, created_at, all step fields); test_reapplying_migration_multiple_times_is_safe applies the migration 5 consecutive times and verifies data integrity, demonstrating idempotent migration behavior."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "All tests live in `tests/forge/persistence/test_runbook_security.py`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All tests are implemented in tests/forge/persistence/test_runbook_security.py (single file). The writer_db fixture uses tmp_path to create a fresh SQLite database, applies lifecycle migrations and runbook migration, and yields the connection. All test classes use this fixture pattern. Coach validation command 'python -m pytest tests/forge/persistence/test_runbook_security.py -q' executed successfully with 13 passed tests in 0.08s."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": false,
+    "passed": false,
+    "command": "set -e\npython -m pytest tests/forge/persistence -q\n",
+    "exit_code": null,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": "parallel_wave"
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "testing",
+  "profile_name": "testing"
+}

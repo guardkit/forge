@@ -1,26 +1,26 @@
 ---
-id: TASK-RSP-006
-title: Concurrency and integration-boundary tests
-status: backlog
-created: 2026-06-21T18:30:00Z
-updated: 2026-06-21T18:30:00Z
-priority: medium
-task_type: testing
-parent_review: TASK-REV-RSP-001
-parent_feature: FEAT-RSP
-feature_slug: runbook-and-step-persistence
-wave: 4
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
+created: 2026-06-21 18:30:00+00:00
 dependencies:
-  - TASK-RSP-004
+- TASK-RSP-004
+estimated_minutes: 90
+feature_slug: runbook-and-step-persistence
+id: TASK-RSP-006
+implementation_mode: task-work
+parent_feature: FEAT-RSP
+parent_review: TASK-REV-RSP-001
+priority: medium
+status: design_approved
 tags:
-  - forge
-  - persistence
-  - runbook
-  - testing
-  - concurrency
+- forge
+- persistence
+- runbook
+- testing
+- concurrency
+task_type: testing
+title: Concurrency and integration-boundary tests
+updated: 2026-06-21 18:30:00+00:00
+wave: 4
 ---
 
 # Concurrency and integration-boundary tests

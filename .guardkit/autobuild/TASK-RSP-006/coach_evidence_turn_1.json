@@ -1,0 +1,150 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": false,
+    "coverage_required": false,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": false
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": false,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "skipped",
+    "test_output_summary": "Independent test verification skipped (tests not required for testing tasks)",
+    "duration_seconds": 0.0,
+    "raw_output": null,
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 7,
+    "criteria_met": 7,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Two threads creating `rb-clash` concurrently leave exactly one whole",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestConcurrentCreate.test_parallel_create_one_succeeds_one_raises_duplicate using threading.Barrier to force genuine contention. Two threads attempt to create the same runbook_id='rb-clash' with three steps. Verified exactly one succeeds, the loser gets RunbookDuplicateError silently, and the final runbook has all 3 steps with no orphaned rows."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Concurrent `advance` + `update_step_status(first, passed)` both",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestConcurrentAdvanceAndUpdate.test_advance_and_update_both_succeed using threading.Barrier to synchronize two workers: one calls advance(), the other calls update_step_status(0, passed). After both threads complete, verified that current_step_index==1 (advanced) and steps[0].status==passed (updated), confirming both writes committed under SQLite's busy_timeout serialization."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "A read-only reader observes pre-commit state without the new result",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestReadOnlySnapshot.test_reader_observes_atomic_transitions using threading.Barrier to synchronize a writer (update_step_status with StepResult) and a read_only_connect reader. The reader observes either None (pre-commit) or the complete StepResult (post-commit), never partial data. WAL mode guarantees snapshot isolation. Verified final state always shows the complete result."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Opening the store at a non-existent / inaccessible location raises a",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestStoreUnavailable with two test methods: test_connect_writer_nonexistent_parent_raises_sqlite_connect_error verifies connect_writer raises SQLiteConnectError when parent directory doesn't exist; test_read_only_connect_nonexistent_file_raises_sqlite_connect_error verifies read_only_connect raises SQLiteConnectError for missing files. Both tests confirm domain-shaped error wrapping."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "A `read_only_connect`-backed repository refuses `create_runbook` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestReadOnlyRefusesWrite.test_create_runbook_on_readonly_connection_refused which opens a read_only_connect connection, attempts create_runbook, and verifies it raises sqlite3.OperationalError (SQLite's readonly database enforcement). After the failed attempt, verified the runbook does not exist in the store, confirming no write occurred."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Loading from an unmigrated store is refused predictably with no",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented TestUnmigratedStoreRejected with two test methods: test_load_from_unmigrated_db_raises_operational_error verifies load_runbook raises sqlite3.OperationalError mentioning 'runbooks' table when the migration hasn't run; test_create_on_unmigrated_db_raises_operational_error verifies create_runbook similarly fails. Both tests apply only lifecycle_migrations, intentionally skipping runbook_migration to simulate an unmigrated store."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "All tests live in",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Created tests/forge/persistence/test_runbook_concurrency.py with 8 test methods across 6 test classes (TestConcurrentCreate, TestConcurrentAdvanceAndUpdate, TestReadOnlySnapshot, TestStoreUnavailable, TestReadOnlyRefusesWrite, TestUnmigratedStoreRejected). Ran the test suite 5 consecutive times; all 8 tests passed in every run (0.06-0.07s per run). No timing flakiness observed."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": false,
+    "passed": false,
+    "command": "set -e\npython -m pytest tests/forge/persistence -q\n",
+    "exit_code": null,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": "parallel_wave"
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "testing",
+  "profile_name": "testing"
+}
