@@ -1,0 +1,272 @@
+{
+  "honesty": {
+    "verified": false,
+    "discrepancies": [
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file features/conftest.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/migrations/__init__.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/migrations/runbook.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/repositories/__init__.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/repositories/runbook_models.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/persistence/test_runbook_migration.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/persistence/test_runbook_models.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      }
+    ],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 7
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": false,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": false
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": true,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "independent_tests": {
+    "tests_passed": false,
+    "test_command": "pytest tests/forge/persistence/test_runbook_migration.py tests/forge/persistence/test_runbook_models.py -v --tb=short",
+    "test_output_summary": "I'll run the pytest command and show you the full output.",
+    "duration_seconds": 6.671974182128906,
+    "raw_output": "\nI'll run the pytest command and show you the full output.\n",
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 9,
+    "criteria_met": 9,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`forge.persistence.repositories.runbook_models` exists and exports",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Module exists with all required exports. Verified in Turn 2 with import test showing all 5 names importable from forge.persistence.repositories package."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`StepStatus` has exactly the five members",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "StepStatus enum verified with 5 members: ['pending', 'running', 'passed', 'failed', 'awaiting_approval']. TestStepStatusEnum.test_step_status_has_five_members passes using set comparison to verify closed set."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Constructing a `Runbook` with an empty `steps` tuple raises",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Runbook.__post_init__ validation raises RunbookValidationError with message 'Runbook must have at least one step (ASSUM-002)' when steps tuple is empty. Test passes."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Constructing a `Runbook` with `current_step_index` outside",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Runbook.__post_init__ validation checks 0 <= current_step_index <= len(steps)-1 and raises RunbookValidationError referencing ASSUM-004. Two tests verify negative index and beyond-range index both raise correctly."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Constructing a `Step` with an empty `step_type` raises",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Step.__post_init__ validation checks step_type is non-empty (after strip) and raises RunbookValidationError with message referencing ASSUM-005. TestStepValidation.test_empty_step_type_raises_validation_error passes."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "A freshly constructed three-step `Runbook` with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All dataclasses use @dataclass(frozen=True, slots=True). TestRunbookConstruction.test_three_step_runbook_is_valid_and_comparable creates three-step runbook and verifies field values and equality comparison works."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`Step.result` defaults to `None`; a `StepResult` round-trips its",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Step.result field has default=None. StepResult frozen dataclass with all 4 required fields. TestStepResultRoundTrip has 3 passing tests: default None, result can be set, and round-trip equality of all fields."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Models are immutable: attempting to set an attribute on a `Runbook`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "All three dataclasses (Runbook, Step, StepResult) use frozen=True. TestImmutability has 3 passing tests verifying AttributeError is raised when attempting to set attributes on each model type."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Unit tests live in `tests/forge/persistence/test_runbook_models.py`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test file exists at tests/forge/persistence/test_runbook_models.py with 14 tests covering all ACs. Tests were written test-first in Turn 1 following TDD RED-GREEN cycle. All 14 tests pass in Turn 2 verification."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": false,
+    "passed": false,
+    "command": "set -e\npython -m pytest tests/forge/persistence -q\n",
+    "exit_code": null,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": "parallel_wave"
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file features/conftest.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file features/conftest.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/persistence/migrations/__init__.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/migrations/__init__.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/persistence/migrations/runbook.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/migrations/runbook.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/persistence/repositories/__init__.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/repositories/__init__.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/persistence/repositories/runbook_models.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/persistence/repositories/runbook_models.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file tests/forge/persistence/test_runbook_migration.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/persistence/test_runbook_migration.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file tests/forge/persistence/test_runbook_models.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/persistence/test_runbook_models.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    }
+  ],
+  "task_type": "declarative",
+  "profile_name": "declarative"
+}

@@ -1,0 +1,16 @@
+{
+  "task_id": "TASK-RSP-001",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "d24df707ff7b3d78f21bef457e9a6e658c7e0422",
+      "timestamp": "2026-06-21T18:59:23.751516",
+      "tests_passed": null,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: unknown)",
+      "from_prior_run": false,
+      "evidence_commits": {}
+    }
+  ],
+  "last_updated": "2026-06-21T18:59:23.751787"
+}
