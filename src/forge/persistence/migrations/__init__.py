@@ -13,6 +13,6 @@ as the canonical ``builds`` / ``stage_log`` substrate.
 
 from __future__ import annotations
 
-from forge.persistence.migrations import lifecycle_bridge_registry
+from forge.persistence.migrations import lifecycle_bridge_registry, runbook
 
-__all__ = ["lifecycle_bridge_registry"]
+__all__ = ["lifecycle_bridge_registry", "runbook"]

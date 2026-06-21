@@ -1,0 +1,135 @@
+{
+  "task_id": "TASK-RSP-002",
+  "turn": 1,
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/migrations/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook_migration.py",
+    "src/forge/persistence/migrations/__init__.py",
+    "src/forge/persistence/repositories/__init__.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/migrations/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook_migration.py",
+    "features/conftest.py",
+    "src/forge/persistence/migrations/runbook.py",
+    "src/forge/persistence/repositories/runbook_models.py",
+    "tests/forge/persistence/test_runbook_migration.py",
+    "tests/forge/persistence/test_runbook_models.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook_migration.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "Create runbook.py migration module with apply() function",
+    "Define RunbookMigrationError exception class",
+    "Create STRICT tables for runbooks and runbook_steps",
+    "Add CHECK constraints on both status columns",
+    "Set runbook_id as PRIMARY KEY in runbooks table",
+    "Set composite PRIMARY KEY in runbook_steps table",
+    "Add FK constraint with ON DELETE CASCADE",
+    "Ensure idempotent migration with CREATE TABLE IF NOT EXISTS",
+    "Wrap sqlite3.Error as RunbookMigrationError with __cause__",
+    "Write comprehensive tests following tmp_path + connect_writer pattern",
+    "Register module in migrations/__init__.py",
+    "Pass all lint and format checks"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 33,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/.guardkit/autobuild/TASK-RSP-002/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/migrations/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/migrations/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook_migration.py"
+  ],
+  "tests_passed_count": 16,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-1",
+      "criterion_text": "`forge.persistence.migrations.runbook.apply(connection)` creates both `runbooks` and `runbook_steps` as **STRICT** tables.",
+      "status": "complete",
+      "evidence": "Created `runbook.py` migration with `CREATE_TABLES_SQL` DDL that creates both tables with STRICT mode. Tests verify both tables exist and enforce STRICT type affinity.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-2",
+      "criterion_text": "Both `status` columns carry a `CHECK` constraint whose allowed set is exactly `pending/running/passed/failed/awaiting_approval` (matches `StepStatus`; see \u00a74 contract).",
+      "status": "complete",
+      "evidence": "Both tables' DDL include `CHECK (status IN ('pending','running','passed','failed','awaiting_approval'))` constraints. Tests verify all five valid values are accepted and invalid values are rejected.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-3",
+      "criterion_text": "`runbooks.runbook_id` is the `PRIMARY KEY`; a duplicate insert is rejected at the engine level (drives the duplicate-create refusal in TASK-RSP-003).",
+      "status": "complete",
+      "evidence": "DDL defines `runbook_id TEXT PRIMARY KEY`. Test `test_duplicate_runbook_id_raises_integrity_error` verifies duplicate inserts are rejected with `sqlite3.IntegrityError`.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-4",
+      "criterion_text": "`runbook_steps` has a composite `PRIMARY KEY (runbook_id, sequence_index)` and a FK to `runbooks(runbook_id)`.",
+      "status": "complete",
+      "evidence": "DDL defines composite `PRIMARY KEY (runbook_id, sequence_index)` and `REFERENCES runbooks(runbook_id) ON DELETE CASCADE`. Tests verify composite PK prevents duplicates, FK enforces parent existence, and cascade delete works.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-5",
+      "criterion_text": "**Idempotent**: applying the migration twice against the same connection changes nothing and raises nothing (Group G 'Re-running the migration against an already-migrated store changes nothing').",
+      "status": "complete",
+      "evidence": "DDL uses `CREATE TABLE IF NOT EXISTS` for both tables and `CREATE INDEX IF NOT EXISTS` for the index. Test `test_apply_is_idempotent` calls `apply()` twice and verifies no errors. Coach validation command confirms double-apply succeeds.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-6",
+      "criterion_text": "A `sqlite3.Error` during migration is re-raised as `RunbookMigrationError` preserving the original via `__cause__`.",
+      "status": "complete",
+      "evidence": "The `apply()` function wraps `connection.executescript()` in try/except catching `sqlite3.Error` and re-raising as `RunbookMigrationError` with `from exc`. Test `test_migration_error_preserves_cause` verifies `__cause__` is preserved.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-7",
+      "criterion_text": "Tests live in `tests/forge/persistence/test_runbook_migration.py`, written **test-first**, using the `tmp_path` + `connect_writer` + `lifecycle_migrations.apply_at_boot` fixture pattern from `test_bridge_registry.py`.",
+      "status": "complete",
+      "evidence": "Created test file following TDD (tests written first, then implementation). Uses `writer_db` fixture with `tmp_path`, `connect_writer`, and `lifecycle_migrations.apply_at_boot`, exactly matching the `test_bridge_registry.py` pattern.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "tests/forge/persistence/test_runbook_migration.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-8",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Ran `ruff check` (all checks passed) and `ruff format` (reformatted test file). All 16 tests pass after formatting. No lint or format errors remain.",
+      "test_file": "tests/forge/persistence/test_runbook_migration.py",
+      "implementation_files": [
+        "src/forge/persistence/migrations/runbook.py",
+        "tests/forge/persistence/test_runbook_migration.py"
+      ]
+    }
+  ]
+}

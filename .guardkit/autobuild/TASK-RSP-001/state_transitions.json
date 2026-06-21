@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-RSP-001",
+    "pre_path": "tasks/backlog/TASK-RSP-001-step-and-runbook-data-models.md",
+    "post_path": "tasks/design_approved/TASK-RSP-001-step-and-runbook-data-models.md",
+    "timestamp": "2026-06-21T17:49:52.955168+00:00",
+    "kind": "design_approved_transition"
+  }
+]

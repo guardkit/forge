@@ -1,0 +1,71 @@
+{
+  "honesty": {
+    "verified": false,
+    "discrepancies": [
+      {
+        "claim_type": "claim_audit",
+        "player_claim": "Player claimed file `src/forge/persistence/repositories/__init__.py",
+        "actual_value": "Path absent from 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed work on a file that does not exist on disk.",
+        "severity": "critical",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit",
+        "player_claim": "Player claimed file `src/forge/persistence/repositories/runbook_models.py",
+        "actual_value": "Path absent from 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed work on a file that does not exist on disk.",
+        "severity": "critical",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit",
+        "player_claim": "Player claimed file `tests/forge/persistence/test_runbook_models.py",
+        "actual_value": "Path absent from 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed work on a file that does not exist on disk.",
+        "severity": "critical",
+        "ignore_rule": null
+      }
+    ],
+    "honesty_score": 0.88,
+    "resolved_paths": [
+      {
+        "claimed": "`src/forge/persistence/repositories/runbook_models.py",
+        "resolved_to": "tasks/design_approved/TASK-RSP-001-step-and-runbook-data-models.md",
+        "task_id": "TASK-RSP-001"
+      },
+      {
+        "claimed": "`tests/forge/persistence/test_runbook_models.py",
+        "resolved_to": "tasks/design_approved/TASK-RSP-001-step-and-runbook-data-models.md",
+        "task_id": "TASK-RSP-001"
+      },
+      {
+        "claimed": "`src/forge/persistence/repositories/__init__.py",
+        "resolved_to": "tasks/design_approved/TASK-RSP-001-step-and-runbook-data-models.md",
+        "task_id": "TASK-RSP-001"
+      },
+      {
+        "claimed": "`tests/forge/persistence/test_runbook_models.py",
+        "resolved_to": "tasks/design_approved/TASK-RSP-001-step-and-runbook-data-models.md",
+        "task_id": "TASK-RSP-001"
+      }
+    ],
+    "should_fix_count": 0
+  },
+  "gathering_status": "partial_honesty_abort",
+  "gathering_error": null,
+  "quality_gates": null,
+  "coverage_details": null,
+  "plan_audit": null,
+  "bdd": null,
+  "arch_review": null,
+  "tests": null,
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "independent_tests": null,
+  "requirements": null,
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [],
+  "task_type": "declarative",
+  "profile_name": "declarative"
+}

@@ -7,9 +7,21 @@ from forge.persistence.repositories.bridge_registry import (
     BridgeRegistryEntry,
     BridgeRegistryNotFoundError,
 )
+from forge.persistence.repositories.runbook_models import (
+    Runbook,
+    RunbookValidationError,
+    Step,
+    StepResult,
+    StepStatus,
+)
 
 __all__ = [
     "BridgeRegistry",
     "BridgeRegistryEntry",
     "BridgeRegistryNotFoundError",
+    "Runbook",
+    "RunbookValidationError",
+    "Step",
+    "StepResult",
+    "StepStatus",
 ]
