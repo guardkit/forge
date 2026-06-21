@@ -38,8 +38,11 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.persistence.migrations import runbook as runbook_migration
 from forge.persistence.repositories.runbook import (
+    RunbookAdvanceError,
     RunbookDuplicateError,
+    RunbookNotFoundError,
     RunbookRepository,
+    RunbookStepNotFoundError,
 )
 from forge.persistence.repositories.runbook_models import (
     Runbook,
@@ -47,7 +50,6 @@ from forge.persistence.repositories.runbook_models import (
     Step,
     StepStatus,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -405,9 +407,7 @@ class TestStepsLoadInSequenceOrder:
         # Directly shuffle the insertion order in the database
         # (This tests that load_runbook properly orders by sequence_index)
         # We'll re-insert in reverse order to simulate out-of-order writes
-        writer_db.execute(
-            "DELETE FROM runbook_steps WHERE runbook_id = 'rb-shuffle'"
-        )
+        writer_db.execute("DELETE FROM runbook_steps WHERE runbook_id = 'rb-shuffle'")
         writer_db.execute("BEGIN IMMEDIATE")
         # Insert in reverse order: third, second, first
         sql = (
@@ -496,3 +496,519 @@ def test_runbook_schema_matches_repository_writes(tmp_path: Path) -> None:
     assert "STRICT" in ddl.upper()
     for status in StepStatus:
         assert status.value in ddl, f"CHECK set missing {status.value!r}"
+
+
+# ===========================================================================
+# TASK-RSP-004: update_step_status + advance
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC-001: Marking the second step `passed` and reloading reports it `passed`
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateStepStatus:
+    """Updating a step status persists and reloads the new status."""
+
+    def test_marking_second_step_passed_persists(
+        self, repository: RunbookRepository, fixed_now: datetime
+    ) -> None:
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=1,
+            ),
+            Step(
+                step_type="deploy",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=2,
+            ),
+        )
+        runbook = _make_runbook(
+            runbook_id="rb-update-status",
+            steps=steps,
+            created_at=fixed_now,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        repository.update_step_status(
+            "rb-update-status", 1, StepStatus.passed, correlation_id="corr-002"
+        )
+
+        loaded = repository.load_runbook("rb-update-status", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].status == StepStatus.pending
+        assert loaded.steps[1].status == StepStatus.passed
+        assert loaded.steps[2].status == StepStatus.pending
+
+
+# ---------------------------------------------------------------------------
+# AC-002: Advancing from the first step puts the pointer on the second step
+# ---------------------------------------------------------------------------
+
+
+class TestAdvanceRunbook:
+    """Advancing a runbook increments current_step_index."""
+
+    def test_advancing_from_first_step_moves_to_second(
+        self, repository: RunbookRepository
+    ) -> None:
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=1,
+            ),
+        )
+        runbook = _make_runbook(
+            runbook_id="rb-advance",
+            steps=steps,
+            current_step_index=0,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        repository.advance("rb-advance", correlation_id="corr-002")
+
+        loaded = repository.load_runbook("rb-advance", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.current_step_index == 1
+
+
+# ---------------------------------------------------------------------------
+# AC-003: A step set to `awaiting_approval` persists and reloads
+# ---------------------------------------------------------------------------
+
+
+class TestAwaitingApprovalStatus:
+    """A step awaiting approval is persisted and reloaded."""
+
+    def test_awaiting_approval_status_persists(
+        self, repository: RunbookRepository
+    ) -> None:
+        steps = (
+            Step(
+                step_type="approval",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook = _make_runbook(runbook_id="rb-await", steps=steps)
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        repository.update_step_status(
+            "rb-await",
+            0,
+            StepStatus.awaiting_approval,
+            correlation_id="corr-002",
+        )
+
+        loaded = repository.load_runbook("rb-await", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].status == StepStatus.awaiting_approval
+
+
+# ---------------------------------------------------------------------------
+# AC-004: Each of the five StepStatus values can be set and read back
+# ---------------------------------------------------------------------------
+
+
+class TestAllStepStatusValues:
+    """Each recognised step status can be stored and read back."""
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            StepStatus.pending,
+            StepStatus.running,
+            StepStatus.passed,
+            StepStatus.failed,
+            StepStatus.awaiting_approval,
+        ],
+    )
+    def test_each_status_value_round_trips(
+        self, repository: RunbookRepository, status: StepStatus
+    ) -> None:
+        steps = (
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook_id = f"rb-status-{status.value}"
+        runbook = _make_runbook(runbook_id=runbook_id, steps=steps)
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        repository.update_step_status(runbook_id, 0, status, correlation_id="corr-002")
+
+        loaded = repository.load_runbook(runbook_id, correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].status == status
+
+
+# ---------------------------------------------------------------------------
+# AC-005: A step result round-trips exit code, output, timestamps
+# ---------------------------------------------------------------------------
+
+
+class TestStepResultRoundTrip:
+    """A step result preserves exit code, output, and timestamps."""
+
+    def test_step_result_round_trips_all_fields(
+        self, repository: RunbookRepository, fixed_now: datetime
+    ) -> None:
+        from forge.persistence.repositories.runbook_models import StepResult
+
+        steps = (
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook = _make_runbook(runbook_id="rb-result", steps=steps)
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        result = StepResult(
+            exit_code=0,
+            captured_output="build succeeded\nall tests passed",
+            started_at=fixed_now,
+            completed_at=datetime(2026, 6, 21, 12, 5, 0, tzinfo=UTC),
+        )
+
+        repository.update_step_status(
+            "rb-result",
+            0,
+            StepStatus.passed,
+            correlation_id="corr-002",
+            result=result,
+        )
+
+        loaded = repository.load_runbook("rb-result", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].result is not None
+        assert loaded.steps[0].result.exit_code == 0
+        assert (
+            loaded.steps[0].result.captured_output
+            == "build succeeded\nall tests passed"
+        )
+        assert loaded.steps[0].result.started_at == fixed_now
+        assert loaded.steps[0].result.completed_at == datetime(
+            2026, 6, 21, 12, 5, 0, tzinfo=UTC
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC-006: Resume pointer can occupy positions 0..2 across a three-step runbook
+# ---------------------------------------------------------------------------
+
+
+class TestResumePointerPositions:
+    """The resume pointer can occupy all valid positions and survives reload."""
+
+    @pytest.mark.parametrize("position", [0, 1, 2])
+    def test_resume_pointer_at_each_position(
+        self, repository: RunbookRepository, position: int
+    ) -> None:
+        steps = tuple(
+            Step(
+                step_type=f"step{i}",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=i,
+            )
+            for i in range(3)
+        )
+        runbook_id = f"rb-pointer-{position}"
+        runbook = _make_runbook(
+            runbook_id=runbook_id,
+            steps=steps,
+            current_step_index=position,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        loaded = repository.load_runbook(runbook_id, correlation_id="corr-002")
+        assert loaded is not None
+        assert loaded.current_step_index == position
+
+
+# ---------------------------------------------------------------------------
+# AC-007: Resume pointer survives store being closed and reopened
+# ---------------------------------------------------------------------------
+
+
+class TestResumePointerPersistence:
+    """The resume pointer survives reopening the store."""
+
+    def test_resume_pointer_survives_reopen(
+        self, tmp_path: Path, fixed_now: datetime
+    ) -> None:
+        db_path = tmp_path / "forge.db"
+
+        # Create and advance in first connection
+        cx1 = sqlite_connect.connect_writer(db_path)
+        lifecycle_migrations.apply_at_boot(cx1)
+        runbook_migration.apply(cx1)
+        repo1 = RunbookRepository(connection=cx1)
+
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=1,
+            ),
+        )
+        runbook = _make_runbook(
+            runbook_id="rb-persist",
+            steps=steps,
+            current_step_index=0,
+            created_at=fixed_now,
+        )
+        repo1.create_runbook(runbook, correlation_id="corr-001")
+        repo1.advance("rb-persist", correlation_id="corr-002")
+        cx1.close()
+
+        # Reopen and verify
+        cx2 = sqlite_connect.connect_writer(db_path)
+        repo2 = RunbookRepository(connection=cx2)
+        loaded = repo2.load_runbook("rb-persist", correlation_id="corr-003")
+        cx2.close()
+
+        assert loaded is not None
+        assert loaded.current_step_index == 1
+
+
+# ---------------------------------------------------------------------------
+# AC-008: Updating out-of-range step raises RunbookStepNotFoundError
+# ---------------------------------------------------------------------------
+
+
+class TestOutOfRangeStepRejected:
+    """Updating a step position out of range raises error, no changes persisted."""
+
+    def test_out_of_range_sequence_index_raises_error(
+        self, repository: RunbookRepository
+    ) -> None:
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook = _make_runbook(runbook_id="rb-out-of-range", steps=steps)
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        with pytest.raises(RunbookStepNotFoundError):
+            repository.update_step_status(
+                "rb-out-of-range",
+                1,
+                StepStatus.passed,
+                correlation_id="corr-002",
+            )
+
+        # Verify no changes persisted
+        loaded = repository.load_runbook("rb-out-of-range", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].status == StepStatus.pending
+
+
+# ---------------------------------------------------------------------------
+# AC-009: Setting unrecognised status raises RunbookValidationError
+# ---------------------------------------------------------------------------
+
+
+class TestUnrecognisedStatusRejected:
+    """Setting an unrecognised status raises error, previous status preserved."""
+
+    def test_unrecognised_status_raises_validation_error(
+        self, repository: RunbookRepository
+    ) -> None:
+        from forge.persistence.repositories.runbook_models import RunbookValidationError
+
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook = _make_runbook(runbook_id="rb-bad-status", steps=steps)
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        # Try to set an invalid status (not a StepStatus member)
+        with pytest.raises(RunbookValidationError):
+            repository.update_step_status(
+                "rb-bad-status",
+                0,
+                "not_a_real_status",  # type: ignore
+                correlation_id="corr-002",
+            )
+
+        # Verify previous status preserved
+        loaded = repository.load_runbook("rb-bad-status", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.steps[0].status == StepStatus.pending
+
+
+# ---------------------------------------------------------------------------
+# AC-010: Advancing past final step raises RunbookAdvanceError
+# ---------------------------------------------------------------------------
+
+
+class TestAdvancePastFinalStepRejected:
+    """Advancing past the final step raises error, pointer and status unchanged."""
+
+    def test_advancing_past_final_step_raises_error(
+        self, repository: RunbookRepository
+    ) -> None:
+        steps = (
+            Step(
+                step_type="only",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+        )
+        runbook = _make_runbook(
+            runbook_id="rb-final-step",
+            steps=steps,
+            current_step_index=0,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        with pytest.raises(RunbookAdvanceError):
+            repository.advance("rb-final-step", correlation_id="corr-002")
+
+        # Verify pointer and status unchanged
+        loaded = repository.load_runbook("rb-final-step", correlation_id="corr-003")
+        assert loaded is not None
+        assert loaded.current_step_index == 0
+        assert loaded.steps[0].status == StepStatus.pending
+
+
+# ---------------------------------------------------------------------------
+# AC-011: Advancing unknown runbook raises RunbookNotFoundError
+# ---------------------------------------------------------------------------
+
+
+class TestAdvanceUnknownRunbookRejected:
+    """Advancing a runbook that does not exist raises RunbookNotFoundError."""
+
+    def test_advancing_nonexistent_runbook_raises_error(
+        self, repository: RunbookRepository
+    ) -> None:
+        with pytest.raises(RunbookNotFoundError):
+            repository.advance("rb-nonexistent", correlation_id="corr-001")
+
+
+# ---------------------------------------------------------------------------
+# AC-012: Overall status round-trips and is not changed by mutations
+# ---------------------------------------------------------------------------
+
+
+class TestOverallStatusNotMutated:
+    """Overall status set at create round-trips and is not changed by update/advance."""
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            StepStatus.pending,
+            StepStatus.running,
+            StepStatus.passed,
+            StepStatus.failed,
+            StepStatus.awaiting_approval,
+        ],
+    )
+    def test_overall_status_not_changed_by_mutations(
+        self, repository: RunbookRepository, status: StepStatus
+    ) -> None:
+        steps = (
+            Step(
+                step_type="build",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=0,
+            ),
+            Step(
+                step_type="test",
+                params={},
+                status=StepStatus.pending,
+                sequence_index=1,
+            ),
+        )
+        runbook_id = f"rb-overall-{status.value}"
+        runbook = _make_runbook(
+            runbook_id=runbook_id,
+            steps=steps,
+            current_step_index=0,
+            status=status,
+        )
+        repository.create_runbook(runbook, correlation_id="corr-001")
+
+        # Mutate step status and advance
+        repository.update_step_status(
+            runbook_id, 0, StepStatus.passed, correlation_id="corr-002"
+        )
+        repository.advance(runbook_id, correlation_id="corr-003")
+
+        # Overall status should be unchanged
+        loaded = repository.load_runbook(runbook_id, correlation_id="corr-004")
+        assert loaded is not None
+        assert loaded.status == status
+
+
+# ---------------------------------------------------------------------------
+# AC-013 (Seam): runbooks_schema contract for mutations
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.seam
+@pytest.mark.integration_contract("runbooks_schema")
+def test_status_check_rejects_unknown_value(tmp_path: Path) -> None:
+    """The DB CHECK set must reject any value outside StepStatus.
+
+    Contract: status TEXT CHECK (status IN <StepStatus values>).
+    Producer: TASK-RSP-002
+    """
+    cx = sqlite_connect.connect_writer(tmp_path / "forge.db")
+    lifecycle_migrations.apply_at_boot(cx)
+    runbook_migration.apply(cx)
+    cx.execute(
+        "INSERT INTO runbooks(runbook_id, target, current_step_index, status, created_at)"
+        " VALUES('rb', 't', 0, ?, '2026-06-21T00:00:00+00:00')",
+        (StepStatus.pending.value,),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        cx.execute(
+            "INSERT INTO runbook_steps(runbook_id, sequence_index, step_type, params, status)"
+            " VALUES('rb', 0, 'shell', '{}', 'not_a_real_status')"
+        )

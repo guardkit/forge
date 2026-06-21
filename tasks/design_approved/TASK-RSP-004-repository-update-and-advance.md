@@ -1,36 +1,38 @@
 ---
-id: TASK-RSP-004
-title: "RunbookRepository: update_step_status + advance"
-status: backlog
-created: 2026-06-21T18:30:00Z
-updated: 2026-06-21T18:30:00Z
-priority: high
-task_type: feature
-parent_review: TASK-REV-RSP-001
-parent_feature: FEAT-RSP
-feature_slug: runbook-and-step-persistence
-wave: 3
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
-dependencies:
-  - TASK-RSP-003
 consumer_context:
-  - task: TASK-RSP-002
-    consumes: runbooks_schema
-    framework: "raw sqlite3 (forge.adapters.sqlite.connect_writer)"
-    driver: "sqlite3 (stdlib, STRICT tables)"
-    format_note: "UPDATE targets (runbook_id, sequence_index); result is JSON TEXT; status must satisfy the CHECK set; current_step_index is an INTEGER column"
-  - task: TASK-RSP-001
-    consumes: StepStatus_value_set
-    framework: "raw sqlite3 (forge.adapters.sqlite.connect_writer)"
-    driver: "sqlite3 (stdlib, STRICT tables)"
-    format_note: "an unrecognised status must be refused with RunbookValidationError before the write reaches the CHECK constraint"
+- consumes: runbooks_schema
+  driver: sqlite3 (stdlib, STRICT tables)
+  format_note: UPDATE targets (runbook_id, sequence_index); result is JSON TEXT; status
+    must satisfy the CHECK set; current_step_index is an INTEGER column
+  framework: raw sqlite3 (forge.adapters.sqlite.connect_writer)
+  task: TASK-RSP-002
+- consumes: StepStatus_value_set
+  driver: sqlite3 (stdlib, STRICT tables)
+  format_note: an unrecognised status must be refused with RunbookValidationError
+    before the write reaches the CHECK constraint
+  framework: raw sqlite3 (forge.adapters.sqlite.connect_writer)
+  task: TASK-RSP-001
+created: 2026-06-21 18:30:00+00:00
+dependencies:
+- TASK-RSP-003
+estimated_minutes: 90
+feature_slug: runbook-and-step-persistence
+id: TASK-RSP-004
+implementation_mode: task-work
+parent_feature: FEAT-RSP
+parent_review: TASK-REV-RSP-001
+priority: high
+status: design_approved
 tags:
-  - forge
-  - persistence
-  - runbook
-  - repository
+- forge
+- persistence
+- runbook
+- repository
+task_type: feature
+title: 'RunbookRepository: update_step_status + advance'
+updated: 2026-06-21 18:30:00+00:00
+wave: 3
 ---
 
 # RunbookRepository: update_step_status + advance

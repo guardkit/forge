@@ -1,0 +1,237 @@
+{
+  "task_id": "TASK-RSP-004",
+  "timestamp": "2026-06-21T19:38:18.182329",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 35,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py",
+    "src/forge/persistence/repositories/__init__.py",
+    "src/forge/persistence/repositories/runbook.py",
+    "tests/forge/persistence/test_runbook.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/.guardkit/autobuild/TASK-RSP-004/player_turn_1.json"
+  ],
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/.guardkit/autobuild/TASK-RSP-004/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py"
+  ],
+  "summary": "35 tests passed",
+  "sdk_turns": {
+    "turns_used": 34,
+    "max_turns": 160,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Marking the second step `passed` and reloading reports it `passed` while the others stay `pending`",
+      "status": "complete",
+      "evidence": "Implemented update_step_status method with transactional integrity. Test TestUpdateStepStatus::test_marking_second_step_passed_persists verifies that marking step 1 as passed persists correctly while steps 0 and 2 remain pending.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Advancing from the first step and reloading puts the pointer on the second step",
+      "status": "complete",
+      "evidence": "Implemented advance method that increments current_step_index by one. Test TestAdvanceRunbook::test_advancing_from_first_step_moves_to_second verifies the pointer moves from 0 to 1.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "A step set to `awaiting_approval` persists and reloads as such",
+      "status": "complete",
+      "evidence": "Test TestAwaitingApprovalStatus::test_awaiting_approval_status_persists verifies that StepStatus.awaiting_approval can be set via update_step_status and persists across reload.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Each of the five `StepStatus` values can be set on a step and read back",
+      "status": "complete",
+      "evidence": "Test TestAllStepStatusValues uses parametrize to test all five StepStatus values (pending, running, passed, failed, awaiting_approval), verifying each can be set and read back.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "A step result round-trips its exit code, captured output, and `started_at`/`completed_at`",
+      "status": "complete",
+      "evidence": "Test TestStepResultRoundTrip::test_step_result_round_trips_all_fields verifies that StepResult with exit_code, captured_output, started_at, and completed_at all round-trip through update_step_status with result parameter.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "The resume pointer can occupy positions 0..2 across a three-step runbook and survives reload",
+      "status": "complete",
+      "evidence": "Test TestResumePointerPositions uses parametrize to verify the resume pointer can be at positions 0, 1, and 2 for a three-step runbook, and each position survives reload.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "The resume pointer survives the store being closed and reopened",
+      "status": "complete",
+      "evidence": "Test TestResumePointerPersistence::test_resume_pointer_survives_reopen creates a runbook, advances it, closes the connection, reopens with a new connection, and verifies the pointer remains at position 1.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Updating a step position out of range raises `RunbookStepNotFoundError`; stored steps unchanged",
+      "status": "complete",
+      "evidence": "Implemented RunbookStepNotFoundError. Test TestOutOfRangeStepRejected::test_out_of_range_sequence_index_raises_error verifies that attempting to update sequence_index=1 on a single-step runbook raises the error and leaves the existing step unchanged.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Setting an unrecognised status raises `RunbookValidationError`; the step keeps its previous status",
+      "status": "complete",
+      "evidence": "Implemented Python-side validation that raises RunbookValidationError before the SQL write if status is not a StepStatus member. Test TestUnrecognisedStatusRejected::test_unrecognised_status_raises_validation_error verifies invalid status raises error and previous status is preserved.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Advancing past the final step raises `RunbookAdvanceError` and leaves the pointer and all step statuses untouched",
+      "status": "complete",
+      "evidence": "Implemented RunbookAdvanceError. Test TestAdvancePastFinalStepRejected::test_advancing_past_final_step_raises_error verifies that advancing from the last step (index 0 in a 1-step runbook) raises the error and leaves pointer and status unchanged.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "Advancing an unknown runbook raises `RunbookNotFoundError`",
+      "status": "complete",
+      "evidence": "Test TestAdvanceUnknownRunbookRejected::test_advancing_nonexistent_runbook_raises_error verifies that calling advance on a non-existent runbook_id raises RunbookNotFoundError.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "The overall status set at create round-trips across all five values and is not changed by `update_step_status`/`advance`",
+      "status": "complete",
+      "evidence": "Test TestOverallStatusNotMutated uses parametrize to verify that for each of the five StepStatus values, when set as the overall runbook status at creation, it remains unchanged after update_step_status and advance operations (ASSUM-009).",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran black formatter and ruff linter. All files pass: 'All checks passed!' from ruff, and black reformatted one file with no errors.",
+      "test_file": null,
+      "implementation_files": [
+        "tests/forge/persistence/test_runbook.py",
+        "src/forge/persistence/repositories/runbook.py",
+        "src/forge/persistence/repositories/__init__.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-014",
+      "criterion_text": "Tests added to `tests/forge/persistence/test_runbook.py`, written **test-first** (TDD)",
+      "status": "complete",
+      "evidence": "Following TDD RED-GREEN-REFACTOR cycle: (1) Wrote comprehensive test suite covering all 13 test classes with parametrized tests. (2) Implemented update_step_status and advance methods. (3) All 35 tests pass including 2 seam tests. Tests were written before implementation per TDD discipline.",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 0.6782540829735808
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 149.08657487499295
+    }
+  ]
+}

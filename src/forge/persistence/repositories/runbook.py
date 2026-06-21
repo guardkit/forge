@@ -40,6 +40,8 @@ __all__ = [
     "RunbookRepository",
     "RunbookDuplicateError",
     "RunbookNotFoundError",
+    "RunbookStepNotFoundError",
+    "RunbookAdvanceError",
 ]
 
 
@@ -66,12 +68,43 @@ class RunbookDuplicateError(RuntimeError):
 class RunbookNotFoundError(RuntimeError):
     """Raised when a requested runbook does not exist.
 
-    Used by future update/advance operations (TASK-RSP-004).
+    Used by update/advance operations (TASK-RSP-004).
     """
 
     def __init__(self, runbook_id: str) -> None:
         super().__init__(f"no runbook found for runbook_id={runbook_id!r}")
         self.runbook_id = runbook_id
+
+
+class RunbookStepNotFoundError(RuntimeError):
+    """Raised when updating a step at an invalid sequence_index.
+
+    The sequence_index must be within the range of existing steps. An
+    out-of-range index leaves all steps unchanged (TASK-RSP-004).
+    """
+
+    def __init__(self, runbook_id: str, sequence_index: int) -> None:
+        super().__init__(
+            f"no step at sequence_index={sequence_index} for runbook_id={runbook_id!r}"
+        )
+        self.runbook_id = runbook_id
+        self.sequence_index = sequence_index
+
+
+class RunbookAdvanceError(RuntimeError):
+    """Raised when attempting to advance past the final step.
+
+    Per ASSUM-004, current_step_index must always point to a valid step.
+    Advancing from the final step is refused (TASK-RSP-004).
+    """
+
+    def __init__(self, runbook_id: str, current_index: int) -> None:
+        super().__init__(
+            f"cannot advance runbook_id={runbook_id!r} past final step "
+            f"(current_step_index={current_index})"
+        )
+        self.runbook_id = runbook_id
+        self.current_index = current_index
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +397,163 @@ class RunbookRepository:
         )
 
         return runbook
+
+    # ------------------------------------------------------------------
+    # Write API — update_step_status (UPDATE runbook_steps)
+    # ------------------------------------------------------------------
+
+    def update_step_status(
+        self,
+        runbook_id: str,
+        sequence_index: int,
+        status: StepStatus,
+        *,
+        correlation_id: str,
+        result: StepResult | None = None,
+    ) -> None:
+        """Update a step's status and optionally its result.
+
+        Updates the status and result columns for the step at the given
+        sequence_index. The update is atomic via BEGIN IMMEDIATE transaction.
+
+        Args:
+            runbook_id: Primary key of the runbook.
+            sequence_index: 0-based position of the step to update.
+            status: New status to set (must be a valid StepStatus member).
+            correlation_id: Correlation ID for tracing this write.
+            result: Optional execution result to persist.
+
+        Raises:
+            ValueError: If correlation_id is empty or status is not a StepStatus.
+            RunbookValidationError: If status is not a valid StepStatus member.
+            RunbookStepNotFoundError: If sequence_index is out of range.
+            sqlite3.Error: For any database error. The transaction is
+                rolled back so no partial writes remain.
+        """
+        if not correlation_id:
+            raise ValueError(
+                "RunbookRepository.update_step_status: correlation_id must be non-empty"
+            )
+
+        # Validate status is a StepStatus member BEFORE the write
+        if not isinstance(status, StepStatus):
+            from forge.persistence.repositories.runbook_models import (
+                RunbookValidationError,
+            )
+
+            raise RunbookValidationError(
+                f"status must be a StepStatus member; got {status!r}"
+            )
+
+        result_json = _encode_result(result)
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+
+            cursor = self._cx.execute(
+                """
+                UPDATE runbook_steps
+                SET status = ?, result = ?
+                WHERE runbook_id = ? AND sequence_index = ?
+                """,
+                (status.value, result_json, runbook_id, sequence_index),
+            )
+
+            if cursor.rowcount == 0:
+                self._safe_rollback()
+                raise RunbookStepNotFoundError(runbook_id, sequence_index)
+
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            self._safe_rollback()
+            raise
+
+        logger.debug(
+            "runbook.update_step_status runbook_id=%s sequence_index=%d status=%s correlation_id=%s",
+            runbook_id,
+            sequence_index,
+            status.value,
+            correlation_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Write API — advance (UPDATE runbooks.current_step_index)
+    # ------------------------------------------------------------------
+
+    def advance(
+        self,
+        runbook_id: str,
+        *,
+        correlation_id: str,
+    ) -> None:
+        """Advance the runbook's resume pointer to the next step.
+
+        Increments current_step_index by one. Refuses to advance past the
+        final step (ASSUM-004). The advance is atomic via BEGIN IMMEDIATE.
+
+        Args:
+            runbook_id: Primary key of the runbook.
+            correlation_id: Correlation ID for tracing this write.
+
+        Raises:
+            ValueError: If correlation_id is empty.
+            RunbookNotFoundError: If the runbook does not exist.
+            RunbookAdvanceError: If already at the final step.
+            sqlite3.Error: For any database error. The transaction is
+                rolled back so no partial writes remain.
+        """
+        if not correlation_id:
+            raise ValueError(
+                "RunbookRepository.advance: correlation_id must be non-empty"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+
+            # Read current state
+            row = self._cx.execute(
+                """
+                SELECT current_step_index,
+                       (SELECT COUNT(*) FROM runbook_steps WHERE runbook_id = ?) AS step_count
+                FROM runbooks
+                WHERE runbook_id = ?
+                """,
+                (runbook_id, runbook_id),
+            ).fetchone()
+
+            if row is None:
+                self._safe_rollback()
+                raise RunbookNotFoundError(runbook_id)
+
+            current_index = row[0]
+            step_count = row[1]
+
+            # Refuse if already at the final step
+            if current_index >= step_count - 1:
+                self._safe_rollback()
+                raise RunbookAdvanceError(runbook_id, current_index)
+
+            # Increment the pointer
+            self._cx.execute(
+                """
+                UPDATE runbooks
+                SET current_step_index = current_step_index + 1
+                WHERE runbook_id = ?
+                """,
+                (runbook_id,),
+            )
+
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            self._safe_rollback()
+            raise
+
+        logger.debug(
+            "runbook.advance runbook_id=%s new_index=%d correlation_id=%s",
+            runbook_id,
+            current_index + 1,
+            correlation_id,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

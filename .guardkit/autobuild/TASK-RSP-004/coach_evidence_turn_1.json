@@ -1,0 +1,242 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": {
+    "status": "parse_degraded",
+    "dialect": "python",
+    "language": "python",
+    "dialects": [
+      "python"
+    ],
+    "languages": [
+      "python"
+    ],
+    "targets_scanned": 2,
+    "symbols_examined": 0,
+    "findings": [],
+    "degraded_files": [
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py"
+    ],
+    "ctor_arity": {
+      "status": "skipped_no_composition_root",
+      "ran": false,
+      "skip_reason": "no composition root found",
+      "dialect": "python",
+      "language": "python",
+      "composition_roots_scanned": 0,
+      "findings": []
+    }
+  },
+  "mocked_seam": {
+    "status": "skipped_no_acceptance_files",
+    "ran": false,
+    "skip_reason": "no acceptance files found",
+    "dialect": "python",
+    "language": "python",
+    "findings": [],
+    "external_mocks_ignored": []
+  },
+  "spec_gap": {
+    "status": "unsupported_stack",
+    "ground_truth_count": 0,
+    "executed_count": 0,
+    "pending_count": 0,
+    "findings": [],
+    "whole_file_deselection": false,
+    "bdd_plugin_name": null,
+    "executed_evidence": "counts_only"
+  },
+  "independent_tests": {
+    "tests_passed": false,
+    "test_command": "pytest tests/forge/persistence/test_runbook.py -v --tb=short",
+    "test_output_summary": "I'll run the test command for you.",
+    "duration_seconds": 5.714253187179565,
+    "raw_output": "\nI'll run the test command for you.\n",
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 14,
+    "criteria_met": 14,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Marking the second step `passed` and reloading reports it `passed`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented update_step_status method with transactional integrity. Test TestUpdateStepStatus::test_marking_second_step_passed_persists verifies that marking step 1 as passed persists correctly while steps 0 and 2 remain pending."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Advancing from the first step and reloading puts the pointer on the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented advance method that increments current_step_index by one. Test TestAdvanceRunbook::test_advancing_from_first_step_moves_to_second verifies the pointer moves from 0 to 1."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "A step set to `awaiting_approval` persists and reloads as such",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestAwaitingApprovalStatus::test_awaiting_approval_status_persists verifies that StepStatus.awaiting_approval can be set via update_step_status and persists across reload."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Each of the five `StepStatus` values can be set on a step and read",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestAllStepStatusValues uses parametrize to test all five StepStatus values (pending, running, passed, failed, awaiting_approval), verifying each can be set and read back."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "A step result round-trips its exit code, captured output, and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestStepResultRoundTrip::test_step_result_round_trips_all_fields verifies that StepResult with exit_code, captured_output, started_at, and completed_at all round-trip through update_step_status with result parameter."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "The resume pointer can occupy positions 0..2 across a three-step",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestResumePointerPositions uses parametrize to verify the resume pointer can be at positions 0, 1, and 2 for a three-step runbook, and each position survives reload."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "The resume pointer survives the store being closed and reopened",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestResumePointerPersistence::test_resume_pointer_survives_reopen creates a runbook, advances it, closes the connection, reopens with a new connection, and verifies the pointer remains at position 1."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Updating a step position out of range raises",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented RunbookStepNotFoundError. Test TestOutOfRangeStepRejected::test_out_of_range_sequence_index_raises_error verifies that attempting to update sequence_index=1 on a single-step runbook raises the error and leaves the existing step unchanged."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Setting an unrecognised status raises `RunbookValidationError`;",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented Python-side validation that raises RunbookValidationError before the SQL write if status is not a StepStatus member. Test TestUnrecognisedStatusRejected::test_unrecognised_status_raises_validation_error verifies invalid status raises error and previous status is preserved."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Advancing past the final step raises `RunbookAdvanceError` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented RunbookAdvanceError. Test TestAdvancePastFinalStepRejected::test_advancing_past_final_step_raises_error verifies that advancing from the last step (index 0 in a 1-step runbook) raises the error and leaves pointer and status unchanged."
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "Advancing an unknown runbook raises `RunbookNotFoundError` (Negative).",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestAdvanceUnknownRunbookRejected::test_advancing_nonexistent_runbook_raises_error verifies that calling advance on a non-existent runbook_id raises RunbookNotFoundError."
+      },
+      {
+        "criterion_id": "AC-012",
+        "criterion_text": "The overall status set at create round-trips across all five values",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test TestOverallStatusNotMutated uses parametrize to verify that for each of the five StepStatus values, when set as the overall runbook status at creation, it remains unchanged after update_step_status and advance operations (ASSUM-009)."
+      },
+      {
+        "criterion_id": "AC-013",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran black formatter and ruff linter. All files pass: 'All checks passed!' from ruff, and black reformatted one file with no errors."
+      },
+      {
+        "criterion_id": "AC-014",
+        "criterion_text": "Tests added to `tests/forge/persistence/test_runbook.py`, written",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Following TDD RED-GREEN-REFACTOR cycle: (1) Wrote comprehensive test suite covering all 13 test classes with parametrized tests. (2) Implemented update_step_status and advance methods. (3) All 35 tests pass including 2 seam tests. Tests were written before implementation per TDD discipline."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": true,
+    "passed": true,
+    "command": "set -e\npython -m pytest tests/forge/persistence -q\n",
+    "exit_code": 0,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": null
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
