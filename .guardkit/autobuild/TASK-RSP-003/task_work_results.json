@@ -1,0 +1,226 @@
+{
+  "task_id": "TASK-RSP-003",
+  "timestamp": "2026-06-21T19:28:07.656974",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation.",
+      "completed": false
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 12,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py",
+    "src/forge/persistence/repositories/__init__.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py",
+    "src/forge/persistence/repositories/runbook.py",
+    "tests/forge/persistence/test_runbook.py"
+  ],
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/.guardkit/autobuild/TASK-RSP-003/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/tests/forge/persistence/test_runbook.py"
+  ],
+  "summary": "12 tests passed",
+  "sdk_turns": {
+    "turns_used": 46,
+    "max_turns": 160,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Creating a three-step runbook persists it under its runbook_id with all three steps in original order; the call reports success",
+      "status": "complete",
+      "evidence": "Implemented create_runbook() with BEGIN IMMEDIATE transactional INSERT of runbook row and all step rows; test_create_three_step_runbook_persists_all_steps_in_order verifies all 3 steps persist in correct order",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "load_runbook returns the same target, created_at, resume pointer, and overall status that were stored; steps come back in sequence order",
+      "status": "complete",
+      "evidence": "Implemented load_runbook() with SELECT ordered by sequence_index ASC; reconstructs Runbook with all fields preserved; test_load_runbook_preserves_all_runbook_fields validates all fields match",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "A newly created runbook loads back with every step pending and current_step_index == 0",
+      "status": "complete",
+      "evidence": "Round-trip test confirms initial state preservation; test_new_runbook_has_pending_steps_and_zero_index creates runbook with pending steps and index 0, loads it back, verifies all steps pending and index 0",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "A single-step runbook round-trips and its pointer rests on the only step",
+      "status": "complete",
+      "evidence": "Boundary test for single-step case; test_single_step_runbook_round_trips creates 1-step runbook with index 0, verifies load returns 1 step with index 0",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Creating a runbook with an empty step list raises RunbookValidationError and persists nothing",
+      "status": "complete",
+      "evidence": "Runbook model __post_init__ validates non-empty steps tuple (ASSUM-002); test_empty_step_list_raises_validation_error confirms validation prevents construction and DB count remains 0",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "A second create_runbook under an existing runbook_id raises RunbookDuplicateError; the original is unaffected",
+      "status": "complete",
+      "evidence": "IntegrityError on PRIMARY KEY violation caught and re-raised as RunbookDuplicateError; _safe_rollback() ensures no partial write; test_duplicate_runbook_id_raises_error verifies error raised and original unchanged",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "load_runbook for an unknown id returns None",
+      "status": "complete",
+      "evidence": "load_runbook checks if runbook row is None and returns None immediately; test_load_nonexistent_runbook_returns_none verifies None returned for missing runbook",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-008",
+      "criterion_text": "Step params round-trip without loss, including nested mappings",
+      "status": "complete",
+      "evidence": "JSON encoding/decoding via _encode_params()/_decode_params() preserves nested dicts and lists; test_nested_params_round_trip verifies complex nested structure survives round-trip",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-009",
+      "criterion_text": "Steps persisted in a shuffled order still load first-to-last by sequence_index",
+      "status": "complete",
+      "evidence": "load_runbook query includes ORDER BY sequence_index ASC; test_steps_load_in_sequence_order manually inserts steps in reverse order (2,1,0) then verifies load returns them in forward order (0,1,2)",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-010",
+      "criterion_text": "Every public method accepts correlation_id: str explicitly",
+      "status": "complete",
+      "evidence": "Both create_runbook() and load_runbook() signatures include correlation_id: str parameter; used for structured logging; test_create_runbook_accepts_correlation_id and test_load_runbook_accepts_correlation_id verify contract",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-011",
+      "criterion_text": "Seam test passes, proving the repo's INSERT columns match the migration DDL",
+      "status": "complete",
+      "evidence": "test_runbook_schema_matches_repository_writes verifies runbooks/runbook_steps table columns, STRICT mode, and StepStatus CHECK set alignment; pytest -m seam passes",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-012",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "ruff check --select E,F,W passes with no errors for both src/forge/persistence/repositories/runbook.py and tests/forge/persistence/test_runbook.py",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-013",
+      "criterion_text": "Tests in tests/forge/persistence/test_runbook.py, written test-first (TDD), class-organised by AC like test_bridge_registry.py",
+      "status": "complete",
+      "evidence": "Tests written before implementation following TDD RED-GREEN cycle; organized in classes TestCreateRunbookThreeSteps, TestLoadRunbookRoundTrip, etc. mirroring bridge_registry pattern; 12 tests total, all passing",
+      "test_file": "tests/forge/persistence/test_runbook.py",
+      "implementation_files": [
+        "src/forge/persistence/repositories/runbook.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 0.6762027500080876
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 138.35515625000698
+    }
+  ]
+}

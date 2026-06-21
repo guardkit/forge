@@ -1,37 +1,39 @@
 ---
-id: TASK-RSP-003
-title: "RunbookRepository: create_runbook + load_runbook"
-status: backlog
-created: 2026-06-21T18:30:00Z
-updated: 2026-06-21T18:30:00Z
-priority: high
-task_type: feature
-parent_review: TASK-REV-RSP-001
-parent_feature: FEAT-RSP
-feature_slug: runbook-and-step-persistence
-wave: 2
-implementation_mode: task-work
 complexity: 6
-estimated_minutes: 90
-dependencies:
-  - TASK-RSP-001
-  - TASK-RSP-002
 consumer_context:
-  - task: TASK-RSP-002
-    consumes: runbooks_schema
-    framework: "raw sqlite3 (forge.adapters.sqlite.connect_writer)"
-    driver: "sqlite3 (stdlib, STRICT tables)"
-    format_note: "INSERT column names/types must match the migration DDL exactly; params/result are JSON TEXT; timestamps ISO-8601 TEXT; steps keyed by (runbook_id, sequence_index)"
-  - task: TASK-RSP-001
-    consumes: StepStatus_value_set
-    framework: "raw sqlite3 (forge.adapters.sqlite.connect_writer)"
-    driver: "sqlite3 (stdlib, STRICT tables)"
-    format_note: "status written to DB must be StepStatus(...).value; the CHECK set and the enum must stay identical"
+- consumes: runbooks_schema
+  driver: sqlite3 (stdlib, STRICT tables)
+  format_note: INSERT column names/types must match the migration DDL exactly; params/result
+    are JSON TEXT; timestamps ISO-8601 TEXT; steps keyed by (runbook_id, sequence_index)
+  framework: raw sqlite3 (forge.adapters.sqlite.connect_writer)
+  task: TASK-RSP-002
+- consumes: StepStatus_value_set
+  driver: sqlite3 (stdlib, STRICT tables)
+  format_note: status written to DB must be StepStatus(...).value; the CHECK set and
+    the enum must stay identical
+  framework: raw sqlite3 (forge.adapters.sqlite.connect_writer)
+  task: TASK-RSP-001
+created: 2026-06-21 18:30:00+00:00
+dependencies:
+- TASK-RSP-001
+- TASK-RSP-002
+estimated_minutes: 90
+feature_slug: runbook-and-step-persistence
+id: TASK-RSP-003
+implementation_mode: task-work
+parent_feature: FEAT-RSP
+parent_review: TASK-REV-RSP-001
+priority: high
+status: design_approved
 tags:
-  - forge
-  - persistence
-  - runbook
-  - repository
+- forge
+- persistence
+- runbook
+- repository
+task_type: feature
+title: 'RunbookRepository: create_runbook + load_runbook'
+updated: 2026-06-21 18:30:00+00:00
+wave: 2
 ---
 
 # RunbookRepository: create_runbook + load_runbook

@@ -1,0 +1,235 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": {
+    "status": "parse_degraded",
+    "dialect": "python",
+    "language": "python",
+    "dialects": [
+      "python"
+    ],
+    "languages": [
+      "python"
+    ],
+    "targets_scanned": 2,
+    "symbols_examined": 0,
+    "findings": [],
+    "degraded_files": [
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/__init__.py",
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-RSP/src/forge/persistence/repositories/runbook.py"
+    ],
+    "ctor_arity": {
+      "status": "skipped_no_composition_root",
+      "ran": false,
+      "skip_reason": "no composition root found",
+      "dialect": "python",
+      "language": "python",
+      "composition_roots_scanned": 0,
+      "findings": []
+    }
+  },
+  "mocked_seam": {
+    "status": "skipped_no_acceptance_files",
+    "ran": false,
+    "skip_reason": "no acceptance files found",
+    "dialect": "python",
+    "language": "python",
+    "findings": [],
+    "external_mocks_ignored": []
+  },
+  "spec_gap": {
+    "status": "unsupported_stack",
+    "ground_truth_count": 0,
+    "executed_count": 0,
+    "pending_count": 0,
+    "findings": [],
+    "whole_file_deselection": false,
+    "bdd_plugin_name": null,
+    "executed_evidence": "counts_only"
+  },
+  "independent_tests": {
+    "tests_passed": false,
+    "test_command": "pytest tests/forge/persistence/test_runbook.py -v --tb=short",
+    "test_output_summary": "I'll run that test command for you.",
+    "duration_seconds": 6.746768951416016,
+    "raw_output": "\nI'll run that test command for you.\n",
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 13,
+    "criteria_met": 13,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Creating a three-step runbook persists it under its `runbook_id`",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented create_runbook() with BEGIN IMMEDIATE transactional INSERT of runbook row and all step rows; test_create_three_step_runbook_persists_all_steps_in_order verifies all 3 steps persist in correct order"
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`load_runbook` returns the same `target`, `created_at`,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented load_runbook() with SELECT ordered by sequence_index ASC; reconstructs Runbook with all fields preserved; test_load_runbook_preserves_all_runbook_fields validates all fields match"
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "A newly created runbook loads back with every step `pending` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Round-trip test confirms initial state preservation; test_new_runbook_has_pending_steps_and_zero_index creates runbook with pending steps and index 0, loads it back, verifies all steps pending and index 0"
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "A single-step runbook round-trips and its pointer rests on the only",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Boundary test for single-step case; test_single_step_runbook_round_trips creates 1-step runbook with index 0, verifies load returns 1 step with index 0"
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Creating a runbook with an empty step list raises",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Runbook model __post_init__ validates non-empty steps tuple (ASSUM-002); test_empty_step_list_raises_validation_error confirms validation prevents construction and DB count remains 0"
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "A second `create_runbook` under an existing `runbook_id` raises",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "IntegrityError on PRIMARY KEY violation caught and re-raised as RunbookDuplicateError; _safe_rollback() ensures no partial write; test_duplicate_runbook_id_raises_error verifies error raised and original unchanged"
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "`load_runbook` for an unknown id returns `None` (Negative:",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "load_runbook checks if runbook row is None and returns None immediately; test_load_nonexistent_runbook_returns_none verifies None returned for missing runbook"
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "Step `params` round-trip without loss, including nested mappings",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "JSON encoding/decoding via _encode_params()/_decode_params() preserves nested dicts and lists; test_nested_params_round_trip verifies complex nested structure survives round-trip"
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "Steps persisted in a shuffled order still load first-to-last by",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "load_runbook query includes ORDER BY sequence_index ASC; test_steps_load_in_sequence_order manually inserts steps in reverse order (2,1,0) then verifies load returns them in forward order (0,1,2)"
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "Every public method accepts `correlation_id: str` explicitly.",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both create_runbook() and load_runbook() signatures include correlation_id: str parameter; used for structured logging; test_create_runbook_accepts_correlation_id and test_load_runbook_accepts_correlation_id verify contract"
+      },
+      {
+        "criterion_id": "AC-011",
+        "criterion_text": "Seam test (below) passes, proving the repo's INSERT columns match",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "test_runbook_schema_matches_repository_writes verifies runbooks/runbook_steps table columns, STRICT mode, and StepStatus CHECK set alignment; pytest -m seam passes"
+      },
+      {
+        "criterion_id": "AC-012",
+        "criterion_text": "All modified files pass project-configured lint/format checks with",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "ruff check --select E,F,W passes with no errors for both src/forge/persistence/repositories/runbook.py and tests/forge/persistence/test_runbook.py"
+      },
+      {
+        "criterion_id": "AC-013",
+        "criterion_text": "Tests in `tests/forge/persistence/test_runbook.py`, written",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Tests written before implementation following TDD RED-GREEN cycle; organized in classes TestCreateRunbookThreeSteps, TestLoadRunbookRoundTrip, etc. mirroring bridge_registry pattern; 12 tests total, all passing"
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": true,
+    "passed": true,
+    "command": "set -e\npython -m pytest tests/forge/persistence -q\n",
+    "exit_code": 0,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": null
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
