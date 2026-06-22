@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-RSP-002",
-    "pre_path": "tasks/backlog/TASK-RSP-002-runbook-store-migration.md",
-    "post_path": "tasks/design_approved/TASK-RSP-002-runbook-store-migration.md",
-    "timestamp": "2026-06-21T17:49:52.967340+00:00",
-    "kind": "design_approved_transition"
-  }
-]

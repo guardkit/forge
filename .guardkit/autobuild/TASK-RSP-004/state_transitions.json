@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-RSP-004",
-    "pre_path": "tasks/backlog/TASK-RSP-004-repository-update-and-advance.md",
-    "post_path": "tasks/design_approved/TASK-RSP-004-repository-update-and-advance.md",
-    "timestamp": "2026-06-21T18:32:51.055278+00:00",
-    "kind": "design_approved_transition"
-  }
-]

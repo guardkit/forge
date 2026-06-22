@@ -9,7 +9,7 @@ implementation_mode: task-work
 parent_feature: FEAT-RSP
 parent_review: TASK-REV-RSP-001
 priority: high
-status: design_approved
+status: completed
 tags:
 - forge
 - persistence

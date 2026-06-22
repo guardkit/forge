@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-RSP-006",
-    "pre_path": "tasks/backlog/TASK-RSP-006-concurrency-and-integration-tests.md",
-    "post_path": "tasks/design_approved/TASK-RSP-006-concurrency-and-integration-tests.md",
-    "timestamp": "2026-06-21T18:42:34.982875+00:00",
-    "kind": "design_approved_transition"
-  }
-]

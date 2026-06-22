@@ -23,7 +23,7 @@ implementation_mode: task-work
 parent_feature: FEAT-RSP
 parent_review: TASK-REV-RSP-001
 priority: high
-status: design_approved
+status: completed
 tags:
 - forge
 - persistence
@@ -60,9 +60,12 @@ resume pointer). Same `BEGIN IMMEDIATE` + `_safe_rollback` discipline.
     leaves the prior committed status intact (Group G atomicity).
 - **`advance(runbook_id, *, correlation_id) -> None`**
   - Increment `current_step_index` by one.
-  - Refuse when already at the final step (`RunbookAdvanceError`); the
-    pointer stays put (Boundary "Advancing past the final step is refused";
-    **ASSUM-004**).
+  - **Allow** advancing from the final step to the **terminal position**
+    (`current_step_index == step_count`, one past the last step) — the
+    completion marker. Refuse only an advance attempted **at** the terminal
+    position with `RunbookAdvanceError`; the pointer stays put (Boundary
+    "Advancing beyond the terminal position is refused"; **ASSUM-004**, R1
+    reconciled with FEAT-RBX).
   - Refuse an unknown runbook with `RunbookNotFoundError` (Negative
     "Advancing a runbook that does not exist is refused").
   - Does **not** mutate overall status (ASSUM-009).
@@ -82,17 +85,20 @@ Add error types `RunbookStepNotFoundError(RuntimeError)` and
       back (Edge "Each recognised step status can be stored and read back").
 - [ ] A step result round-trips its exit code, captured output, and
       `started_at`/`completed_at` (Edge "A step result preserves...").
-- [ ] The resume pointer can occupy positions 0..2 across a three-step
-      runbook and survives reload (Boundary scenario outline).
+- [ ] The resume pointer can occupy positions 0..3 across a three-step
+      runbook — 0..2 on the steps and 3 at the terminal/complete position —
+      and survives reload (Boundary scenario outline, R1).
 - [ ] The resume pointer survives the store being closed and reopened
       (Edge "The resume pointer survives reopening the store").
 - [ ] Updating a step position out of range raises
       `RunbookStepNotFoundError`; stored steps unchanged (Negative).
 - [ ] Setting an unrecognised status raises `RunbookValidationError`;
       the step keeps its previous status (Negative).
-- [ ] Advancing past the final step raises `RunbookAdvanceError` and
-      leaves the pointer and all step statuses untouched (Boundary +
-      Group G refused-advance consistency; ASSUM-004).
+- [ ] Advancing from the final step moves the pointer to the terminal
+      position (`current_step_index == step_count`); advancing **beyond** the
+      terminal position raises `RunbookAdvanceError` and leaves the pointer and
+      all step statuses untouched (Boundary + Group G refused-advance
+      consistency; ASSUM-004, R1).
 - [ ] Advancing an unknown runbook raises `RunbookNotFoundError` (Negative).
 - [ ] The overall status set at create round-trips across all five values
       and is not changed by `update_step_status`/`advance` (Edge outline +

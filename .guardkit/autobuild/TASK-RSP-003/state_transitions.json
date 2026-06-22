@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-RSP-003",
-    "pre_path": "tasks/backlog/TASK-RSP-003-repository-create-and-load.md",
-    "post_path": "tasks/design_approved/TASK-RSP-003-repository-create-and-load.md",
-    "timestamp": "2026-06-21T18:21:02.119040+00:00",
-    "kind": "design_approved_transition"
-  }
-]
