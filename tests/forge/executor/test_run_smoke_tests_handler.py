@@ -236,3 +236,45 @@ class TestEnvFileHandling:
         # Should succeed — the env_file is just passed as a path
         assert outcome.status == StepStatus.passed
         assert outcome.result["exit_code"] == 0
+
+
+class TestWiringReadiness:
+    """Test that run_smoke_tests is ready for registry wiring."""
+
+    def test_handler_can_be_resolved_through_registry(self, tmp_path):
+        """run_smoke_tests can be registered and resolved through StepTypeRegistry.
+
+        This test demonstrates wiring readiness — the handler can be registered
+        in a registry and invoked through the registry.resolve() path. Actual
+        registration is TASK-SSH-005.
+        """
+        from forge.executor.shell_steps import run_smoke_tests
+        from forge.executor.registry import StepTypeRegistry
+
+        # Create a registry and register the handler
+        registry = StepTypeRegistry()
+        registry.register("run_smoke_tests", run_smoke_tests)
+
+        # Verify it can be resolved
+        resolved_handler = registry.resolve("run_smoke_tests")
+        assert resolved_handler is not None
+        assert resolved_handler is run_smoke_tests
+
+        # Verify the resolved handler works
+        script = tmp_path / "test.sh"
+        script.write_text("#!/usr/bin/env bash\nexit 0\n")
+        script.chmod(0o755)
+
+        step = Step(
+            step_type="run_smoke_tests",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+            },
+            status=StepStatus.running,
+            sequence_index=0,
+        )
+
+        outcome = resolved_handler(step)
+        assert outcome.status == StepStatus.passed
