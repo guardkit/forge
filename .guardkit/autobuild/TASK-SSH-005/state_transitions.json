@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-SSH-005",
-    "pre_path": "tasks/backlog/TASK-SSH-005-register-shell-handlers.md",
-    "post_path": "tasks/design_approved/TASK-SSH-005-register-shell-handlers.md",
-    "timestamp": "2026-06-22T15:02:09.298531+00:00",
-    "kind": "design_approved_transition"
-  }
-]

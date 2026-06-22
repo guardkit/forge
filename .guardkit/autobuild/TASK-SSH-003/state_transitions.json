@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-SSH-003",
-    "pre_path": "tasks/backlog/TASK-SSH-003-deploy-compose-handler.md",
-    "post_path": "tasks/design_approved/TASK-SSH-003-deploy-compose-handler.md",
-    "timestamp": "2026-06-22T14:40:46.221928+00:00",
-    "kind": "design_approved_transition"
-  }
-]

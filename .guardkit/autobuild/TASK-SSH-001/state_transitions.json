@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-SSH-001",
-    "pre_path": "tasks/backlog/TASK-SSH-001-scrub-process-output.md",
-    "post_path": "tasks/design_approved/TASK-SSH-001-scrub-process-output.md",
-    "timestamp": "2026-06-22T14:13:24.753511+00:00",
-    "kind": "design_approved_transition"
-  }
-]

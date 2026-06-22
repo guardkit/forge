@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "TASK-SSH-006",
-    "pre_path": "tasks/backlog/TASK-SSH-006-integration-fleet-memory-smoke.md",
-    "post_path": "tasks/design_approved/TASK-SSH-006-integration-fleet-memory-smoke.md",
-    "timestamp": "2026-06-22T15:08:21.492655+00:00",
-    "kind": "design_approved_transition"
-  }
-]
