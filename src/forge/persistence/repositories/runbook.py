@@ -149,6 +149,7 @@ def _encode_result(result: StepResult | None) -> str | None:
             "captured_output": result.captured_output,
             "started_at": result.started_at.isoformat(),
             "completed_at": result.completed_at.isoformat(),
+            "payload": result.payload,
         }
     )
 
@@ -172,6 +173,9 @@ def _decode_result(raw: str | None) -> StepResult | None:
         captured_output=decoded["captured_output"],
         started_at=datetime.fromisoformat(decoded["started_at"]),
         completed_at=datetime.fromisoformat(decoded["completed_at"]),
+        # ``payload`` is optional and absent from legacy rows written before
+        # TASK-RBX-008; default to None so old results still decode.
+        payload=decoded.get("payload"),
     )
 
 

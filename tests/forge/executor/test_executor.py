@@ -209,7 +209,9 @@ def test_status_and_result_persisted(
     persisted = loaded.steps[0].result
     assert persisted is not None, "step result must be persisted (not just announced)"
     assert persisted.exit_code == 0
-    assert "test-step" in persisted.captured_output
+    # TASK-RBX-008: the handler's structured result is a first-class payload,
+    # round-tripped verbatim — not a JSON blob stuffed into captured_output.
+    assert persisted.payload == {"step_type": "test-step", "params": {}}
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +315,9 @@ def test_resumed_at_its_final_step(
     registry.register("test-step", counting_handler)
 
     # Create a 3-step runbook
-    runbook = create_test_runbook(repository, "rb-006", ["test-step", "test-step", "test-step"])
+    runbook = create_test_runbook(
+        repository, "rb-006", ["test-step", "test-step", "test-step"]
+    )
 
     # Manually advance pointer to final step
     repository.update_step_status(
@@ -422,9 +426,7 @@ def test_failing_step_stops_the_run(
     registry.register("failing-step", failing_handler)
     registry.register("test-step", passing_handler)
 
-    runbook = create_test_runbook(
-        repository, "rb-010", ["failing-step", "test-step"]
-    )
+    runbook = create_test_runbook(repository, "rb-010", ["failing-step", "test-step"])
 
     result = asyncio.run(executor.run(runbook.runbook_id, correlation_id="corr-010"))
 
@@ -606,9 +608,7 @@ def test_step_that_requires_approval(
     registry.register("approval-step", approval_handler)
     registry.register("test-step", passing_handler)
 
-    runbook = create_test_runbook(
-        repository, "rb-016", ["approval-step", "test-step"]
-    )
+    runbook = create_test_runbook(repository, "rb-016", ["approval-step", "test-step"])
 
     result = asyncio.run(executor.run(runbook.runbook_id, correlation_id="corr-016"))
 
@@ -642,7 +642,9 @@ def test_step_result_announcement_reports_outcome(
     registry.register("passing-step", passing_handler)
     registry.register("failing-step", failing_handler)
 
-    runbook = create_test_runbook(repository, "rb-017", ["passing-step", "failing-step"])
+    runbook = create_test_runbook(
+        repository, "rb-017", ["passing-step", "failing-step"]
+    )
 
     asyncio.run(executor.run(runbook.runbook_id, correlation_id="corr-017"))
 

@@ -22,7 +22,6 @@ Design invariants:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -401,20 +400,23 @@ class RunbookExecutor:
     ) -> StepResult | None:
         """Adapt a handler's free-form ``StepOutcome.result`` into a ``StepResult``.
 
-        The persistence layer records a strict ``StepResult`` (exit_code,
-        captured_output, timestamps) while a handler returns an arbitrary
-        JSON-serialisable dict. The dict is preserved verbatim as JSON in
-        ``captured_output``; ``exit_code`` is derived from the outcome status
-        (0 for passed, 1 otherwise). Returns ``None`` when the handler produced
-        no result, so the step's ``result`` column stays NULL.
+        The handler's structured, JSON-serialisable dict is persisted as a
+        first-class value in ``StepResult.payload`` (round-tripped verbatim),
+        not stuffed into ``captured_output`` as a JSON blob (TASK-RBX-008
+        reconciled the model). ``exit_code`` is derived from the outcome status
+        (0 for passed, 1 otherwise); ``captured_output`` is empty because these
+        in-process handlers report their outcome structurally rather than as a
+        stdout/stderr stream. Returns ``None`` when the handler produced no
+        result, so the step's ``result`` column stays NULL.
         """
         if outcome.result is None:
             return None
         return StepResult(
             exit_code=0 if outcome.status == StepStatus.passed else 1,
-            captured_output=json.dumps(outcome.result),
+            captured_output="",
             started_at=started_at,
             completed_at=completed_at,
+            payload=outcome.result,
         )
 
     async def _safe_publish(self, publish_method, payload) -> None:

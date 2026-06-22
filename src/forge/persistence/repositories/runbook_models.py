@@ -86,20 +86,27 @@ class StepResult:
     """Execution result for a completed step.
 
     Records the outcome of step execution: exit code, captured output,
-    and timing information. A step has no result until one is recorded
-    (**ASSUM-007**) — ``Step.result`` is ``StepResult | None``.
+    timing information, and the handler's structured result. A step has no
+    result until one is recorded (**ASSUM-007**) — ``Step.result`` is
+    ``StepResult | None``.
 
     Attributes:
         exit_code: Process exit code (0 for success).
         captured_output: Combined stdout/stderr from step execution.
         started_at: When the step began execution (**ASSUM-008**).
         completed_at: When the step finished execution (**ASSUM-008**).
+        payload: The handler's structured, JSON-serialisable result mapping
+            (``StepOutcome.result``), persisted as a first-class value and
+            round-tripped verbatim. ``None`` when the handler produced no
+            structured result, or for legacy rows written before this field
+            existed (TASK-RBX-008).
     """
 
     exit_code: int
     captured_output: str
     started_at: datetime
     completed_at: datetime
+    payload: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
