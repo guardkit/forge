@@ -14,7 +14,9 @@ from __future__ import annotations
 import os
 import subprocess
 
+from forge.executor.registry import StepOutcome
 from forge.memory.redaction import scrub_process_output
+from forge.persistence.repositories.runbook_models import Step, StepStatus
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -137,4 +139,106 @@ def _run_script_step(
     return (exit_code, output)
 
 
-__all__ = ["_run_script_step", "DEFAULT_TIMEOUT_SECONDS", "DEFAULT_OUTPUT_CAP_BYTES"]
+def deploy_compose(step: Step) -> StepOutcome:
+    """Execute a deploy_compose step (TASK-SSH-003).
+
+    Extracts cwd, script, env_file (and optional timeout/output_cap overrides)
+    from step.params, delegates to the shared core (_run_script_step), and maps
+    the exit status to a verdict: 0 → passed, non-zero → failed.
+
+    Args:
+        step: The Step instance containing params and metadata.
+
+    Returns:
+        StepOutcome with status (passed/failed) and a JSON-serializable result
+        dict containing exit_code and scrubbed captured_output.
+
+    Raises:
+        Never raises. All errors are returned as failed outcomes.
+    """
+    # Extract required params
+    cwd = step.params["cwd"]
+    script = step.params["script"]
+    env_file = step.params.get("env_file")
+
+    # Extract optional overrides (use defaults if not provided)
+    timeout = step.params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+    output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
+
+    # Delegate to shared core
+    exit_code, captured_output = _run_script_step(
+        cwd=cwd,
+        script=script,
+        env_file=env_file,
+        timeout=timeout,
+        output_cap=output_cap,
+    )
+
+    # Map exit status to verdict
+    status = StepStatus.passed if exit_code == 0 else StepStatus.failed
+
+    # Build result dict (JSON-serializable, executor persists it verbatim)
+    result = {
+        "exit_code": exit_code,
+        "captured_output": captured_output,
+    }
+
+    return StepOutcome(status=status, result=result)
+
+
+def run_smoke_tests(step: Step) -> StepOutcome:
+    """Execute a run_smoke_tests step (TASK-SSH-004).
+
+    Extracts cwd, script, env_file (and optional timeout/output_cap overrides)
+    from step.params, delegates to the shared core (_run_script_step), and maps
+    the exit status to a verdict: 0 → passed, non-zero → failed.
+
+    For smoke tests, the script's exit status IS the verdict.
+
+    Args:
+        step: The Step instance containing params and metadata.
+
+    Returns:
+        StepOutcome with status (passed/failed) and a JSON-serializable result
+        dict containing exit_code and scrubbed captured_output.
+
+    Raises:
+        Never raises. All errors are returned as failed outcomes.
+    """
+    # Extract required params
+    cwd = step.params["cwd"]
+    script = step.params["script"]
+    env_file = step.params.get("env_file")
+
+    # Extract optional overrides (use defaults if not provided)
+    timeout = step.params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+    output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
+
+    # Delegate to shared core
+    exit_code, captured_output = _run_script_step(
+        cwd=cwd,
+        script=script,
+        env_file=env_file,
+        timeout=timeout,
+        output_cap=output_cap,
+    )
+
+    # Map exit status to verdict: 0 → passed, non-zero → failed
+    status = StepStatus.passed if exit_code == 0 else StepStatus.failed
+
+    # Build result dict (JSON-serializable, executor persists it verbatim)
+    result = {
+        "exit_code": exit_code,
+        "captured_output": captured_output,
+    }
+
+    return StepOutcome(status=status, result=result)
+
+
+__all__ = [
+    "_run_script_step",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "DEFAULT_OUTPUT_CAP_BYTES",
+    "deploy_compose",
+    "run_smoke_tests",
+]

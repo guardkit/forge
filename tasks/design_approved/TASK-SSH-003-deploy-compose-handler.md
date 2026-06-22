@@ -1,29 +1,31 @@
 ---
-id: TASK-SSH-003
-title: deploy_compose handler + verdict mapping
-status: backlog
-priority: high
-task_type: feature
-parent_review: TASK-REV-SSH1
-parent_feature: FEAT-SSH
-feature_slug: shell-script-step-handlers
-wave: 3
-implementation_mode: task-work
 complexity: 3
-estimated_minutes: 45
-dependencies:
-  - TASK-SSH-002
-tags:
-  - forge
-  - runbook
-  - shell-step
-  - deploy
 consumer_context:
-  - task: TASK-SSH-002
-    consumes: STEP_OUTCOME
-    framework: "forge.executor.registry.StepHandler protocol: (step: Step) -> StepOutcome"
-    driver: "forge.persistence.repositories.runbook_models"
-    format_note: "Handler returns StepOutcome(status, result); status is StepStatus.passed for exit 0, StepStatus.failed otherwise. result is a JSON-serializable dict carrying exit_code and scrubbed captured_output."
+- consumes: STEP_OUTCOME
+  driver: forge.persistence.repositories.runbook_models
+  format_note: Handler returns StepOutcome(status, result); status is StepStatus.passed
+    for exit 0, StepStatus.failed otherwise. result is a JSON-serializable dict carrying
+    exit_code and scrubbed captured_output.
+  framework: 'forge.executor.registry.StepHandler protocol: (step: Step) -> StepOutcome'
+  task: TASK-SSH-002
+dependencies:
+- TASK-SSH-002
+estimated_minutes: 45
+feature_slug: shell-script-step-handlers
+id: TASK-SSH-003
+implementation_mode: task-work
+parent_feature: FEAT-SSH
+parent_review: TASK-REV-SSH1
+priority: high
+status: design_approved
+tags:
+- forge
+- runbook
+- shell-step
+- deploy
+task_type: feature
+title: deploy_compose handler + verdict mapping
+wave: 3
 ---
 
 # TASK-SSH-003 — `deploy_compose` handler

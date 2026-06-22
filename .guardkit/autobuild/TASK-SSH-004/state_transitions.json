@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-SSH-004",
+    "pre_path": "tasks/backlog/TASK-SSH-004-run-smoke-tests-handler.md",
+    "post_path": "tasks/design_approved/TASK-SSH-004-run-smoke-tests-handler.md",
+    "timestamp": "2026-06-22T14:40:46.045818+00:00",
+    "kind": "design_approved_transition"
+  }
+]
