@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-SSH-002",
+    "pre_path": "tasks/backlog/TASK-SSH-002-subprocess-runner-core.md",
+    "post_path": "tasks/design_approved/TASK-SSH-002-subprocess-runner-core.md",
+    "timestamp": "2026-06-22T14:31:24.429946+00:00",
+    "kind": "design_approved_transition"
+  }
+]

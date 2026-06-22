@@ -1,29 +1,31 @@
 ---
-id: TASK-SSH-002
-title: Subprocess-runner core (timeout + size-cap + scrub at boundary)
-status: backlog
-priority: high
-task_type: feature
-parent_review: TASK-REV-SSH1
-parent_feature: FEAT-SSH
-feature_slug: shell-script-step-handlers
-wave: 2
-implementation_mode: task-work
 complexity: 5
-estimated_minutes: 75
-dependencies:
-  - TASK-SSH-001
-tags:
-  - forge
-  - runbook
-  - shell-step
-  - subprocess
 consumer_context:
-  - task: TASK-SSH-001
-    consumes: SCRUB_MARKERS
-    framework: "src/forge/memory/redaction.scrub_process_output (pure str->str)"
-    driver: "re"
-    format_note: "Captured output MUST pass through scrub_process_output exactly once, at the capture boundary, before it is returned or stored. Markers: ***REDACTED-DSN*** / ***REDACTED-PASSWORD***."
+- consumes: SCRUB_MARKERS
+  driver: re
+  format_note: 'Captured output MUST pass through scrub_process_output exactly once,
+    at the capture boundary, before it is returned or stored. Markers: ***REDACTED-DSN***
+    / ***REDACTED-PASSWORD***.'
+  framework: src/forge/memory/redaction.scrub_process_output (pure str->str)
+  task: TASK-SSH-001
+dependencies:
+- TASK-SSH-001
+estimated_minutes: 75
+feature_slug: shell-script-step-handlers
+id: TASK-SSH-002
+implementation_mode: task-work
+parent_feature: FEAT-SSH
+parent_review: TASK-REV-SSH1
+priority: high
+status: design_approved
+tags:
+- forge
+- runbook
+- shell-step
+- subprocess
+task_type: feature
+title: Subprocess-runner core (timeout + size-cap + scrub at boundary)
+wave: 2
 ---
 
 # TASK-SSH-002 — Subprocess-runner core

@@ -1,0 +1,21 @@
+{
+  "phase_4": {
+    "status": "passed",
+    "duration_seconds": 3.5285948750097305,
+    "error": null,
+    "tests_run": 12,
+    "tests_failed": 0,
+    "coverage_pct": 0.0,
+    "output_summary": "Result:\ntests/forge/executor/test_shell_steps_core.py::TestTimeoutHandling::test_timeout_captures_partial_output PASSED [ 75%]\ntests/forge/executor/test_shell_steps_core.py::TestOutputSizeCap::test_ou",
+    "quality_gates_passed": true
+  },
+  "phase_5": {
+    "status": "passed",
+    "duration_seconds": 188.73361008398933,
+    "error": null,
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

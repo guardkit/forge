@@ -1,0 +1,213 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": {
+    "status": "parse_degraded",
+    "dialect": "python",
+    "language": "python",
+    "dialects": [
+      "python"
+    ],
+    "languages": [
+      "python"
+    ],
+    "targets_scanned": 1,
+    "symbols_examined": 0,
+    "findings": [],
+    "degraded_files": [
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py"
+    ],
+    "ctor_arity": {
+      "status": "skipped_no_composition_root",
+      "ran": false,
+      "skip_reason": "no composition root found",
+      "dialect": "python",
+      "language": "python",
+      "composition_roots_scanned": 0,
+      "findings": []
+    }
+  },
+  "mocked_seam": {
+    "status": "skipped_no_acceptance_files",
+    "ran": false,
+    "skip_reason": "no acceptance files found",
+    "dialect": "python",
+    "language": "python",
+    "findings": [],
+    "external_mocks_ignored": []
+  },
+  "spec_gap": {
+    "status": "unsupported_stack",
+    "ground_truth_count": 0,
+    "executed_count": 0,
+    "pending_count": 0,
+    "findings": [],
+    "whole_file_deselection": false,
+    "bdd_plugin_name": null,
+    "executed_evidence": "counts_only"
+  },
+  "independent_tests": {
+    "tests_passed": false,
+    "test_command": "pytest tests/forge/executor/test_shell_steps_core.py -v --tb=short",
+    "test_output_summary": "I'll run the pytest command for you.",
+    "duration_seconds": 17.807217836380005,
+    "raw_output": "\nI'll run the pytest command for you.\n",
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 10,
+    "criteria_met": 10,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`_run_script_step` runs the named script with `cwd` as its current working",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented subprocess.run with cwd parameter. Test test_runs_script_with_specified_working_directory verifies the script executes in the specified directory by running 'pwd' and confirming the output matches tmp_path."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`env_file` is exposed to the subprocess **by path only**; the function",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "env_file is passed via ENV_FILE environment variable to the subprocess. The function only sets env['ENV_FILE'] = env_file and never calls open() or read(). Test test_env_file_exposed_by_path_only verifies the ENV_FILE variable contains the file path."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "Combined stdout **and** stderr are captured into a single output string",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implementation combines stdout and stderr: raw_output = result.stdout + result.stderr. Test test_combined_stdout_and_stderr_captured verifies both streams appear in the output."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Captured output is passed through `scrub_process_output` exactly once at",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "After capture and truncation, output = scrub_process_output(output) is called exactly once before return. Test test_scrub_markers_applied_at_capture_boundary (seam test) verifies PostgreSQL DSN is replaced with ***REDACTED-DSN***. Test test_password_in_stderr_is_scrubbed verifies passwords are scrubbed."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "A script that exceeds `timeout` is killed and the call returns a non-zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "subprocess.run timeout parameter is set. TimeoutExpired exception is caught, exit code 124 (GNU timeout convention) is returned, and partial output from e.stdout + e.stderr is captured. Test test_subprocess_timeout_does_not_hang verifies non-zero exit. Test test_timeout_captures_partial_output verifies partial output is captured."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Output longer than `output_cap` is truncated to the cap before scrubbing,",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Before decoding, raw_output is truncated to output_cap bytes if len(raw_output) > output_cap. Truncation marker '... [OUTPUT TRUNCATED] ...' is appended. Test test_output_exceeding_cap_is_truncated verifies truncation occurs and marker is present. Test test_truncation_happens_before_scrubbing verifies order."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "A script producing no output returns `(0, \"\")` for the clean-exit path",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Empty output is handled naturally: if result.stdout + result.stderr is empty bytes, decode produces empty string. Test test_no_output_returns_clean_exit verifies exit_code=0 and output='' for silent successful script."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "A missing / non-executable script does **not** raise out of the function \u2014",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FileNotFoundError and PermissionError exceptions are caught and return (127, '') and (126, '') respectively (shell conventions). Generic Exception catch returns (1, error_msg). Test test_missing_script_does_not_raise verifies non-zero exit for missing script."
+      },
+      {
+        "criterion_id": "AC-009",
+        "criterion_text": "The function performs no env-file existence check (ASSUM-013 stays",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "No file existence check is performed on env_file. The path is simply assigned to env['ENV_FILE'] without validation. Test test_no_env_file_existence_check_performed passes a non-existent env_file path and verifies the script runs successfully."
+      },
+      {
+        "criterion_id": "AC-010",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran 'ruff check src/forge/executor/shell_steps.py' -> All checks passed! Ran 'ruff format --check src/forge/executor/shell_steps.py' -> 1 file already formatted."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": true,
+    "passed": true,
+    "command": "set -e\npytest tests/forge -m \"not slow\" -x \\\n  -k \"shell_steps or scrub_process_output or deploy_compose or run_smoke_tests or register_shell_handlers\"\n",
+    "exit_code": 0,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": null
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
