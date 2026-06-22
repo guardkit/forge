@@ -1,0 +1,146 @@
+{
+  "task_id": "TASK-SSH-005",
+  "timestamp": "2026-06-22T16:05:23.819748",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 10,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py",
+    "src/forge/executor/__init__.py",
+    "src/forge/executor/shell_steps.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/.guardkit/autobuild/TASK-SSH-005/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/.guardkit/autobuild/TASK-SSH-005/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "summary": "10 tests passed",
+  "sdk_turns": {
+    "turns_used": 25,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`register_shell_handlers(registry)` registers `deploy_compose` under the \"deploy_compose\" step type and `run_smoke_tests` under the \"run_smoke_tests\" step type.",
+      "status": "complete",
+      "evidence": "Implemented register_shell_handlers() function in shell_steps.py that calls registry.register() for both handlers. Tests verify both handlers are registered under their respective keys.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "After calling it, `registry.resolve(\"deploy_compose\")` and `registry.resolve(\"run_smoke_tests\")` each return a non-`None` handler (covers key-example \"deploy and smoke handlers are registered under their step types\").",
+      "status": "complete",
+      "evidence": "Tests test_resolve_returns_non_none_for_registered_handlers() and test_registers_*_handler() verify that resolve() returns non-None handlers for both step types after registration.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`resolve` for an unrelated step type still returns `None` (registration is additive and does not shadow other handlers).",
+      "status": "complete",
+      "evidence": "Tests test_resolve_unrelated_step_type_returns_none() and test_registration_preserves_existing_handlers() verify that unrelated step types return None and pre-existing handlers remain intact after registration.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "The function and both handlers are exported from the `forge.executor` package surface for executor wire-up.",
+      "status": "complete",
+      "evidence": "Updated src/forge/executor/__init__.py to export register_shell_handlers, deploy_compose, and run_smoke_tests. Tests verify all three are accessible from both forge.executor.shell_steps and forge.executor packages.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/__init__.py",
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Ran ruff check and ruff format --check on both modified files. Both passed with 'All checks passed!' and '2 files already formatted' outputs.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py",
+        "src/forge/executor/__init__.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 0.9047644999809563
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 103.78046512504807
+    }
+  ]
+}

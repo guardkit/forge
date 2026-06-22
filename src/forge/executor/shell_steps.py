@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-from forge.executor.registry import StepOutcome
+from forge.executor.registry import StepOutcome, StepTypeRegistry
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
 
@@ -235,10 +235,33 @@ def run_smoke_tests(step: Step) -> StepOutcome:
     return StepOutcome(status=status, result=result)
 
 
+# ---------------------------------------------------------------------------
+# Registry wiring
+# ---------------------------------------------------------------------------
+
+
+def register_shell_handlers(registry: StepTypeRegistry) -> None:
+    """Register shell-step handlers in the StepTypeRegistry (TASK-SSH-005).
+
+    Wires deploy_compose and run_smoke_tests handlers into the provided registry
+    under their step-type keys, making them discoverable by the executor.
+
+    Args:
+        registry: The StepTypeRegistry instance to register handlers in.
+
+    Per FEAT-SSH planning, the step-type keys match handler names:
+    - "deploy_compose" → deploy_compose
+    - "run_smoke_tests" → run_smoke_tests
+    """
+    registry.register("deploy_compose", deploy_compose)
+    registry.register("run_smoke_tests", run_smoke_tests)
+
+
 __all__ = [
     "_run_script_step",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_OUTPUT_CAP_BYTES",
     "deploy_compose",
     "run_smoke_tests",
+    "register_shell_handlers",
 ]

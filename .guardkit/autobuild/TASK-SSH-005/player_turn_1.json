@@ -1,0 +1,94 @@
+{
+  "task_id": "TASK-SSH-005",
+  "turn": 1,
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py",
+    "src/forge/executor/__init__.py",
+    "src/forge/executor/shell_steps.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py",
+    "tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "Register deploy_compose handler under 'deploy_compose' key",
+    "Register run_smoke_tests handler under 'run_smoke_tests' key",
+    "Export function and handlers from forge.executor package",
+    "Ensure registration is additive (doesn't shadow other handlers)",
+    "Pass all lint/format checks"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 25,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/.guardkit/autobuild/TASK-SSH-005/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_register_shell_handlers.py"
+  ],
+  "tests_passed_count": 10,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`register_shell_handlers(registry)` registers `deploy_compose` under the \"deploy_compose\" step type and `run_smoke_tests` under the \"run_smoke_tests\" step type.",
+      "status": "complete",
+      "evidence": "Implemented register_shell_handlers() function in shell_steps.py that calls registry.register() for both handlers. Tests verify both handlers are registered under their respective keys.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "After calling it, `registry.resolve(\"deploy_compose\")` and `registry.resolve(\"run_smoke_tests\")` each return a non-`None` handler (covers key-example \"deploy and smoke handlers are registered under their step types\").",
+      "status": "complete",
+      "evidence": "Tests test_resolve_returns_non_none_for_registered_handlers() and test_registers_*_handler() verify that resolve() returns non-None handlers for both step types after registration.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`resolve` for an unrelated step type still returns `None` (registration is additive and does not shadow other handlers).",
+      "status": "complete",
+      "evidence": "Tests test_resolve_unrelated_step_type_returns_none() and test_registration_preserves_existing_handlers() verify that unrelated step types return None and pre-existing handlers remain intact after registration.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "The function and both handlers are exported from the `forge.executor` package surface for executor wire-up.",
+      "status": "complete",
+      "evidence": "Updated src/forge/executor/__init__.py to export register_shell_handlers, deploy_compose, and run_smoke_tests. Tests verify all three are accessible from both forge.executor.shell_steps and forge.executor packages.",
+      "test_file": "tests/forge/executor/test_register_shell_handlers.py",
+      "implementation_files": [
+        "src/forge/executor/__init__.py",
+        "src/forge/executor/shell_steps.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Ran ruff check and ruff format --check on both modified files. Both passed with 'All checks passed!' and '2 files already formatted' outputs.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/executor/shell_steps.py",
+        "src/forge/executor/__init__.py"
+      ]
+    }
+  ]
+}

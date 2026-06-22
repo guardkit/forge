@@ -1,24 +1,24 @@
 ---
-id: TASK-SSH-005
-title: register_shell_handlers registry wiring
-status: backlog
-priority: high
-task_type: feature
-parent_review: TASK-REV-SSH1
-parent_feature: FEAT-SSH
-feature_slug: shell-script-step-handlers
-wave: 4
-implementation_mode: task-work
 complexity: 2
-estimated_minutes: 35
 dependencies:
-  - TASK-SSH-003
-  - TASK-SSH-004
+- TASK-SSH-003
+- TASK-SSH-004
+estimated_minutes: 35
+feature_slug: shell-script-step-handlers
+id: TASK-SSH-005
+implementation_mode: task-work
+parent_feature: FEAT-SSH
+parent_review: TASK-REV-SSH1
+priority: high
+status: design_approved
 tags:
-  - forge
-  - runbook
-  - shell-step
-  - registry
+- forge
+- runbook
+- shell-step
+- registry
+task_type: feature
+title: register_shell_handlers registry wiring
+wave: 4
 ---
 
 # TASK-SSH-005 — `register_shell_handlers` registry wiring
