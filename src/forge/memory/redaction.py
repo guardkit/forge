@@ -95,6 +95,20 @@ _BEARER_RE = re.compile(r"Bearer [A-Za-z0-9._\-]{20,}")
 #: GitHub redaction) is *not* matched.
 _HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 
+#: PostgreSQL DSN patterns (postgresql:// or postgres://, optional +driver).
+#: Matches DSNs with user:pass@host:port/db format, optional query params.
+#: Tolerates async driver suffixes like postgresql+asyncpg://.
+_POSTGRESQL_DSN_RE = re.compile(r"postgres(?:ql)?(?:\+[a-zA-Z0-9_]+)?://[^\s]+")
+
+#: password= pattern (case-insensitive key, value until whitespace/shell delimiter).
+#: Stops at common shell delimiters: whitespace, ;, &, |, ), etc.
+_PASSWORD_KV_RE = re.compile(r"(?i)password=[^\s;&|)]+")
+
+#: PGPASSWORD= pattern (case-sensitive env var).
+#: Stops at common shell delimiters: whitespace, ;, &, |, ), etc.
+_PGPASSWORD_RE = re.compile(r"PGPASSWORD=[^\s;&|)]+")
+
+
 # ---------------------------------------------------------------------------
 # Replacement markers
 # ---------------------------------------------------------------------------
@@ -102,6 +116,8 @@ _HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 _GITHUB_REDACTION = "***REDACTED-GITHUB-TOKEN***"
 _BEARER_REDACTION = "Bearer ***REDACTED***"
 _HEX_REDACTION = "***REDACTED-HEX***"
+_DSN_REDACTION = "***REDACTED-DSN***"
+_PASSWORD_REDACTION = "***REDACTED-PASSWORD***"
 
 
 def redact_credentials(text: str) -> str:
@@ -125,9 +141,7 @@ def redact_credentials(text: str) -> str:
         TypeError: ``text`` is not a string.
     """
     if not isinstance(text, str):
-        raise TypeError(
-            "redact_credentials expected str, got " f"{type(text).__name__}"
-        )
+        raise TypeError(f"redact_credentials expected str, got {type(text).__name__}")
 
     # Order matters — see module docstring. Most-specific GitHub prefixes
     # first (so their non-bearer characters survive), then bearer tokens,
@@ -141,4 +155,71 @@ def redact_credentials(text: str) -> str:
     return text
 
 
-__all__ = ["redact_credentials"]
+def scrub_process_output(text: str) -> str:
+    """Return ``text`` with process-output credentials replaced.
+
+    Scrubs PostgreSQL connection strings (DSNs) and password key-value
+    pairs from subprocess output. This is the single credential-scrub
+    site for all shell-step captured output (TASK-SSH-001).
+
+    Pattern set and ordering:
+
+    1. ``postgresql://...`` and ``postgres://...`` DSNs (with optional
+       ``+driver`` suffix like ``postgresql+asyncpg://``) →
+       ``***REDACTED-DSN***``
+
+       Run *first* so DSNs containing ``:password@`` in the authority
+       section are consumed by this pass before the bare ``password=``
+       pattern runs.
+
+    2. ``password=<value>`` (case-insensitive key) →
+       ``password=***REDACTED-PASSWORD***``
+
+    3. ``PGPASSWORD=<value>`` (case-sensitive env var) →
+       ``PGPASSWORD=***REDACTED-PASSWORD***``
+
+    The function is pure: no logging, no I/O, no original-value retention.
+    It is idempotent: ``scrub_process_output(scrub_process_output(s)) ==
+    scrub_process_output(s)`` for every ``s``.
+
+    Args:
+        text: The input text to scrub. Unicode is supported; only ASCII
+            credential shapes are matched, so non-ASCII characters around
+            a match are preserved verbatim.
+
+    Returns:
+        The scrubbed string. If no pattern matches, the original string
+        is returned unchanged (but note Python may still allocate a new
+        object — callers must not rely on identity).
+
+    Raises:
+        TypeError: ``text`` is not a string.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"scrub_process_output expected str, got {type(text).__name__}")
+
+    # Order matters — DSN first (see docstring). Most-specific patterns
+    # first so previously-redacted markers (which contain no credential
+    # shapes) are not double-processed.
+    text = _POSTGRESQL_DSN_RE.sub(_DSN_REDACTION, text)
+
+    # password= pattern: replace full match with key + redaction marker
+    def _replace_password_kv(match: re.Match[str]) -> str:
+        # Extract the key (password=, PASSWORD=, etc.) and preserve it
+        full_match = match.group(0)
+        equals_pos = full_match.index("=")
+        key = full_match[: equals_pos + 1]  # includes the '='
+        return key + _PASSWORD_REDACTION
+
+    text = _PASSWORD_KV_RE.sub(_replace_password_kv, text)
+
+    # PGPASSWORD= pattern: same approach
+    def _replace_pgpassword(match: re.Match[str]) -> str:
+        return "PGPASSWORD=" + _PASSWORD_REDACTION
+
+    text = _PGPASSWORD_RE.sub(_replace_pgpassword, text)
+
+    return text
+
+
+__all__ = ["redact_credentials", "scrub_process_output"]

@@ -1,0 +1,116 @@
+{
+  "task_id": "TASK-SSH-001",
+  "turn": 1,
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/memory/redaction.py",
+    "src/forge/memory/redaction.py"
+  ],
+  "files_created": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/memory/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/memory/test_scrub_process_output.py",
+    "tests/forge/memory/__init__.py",
+    "tests/forge/memory/test_scrub_process_output.py"
+  ],
+  "tests_written": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/memory/test_scrub_process_output.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "Add scrub_process_output function to src/forge/memory/redaction.py",
+    "Export function via __all__",
+    "Implement PostgreSQL DSN pattern with optional +driver suffix",
+    "Implement case-insensitive password= pattern",
+    "Implement case-sensitive PGPASSWORD= pattern",
+    "Ensure idempotency",
+    "Ensure purity (no I/O, no logging, TypeError for non-str)",
+    "Prevent false positives on http(s):// URLs",
+    "Pass lint/format checks"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 33,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/.guardkit/autobuild/TASK-SSH-001/player_turn_1.json",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/memory/redaction.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/memory/__init__.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/memory/test_scrub_process_output.py"
+  ],
+  "tests_passed_count": 28,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`scrub_process_output(text: str) -> str` is added to `src/forge/memory/redaction.py` and exported via `__all__`.",
+      "status": "complete",
+      "evidence": "Function implemented at lines 158-210 of src/forge/memory/redaction.py with proper type hints and docstring. Exported in __all__ at line 213.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "A `postgresql://user:pass@host:5432/db` DSN is replaced by `***REDACTED-DSN***`; the same holds for the `postgres://` scheme.",
+      "status": "complete",
+      "evidence": "PostgreSQL DSN pattern implemented with regex `postgres(?:ql)?(?:\\+[a-zA-Z0-9_]+)?://[^\\s]+` at line 101. Supports both postgresql:// and postgres:// schemes, with optional +driver suffixes. Verified by 8 test cases in TestPostgreSQLDSNPattern class.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`password=hunter2` \u2192 `password=***REDACTED-PASSWORD***` and `PGPASSWORD=hunter2` \u2192 `PGPASSWORD=***REDACTED-PASSWORD***` (key preserved, value redacted).",
+      "status": "complete",
+      "evidence": "Password key-value patterns implemented with case-insensitive password= regex at line 105 and case-sensitive PGPASSWORD= regex at line 109. Replacement functions preserve keys at lines 191-199. Verified by 7 test cases across TestPasswordKeyValuePattern and TestPGPasswordEnvVarPattern classes.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "The function is **idempotent**: `scrub_process_output(scrub_process_output(s)) == scrub_process_output(s)` for all `s` \u2014 output already containing a redaction marker is left unchanged (covers the `.feature` \"already redacted\" scenario).",
+      "status": "complete",
+      "evidence": "Idempotency achieved by using fixed replacement markers that do not match any credential patterns. Verified by 3 test cases in TestIdempotency class that confirm double-application produces identical results.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "The function is **pure**: no I/O, no logging, no retention of the original value; non-`str` input raises `TypeError` (mirrors `redact_credentials`).",
+      "status": "complete",
+      "evidence": "Function is pure: only uses stdlib re module, no logging or I/O. TypeError raised for non-str input at lines 188-190. Verified by TestPurityAndApi class with 5 test cases including log capture verification.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "Non-credential text (plain log lines, URLs that are not DSNs) is returned unchanged \u2014 no false positives on `http(s)://` URLs.",
+      "status": "complete",
+      "evidence": "DSN pattern specifically matches postgres/postgresql schemes only, not http/https. Verified by 2 test cases in TestPostgreSQLDSNPattern (test_negative_http_url_is_not_redacted, test_negative_https_url_with_path_is_not_redacted) that confirm http/https URLs are unchanged.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors.",
+      "status": "complete",
+      "evidence": "Both source and test files pass ruff check and ruff format --check with zero errors. Verified inline during implementation.",
+      "test_file": "tests/forge/memory/test_scrub_process_output.py",
+      "implementation_files": [
+        "src/forge/memory/redaction.py"
+      ]
+    }
+  ]
+}

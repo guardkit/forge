@@ -1,0 +1,192 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": {
+    "status": "parse_degraded",
+    "dialect": "python",
+    "language": "python",
+    "dialects": [
+      "python"
+    ],
+    "languages": [
+      "python"
+    ],
+    "targets_scanned": 1,
+    "symbols_examined": 0,
+    "findings": [],
+    "degraded_files": [
+      "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/memory/redaction.py"
+    ],
+    "ctor_arity": {
+      "status": "skipped_no_composition_root",
+      "ran": false,
+      "skip_reason": "no composition root found",
+      "dialect": "python",
+      "language": "python",
+      "composition_roots_scanned": 0,
+      "findings": []
+    }
+  },
+  "mocked_seam": {
+    "status": "skipped_no_acceptance_files",
+    "ran": false,
+    "skip_reason": "no acceptance files found",
+    "dialect": "python",
+    "language": "python",
+    "findings": [],
+    "external_mocks_ignored": []
+  },
+  "spec_gap": {
+    "status": "unsupported_stack",
+    "ground_truth_count": 0,
+    "executed_count": 0,
+    "pending_count": 0,
+    "findings": [],
+    "whole_file_deselection": false,
+    "bdd_plugin_name": null,
+    "executed_evidence": "counts_only"
+  },
+  "independent_tests": {
+    "tests_passed": false,
+    "test_command": "pytest tests/forge/memory/test_scrub_process_output.py -v --tb=short",
+    "test_output_summary": "I'll run the test command for you.",
+    "duration_seconds": 8.193953037261963,
+    "raw_output": "\nI'll run the test command for you.\n",
+    "signal_absent": false
+  },
+  "requirements": {
+    "criteria_total": 7,
+    "criteria_met": 7,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`scrub_process_output(text: str) -> str` is added to",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Function implemented at lines 158-210 of src/forge/memory/redaction.py with proper type hints and docstring. Exported in __all__ at line 213."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "A `postgresql://user:pass@host:5432/db` DSN is replaced by",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "PostgreSQL DSN pattern implemented with regex `postgres(?:ql)?(?:\\+[a-zA-Z0-9_]+)?://[^\\s]+` at line 101. Supports both postgresql:// and postgres:// schemes, with optional +driver suffixes. Verified by 8 test cases in TestPostgreSQLDSNPattern class."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`password=hunter2` \u2192 `password=***REDACTED-PASSWORD***` and",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Password key-value patterns implemented with case-insensitive password= regex at line 105 and case-sensitive PGPASSWORD= regex at line 109. Replacement functions preserve keys at lines 191-199. Verified by 7 test cases across TestPasswordKeyValuePattern and TestPGPasswordEnvVarPattern classes."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "The function is **idempotent**:",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Idempotency achieved by using fixed replacement markers that do not match any credential patterns. Verified by 3 test cases in TestIdempotency class that confirm double-application produces identical results."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "The function is **pure**: no I/O, no logging, no retention of the",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Function is pure: only uses stdlib re module, no logging or I/O. TypeError raised for non-str input at lines 188-190. Verified by TestPurityAndApi class with 5 test cases including log capture verification."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "Non-credential text (plain log lines, URLs that are not DSNs) is",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "DSN pattern specifically matches postgres/postgresql schemes only, not http/https. Verified by 2 test cases in TestPostgreSQLDSNPattern (test_negative_http_url_is_not_redacted, test_negative_https_url_with_path_is_not_redacted) that confirm http/https URLs are unchanged."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Both source and test files pass ruff check and ruff format --check with zero errors. Verified inline during implementation."
+      }
+    ]
+  },
+  "runtime_parity": {
+    "ran": true,
+    "passed": true,
+    "command": "set -e\npytest tests/forge -m \"not slow\" -x \\\n  -k \"shell_steps or scrub_process_output or deploy_compose or run_smoke_tests or register_shell_handlers\"\n",
+    "exit_code": 0,
+    "expected_exit": 0,
+    "timed_out": false,
+    "stderr_tail": "",
+    "skipped_reason": null
+  },
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
