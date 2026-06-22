@@ -478,6 +478,87 @@ class RunbookRepository:
         )
 
     # ------------------------------------------------------------------
+    # Write API — try_claim_step_for_execution (atomic claim of a runnable step)
+    # ------------------------------------------------------------------
+
+    def try_claim_step_for_execution(
+        self,
+        runbook_id: str,
+        sequence_index: int,
+        *,
+        correlation_id: str,
+    ) -> bool:
+        """Atomically claim a runnable step for execution (TASK-RBX-007 concurrency).
+
+        Transitions the step at ``sequence_index`` from a *runnable* status
+        (``pending``; ``failed`` — retry on resume; ``awaiting_approval`` —
+        re-attempt the gate) to ``running`` in a single ``BEGIN IMMEDIATE``
+        transaction, and reports whether *this* caller won the claim. Two
+        executors racing on the same runbook serialise: exactly one observes
+        ``rowcount == 1`` (claimed) while the other observes ``rowcount == 0``
+        and must skip the step. This is the no-double-run guarantee the executor
+        relies on — it never runs a handler for a step it did not claim.
+
+        A ``passed`` step (already done — the executor advances past it via its
+        recovery shortcut) and a ``running`` step (already claimed by a
+        concurrent executor) are NOT claimable.
+
+        Args:
+            runbook_id: Primary key of the runbook.
+            sequence_index: 0-based position of the step to claim.
+            correlation_id: Correlation ID for tracing this write.
+
+        Returns:
+            True if this caller transitioned the step to ``running``; False if
+            the step was ``passed``/``running`` or does not exist. ``failed`` and
+            ``awaiting_approval`` ARE claimable so a resumed run retries them.
+
+        Raises:
+            ValueError: If correlation_id is empty.
+            sqlite3.Error: For any database error. The transaction is rolled
+                back so no partial writes remain.
+        """
+        if not correlation_id:
+            raise ValueError(
+                "RunbookRepository.try_claim_step_for_execution: "
+                "correlation_id must be non-empty"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            cursor = self._cx.execute(
+                """
+                UPDATE runbook_steps
+                SET status = ?
+                WHERE runbook_id = ? AND sequence_index = ?
+                  AND status IN (?, ?, ?)
+                """,
+                (
+                    StepStatus.running.value,
+                    runbook_id,
+                    sequence_index,
+                    StepStatus.pending.value,
+                    StepStatus.failed.value,
+                    StepStatus.awaiting_approval.value,
+                ),
+            )
+            claimed = cursor.rowcount == 1
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            self._safe_rollback()
+            raise
+
+        logger.debug(
+            "runbook.try_claim_step_for_execution runbook_id=%s sequence_index=%d "
+            "claimed=%s correlation_id=%s",
+            runbook_id,
+            sequence_index,
+            claimed,
+            correlation_id,
+        )
+        return claimed
+
+    # ------------------------------------------------------------------
     # Write API — advance (UPDATE runbooks.current_step_index)
     # ------------------------------------------------------------------
 

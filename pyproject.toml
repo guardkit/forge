@@ -187,4 +187,8 @@ markers = [
     "production-image: feature-slug tag for FEAT-FORGE-009",
     "seam: TASK-F009-006 cross-file seam tests (Contract A drift detector)",
     "slow: tests that require docker / live NATS — excluded by default",
+    # FEAT-RBX (runbook executor) — registered by TASK-RBX-001 so the
+    # runbook-executor unit tests bind without unknown-mark warnings.
+    "runbook-executor: feature-level tag for FEAT-RBX Runbook Executor",
+    "runbook_executor: feature-slug tag for FEAT-RBX",
 ]
