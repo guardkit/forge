@@ -136,7 +136,9 @@ class TestMigrationCreatesTable:
             "status",
             "result",
         }
-        assert required == names
+        # The claim-lease columns (TASK-RBX-009 crash recovery) are additive.
+        lease_columns = {"claimed_at", "claimed_by"}
+        assert names == required | lease_columns
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +318,66 @@ class TestIdempotency:
             "WHERE type='table' AND name='runbook_steps'",
         ).fetchone()
         assert steps_row is not None
+
+    def test_apply_twice_keeps_lease_columns_singular(
+        self, writer_db: sqlite3.Connection
+    ) -> None:
+        """Re-applying never duplicates the TASK-RBX-009 lease columns."""
+        runbook_migration.apply(writer_db)
+        runbook_migration.apply(writer_db)
+
+        names = [
+            row[1] for row in writer_db.execute("PRAGMA table_info(runbook_steps)")
+        ]
+        assert names.count("claimed_at") == 1
+        assert names.count("claimed_by") == 1
+
+    def test_apply_upgrades_preexisting_table_without_lease_columns(
+        self, tmp_path: Path
+    ) -> None:
+        """The guarded ALTER adds lease columns to a pre-RBX-009 table.
+
+        Simulates a database migrated before the claim-lease columns existed:
+        the table is created without them, then ``apply`` back-fills the columns
+        via ``_ensure_claim_lease_columns`` — the upgrade path that keeps the
+        migration idempotent across schema versions.
+        """
+        db_path = tmp_path / "legacy.db"
+        cx = sqlite_connect.connect_writer(db_path)
+        try:
+            lifecycle_migrations.apply_at_boot(cx)
+            # Old schema: runbook_steps WITHOUT claimed_at / claimed_by.
+            with cx:
+                cx.executescript(
+                    """
+                    CREATE TABLE runbooks (
+                        runbook_id          TEXT PRIMARY KEY,
+                        target              TEXT NOT NULL,
+                        current_step_index  INTEGER NOT NULL,
+                        status              TEXT NOT NULL,
+                        created_at          TEXT NOT NULL
+                    ) STRICT;
+                    CREATE TABLE runbook_steps (
+                        runbook_id      TEXT NOT NULL,
+                        sequence_index  INTEGER NOT NULL,
+                        step_type       TEXT NOT NULL,
+                        params          TEXT NOT NULL DEFAULT '{}',
+                        status          TEXT NOT NULL,
+                        result          TEXT,
+                        PRIMARY KEY (runbook_id, sequence_index)
+                    ) STRICT;
+                    """
+                )
+            pre = {row[1] for row in cx.execute("PRAGMA table_info(runbook_steps)")}
+            assert "claimed_at" not in pre and "claimed_by" not in pre
+
+            runbook_migration.apply(cx)
+
+            post = {row[1] for row in cx.execute("PRAGMA table_info(runbook_steps)")}
+            assert "claimed_at" in post
+            assert "claimed_by" in post
+        finally:
+            cx.close()
 
 
 # ---------------------------------------------------------------------------

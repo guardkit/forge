@@ -22,14 +22,18 @@ Design invariants:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from forge.adapters.nats.pipeline_publisher import PublishFailure
 from forge.executor.registry import StepOutcome, StepTypeRegistry
-from forge.persistence.repositories.runbook import RunbookRepository
+from forge.persistence.repositories.runbook import (
+    DEFAULT_CLAIM_LEASE_SECONDS,
+    RunbookRepository,
+)
 from forge.persistence.repositories.runbook_models import StepResult, StepStatus
 from nats_core.events import (
     EscalatedPayload,
@@ -47,6 +51,14 @@ logger = logging.getLogger(__name__)
 __all__ = ["RunbookExecutor", "RunResult"]
 
 
+#: Default backoff (seconds) between reload attempts when the step at the resume
+#: pointer is ``running`` but not claimable — held by a live peer executor, or
+#: by a crashed peer whose lease has not yet expired. The ``await asyncio.sleep``
+#: keeps the dispatch loop from hot-spinning while it waits for the peer to
+#: advance the pointer or for the lease to expire (TASK-RBX-009).
+_DEFAULT_STALL_BACKOFF_SECONDS: Final[float] = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
@@ -60,11 +72,20 @@ class RunResult:
         status: Overall run status (complete, already_complete, or escalated).
         stopped_at_index: Step index where execution stopped (None if completed).
         reason: Escalation reason if status is escalated (None otherwise).
+            ``stalled`` means the step at the resume pointer stayed ``running``
+            and un-claimable across the configured number of no-progress
+            backoff cycles — the executor stops instead of busy-spinning
+            (TASK-RBX-009). Unlike the other reasons, ``stalled`` is not
+            published as a NATS escalated event (the sibling ``nats_core``
+            ``EscalatedPayload.reason`` Literal does not include it); it is
+            logged and surfaced via this result.
     """
 
     status: Literal["complete", "already_complete", "escalated"]
     stopped_at_index: int | None = None
-    reason: Literal["unknown_handler", "step_failed", "awaiting_approval"] | None = None
+    reason: (
+        Literal["unknown_handler", "step_failed", "awaiting_approval", "stalled"] | None
+    ) = None
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +103,18 @@ class RunbookExecutor:
         repository: Persistence repository for loading/updating runbooks.
         registry: Step type registry for resolving handlers.
         publisher: Event publisher for announcing lifecycle events.
+        claim_lease_seconds: Claim-lease window passed to the repository when
+            claiming a step. A ``running`` step claimed longer ago than this is
+            reclaimable as crash recovery (TASK-RBX-009).
+        stall_backoff_seconds: Seconds to sleep between reload attempts while
+            the step at the resume pointer is ``running`` but not claimable.
+        max_stall_cycles: Number of consecutive no-progress backoff cycles on a
+            single un-claimable ``running`` step before the executor stops with
+            ``reason="stalled"`` instead of busy-spinning. Defaults to a value
+            derived from the lease and backoff so the lease-reclaim path (which
+            restores progress within ``claim_lease_seconds``) always wins over
+            this safety net for a crashed peer; it then only fires if the step
+            is truly wedged.
     """
 
     def __init__(
@@ -89,10 +122,26 @@ class RunbookExecutor:
         repository: RunbookRepository,
         registry: StepTypeRegistry,
         publisher: RunbookPublisher,
+        *,
+        claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS,
+        stall_backoff_seconds: float = _DEFAULT_STALL_BACKOFF_SECONDS,
+        max_stall_cycles: int | None = None,
     ) -> None:
         self._repo = repository
         self._registry = registry
         self._publisher = publisher
+        self._claim_lease_seconds = claim_lease_seconds
+        self._stall_backoff_seconds = stall_backoff_seconds
+        if max_stall_cycles is not None:
+            self._max_stall_cycles = max_stall_cycles
+        elif stall_backoff_seconds > 0:
+            # Bound the wait at roughly one lease window plus a margin so a
+            # crashed peer's expired lease is reclaimed before this net trips.
+            self._max_stall_cycles = (
+                int(claim_lease_seconds / stall_backoff_seconds) + 2
+            )
+        else:
+            self._max_stall_cycles = 1
 
     async def run(self, runbook_id: str, *, correlation_id: str) -> RunResult:
         """Execute a runbook from its current resume point.
@@ -153,6 +202,13 @@ class RunbookExecutor:
         )
 
         # 5. Loop through steps
+        #
+        # Crash-recovery stall guard (TASK-RBX-009): track consecutive
+        # no-progress backoff cycles on a single un-claimable ``running`` step
+        # so the loop never hot-spins. Reset whenever the pointer moves on
+        # (a peer advanced) or we win a claim.
+        stall_count = 0
+        stalled_index: int | None = None
         while True:
             # Reload runbook at the start of each iteration to detect concurrent changes
             runbook = self._repo.load_runbook(runbook_id, correlation_id=correlation_id)
@@ -176,20 +232,12 @@ class RunbookExecutor:
                     step_index,
                 )
                 self._repo.advance(runbook_id, correlation_id=correlation_id)
+                stall_count = 0
+                stalled_index = None
                 continue
 
-            # Announce step-started
-            await self._safe_publish(
-                self._publisher.publish_step_started,
-                StepStartedPayload(
-                    runbook_id=runbook.runbook_id,
-                    sequence_index=step.sequence_index,
-                    step_type=step.step_type,
-                    correlation_id=correlation_id,
-                ),
-            )
-
-            # Resolve handler
+            # Resolve handler BEFORE claiming so an unknown handler escalates
+            # without leaving a step claimed/running behind us.
             handler = self._registry.resolve(step.step_type)
             if handler is None:
                 logger.warning(
@@ -197,6 +245,16 @@ class RunbookExecutor:
                     runbook_id,
                     step_index,
                     step.step_type,
+                )
+                # Announce step-started for observability before escalating.
+                await self._safe_publish(
+                    self._publisher.publish_step_started,
+                    StepStartedPayload(
+                        runbook_id=runbook.runbook_id,
+                        sequence_index=step.sequence_index,
+                        step_type=step.step_type,
+                        correlation_id=correlation_id,
+                    ),
                 )
                 await self._safe_publish(
                     self._publisher.publish_escalated,
@@ -213,27 +271,77 @@ class RunbookExecutor:
                     reason="unknown_handler",
                 )
 
-            # Atomically claim this step (pending -> running) BEFORE running its
-            # handler. Two executors racing on the same runbook serialise here:
-            # exactly one transitions pending->running (claimed) and proceeds;
-            # the loser sees rowcount 0 (already claimed / completed / not
-            # pending) and skips. This is the no-double-run guarantee. It
-            # replaces a non-atomic "reload and compare" that had a TOCTOU
-            # window in which both executors could pass the check and run the
-            # same handler (flaky double-run, TASK-RBX-007).
+            # Atomically claim this step BEFORE running its handler. Two
+            # executors racing on the same runbook serialise here: exactly one
+            # transitions a runnable step -> running (claimed) and proceeds; the
+            # loser sees rowcount 0 and skips. This is the no-double-run
+            # guarantee. It replaces a non-atomic "reload and compare" that had
+            # a TOCTOU window in which both executors could pass the check and
+            # run the same handler (flaky double-run, TASK-RBX-007).
+            #
+            # A step left ``running`` by a crashed executor is reclaimed here
+            # once its lease (claimed_at) expires; until then the claim returns
+            # False and we back off rather than hot-spin (TASK-RBX-009).
             claimed = self._repo.try_claim_step_for_execution(
                 runbook_id,
                 step_index,
                 correlation_id=correlation_id,
+                lease_seconds=self._claim_lease_seconds,
+                owner=correlation_id,
             )
             if not claimed:
+                # The step at the pointer is ``running`` with a live lease
+                # (a genuinely in-flight peer, or a crashed peer whose lease has
+                # not yet expired), or it was just completed/advanced by a peer.
+                # Either way, do NOT run it (no-double-run). Back off so the loop
+                # cannot busy-spin; the peer will advance the pointer, or the
+                # lease will expire and a later iteration will reclaim it.
+                if step_index != stalled_index:
+                    # New step under contention — reset the no-progress counter.
+                    stall_count = 0
+                    stalled_index = step_index
+                stall_count += 1
+                if stall_count > self._max_stall_cycles:
+                    logger.warning(
+                        "executor.run runbook_id=%s step_index=%d: step stuck in "
+                        "running across %d no-progress cycles, escalating stalled",
+                        runbook_id,
+                        step_index,
+                        stall_count,
+                    )
+                    # Not published as a NATS escalated event: the sibling
+                    # nats_core EscalatedPayload.reason Literal has no "stalled".
+                    return RunResult(
+                        status="escalated",
+                        stopped_at_index=step_index,
+                        reason="stalled",
+                    )
                 logger.info(
-                    "executor.run runbook_id=%s step_index=%d: already claimed or "
-                    "completed by a concurrent executor, skipping",
+                    "executor.run runbook_id=%s step_index=%d: running step not "
+                    "claimable (cycle %d/%d), backing off",
                     runbook_id,
                     step_index,
+                    stall_count,
+                    self._max_stall_cycles,
                 )
+                if self._stall_backoff_seconds > 0:
+                    await asyncio.sleep(self._stall_backoff_seconds)
                 continue
+
+            # Claim won — progress. Reset the stall guard and announce
+            # step-started now that we own the step (announced once per step we
+            # actually run, not on every backoff poll).
+            stall_count = 0
+            stalled_index = None
+            await self._safe_publish(
+                self._publisher.publish_step_started,
+                StepStartedPayload(
+                    runbook_id=runbook.runbook_id,
+                    sequence_index=step.sequence_index,
+                    step_type=step.step_type,
+                    correlation_id=correlation_id,
+                ),
+            )
 
             # Execute handler (catch exceptions); bracket with timestamps so the
             # persisted StepResult records real start/finish times.

@@ -28,11 +28,17 @@ Schema (AC-1, AC-2, AC-3, AC-4)
 * ``status TEXT NOT NULL`` — step status with CHECK constraint (same set
   as runbooks.status).
 * ``result TEXT`` — nullable JSON result (null until step completes).
+* ``claimed_at TEXT`` — nullable ISO-8601 instant the step was last claimed
+  (transitioned to ``running``); drives crash-recovery lease reclaim
+  (TASK-RBX-009).
+* ``claimed_by TEXT`` — nullable identifier of the executor that won the claim.
 * Composite ``PRIMARY KEY (runbook_id, sequence_index)``.
 
-The migration is idempotent: ``CREATE TABLE IF NOT EXISTS`` guarantees
-re-running the script against an already-migrated database is a no-op,
-matching the contract of :func:`forge.lifecycle.migrations.apply_at_boot`.
+The migration is idempotent: ``CREATE TABLE IF NOT EXISTS`` plus a guarded
+``ALTER TABLE ... ADD COLUMN`` (see :func:`_ensure_claim_lease_columns`)
+guarantee re-running the script against an already-migrated database — with or
+without the claim-lease columns — is a no-op, matching the contract of
+:func:`forge.lifecycle.migrations.apply_at_boot`.
 """
 
 from __future__ import annotations
@@ -71,6 +77,14 @@ CREATE TABLE IF NOT EXISTS runbook_steps (
         status IN ('pending','running','passed','failed','awaiting_approval')
     ),
     result          TEXT,
+    -- Claim-lease columns (TASK-RBX-009 crash recovery). ``claimed_at`` is the
+    -- ISO-8601 wall-clock instant a step was last transitioned to ``running``;
+    -- ``claimed_by`` records which executor won the claim (NULL when unknown).
+    -- A ``running`` step whose ``claimed_at`` is older than the claim lease is
+    -- presumed abandoned by a crashed executor and may be reclaimed. Both are
+    -- NULL for steps that have never been claimed.
+    claimed_at      TEXT,
+    claimed_by      TEXT,
     PRIMARY KEY (runbook_id, sequence_index)
 ) STRICT;
 
@@ -113,9 +127,30 @@ def apply(connection: sqlite3.Connection) -> None:
     try:
         with connection:  # commit on success; rollback on any raise.
             connection.executescript(CREATE_TABLES_SQL)
+            _ensure_claim_lease_columns(connection)
     except sqlite3.Error as exc:
         raise RunbookMigrationError(
             f"failed to apply runbooks/runbook_steps migration: {exc}"
         ) from exc
 
     logger.debug("applied runbooks and runbook_steps migration")
+
+
+def _ensure_claim_lease_columns(connection: sqlite3.Connection) -> None:
+    """Add the claim-lease columns to a pre-existing ``runbook_steps`` table.
+
+    Fresh databases get ``claimed_at`` / ``claimed_by`` directly from
+    ``CREATE_TABLES_SQL``; this upgrade path covers databases migrated before
+    TASK-RBX-009 added them. SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the
+    existing columns are read from ``PRAGMA table_info`` and only the missing
+    ones are added — keeping the whole migration idempotent (safe to re-run on
+    every boot). Adding a nullable ``TEXT`` column to a STRICT table is allowed
+    and back-fills existing rows with NULL.
+    """
+    existing = {
+        row[1] for row in connection.execute("PRAGMA table_info(runbook_steps)")
+    }
+    if "claimed_at" not in existing:
+        connection.execute("ALTER TABLE runbook_steps ADD COLUMN claimed_at TEXT")
+    if "claimed_by" not in existing:
+        connection.execute("ALTER TABLE runbook_steps ADD COLUMN claimed_by TEXT")

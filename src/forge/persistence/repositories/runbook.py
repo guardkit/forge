@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from typing import Any, Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final, Mapping
 
 from forge.persistence.repositories.runbook_models import (
     Runbook,
@@ -42,7 +43,20 @@ __all__ = [
     "RunbookNotFoundError",
     "RunbookStepNotFoundError",
     "RunbookAdvanceError",
+    "DEFAULT_CLAIM_LEASE_SECONDS",
 ]
+
+
+#: Default claim-lease window, in seconds (TASK-RBX-009 crash recovery). A
+#: ``running`` step whose ``claimed_at`` is older than this is presumed
+#: abandoned by a crashed executor and becomes reclaimable by
+#: :meth:`RunbookRepository.try_claim_step_for_execution`. The window MUST
+#: exceed the slowest expected handler duration: a live executor does not
+#: heartbeat while its handler runs, so a handler that outlives the lease could
+#: have its in-flight step reclaimed by a peer and run twice. The in-process
+#: handlers this phase are sub-second; 15 minutes leaves generous headroom for
+#: the shell-script step handlers (FEAT-SSH).
+DEFAULT_CLAIM_LEASE_SECONDS: Final[float] = 900.0
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +180,6 @@ def _decode_result(raw: str | None) -> StepResult | None:
     if not isinstance(decoded, dict):
         logger.warning("runbook: result JSON not a dict (%r)", decoded)
         return None
-    from datetime import datetime
-
     return StepResult(
         exit_code=decoded["exit_code"],
         captured_output=decoded["captured_output"],
@@ -383,8 +395,6 @@ class RunbookRepository:
             )
 
         # Reconstruct runbook
-        from datetime import datetime
-
         runbook = Runbook(
             runbook_id=runbook_row[0],
             target=runbook_row[1],
@@ -491,31 +501,52 @@ class RunbookRepository:
         sequence_index: int,
         *,
         correlation_id: str,
+        now: datetime | None = None,
+        lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS,
+        owner: str | None = None,
     ) -> bool:
-        """Atomically claim a runnable step for execution (TASK-RBX-007 concurrency).
+        """Atomically claim a runnable step for execution (TASK-RBX-007/-009).
 
-        Transitions the step at ``sequence_index`` from a *runnable* status
-        (``pending``; ``failed`` — retry on resume; ``awaiting_approval`` —
-        re-attempt the gate) to ``running`` in a single ``BEGIN IMMEDIATE``
-        transaction, and reports whether *this* caller won the claim. Two
+        Transitions the step at ``sequence_index`` to ``running`` in a single
+        ``BEGIN IMMEDIATE`` transaction, stamping ``claimed_at`` (and
+        ``claimed_by``), and reports whether *this* caller won the claim. Two
         executors racing on the same runbook serialise: exactly one observes
         ``rowcount == 1`` (claimed) while the other observes ``rowcount == 0``
         and must skip the step. This is the no-double-run guarantee the executor
         relies on — it never runs a handler for a step it did not claim.
 
+        A step is claimable when it is:
+
+        * ``pending`` — never started;
+        * ``failed`` — retried on resume;
+        * ``awaiting_approval`` — the gate is re-attempted; or
+        * ``running`` **with an expired lease** — its ``claimed_at`` is older
+          than ``lease_seconds`` (or NULL), so the owning executor is presumed
+          to have crashed mid-step (TASK-RBX-009 crash recovery). Reclaiming it
+          re-stamps ``claimed_at`` to ``now``.
+
         A ``passed`` step (already done — the executor advances past it via its
-        recovery shortcut) and a ``running`` step (already claimed by a
-        concurrent executor) are NOT claimable.
+        recovery shortcut) and a ``running`` step **whose lease is still live**
+        (a genuinely in-flight peer) are NOT claimable: the lease window is what
+        preserves the no-double-run guarantee across a crash. The lease MUST
+        exceed the slowest handler duration — see
+        :data:`DEFAULT_CLAIM_LEASE_SECONDS`.
 
         Args:
             runbook_id: Primary key of the runbook.
             sequence_index: 0-based position of the step to claim.
             correlation_id: Correlation ID for tracing this write.
+            now: Wall-clock instant to stamp/compare against (defaults to
+                ``datetime.now(UTC)``). Injectable for deterministic tests.
+            lease_seconds: Claim-lease window; a ``running`` step claimed longer
+                ago than this is reclaimable.
+            owner: Optional identifier recorded in ``claimed_by`` for the
+                executor that won this claim.
 
         Returns:
             True if this caller transitioned the step to ``running``; False if
-            the step was ``passed``/``running`` or does not exist. ``failed`` and
-            ``awaiting_approval`` ARE claimable so a resumed run retries them.
+            the step was ``passed``, did not exist, or was ``running`` with a
+            still-live lease.
 
         Raises:
             ValueError: If correlation_id is empty.
@@ -528,22 +559,38 @@ class RunbookRepository:
                 "correlation_id must be non-empty"
             )
 
+        claim_time = now if now is not None else datetime.now(UTC)
+        claimed_at_iso = claim_time.isoformat()
+        # Lease cutoff: a running step whose claimed_at is < this is reclaimable.
+        # ISO-8601 strings stamped with the same UTC offset compare
+        # lexicographically in chronological order, so the comparison is done
+        # in SQL inside the atomic UPDATE (essential — the runnable check and
+        # the write must not straddle a transaction boundary).
+        lease_cutoff_iso = (claim_time - timedelta(seconds=lease_seconds)).isoformat()
+
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
             cursor = self._cx.execute(
                 """
                 UPDATE runbook_steps
-                SET status = ?
+                SET status = ?, claimed_at = ?, claimed_by = ?
                 WHERE runbook_id = ? AND sequence_index = ?
-                  AND status IN (?, ?, ?)
+                  AND (
+                        status IN (?, ?, ?)
+                     OR (status = ? AND (claimed_at IS NULL OR claimed_at < ?))
+                  )
                 """,
                 (
                     StepStatus.running.value,
+                    claimed_at_iso,
+                    owner,
                     runbook_id,
                     sequence_index,
                     StepStatus.pending.value,
                     StepStatus.failed.value,
                     StepStatus.awaiting_approval.value,
+                    StepStatus.running.value,
+                    lease_cutoff_iso,
                 ),
             )
             claimed = cursor.rowcount == 1
@@ -554,10 +601,11 @@ class RunbookRepository:
 
         logger.debug(
             "runbook.try_claim_step_for_execution runbook_id=%s sequence_index=%d "
-            "claimed=%s correlation_id=%s",
+            "claimed=%s owner=%s correlation_id=%s",
             runbook_id,
             sequence_index,
             claimed,
+            owner,
             correlation_id,
         )
         return claimed

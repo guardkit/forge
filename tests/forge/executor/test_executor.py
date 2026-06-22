@@ -696,3 +696,129 @@ def test_failure_to_announce_events(
     loaded = repository.load_runbook(runbook.runbook_id, correlation_id="corr-018")
     assert loaded is not None
     assert loaded.steps[0].status == StepStatus.passed
+
+
+# ---------------------------------------------------------------------------
+# TASK-RBX-009: crash recovery for steps stuck in 'running'
+# ---------------------------------------------------------------------------
+
+
+def _force_step_running(
+    repository: RunbookRepository,
+    runbook_id: str,
+    sequence_index: int,
+    *,
+    claimed_at: str | None,
+) -> None:
+    """Drive a step straight to ``running`` with a chosen lease stamp.
+
+    Simulates the state a crashed (stale ``claimed_at``) or genuinely in-flight
+    (fresh ``claimed_at``) executor leaves behind, bypassing the claim API so
+    the test controls the lease instant.
+    """
+    cx = repository._cx  # white-box: drive the lease column directly
+    cx.execute("BEGIN IMMEDIATE;")
+    cx.execute(
+        """
+        UPDATE runbook_steps
+        SET status = ?, claimed_at = ?, claimed_by = ?
+        WHERE runbook_id = ? AND sequence_index = ?
+        """,
+        (StepStatus.running.value, claimed_at, "dead-peer", runbook_id, sequence_index),
+    )
+    cx.execute("COMMIT;")
+
+
+def test_crash_recovery_reclaims_stale_running_step(
+    executor: RunbookExecutor,
+    repository: RunbookRepository,
+    registry: StepTypeRegistry,
+) -> None:
+    """AC-1: a step left ``running`` by a crash is reclaimed and progresses.
+
+    The step sits in ``running`` with a long-expired lease (claimed in 2020).
+    On the next run the executor reclaims it via the lease, runs the handler,
+    and completes — instead of busy-spinning on an un-advanceable pointer.
+    """
+    call_count = []
+
+    def counting_handler(step: Step) -> StepOutcome:
+        call_count.append(step.sequence_index)
+        return passing_handler(step)
+
+    registry.register("test-step", counting_handler)
+
+    runbook = create_test_runbook(repository, "rb-rbx009-recover", ["test-step"])
+    # Simulate a crashed executor: step stuck running with an ancient lease.
+    _force_step_running(
+        repository,
+        runbook.runbook_id,
+        0,
+        claimed_at="2020-01-01T00:00:00+00:00",
+    )
+
+    result = asyncio.run(
+        executor.run(runbook.runbook_id, correlation_id="corr-rbx009-recover")
+    )
+
+    assert result.status == "complete"
+    assert call_count == [0], "the reclaimed step must run exactly once"
+
+    loaded = repository.load_runbook(
+        runbook.runbook_id, correlation_id="corr-rbx009-recover"
+    )
+    assert loaded is not None
+    assert loaded.steps[0].status == StepStatus.passed
+    assert loaded.current_step_index == 1
+
+
+def test_stuck_running_step_escalates_stalled_without_busyspin(
+    repository: RunbookRepository,
+    registry: StepTypeRegistry,
+    mock_publisher: AsyncMock,
+) -> None:
+    """AC-1 (backoff guard): an un-reclaimable running step escalates 'stalled'.
+
+    The step is ``running`` with a fresh lease (a live peer) and the lease is
+    set far longer than the run, so it is never reclaimable. The executor backs
+    off a bounded number of cycles then stops with ``reason='stalled'`` rather
+    than busy-spinning forever; the handler is never run.
+    """
+    handler_calls = []
+
+    def never_runs(step: Step) -> StepOutcome:
+        handler_calls.append(step.sequence_index)
+        return passing_handler(step)
+
+    registry.register("test-step", never_runs)
+
+    runbook = create_test_runbook(repository, "rb-rbx009-stalled", ["test-step"])
+    # A live peer owns the step right now — fresh lease, never expires in-test.
+    _force_step_running(
+        repository,
+        runbook.runbook_id,
+        0,
+        claimed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # Lease far exceeds the test (never reclaim); tiny stall budget, no sleep.
+    stall_executor = RunbookExecutor(
+        repository=repository,
+        registry=registry,
+        publisher=mock_publisher,
+        claim_lease_seconds=10_000.0,
+        stall_backoff_seconds=0.0,
+        max_stall_cycles=3,
+    )
+
+    result = asyncio.run(
+        stall_executor.run(runbook.runbook_id, correlation_id="corr-rbx009-stalled")
+    )
+
+    assert result.status == "escalated"
+    assert result.reason == "stalled"
+    assert result.stopped_at_index == 0
+    assert handler_calls == [], "a stalled step's handler must never run"
+    # The step we never claimed gets no step-started, and the run never completes.
+    assert mock_publisher.publish_step_started.call_count == 0
+    assert mock_publisher.publish_runbook_complete.call_count == 0
