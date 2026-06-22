@@ -1,0 +1,16 @@
+{
+  "task_id": "TASK-SSH-005",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "8095066c524f9f8f80d1e7925fef1698e6cb9ea3",
+      "timestamp": "2026-06-22T16:08:13.197440",
+      "tests_passed": true,
+      "test_count": 1,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false,
+      "evidence_commits": {}
+    }
+  ],
+  "last_updated": "2026-06-22T16:08:13.197645"
+}

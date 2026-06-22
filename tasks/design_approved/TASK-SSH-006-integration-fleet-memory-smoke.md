@@ -1,24 +1,24 @@
 ---
-id: TASK-SSH-006
-title: Integration test — fleet-memory smoke.sh against a throwaway target
-status: backlog
-priority: medium
-task_type: testing
-parent_review: TASK-REV-SSH1
-parent_feature: FEAT-SSH
-feature_slug: shell-script-step-handlers
-wave: 5
-implementation_mode: task-work
 complexity: 3
-estimated_minutes: 50
 dependencies:
-  - TASK-SSH-005
+- TASK-SSH-005
+estimated_minutes: 50
+feature_slug: shell-script-step-handlers
+id: TASK-SSH-006
+implementation_mode: task-work
+parent_feature: FEAT-SSH
+parent_review: TASK-REV-SSH1
+priority: medium
+status: design_approved
 tags:
-  - forge
-  - runbook
-  - shell-step
-  - integration
-  - slow
+- forge
+- runbook
+- shell-step
+- integration
+- slow
+task_type: testing
+title: Integration test — fleet-memory smoke.sh against a throwaway target
+wave: 5
 ---
 
 # TASK-SSH-006 — Integration test against the real fleet-memory smoke script
