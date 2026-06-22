@@ -194,7 +194,7 @@ def test_status_and_result_persisted(
     repository: RunbookRepository,
     registry: StepTypeRegistry,
 ) -> None:
-    """AC-002: A completed step is recorded passed."""
+    """AC-002: A completed step is recorded passed and its result persisted."""
     registry.register("test-step", passing_handler)
 
     runbook = create_test_runbook(repository, "rb-002", ["test-step"])
@@ -205,6 +205,11 @@ def test_status_and_result_persisted(
     loaded = repository.load_runbook(runbook.runbook_id, correlation_id="corr-002")
     assert loaded is not None
     assert loaded.steps[0].status == StepStatus.passed
+    # AC-002: the handler's result is persisted durably, not just announced.
+    persisted = loaded.steps[0].result
+    assert persisted is not None, "step result must be persisted (not just announced)"
+    assert persisted.exit_code == 0
+    assert "test-step" in persisted.captured_output
 
 
 # ---------------------------------------------------------------------------

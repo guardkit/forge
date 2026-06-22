@@ -22,14 +22,16 @@ Design invariants:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from forge.adapters.nats.pipeline_publisher import PublishFailure
 from forge.executor.registry import StepOutcome, StepTypeRegistry
 from forge.persistence.repositories.runbook import RunbookRepository
-from forge.persistence.repositories.runbook_models import StepStatus
+from forge.persistence.repositories.runbook_models import StepResult, StepStatus
 from nats_core.events import (
     EscalatedPayload,
     RunbookCompletePayload,
@@ -234,7 +236,9 @@ class RunbookExecutor:
                 )
                 continue
 
-            # Execute handler (catch exceptions)
+            # Execute handler (catch exceptions); bracket with timestamps so the
+            # persisted StepResult records real start/finish times.
+            started_at = datetime.now(UTC)
             try:
                 outcome = handler(step)
             except Exception as exc:
@@ -247,18 +251,22 @@ class RunbookExecutor:
                     status=StepStatus.failed,
                     result={"error": str(exc), "exception_type": type(exc).__name__},
                 )
+            completed_at = datetime.now(UTC)
+
+            # Adapt the handler's free-form result dict into the persistence
+            # StepResult so the outcome is durably recorded, not just announced.
+            step_result = self._build_step_result(outcome, started_at, completed_at)
 
             # Map outcome
             if outcome.status == StepStatus.passed:
-                # Update step status, then advance
-                # Note: result parameter omitted due to type mismatch (StepOutcome.result
-                # is dict but repository expects StepResult dataclass)
+                # Persist status + result, THEN advance (result-before-advance).
                 try:
                     self._repo.update_step_status(
                         runbook_id,
                         step_index,
                         StepStatus.passed,
                         correlation_id=correlation_id,
+                        result=step_result,
                     )
                     self._repo.advance(runbook_id, correlation_id=correlation_id)
                 except Exception as advance_err:
@@ -310,6 +318,7 @@ class RunbookExecutor:
                     step_index,
                     StepStatus.failed,
                     correlation_id=correlation_id,
+                    result=step_result,
                 )
 
                 # Announce step-result (failure)
@@ -350,6 +359,7 @@ class RunbookExecutor:
                     step_index,
                     StepStatus.awaiting_approval,
                     correlation_id=correlation_id,
+                    result=step_result,
                 )
 
                 # Announce escalated
@@ -382,6 +392,30 @@ class RunbookExecutor:
 
         logger.info("executor.run runbook_id=%s: complete", runbook_id)
         return RunResult(status="complete")
+
+    @staticmethod
+    def _build_step_result(
+        outcome: StepOutcome,
+        started_at: datetime,
+        completed_at: datetime,
+    ) -> StepResult | None:
+        """Adapt a handler's free-form ``StepOutcome.result`` into a ``StepResult``.
+
+        The persistence layer records a strict ``StepResult`` (exit_code,
+        captured_output, timestamps) while a handler returns an arbitrary
+        JSON-serialisable dict. The dict is preserved verbatim as JSON in
+        ``captured_output``; ``exit_code`` is derived from the outcome status
+        (0 for passed, 1 otherwise). Returns ``None`` when the handler produced
+        no result, so the step's ``result`` column stays NULL.
+        """
+        if outcome.result is None:
+            return None
+        return StepResult(
+            exit_code=0 if outcome.status == StepStatus.passed else 1,
+            captured_output=json.dumps(outcome.result),
+            started_at=started_at,
+            completed_at=completed_at,
+        )
 
     async def _safe_publish(self, publish_method, payload) -> None:
         """Wrap publish calls to catch + log PublishFailure (ASSUM-009-exec).
