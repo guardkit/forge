@@ -1,0 +1,30 @@
+{
+  "id": "TURN-FEAT-SSH-1",
+  "feature_id": "FEAT-SSH",
+  "task_id": "TASK-SSH-003",
+  "turn_number": 1,
+  "player_summary": "Implementation attempt",
+  "player_decision": "approve",
+  "coach_decision": "approve",
+  "coach_feedback": null,
+  "mode": "fresh_start",
+  "blockers_found": [],
+  "progress_summary": "Turn 1: approve",
+  "acceptance_criteria_status": {},
+  "files_modified": [
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/src/forge/executor/shell_steps.py",
+    "src/forge/executor/shell_steps.py",
+    "/Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-SSH/tests/forge/executor/test_deploy_compose_handler.py",
+    "tests/forge/executor/test_deploy_compose_handler.py",
+    "tests/forge/executor/test_run_smoke_tests_handler.py"
+  ],
+  "tests_passed": 1,
+  "tests_failed": 0,
+  "coverage": null,
+  "arch_score": null,
+  "started_at": "2026-06-22T15:49:48.184636",
+  "completed_at": "2026-06-22T15:49:48.184636",
+  "duration_seconds": null,
+  "lessons_from_turn": [],
+  "what_to_try_next": null
+}
