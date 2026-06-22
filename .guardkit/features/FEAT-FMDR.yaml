@@ -1,0 +1,129 @@
+id: FEAT-FMDR
+name: Fleet-memory Deploy Runbook
+description: 'FORGE-OL-04: hand-authored typed two-step runbook (deploy_compose then
+  run_smoke_tests) executed via forge runbook run to stand fleet-memory up and verify
+  it; first harvested exemplar; closes TASK-MEM-008 and ticks FEAT-MEM-01 NAS AC.'
+created: '2026-06-22T17:28:35.051359'
+status: in_progress
+complexity: 6
+estimated_tasks: 6
+tasks:
+- id: TASK-FMDR-001
+  name: Author fleet-memory runbook exemplar JSON
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-001-author-fleet-memory-runbook-exemplar.md
+  complexity: 3
+  dependencies: []
+  status: in_progress
+  implementation_mode: direct
+  estimated_minutes: 33
+  requires_infrastructure: []
+  result: null
+  turns_completed: 0
+  current_turn: 1
+  started_at: '2026-06-22T22:07:21.068369'
+  completed_at: null
+- id: TASK-FMDR-002
+  name: Wire forge runbook run to real handlers and publisher
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-002-wire-cli-real-handlers-and-publisher.md
+  complexity: 6
+  dependencies: []
+  status: in_progress
+  implementation_mode: task-work
+  estimated_minutes: 113
+  requires_infrastructure: []
+  result: null
+  turns_completed: 0
+  current_turn: 1
+  started_at: '2026-06-22T22:07:21.071991'
+  completed_at: null
+- id: TASK-FMDR-006
+  name: Coordinated fleet-memory local wrappers
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-006-coordinated-fleet-memory-local-wrappers.md
+  complexity: 2
+  dependencies: []
+  status: deferred
+  implementation_mode: direct
+  estimated_minutes: 22
+  requires_infrastructure: []
+  result:
+    total_turns: 0
+    final_decision: deferred
+    error: null
+    deferred_reason: "operator follow-up \u2014 runtime verification required"
+  turns_completed: 0
+  current_turn: 0
+  started_at: null
+  completed_at: '2026-06-22T22:07:21.075865'
+- id: TASK-FMDR-003
+  name: Scenario suite scripted handlers
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-003-scenario-suite-scripted-handlers.md
+  complexity: 6
+  dependencies:
+  - TASK-FMDR-001
+  - TASK-FMDR-002
+  status: pending
+  implementation_mode: task-work
+  estimated_minutes: 113
+  requires_infrastructure: []
+  result: null
+  turns_completed: 0
+  current_turn: 0
+  started_at: null
+  completed_at: null
+- id: TASK-FMDR-004
+  name: Disposable compose e2e
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-004-disposable-compose-e2e.md
+  complexity: 5
+  dependencies:
+  - TASK-FMDR-001
+  - TASK-FMDR-002
+  - TASK-FMDR-006
+  status: pending
+  implementation_mode: task-work
+  estimated_minutes: 75
+  requires_infrastructure: []
+  result: null
+  turns_completed: 0
+  current_turn: 0
+  started_at: null
+  completed_at: null
+- id: TASK-FMDR-005
+  name: Real NAS stand-up operator handoff
+  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-005-real-nas-standup-operator-handoff.md
+  complexity: 2
+  dependencies:
+  - TASK-FMDR-003
+  - TASK-FMDR-004
+  status: pending
+  implementation_mode: direct
+  estimated_minutes: 22
+  requires_infrastructure: []
+  result: null
+  turns_completed: 0
+  current_turn: 0
+  started_at: null
+  completed_at: null
+orchestration:
+  parallel_groups:
+  - - TASK-FMDR-001
+    - TASK-FMDR-002
+    - TASK-FMDR-006
+  - - TASK-FMDR-003
+    - TASK-FMDR-004
+  - - TASK-FMDR-005
+  estimated_duration_minutes: 378
+  recommended_parallel: 3
+preflight_strict: false
+evidence_repos: []
+execution:
+  started_at: '2026-06-22T22:07:19.923746'
+  completed_at: null
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
+  total_turns: 0
+  tasks_completed: 0
+  tasks_failed: 0
+  current_wave: 1
+  completed_waves: []
+  last_updated: '2026-06-22T22:07:21.075877'
+  archived_at: null
+  archived_to: null
