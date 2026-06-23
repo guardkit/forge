@@ -165,6 +165,8 @@ markers = [
     "security: @security scenarios — security-property coverage",
     "concurrency: @concurrency scenarios — concurrent-event coverage",
     "data_integrity: @data-integrity scenarios — data-integrity coverage",
+    "failure: failure-path scenarios — failed-step / halt-and-escalate coverage",
+    "resume: resume / crash-recovery scenarios — re-entry after a recorded step",
     "integration: @integration scenarios — integration-boundary coverage",
     # Seam tests stamping the §4 Integration Contract they exercise. The
     # argument is the contract name (e.g. ``CapabilityResolution``,
