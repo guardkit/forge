@@ -4,6 +4,8 @@
 
 > **⚠️ UPDATE — 19 April 2026:** Fleet-level framing refined in `forge/docs/research/ideas/fleet-architecture-v3-coherence-via-flywheel.md`. This v2 remains valid as the **repo index + decision log**; the v3 doc is the **framing companion**. See §"Addendum — D40-D46 (Fleet v3)" at the bottom of this document for the new resolved decisions.
 
+> **⚠️ SUPERSEDED FRAMING — 10 June 2026 (DECISION-DF-003):** The fully-autonomous pipeline this document describes (Ideation Agent → Product Owner Agent → Architect Agent → Forge → GuardKit commands as one unattended, locally-served flow) is **deferred, not current**. Per `guardkit/docs/decisions/DECISION-DF-003-hybrid-pipeline-boundary-frontier-planning-local-build.md`: planning stages (ideation → `/feature-plan`) run **attended on frontier models**; only the build half (AutoBuild → `/task-review`) runs unattended on local inference, with the **Forge orchestrating the build half only**. Specialist planning agents remain as config-switchable fallback *reviewers* and dataset-factory products. This document stays valid as the repo index and decision log; read its pipeline narrative through the DF-003 lens.
+
 ---
 
 ## Overview

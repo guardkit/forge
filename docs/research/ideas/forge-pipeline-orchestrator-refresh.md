@@ -6,6 +6,8 @@
 ## Repo: `guardkit/forge`
 ## Related: `specialist-agent` unified harness (Phase 1B), `nats-core` (98% coverage, implemented), `nats-infrastructure` (configured, ready to run), fleet master index
 
+> **⚠️ SCOPE UPDATE — 10 June 2026 (DECISION-DF-003):** The Forge's scope is now fixed as **orchestrator and checkpoint manager of the unattended local build half only** (AutoBuild waves, gate evaluation, confidence-gated checkpoints, re-dispatch). It does **not** drive the planning stages — ideation → `/feature-plan` run attended on frontier models per `guardkit/docs/decisions/DECISION-DF-003-hybrid-pipeline-boundary-frontier-planning-local-build.md`. The full-autonomy orchestration ambitions in this document are deferred behind DF-003's revisit conditions. Forge work is keep-warm pace per the Workstream A scope.
+
 ---
 
 ## Purpose of this document
