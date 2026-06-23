@@ -60,7 +60,12 @@ def _run_script_step(
 
     Args:
         cwd: Working directory for the subprocess. Must exist.
-        script: Path to the script to execute. Must be executable.
+        script: Script to execute, resolved relative to ``cwd`` and must be
+            executable. A bare filename (no directory component, e.g.
+            ``deploy.sh``) is resolved relative to ``cwd`` — it is **not**
+            searched on PATH. Names that already carry a directory component
+            (``./deploy.sh``, ``bin/deploy.sh``, ``/abs/deploy.sh``) are used
+            as-is (TASK-FMDR-007).
         env_file: Optional path to an environment file. Passed via ENV_FILE
             environment variable. No existence check is performed (ASSUM-013).
         timeout: Maximum execution time in seconds. Defaults to 600 (10 min).
@@ -81,10 +86,19 @@ def _run_script_step(
     if env_file is not None:
         env["ENV_FILE"] = env_file
 
+    # Resolve a bare script name (no directory component) relative to cwd.
+    # subprocess resolves an executable containing a path separator relative
+    # to cwd, but searches PATH for a bare name — so "deploy.sh" would not be
+    # found in cwd. Prepending "./" honors the "script is relative to cwd"
+    # contract while leaving paths that already carry a directory component
+    # (e.g. "./deploy.sh", "bin/deploy.sh", "/abs/deploy.sh") untouched
+    # (TASK-FMDR-007).
+    program = script if os.path.dirname(script) else os.path.join(os.curdir, script)
+
     try:
         # Run the subprocess with combined output capture
         result = subprocess.run(
-            [script],
+            [program],
             cwd=cwd,
             env=env,
             capture_output=True,

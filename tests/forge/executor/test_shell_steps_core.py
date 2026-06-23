@@ -269,6 +269,82 @@ class TestOutputSizeCap:
         assert len(output.encode()) <= 300  # Allow for truncation marker
 
 
+class TestBareScriptNameRelativeCwd:
+    """TASK-FMDR-007 regression: a bare script name with a relative cwd resolves
+    relative to cwd, not via PATH.
+
+    The shipped exemplar runbook uses ``script="deploy.sh"`` (filename only) with
+    a relative ``cwd`` (``fleet-memory/deploy/nas``). On Python 3.12 a bare program
+    name is searched on PATH (which does not include the deploy dir), so the first
+    real NAS run failed at step 0 with exit 127. These tests exercise the exact
+    production combination — bare name + relative cwd through the real runner —
+    which no prior test covered (every other test passes an absolute script path).
+    """
+
+    def test_bare_script_name_resolves_relative_to_relative_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        """A bare filename runs from a *relative* cwd (the exemplar's exact form)."""
+        from forge.executor.shell_steps import _run_script_step
+
+        # Arrange: a deploy dir reachable by a relative path, with a bare-named script
+        deploy_dir = tmp_path / "deploy" / "nas"
+        deploy_dir.mkdir(parents=True)
+        script = deploy_dir / "deploy.sh"
+        script.write_text("#!/usr/bin/env bash\necho deployed\n")
+        script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)  # make "deploy/nas" a valid relative cwd
+
+        # Act: bare filename + relative cwd
+        exit_code, output = _run_script_step(
+            cwd="deploy/nas", script="deploy.sh", env_file=None
+        )
+
+        # Assert: it actually ran, not 127 (command not found)
+        assert exit_code == 0, f"bare script not resolved relative to cwd: {output!r}"
+        assert "deployed" in output
+
+    def test_bare_name_with_relative_cwd_does_not_return_127(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression guard: the original symptom was exit 127 (FileNotFoundError)."""
+        from forge.executor.shell_steps import _run_script_step
+
+        deploy_dir = tmp_path / "fleet-memory" / "deploy" / "nas"
+        deploy_dir.mkdir(parents=True)
+        script = deploy_dir / "smoke.sh"
+        script.write_text("#!/usr/bin/env bash\nexit 0\n")
+        script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        exit_code, _ = _run_script_step(
+            cwd="fleet-memory/deploy/nas", script="smoke.sh", env_file=None
+        )
+
+        assert exit_code != 127
+        assert exit_code == 0
+
+    def test_dotslash_script_with_relative_cwd_still_works(
+        self, tmp_path, monkeypatch
+    ):
+        """A name already carrying a directory component is left untouched and runs."""
+        from forge.executor.shell_steps import _run_script_step
+
+        deploy_dir = tmp_path / "deploy" / "nas"
+        deploy_dir.mkdir(parents=True)
+        script = deploy_dir / "deploy.sh"
+        script.write_text("#!/usr/bin/env bash\necho deployed\n")
+        script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        exit_code, output = _run_script_step(
+            cwd="deploy/nas", script="./deploy.sh", env_file=None
+        )
+
+        assert exit_code == 0
+        assert "deployed" in output
+
+
 class TestEnvFileValidation:
     """Test env-file validation behavior."""
 

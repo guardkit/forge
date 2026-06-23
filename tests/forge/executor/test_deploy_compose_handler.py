@@ -213,6 +213,41 @@ exit 0
         assert outcome.status == StepStatus.passed
         assert str(workdir) in outcome.result["captured_output"]
 
+    def test_bare_script_with_relative_cwd_runs(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """TASK-FMDR-007: deploy_compose runs a bare script name with a relative cwd.
+
+        Reproduces the real-NAS step-0 failure: the shipped exemplar runbook uses
+        script="deploy.sh" (filename only) + a relative cwd ("fleet-memory/deploy/nas").
+        Before the fix this returned exit 127 (command not found); it must now resolve
+        the script relative to cwd and run it.
+        """
+        deploy_dir = tmp_path / "fleet-memory" / "deploy" / "nas"
+        deploy_dir.mkdir(parents=True)
+        script = deploy_dir / "deploy.sh"
+        script.write_text("#!/bin/bash\necho 'Deploying...'\nexit 0\n")
+        script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)  # make the relative cwd resolvable
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": "fleet-memory/deploy/nas",  # relative cwd
+                "script": "deploy.sh",  # bare filename (no path separator)
+                "env_file": ".env.deploy",
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert outcome.result["exit_code"] == 0
+        assert outcome.result["exit_code"] != 127
+        assert "Deploying..." in outcome.result["captured_output"]
+
     def test_env_file_passed_to_script(self, tmp_path: Path) -> None:
         """Verify env_file param is passed via ENV_FILE environment variable."""
         env_file = tmp_path / ".env"
