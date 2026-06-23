@@ -16,5 +16,27 @@
     "coverage": 80,
     "complexity": 10,
     "gates": true
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/capture_slash_command.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/capture_slash_command.py"
+          }
+        ]
+      }
+    ]
   }
 }
