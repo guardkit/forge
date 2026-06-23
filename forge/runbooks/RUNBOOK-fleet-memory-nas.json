@@ -1,0 +1,29 @@
+{
+  "runbook_id": "fleet-memory-nas-deploy",
+  "target": "nas",
+  "current_step_index": 0,
+  "status": "pending",
+  "created_at": "2026-06-22T00:00:00+00:00",
+  "steps": [
+    {
+      "step_type": "deploy_compose",
+      "params": {
+        "cwd": "fleet-memory/deploy/nas",
+        "script": "deploy.sh",
+        "env_file": ".env.deploy"
+      },
+      "status": "pending",
+      "sequence_index": 0
+    },
+    {
+      "step_type": "run_smoke_tests",
+      "params": {
+        "cwd": "fleet-memory/deploy/nas",
+        "script": "smoke.sh",
+        "env_file": ".env.deploy"
+      },
+      "status": "pending",
+      "sequence_index": 1
+    }
+  ]
+}

@@ -6,15 +6,21 @@ JSON, persists it via ``create_runbook`` (ASSUM-007), then runs it through
 
 The runbook group is structured as a Click Group so ``forge runbook <verb>``
 can grow later (e.g., ``forge runbook list``, ``forge runbook status``).
+
+TASK-FMDR-002: Wired to real shell handlers (register_shell_handlers) and
+real NATS publisher (nats.connect) with best-effort publishing semantics.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -22,11 +28,14 @@ from forge.adapters.nats.runbook_publisher import RunbookPublisher
 from forge.adapters.sqlite.connect import connect_writer
 from forge.executor.executor import RunbookExecutor
 from forge.executor.registry import StepTypeRegistry
+from forge.executor.shell_steps import register_shell_handlers
 from forge.persistence.repositories.runbook import (
     RunbookDuplicateError,
     RunbookRepository,
 )
 from forge.persistence.repositories.runbook_models import Runbook, Step, StepStatus
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +157,13 @@ def runbook_cmd() -> None:
     default=None,
     help="Path to forge.db (SQLite). Defaults to ~/.forge/forge.db.",
 )
-def run_cmd(path: Path, db_path: Path | None) -> None:
+@click.option(
+    "--no-events",
+    is_flag=True,
+    default=False,
+    help="Disable NATS event publishing (useful when no broker is available).",
+)
+def run_cmd(path: Path, db_path: Path | None, no_events: bool) -> None:
     """Execute a runbook from a JSON file.
 
     Reads the runbook at PATH, persists it to the database, then executes
@@ -156,6 +171,9 @@ def run_cmd(path: Path, db_path: Path | None) -> None:
 
     The runbook is persisted BEFORE execution (ASSUM-007) so results and
     pointer survive a crash mid-run.
+
+    TASK-FMDR-002: Uses real shell handlers and publishes lifecycle events
+    to NATS (best-effort). Use --no-events to skip event publishing.
     """
     # 1. Read and parse the runbook file
     try:
@@ -193,12 +211,9 @@ def run_cmd(path: Path, db_path: Path | None) -> None:
         )
         sys.exit(1)
 
-    # For now, use empty registry and a no-op publisher
-    # (full wiring will come in integration)
+    # Build registry with real shell handlers (TASK-FMDR-002 AC-001)
     registry = StepTypeRegistry()
-    publisher = RunbookPublisher(nats_client=_NoOpNATSClient())
-
-    executor = _build_executor(repository, registry, publisher)
+    register_shell_handlers(registry)
 
     # 4. Persist the runbook BEFORE execution (ASSUM-007)
     try:
@@ -220,12 +235,14 @@ def run_cmd(path: Path, db_path: Path | None) -> None:
         )
         sys.exit(1)
 
-    # 5. Execute the runbook
+    # 5. Execute the runbook with NATS lifecycle management
     try:
         result = asyncio.run(
-            executor.run(
+            _run_with_nats(
+                repository,
+                registry,
                 runbook.runbook_id,
-                correlation_id=f"cli-run-{runbook.runbook_id}",
+                no_events,
             )
         )
     except Exception as exc:
@@ -246,6 +263,99 @@ def run_cmd(path: Path, db_path: Path | None) -> None:
             f"{result.reason}"
         )
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# NATS connection helpers (TASK-FMDR-002)
+# ---------------------------------------------------------------------------
+
+
+async def _run_with_nats(
+    repository: RunbookRepository,
+    registry: StepTypeRegistry,
+    runbook_id: str,
+    no_events: bool,
+) -> Any:
+    """Run the runbook with NATS lifecycle management.
+
+    Connects to NATS (if events enabled), executes the runbook, and ensures
+    the NATS connection is properly closed afterward.
+
+    Args:
+        repository: Runbook persistence repository.
+        registry: Step type registry with registered handlers.
+        runbook_id: ID of the runbook to execute.
+        no_events: Whether to skip NATS event publishing.
+
+    Returns:
+        RunResult from the executor.
+    """
+    # Connect to NATS or use no-op client
+    if no_events:
+        nats_client = _NoOpNATSClient()
+    else:
+        nats_client = await _connect_nats_best_effort()
+
+    try:
+        # Build publisher and executor
+        publisher = RunbookPublisher(nats_client=nats_client)
+        executor = _build_executor(repository, registry, publisher)
+
+        # Execute the runbook
+        result = await executor.run(
+            runbook_id,
+            correlation_id=f"cli-run-{runbook_id}",
+        )
+        return result
+    finally:
+        # Clean up NATS connection if it's a real client
+        if not isinstance(nats_client, _NoOpNATSClient):
+            try:
+                await nats_client.close()
+            except Exception as exc:
+                logger.debug("Failed to close NATS connection: %s", exc)
+
+
+async def _connect_nats_best_effort() -> _NoOpNATSClient | Any:
+    """Connect to NATS broker with best-effort semantics.
+
+    Attempts to connect to the NATS broker specified by FORGE_NATS_URL env var
+    (defaults to nats://127.0.0.1:4222). If connection fails, falls back to
+    the no-op client so the runbook execution can still proceed.
+
+    This implements AC-003: publishing is best-effort; if no broker is reachable,
+    the run still completes.
+
+    Returns:
+        A connected NATS client, or _NoOpNATSClient if connection fails.
+    """
+    servers = os.environ.get("FORGE_NATS_URL", "nats://127.0.0.1:4222")
+
+    try:
+        import nats  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning(
+            "nats-py not installed; lifecycle events will not be published. "
+            "Install with: pip install nats-py"
+        )
+        return _NoOpNATSClient()
+
+    try:
+        client = await nats.connect(
+            servers=servers,
+            connect_timeout=2,  # Fail fast if broker unavailable
+            max_reconnect_attempts=0,  # Don't retry on connection failure
+        )
+        logger.info("Connected to NATS broker at %s", servers)
+        return client
+    except Exception as exc:
+        logger.warning(
+            "Failed to connect to NATS broker at %s: %s. "
+            "Runbook will execute but lifecycle events will not be published.",
+            servers,
+            exc,
+        )
+        return _NoOpNATSClient()
 
 
 # ---------------------------------------------------------------------------
