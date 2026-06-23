@@ -59,6 +59,51 @@ Tracked in **guardkit `TASK-ABFIX-010`** (follow-up to FEAT-CD4C / TASK-ABFIX-00
 - Repeated honesty flags (`claim_audit_unmodified`, should_fix) on both tasks — the deterministic honesty layer worked correctly; worth confirming the Player guidance on audit-file edits.
 - Graphiti/FalkorDB `bound to a different event loop` errors recurred during Coach context loading. Non-fatal (warns and continues) but noisy; separate issue.
 
-## Salvage decision
+## Second finding — TASK-FMDR-004 false *approval* (the mirror image)
 
-001/002 deliverables are green and being salvaged manually (review + mark complete). 003/004 (scenario suite, disposable-compose e2e) were never started and will be handled separately.
+After 001/002/003/006 landed, TASK-FMDR-004 (disposable-compose e2e) was
+re-run and the Coach **approved it on turn 1 — while its own deterministic run
+was 5/9 red.** Where 001 was a false *rejection*, 004 is a false *approval*. Two
+things combined:
+
+1. **Test gate `required=False`** for this task, so green tests weren't required
+   to pass.
+2. The LLM Coach reasoned the failures were "a substrate failure attributed to
+   the orchestrator… evidence is ABSENT, not failed" and approved.
+
+The Coach was half-right: 4 of the 5 failures were a genuine **host substrate
+gap** — `psql` was not installed, and `smoke.sh` GATE G4 connects over the
+published port with the host `psql` client. But the approval masked **two real
+test-code bugs** the Player shipped that no amount of infra would fix:
+
+- `repository.get_runbook_by_id(...)` — method does not exist; the API is
+  `load_runbook(runbook_id, *, correlation_id)`.
+- Asserted `runbook.status.value == "complete"`, but completion is
+  **pointer-based** (`current_step_index == step_count`, executor.run ASSUM-005);
+  the top-level `runbooks.status` column is never mutated during execution.
+
+**Resolution:** installed `psql` (libpq), fixed both test bugs → genuine **9/9**
+(real docker compose: deploy → smoke G3/G4/G5 → complete, idempotent redeploy,
+teardown, daemon-down, missing-wrappers skip). Landed to main `83719ed`.
+
+**Lesson:** a `required=False` test gate plus "substrate failure" reasoning lets
+a red e2e self-approve with real code bugs inside. For a *testing*-type task
+whose entire purpose is the test passing, the test gate should be required (or
+substrate-vs-code-failure must be distinguished deterministically, not by LLM
+prose). Captured as a "see also" on guardkit TASK-ABFIX-010.
+
+## Salvage decision & final state
+
+All six tasks resolved; deliverables salvaged to main as clean snapshots
+(no noisy autobuild history):
+
+| Task | Outcome | Commit |
+|------|---------|--------|
+| 001 runbook exemplar JSON | green (false-stall salvaged) | `4753b20` |
+| 002 wire CLI/handlers/NATS | green (stopped-mid-turn salvaged) | `4753b20` |
+| 003 scenario suite (10 tests) | Coach-approved turn 1 | `6d10d97` |
+| 006 fleet-memory local wrappers | already authored+committed | fleet-memory `d6cf3d4` |
+| 004 disposable-compose e2e (9 tests) | false-approval; fixed to real 9/9 | `83719ed` |
+| 005 real-NAS stand-up | operator handoff (depends on 003/004) | — pending |
+
+Plus `8b8bed8` (revert the global pytest `--timeout` addopts; see above).
