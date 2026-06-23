@@ -9,6 +9,7 @@ files, written **test-first** (TDD).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -547,3 +548,336 @@ class TestCredentialScrubbing:
         # 1. CLI calls register_shell_handlers (tested in TestRealHandlerIntegration)
         # 2. Shell handlers call scrub_process_output (tested in FEAT-SSH tests)
         # 3. Therefore, CLI → handlers → scrubbing (transitive property)
+
+
+# ---------------------------------------------------------------------------
+# TASK-FMDR-008: NATS authentication + fail-fast against an auth-rejecting broker
+# ---------------------------------------------------------------------------
+
+
+def _record_connect(
+    *, client: Any = None, raise_exc: BaseException | None = None
+) -> tuple[Any, list[tuple[str, dict[str, Any]]]]:
+    """Build a fake ``nats_connect`` seam that records its calls.
+
+    Returns the fake coroutine function and the shared ``calls`` list of
+    ``(servers, kwargs)`` tuples so a test can assert how connect was invoked
+    (and, crucially, that it was invoked exactly once — no reconnect spin).
+    """
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_connect(servers: str, **kwargs: Any) -> Any:
+        calls.append((servers, kwargs))
+        if raise_exc is not None:
+            raise raise_exc
+        return client
+
+    return fake_connect, calls
+
+
+class TestResolveNATSAuth:
+    """AC-1: credential resolution from FORGE_NATS_* env vars (precedence)."""
+
+    def test_creds_file_takes_precedence(self) -> None:
+        """FORGE_NATS_CREDS → user_credentials, and wins over all others."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        env = {
+            "FORGE_NATS_CREDS": "/etc/forge/operator.creds",
+            "FORGE_NATS_TOKEN": "tok",
+            "FORGE_NATS_USER": "u",
+            "FORGE_NATS_PASSWORD": "p",
+        }
+        assert _resolve_nats_auth(env) == {
+            "user_credentials": "/etc/forge/operator.creds"
+        }
+
+    def test_token_wins_over_user_password(self) -> None:
+        """FORGE_NATS_TOKEN → token, ahead of user+password."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        env = {
+            "FORGE_NATS_TOKEN": "s3cr3t",
+            "FORGE_NATS_USER": "u",
+            "FORGE_NATS_PASSWORD": "p",
+        }
+        assert _resolve_nats_auth(env) == {"token": "s3cr3t"}
+
+    def test_user_and_password_together(self) -> None:
+        """FORGE_NATS_USER + FORGE_NATS_PASSWORD → user/password kwargs."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        env = {"FORGE_NATS_USER": "operator", "FORGE_NATS_PASSWORD": "pw"}
+        assert _resolve_nats_auth(env) == {"user": "operator", "password": "pw"}
+
+    def test_lone_user_or_password_ignored(self) -> None:
+        """A user without a password (or vice-versa) yields no auth kwargs."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        assert _resolve_nats_auth({"FORGE_NATS_USER": "u"}) == {}
+        assert _resolve_nats_auth({"FORGE_NATS_PASSWORD": "p"}) == {}
+
+    def test_no_credentials_is_anonymous(self) -> None:
+        """No FORGE_NATS_* vars → empty kwargs (anonymous connect, historical)."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        assert _resolve_nats_auth({}) == {}
+
+    def test_whitespace_only_value_is_treated_as_unset(self) -> None:
+        """A blank/whitespace value falls through rather than being used."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        assert _resolve_nats_auth({"FORGE_NATS_CREDS": "   "}) == {}
+        assert _resolve_nats_auth({"FORGE_NATS_TOKEN": ""}) == {}
+
+    def test_surrounding_whitespace_is_stripped(self) -> None:
+        """A trailing newline (e.g. sourced from a file) is stripped off."""
+        from forge.cli.runbook import _resolve_nats_auth
+
+        assert _resolve_nats_auth({"FORGE_NATS_TOKEN": "tok\n"}) == {"token": "tok"}
+
+
+class TestSafeServerDisplay:
+    """AC-1: inline userinfo is stripped from the URL before it is logged."""
+
+    def test_strips_inline_userinfo(self) -> None:
+        from forge.cli.runbook import _safe_server_display
+
+        assert (
+            _safe_server_display("nats://operator:supersecret@host:4222")
+            == "nats://host:4222"
+        )
+
+    def test_passes_through_credential_free_url(self) -> None:
+        from forge.cli.runbook import _safe_server_display
+
+        assert _safe_server_display("nats://127.0.0.1:4222") == "nats://127.0.0.1:4222"
+
+    def test_handles_comma_separated_list(self) -> None:
+        from forge.cli.runbook import _safe_server_display
+
+        assert (
+            _safe_server_display("nats://u:p@h1:4222,nats://h2:4222")
+            == "nats://h1:4222,nats://h2:4222"
+        )
+
+    def test_strips_userinfo_from_scheme_less_entry(self) -> None:
+        """A scheme-less ``user:pass@host`` must not leak its userinfo."""
+        from forge.cli.runbook import _safe_server_display
+
+        assert _safe_server_display("operator:secretpw@host:4222") == "host:4222"
+
+
+class TestScrubForLog:
+    """AC-1: known secret values are redacted deterministically, by value."""
+
+    def test_redacts_known_short_opaque_token(self) -> None:
+        """A short opaque token (no recognisable shape) is still redacted."""
+        from forge.cli.runbook import _scrub_for_log
+
+        # 's3cr3t' matches none of the redaction *shape* patterns; it is only
+        # removed because it is passed in as a known secret value.
+        out = _scrub_for_log("connect failed for token s3cr3t", ["s3cr3t"])
+        assert "s3cr3t" not in out
+        assert "REDACTED" in out
+
+    def test_still_redacts_shapes_without_known_secrets(self) -> None:
+        """With no known secrets, shape-based scrubbing still applies."""
+        from forge.cli.runbook import _scrub_for_log
+
+        assert "hunter2" not in _scrub_for_log("error password=hunter2 here")
+
+
+class TestBestEffortAuthAndFailFast:
+    """AC-1/AC-2: auth kwargs reach connect; auth-reject fails fast to NoOp."""
+
+    def test_auth_kwargs_passed_to_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolved credentials are forwarded verbatim to the connect seam."""
+        import forge.cli.runbook as rb
+
+        sentinel = object()
+        fake_connect, calls = _record_connect(client=sentinel)
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        result = asyncio.run(
+            rb._connect_nats_best_effort(environ={"FORGE_NATS_TOKEN": "tok-123"})
+        )
+
+        assert result is sentinel
+        assert len(calls) == 1
+        _servers, kwargs = calls[0]
+        assert kwargs["token"] == "tok-123"
+        # AC-2 guard: reconnect is disabled so an auth-reject can't spin.
+        assert kwargs["allow_reconnect"] is False
+        assert kwargs["max_reconnect_attempts"] == 0
+
+    def test_auth_reject_fails_fast_to_noop_single_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-2: an Authorization Violation → NoOp client, connect tried once.
+
+        The single-attempt assertion is the deterministic proxy for "no
+        reconnect spin": the code makes exactly one connect attempt and, on
+        failure, returns the NoOp client rather than looping.
+        """
+        import forge.cli.runbook as rb
+
+        auth_error = Exception("nats: 'Authorization Violation'")
+        fake_connect, calls = _record_connect(raise_exc=auth_error)
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        result = asyncio.run(
+            rb._connect_nats_best_effort(environ={"FORGE_NATS_URL": "nats://host:4222"})
+        )
+
+        assert isinstance(result, rb._NoOpNATSClient)
+        assert len(calls) == 1, "connect must be attempted exactly once (no spin)"
+        assert calls[0][1]["allow_reconnect"] is False
+        # NOTE: this asserts the *application* makes a single attempt and does
+        # not loop. The transport-level guarantee that nats-py honours
+        # allow_reconnect=False for an Authorization Violation (rather than
+        # retrying internally before raising) requires an integration test
+        # against a live auth_required broker — see TASK-FMDR-008 AC-3, which
+        # is operator-verified.
+
+    def test_unreachable_broker_falls_back_to_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unreachable broker (ConnectionError) still yields the NoOp client."""
+        import forge.cli.runbook as rb
+
+        fake_connect, _calls = _record_connect(
+            raise_exc=ConnectionError("connection refused")
+        )
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        result = asyncio.run(rb._connect_nats_best_effort(environ={}))
+        assert isinstance(result, rb._NoOpNATSClient)
+
+    def test_missing_nats_py_falls_back_to_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ImportError (nats-py absent) is handled with the install hint path."""
+        import forge.cli.runbook as rb
+
+        fake_connect, _calls = _record_connect(raise_exc=ImportError("no nats"))
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        result = asyncio.run(rb._connect_nats_best_effort(environ={}))
+        assert isinstance(result, rb._NoOpNATSClient)
+
+    def test_secret_never_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-1: neither inline-URL userinfo nor error-embedded creds are logged."""
+        import logging
+
+        import forge.cli.runbook as rb
+
+        # Error message deliberately carries a password= shape to prove the
+        # log path is scrubbed via forge.memory.redaction.
+        fake_connect, _calls = _record_connect(
+            raise_exc=Exception("auth failed: password=supersecret")
+        )
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        with caplog.at_level(logging.WARNING, logger=rb.logger.name):
+            asyncio.run(
+                rb._connect_nats_best_effort(
+                    environ={
+                        "FORGE_NATS_URL": "nats://operator:urlsecret@host:4222",
+                        "FORGE_NATS_TOKEN": "tok-secret",
+                    }
+                )
+            )
+
+        logged = caplog.text
+        assert "supersecret" not in logged  # scrubbed from the error message
+        assert "urlsecret" not in logged  # stripped from the URL userinfo
+        assert "tok-secret" not in logged  # token redacted by known-value pass
+        # The sanitised host:port is still logged for operability.
+        assert "nats://host:4222" in logged
+
+    def test_token_absent_from_success_log(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-1 (success path): a valid-creds connect never logs the token.
+
+        Structural guard against a future log line that serialises the
+        resolved auth kwargs — even the INFO success line is checked.
+        """
+        import logging
+
+        import forge.cli.runbook as rb
+
+        fake_connect, _calls = _record_connect(client=object())
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        with caplog.at_level(logging.INFO, logger=rb.logger.name):
+            asyncio.run(
+                rb._connect_nats_best_effort(
+                    environ={"FORGE_NATS_TOKEN": "tok-success-secret"}
+                )
+            )
+
+        assert "tok-success-secret" not in caplog.text
+        assert "Connected to NATS broker" in caplog.text
+
+
+@pytest.mark.integration
+class TestRunbookExecutesAgainstAuthRejectingBroker:
+    """AC-2: against an auth-rejecting broker the runbook still runs its steps."""
+
+    def test_run_completes_when_broker_rejects_auth(
+        self,
+        valid_runbook_json: Path,
+        mock_repository: MagicMock,
+        mock_executor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A rejecting broker degrades to NoOp; executor.run still fires once."""
+        import forge.cli.runbook as rb
+
+        fake_connect, calls = _record_connect(
+            raise_exc=Exception("nats: 'Authorization Violation'")
+        )
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        runner = CliRunner()
+        result = runner.invoke(runbook_cmd, ["run", str(valid_runbook_json)])
+
+        assert result.exit_code == 0
+        assert "complete" in result.output.lower()
+        # Connect was attempted (and rejected) exactly once, then execution
+        # proceeded against the NoOp publisher.
+        assert len(calls) == 1
+        mock_executor.run.assert_called_once()
+
+
+@pytest.mark.integration
+class TestNoEventsRemainsCredentialFree:
+    """AC-4: --no-events still works and never touches the connect seam."""
+
+    def test_no_events_skips_connect_entirely(
+        self,
+        valid_runbook_json: Path,
+        mock_repository: MagicMock,
+        mock_executor: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--no-events: connect seam is never called, no credentials required."""
+        import forge.cli.runbook as rb
+
+        fake_connect, calls = _record_connect(client=object())
+        monkeypatch.setattr(rb, "nats_connect", fake_connect)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            runbook_cmd, ["run", "--no-events", str(valid_runbook_json)]
+        )
+
+        assert result.exit_code == 0
+        assert len(calls) == 0, "--no-events must not attempt any NATS connect"
+        mock_executor.run.assert_called_once()

@@ -6,7 +6,7 @@ description: 'FORGE-OL-04: hand-authored typed two-step runbook (deploy_compose 
 created: '2026-06-22T17:28:35.051359'
 status: paused
 complexity: 6
-estimated_tasks: 6
+estimated_tasks: 8
 tasks:
 - id: TASK-FMDR-001
   name: Author fleet-memory runbook exemplar JSON
@@ -114,15 +114,72 @@ tasks:
   dependencies:
   - TASK-FMDR-003
   - TASK-FMDR-004
-  status: pending
+  - TASK-FMDR-007
+  - TASK-FMDR-008
+  status: blocked
   implementation_mode: direct
   estimated_minutes: 22
   requires_infrastructure: []
-  result: null
+  result:
+    final_decision: blocked
+    note: '2026-06-23 real-NAS run on GB10. Pre-flight all green; run escalated at step 0
+      (handler exit_code 127) because the exemplar uses a bare "deploy.sh" script param the
+      handler cannot resolve with a relative cwd (filed TASK-FMDR-007), and the auth-required
+      NATS broker rejected the credential-less CLI (filed TASK-FMDR-008). Nothing stood up on
+      the NAS (clean D8 failure). Also: forge runbook run needs ~/.forge created + the runbook
+      migration applied manually first. See TASK-FMDR-005 "Run attempt — 2026-06-23".'
   turns_completed: 0
   current_turn: 0
-  started_at: null
+  started_at: '2026-06-23T16:09:00'
   completed_at: null
+- id: TASK-FMDR-007
+  name: Fix shell-step script/cwd resolution (handler cannot run bare script name)
+  file_path: tasks/completed/2026-06/TASK-FMDR-007-fix-shell-step-script-cwd-resolution.md
+  complexity: 3
+  dependencies: []
+  status: completed
+  implementation_mode: task-work
+  estimated_minutes: 45
+  requires_infrastructure: []
+  result:
+    final_decision: completed
+    note: '2026-06-23. Option A — fixed _run_script_step to resolve a bare script name
+      relative to cwd (prepend ./); exemplar JSON + filename-only contract untouched.
+      Added the missing bare-name + relative-cwd regression coverage at the core-runner
+      and deploy_compose-handler levels. shell-step + exemplar suites green (103 passed).
+      Remaining suite failures proven pre-existing/environmental via baseline stash.
+      Unblocks TASK-FMDR-005.'
+  turns_completed: 1
+  current_turn: 1
+  started_at: '2026-06-23T00:00:00'
+  completed_at: '2026-06-23T00:00:00'
+- id: TASK-FMDR-008
+  name: Wire NATS auth into forge runbook run CLI
+  file_path: tasks/completed/2026-06/TASK-FMDR-008-wire-nats-auth-into-runbook-run-cli.md
+  complexity: 3
+  dependencies: []
+  status: completed
+  implementation_mode: task-work
+  estimated_minutes: 45
+  requires_infrastructure: []
+  result:
+    final_decision: completed
+    note: '2026-06-23. Added _resolve_nats_auth (FORGE_NATS_CREDS / FORGE_NATS_TOKEN
+      / FORGE_NATS_USER+PASSWORD, precedence creds>token>user+pass, values stripped)
+      and passed auth kwargs into nats.connect. Real fix for the reconnect-spin is
+      allow_reconnect=False (auth violation now raises on first attempt -> NoOp fallback,
+      runbook still runs). Secrets never logged: inline user:pass@ userinfo stripped
+      from the server display (incl. scheme-less URLs) + known secret values redacted
+      by literal before the forge.memory.redaction shape scrubbers. Added a nats_connect
+      test seam. 65 tests green (CLI runbook + fleet BDD + exemplar), module line cov
+      87%, ruff clean, independent security review (2 HIGH findings addressed). AC-1/2/4
+      met; AC-3 (in-order publish to a LIVE auth-required broker) is operator-verified
+      only -- needs real creds + broker. Unblocks TASK-FMDR-005 (both its filed blockers
+      007+008 now resolved).'
+  turns_completed: 1
+  current_turn: 1
+  started_at: '2026-06-23T00:00:00'
+  completed_at: '2026-06-23T00:00:00'
 orchestration:
   parallel_groups:
   - - TASK-FMDR-001
