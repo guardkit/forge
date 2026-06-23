@@ -10621,3 +10621,1014 @@ richardwoollcott@promaxgb10-41b1:~/Projects/appmilla_github/forge$
 
 
 GUARDKIT_LOG_LEVEL=DEBUG guardkit autobuild feature FEAT-CBDE --verbose
+
+---
+
+## /feature-spec runbook-and-step-data-model-for-the-forge-output-side-loop-a — 2026-06-21T17:04:13Z
+
+### Prompt
+
+```
+/feature-spec "Runbook and Step data model for the Forge output-side loop: a typed Step (step_type, params dict, status enum pending/running/passed/failed/awaiting_approval, result with exit_code + captured_output + timestamps, sequence_index) and a Runbook (runbook_id, ordered list of steps, current_step_index, overall status, target name, created_at) persisted in forge's existing SQLite store via a sibling table reusing adapters/sqlite/connect.py and the existing migration path; status-per-step queryable; resume pointer (current_step_index); gates-as-data (a step in awaiting_approval) modelled even though this phase uses none; NO executor logic yet — model + persistence + repository methods (create_runbook, load_runbook, update_step_status, advance) with unit tests; no NATS, no subprocess, no LLM"
+```
+
+### Assistant response
+
+I'll execute the `/feature-spec` Propose-Review methodology. Starting with **Phase 1: Context Gathering** (silent, no interaction).
+
+Let me gather context about the stack, the existing SQLite store, migration path, and any prior conventions.
+
+Stack is **Python**. Let me examine the SQLite adapter, migration path, persistence layer, and existing repository/model conventions.
+
+Let me examine the migration system, repository pattern, and model conventions in depth.
+
+Let me examine the boot migration path, the canonical schema, and existing `.feature` conventions.
+
+Let me read the canonical schema and a relevant existing `.feature` file to match conventions.
+
+
+---
+
+## /feature-spec minimal-runbook-executor-for-the-forge-output-side-loop-disp — 2026-06-21T17:31:47Z
+
+### Prompt
+
+```
+/feature-spec "Minimal runbook executor for the Forge output-side loop: dispatch-by-step-type loop over a persisted Runbook (from the runbook model feature) — resolve each step's handler via a step_type registry, run it, persist result + status, advance the current-step pointer; stop-and-resume on failure (re-enter at the failed step index, no restart); publish NATS lifecycle events runbook-started/step-started/step-result/runbook-complete/escalated reusing the existing pipeline_publisher pattern and envelope; the executor has NO knowledge of step internals (registry indirection only); a CLI entry 'forge runbook run <path-to-runbook-json>' to load and execute; in-memory fake step handlers in tests so unit gates need no subprocess or NATS broker; one marker-gated integration test with a real NATS publish"
+```
+
+### Assistant response
+
+I'll execute the `/feature-spec` workflow. Starting with **Phase 1: Context Gathering** (AI-only, no interaction). Let me scan the codebase for the referenced components: the Runbook model, the `pipeline_publisher` pattern, the `forge` CLI, and any existing `.feature` files.
+
+The runbook model feature already exists (`features/runbook-and-step-persistence/`). Let me read the key artifacts: the Runbook persistence model, the `pipeline_publisher`, the existing runbook feature spec, and the `forge` CLI structure.
+
+Now let me understand the runbook model implementation status, the `forge` CLI entry structure, and the existing NATS events/envelope module.
+
+Let me ground the last two pieces: the `forge` CLI main group (how `forge runbook run` attaches) and the integration-test marker convention used in this repo.
+
+
+---
+
+## /feature-plan runbook-and-step-persistence — 2026-06-21T17:22:31Z
+
+### Prompt
+
+```
+/feature-plan "Runbook and Step Persistence" --context features/runbook-and-step-persistence/runbook-and-step-persistence_summary.md
+```
+
+### Assistant response
+
+I'll execute the `/feature-plan` workflow for "Runbook and Step Persistence". Let me start by reading the context file and understanding the existing feature structure.
+
+Let me read the full feature spec and explore the existing Forge persistence conventions referenced in the summary.
+
+Now I understand the spec fully. Let me explore the existing Forge persistence conventions that this feature must reuse, so the plan is grounded in real code.
+
+I now have a complete picture: the spec (33 scenarios, 11 confirmed assumptions) plus the exact Forge persistence conventions this feature must reuse (`BridgeRegistry` exemplar, `connect_writer`/`read_only_connect`, idempotent `apply(connection)` migrations, STRICT tables with CHECK constraints, `tmp_path` test fixtures).
+
+The technical approach here is essentially **pre-determined by the spec** — it explicitly says to mirror `BridgeRegistry`. So the review's real value is task breakdown, not choosing between competing options. Before I generate the plan, let me confirm the few preferences that actually shape the output.
+
+Preview fields can't be null — let me fix that (keep previews only where they aid comparison).
+
+Decisions captured: **Layered breakdown (~6 tasks)**, **TDD**, **Full structure + YAML**. That's effectively the `[I]mplement` path with Context A/B answered.
+
+Before generating files, let me verify the environment — task directories, the feature-YAML generator CLI, and existing task ID conventions.
+
+Environment confirmed. Let me examine an existing task file and feature YAML in this repo to match the exact local conventions (not just the generic docs), plus the test exemplar.
+
+Let me check the existing `smoke_gates` format in this repo to match it exactly.
+
+I have full fidelity on conventions now. Let me check the generator CLI options (to control the feature ID), then track the build with a todo list.
+
+Everything is grounded now. I have the spec, the exact Forge persistence conventions, the local task/YAML/smoke-gate formats, and the user's choices (Layered / TDD / Full structure + YAML).
+
+Here's the review analysis, then I'll generate the structure.
+
+---
+
+## 🔍 FEATURE PLANNING: Runbook and Step Persistence
+
+### Technical Options Analysis
+
+The `/feature-spec` output already resolved the hard analytical questions (33 scenarios, 11 confirmed assumptions). The implementation notes are explicit: **mirror the `BridgeRegistry` exemplar**. So this is less "choose between options" and more "decompose correctly". For completeness:
+
+| Option | Verdict |
+|---|---|
+| **1. Sibling tables + repository mirroring `BridgeRegistry` (Recommended)** | STRICT `runbooks` + `runbook_steps` tables, idempotent `apply(connection)` migration, `RunbookRepository` with `BEGIN IMMEDIATE` writes, `_safe_rollback`, JSON `params`/`result`, ISO-8601 TEXT timestamps. Reuses `connect_writer`/`read_only_connect`. **Zero new infra, full convention reuse, every scenario satisfiable as pure unit tests.** |
+| 2. Single denormalised `runbooks` table with JSON steps blob | Simpler schema, but loses per-step query/`CHECK`/sequence-order guarantees the spec demands (Group G "reload in sequence order", per-step status query). Rejected. |
+| 3. New ORM/SQLModel layer | Adds a dependency and diverges from the established raw-`sqlite3` convention. Rejected (LCOI/YAGNI). |
+
+**Recommended: Option 1** — complexity 5/6, risk **Low**, pure-unit (no NATS/subprocess/LLM), `tmp_path` SQLite per test.
+
+The three low-confidence assumptions are now **locked as decisions** (all marked `confirmed` in the manifest): empty step-list refused (ASSUM-002), advance-past-final refused (ASSUM-004), overall status immutable this phase (ASSUM-009).
+
+### Decision: **[I]mplement** (per your answers) → generating the layered, TDD, full-structure plan now.
+
+Let me create the folder and the provenance-anchoring review task.
+
+Now generating all artifacts. Starting with the review-task provenance anchor and the two Wave 1 tasks (models + migration).
+
+Now the Wave 2 + Wave 3 repository tasks (§4 consumers — these get `consumer_context` frontmatter and seam-test stubs).
+
+Now the Wave 4 test tasks (security/data-integrity and concurrency/integration — separate test files for parallel safety).
+
+All six tasks + review anchor created. Now the **IMPLEMENTATION-GUIDE.md** with the mandatory Mermaid diagrams (data flow, integration-contract sequence, dependency graph, and §4 contracts).
+
+All markdown artifacts are written. Now generating the structured YAML feature file via the CLI (this also runs the AC linter + R2/R3 nudges from steps 10.5–10.7).
+
+YAML generated cleanly: **FEAT-RSP, 6 tasks, 4 waves**, and the **AC linter passed with 0 unverifiable criteria** (my ACs are all concrete/verifiable). The R3 nudge confirms `tests/forge` is a real test root.
+
+Let me add a feature-level smoke gate (between-wave composition check) and then run the validators. First, let me see the YAML's orchestration tail to place the block correctly.
+
+YAML structure confirmed. Let me append the `smoke_gates` block (composition check after waves 3 and 4, both temporally safe since all referenced test files exist by then), then run the validators.
+
+Now run the validators — smoke-gate path validation (Step 8.6) and the full feature pre-flight (Step 8.5):
+
+Both validators pass — **smoke-gate paths OK**, **feature FEAT-RSP is valid** (task files exist, deps valid, no intra-wave conflicts, task_types valid).
+
+Now **Step 11: BDD scenario linking** — tag the 33 Gherkin scenarios with `@task:<TASK-ID>` to activate the R2 task-level BDD oracle. Let me prepare the matching request:
+
+Status `ready` — 33 scenarios, 6 tasks. Now I invoke the `bdd-linker` subagent with the request payload, then apply its mapping.
+
+Now I'll invoke the `bdd-linker` subagent with this payload to map all 33 scenarios to the 6 tasks.
+
+All 33 scenarios mapped with high confidence (0.82–0.93, all above the 0.6 threshold). Let me write the matcher response to a file and apply the mapping (rewrites the `.feature` file with `@task:` tags).
+
+All 33 scenarios linked (`@task:` count = 33, 0 below threshold). R2 BDD oracle now activated. Let me clean up temp files and show a sample of the tagged `.feature` file.
+
+
+---
+
+## /feature-plan runbook-executor — 2026-06-21T17:47:56Z
+
+### Prompt
+
+```
+/feature-plan "Runbook Executor" \
+  --context features/runbook-executor/runbook-executor_summary.md
+```
+
+### Assistant response
+
+I'll execute the `/feature-plan` workflow for "Runbook Executor". Let me start by reading the context file to understand the feature.
+
+Now let me understand the existing project structure and the related persistence feature before proceeding with planning.
+
+Let me read the executor feature spec, assumptions, and the persistence feature's implementation guide to mirror conventions.
+
+Now let me understand the existing Forge codebase conventions that these tasks must ground in — the publisher pattern, CLI structure, and persistence repository surface.
+
+Let me examine the key reuse points: the publisher pattern, CLI group, persistence repository surface, and the persistence feature's implementation guide.
+
+Let me examine the publisher pattern and CLI group structure — the two main reuse points for the executor.
+
+Let me check where `nats_core` events live (new EventType members needed) and the persistence repository location.
+
+I have nearly everything. Let me verify one thing that determines whether a key question is even viable — whether `MessageEnvelope.event_type` strictly requires the `EventType` enum (which would force editing the sibling `nats-core` package) or accepts arbitrary strings.
+
+I now have a complete picture of the feature and its codebase grounding. Two genuinely consequential decisions gate the task breakdown — both are flagged by the spec itself as needing human resolution, and both change what I generate. Let me get those settled.
+
+Key findings from my analysis:
+- **`MessageEnvelope.event_type` is a closed `EventType` enum** in the sibling `nats-core` package, with a payload registry (`payload_class_for_event_type` raises on unknown types). So emitting runbook events "by the book" means extending `nats-core`.
+- **The ASSUM-004 conflict is real and unresolved**: the executor spec wants the pointer to rest *beyond* the final step (`== count`), but FEAT-RSP's locked plan refuses advancing past the last step.
+
+Decision recorded. For Q1 you asked for the best long-term quality solution, so I'll go with **relaxing persistence** (pointer rests at `index == step_count` as the single, unambiguous durable completion marker). The alternative leaves the pointer ambiguous at the final step — you'd have to read step status to tell "pending" from "done", which is exactly the kind of dual-source-of-truth that causes resume bugs later. This requires reconciling the not-yet-built FEAT-RSP plan, which I'll do as part of this run.
+
+Let me look at the exact conventions to mirror (an RSP task file, the bridge_registry repo, and the YAML generator's options) before generating.
+
+I have everything I need. The design is settled:
+
+- **Q1 → relax persistence (R1):** the resume pointer is the single, unambiguous completion marker. Because the executor stops on failure, the pointer only ever reaches `== step_count` when every step passed — so `(current_step_index, per-step statuses)` fully determines runbook state with no redundant overall-status writes. This needs exactly one narrow amendment to the not-yet-built FEAT-RSP: `advance()` may reach the terminal position `== count` (but not beyond). FEAT-RSP's ASSUM-009 (overall status not mutated) stays intact.
+- **Q2 → extend nats-core.**
+
+Let me track this generation work and create the feature folder.
+
+Now I'll generate the full feature plan. Starting with the review/decision document, then the seven task files. Let me write the review doc first.
+
+Now the seven task files. TASK-RBX-001 (registry foundation):
+
+Now TASK-RBX-002 (nats-core lifecycle events — declarative, the §4 producer):
+
+TASK-RBX-003 (RunbookPublisher — consumer of the events contract, with seam test):
+
+TASK-RBX-004 (executor dispatch loop — the core, consumer of multiple contracts):
+
+TASK-RBX-005 (CLI `forge runbook run`):
+
+TASK-RBX-006 and TASK-RBX-007 (the two scenario-coverage test tasks):
+
+All seven task files written. Now the IMPLEMENTATION-GUIDE.md with the mandatory diagrams (data flow, integration-contract sequence since aggregate complexity ≥ 5, task dependency graph, and §4 contracts):
+
+Now the README. Let me mirror the persistence feature's README format:
+
+All planning docs written. Now generate the structured YAML feature file via the generator (with `--discover` to resolve the real file paths and `--feature-id FEAT-RBX` to match the FEAT-RSP naming convention):
+
+The YAML generated cleanly — **0 unverifiable ACs**, 5 waves. The R3 nudge correctly notes no smoke gates. Like FEAT-RSP, I'll add a between-wave smoke gate. Let me read the generated YAML and verify the available test roots before authoring the gate (the command emphasizes path verification to avoid the TASK-REV-DEA8 regression).
+
+Verified: `tests/forge` and `tests/bdd` exist; `tests/forge/executor` correctly does **not** exist yet (it's created by wave 1, so I won't hardcode it). Note the grep matched *file contents*, but `-k` filters on *node ids* (path + test name) — so `-k "runbook or executor"` will target only the new tests (their paths contain those words), not the existing files that merely mention the words in comments.
+
+Like FEAT-RSP, I'll add a between-wave smoke gate using the existing `tests/forge` root + a `-k` filter (spatially verified root; temporally safe since executor tests exist from wave 3 on):
+
+Now run the two validation passes the command requires — feature pre-flight (8.5) and the smoke-gate validator (8.6, since I hand-injected smoke gates):
+
+Both validations pass: **✓ Feature FEAT-RBX is valid** and **✓ smoke_gates.command paths OK**.
+
+Now the cross-feature reconciliation my R1 decision requires. Since I stated in the guide that the FEAT-RSP amendment is applied as part of this run, I'll make that true — surgically. Let me first see the exact persistence scenarios/assumptions affected.
+
+The persistence `.feature` encodes the **old** ASSUM-004 directly in human-confirmed scenarios ("Advancing past the final step is refused", lines 119–123 and 360–365). These were confirmed by you during `/feature-spec`. I created the FEAT-RBX files in this run, but I did **not** create the FEAT-RSP spec — so rather than silently flip your confirmed BDD across four files, I'll keep the executor plan self-contained and surface the reconciliation as a precise, required pre-build action for you to apply atomically. Let me correct my two over-stated wording spots and turn the guide section into an exact checklist.
+
+Wording corrected — the reconciliation is now surfaced as a precise, required, *not-yet-applied* checklist that you own.
+
+Now **Step 11: BDD scenario linking** — wire `@task:<TASK-ID>` tags onto the executor's `.feature` scenarios so the R2 BDD oracle activates during build. Let me run the prepare step:
+
+`status: ready` — 28 scenarios, 7 tasks. Now Step 11.2: read the request payload and invoke the `bdd-linker` subagent to map scenarios → tasks.
+
+The payload has all 28 scenarios with steps + the 7-task list. Now I'll invoke the `bdd-linker` subagent to produce the scenario→task mapping (it reads the request file and returns the `TaskMatch` JSON array):
+
+Now I'll invoke the `bdd-linker` subagent to do the matching:
+
+All 28 scenarios matched with high confidence. The distribution looks right: registry-specific → 001, CLI scenarios → 005, security/data-integrity → 006, concurrency/real-broker → 007, the executor core → 004. Now Step 11.3 — write the response and apply the tags:
+
+All 28 scenarios tagged. Let me verify the tags landed in the `.feature` file and clean up temp files:
+
+All 28 scenarios carry `@task:` tags (R2 BDD oracle now activates during build). Distribution confirms the design — TASK-RBX-002 (nats-core declarative) and TASK-RBX-003 (publisher, unit-tested directly) correctly have no BDD scenarios; the executor core owns 17.
+
+Let me do a final integrity check of the complete deliverable set:
+
+
+---
+
+## /feature-complete FEAT-RSP — 2026-06-21T20:40:43Z
+
+### Prompt
+
+```
+/feature-complete FEAT-RSP then verify
+```
+
+### Assistant response
+
+I'll run `/feature-complete FEAT-RSP` then verify. This merges to `main`, so let me first gather the exact state and preview before executing — confirming the branch topology (FEAT-RSP used one shared worktree/branch), what will merge (including my R1 commit `3f5aca5`), and the main working-tree state.
+
+This is a shared-worktree feature (one `autobuild/FEAT-RSP` branch, my R1 commit `3f5aca5` at its head). One thing to watch: the branch committed its own copies of the task `.md` files, and main has **untracked** copies at those same paths (my R1 plan edits) — that can block a merge. Let me preview via the CLI and pin down any collisions before doing anything destructive:
+
+Two key findings: the `guardkit` CLI only **validates and prints merge instructions** (Phase 2/3 are placeholders) — it doesn't perform the merge, so I'll do the git steps manually per the command's Step 0. And my collision check was fooled by git collapsing the untracked directory. Let me get the precise picture with `-uall`:
+
+No collisions reported and the modified files are clean in main — but the branch's `TASK-RSP-004.md` grep returned nothing, which is suspicious (even the old version contains "final step"). This smells like `tasks/` being gitignored (the branch force-added those files, consistent with the earlier "force-add autobuild" commit). Let me nail down the ground truth before any merge:
+
+Now the picture is clear: the task `.md` is untracked (not ignored, not on the branch at that path — the diff stat abbreviated a *different* path), and **main is an ancestor of the branch, so a fast-forward is possible**. The precise collision check was empty. Before doing the FF, one last safety check — whether the branch's force-added `.guardkit/autobuild` artifacts collide with anything ignored in main (which wouldn't show in `??`):
+
+The branch keeps its task md under `tasks/design_approved/` (not `tasks/backlog/`), so no collision with my R1 plan edits — and **main is an ancestor, so this is a clean fast-forward**. The one remaining risk: main has `.guardkit/autobuild/TASK-RSP-005/006/` dirs on disk that the branch force-adds as tracked. Let me see exactly what untracked files sit there (a FF refuses to overwrite untracked files):
+
+Crystal clear now: main's autobuild dirs contain only `progress.log` (gitignored); the branch adds different `*.json` files. **No collisions, main is an ancestor → clean fast-forward.** Executing the merge:
+
+**Fast-forward merge succeeded** — main HEAD is now `3f5aca5` (the R1 commit), with the persistence code, migrations, and 5 test files in `main`. Now the **verify** step — running the persistence suite against `main`:
+
+**110 passed on main** — the merge is verified. Now the standard finalization: remove the worktree and delete the merged branch, then a final sanity check that the new `__init__.py` exports didn't break collection elsewhere.
+
+Everything is clean and verified. Let me confirm the final main state for an accurate report:
+
+
+---
+
+## /feature-spec two-runbook-step-types-wrapping-existing-shell-scripts-as-su — 2026-06-21T20:49:32Z
+
+### Prompt
+
+```
+/feature-spec "Two runbook step types wrapping existing shell scripts as subprocesses: deploy_compose(cwd, script, env_file) and run_smoke_tests(cwd, script, env_file) — each runs the named script in cwd with the env_file available, captures exit_code + stdout/stderr, maps exit 0 to passed and non-zero to failed (run_smoke_tests' exit code is the step verdict); preserves the script's own idempotency; credential-scoped — env_file is a path only, and captured output is scrubbed of postgres DSN and password patterns before being stored in the step result or published; both registered into the executor's step_type registry; unit tests with a fake script exercising the exit-0 and exit-1 paths plus an output-scrub assertion on a planted secret; one marker-gated integration test invoking fleet-memory deploy/nas/smoke.sh against a throwaway target"
+```
+
+### Assistant response
+
+I'll execute the `/feature-spec` Propose-Review methodology. Starting with Phase 1: Context Gathering (silent).
+
+Let me look at the existing runbook-executor feature and find the step_type registry implementation.
+
+Let me look at the redaction helper and check the fleet-memory smoke.sh referenced for the integration test.
+
+Context loaded. I have everything I need — the upstream `Step`/`Runbook` model, the executor's registry-dispatch contract, and the existing redaction helper. Proceeding to the proposal.
+
+```
+Context loaded: stack=python; Step/Runbook models found (status enum
+pending/running/passed/failed/awaiting_approval, result = exit_code +
+captured_output + timestamps); 14 existing .feature files — runbook-executor
+and runbook-and-step-persistence are the direct upstream; 1 redaction helper
+(redact_credentials) covering GitHub/bearer/hex ONLY — no postgres-DSN or
+password coverage exists yet, so this feature introduces a new scrub pattern set.
+```
+
+A note before the proposal: the executor (runbook-executor.feature) already owns the dispatch loop, status persistence, and lifecycle events. This feature is **only the two concrete handlers** registered into that registry — so scenarios are scoped to handler behaviour (run script → map exit → scrub → result), not the executor's loop, which is specified upstream.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURE SPEC PROPOSAL: Shell Script Step Handlers (deploy_compose, run_smoke_tests)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+```gherkin
+@shell-script-step-handlers
+Feature: Shell Script Step Handlers
+  As the Forge output-side loop
+  I want deploy and smoke-test runbook steps that wrap existing shell scripts as
+  subprocesses, mapping each script's exit status to a step verdict and scrubbing
+  credentials out of captured output
+  So that real deploy/verify scripts run as registry-dispatched steps without the
+  executor knowing their internals and without leaking secrets into results or events
+
+  Background:
+    Given the deploy and smoke-test handlers are registered in the executor's step-type registry
+```
+
+```
+━━ GROUP A: Key Examples (5 scenarios) ━━
+```
+
+```gherkin
+  # Why: Core deploy path — a deploy script that exits cleanly is a passed step
+  @key-example @smoke
+  Scenario: A deploy step whose script exits cleanly is recorded as passed
+    Given a deploy step naming a script that exits with status zero
+    When the executor runs the step
+    Then the script should run once in the step's working directory
+    And the step should be recorded as passed
+    And the script's exit status and captured output should be recorded in the step result
+
+  # Why: Core smoke path — the smoke script's exit status IS the step's verdict
+  @key-example @smoke
+  Scenario: A smoke-test step whose script exits cleanly is recorded as passed
+    Given a smoke-test step naming a script that exits with status zero
+    When the executor runs the step
+    Then the step should be recorded as passed
+    And the smoke script's exit status should be the step's verdict
+
+  # Why: The smoke script's non-zero exit is the failing verdict — this is the gate
+  @key-example @smoke
+  Scenario: A smoke-test step whose script exits non-zero is recorded as failed
+    Given a smoke-test step naming a script that exits with a non-zero status
+    When the executor runs the step
+    Then the step should be recorded as failed
+    And the failing exit status should be the step's verdict
+
+  # Why: Both handlers must be reachable by the executor through the registry
+  @key-example
+  Scenario: The deploy and smoke handlers are registered under their step types
+    Given the executor's step-type registry
+    When the registry is consulted for the deploy and smoke-test step types
+    Then a handler should be registered for the deploy step type
+    And a handler should be registered for the smoke-test step type
+
+  # Why: The script runs in the named working directory with the env file available
+  @key-example
+  Scenario: The script runs in its working directory with the environment file available
+    Given a deploy step naming a script, a working directory, and an environment file path
+    When the executor runs the step
+    Then the script should run with that working directory as its current directory
+    And the environment file should be available to the script by its path
+```
+
+```
+━━ GROUP B: Boundary Conditions (2 scenarios) ━━
+```
+
+```gherkin
+  # Why: Just-inside / just-outside the pass boundary — only exit status zero passes
+  # [ASSUMPTION: confidence=high] Exit status zero maps to passed; every non-zero status maps to failed.
+  @boundary
+  Scenario Outline: A step's verdict follows the script's exit status
+    Given a smoke-test step naming a script that exits with status <exit_status>
+    When the executor runs the step
+    Then the step should be recorded as <verdict>
+    Examples:
+      | exit_status | verdict |
+      | 0           | passed  |
+      | 1           | failed  |
+      | 137         | failed  |
+
+  # Why: Zero-length boundary — a script that prints nothing still yields a recorded result
+  @boundary
+  Scenario: A script that produces no output still records a result
+    Given a deploy step naming a script that exits with status zero and prints nothing
+    When the executor runs the step
+    Then the step should be recorded as passed
+    And the step result should record empty captured output
+```
+
+```
+━━ GROUP C: Negative Cases (3 scenarios) ━━
+```
+
+```gherkin
+  # Why: Negative deploy path — a deploy script that exits non-zero fails the step
+  @negative
+  Scenario: A deploy step whose script exits non-zero is recorded as failed
+    Given a deploy step naming a script that exits with a non-zero status
+    When the executor runs the step
+    Then the step should be recorded as failed
+    And the script's exit status and captured output should be recorded in the step result
+
+  # Why: A script that cannot be run fails the step rather than crashing the executor
+  # [ASSUMPTION: confidence=medium] A missing or non-executable script is contained as a step failure, not an executor crash.
+  @negative
+  Scenario: A step naming a script that cannot be run is recorded as failed
+    Given a deploy step naming a script that does not exist or cannot be executed
+    When the executor runs the step
+    Then the step should be recorded as failed
+    And the executor should not crash
+
+  # Why: Credential scope — the env file is passed as a path; its contents are never captured
+  # [ASSUMPTION: confidence=high] The handler passes env_file as a path only; it never reads the file contents into the step result or any event.
+  @negative @edge-case
+  Scenario: The environment file contents are never captured into the step result
+    Given a smoke-test step whose environment file holds credentials
+    When the executor runs the step
+    Then the environment file's contents should not appear in the step result
+    And the environment file should be referenced only by its path
+```
+
+```
+━━ GROUP D: Edge Cases (4 scenarios) ━━
+```
+
+```gherkin
+  # Why: The handler adds no idempotency of its own — the script's own idempotency governs re-runs
+  # [ASSUMPTION: confidence=high] Re-running a step re-invokes the script unchanged; idempotency is the script's responsibility, not the handler's.
+  @edge-case
+  Scenario: Re-running a deploy step re-invokes the script and preserves its own idempotency
+    Given a deploy step whose script is idempotent
+    When the executor runs the step twice
+    Then the script should run on each execution
+    And the handler should add no idempotency guard of its own
+    And the end state should match the script's own idempotent behaviour
+
+  # Why: Output-scrub on store — a postgres DSN in script output is scrubbed before it reaches the result
+  @edge-case @smoke
+  Scenario: A postgres DSN in the script output is scrubbed before being stored
+    Given a deploy step whose script prints a postgres connection string to its output
+    When the executor runs the step
+    Then the stored step result should not contain the postgres connection string
+    And the captured output should show the connection string replaced by a redaction marker
+
+  # Why: Output-scrub on publish — a password in script output is scrubbed before the result is announced
+  @edge-case
+  Scenario: A password in the script output is scrubbed before the result is published
+    Given a smoke-test step whose script prints a password to its output
+    When the executor runs the step
+    Then the published step result should not contain the password
+    And the published captured output should show the password replaced by a redaction marker
+
+  # Why: Both streams captured — a secret on the error stream is captured and scrubbed too
+  # [ASSUMPTION: confidence=medium] stdout and stderr are both captured into the single captured-output field; scrubbing applies to both.
+  @edge-case
+  Scenario: A secret printed to the error stream is captured and scrubbed
+    Given a smoke-test step whose script prints a postgres DSN to its error stream and exits non-zero
+    When the executor runs the step
+    Then the step should be recorded as failed
+    And the captured output should include the error stream
+    And the postgres DSN should not appear anywhere in the captured output
+```
+
+```
+━━ GROUP E: Integration (1 scenario) ━━
+```
+
+```gherkin
+  # Why: Real-script proof — the actual fleet-memory smoke script is the verdict against a throwaway target
+  # [ASSUMPTION: confidence=medium] The integration test is marker-gated and runs only against a disposable target, never production.
+  @integration @slow
+  Scenario: The fleet-memory smoke script runs against a throwaway target and its exit status is the verdict
+    Given the fleet-memory smoke-test script and a throwaway target
+    When the executor runs a smoke-test step naming that script
+    Then the smoke script should run to completion against the throwaway target
+    And the step's verdict should be the script's exit status
+    And no credentials from the script output should appear in the step result
+```
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total: 15 scenarios across 5 groups
+Inferred assumptions: 8 (will be resolved in Phase 5)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CURATION: Review each group
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [A] Accept   [R] Reject   [M] Modify   [+] Add   [?] Defer
+
+Fast path: "A A A A A" accepts all five groups.
+
+GROUP A — Key Examples (5):        _
+GROUP B — Boundary Conditions (2): _
+GROUP C — Negative Cases (3):      _
+GROUP D — Edge Cases (4):          _
+GROUP E — Integration (1):         _
+```
+
+Two things worth flagging for your curation decision:
+
+1. **The scrubber doesn't exist yet.** [redaction.py](src/forge/memory/redaction.py)'s `redact_credentials` covers GitHub tokens / bearer / hex but **not** postgres DSN or password patterns. This feature needs a new pattern set (e.g. `postgresql://user:pass@host/db` and `password=` / `PGPASSWORD=` shapes). I'll surface the exact patterns as a Phase 5 assumption — decide whether to extend `redaction.py` or add a sibling scrubber.
+
+2. **No timeout is specified** in your description. I'll raise "handler imposes no subprocess timeout this phase" as a low-confidence Phase 5 assumption — flag now if you want a timeout scenario added to Group D instead.
+
+Tell me your five group decisions (and any M/+ details) and I'll run Phase 4 → 5 → file generation.
+
+
+---
+
+## /feature-plan shell-script-step-handlers — 2026-06-22T06:59:21Z
+
+### Prompt
+
+```
+/feature-plan "Shell Script Step Handlers" \
+      --context features/shell-script-step-handlers/shell-script-step-handlers_summary.md
+```
+
+### Assistant response
+
+I'll follow the `/feature-plan` orchestration flow. Let me start by reading the context file to understand the feature.
+
+Let me explore the existing feature artifacts and the codebase context before proceeding.
+
+I now have a complete picture of the contract this feature builds on. Let me summarize what I found before clarifying scope:
+
+- **Upstream interface (FEAT-RBX, in progress)**: `StepHandler` Protocol = `(step: Step) -> StepOutcome`; `StepOutcome(status: StepStatus, result: dict|None)`; `StepTypeRegistry.register/resolve`. Step params come from `Step.params` (a Mapping). Handlers must map exit status → `StepStatus.passed/failed`.
+- **Scrubber gap**: `src/forge/memory/redaction.py::redact_credentials` covers GitHub/bearer/hex only and is Graphiti-scoped. This feature needs a **new sibling** `scrub_process_output` with postgres-DSN + password patterns, following the same purity/idempotency contract.
+- **Spec is mature**: 20 scenarios, BDD `.feature` file present, 14 assumptions (3 low-confidence open ones).
+
+Per the `/feature-plan` flow, I'll start with **Context A: Review Scope Clarification**. The three low-confidence open assumptions materially change the plan, so I'll fold them in.
+
+Context A recorded: **Security + correctness** focus, **harden timeout + size cap now** (extends the spec's ASSUM-008/009 — ASSUM-013 env-file pre-validation stays deferred), **Standard** depth.
+
+Let me ground task conventions against existing artifacts before producing the analysis.
+
+
+---
+
+## /feature-plan shell-script-step-handlers — 2026-06-22T12:56:37Z
+
+### Prompt
+
+```
+/feature-plan "Shell Script Step Handlers" \
+      --context features/shell-script-step-handlers/shell-script-step-handlers_summary.md
+```
+
+### Assistant response
+
+I'll follow the `/feature-plan` orchestration flow. Let me start by reading the context file to understand the feature.
+
+Let me gather more context about the feature spec, the existing executor, and the codebase structure.
+
+The `.feature` file already has `@task:TASK-SSH-*` tags, and git status shows an existing `.guardkit/features/FEAT-SSH.yaml`. Let me inspect these and the registry/executor to ground the plan.
+
+It appears `/feature-plan` has already produced a complete plan for FEAT-SSH. Let me verify the task files and implementation guide actually exist before deciding whether to re-run.
+
+The plan for **"Shell Script Step Handlers"** already exists and is complete — it appears `/feature-plan` was already run earlier today (artifacts timestamped 2026-06-22 09:09–09:14). Before I re-run and risk clobbering good work, here's what's already on disk:
+
+**`.guardkit/features/FEAT-SSH.yaml`** — 6 tasks, complexity 5, 5 waves, smoke gates configured:
+- TASK-SSH-001: `scrub_process_output` credential scrubber (the new sibling scrubber called out in the summary)
+- TASK-SSH-002: Subprocess-runner core (timeout + size-cap + scrub) — also hardens ASSUM-008/009
+- TASK-SSH-003 / 004: `deploy_compose` / `run_smoke_tests` handlers (parallel)
+- TASK-SSH-005: registry wiring
+- TASK-SSH-006: integration test against fleet-memory `smoke.sh`
+
+**Also present and well-formed:**
+- All 6 task markdown files + `IMPLEMENTATION-GUIDE.md` + `README.md` in [tasks/backlog/shell-script-step-handlers/](tasks/backlog/shell-script-step-handlers/)
+- The `.feature` file is already BDD-linked — all 20 scenarios carry `@task:TASK-SSH-*` tags (Step 11 already done)
+- Smoke-gate command targets `tests/forge`, which **exists** (so the known stale-path footgun doesn't apply)
+
+This is a genuine fork, so I'd rather not guess.
+
+Understood — keeping the existing plan as-is. No changes made.
+
+**FEAT-SSH is ready for the next step.** When you want to implement it:
+
+```bash
+/feature-build FEAT-SSH
+```
+
+The plan is intact:
+- `.guardkit/features/FEAT-SSH.yaml` — 6 tasks across 5 waves, smoke gate on `tests/forge` (path verified present)
+- [tasks/backlog/shell-script-step-handlers/](tasks/backlog/shell-script-step-handlers/) — 6 task files + `IMPLEMENTATION-GUIDE.md` + `README.md`
+- `.feature` fully BDD-linked (all 20 scenarios tagged `@task:TASK-SSH-*`)
+
+One thing worth a glance before you build: the summary flags **ASSUM-008/009/013** as low-confidence (subprocess timeout, output size-cap, env-file pre-validation). The YAML shows TASK-SSH-002 already folds in timeout + size-cap hardening and defers env-file validation — so those assumptions were resolved at plan time. Nothing to do unless you want to revisit that call.
+
+
+---
+
+## /task-work TASK-RBX-008 — 2026-06-22T13:19:28Z
+
+### Prompt
+
+```
+/task-work TASK-RBX-008
+```
+
+### Assistant response
+
+I'll start by loading the task context for TASK-RBX-008. Let me find the task file.
+
+I found the task in backlog. Let me read it along with the feature context.
+
+Let me examine the relevant source files to understand the current contract.
+
+Now let me read the persistence layer.
+
+Now let me look at the models and the registry's StepOutcome.
+
+Now let me look at the migration schema and existing tests to understand the test patterns and seam markers.
+
+Let me look at the shell-script step handlers to see what handlers actually put in their result dicts, and the existing executor seam/integration test.
+
+Let me look at the executor unit test to understand the fake repo and existing patterns.
+
+Let me check the seam marker definition and an example seam test for the project's convention.
+
+I now have a complete understanding. Let me check for other consumers of `StepResult` / `captured_output` before deciding the model change.
+
+Decision: **Option (b)** — give `StepResult` a typed `payload: Mapping | None` field (default `None`, so all existing constructions stay valid), round-trip it through encode/decode, and have the executor put the handler dict there instead of JSON-stuffing `captured_output`. This preserves the executor-recorded timing/exit_code metadata while making the structured result first-class.
+
+Let me check the pytest `addopts` to know how seam tests are gated.
+
+The plan is clear. Let me implement. Starting with the model — add the `payload` field to `StepResult`.
+
+Now the encode/decode round-trip in the repository:
+
+Now the executor's `_build_step_result` — replace the JSON stopgap with the first-class payload, and drop the now-unused `json` import:
+
+Now update the existing executor test that asserted the old captured-output stopgap:
+
+Now the dedicated real-repo seam test. Let me create it:
+
+Now let me run the affected tests: the executor suite, the persistence runbook suite, and the new seam test.
+
+All pass. Let me run the broader runbook-related suite plus the seam-marked subset to confirm nothing else regressed, and run lint/format checks.
+
+Now lint/format checks (AC-4). Let me check which tools the project uses and run them on the modified files.
+
+zsh doesn't word-split unquoted variables. Let me pass files explicitly.
+
+Formatting applied. Let me run the full affected suite once more to confirm green, then verify nothing else in the repo imports/breaks on the `StepResult` change.
+
+All green (167 passed, 1 skipped). Now let me update the task file — mark acceptance criteria complete and transition to `in_review`.
+
+The task file's status frontmatter now reflects `in_review` (kept in its feature folder `runbook-executor/` to preserve FEAT-RBX grouping, matching how the other RBX tasks are organized).
+
+## ✅ Task Work Complete — TASK-RBX-008
+
+**Harden executor↔persistence result contract**
+
+### What changed
+
+**Model reconciliation (chose option b):** Rather than keep the `captured_output`-as-JSON stopgap, `StepResult` now carries a typed `payload: Mapping[str, Any] | None` field. The handler's structured result is a first-class persisted value, not a JSON blob smuggled inside `captured_output`. This keeps the executor-recorded `started_at`/`completed_at` timing and the status-derived `exit_code` as proper metadata.
+
+- [runbook_models.py](src/forge/persistence/repositories/runbook_models.py#L99-L106) — added `payload` field (default `None`, so every existing `StepResult(...)` construction stays valid)
+- [runbook.py](src/forge/persistence/repositories/runbook.py#L142-L175) — `_encode_result`/`_decode_result` round-trip `payload`; legacy rows without the key decode to `None`
+- [executor.py](src/forge/executor/executor.py#L396-L418) — `_build_step_result` writes the dict to `payload` with `captured_output=""`; removed the `json.dumps` stopgap and the now-unused `import json`
+
+**Real-repo seam test (new):** [test_executor_seam.py](tests/forge/executor/test_executor_seam.py) — marked `@pytest.mark.seam`, drives `RunbookExecutor.run` against a real `RunbookRepository` + tmp SQLite (no fakes). Asserts status + payload round-trip for passed/failed/multi-step runs, and that the step is observably `running` mid-handler — which only happens if the real `try_claim_step_for_execution` fired. It fails if `update_step_status(result=…)` were dropped (payload → `None`) or if the claim method were missing (`AttributeError`).
+
+Also updated the existing AC-002 assertion in [test_executor.py](tests/forge/executor/test_executor.py#L209-L214) to check `payload` instead of the old captured-output stopgap.
+
+### Quality gates
+
+| Gate | Result |
+|------|--------|
+| Tests | ✅ 167 passed, 1 skipped (executor + persistence + runbook BDD/CLI/fold) |
+| Seam subset (`-m seam`) | ✅ 4 passed |
+| `ruff check` | ✅ clean on all 5 files |
+| `ruff format --check` | ✅ clean |
+
+All four acceptance criteria are met. Changes are staged in the working tree (not committed) — let me know if you'd like me to commit them.
+
+
+---
+
+## /task-complete TASK-RBX-008 — 2026-06-22T13:29:36Z
+
+### Prompt
+
+```
+/task-complete TASK-RBX-008 then commit
+```
+
+### Assistant response
+
+I'll finalize TASK-RBX-008: validate completion, organize the task file into the completed structure, then commit. Let me first check the repo's completed-task convention and current git state.
+
+The sibling feature tasks (RSP) land as flat files in `tasks/completed/`. Let me confirm RBX convention and that there are no related artifacts to move.
+
+Convention confirmed — completed RBX tasks are flat files in `tasks/completed/`. Let me run the completion quality gate (tests) once more, then finalize.
+
+Green. Now update the frontmatter to `completed` and move the file with `git mv` to preserve history.
+
+Now commit. This repo's convention is to commit task work directly to `main` (the entire recent history does so), and you explicitly asked to commit — so I'll stage only the TASK-RBX-008 files and commit there, leaving the unrelated working-tree changes untouched.
+
+The `git mv` already staged the rename. Let me stage the remaining files without the now-removed old path.
+
+The six task files are staged (the `??` entries are pre-existing untracked files, correctly left out). Committing:
+
+## ✅ TASK-RBX-008 Complete
+
+**Completion validation**
+- All 4 acceptance criteria satisfied ✅
+- Tests: 160 passed, 1 skipped (executor + persistence + runbook BDD/CLI gate) ✅
+- Lint/format: `ruff check` + `ruff format --check` clean ✅
+
+**File organization**
+- `git mv` → `tasks/completed/TASK-RBX-008-harden-result-contract.md` (history preserved, matching the flat RSP/RBX completed convention)
+- Frontmatter set to `status: completed` with `completed` + `completed_location` metadata
+- No stray root artifacts or `docs/state/TASK-RBX-008/` to relocate
+
+**Progress rollup** — FEAT-RBX now has one remaining backlog task: [TASK-RBX-009-crash-recovery-lease.md](tasks/backlog/runbook-executor/TASK-RBX-009-crash-recovery-lease.md).
+
+**Graphiti capture** — skipped (MCP `add_memory` not in this session; non-blocking per spec).
+
+**Commit** — `c64a19f` on `main`, scoped to exactly the 6 TASK-RBX-008 files (the unrelated working-tree changes from the session snapshot were deliberately left unstaged). Not pushed — say the word if you'd like me to push.
+
+Note: I committed to `main` because this repo's entire task history commits directly there and you explicitly asked. If you'd prefer this on a branch instead, I can `git branch` + reset to move it.
+
+
+---
+
+## /task-work TASK-RBX-009 — 2026-06-22T13:29:56Z
+
+### Prompt
+
+```
+/task-work TASK-RBX-009
+```
+
+### Assistant response
+
+I'll start by loading the task context. Let me find the task file.
+
+Found it in backlog. Let me read the task file.
+
+This is a complexity-5 task from a review (`parent_review`), so it auto-detects to **LIGHT** intensity. The scope explicitly says "Pick the approach with the team," so I need to understand the code first, then get your decision on the approach. Let me read the relevant files.
+
+Now let me read the runbook repository and models.
+
+Now let me look at the migration schema and the existing tests, plus check how the executor handles the running step in its recovery shortcut.
+
+Let me look at the concurrency test and the migration application pattern to understand idempotency conventions.
+
+Now let me look at the executor test to understand the test harness (fake repo vs real repo).
+
+I now have a thorough understanding. The task explicitly requires a **team decision** on the approach ("Pick the approach with the team; ship at least the backoff guard"). Here's what I found:
+
+- The `while True` loop in [executor.py:156](src/forge/executor/executor.py#L156) reloads the runbook each iteration. A `running` step at the pointer is neither fast-advanced (only `passed` is) nor claimable (`try_claim_step_for_execution` excludes `running`), so the loop `continue`s forever → busy-spin.
+- All ACs can be satisfied by the **backoff guard** alone (escalate as `stalled`); the lease/owner column is explicitly conditional ("*If* a lease/owner column is added…").
+
+Let me get your decision on scope before implementing.
+
+The user chose the **full lease/heartbeat** approach. That elevates this beyond LIGHT (schema migration + repo + executor + idempotency + no-steal guarantee), so I'll treat it with standard rigor. 
+
+A key design insight: the lease alone doesn't prevent busy-spin — while a `running` step's lease is *unexpired* (held by a live or recently-crashed executor), the claim still fails and the loop would hot-spin until expiry. So the correct design is **lease + backoff guard** (which the task mandates as the minimum anyway). Let me read the rest of the executor tests and the seam test to preserve announce/claim semantics.
+
+Let me check the seam test and the existing repo test for claim, to mirror their patterns.
+
+Let me check the existing claim test and where the executor/claim is wired, plus the lifecycle migration registration.
+
+There's an existing lease idiom in `coexistence.py` using `claimed_at`/`claimed_by`. Let me read it to mirror project conventions.
+
+Good — there's an established `claimed_at`/`claimed_by` lease idiom in the project. Now let me check the BDD tests and CLI wiring for any `step_started`/executor-construction assumptions I might affect.
+
+The CLI formats `result.reason` into a message, so `"stalled"` slots in fine. Let me check the BDD test around line 222 (the "adversarial_step_type" / step_started==1 assertions) to confirm my plan to announce `step_started` only after a successful claim won't break them.
+
+The test at line 222-224 requires `step_started` to be announced for the unknown-handler case, so I'll announce it in that branch and after a successful claim. Let me verify `EscalatedPayload.reason` accepts a `"stalled"` value (it might be a constrained Literal).
+
+`EscalatedPayload.reason` is a strict `Literal` and lives in the **`nats_core` sibling package** (which per my memory I shouldn't edit from a forge-scoped task). So for the `stalled` safety-net I'll return `RunResult(reason="stalled")` + log, but not publish a NATS escalated event (documented). Let me confirm the CLI handles the escalated result generically.
+
+I have a complete design. Let me transition the task to in_progress, then implement. First the state transition:
+
+Now let me implement. **1. Migration** — add `claimed_at`/`claimed_by` columns to the DDL and an idempotent upgrade path for existing tables:
+
+Update the migration docstring to document the new columns:
+
+**2. Repository** — add the lease-aware claim. First the imports and a lease constant:
+
+Now remove the two local `from datetime import datetime` imports since it's now top-level:
+
+Now the core change — the lease-aware `try_claim_step_for_execution`:
+
+**3. Executor** — add `stalled` to `RunResult`, imports, and a lease/backoff constant:
+
+Now the `__init__` with the new lease/backoff parameters:
+
+Now the loop restructure. Let me re-read the current loop body to edit precisely:
+
+Now I'll restructure the loop. First, add stall-tracking state before the loop and remove the early `step_started` announce (it moves to after a successful claim):
+
+Let me verify the modules compile and run the existing test suites to check for regressions:
+
+All pass except one schema test that asserts an exact column set (legitimately needs updating for the new columns). Let me read and fix it:
+
+The schema test is fixed. Now let me write the new tests. First check whether `test_runbook.py` already covers the claim method:
+
+No direct unit test exists for the claim method. Let me create a focused test module for the lease behavior:
+
+Now the migration idempotency + upgrade-path tests. Let me check the fixtures in the migration test file:
+
+Let me look at the existing idempotency test class to extend it:
+
+Now the executor crash-recovery + stalled tests. Let me append them to `test_executor.py`:
+
+Now run the full set of affected tests:
+
+All green. Now let me run lint/format (AC4) and the wider runbook-related suite for regressions:
+
+zsh doesn't word-split unquoted variables. Let me pass files explicitly:
+
+Lint clean. Let me apply formatting:
+
+Formatting applied and clean. Let me run the broader runbook-related suite (CLI, security, integration, BDD) to confirm no wider regressions:
+
+All 203 pass. Let me also run the integration BDD test (it may skip without nats-py):
+
+The 2 integration errors are a pre-existing pytest-asyncio fixture/live-broker infra issue, unrelated to my change. Let me confirm they fail identically on the baseline (stash my changes):
+
+Confirmed pre-existing — identical errors on baseline without my changes. 
+
+Now let me finalize the task: mark ACs complete, add an implementation summary, and move to `in_review`.
+
+Now move the task to `in_review` and update its frontmatter:
+
+Let me do a final confirmation run of the new/changed tests for the report:
+
+✅ **Task Work Complete — TASK-RBX-009** (Executor crash-recovery for steps stuck in `running`)
+
+**Approach:** Lease/heartbeat (your choice) + backoff guard. The lease alone doesn't prevent busy-spin — while a `running` step's lease is *unexpired*, the claim still fails, so the loop would hot-spin until expiry. The two mechanisms together cover both crash-recovery and the spin guard the task mandated.
+
+## What changed
+
+| File | Change |
+|------|--------|
+| [migrations/runbook.py](src/forge/persistence/migrations/runbook.py) | Added nullable `claimed_at`/`claimed_by` to `runbook_steps` (fresh DBs in `CREATE TABLE`; older DBs via guarded `ALTER TABLE` — `_ensure_claim_lease_columns`). Idempotent across schema versions. |
+| [repositories/runbook.py](src/forge/persistence/repositories/runbook.py) | `try_claim_step_for_execution` stamps the lease and reclaims a `running` step whose `claimed_at` is NULL/older than `lease_seconds` (default `DEFAULT_CLAIM_LEASE_SECONDS=900`) — all in one atomic UPDATE, so no-steal holds. |
+| [executor/executor.py](src/forge/executor/executor.py) | Passes the lease to the claim; backs off (`asyncio.sleep`) instead of hot-spinning; after `max_stall_cycles` no-progress cycles returns `RunResult(reason="stalled")`. `step_started` now fires once per claimed step, not per poll. |
+
+## Acceptance criteria — all met
+- ✅ Crashed `running` step makes progress (reclaimed) or escalates `stalled`, never busy-spinning
+- ✅ Live in-flight `running` step is **not** stolen (live-lease claim refused)
+- ✅ Lease columns added; migration idempotent + upgrade path; repo seam tests cover reclaim
+- ✅ Lint (`ruff check`) and format (`ruff format`) clean on all modified files
+
+## Tests
+- **New:** `test_runbook_claim_lease.py` (reclaim, NULL-lease, no-steal, passed-refusal, owner stamping); 2 migration tests (idempotent re-apply, ALTER upgrade of a pre-RBX-009 table); 2 executor tests (end-to-end reclaim, `stalled` escalation without spin).
+- **Updated:** schema column-set assertion to include the additive lease columns.
+- **Results:** 203 passed / 1 skipped across the runbook suite. The 2 errors in `test_runbook_executor_integration.py` are **pre-existing** (pytest-asyncio fixture + live-broker infra) — confirmed identical on baseline via stash.
+
+## Two follow-ups (documented in the task file)
+1. **Lease vs. handler duration:** the executor doesn't heartbeat during a handler, so a handler outliving the 900s lease could be reclaimed → double-run. Periodic claim-renewal during long handlers (notably FEAT-SSH shell steps) is the robust fix.
+2. **`stalled` not on the wire:** not published as a NATS escalated event because `nats_core.EscalatedPayload.reason` is a closed Literal in that **sibling package** (out of scope per [[autobuild-cannot-edit-sibling-repos]]). It's logged + surfaced via `RunResult`/CLI. Adding `stalled` to that Literal is a small upstream follow-up.
+
+**State:** `backlog` → `in_review` (moved to [tasks/in_review/runbook-executor/](tasks/in_review/runbook-executor/TASK-RBX-009-crash-recovery-lease.md)). Changes are staged/working-tree only — not committed, per your standing preference.
+
+
+---
+
+## /task-complete TASK-RBX-009 — 2026-06-22T13:50:21Z
+
+### Prompt
+
+```
+/task-complete TASK-RBX-009  then commit
+```
+
+### Assistant response
+
+I'll complete TASK-RBX-009: validate, organize files into the completed structure, capture knowledge, then commit.
+
+First, let me check the current location and the completed-folder convention used in this repo:
+
+The repo convention for RBX tasks is a **flat file** in `tasks/completed/` (siblings RBX-001…008 are all flat), not a subfolder — I'll match that. No related artifacts exist (no `TASK-RBX-009-*` files in root, no `docs/state/TASK-RBX-009`). Let me run a final validation, then complete.
+
+All gates pass. Now move the task to completed (flat convention) and update frontmatter:
+
+Now the Graphiti knowledge capture (non-blocking). Let me load the tool and check availability:
+
+Graphiti is reachable. Let me capture the task outcome and the key architectural decision:
+
+Group honored (no override). Now the architectural decision episode:
+
+Both episodes captured to the correct groups. Now the commit. The initial git status showed **pre-existing uncommitted changes** in some files before my session (including `runbook_models.py`, which I never touched). I must not sweep unrelated work into this commit — let me investigate what's mine vs. pre-existing.
+
+`runbook_models.py` is now clean and HEAD has moved to `c64a19f` — the pre-existing changes I worried about are already committed. The only modified files now are exactly the ones I edited. Let me verify my diffs against HEAD contain only RBX-009 work (no stray leftovers):
+
+All diff content is RBX-009 work — no stray hunks. Let me check the task-file move state, then stage precisely (not a blanket add — there are many unrelated dirty files in the tree):
+
+The task move is staged as a rename. I'll commit the code, tests, and task-state move — keeping it focused (the tree has many unrelated dirty files I'll leave untouched). Staging precisely:
+
+The non-existent backlog path aborted the `git add`. Let me stage without it:
+
+All 8 changes staged. Committing (following the repo's conventional-commit style and direct-to-main task pipeline convention):
+
+
+---
+
+## /feature-spec hand-authored-fleet-memory-deploy-runbook-plus-executor-stan — 2026-06-22T14:13:21Z
+
+### Prompt
+
+```
+/feature-spec "Hand-authored fleet-memory deploy runbook plus executor stand-up: a typed 2-step runbook (deploy_compose then run_smoke_tests, both targeting fleet-memory/deploy/nas with .env.deploy, NO approval gates because the target is local and reversible) persisted via the runbook model and executed via 'forge runbook run'; on success fleet-memory Postgres+pgvector is live on the NAS with smoke gates G3-G5 green; the runbook JSON saved as the first harvested exemplar under forge/runbooks/; an end-to-end test that runs the executor against a disposable compose target (fleet-memory deploy/local, NOT the real NAS) proving deploy then smoke then runbook-complete; then the same executor (forge runbook run with the real .env.deploy) runs the runbook against the real NAS as the actual stand-up — not a manual ./deploy.sh — which closes TASK-MEM-008 and ticks FEAT-MEM-01's NAS acceptance criterion"
+```
+
+### Assistant response
+
+I'll start with Phase 1: Context Gathering. Let me silently scan the codebase to understand the runbook model, executor, fleet-memory deploy structure, and smoke gates.
+
+Fleet-memory deploy assets aren't in this repo (likely a sibling repo). Let me read the executor source, CLI, step handlers, existing runbook feature conventions, and the MEM/exemplar context docs.
+
+Let me read the build plan for FORGE-OL-04, the step handlers, and the CLI runbook command.
+
+Let me quickly confirm the step handler names/params and registry, plus glance at an existing runbook feature file for convention.
+
+
+---
+
+## /feature-plan fleet-memory-deploy-runbook — 2026-06-22T14:50:29Z
+
+### Prompt
+
+```
+/feature-plan "Fleet-memory Deploy Runbook" --context features/fleet-memory-deploy-runbook/fleet-memory-deploy-runbook_summary.md
+```
+
+### Assistant response
+
+I'll follow the `/feature-plan` workflow. Let me start by reading the context file you specified.
+
+Let me explore the feature spec directory and the relevant codebase context.
+
+Now let me explore the relevant codebase to ground the plan in reality. I'll dispatch parallel exploration.
+
+Let me map the executor, registry, step handlers (FEAT-SSH), and runbooks location in parallel.
+
+I have a clear picture now. Before I build the plan, let me flag the key finding and confirm a couple of decisions that genuinely change the task breakdown.
+
+**Critical finding:** The FEAT-SSH handlers (`deploy_compose`, `run_smoke_tests`) are implemented but **only in the `.guardkit/worktrees/FEAT-SSH/` worktree — not merged into `main`**. TASK-SSH-005 (`register_shell_handlers`) and TASK-SSH-006 (integration test) are still pending. This feature's core wiring (`forge runbook run` → real registry + real NATS publisher) depends on that code landing. Also, the deploy/smoke scripts live in the **sibling `fleet-memory` repo**, which an autobuild worktree can't edit (per project memory).
+
+Decisions noted: **depend on FEAT-SSH merge** (hard prerequisite — no handler re-implementation), **operator_handoff** for the real-NAS run, **balanced/all-aspects** review. Proceeding to the review analysis.
+
+Let me quickly ground one detail — how a real NATS client is constructed elsewhere, since TASK-FMDR-002 must replace `_NoOpNATSClient`.
+
+
+---
+
+## /feature-complete FEAT-SSH — 2026-06-22T15:20:16Z
+
+### Prompt
+
+```
+/feature-complete FEAT-SSH
+```
+
+### Assistant response
+
+I'll run `/feature-complete FEAT-SSH` in feature mode. First a dry-run to preview what will be merged to main, then I'll execute the merge.
+
+The CLI's complete command is mostly placeholder logic (Phases 2–3 are stubs) and just prints merge instructions — it doesn't perform the merge. Following the slash command's Step 0 execution instructions, I'll do the actual merge. This is a single feature branch (`autobuild/FEAT-SSH`), not per-task branches.
+
+Let me first verify state and preview the real diff before touching main.
+
+The diff mixes real code changes with a large volume of autobuild artifact JSON files (`.guardkit/autobuild/...`, task-plans). The real deliverables are:
+
+- [src/forge/executor/shell_steps.py](src/forge/executor/shell_steps.py) (+267, new)
+- [src/forge/memory/redaction.py](src/forge/memory/redaction.py) (+89, `scrub_process_output`)
+- [src/forge/executor/__init__.py](src/forge/executor/__init__.py) (+4)
+- 6 test files (~1600 lines), task files, implementation plans
+
+The repo convention (from recent commits like `bc90bc4 chore(FEAT-RSP): finalize feature-complete — archive, move tasks, strip autobuild artifacts`) is to merge then strip the autobuild artifacts. Let me check exactly how the last feature was finalized so I match the pattern.
+
+This matches a clear established convention: **FF-merge the branch, then a `chore` finalize commit strips the autobuild artifacts/task-plans the merge pulled in, moves task files to `tasks/completed/`, and archives the feature YAML.** Note `.guardkit/archive/` is gitignored, so archiving is local-only.
+
+Let me verify FF is possible and check the one real config change (`bootstrap_state.json`) before merging.
+
+FF is clean and possible. The `bootstrap_state.json` change is just transient venv-path/timestamp state (the prior FEAT-RSP merge left the same kind of change in place) — harmless, I'll leave it as the merge brings it.
+
+Proceeding with the fast-forward merge into main:
+
+Merge complete (fast-forward to `80ef2f1`). Now let me verify tests pass on main before doing the finalize cleanup. I'll run the feature's smoke gate plus the new test files.
+
+67 passed. Now the finalize cleanup, matching the FEAT-RSP convention. Let me check task frontmatter format and the FEAT-RSP archive layout first.
+
+All clear. Now executing the finalize: flip task status to `completed` + move to `tasks/completed/`, strip the task-plans and autobuild turn artifacts, and archive the feature YAML locally.
+
+All 81 finalize entries staged. Let me confirm nothing unrelated is staged before committing (the repo had pre-existing dirty files I must not sweep in).
+
+Only SSH finalize changes are staged, and the deliverable source files are already on main from the merge. Committing the finalize chore:
+
+Now cleanup the worktree and delete the merged branch:
+
+The `guardkit worktree` subcommand doesn't exist in this CLI version. I'll remove the worktree directly via git, then delete the branch.
+
+Cleanup complete. Final verification of main's state:

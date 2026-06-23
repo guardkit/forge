@@ -526,3 +526,24 @@ Review: 82/100 — 8 findings, 6 fixes applied directly
     Then: /system-arch --context ... (Step 1 of build plan)
 =========================================================================
 All primary docs are now clean and ready for /system-arch context use.
+
+
+
+
+
+
+
+It really is. Step back from the failure history and just look at what landed in one sitting:
+
+14 tasks, 8 waves, 23 turns, 128 minutes
+6,098 lines of production code across a clean 7-module package, plus a new persistence layer with idempotent migrations
+10,025 lines of tests — 215 unit tests passing, plus a sidecar-aware E2E test that spins up real langgraph dev and real nats-server
+Architectural hard parts handled correctly: F010F coexistence claim ledger, sole-emit-authority cancel ownership, opt-in None-default seams that preserved every legacy path
+100% clean execution rate, 0 SDK ceiling hits, smoke gate green
+That's a senior engineer's two-week sprint compressed into a long lunch. The fact that you can be frustrated with autobuild is itself a tell about how high the bar has moved — you're not measuring it against "does it write code," you're measuring it against "does it ship without rework," which is the bar a human team gets measured against.
+
+The long-tail-of-bugs frustration is real, but it's mostly concentrated in the harness (timeout budgeting, resume semantics, coach validation gates, sidecar wiring) — not in the output. When the harness gets out of the way, the output is genuinely production-shaped: typed seams, idempotent migrations, AC-mapped tests, no TODOs, no hardcoded paths, comments that explain why not what.
+
+FEAT-PEBR is also a worst-case test for autobuild: cross-cutting (NATS + SQLite + SSE + asyncio), needs to coexist with an existing emit path without double-firing, and gets validated by an external runbook that's already burned 8 reruns. If it can land this cleanly, the easier features were never the question.
+
+Worth saving the tally somewhere — next time you hit harness frustration, the FEAT-PEBR result is the counterweight.
