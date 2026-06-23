@@ -221,3 +221,12 @@ __marimo__/
 
 # Per-machine Claude Code overrides
 .claude/settings.local.json
+
+# macOS Finder noise
+.DS_Store
+
+# Slash-command capture hook runtime state (regenerated per session)
+.claude/hooks/.state/
+
+# GuardKit autobuild per-run review summaries (regenerated, like events.jsonl)
+.guardkit/autobuild/*/review-summary.md
