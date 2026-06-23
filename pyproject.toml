@@ -140,13 +140,12 @@ where = ["src"]
 # ``tests/bdd/conftest.py`` fails to import ``forge.adapters.*`` at
 # collection time and the oracle reports a synthetic BDD failure.
 pythonpath = ["src"]
-# Default per-test wall-clock guard. Without this, a test that blocks on a
-# real connection/subprocess hangs until an external wall-clock kill, which
-# the AutoBuild Coach harness misreads as an "absent test signal" false-green
-# (see FEAT-FMDR retro: TASK-FMDR-001 stalled on 60s isolated-run hangs).
-# pytest-timeout is already a dev dependency; thread method avoids needing
-# signal support so it works under the SDK subprocess runner.
-addopts = "--timeout=30 --timeout-method=thread"
+# NOTE: a global ``addopts = "--timeout=..."`` was tried here to bound hanging
+# tests but reverted — it hard-fails any interpreter lacking pytest-timeout
+# (the AutoBuild worktree .venv does not install it), turning every pytest run
+# into "unrecognized arguments". Bounding test hangs belongs in the AutoBuild
+# harness (guardkit TASK-ABFIX-010), not as a repo-wide pytest arg. See
+# docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md.
 # pytest-bdd: feature files live alongside the source-of-truth Gherkin
 # under ``features/``. Scenarios are wired to step functions in
 # ``tests/bdd/``. See TASK-NFI-011.
