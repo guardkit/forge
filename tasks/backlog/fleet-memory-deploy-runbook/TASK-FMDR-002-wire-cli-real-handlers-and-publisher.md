@@ -30,13 +30,71 @@ test_results:
   coverage: null
   last_run: null
 autobuild_state:
-  current_turn: 0
+  current_turn: 2
   max_turns: 5
   worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
   base_branch: main
-  started_at: '2026-06-22T22:07:21.085990'
-  last_updated: '2026-06-22T22:07:21.085992'
-  turns: []
+  started_at: '2026-06-23T06:31:03.489698'
+  last_updated: '2026-06-23T07:08:39.993835'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
+      \ Player claim: Player claimed file forge/runbooks/RUNBOOK-fleet-memory-nas.json.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/cli/runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file tests/forge/test_runbook_exemplar.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n... and 4 more issues"
+    timestamp: '2026-06-23T06:31:03.489698'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
+      \ Player claim: Player claimed file forge/runbooks/RUNBOOK-fleet-memory-nas.json.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/cli/runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file tests/forge/test_cli_runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n... and 5 more issues"
+    timestamp: '2026-06-23T06:59:03.726218'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-FMDR-002 — Wire `forge runbook run` to real handlers + real publisher

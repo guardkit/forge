@@ -4,7 +4,7 @@ description: 'FORGE-OL-04: hand-authored typed two-step runbook (deploy_compose 
   run_smoke_tests) executed via forge runbook run to stand fleet-memory up and verify
   it; first harvested exemplar; closes TASK-MEM-008 and ticks FEAT-MEM-01 NAS AC.'
 created: '2026-06-22T17:28:35.051359'
-status: in_progress
+status: paused
 complexity: 6
 estimated_tasks: 6
 tasks:
@@ -13,47 +13,56 @@ tasks:
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-001-author-fleet-memory-runbook-exemplar.md
   complexity: 3
   dependencies: []
-  status: in_progress
+  status: completed
   implementation_mode: direct
   estimated_minutes: 33
   requires_infrastructure: []
-  result: null
+  result:
+    final_decision: completed
+    note: Deliverable green (34/34 tests); autobuild reported false-green stall (harness,
+      not code). Manually salvaged to main commit 4753b20. See docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md
   turns_completed: 0
   current_turn: 1
-  started_at: '2026-06-22T22:07:21.068369'
-  completed_at: null
+  started_at: '2026-06-23T06:31:03.470264'
+  completed_at: '2026-06-23T00:00:00'
 - id: TASK-FMDR-002
   name: Wire forge runbook run to real handlers and publisher
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-002-wire-cli-real-handlers-and-publisher.md
   complexity: 6
   dependencies: []
-  status: in_progress
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
-  result: null
+  result:
+    final_decision: completed
+    note: Deliverable green (34/34 tests); autobuild stopped mid turn-3 (gates had
+      read ALL_PASSED=True). Manually salvaged to main commit 4753b20. See docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md
   turns_completed: 0
   current_turn: 1
-  started_at: '2026-06-22T22:07:21.071991'
-  completed_at: null
+  started_at: '2026-06-23T06:31:03.474047'
+  completed_at: '2026-06-23T00:00:00'
 - id: TASK-FMDR-006
   name: Coordinated fleet-memory local wrappers
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-006-coordinated-fleet-memory-local-wrappers.md
   complexity: 2
   dependencies: []
-  status: deferred
+  status: completed
   implementation_mode: direct
   estimated_minutes: 22
   requires_infrastructure: []
   result:
     total_turns: 0
-    final_decision: deferred
+    final_decision: completed
     error: null
-    deferred_reason: "operator follow-up \u2014 runtime verification required"
+    note: Wrappers (deploy.sh/smoke.sh/.env.deploy.example) authored + committed in
+      sibling fleet-memory repo at d6cf3d4; satisfy G2/G3-G5 contract, syntax-clean.
+      Live docker-compose verification is exercised by TASK-FMDR-004 (needs Docker
+      running).
   turns_completed: 0
   current_turn: 0
   started_at: null
-  completed_at: '2026-06-22T22:07:21.075865'
+  completed_at: '2026-06-23T00:00:00'
 - id: TASK-FMDR-003
   name: Scenario suite scripted handlers
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-003-scenario-suite-scripted-handlers.md
@@ -61,15 +70,21 @@ tasks:
   dependencies:
   - TASK-FMDR-001
   - TASK-FMDR-002
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 113
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+    note: Coach-approved turn 1 (10/10 criteria, 10 tests green). Salvaged to main
+      commit 6d10d97.
+  turns_completed: 1
   current_turn: 0
   started_at: null
-  completed_at: null
+  completed_at: '2026-06-23T08:15:37.599767'
 - id: TASK-FMDR-004
   name: Disposable compose e2e
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-004-disposable-compose-e2e.md
@@ -78,15 +93,20 @@ tasks:
   - TASK-FMDR-001
   - TASK-FMDR-002
   - TASK-FMDR-006
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
   requires_infrastructure: []
-  result: null
-  turns_completed: 0
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+    note: "Coach 'approved' but its run was 5/9 red (required=False test gate + substrate-failure reasoning). Real green required: install host psql (G4), fix get_runbook_by_id->load_runbook, fix completion assertion to pointer-based. Now genuinely 9/9 (real docker compose). Salvaged to main commit 83719ed."
+  turns_completed: 1
   current_turn: 0
   started_at: null
-  completed_at: null
+  completed_at: '2026-06-23T00:00:00'
 - id: TASK-FMDR-005
   name: Real NAS stand-up operator handoff
   file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-005-real-nas-standup-operator-handoff.md
@@ -116,14 +136,14 @@ orchestration:
 preflight_strict: false
 evidence_repos: []
 execution:
-  started_at: '2026-06-22T22:07:19.923746'
-  completed_at: null
+  started_at: '2026-06-23T09:22:25.852609'
+  completed_at: '2026-06-23T09:34:15.751108'
   worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
-  total_turns: 0
-  tasks_completed: 0
+  total_turns: 1
+  tasks_completed: 1
   tasks_failed: 0
   current_wave: 1
   completed_waves: []
-  last_updated: '2026-06-22T22:07:21.075877'
+  last_updated: '2026-06-23T09:34:15.747853'
   archived_at: null
   archived_to: null

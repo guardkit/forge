@@ -1,7 +1,7 @@
 ---
 id: TASK-FMDR-001
 title: Author the fleet-memory runbook exemplar JSON + shape/round-trip test
-status: in_progress
+status: blocked
 created: 2026-06-22 00:00:00+00:00
 priority: high
 task_type: declarative
@@ -22,13 +22,91 @@ test_results:
   coverage: null
   last_run: null
 autobuild_state:
-  current_turn: 0
+  current_turn: 3
   max_turns: 5
   worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
   base_branch: main
-  started_at: '2026-06-22T22:07:21.084213'
-  last_updated: '2026-06-22T22:07:21.084215'
-  turns: []
+  started_at: '2026-06-23T06:31:03.487096'
+  last_updated: '2026-06-23T07:07:41.120660'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: "- The implementation broke an existing test: tests/forge/test_cli_runbook.py::TestRunbookExecution::test_run_valid_runbook_succeeds.\
+      \ This regression must be fixed before approval. The orchestrator's test-orchestrator\
+      \ specialist reported this as a 'substrate failure' \u2014 your changes are\
+      \ incompatible with the existing test suite.: Investigate why test_run_valid_runbook_succeeds\
+      \ fails. The likely cause is that your changes to src/forge/cli/runbook.py modified\
+      \ the Runbook class or _parse_runbook_file function in a way that breaks existing\
+      \ functionality. Review the test to understand what it expects, then adjust\
+      \ your implementation to maintain backward compatibility while still satisfying\
+      \ the new requirements.\n- Evidence gathering aborted (gathering_status: partial_gate_abort)\
+      \ before all verification gates completed. Cannot independently verify acceptance\
+      \ criteria without complete evidence.: Fix the failing test so that all quality\
+      \ gates pass and evidence gathering completes successfully. Once tests pass,\
+      \ the orchestrator can collect complete evidence for all acceptance criteria."
+    timestamp: '2026-06-23T06:31:03.487096'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
+      \ Player claim: Player claimed file forge/runbooks/RUNBOOK-fleet-memory-nas.json.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/cli/runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file tests/forge/test_runbook_exemplar.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n... and 3 more issues"
+    timestamp: '2026-06-23T06:38:25.043689'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
+      \ Player claim: Player claimed file forge/runbooks/RUNBOOK-fleet-memory-nas.json.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/cli/runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file tests/forge/test_cli_runbook.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n... and 4 more issues"
+    timestamp: '2026-06-23T06:59:29.472174'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-FMDR-001 — Author the fleet-memory runbook exemplar JSON

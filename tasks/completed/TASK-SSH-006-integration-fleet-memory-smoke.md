@@ -9,7 +9,7 @@ implementation_mode: task-work
 parent_feature: FEAT-SSH
 parent_review: TASK-REV-SSH1
 priority: medium
-status: design_approved
+status: completed
 tags:
 - forge
 - runbook

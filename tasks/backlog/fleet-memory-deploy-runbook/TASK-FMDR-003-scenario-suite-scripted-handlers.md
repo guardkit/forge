@@ -1,7 +1,7 @@
 ---
 id: TASK-FMDR-003
-title: "Scenario test suite for the fleet-memory runbook (scripted handlers, CI-safe)"
-status: backlog
+title: Scenario test suite for the fleet-memory runbook (scripted handlers, CI-safe)
+status: in_review
 created: 2026-06-22 00:00:00+00:00
 priority: high
 task_type: testing
@@ -13,18 +13,34 @@ implementation_mode: task-work
 complexity: 6
 estimated_minutes: 120
 dependencies:
-  - TASK-FMDR-001
-  - TASK-FMDR-002
+- TASK-FMDR-001
+- TASK-FMDR-002
 tags:
-  - forge-output-loop
-  - runbook-executor
-  - bdd
-  - security
-  - concurrency
+- forge-output-loop
+- runbook-executor
+- bdd
+- security
+- concurrency
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
+  base_branch: main
+  started_at: '2026-06-23T08:03:52.868555'
+  last_updated: '2026-06-23T08:15:37.597982'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-06-23T08:03:52.868555'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-FMDR-003 — Scenario suite (scripted handlers, no live Docker)

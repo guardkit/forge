@@ -1,7 +1,7 @@
 ---
 id: TASK-FMDR-004
-title: "End-to-end run against the disposable deploy/local compose target"
-status: backlog
+title: End-to-end run against the disposable deploy/local compose target
+status: in_review
 created: 2026-06-22 00:00:00+00:00
 priority: high
 task_type: testing
@@ -13,18 +13,34 @@ implementation_mode: task-work
 complexity: 5
 estimated_minutes: 90
 dependencies:
-  - TASK-FMDR-001
-  - TASK-FMDR-002
-  - TASK-FMDR-006
+- TASK-FMDR-001
+- TASK-FMDR-002
+- TASK-FMDR-006
 tags:
-  - forge-output-loop
-  - integration-test
-  - fleet-memory
-  - docker-compose
+- forge-output-loop
+- integration-test
+- fleet-memory
+- docker-compose
 test_results:
   status: pending
   coverage: null
   last_run: null
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
+  base_branch: main
+  started_at: '2026-06-23T09:22:25.867789'
+  last_updated: '2026-06-23T09:34:15.746031'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-06-23T09:22:25.867789'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-FMDR-004 — Disposable-compose end-to-end run
