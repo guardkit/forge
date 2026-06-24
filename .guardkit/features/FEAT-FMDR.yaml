@@ -4,7 +4,7 @@ description: 'FORGE-OL-04: hand-authored typed two-step runbook (deploy_compose 
   run_smoke_tests) executed via forge runbook run to stand fleet-memory up and verify
   it; first harvested exemplar; closes TASK-MEM-008 and ticks FEAT-MEM-01 NAS AC.'
 created: '2026-06-22T17:28:35.051359'
-status: paused
+status: completed
 complexity: 6
 estimated_tasks: 8
 tasks:
@@ -198,13 +198,25 @@ preflight_strict: false
 evidence_repos: []
 execution:
   started_at: '2026-06-23T09:22:25.852609'
-  completed_at: '2026-06-23T09:34:15.751108'
-  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-FMDR
+  completed_at: '2026-06-24T14:00:00'
+  # Original AutoBuild ran on the Mac and stopped after 1 task (false-green stall);
+  # deliverables were manually salvaged/landed on main. No worktree exists on the GB10
+  # (the prior worktree_path was a stale /Users Mac path — cleared).
+  worktree_path: null
   total_turns: 1
-  tasks_completed: 1
+  tasks_completed: 8
   tasks_failed: 0
-  current_wave: 1
-  completed_waves: []
-  last_updated: '2026-06-23T09:34:15.747853'
+  current_wave: 3
+  completed_waves:
+  - 1
+  - 2
+  - 3
+  last_updated: '2026-06-24T14:00:00'
   archived_at: null
   archived_to: null
+  note: >-
+    All 8 FMDR tasks complete and on main (001-006 salvaged: 4753b20/6d10d97/83719ed;
+    007/008/005-complete + session docs merged 2026-06-24 via FF to main). FORGE-OL-04
+    landed: fleet-memory live on the real NAS; forge on a dedicated, subject-scoped NATS
+    user. Manual completion (not /feature-complete) because the work was on task/* branches
+    with no GuardKit worktree. See docs/handoffs/FMDR-NATS-SESSION-DISCOVERIES-2026-06-24.md.
