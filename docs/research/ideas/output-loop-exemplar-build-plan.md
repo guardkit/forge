@@ -5,6 +5,15 @@
 ## Upstream: `docs/handoffs/forge-output-loop-conversation-starter.md` (runbook model + D1–D15); `factory-scaling-and-output-bottleneck-findings.md` (D11–D15)
 ## Prerequisites: fleet-memory `deploy/nas/{deploy.sh,smoke.sh}` built + idempotent (done); `.env.deploy` fillable from `.env.deploy.example` (NAS host/user/ssh-port/docker-root + PG password) with the `fleet_memory_nas_ed25519` SSH key in place; forge orchestrator live (serve, SQLite lifecycle, NATS publishers); NATS JetStream live.
 ## Status as of 2026-06-21: **Not started.** FORGE-OL-01 is the entry point.
+## Status as of 2026-06-24: **ALL FOUR PHASES LANDED.** OL-01..03 shipped as the
+##   runbook-and-step-persistence / runbook-executor / shell-script-step-handlers task groups;
+##   OL-04 = FEAT-FMDR — fleet-memory Postgres+pgvector stood up on the real NAS by the executor
+##   on 2026-06-23 (all smoke gates green), closing TASK-MEM-008 / ticking FEAT-MEM-01's NAS AC.
+##   Lifecycle events verified publishing in order to the live NATS broker (forge now authenticates
+##   as a dedicated `forge` user). The exemplar runbook is harvested at
+##   `forge/runbooks/RUNBOOK-fleet-memory-nas.json`. Full session record + hard-won Synology/NATS
+##   gotchas: `docs/handoffs/FMDR-NATS-SESSION-DISCOVERIES-2026-06-24.md`. Remaining: operational
+##   hardening only (rebuild prod image ≥008; envsubst-scope the forge NATS user; rotate creds).
 ## Plan-update convention (context-switch resilience):
 ##   - **After `/feature-spec` lands:** flip the row in Feature Summary to **Spec'd** + GuardKit id; add a `**Status:**` line atop that feature with the spec commit + `features/<slug>/` path.
 ##   - **After `/feature-plan`:** flip to **Plan'd**; add plan commit + `.guardkit/features/FEAT-XXXX.yaml` + task-tree path.
@@ -37,10 +46,10 @@ Four features, strictly sequential (01 → 02 → 03 → 04). 01 is the data mod
 
 | Feature | Title | Status | GuardKit ID |
 |---|---|---|---|
-| FORGE-OL-01 | Runbook & Step model + SQLite persistence | Not started | — |
-| FORGE-OL-02 | Minimal executor + NATS lifecycle events | Not started | — |
-| FORGE-OL-03 | Step types: deploy_compose + run_smoke_tests | Not started | — |
-| FORGE-OL-04 | fleet-memory runbook + stand-up | Not started | — |
+| FORGE-OL-01 | Runbook & Step model + SQLite persistence | **Landed** | runbook-and-step-persistence (TASK-RSP-*) |
+| FORGE-OL-02 | Minimal executor + NATS lifecycle events | **Landed** | runbook-executor (TASK-RBX-*) + FEAT-FMDR-002 (CLI/publisher) |
+| FORGE-OL-03 | Step types: deploy_compose + run_smoke_tests | **Landed** | shell-script-step-handlers (FEAT-SSH / TASK-SSH-*) |
+| FORGE-OL-04 | fleet-memory runbook + stand-up | **Landed** | FEAT-FMDR (real-NAS stand-up 2026-06-23; see §below) |
 
 ## Architectural Constraints (enforce in every spec)
 

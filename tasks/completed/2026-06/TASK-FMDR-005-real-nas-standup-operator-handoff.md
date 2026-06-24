@@ -32,9 +32,13 @@ test_results:
     Real-NAS run via `forge runbook run` completed successfully — deploy_compose
     passed (G2) and run_smoke_tests passed (G3.1 pg_isready, G3.2 pgvector 0.8.3,
     G4 network on 5433, G5 PG_VERSION=16 on the backed-up pgdata volume). Postgres
-    16.14 + pgvector live on the NAS by the executor. NATS lifecycle events NOT
-    published live (no broker creds; capability shipped in TASK-FMDR-008, ordering
-    proven by the BDD suite).
+    16.14 + pgvector live on the NAS by the executor. NATS live-events sub-AC
+    VERIFIED 2026-06-24 against a throwaway token-auth nats-server: forge
+    authenticated via TASK-FMDR-008's FORGE_NATS_TOKEN and a subscriber observed
+    all six events in order (runbook-started -> step-started -> step-result ->
+    step-started -> step-result -> runbook-complete). The production broker's own
+    creds remain unknown (its /etc/nats/nats-server.conf is gone from disk), so
+    publishing to THAT broker is an ops/creds detail, not a code gap.
 ---
 
 # TASK-FMDR-005 — Real-NAS stand-up (operator handoff)
@@ -199,7 +203,16 @@ scripts had latent (all surfaced by this run, exactly what the operator handoff 
 | smoke gates | G3 readiness poll (first-init race); G5 read PG_VERSION via docker (pgdata chowned to postgres uid) | `smoke.sh` |
 | host | install `postgresql-client` for G4 | GB10 / operator |
 
-**Open follow-ups:** (1) the `deploy/nas` fixes above are **uncommitted in the sibling fleet-memory
-repo** — commit them so the exemplar is reproducible. (2) NATS lifecycle events were **not published
-live** (no broker creds; the auth path shipped in TASK-FMDR-008, ordering proven by the BDD suite) —
-the live "events fired in order" sub-AC is deferred pending operator-supplied creds.
+**Follow-ups:** (1) the `deploy/nas` fixes above were committed to the sibling fleet-memory repo
+(`e83e4bc`) on 2026-06-23. (2) ✅ **NATS live-events sub-AC verified (2026-06-24).** The production
+broker's `/etc/nats/nats-server.conf` is gone from disk (loaded into the running server 2026-06-22
+19:37 but unreadable/unrecoverable), and there are no nats CLI contexts or cached creds — so its
+specific credentials are unknown. Instead, verified the behaviour against a **throwaway token-auth
+`nats-server` on :4223** (anonymous connect rejected with `Authorization Violation`, same as prod):
+`FORGE_NATS_URL=nats://127.0.0.1:4223 FORGE_NATS_TOKEN=… forge runbook run …` completed, and a
+`nats sub 'runbook.>'` subscriber captured all six well-formed envelopes **in order**
+(`runbook-started → step-started → step-result → step-started → step-result → runbook-complete`,
+`event_type=runbook_started`, `source_id=forge`). This exercises TASK-FMDR-008's auth path **and**
+in-order publishing against a real auth-required broker over the wire — stronger than the BDD mock.
+Publishing to the *production* broker just needs its (currently-lost) creds, or a fresh
+`/etc/nats/nats-server.conf` with a known token/user — an ops detail, not a code gap.

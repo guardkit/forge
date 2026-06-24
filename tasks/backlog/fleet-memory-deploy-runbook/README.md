@@ -33,12 +33,15 @@ TASK-MEM-008; ticks FEAT-MEM-01's NAS AC.** See the "RESOLVED — 2026-06-23" se
 Getting there took 007/008 (forge: bare-script resolution + NATS auth/no-spin) **plus** a stack of
 NAS-environment + deploy-script fixes the never-run-against-a-real-Synology scripts had latent
 (DSM rsync service, Compose V2, port 5432→5433 vs DSM's own Postgres, `./pgdata`+mkdir, initdb
-rsync trailing-slash, smoke G3 readiness/G5 perms, host psql). The `deploy/nas` edits are
-**uncommitted in the sibling fleet-memory repo** — commit them so the exemplar is reproducible.
-Fourth+ instance of the false-green pattern (`docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md`):
-tests/local-target green, but the real Synology path was never exercised until this run. Also:
-`forge runbook run` needs `~/.forge/` created and the runbook migration applied first — no shipped
-boot path does this.
+rsync trailing-slash, smoke G3 readiness/G5 perms, host psql). The `deploy/nas` fixes are
+**committed** in the sibling fleet-memory repo (`e83e4bc`). Fourth+ instance of the false-green
+pattern (`docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md`): tests/local-target green, but
+the real Synology path was never exercised until this run. Also: `forge runbook run` needs
+`~/.forge/` created and the runbook migration applied first — no shipped boot path does this.
+
+**2026-06-24 — NATS integration + full session record.** forge migrated to a dedicated `forge`
+NATS user; lifecycle events verified publishing in order to the live broker. Consolidated record of
+every Synology/NATS/runbook gotcha from this work: **`docs/handoffs/FMDR-NATS-SESSION-DISCOVERIES-2026-06-24.md`**.
 
 ## Execution
 
