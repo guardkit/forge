@@ -19,7 +19,26 @@ TASK-MEM-008 and ticks FEAT-MEM-01's NAS-deploy acceptance criterion.
 | TASK-FMDR-006 | Coordinated fleet-memory: `deploy/local` deploy.sh + smoke.sh wrappers | **operator_handoff** | 1 | 2 |
 | TASK-FMDR-003 | Scenario suite (scripted handlers, CI-safe) | testing | 2 | 6 |
 | TASK-FMDR-004 | Disposable-compose end-to-end run (`deploy/local`, Docker-required) | testing | 2 | 5 |
-| TASK-FMDR-005 | Real-NAS stand-up — **operator_handoff** (closes TASK-MEM-008) | operator_handoff | 3 | 2 |
+| TASK-FMDR-005 | Real-NAS stand-up — **operator_handoff** (closes TASK-MEM-008) — ✅ **DONE** | operator_handoff | 3 | 2 |
+| TASK-FMDR-007 | Fix shell-step script/cwd resolution (handler can't run bare `deploy.sh`) | feature | 3 | 3 |
+| TASK-FMDR-008 | Wire NATS auth into `forge runbook run` (live "events in order" sub-AC) | feature | 3 | 3 |
+
+## 2026-06-23 — Wave 3 COMPLETE — fleet-memory Postgres+pgvector live on the real NAS ✅
+
+`forge runbook run` stood fleet-memory up on the GB10's NAS (`whitestocks`) — **all gates green**
+(deploy G2; smoke G3 pgvector 0.8.3 / G4 network on 5433 / G5 backed-up volume). **Closes
+TASK-MEM-008; ticks FEAT-MEM-01's NAS AC.** See the "RESOLVED — 2026-06-23" section in
+`TASK-FMDR-005-real-nas-standup-operator-handoff.md`.
+
+Getting there took 007/008 (forge: bare-script resolution + NATS auth/no-spin) **plus** a stack of
+NAS-environment + deploy-script fixes the never-run-against-a-real-Synology scripts had latent
+(DSM rsync service, Compose V2, port 5432→5433 vs DSM's own Postgres, `./pgdata`+mkdir, initdb
+rsync trailing-slash, smoke G3 readiness/G5 perms, host psql). The `deploy/nas` edits are
+**uncommitted in the sibling fleet-memory repo** — commit them so the exemplar is reproducible.
+Fourth+ instance of the false-green pattern (`docs/reviews/FEAT-FMDR-autobuild-false-green-analysis.md`):
+tests/local-target green, but the real Synology path was never exercised until this run. Also:
+`forge runbook run` needs `~/.forge/` created and the runbook migration applied first — no shipped
+boot path does this.
 
 ## Execution
 

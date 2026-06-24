@@ -109,29 +109,33 @@ tasks:
   completed_at: '2026-06-23T00:00:00'
 - id: TASK-FMDR-005
   name: Real NAS stand-up operator handoff
-  file_path: tasks/backlog/fleet-memory-deploy-runbook/TASK-FMDR-005-real-nas-standup-operator-handoff.md
+  file_path: tasks/completed/2026-06/TASK-FMDR-005-real-nas-standup-operator-handoff.md
   complexity: 2
   dependencies:
   - TASK-FMDR-003
   - TASK-FMDR-004
   - TASK-FMDR-007
   - TASK-FMDR-008
-  status: blocked
+  status: completed
   implementation_mode: direct
   estimated_minutes: 22
   requires_infrastructure: []
   result:
-    final_decision: blocked
-    note: '2026-06-23 real-NAS run on GB10. Pre-flight all green; run escalated at step 0
-      (handler exit_code 127) because the exemplar uses a bare "deploy.sh" script param the
-      handler cannot resolve with a relative cwd (filed TASK-FMDR-007), and the auth-required
-      NATS broker rejected the credential-less CLI (filed TASK-FMDR-008). Nothing stood up on
-      the NAS (clean D8 failure). Also: forge runbook run needs ~/.forge created + the runbook
-      migration applied manually first. See TASK-FMDR-005 "Run attempt — 2026-06-23".'
-  turns_completed: 0
-  current_turn: 0
+    final_decision: completed
+    note: '2026-06-23 real-NAS run on GB10 COMPLETED SUCCESSFULLY via `forge runbook run`.
+      deploy_compose passed (G2) and run_smoke_tests passed (G3.1 pg_isready, G3.2 pgvector
+      0.8.3, G4 network on 5433, G5 PG_VERSION=16 on the backed-up pgdata volume). Postgres
+      16.14 + pgvector live on the NAS by the executor. Closes TASK-MEM-008; ticks FEAT-MEM-01
+      NAS AC. Required (after 007/008 merged): enable DSM rsync service + install Compose V2 on
+      the NAS; install host psql; plus deploy-script fixes in the sibling fleet-memory repo
+      (port 5432->5433 vs DSM Postgres, ./pgdata + mkdir, initdb rsync trailing-slash, smoke
+      G3 readiness wait + G5 read-via-docker) -- those edits are UNCOMMITTED in fleet-memory
+      and should be committed. NATS lifecycle events not published live (no broker creds; 008
+      shipped the auth path, ordering proven by BDD). See TASK-FMDR-005 "RESOLVED — 2026-06-23".'
+  turns_completed: 1
+  current_turn: 1
   started_at: '2026-06-23T16:09:00'
-  completed_at: null
+  completed_at: '2026-06-23T21:26:38'
 - id: TASK-FMDR-007
   name: Fix shell-step script/cwd resolution (handler cannot run bare script name)
   file_path: tasks/completed/2026-06/TASK-FMDR-007-fix-shell-step-script-cwd-resolution.md

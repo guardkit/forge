@@ -11632,3 +11632,265 @@ Now cleanup the worktree and delete the merged branch:
 The `guardkit worktree` subcommand doesn't exist in this CLI version. I'll remove the worktree directly via git, then delete the branch.
 
 Cleanup complete. Final verification of main's state:
+
+
+---
+
+## /task-work TASK-FMDR-007 — 2026-06-23T16:52:31Z
+
+### Prompt
+
+```
+/task-work TASK-FMDR-007
+```
+
+### Assistant response
+
+I'll execute the `/task-work` protocol for TASK-FMDR-007. Let me start by parsing flags and loading the task context.
+
+**Step 0: Parse Flags** — No flags provided → Standard workflow mode (all phases).
+
+**Step 1: Load Task Context** — Searching for the task file across states.
+
+Found the task in backlog (within feature folder `fleet-memory-deploy-runbook`). Let me read it.
+
+**Task loaded.** This is a complexity-3 bug fix with provenance `parent_review: TASK-REV-FMDR` + `feature_id: FEAT-FMDR`.
+
+**Intensity auto-detection:** No high-risk keywords; `parent_review` present + complexity 3 (≤4) → **MINIMAL** intensity (micro-task: ≤3 complexity, ≤3 files, ~45 min). This streamlines to: load context → simplified implementation → testing → quick review (no planning/arch-review ceremony).
+
+Let me transition the task to `in_progress` and read the relevant code to confirm the root cause and the design decision.
+
+Root cause confirmed exactly as described. Line 86: `subprocess.run([script], cwd=cwd, ...)` with a bare `script="deploy.sh"` resolves via PATH, not relative to `cwd`. Let me read the relevant tests to understand the structure and what needs to stay consistent.
+
+Now I have full clarity. Key finding: [test_runbook_exemplar.py:228](tests/forge/test_runbook_exemplar.py#L228) actively asserts `"/" not in script` and `script == "deploy.sh"` — encoding the **filename-only contract**. This makes the decision clear:
+
+**Design decision: Option A (fix the handler)** — recommended in the task, preserves the filename-only contract the exemplar test encodes, fixes every runbook at once, and leaves the shipped JSON + existing assertions untouched. Option B would violate that contract and require rewriting those assertions.
+
+Let me find the existing handler tests to place the regression test correctly.
+
+The core runner tests live in `tests/forge/executor/test_shell_steps_core.py`. Let me read it to match the existing style for the regression test.
+
+I have full clarity now. All existing tests pass an **absolute** `script` path — the bare-name + relative-cwd combination is genuinely untested, exactly the gap the task describes. Let me check the task directory structure before transitioning state.
+
+Python 3.12.3 confirms the root-cause environment. Let me quickly verify the exact subprocess behavior on this machine before writing the fix — confirming both the bug and my chosen resolution approach.
+
+Fix logic verified on the live environment: `dirname("deploy.sh")` is empty → prepend `./` → runs correctly in the relative cwd (rc=0); paths already containing a directory component (`./x`, `bin/x`, `/abs/x`) pass through untouched. Cross-platform via `os.path`.
+
+**Phase 1.4: State transition** (backlog → in_progress, preserving feature subfolder).
+
+The file isn't git-tracked yet (untracked). Using a plain move.
+
+Now update the frontmatter to reflect the in_progress state.
+
+✅ Transitioned TASK-FMDR-007: `backlog` → `IN_PROGRESS`.
+
+**Phase 3: Implementation (Option A — fix the handler).** Resolve a bare script name relative to `cwd` by prepending `./`, honoring the handler's documented "script is relative to cwd" contract.
+
+Now update the docstring to document this contract for future callers.
+
+**Phase 3 (cont): Regression test.** The AC requires a test exercising the **real handler** with a **bare `script` + relative `cwd`**, asserting it actually runs. Let me check how the existing handler tests construct a `Step`.
+
+The `Step` model and handler patterns are clear. Now I'll add the regression tests. The key is using `monkeypatch.chdir(tmp_path)` so a **relative** cwd resolves deterministically — reproducing the exact production combination (bare name + relative cwd) that no prior test exercised.
+
+First, the core-runner regression class:
+
+Now the handler-level regression test — the most faithful reproduction of the real NAS step-0 failure (`deploy_compose` with the exemplar's exact params):
+
+**Phase 4: Testing.** First, the compilation/syntax check via import, then run the new regression tests, then the full suites required by the AC.
+
+All 4 regression tests pass. Now the full suites required by AC ("Full suite green: `tests/forge/`, `tests/bdd/`, `tests/integration/`").
+
+The full suite is running in the background. Let me wait for it to complete and check the result.
+
+The background suite is still running. Let me load the Monitor tool to wait efficiently until it finishes.
+
+The full suite is running. I'll wait for it to complete before proceeding to the final review and state transition.
+
+Tests are still running. I'll await the completion notification rather than poll.
+
+I'll wait for the test suite to finish — the monitor will notify me when the pytest summary line appears.
+
+
+---
+
+## /task-work TASK-FMDR-008 — 2026-06-23T16:52:59Z
+
+### Prompt
+
+```
+/task-work TASK-FMDR-008
+```
+
+### Assistant response
+
+I'll start by loading the task context for TASK-FMDR-008. Let me search for the task file and read it.
+
+I have the task context. Let me read the key source files referenced in the task and understand the codebase before planning.
+
+Now let me read the actual CLI file and the redaction module — these are the core files for this task.
+
+Now let me understand the test patterns and the config-loading conventions in the codebase.
+
+Let me look at the relevant test for the event stream and the serve config conventions for NATS env vars.
+
+Let me check the config model (for the `forge.yaml` source) and how `nats.connect` is seamed for testing elsewhere.
+
+Let me find where the runbook CLI itself is tested and check the `_serve_daemon` connect-seam pattern to follow the established testing convention.
+
+Let me read the existing CLI runbook test file to follow its patterns.
+
+I now have a complete understanding of the task and codebase. Let me verify the test environment and check `nats-py` availability.
+
+All required `nats.connect` parameters exist. I have full context now.
+
+This is a focused, complexity-3 credential-plumbing change in one well-understood file. Rather than spawn a chain of planning/review subagents to re-derive context I already have, I'll implement and test it directly (real test execution is the actual quality gate), then run an independent security review via subagent — that adds genuine adversarial value given this handles secrets. Let me set up tracking.
+
+First, transition the task to in_progress.
+
+TASK-FMDR-007 is already in progress in that feature folder. Let me update FMDR-008's frontmatter and move it alongside.
+
+Now I'll implement the changes. First, the imports:
+
+Now rewrite the NATS connection helpers section (the credential resolution, log-safety helpers, connect seam, and best-effort connect):
+
+Now update the module docstring and the `run` command help to document the new auth env vars:
+
+Let me add the `nats_connect` seam to `__all__` for consistency with the `_serve_daemon` seam pattern:
+
+Let me verify the implementation compiles and review the final connection-helpers region:
+
+Implementation works. Now let me add the tests.
+
+Now let me add comprehensive tests. I'll append a new section to the CLI test file:
+
+Now let me run the test suite — the full CLI runbook file plus the fleet-memory regression suite:
+
+The CLI test module doesn't import `asyncio`. Let me add it:
+
+All 29 pass. Now the regression suite (fleet-memory BDD + e2e seam, and the broader CLI/executor area) plus coverage on the changed module:
+
+pytest-cov isn't installed. Let me use `coverage` directly:
+
+85% line coverage on the module (gate is ≥80%) — the misses are pre-existing CLI error branches and the live-broker-only connect seam, not the new logic. Let me run lint/format checks on the changed files and confirm the e2e seam test still imports cleanly.
+
+ruff passes; the source file is clean. Black wants to reformat the test file. Let me see what it wants and apply it:
+
+Only one genuine violation in my new code (a 95-char line >88 limit); the other two are black's collapsing preference. Let me apply all three to keep my additions clean without churning the pre-existing file:
+
+All green. Let me confirm the Docker-gated e2e test still imports cleanly (it imports `cli.runbook`):
+
+Tests pass, lint clean, imports intact. Let me update tracking and run the independent security review.
+
+The review surfaced two HIGH findings worth acting on: the reused scrubber only matches credential *shapes* (postgres DSN, `password=`, github/bearer/hex), so a short opaque NATS token or inline-URL password could slip through `str(exc)` logging. The robust fix is to redact the **known resolved secret values** literally — a deterministic guarantee independent of pattern coverage — and to also strip userinfo from scheme-less URLs. I'll apply the genuinely valuable findings (1, 2, 3, 4, 8, 9) and decline the speculative one (6, which would harm debuggability). Let me update the implementation.
+
+Now update `_connect_nats_best_effort` to collect the known secrets and use them in both log paths:
+
+Now let me add tests for the new robustness — scheme-less URL stripping, whitespace handling, known-value redaction, and a success-path secret guard:
+
+Now strengthen `test_secret_never_logged` with a short-opaque-token case and add a success-path guard (Finding 9), plus the single-attempt caveat comment (Finding 5):
+
+Now update `test_secret_never_logged` to also cover a short opaque token and assert the success-path info log is clean:
+
+All 65 pass, lint clean. Let me re-check coverage on the changed module:
+
+87% line coverage (gate ≥80%); the 23 misses are all pre-existing CLI error branches and the live-broker-only connect seam — my new auth logic is fully covered. Let me do a final read-through of the changed region to confirm coherence:
+
+The implementation is coherent and complete. Let me finalize: update the task file (AC status, frontmatter, test results) and transition to `in_review`.
+
+Now update the acceptance-criteria checkboxes and append an implementation summary to the task body:
+
+Now move the task file to `in_review`:
+
+Let me verify I didn't disturb TASK-FMDR-007 — in_progress unexpectedly looks empty. Let me check the full state and git status.
+
+TASK-FMDR-007 was moved to `in_review` by a separate/parallel session (note the new `task-work-TASK-FMDR-007-history.md`) — my work only touched 008. Everything is intact. Let me do a final consolidated verification and a CLI smoke test of the new help text.
+
+All green. Let me complete tracking and write the final report.
+
+
+---
+
+## /task-complete TASK-FMDR-007 — 2026-06-23T17:13:33Z
+
+### Prompt
+
+```
+/task-complete TASK-FMDR-007 then commit
+```
+
+### Assistant response
+
+The task passed all quality gates and is in `in_review`. Now I'll run the completion protocol, then commit — committing **only** the FMDR-007 work (the unrelated FMDR-008 changes in the tree must stay out). Let me first inspect the current state, the `completed/` convention, and the ambiguous files.
+
+Now I have the full picture. The working tree intermingles **three** things: my FMDR-007 fix, unrelated **FMDR-008** code (`runbook.py`, `test_cli_runbook.py`), and shared FMDR tracking metadata (`FEAT-FMDR.yaml`, `README.md`, `TASK-FMDR-005.md`) + hook history files. The commit must include **only FMDR-007's deliverable** and must not sweep in FMDR-008's unfinished code.
+
+Let me check the `completed/` convention and Graphiti config before finalizing.
+
+Convention confirmed: completed tasks are flat files in `tasks/completed/{YYYY-MM}/`. Graphiti is enabled (`falkordb_host: whitestocks`), and `mcp__graphiti__add_memory` is in the deferred-tools list.
+
+**Decision on commit scope:** I'll commit **only** the FMDR-007 deliverable (fix + tests + completed task file) on a new branch. I will **not** commit `FEAT-FMDR.yaml`/`README.md`/`TASK-FMDR-005.md` (they carry pre-existing FMDR-005/008 tracking edits I didn't author) or the FMDR-008 code — those stay in the working tree for you to handle, since the feature file is entangled with another task.
+
+**Step 1: File organization** — move task to completed, update frontmatter.
+
+**Step 2: Graphiti knowledge capture** (non-blocking, per protocol). Loading the MCP tool.
+
+Capturing the task outcome and the Option A/B architectural decision to the knowledge graph (non-blocking).
+
+Both Graphiti writes succeeded; the response confirms the `group_id` was honored (`guardkit__task_outcomes` and `guardkit__project_decisions` — no override, Step 2a is a no-op). ✅ Knowledge captured.
+
+**Step 3: Git commit.** On `main` (default branch) → branch first, then stage **only** the FMDR-007 files (excluding FMDR-008 code and entangled tracking files).
+
+Staging is exactly correct — only the 4 FMDR-007 files. But `tasks/in_review/fleet-memory-deploy-runbook/` still shows as untracked (git reports it, so it's not empty). Let me check before committing.
+
+Key finding: `tasks/in_review/fleet-memory-deploy-runbook/` contains **TASK-FMDR-008's task file** — FMDR-008 is itself active work (file in `in_review` + its code changes). Correctly left untouched. The staging is exactly right: only the 4 FMDR-007 files (`M shell_steps.py`, `A` completed task, `M` both test files).
+
+Committing now:
+
+The commit is clean: exactly the 4 FMDR-007 files (fix + 2 test files + completed task), on branch `task/TASK-FMDR-007-fix-shell-step-cwd-resolution`, no FMDR-008 code or entangled tracking files. Not pushed (you said commit, not push).
+
+**Progress rollup:** Let me update the FMDR-007 entry in the feature tracker to `completed` (accurate rollup, left uncommitted with the other FMDR tracking edits). Reading the relevant section.
+
+Feature rollup applied (FMDR-007 → `completed`, left uncommitted with the other FMDR tracking edits). Let me verify the final state for an accurate report.
+
+
+---
+
+## /task-complete TASK-FMDR-008 — 2026-06-23T17:48:15Z
+
+### Prompt
+
+```
+/task-complete TASK-FMDR-008 then commit
+```
+
+### Assistant response
+
+I'll finalize completion for TASK-FMDR-008 and commit. First, let me check the existing `completed/` directory convention and the feature YAML for the progress rollup.
+
+TASK-FMDR-007 (the parallel session) completed into `tasks/completed/2026-06/` — I'll follow that sibling convention. Let me check the feature YAML for the rollup status.
+
+I have the full picture. TASK-FMDR-008 is currently `in_review`; I'll complete it following the FMDR-007 convention (`tasks/completed/2026-06/`). Let me update the task frontmatter first, then move it.
+
+Now move the task file to `tasks/completed/2026-06/` (matching the FMDR-007 sibling) and clean up the now-empty `in_review` feature folder:
+
+Now update the FEAT-FMDR.yaml rollup — mark TASK-FMDR-008 completed with its result note and new file path:
+
+Feature rollup: **7 of 8 tasks complete** (only TASK-FMDR-005, the operator NAS handoff, remains — now unblocked since both its filed blockers 007+008 are done).
+
+Now the Graphiti knowledge capture. Let me load the MCP tools and check availability.
+
+Graphiti is available. Let me capture the task outcome and the key architectural decision:
+
+Both episodes queued to the correct groups (no group override — Step 2a clean). Now the commit. Let me first check the precise git state — there's parallel TASK-FMDR-007 work in the working tree that I must keep separate from my 008 commit.
+
+The parallel 007 session already committed its code (commit `7152fff` on main) — so the working tree is now clean of 007's code changes. The remaining changes are mine (008) plus some pre-existing/auto-generated files. Let me verify the FEAT-FMDR.yaml diff is purely my 008 edit before staging:
+
+The YAML was already dirty at session start (pre-existing accurate feature-tracking edits: 005-blocked, 007 entry, `estimated_tasks` bump) plus my 008 edit — all consistent with reality. The parallel 007 committed directly to main (`7152fff`), so I'll follow that convention and commit my 008 work to main, **scoped to my files only** (explicit `git add`, leaving the unrelated pre-existing/hook-generated changes untouched).
+
+All 5 of my files staged; unrelated changes left alone. Now commit to main:
+
+The commit landed on branch `task/TASK-FMDR-007-fix-shell-step-cwd-resolution`, **not main** — the parallel 007 session had switched this shared working tree onto its own task branch (and committed 007 there as `7152fff`). So my 008 commit stacked on top of 007's branch. Let me inspect the branch topology before deciding how to clean this up.
+
+Clear picture now: the 007 branch sits 2 commits ahead of `main` — `7152fff` (007) then my `b15425c` (008) stacked on top. Both are local, unpushed, completed FMDR tasks. My 008 commit is cleanly on top, but it's buried under a branch named for 007. Let me give 008 its own correctly-named branch and restore the 007 branch to contain only 007 — local, fully reversible (reflog) surgery.
+
+Topology is clean. Let me do a final verification:

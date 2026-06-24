@@ -56,6 +56,15 @@ ssh -i ~/.ssh/fleet_memory_nas_ed25519 -o BatchMode=yes -p 22 \
 ```
 
 Pre-flight gotchas:
+- **DSM rsync service must be ON** (Control Panel → File Services → rsync → "Enable rsync
+  service"). `deploy.sh` step 2a syncs the compose folder with `rsync`, and Synology gates
+  SSH-mode `rsync --server` behind this toggle. If off, the deploy step fails with the
+  misleading client message `Permission denied, please try again.` — the true remote error is
+  `rsync error: rsync service is no running (code 43)`. Check from the GB10 with a **real rsync
+  dry-run** (authoritative — a hand-rolled `rsync --server …` one-liner gives a false `43` even when
+  the service is ON):
+  `cd ~/Projects/appmilla_github/fleet-memory/deploy/nas && rsync -avzn -e "ssh -i ~/.ssh/fleet_memory_nas_ed25519 -p 22 -o BatchMode=yes" docker-compose.yml RichardWoollcott@whitestocks.tailebf801.ts.net:/tmp/`
+  (exit 0 ⇒ serving). Confirmed disabled on the 2026-06-23 run; enabling it unblocked the deploy.
 - **Host key**: if you get `Host key verification failed`, accept the NAS host key
   once (`ssh-keyscan` into `known_hosts`, or connect interactively).
 - **Tailscale expiry**: `whitestocks`'s key was set to lapse ~1 month after
