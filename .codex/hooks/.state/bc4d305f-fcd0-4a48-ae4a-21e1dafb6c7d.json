@@ -1,0 +1,11 @@
+{
+  "session_id": "bc4d305f-fcd0-4a48-ae4a-21e1dafb6c7d",
+  "command": "feature-complete",
+  "slug": "FEAT-SSH",
+  "prompt": "/feature-complete FEAT-SSH",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/bc4d305f-fcd0-4a48-ae4a-21e1dafb6c7d.jsonl",
+  "started_at": "2026-06-22T15:20:16Z",
+  "started_at_epoch": 1782141616.372554,
+  "completion_written": true,
+  "completed_at": "2026-06-22T15:23:41Z"
+}

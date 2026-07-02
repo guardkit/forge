@@ -1,0 +1,11 @@
+{
+  "session_id": "a6704e94-2365-411c-9ae2-49e2df244858",
+  "command": "feature-plan",
+  "slug": "shell-script-step-handlers",
+  "prompt": "/feature-plan \"Shell Script Step Handlers\" \\\n      --context features/shell-script-step-handlers/shell-script-step-handlers_summary.md",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/a6704e94-2365-411c-9ae2-49e2df244858.jsonl",
+  "started_at": "2026-06-22T06:59:21Z",
+  "started_at_epoch": 1782111561.7502568,
+  "completion_written": true,
+  "completed_at": "2026-06-22T07:54:26Z"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "6b4e7f19-d43c-47c1-a77b-9566f8c1d4b9",
+  "command": "feature-plan",
+  "slug": "fleet-memory-deploy-runbook",
+  "prompt": "/feature-plan \"Fleet-memory Deploy Runbook\" --context features/fleet-memory-deploy-runbook/fleet-memory-deploy-runbook_summary.md",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/6b4e7f19-d43c-47c1-a77b-9566f8c1d4b9.jsonl",
+  "started_at": "2026-06-22T14:50:29Z",
+  "started_at_epoch": 1782139829.7572749,
+  "completion_written": true,
+  "completed_at": "2026-06-22T15:07:45Z"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "70936bad-bc15-440e-a894-52b68ec32250",
+  "command": "feature-spec",
+  "slug": "runbook-and-step-data-model-for-the-forge-output-side-loop-a",
+  "prompt": "/feature-spec \"Runbook and Step data model for the Forge output-side loop: a typed Step (step_type, params dict, status enum pending/running/passed/failed/awaiting_approval, result with exit_code + captured_output + timestamps, sequence_index) and a Runbook (runbook_id, ordered list of steps, current_step_index, overall status, target name, created_at) persisted in forge's existing SQLite store via a sibling table reusing adapters/sqlite/connect.py and the existing migration path; status-per-step queryable; resume pointer (current_step_index); gates-as-data (a step in awaiting_approval) modelled even though this phase uses none; NO executor logic yet \u2014 model + persistence + repository methods (create_runbook, load_runbook, update_step_status, advance) with unit tests; no NATS, no subprocess, no LLM\"",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/70936bad-bc15-440e-a894-52b68ec32250.jsonl",
+  "started_at": "2026-06-21T17:04:13Z",
+  "started_at_epoch": 1782061453.6409469,
+  "completion_written": true,
+  "completed_at": "2026-06-21T17:08:00Z"
+}

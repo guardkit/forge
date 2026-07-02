@@ -1,0 +1,11 @@
+{
+  "session_id": "e738dd1f-f45d-4d09-9c58-f4052d8f5bd3",
+  "command": "task-complete",
+  "slug": "TASK-RBX-009",
+  "prompt": "/task-complete TASK-RBX-009  then commit",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/e738dd1f-f45d-4d09-9c58-f4052d8f5bd3.jsonl",
+  "started_at": "2026-06-22T13:50:21Z",
+  "started_at_epoch": 1782136221.3796859,
+  "completion_written": true,
+  "completed_at": "2026-06-22T13:55:04Z"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "9d883bf4-1268-4dac-ba62-d551d8572f5b",
+  "command": "feature-spec",
+  "slug": "hand-authored-fleet-memory-deploy-runbook-plus-executor-stan",
+  "prompt": "/feature-spec \"Hand-authored fleet-memory deploy runbook plus executor stand-up: a typed 2-step runbook (deploy_compose then run_smoke_tests, both targeting fleet-memory/deploy/nas with .env.deploy, NO approval gates because the target is local and reversible) persisted via the runbook model and executed via 'forge runbook run'; on success fleet-memory Postgres+pgvector is live on the NAS with smoke gates G3-G5 green; the runbook JSON saved as the first harvested exemplar under forge/runbooks/; an end-to-end test that runs the executor against a disposable compose target (fleet-memory deploy/local, NOT the real NAS) proving deploy then smoke then runbook-complete; then the same executor (forge runbook run with the real .env.deploy) runs the runbook against the real NAS as the actual stand-up \u2014 not a manual ./deploy.sh \u2014 which closes TASK-MEM-008 and ticks FEAT-MEM-01's NAS acceptance criterion\"",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/9d883bf4-1268-4dac-ba62-d551d8572f5b.jsonl",
+  "started_at": "2026-06-22T14:13:21Z",
+  "started_at_epoch": 1782137601.001756,
+  "completion_written": true,
+  "completed_at": "2026-06-22T14:15:36Z"
+}

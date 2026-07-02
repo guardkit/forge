@@ -1,0 +1,2 @@
+[mcp_servers.graphiti]
+url = "http://promaxgb10-41b1:8004/mcp"

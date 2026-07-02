@@ -1,0 +1,11 @@
+{
+  "session_id": "f0979a73-2cb3-44dd-8ece-6c70830e2aaf",
+  "command": "feature-plan",
+  "slug": "runbook-and-step-persistence",
+  "prompt": "/feature-plan \"Runbook and Step Persistence\" --context features/runbook-and-step-persistence/runbook-and-step-persistence_summary.md",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/f0979a73-2cb3-44dd-8ece-6c70830e2aaf.jsonl",
+  "started_at": "2026-06-21T17:22:31Z",
+  "started_at_epoch": 1782062551.662647,
+  "completion_written": true,
+  "completed_at": "2026-06-21T17:40:20Z"
+}

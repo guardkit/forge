@@ -1,0 +1,11 @@
+{
+  "session_id": "161a7ec9-53e2-48c9-910e-8869da5b1423",
+  "command": "feature-complete",
+  "slug": "FEAT-RSP",
+  "prompt": "/feature-complete FEAT-RSP then verify",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/161a7ec9-53e2-48c9-910e-8869da5b1423.jsonl",
+  "started_at": "2026-06-21T20:40:43Z",
+  "started_at_epoch": 1782074443.998983,
+  "completion_written": true,
+  "completed_at": "2026-06-21T20:49:32Z"
+}
