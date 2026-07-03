@@ -1,0 +1,11 @@
+{
+  "session_id": "f3a6537a-5d36-4913-b267-029228ff7731",
+  "command": "feature-spec",
+  "slug": "two-runbook-step-types-wrapping-existing-shell-scripts-as-su",
+  "prompt": "/feature-spec \"Two runbook step types wrapping existing shell scripts as subprocesses: deploy_compose(cwd, script, env_file) and run_smoke_tests(cwd, script, env_file) \u2014 each runs the named script in cwd with the env_file available, captures exit_code + stdout/stderr, maps exit 0 to passed and non-zero to failed (run_smoke_tests' exit code is the step verdict); preserves the script's own idempotency; credential-scoped \u2014 env_file is a path only, and captured output is scrubbed of postgres DSN and password patterns before being stored in the step result or published; both registered into the executor's step_type registry; unit tests with a fake script exercising the exit-0 and exit-1 paths plus an output-scrub assertion on a planted secret; one marker-gated integration test invoking fleet-memory deploy/nas/smoke.sh against a throwaway target\"",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/f3a6537a-5d36-4913-b267-029228ff7731.jsonl",
+  "started_at": "2026-06-21T20:49:32Z",
+  "started_at_epoch": 1782074972.844861,
+  "completion_written": true,
+  "completed_at": "2026-06-21T20:56:17Z"
+}

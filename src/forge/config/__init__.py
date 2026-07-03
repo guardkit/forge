@@ -10,6 +10,8 @@ and ``forge.config.loader``).
 from .loader import load_config
 from .models import (
     ApprovalConfig,
+    BudgetConfig,
+    BudgetGuards,
     FilesystemPermissions,
     FleetConfig,
     ForgeConfig,
@@ -20,6 +22,8 @@ from .models import (
 
 __all__ = [
     "ApprovalConfig",
+    "BudgetConfig",
+    "BudgetGuards",
     "FilesystemPermissions",
     "FleetConfig",
     "ForgeConfig",

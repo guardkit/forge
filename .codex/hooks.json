@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/richardwoollcott/Projects/appmilla_github/forge/.codex/hooks/capture_slash_command.py'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/richardwoollcott/Projects/appmilla_github/forge/.codex/hooks/capture_slash_command.py'"
+          }
+        ]
+      }
+    ]
+  }
+}

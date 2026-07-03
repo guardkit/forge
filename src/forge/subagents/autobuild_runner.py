@@ -1014,6 +1014,14 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
 # helpers below resolve the repo and guardkit binary paths from the launch
 # payload + environment, and the rewritten ``_node_running_wave`` body
 # orchestrates the subprocess with timeout + exit-code mapping.
+#
+# ADR-ARCH-033: this deliberately bypasses ``adapters/guardkit/run.py`` (the
+# one-shot "single boundary") because autobuild is a long-running streaming
+# build. KNOWN GAP: this path does NOT populate ``last_coach_score`` /
+# ``aggregate_coach_score`` (they stay ``None``) — a prerequisite for the
+# FEAT-UBS-002 budget guards. Closing it is gated on capturing a real
+# ``guardkit autobuild --verbose`` transcript (TASK-ABW-OPS rehearsal) so the
+# score parser is built against a verified format, not an assumed one.
 
 
 #: Environment override for the base directory containing local repo

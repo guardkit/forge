@@ -1,0 +1,11 @@
+{
+  "session_id": "5db6ca2f-7508-470e-81d3-e050b409826a",
+  "command": "feature-spec",
+  "slug": "minimal-runbook-executor-for-the-forge-output-side-loop-disp",
+  "prompt": "/feature-spec \"Minimal runbook executor for the Forge output-side loop: dispatch-by-step-type loop over a persisted Runbook (from the runbook model feature) \u2014 resolve each step's handler via a step_type registry, run it, persist result + status, advance the current-step pointer; stop-and-resume on failure (re-enter at the failed step index, no restart); publish NATS lifecycle events runbook-started/step-started/step-result/runbook-complete/escalated reusing the existing pipeline_publisher pattern and envelope; the executor has NO knowledge of step internals (registry indirection only); a CLI entry 'forge runbook run <path-to-runbook-json>' to load and execute; in-memory fake step handlers in tests so unit gates need no subprocess or NATS broker; one marker-gated integration test with a real NATS publish\"",
+  "transcript_path": "/Users/richardwoollcott/.claude/projects/-Users-richardwoollcott-Projects-appmilla-github-forge/5db6ca2f-7508-470e-81d3-e050b409826a.jsonl",
+  "started_at": "2026-06-21T17:31:47Z",
+  "started_at_epoch": 1782063107.322228,
+  "completion_written": true,
+  "completed_at": "2026-06-21T17:35:01Z"
+}

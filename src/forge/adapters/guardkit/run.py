@@ -13,6 +13,14 @@ The :func:`run` coroutine is the *single boundary* through which every
   (TASK-GCI-004) to fold raw subprocess output into the canonical
   :class:`~forge.adapters.guardkit.models.GuardKitResult`.
 
+Scope note (ADR-ARCH-033): "single boundary" here means every *one-shot* tool
+invocation. The long-running ``guardkit autobuild`` build deliberately uses a
+*separate* streaming subprocess in ``subagents/autobuild_runner.py`` today (live
+progress + 3600s budget + direct lifecycle mapping). Converging that path onto a
+streaming variant of this module — so the runner consumes a structured
+``GuardKitResult.coach_score`` instead of scraping stdout — is the tracked
+follow-up in ADR-ARCH-033 (and the prerequisite for FEAT-UBS-002).
+
 Behaviour contract (per ADR-ARCH-025 and the task acceptance criteria):
 
 - the function **never raises** past its boundary, with one exception —
