@@ -1,7 +1,7 @@
 # Unattended Build Service — Scope (Phase UBS)
 
-**Status:** NOT STARTED
-**Date:** 2026-06-11
+**Status:** PARTIALLY STARTED — keystone core (runner→guardkit wiring) landed 2026-05-14 (TASK-ABW-001); sibling features (UBS-002/003/004) still open
+**Date:** 2026-06-11 · **Corrected:** 2026-07-02 (see §2 banner)
 **Repo focus:** forge (primary) · guardkitfactory (gate fix) · jarvis (notification surface) · ops (GB10 deployment)
 **Decision frame:** DF-003 (build half unattended on local, Forge orchestrating the build half only) · DF-002 (Rich-hours ledger; plant recovery) · DECISION-DF-001 (local inference on the unattended critical path)
 **Companion findings:** `ai-transition/docs/fine-tuned-judgment-agents-findings.md` (§6 addendum)
@@ -24,6 +24,19 @@ loop is not the product; it is the factory's night shift.**
 
 ## 2. Current state (verified from source, 2026-06-11)
 
+> **⚠️ 2026-07-02 correction (re-verified from source).** The `autobuild_runner`
+> row below was already stale when this table was written. TASK-ABW-001 landed the
+> real `guardkit autobuild` subprocess wiring on **2026-05-14** (coach-ft-v3 Coach
+> routing added 2026-06-21) — ~4 weeks before this table's "verified 2026-06-11"
+> date, which did not re-check that row. The keystone's *core deliverable is
+> code-complete, not a placeholder.* What actually remains: (a) operational
+> validation (TASK-ABW-OPS, operator-handoff — never run; the FEAT-9E59 rehearsal
+> was tied to the since-passed 2026-05-16 demo); (b) the **coach-score population
+> gap** — `last_coach_score`/`aggregate_coach_score` are plumbed through the bridge
+> but the runner never sets them (always `None`), a prerequisite for UBS-002
+> (see ADR-ARCH-033); (c) the genuinely-unstarted sibling features UBS-002/003/004.
+> All *other* rows below were re-verified accurate as of 2026-07-02.
+
 | Component | State |
 |---|---|
 | `forge serve` daemon (healthz, dispatcher, state channel, recovery) | ✅ Built |
@@ -33,7 +46,7 @@ loop is not the product; it is the factory's night shift.**
 | Mode B planner (feature chain) / Mode C planner (review → fix → re-review) | ✅ Built; Mode C assumptions catalogued (ASSUM-004…017) |
 | guardkit adapter (`adapters/guardkit/run.py`, parser, progress subscriber, D39 context resolver) | ✅ Built |
 | Lifecycle bridge → `pipeline.*` envelopes (paused/resumed/complete/failed) | ✅ Built |
-| `autobuild_runner` subagent node bodies | ❌ **Placeholders** — graph transitions without invoking the adapter (named follow-up in module docstring) |
+| `autobuild_runner` subagent node bodies | ✅ **Wired (2026-05-14, TASK-ABW-001)** — `_node_running_wave` shells `guardkit autobuild feature <id> --fresh --verbose --coach-model coach-ft-v3` with timeout + exit-code→lifecycle mapping. ⚠️ **Gap:** Coach score not parsed into `last_coach_score`/`aggregate_coach_score` (always `None`) — UBS-002 prerequisite (ADR-ARCH-033) |
 | Progress/escalation notifications → Telegram | ❌ Not wired |
 | Unattended budget guards (Mode C cycle cap, wall-clock/token budget) | ❌ Not present (ASSUM-010: no numeric cap, reviewer-driven) |
 | guardkit AutoBuild on local inference (FEAT-AOF) | ⚠️ Blocked at run-24 — TASK-FIX-COACHSYNTH (guardkitfactory) |

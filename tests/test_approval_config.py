@@ -192,6 +192,26 @@ class TestApprovalYamlRoundTrip:
                 "default_history_limit": 50,
                 "repo_allowlist": [],
             },
+            # ``budget`` was added by FEAT-UBS-002 — like ``queue`` above, the
+            # unfiltered round-trip dump now always includes it, so this "all
+            # sections" test must declare it with default values.
+            "budget": {
+                "default_profile": "attended",
+                "profiles": {
+                    "attended": {
+                        "max_review_cycles": None,
+                        "max_build_wallclock_seconds": None,
+                        "max_build_tokens": None,
+                        "min_coach_score": None,
+                    },
+                    "unattended": {
+                        "max_review_cycles": 2,
+                        "max_build_wallclock_seconds": 5400,
+                        "max_build_tokens": None,
+                        "min_coach_score": None,
+                    },
+                },
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

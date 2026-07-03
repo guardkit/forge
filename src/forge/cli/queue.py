@@ -226,9 +226,7 @@ def make_persistence(config: ForgeConfig) -> _PersistenceLike:
     from forge.lifecycle.migrations import apply_at_boot
 
     raw_path = os.environ.get("FORGE_DB_PATH")
-    db_path = (
-        Path(raw_path).expanduser() if raw_path else DEFAULT_DB_PATH.expanduser()
-    )
+    db_path = Path(raw_path).expanduser() if raw_path else DEFAULT_DB_PATH.expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = connect_writer(db_path)
@@ -326,9 +324,7 @@ def _path_in_allowlist(repo: Path, allowlist: list[Path]) -> bool:
             # Defensive — pathological symlink loops should not crash
             # the CLI. Skip the bad entry; the operator can re-run after
             # cleaning up ``forge.yaml``.
-            logger.warning(
-                "repo_allowlist entry %r could not be resolved", entry
-            )
+            logger.warning("repo_allowlist entry %r could not be resolved", entry)
             continue
         if repo_resolved == entry_resolved:
             return True
@@ -479,9 +475,7 @@ def resolve_mode(value: str) -> BuildMode:
         click.BadParameter: For any value outside the accepted set.
     """
     if not isinstance(value, str):
-        raise click.BadParameter(
-            f"--mode must be a string; got {type(value).__name__}"
-        )
+        raise click.BadParameter(f"--mode must be a string; got {type(value).__name__}")
     candidate = value.strip().lower()
     if candidate in _MODE_FLAG_TO_BUILD_MODE:
         return _MODE_FLAG_TO_BUILD_MODE[candidate]
@@ -572,6 +566,16 @@ def _require_forge_config(config: Any) -> ForgeConfig:
         "Auto-generated (uuid4) when omitted."
     ),
 )
+@click.option(
+    "--profile",
+    "profile_name",
+    default=None,
+    help=(
+        "Budget-guard profile from config.budget.profiles (e.g. 'unattended'). "
+        "Selects review-cycle / wall-clock caps for the build (FEAT-UBS-002). "
+        "Attended (the default) = caps off (ASSUM-010)."
+    ),
+)
 @click.pass_obj
 def queue_cmd(
     config_obj: Any,
@@ -583,6 +587,7 @@ def queue_cmd(
     max_turns: int | None,
     sdk_timeout_seconds: int | None,
     correlation_id: str | None,
+    profile_name: str | None,
 ) -> None:
     """Enqueue a build for ``feature_id`` (write-then-publish).
 
@@ -621,6 +626,55 @@ def queue_cmd(
 
     config = _require_forge_config(config_obj)
 
+    # 0. FEAT-UBS-002 — resolve + validate the budget-guard profile BEFORE any
+    #    side effect (mirrors the mode-resolution discipline). An unknown name
+    #    is rejected here rather than silently falling back to the default.
+    #
+    #    NOTE (skeleton): the selected profile is not yet carried across the
+    #    queue→daemon boundary. ``BuildQueuedPayload`` (nats-core) has no
+    #    profile field and the ``builds`` table has no profile column, so a
+    #    per-build ``--profile`` override cannot travel to the daemon today —
+    #    the daemon resolves caps from ``config.budget.default_profile``.
+    #    Plumbing the override (a nats-core field via ADR, or a ``builds``
+    #    column + daemon read) is tracked in TASK-UBS-002-integration.
+    try:
+        # Pass profile_name straight through — resolve() owns the None→default
+        # mapping (models.py), so a future change to that logic is not silently
+        # bypassed by pre-computing the effective name here.
+        guards = config.budget.resolve(profile_name)
+    except KeyError as exc:
+        # Reuse resolve()'s message (single sort); args[0] strips KeyError's
+        # repr-quoting so the operator sees a clean sentence.
+        raise click.UsageError(exc.args[0])
+    effective_profile = profile_name or config.budget.default_profile
+    if guards.caps_enabled:
+        # Render only the caps that are set, derived from the model so a new cap
+        # field needs no edit here. The coach-score floor is flagged dormant
+        # (ADR-ARCH-033) so an inert stub is not shown as an active cap.
+        rendered = ", ".join(
+            f"{name}={value}"
+            + (
+                " (dormant — coach-score feed pending, ADR-ARCH-033)"
+                if name == "min_coach_score"
+                else ""
+            )
+            for name, value in guards.model_dump().items()
+            if value is not None
+        )
+        click.echo(f"budget profile {effective_profile!r}: {rendered}")
+    # Honest-deferral note: fire whenever an explicit --profile override differs
+    # from what the daemon will actually apply (default_profile) — regardless of
+    # whether the selected profile has caps. `--profile attended` against a
+    # capped default is exactly the silent mismatch this surfaces.
+    if profile_name is not None and profile_name != config.budget.default_profile:
+        click.echo(
+            f"NOTE: --profile {profile_name!r} is not yet plumbed to the daemon "
+            "(FEAT-UBS-002 skeleton); the running daemon applies "
+            f"config.budget.default_profile={config.budget.default_profile!r}. "
+            "See TASK-UBS-002-integration.",
+            err=True,
+        )
+
     # 1. Resolve ``feature_id`` and (Mode C only) ``task_id`` BEFORE any
     #    side effect (AC-003 / sc_003). Mode A/B reuse the existing
     #    discipline; Mode C interprets the positional as a TASK-XXX
@@ -641,9 +695,7 @@ def queue_cmd(
         task_id = positional_id
         # 1b. Parent feature_id comes from the fix-task YAML.
         try:
-            raw_parent = _load_parent_feature_from_fix_task_yaml(
-                Path(feature_yaml)
-            )
+            raw_parent = _load_parent_feature_from_fix_task_yaml(Path(feature_yaml))
         except click.UsageError:
             # Click handles UsageError formatting + exit code on its own
             # — re-raise so the operator sees the canonical message

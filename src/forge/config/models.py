@@ -82,6 +82,18 @@ DEFAULT_APPROVAL_WAIT_SECONDS = 300
 #: forge.yaml.approval.max_wait_seconds ≈ 3600").
 DEFAULT_APPROVAL_MAX_WAIT_SECONDS = 3600
 
+#: FEAT-UBS-002 — the reserved profile name whose caps must all be unset. It
+#: encodes FEAT-FORGE-008 ASSUM-010 (attended mode = reviewer-driven, no numeric
+#: cap). ``BudgetConfig`` rejects any config that puts a cap on this profile.
+ATTENDED_PROFILE_NAME = "attended"
+
+#: FEAT-UBS-002 — conservative default caps for the ``unattended`` profile. Kept
+#: deliberately tight at launch per scope §3 constraint 1 ("autonomy follows
+#: verification quality"); loosened only as the QA-Verifier Phase-0 gates come
+#: online on the features being built.
+DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES = 2
+DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS = 5400  # 90 minutes
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -306,13 +318,161 @@ class QueueConfig(BaseModel):
     )
 
 
+class BudgetGuards(BaseModel):
+    """Per-profile build budget caps (FEAT-UBS-002).
+
+    Every cap is optional. ``None`` means *no cap* — the attended-mode
+    semantics preserved from FEAT-FORGE-008 ASSUM-010 (reviewer-driven Mode C
+    termination, no numeric iteration cap). A cap constrains a build only when
+    it is set to a positive value in an *unattended* profile. This model is the
+    declarative half; enforcement lives in
+    :mod:`forge.pipeline.budget_guard` (a profile layered *on top* of the Mode C
+    planner, never a rewrite of it).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_review_cycles: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Cap on Mode C follow-up review cycles. ``None`` = no cap "
+            "(ASSUM-010). On breach the build pauses and escalates rather "
+            "than running further reviews."
+        ),
+    )
+    max_build_wallclock_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Cap on total build wall-clock (seconds). ``None`` = no cap. "
+            "Distinct from the runner's per-subprocess timeout — this bounds "
+            "the whole build."
+        ),
+    )
+    max_build_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional cap on tokens consumed by a build (LangSmith-tagged or "
+            "parsed from harness output). ``None`` = no cap / not measured."
+        ),
+    )
+    min_coach_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Optional Coach-score floor. STUB (ADR-ARCH-033): enforcement is "
+            "inert until the runner populates ``last_coach_score`` — the "
+            "coach-score gap that is itself a UBS-002 prerequisite. Set here "
+            "so the guard activates automatically once the score flows."
+        ),
+    )
+
+    @property
+    def caps_enabled(self) -> bool:
+        """Whether any cap is configured (i.e. this is an unattended-style profile).
+
+        Deliberately includes ``min_coach_score`` even though its enforcement is a
+        STUB (ADR-ARCH-033): a configured floor is still a cap for ASSUM-010
+        purposes, so ``BudgetConfig`` correctly rejects arming the reserved
+        ``attended`` profile with only a floor. The CLI annotates the floor as
+        dormant when it echoes the caps, so an inert stub is not misrepresented as
+        an active cap. Do not drop ``min_coach_score`` here without also moving the
+        attended-arming guard, or ASSUM-010 leaks.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.max_review_cycles,
+                self.max_build_wallclock_seconds,
+                self.max_build_tokens,
+                self.min_coach_score,
+            )
+        )
+
+
+def _default_budget_profiles() -> dict[str, BudgetGuards]:
+    """Two built-in profiles: ``attended`` (caps off) and ``unattended``."""
+    return {
+        ATTENDED_PROFILE_NAME: BudgetGuards(),  # all None — ASSUM-010 preserved
+        "unattended": BudgetGuards(
+            max_review_cycles=DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES,
+            max_build_wallclock_seconds=(
+                DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS
+            ),
+        ),
+    }
+
+
+class BudgetConfig(BaseModel):
+    """Named budget-guard profiles for the Unattended Build Service (UBS-002).
+
+    ``forge queue --profile <name>`` selects one profile; the daemon resolves
+    the caps for the build. The ``attended`` profile is reserved and must keep
+    every cap unset (ASSUM-010) — the model_validator rejects any config that
+    arms it, so an operator cannot silently turn attended builds into capped
+    ones by editing the wrong block.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_profile: str = Field(
+        default=ATTENDED_PROFILE_NAME,
+        description=(
+            "Profile applied when a build does not request one. Defaults to "
+            "``attended`` (caps off) so unattended caps are strictly opt-in."
+        ),
+    )
+    profiles: dict[str, BudgetGuards] = Field(
+        default_factory=_default_budget_profiles,
+        description="Map of profile name → budget caps.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_profiles(self) -> BudgetConfig:
+        """Reject a missing default profile or an armed ``attended`` profile."""
+        if self.default_profile not in self.profiles:
+            raise ValueError(
+                f"budget.default_profile {self.default_profile!r} is not one "
+                f"of the defined profiles {sorted(self.profiles)!r}"
+            )
+        attended = self.profiles.get(ATTENDED_PROFILE_NAME)
+        if attended is not None and attended.caps_enabled:
+            raise ValueError(
+                f"budget.profiles[{ATTENDED_PROFILE_NAME!r}] must have all caps "
+                "unset (FEAT-FORGE-008 ASSUM-010 — attended mode is "
+                "reviewer-driven with no numeric cap); use a differently-named "
+                "profile for capped builds"
+            )
+        return self
+
+    def resolve(self, name: str | None) -> BudgetGuards:
+        """Return the caps for ``name`` (or ``default_profile`` when ``None``).
+
+        Raises:
+            KeyError: If ``name`` is not a defined profile — surfaced so the
+                CLI can list the known profiles rather than silently applying
+                the default.
+        """
+        key = name if name is not None else self.default_profile
+        try:
+            return self.profiles[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"unknown budget profile {key!r}; known profiles: "
+                f"{sorted(self.profiles)!r}"
+            ) from exc
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
-    ``fleet``, ``pipeline``, ``approval`` and ``queue`` are optional with
-    sensible defaults so that a minimal ``forge.yaml`` only needs to declare
-    the required ``permissions`` section. ``permissions`` itself is required
-    because there is no safe default filesystem allowlist.
+    ``fleet``, ``pipeline``, ``approval``, ``queue`` and ``budget`` are optional
+    with sensible defaults so that a minimal ``forge.yaml`` only needs to
+    declare the required ``permissions`` section. ``permissions`` itself is
+    required because there is no safe default filesystem allowlist.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -321,6 +481,13 @@ class ForgeConfig(BaseModel):
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    budget: BudgetConfig = Field(
+        default_factory=BudgetConfig,
+        description=(
+            "FEAT-UBS-002 budget-guard profiles. Defaults to attended "
+            "(caps off); operators opt into unattended caps per profile."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -331,6 +498,7 @@ class ForgeConfig(BaseModel):
 
 
 __all__ = [
+    "ATTENDED_PROFILE_NAME",
     "DEFAULT_APPROVAL_MAX_WAIT_SECONDS",
     "DEFAULT_APPROVAL_WAIT_SECONDS",
     "DEFAULT_APPROVED_ORIGINATORS",
@@ -340,7 +508,11 @@ __all__ = [
     "DEFAULT_INTENT_MIN_CONFIDENCE",
     "DEFAULT_PROGRESS_INTERVAL_SECONDS",
     "DEFAULT_STALE_HEARTBEAT_SECONDS",
+    "DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS",
+    "DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES",
     "ApprovalConfig",
+    "BudgetConfig",
+    "BudgetGuards",
     "FilesystemPermissions",
     "FleetConfig",
     "ForgeConfig",

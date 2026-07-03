@@ -1,0 +1,43 @@
+id: FEAT-UBS-002
+name: Unattended build-profile budget guards
+description: 'Named budget profiles for the Unattended Build Service. Reserved attended
+  profile keeps all caps unset (ASSUM-010); unattended carries conservative caps. A
+  pure evaluator judges over/within budget (first-breach-wins); on breach a running
+  build pauses and raises a high-risk approval. Retro-planned: the skeleton (config
+  + evaluator + CLI) is built and unit-tested; the live enforcement is deferred.'
+created: '2026-07-03T00:00:00'
+status: in_progress
+complexity: 6
+estimated_tasks: 2
+tasks:
+- id: TASK-UBS-002-skeleton
+  name: Budget-guard skeleton — config profiles, pure evaluator, CLI flag
+  file_path: tasks/backlog/unattended-build-service/TASK-UBS-002-skeleton.md
+  complexity: 5
+  dependencies: []
+  status: completed
+  implementation_mode: task-work
+  estimated_minutes: 0
+  requires_infrastructure: []
+  result:
+    final_decision: completed
+    note: Built outside autobuild, then retro-formalised via /feature-spec + /feature-plan
+      and independently reviewed via /code-review. 29 unit tests green across
+      test_budget_config.py, test_budget_guard.py, test_cli_profile_flag.py. Oracle
+      = the 15 @task:TASK-UBS-002-skeleton BDD scenarios.
+- id: TASK-UBS-002-integration
+  name: Wire the budget guard into the supervisor + plumb the profile
+  file_path: tasks/backlog/unattended-build-service/TASK-UBS-002-integration.md
+  complexity: 6
+  dependencies:
+  - TASK-UBS-002-skeleton
+  status: pending
+  implementation_mode: task-work
+  estimated_minutes: 240
+  requires_infrastructure: []
+orchestration:
+  parallel_groups:
+  - - TASK-UBS-002-skeleton
+  - - TASK-UBS-002-integration
+  estimated_duration_minutes: 240
+  recommended_parallel: 1

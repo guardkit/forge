@@ -15,7 +15,7 @@ A short **delta** to the existing `unattended-build-service-scope.md` (Phase UBS
 
 The weekend "Claude-Code-drives-AutoBuild-and-fixes-failures" pattern is already productised, locally, as **Phase UBS**: the Forge daemon (`forge serve`) + queue + Mode B/C planners, driving AutoBuild through `adapters/guardkit/run.py`, with Mode C doing review → fix → re-review. It is **local by design** — UBS §3.5: "DF-001 holds… frontier never enters the unattended path."
 
-**The keystone is FEAT-UBS-001** — the `autobuild_runner` node bodies are placeholders; the graph transitions without invoking the adapter. Wiring them (per the frozen `AutobuildState` schema) is what makes the night shift real. That is the next concrete build on the forge side, and it already exists in the scope + build plan. Nothing in this addendum changes it.
+**The keystone is FEAT-UBS-001.** ⚠️ **2026-07-02 correction (verified from source):** the `autobuild_runner` node bodies are **no longer placeholders** — TASK-ABW-001 wired `_node_running_wave` to invoke `guardkit autobuild` on 2026-05-14 (coach-ft-v3 routing added 2026-06-21). The keystone's *core deliverable is code-complete.* What remains to make the night shift real: operational validation (TASK-ABW-OPS, operator-handoff), closing the **coach-score population gap** (`last_coach_score`/`aggregate_coach_score` are plumbed but never set — ADR-ARCH-033; a prerequisite for UBS-002), and the sibling features UBS-002/003/004. This addendum's *strategy* is unchanged — only the keystone's status is corrected.
 
 ---
 

@@ -1,0 +1,188 @@
+"""Tests for the ``forge queue --profile`` CLI surface (FEAT-UBS-002).
+
+Coverage:
+
+* Unknown profile is rejected before any side effect (UsageError / exit 2).
+* A known unattended profile echoes the resolved caps and the not-yet-plumbed
+  NOTE, and still enqueues successfully.
+* The attended default is silent (no caps banner) and enqueues normally.
+
+Mirrors the ``click.testing.CliRunner`` + fake-persistence harness in
+``tests.forge.test_cli_mode_flag`` so the suite runs without a NATS broker.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from click.testing import CliRunner
+
+from forge.cli import queue as cli_queue
+from forge.cli.main import main
+from forge.lifecycle.modes import BuildMode
+
+
+@pytest.fixture
+def repo_dir(tmp_path: Path) -> Path:
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    return repo
+
+
+@pytest.fixture
+def feature_yaml(tmp_path: Path) -> Path:
+    path = tmp_path / "feature.yaml"
+    path.write_text("name: example\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def config_path(tmp_path: Path, repo_dir: Path) -> Path:
+    """A forge.yaml whose budget block defines attended + unattended."""
+    doc = {
+        "queue": {"repo_allowlist": [str(repo_dir)]},
+        "budget": {
+            "default_profile": "attended",
+            "profiles": {
+                "attended": {},
+                "unattended": {
+                    "max_review_cycles": 2,
+                    "max_build_wallclock_seconds": 5400,
+                },
+            },
+        },
+        "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+    }
+    path = tmp_path / "forge.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return path
+
+
+class _FakePersistence:
+    """Minimal in-memory persistence: records queued builds, no NATS/db."""
+
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    def exists_active_build(self, feature_id: str) -> bool:  # noqa: ARG002
+        return False
+
+    def queue_build(
+        self, payload: Any, *, mode: BuildMode | str | None = None  # noqa: ARG002
+    ) -> str:
+        self.records.append(payload)
+        return f"build-{payload.feature_id}"
+
+
+@pytest.fixture
+def fake_persistence(monkeypatch: pytest.MonkeyPatch) -> _FakePersistence:
+    fake = _FakePersistence()
+    monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
+    monkeypatch.setattr(cli_queue, "publish", lambda subject, body: None)
+    return fake
+
+
+def _invoke(config_path: Path, repo_dir: Path, feature_yaml: Path, *profile_args: str):
+    runner = CliRunner()
+    return runner.invoke(
+        main,
+        [
+            "--config",
+            str(config_path),
+            "queue",
+            "FEAT-PROF",
+            "--repo",
+            str(repo_dir),
+            "--feature-yaml",
+            str(feature_yaml),
+            *profile_args,
+        ],
+    )
+
+
+class TestUnknownProfileRejected:
+    """AC: an unknown --profile fails fast, before persistence/publish."""
+
+    def test_unknown_profile_exit_2(
+        self, config_path: Path, repo_dir: Path, feature_yaml: Path
+    ) -> None:
+        # No fake_persistence fixture: the rejection must happen before any
+        # persistence call, so the real make_persistence is never reached.
+        result = _invoke(config_path, repo_dir, feature_yaml, "--profile", "ghost")
+        assert result.exit_code == 2, result.output
+        assert "unknown budget profile" in result.output
+        assert "unattended" in result.output  # lists known profiles
+
+
+class TestKnownProfileEchoesCaps:
+    """AC: a capped profile echoes its caps + the not-yet-plumbed NOTE."""
+
+    def test_unattended_echoes_caps_and_note(
+        self,
+        config_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fake_persistence: _FakePersistence,
+    ) -> None:
+        result = _invoke(config_path, repo_dir, feature_yaml, "--profile", "unattended")
+        assert result.exit_code == 0, result.output
+        assert "budget profile 'unattended'" in result.output
+        assert "max_review_cycles=2" in result.output
+        assert "not yet plumbed to the daemon" in result.output
+        assert len(fake_persistence.records) == 1
+
+
+class TestAttendedDefaultSilent:
+    """AC: the attended default enqueues with no caps banner (ASSUM-010)."""
+
+    def test_no_profile_is_silent_and_enqueues(
+        self,
+        config_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fake_persistence: _FakePersistence,
+    ) -> None:
+        result = _invoke(config_path, repo_dir, feature_yaml)
+        assert result.exit_code == 0, result.output
+        assert "budget profile" not in result.output
+        assert len(fake_persistence.records) == 1
+
+
+class TestAttendedOverrideAgainstCappedDefault:
+    """AC (review fix): --profile attended against a capped default warns of the
+    mismatch even though the selected profile has no caps to echo."""
+
+    def test_attended_override_warns_and_shows_no_caps(
+        self,
+        tmp_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fake_persistence: _FakePersistence,
+    ) -> None:
+        # Capped default; operator explicitly asks for caps OFF (attended). The
+        # daemon would still apply the capped default — surface that silently no
+        # more.
+        doc = {
+            "queue": {"repo_allowlist": [str(repo_dir)]},
+            "budget": {
+                "default_profile": "unattended",
+                "profiles": {
+                    "attended": {},
+                    "unattended": {"max_review_cycles": 2},
+                },
+            },
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+        }
+        cfg = tmp_path / "forge.yaml"
+        cfg.write_text(yaml.safe_dump(doc), encoding="utf-8")
+        result = _invoke(cfg, repo_dir, feature_yaml, "--profile", "attended")
+        assert result.exit_code == 0, result.output
+        # attended has no caps -> no caps banner
+        assert "budget profile" not in result.output
+        # but the mismatch (daemon applies the capped default) IS surfaced
+        assert "not yet plumbed to the daemon" in result.output
+        assert "default_profile='unattended'" in result.output
+        assert len(fake_persistence.records) == 1

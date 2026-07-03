@@ -1,6 +1,24 @@
 # Unattended Build Service — Build Plan (Phase UBS)
 
-## Status: Ready for `/feature-spec FEAT-UBS-001` once Prerequisite 1 clears
+## Status (2026-07-03)
+
+- **FEAT-UBS-001 (keystone):** core SHIPPED (TASK-ABW-001, 2026-05-14) — do NOT
+  `/feature-spec FEAT-UBS-001`. Operational validation still pending →
+  `TASK-ABW-OPS` (operator-handoff: GB10 allowlist + sidecar restart + FEAT-9E59
+  rehearsal, now also capturing the autobuild transcript for the coach-score gap).
+- **FEAT-UBS-002 (budget guards):** SKELETON DONE + under process — config
+  profiles + pure `budget_guard` evaluator + `forge queue --profile`, 30 unit
+  tests; formalised via `/feature-spec` + `/feature-plan`
+  (`.guardkit/features/FEAT-UBS-002.yaml`, `features/unattended-build-service-budget-guards/`);
+  independently reviewed via `/code-review` (one silent-mismatch defect found +
+  fixed). Live enforcement (supervisor wiring + queue→daemon profile plumbing +
+  coach-score activation) DEFERRED → `TASK-UBS-002-integration`.
+- **Substrate/fork decision:** `ADR-ARCH-033` (runner's direct-shell path
+  ratified as interim; coach-score population gap is the UBS-002 prerequisite).
+- **Next per this plan (visibility before autonomy):** FEAT-UBS-003, then the
+  UBS-002 integration, then FEAT-UBS-004.
+
+## Original status (2026-06-11): Ready for `/feature-spec FEAT-UBS-001` once Prerequisite 1 clears
 ## Repo: forge (primary); guardkitfactory (prerequisite); jarvis (UBS-003)
 ## Scope doc: `unattended-build-service-scope.md` (same directory)
 
@@ -21,13 +39,13 @@
 
 ## Feature summary
 
-| # | Feature | Repo | Depends on | Est. |
-|---|---------|------|-----------|------|
-| 1 | FEAT-UBS-001 — runner node bodies → guardkit adapter | forge | P1, P2 | 1–2 days |
-| 2 | FEAT-UBS-003 — notifications → Jarvis → Telegram | forge + jarvis | UBS-001 (envelope flow to observe) | 1 day |
-| 3 | FEAT-UBS-002 — unattended budget guards | forge | UBS-001 | 0.5–1 day |
-| 4 | FEAT-UBS-004 — GB10 deployment + runbook + first overnight | ops | UBS-001..003 | 0.5 day + 1 night |
-| 5 | FEAT-UBS-005 — two-Spark dispatch (ADR-SP-012 amendment) | forge | ≥5 clean overnights + queue-depth evidence | deferred |
+| # | Feature | Repo | Depends on | Est. | Status (2026-07-03) |
+|---|---------|------|-----------|------|---------------------|
+| 1 | FEAT-UBS-001 — runner node bodies → guardkit adapter | forge | P1, P2 | 1–2 days | ✅ core shipped; ⏳ TASK-ABW-OPS validation |
+| 2 | FEAT-UBS-003 — notifications → Jarvis → Telegram | forge + jarvis | UBS-001 (envelope flow to observe) | 1 day | ⬜ **next** |
+| 3 | FEAT-UBS-002 — unattended budget guards | forge | UBS-001 | 0.5–1 day | 🟡 skeleton done + reviewed; ⏳ TASK-UBS-002-integration |
+| 4 | FEAT-UBS-004 — GB10 deployment + runbook + first overnight | ops | UBS-001..003 | 0.5 day + 1 night | ⬜ |
+| 5 | FEAT-UBS-005 — two-Spark dispatch (ADR-SP-012 amendment) | forge | ≥5 clean overnights + queue-depth evidence | deferred | ⬜ deferred |
 
 Ordering note: UBS-003 before UBS-002 — visibility before autonomy. Watching
 the first capped-off attended runs through Telegram is itself validation input

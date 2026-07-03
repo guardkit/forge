@@ -84,7 +84,7 @@ Cross-repo work from a single in-repo session is a dodgy process precisely becau
 
 1. **`DECISION-DF-006`** filed (done) — the substrate constraint both specs inherit.
 2. **QA Verifier Phase 0** (`guardkit`) — deterministic gates (anti-stub AST, coverage/reachability, FEAT-MEM-05 as the behavioural oracle). Cheap, no fine-tune, closes the `fs-01` class. **This is the highest-leverage first move** and it de-risks everything downstream.
-3. **FEAT-UBS-001** (`forge`) — wire the `autobuild_runner` placeholders to the guardkit adapter (the keystone that makes the night shift real). Gated by QA Verifier Phase 0 for unattended safety.
+3. **FEAT-UBS-001** (`forge`) — ⚠️ **core already shipped** (TASK-ABW-001, 2026-05-14): `_node_running_wave` invokes `guardkit autobuild`. Remaining keystone work is operational validation (TASK-ABW-OPS, operator-handoff) + closing the **coach-score population gap** (ADR-ARCH-033) that UBS-002's budget guards depend on. Gated by QA Verifier Phase 0 for unattended safety.
 4. Then **QA Verifier Phase 1** (fine-tune) + **UBS-002/003/004**; the improve loop after.
 
 **Honest priority note.** Rich's own June sequencing (findings D15; the 14 June capture's 20 June status update) places the **LPA HSBC demo (9 July)** and the **output-side deploy/verify loop** *ahead* of this build-side improve work. If the demo is still live, QA Verifier Phase 0 is the only item here cheap enough to run in parallel without stealing focus; the UBS keystone and the improve loop are post-demo. This is a flag, not a blocker — but sequence with it in view rather than letting build-side dependability quietly displace the demo.
