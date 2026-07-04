@@ -91,12 +91,21 @@ breach as rationale — never silent termination, never silent continuation.
 Attended profile = caps off (ASSUM-010 unchanged). Per-build override at
 queue time (`forge queue FEAT-X --profile unattended`).
 
-### FEAT-UBS-003 — Pipeline notifications → Jarvis → Telegram (and approvals back)
+### FEAT-UBS-003 — Pipeline notifications → Jarvis → Slack (and approvals back)
+> **2026-07-03 delta:** surface pivoted **Telegram → Slack** by operator
+> decision (no Telegram account; Telegram was an ideation default never
+> actually chosen). Slack Socket Mode keeps the reply path outbound-only — the
+> same no-public-endpoint property that motivated Telegram. v1 scope widened
+> to the full lifecycle (queued → running → terminal + pauses). Spec:
+> `features/jarvis-notification-bridge/` (31 scenarios, assumptions resolved).
+
 Jarvis subscribes to `pipeline.*` lifecycle envelopes and
-`agents.approval.forge.*`; routes to Telegram with build/feature/correlation
-context and coach scores. v1: one-way notifications for all terminal states +
-pauses. v1.1: approve/reject replies from Telegram → `ApprovalResponsePayload`
-→ Forge approval subscriber → resume (the `mark_resume_pending` path).
+`agents.approval.forge.*`; routes to Slack with build/feature/correlation
+context and coach scores. v1: one-way notifications for queued (jarvis-intake),
+running, all terminal states + pauses. v1.1: approve/reject interactive-button
+replies from Slack → `ApprovalResponsePayload` → Forge approval subscriber →
+resume (the `mark_resume_pending` path — note: production wiring for the
+approval subscriber does not exist yet, verified 2026-07-03).
 Notification failure is logged-and-continue per DDR-007.
 
 ### FEAT-UBS-004 — GB10 deployment + overnight runbook (ops)

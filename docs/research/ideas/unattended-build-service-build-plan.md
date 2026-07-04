@@ -13,10 +13,34 @@
   independently reviewed via `/code-review` (one silent-mismatch defect found +
   fixed). Live enforcement (supervisor wiring + queue→daemon profile plumbing +
   coach-score activation) DEFERRED → `TASK-UBS-002-integration`.
+- **FEAT-UBS-003 (notifications → Jarvis → Slack, was Telegram):** SPEC
+  REVISED (2026-07-03, same day as written) — **surface pivoted to Slack by
+  operator decision** (no Telegram account; Telegram was an ideation-doc
+  default never actually chosen; Slack Socket Mode keeps the v1.1 reply path
+  outbound-only). Now 31 scenarios (8 key / 5 boundary / 7 negative / 12 edge;
+  2 security; 6 smoke), parser-validated. v1 scope widened to **full
+  lifecycle** (queued → running → terminal + pauses) per the operator and the
+  original validation line. Both low-confidence assumptions RESOLVED:
+  ASSUM-003 coach-score range source-verified (0.0–1.0 forge-enforced
+  contract; wire unconstrained; **always None today** per ADR-ARCH-033);
+  ASSUM-007 → Slack bot/channel binding (JARVIS_SLACK_* env vars). Two new
+  assumptions recorded: ASSUM-010 (build-cancelled has no verified forge
+  producer today) + ASSUM-011 (queued notification fires at jarvis intake
+  publish-time; CLI-queued builds get none). Local NATS prerequisite fixed
+  (see P3 note). **PLANNED (2026-07-03, TASK-REV-C951):** judge-panel decision
+  review chose the validation-first in-process Slack sink (88/100;
+  correlation-independent fan-out; plain pytest, no BDD glue — both
+  operator-confirmed). 16 tasks generated (13 jarvis + 3 forge, repo-local per
+  the autobuild sibling-repo constraint); jarvis v1 feature YAML
+  **FEAT-28FF** validated (5 waves, smoke gates after waves 2/3/4); v1.1
+  YAMLs deliberately deferred until the live v1 checkpoint (TASK-JNB-004)
+  passes. Report: `.claude/reviews/TASK-REV-C951-review-report.md`. Next:
+  `/feature-build FEAT-28FF` in the jarvis repo (bot `/invite` to
+  #forge-builds still pending for the checkpoint).
 - **Substrate/fork decision:** `ADR-ARCH-033` (runner's direct-shell path
   ratified as interim; coach-score population gap is the UBS-002 prerequisite).
-- **Next per this plan (visibility before autonomy):** FEAT-UBS-003, then the
-  UBS-002 integration, then FEAT-UBS-004.
+- **Next per this plan (visibility before autonomy):** FEAT-UBS-003
+  `/feature-plan` (spec done), then the UBS-002 integration, then FEAT-UBS-004.
 
 ## Original status (2026-06-11): Ready for `/feature-spec FEAT-UBS-001` once Prerequisite 1 clears
 ## Repo: forge (primary); guardkitfactory (prerequisite); jarvis (UBS-003)
@@ -33,7 +57,12 @@
 - [ ] **P2:** One clean FEAT-AOF run end-to-end on local inference (Player +
   LLM Coach gather/synthesis) — freezes the harness contract UBS-001 wires to.
 - [ ] **P3:** NATS up on GB10 (`nats-infrastructure` docker compose) — required
-  for UBS-003 testing and the lifecycle bridge.
+  for UBS-003 testing and the lifecycle bridge. *(Local dev broker fixed +
+  verified 2026-07-03: container had been crash-looping since the ~Jun-24
+  accounts-template update — three new account passwords missing from `.env`
+  (FORGE/FLEET_MEMORY/GUARDKIT_NATS_PASSWORD, now generated + appended) and the
+  Apr-17 image baked a stale entrypoint that clobbered `$JS.>` subjects (image
+  rebuilt). PIPELINE/AGENTS/JARVIS streams verified live as the `forge` user.)*
 - [ ] Second GB10 racked + Tailscale'd (arrives 2026-06-12) — needed only for
   UBS-005, not for the critical path.
 
@@ -42,7 +71,7 @@
 | # | Feature | Repo | Depends on | Est. | Status (2026-07-03) |
 |---|---------|------|-----------|------|---------------------|
 | 1 | FEAT-UBS-001 — runner node bodies → guardkit adapter | forge | P1, P2 | 1–2 days | ✅ core shipped; ⏳ TASK-ABW-OPS validation |
-| 2 | FEAT-UBS-003 — notifications → Jarvis → Telegram | forge + jarvis | UBS-001 (envelope flow to observe) | 1 day | ⬜ **next** |
+| 2 | FEAT-UBS-003 — notifications → Jarvis → **Slack** (was Telegram) | forge + jarvis | UBS-001 (envelope flow to observe) | 1 day | 🟡 **spec revised** (31 scenarios; Slack pivot; assumptions resolved) → `/feature-plan` |
 | 3 | FEAT-UBS-002 — unattended budget guards | forge | UBS-001 | 0.5–1 day | 🟡 skeleton done + reviewed; ⏳ TASK-UBS-002-integration |
 | 4 | FEAT-UBS-004 — GB10 deployment + runbook + first overnight | ops | UBS-001..003 | 0.5 day + 1 night | ⬜ |
 | 5 | FEAT-UBS-005 — two-Spark dispatch (ADR-SP-012 amendment) | forge | ≥5 clean overnights + queue-depth evidence | deferred | ⬜ deferred |
@@ -88,6 +117,10 @@ drives real lifecycle transitions on the wire (`forge status` shows wave/task
 progression); kill-and-recover mid-build leaves SQLite consistent.
 
 ### Step 2 — FEAT-UBS-003
+`/feature-spec` **DONE (2026-07-03)** → `features/jarvis-notification-bridge/`
+(`.feature` + `_assumptions.yaml` + `_summary.md`; parser-validated). The
+invocation used (note: approval subscriber lives at
+`src/forge/adapters/nats/approval_subscriber.py`, not `src/forge/nats/`):
 ```
 /feature-spec "Jarvis notification bridge: subscribe to pipeline.* lifecycle \
 envelopes and agents.approval.forge.*; route to Telegram with build_id, \
@@ -96,13 +129,46 @@ feature_id, correlation_id, stage, coach score, rationale. v1 one-way \
 ApprovalResponsePayload -> Forge approval subscriber resume path. \
 Notification failure = log WARNING and continue (DDR-007)." \
   --context ../jarvis \
-  --context src/forge/nats/approval_subscriber.py \
+  --context src/forge/adapters/nats/approval_subscriber.py \
   --context docs/research/ideas/unattended-build-service-scope.md
 ```
-Then `/feature-plan` + `guardkit autobuild` as above (jarvis repo for the
-adapter half if the spec splits it).
-Validation: queue a toy feature from Open WebUI; phone receives queued →
-running → terminal; a deliberately paused build delivers its approval request.
+~~Before `/feature-plan`: resolve the 2 low-confidence assumptions~~ **DONE
+(2026-07-03):** ASSUM-003 source-verified (0.0–1.0 forge-enforced contract;
+wire unconstrained; always None today per ADR-ARCH-033 — the no-score render
+path is the live default); ASSUM-007 resolved by the **Slack pivot** (operator
+decision: no Telegram account; single operator Slack channel, bot token +
+channel id; v1.1 replies via Socket Mode buttons authorized against the
+operator member id). v1 scope widened to full lifecycle (queued → running →
+terminal + pauses); spec revised to 31 scenarios + 2 new assumptions
+(ASSUM-010 build-cancelled producer gap; ASSUM-011 queued-at-intake).
+
+**Planning fork — RESOLVED by verification (2026-07-03):** jarvis ships
+`ForgeNotificationsSubscriber` (FEAT-JARVIS-005) routing
+started/stage-complete/complete/failed to the **CLI** FIFO via a correlation
+map, as one ephemeral push consumer with a multi-subject filter. The workqueue
+PIPELINE stream rejects any second consumer with overlapping filters
+(err_code=10100, TASK-FRR-F010Db) — so the Slack surface **must extend that
+subscriber in-process** (its docstring already reserves promotion to
+`jarvis.notification.{adapter}` wire payloads — the FEAT-JARVIS-006 pattern;
+the JARVIS stream is provisioned and live). `build-paused`/`build-cancelled`
+can be added to the existing filter (no other consumer binds them — verified
+live). The queued notification fires at jarvis intake publish-time
+(`tools/dispatch.py`), never from the stream. v1.1 forge-side gap to plan for:
+no production wiring instantiates `ApprovalSubscriber` today.
+```
+/feature-plan "Jarvis Notification Bridge" \
+  --context features/jarvis-notification-bridge/jarvis-notification-bridge_summary.md
+```
+Then `guardkit autobuild` as above (jarvis repo for the adapter half if the
+plan splits it).
+Validation (v1 checkpoint, gates v1.1): queue a toy feature from Open WebUI;
+phone receives queued → running → terminal; a deliberately paused build
+delivers its approval request with rationale. Only after v1 passes: a Slack
+approve button resumes it (v1.1).
+
+> Note: `/feature-spec` Step 8's `installer.core.commands.lib.feature_spec_normalize`
+> module is not present in this repo — validate the emitted `.feature` with the
+> vendored `gherkin` parser directly (it is what `/feature-plan` Step 11 uses).
 
 ### Step 3 — FEAT-UBS-002
 ```
@@ -142,8 +208,8 @@ affinity. **Do not start before the revisit condition in the scope doc.**
 |---|---|---|
 | `src/forge/subagents/autobuild_runner.py` | UBS-001 | Node bodies (graph/schema frozen) |
 | `src/forge/adapters/guardkit/run.py` (+parser/progress) | UBS-001 | Invocation surface hardening as needed |
-| `jarvis` notification adapter module | UBS-003 | New subscriber + Telegram routing |
-| `src/forge/nats/approval_subscriber.py` | UBS-003 v1.1 | Telegram reply → resume |
+| `jarvis` notification adapter module | UBS-003 | Extend ForgeNotificationsSubscriber + Slack routing (was Telegram) |
+| `src/forge/adapters/nats/approval_subscriber.py` | UBS-003 v1.1 | Slack reply → resume (+ production wiring — none exists today) |
 | `src/forge/config/models.py` + `loader.py` | UBS-002 | Unattended profile + caps |
 | `src/forge/pipeline/mode_c_planner.py` (or supervision wrapper) | UBS-002 | Cycle-cap enforcement point |
 | `src/forge/cli/queue.py` | UBS-002 | `--profile` flag |
