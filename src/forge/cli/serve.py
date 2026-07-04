@@ -326,6 +326,7 @@ def bind_production_dispatch_chain(
                 stream_source=bridge_wireup_parts.stream_source,
                 identity_provider=bridge_wireup_parts.identity_provider,
                 run_state_fetcher=bridge_wireup_parts.run_state_fetcher,
+                build_state_recorder=bridge_wireup_parts.build_state_recorder,
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger

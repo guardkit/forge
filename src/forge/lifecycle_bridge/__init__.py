@@ -14,6 +14,7 @@ from forge.lifecycle_bridge.bridge import (
     BuildContext,
     LifecycleBridge,
 )
+from forge.lifecycle_bridge.build_state_recorder import build_build_state_recorder
 from forge.lifecycle_bridge.coexistence import TerminalPublishLedger
 from forge.lifecycle_bridge.run_state_source import (
     RUN_STATUS_TERMINAL,
@@ -39,6 +40,7 @@ __all__ = [
     "StreamEventTranslator",
     "StreamSource",
     "TerminalPublishLedger",
+    "build_build_state_recorder",
     "langgraph_run_state_fetcher",
     "langgraph_stream_source",
 ]

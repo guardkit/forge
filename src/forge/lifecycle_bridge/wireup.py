@@ -258,6 +258,19 @@ class StreamSource(Protocol):
 #: backs off and retries up to ``identity_resolution_attempts`` times.
 IdentityProvider = Callable[[str], Awaitable[tuple[str, str] | None]]
 
+#: Write-back seam invoked after each *successful* publish so the
+#: ``builds`` row tracks the lifecycle the bridge just put on the wire
+#: (SQLite is source-of-truth — ADR-ARCH-008). Without it the row stays
+#: ``QUEUED`` past terminal and the Group C "active in-flight duplicate"
+#: check wedges every subsequent dispatch for the feature (observed
+#: 2026-07-04 on GB10). ``None`` (the default) preserves the historical
+#: publish-only behaviour for callers that have not opted in; production
+#: wires :func:`forge.lifecycle_bridge.build_state_recorder.build_build_state_recorder`.
+#: Implementations must swallow their own expected failure modes — the
+#: wireup additionally guards the call so a recorder bug can never turn
+#: a successful publish into a failed one.
+BuildStateRecorder = Callable[[PipelineEvent], Awaitable[None]]
+
 
 def _default_identity_provider() -> IdentityProvider:
     """Return an identity provider that always reports "no identity yet".
@@ -348,6 +361,13 @@ class LifecycleBridgeWireup:
             state available", which preserves pre-FOLLOWUP-C-RACE
             behaviour for callers that have not opted in. Production
             wires :func:`forge.lifecycle_bridge.run_state_source.langgraph_run_state_fetcher`.
+        build_state_recorder: A :data:`BuildStateRecorder` invoked with
+            each payload after its publish succeeds, so the ``builds``
+            row tracks the lifecycle just put on the wire. Defaults to
+            ``None`` (no write-back — pre-existing behaviour). Recorder
+            exceptions are logged at WARNING and never affect the
+            publish result. Production wires
+            :func:`forge.lifecycle_bridge.build_state_recorder.build_build_state_recorder`.
         deadline_seconds: Per-build deadline written to the registry
             row's ``deadline_at`` column. Defaults to
             :data:`DEFAULT_DEADLINE_SECONDS` (300s).
@@ -377,6 +397,7 @@ class LifecycleBridgeWireup:
         stream_source: StreamSource,
         identity_provider: IdentityProvider | None = None,
         run_state_fetcher: RunStateFetcher | None = None,
+        build_state_recorder: BuildStateRecorder | None = None,
         deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
         identity_resolution_attempts: int = 3,
         identity_poll_interval_seconds: float = 1.0,
@@ -419,6 +440,7 @@ class LifecycleBridgeWireup:
             if run_state_fetcher is not None
             else _default_run_state_fetcher()
         )
+        self._build_state_recorder = build_state_recorder
         self._deadline_seconds = deadline_seconds
         self._identity_resolution_attempts = max(1, int(identity_resolution_attempts))
         self._identity_poll_interval_seconds = max(
@@ -1233,7 +1255,6 @@ class LifecycleBridgeWireup:
             return False
         try:
             await publish(event)
-            return True
         except Exception as exc:  # noqa: BLE001
             # PublishFailure (or transport-level error) must not crash
             # the observer. AC-1: log WARNING with subject + correlation_id
@@ -1253,6 +1274,39 @@ class LifecycleBridgeWireup:
                 cid,
             )
             return False
+        # Write-back AFTER a successful publish only. Ordering is
+        # load-bearing: recording a terminal state before its envelope
+        # is on the wire would flip the row terminal, and the consumer's
+        # "duplicate already-terminal → ack + skip" path would then eat
+        # the JetStream redelivery that the publish-failure contract
+        # (TASK-FRR-PEB-011 AC-2/AC-3) relies on to retry the publish.
+        await self._record_build_state(event, feature_id)
+        return True
+
+    async def _record_build_state(self, event: PipelineEvent, feature_id: str) -> None:
+        """Invoke the :data:`BuildStateRecorder`, downgrading any failure.
+
+        A recorder bug (or an optimistic-concurrency clash with the CLI
+        cancel path) must never turn a successful publish into a failed
+        one — the envelope is already on the wire, so the observer's
+        ack/detach decision has to key off the publish alone. Failures
+        land at WARNING with enough context to reconcile the row by
+        hand.
+        """
+        if self._build_state_recorder is None:
+            return
+        try:
+            await self._build_state_recorder(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "wireup._record_build_state: recorder raised (%s) for "
+                "feature_id=%s payload_type=%s build_id=%s; builds row "
+                "may lag the published lifecycle",
+                exc,
+                feature_id,
+                type(event).__name__,
+                getattr(event, "build_id", None),
+            )
 
     # ------------------------------------------------------------------
     # Terminal handling

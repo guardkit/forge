@@ -53,6 +53,7 @@ from forge.lifecycle_bridge import (
     StreamEventTranslator,
     StreamSource,
     TerminalPublishLedger,
+    build_build_state_recorder,
     langgraph_run_state_fetcher,
     langgraph_stream_source,
 )
@@ -64,7 +65,7 @@ from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
-    from forge.lifecycle_bridge.wireup import IdentityProvider
+    from forge.lifecycle_bridge.wireup import BuildStateRecorder, IdentityProvider
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,7 @@ class LifecycleBridgeWireupParts:
     identity_provider: "IdentityProvider"
     run_state_fetcher: RunStateFetcher
     terminal_publish_ledger: TerminalPublishLedger
+    build_state_recorder: "BuildStateRecorder"
 
 
 def _build_async_tasks_identity_provider(
@@ -181,7 +183,8 @@ def _build_async_tasks_identity_provider(
     poll fits comfortably within the wireup's per-poll budget):
 
     1. SQLite read: ``SELECT task_id FROM async_tasks WHERE feature_id
-       = ? LIMIT 1``. ``task_id`` equals ``thread_id`` per
+       = ? ORDER BY started_at DESC, rowid DESC LIMIT 1``. ``task_id``
+       equals ``thread_id`` per
        :mod:`forge.cli._serve_async_task_starter` (line 148-149: the
        state-channel command writes one entry keyed by the
        just-launched task's ``thread_id``). The dispatcher writes
@@ -191,6 +194,15 @@ def _build_async_tasks_identity_provider(
        :func:`dispatch_autobuild_async`, so the row is not yet present
        at the first poll. Returns ``None`` on miss; the wireup retries
        per its ``identity_resolution_attempts`` budget.
+
+       ``ORDER BY started_at DESC`` is load-bearing: ``async_tasks``
+       accumulates one row per dispatched build and rows for dead
+       builds are not garbage-collected, so an unordered ``LIMIT 1``
+       pins resolution to the *oldest* row — whose thread no longer
+       exists on a restarted sidecar, 404ing every poll while the live
+       run streams unobserved (observed 2026-07-04 on GB10 for
+       FEAT-9E59). Newest-first makes the just-dispatched row win;
+       ``rowid DESC`` breaks same-instant ties.
 
     2. ``langgraph_sdk`` fetch: once ``thread_id`` is known, call
        ``client.runs.list(thread_id, limit=1)`` (verified against
@@ -217,7 +229,8 @@ def _build_async_tasks_identity_provider(
         # Step 1 — SQLite lookup against the shared writer connection.
         try:
             row = sqlite_pool.connection.execute(
-                "SELECT task_id FROM async_tasks WHERE feature_id = ? " "LIMIT 1",
+                "SELECT task_id FROM async_tasks WHERE feature_id = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
                 (feature_id,),
             ).fetchone()
         except sqlite3.Error as exc:
@@ -314,6 +327,10 @@ def _build_lifecycle_bridge_wireup_parts(
     # AsyncSubAgentMiddleware — out of forge's modify-able surface).
     run_state_fetcher = langgraph_run_state_fetcher(runner_url=autobuild_runner_url)
     terminal_publish_ledger = TerminalPublishLedger(connection=connection)
+    # Builds-row write-back for published lifecycle envelopes — without
+    # it the row stays QUEUED past terminal and exists_active_build
+    # wedges the feature's next dispatch (2026-07-04 GB10 gap).
+    build_state_recorder = build_build_state_recorder(sqlite_pool)
 
     return LifecycleBridgeWireupParts(
         bridge=bridge,
@@ -322,6 +339,7 @@ def _build_lifecycle_bridge_wireup_parts(
         identity_provider=identity_provider,
         run_state_fetcher=run_state_fetcher,
         terminal_publish_ledger=terminal_publish_ledger,
+        build_state_recorder=build_state_recorder,
     )
 
 

@@ -40,8 +40,9 @@ def sqlite_pool_with_async_tasks_table() -> Any:
     """Build a real ``SqliteLifecyclePersistence`` over an in-memory DB.
 
     The ``async_tasks`` table mirrors the production schema's columns
-    we depend on: ``feature_id`` and ``task_id``. Other columns are
-    omitted — the provider's SELECT pulls only ``task_id``.
+    we depend on: ``feature_id``, ``task_id``, and ``started_at`` (the
+    provider's SELECT orders newest-first on ``started_at``). Other
+    columns are omitted.
     """
     cx = sqlite3.connect(":memory:")
     cx.row_factory = sqlite3.Row
@@ -50,7 +51,8 @@ def sqlite_pool_with_async_tasks_table() -> Any:
             task_id      TEXT PRIMARY KEY,
             feature_id   TEXT NOT NULL,
             build_id     TEXT,
-            correlation_id TEXT
+            correlation_id TEXT,
+            started_at   TEXT
         )
         """)
     cx.commit()
@@ -289,3 +291,59 @@ def test_identity_provider_returns_none_when_sqlite_raises(
 
     assert result is None
     assert any("SQLite read failed" in record.getMessage() for record in caplog.records)
+
+
+def test_identity_provider_prefers_newest_async_tasks_row(
+    sqlite_pool_with_async_tasks_table: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple rows for a feature → the newest ``started_at`` wins.
+
+    Regression for the 2026-07-04 GB10 incident: ``async_tasks``
+    accumulates one row per dispatched build, and the unordered
+    ``LIMIT 1`` pinned resolution to the *oldest* row — a thread that no
+    longer existed on the restarted sidecar — so identity resolution
+    404-looped while the live run streamed unobserved. The oldest row
+    is inserted FIRST so an unordered ``LIMIT 1`` would return it and
+    fail this test.
+    """
+    pool = sqlite_pool_with_async_tasks_table
+    pool.connection.execute(
+        "INSERT INTO async_tasks (task_id, feature_id, started_at) " "VALUES (?, ?, ?)",
+        ("thread-STALE", "FEAT-DUP", "2026-05-15T10:13:50+00:00"),
+    )
+    pool.connection.execute(
+        "INSERT INTO async_tasks (task_id, feature_id, started_at) " "VALUES (?, ?, ?)",
+        ("thread-LIVE", "FEAT-DUP", "2026-07-04T08:51:40+00:00"),
+    )
+    pool.connection.commit()
+
+    captured: dict[str, Any] = {}
+
+    class _Run:
+        run_id = "run-LIVE"
+
+    class _FakeRuns:
+        async def list(self, thread_id: str, *, limit: int = 10) -> list[Any]:
+            captured["thread_id"] = thread_id
+            return [_Run()]
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.runs = _FakeRuns()
+
+    import langgraph_sdk
+
+    monkeypatch.setattr(langgraph_sdk, "get_client", lambda *, url: _FakeClient())
+
+    from forge.cli._serve_production import _build_async_tasks_identity_provider
+
+    provider = _build_async_tasks_identity_provider(
+        sqlite_pool=pool,
+        autobuild_runner_url="http://sidecar:8124",
+    )
+
+    result = asyncio.run(provider("FEAT-DUP"))
+
+    assert captured["thread_id"] == "thread-LIVE"
+    assert result == ("thread-LIVE", "run-LIVE")

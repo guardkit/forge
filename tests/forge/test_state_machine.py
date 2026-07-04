@@ -431,3 +431,72 @@ class TestSingleStatusWriter:
         assert len(matched) <= 1, (
             f"grep found multiple status writers: {matched}"
         )
+
+
+class TestTransitionChain:
+    """``transition_chain`` — multi-hop composition (bridge write-back).
+
+    The lifecycle bridge observes builds in coarser steps than the
+    transition graph permits in one hop (a fast run's first envelope
+    can be ``build-complete`` against a ``QUEUED`` row). The chain
+    helper walks the shortest legal path so callers never hand-roll
+    intermediate hops.
+    """
+
+    def test_chain_to_same_state_returns_empty_list(self) -> None:
+        assert sm.transition_chain(_build(BuildState.QUEUED), BuildState.QUEUED) == []
+
+    def test_single_hop_chain_matches_transition(self) -> None:
+        chain = sm.transition_chain(_build(BuildState.QUEUED), BuildState.CANCELLED)
+        assert [(t.from_state, t.to_state) for t in chain] == [
+            (BuildState.QUEUED, BuildState.CANCELLED)
+        ]
+
+    def test_queued_to_complete_walks_the_full_legal_path(self) -> None:
+        chain = sm.transition_chain(_build(BuildState.QUEUED), BuildState.COMPLETE)
+        assert [(t.from_state, t.to_state) for t in chain] == [
+            (BuildState.QUEUED, BuildState.PREPARING),
+            (BuildState.PREPARING, BuildState.RUNNING),
+            (BuildState.RUNNING, BuildState.FINALISING),
+            (BuildState.FINALISING, BuildState.COMPLETE),
+        ]
+
+    def test_every_hop_is_table_legal(self) -> None:
+        for from_state in BuildState:
+            for to_state in BuildState:
+                try:
+                    chain = sm.transition_chain(_build(from_state), to_state)
+                except InvalidTransitionError:
+                    continue
+                for hop in chain:
+                    assert hop.to_state in TRANSITION_TABLE[hop.from_state]
+
+    def test_hops_compose_from_state_to_state(self) -> None:
+        chain = sm.transition_chain(_build(BuildState.QUEUED), BuildState.FAILED)
+        for earlier, later in zip(chain, chain[1:]):
+            assert earlier.to_state is later.from_state
+
+    def test_fields_land_on_final_hop_only(self) -> None:
+        chain = sm.transition_chain(
+            _build(BuildState.QUEUED),
+            BuildState.COMPLETE,
+            pr_url="https://example.test/pr/1",
+        )
+        assert chain[-1].pr_url == "https://example.test/pr/1"
+        assert all(t.pr_url is None for t in chain[:-1])
+
+    def test_completed_at_set_on_terminal_hop_only(self) -> None:
+        chain = sm.transition_chain(_build(BuildState.QUEUED), BuildState.COMPLETE)
+        assert chain[-1].completed_at is not None
+        assert all(t.completed_at is None for t in chain[:-1])
+
+    def test_no_path_out_of_terminal_raises(self) -> None:
+        with pytest.raises(InvalidTransitionError):
+            sm.transition_chain(_build(BuildState.COMPLETE), BuildState.RUNNING)
+
+    def test_error_field_recorded_on_failed_target(self) -> None:
+        chain = sm.transition_chain(
+            _build(BuildState.RUNNING), BuildState.FAILED, error="boom"
+        )
+        assert chain[-1].to_state is BuildState.FAILED
+        assert chain[-1].error == "boom"

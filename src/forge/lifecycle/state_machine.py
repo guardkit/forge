@@ -67,6 +67,7 @@ __all__ = [
     "TRANSITION_TABLE",
     "Transition",
     "transition",
+    "transition_chain",
 ]
 
 
@@ -289,3 +290,91 @@ def transition(
         completed_at=completed_at,
         **fields,
     )
+
+
+def transition_chain(
+    build: Any,
+    to_state: BuildState,
+    **fields: Any,
+) -> list[Transition]:
+    """Compose the shortest legal sequence of Transitions reaching ``to_state``.
+
+    Some observers learn about a build's lifecycle in coarser steps than
+    the transition graph permits in one hop — the lifecycle bridge, for
+    example, sees ``build-complete`` for a row still in ``QUEUED``
+    (legal path: ``QUEUED → PREPARING → RUNNING → FINALISING →
+    COMPLETE``). Rather than let such callers hand-roll intermediate
+    hops (and drift from :data:`TRANSITION_TABLE`), this helper walks a
+    breadth-first shortest path through the authoritative table and
+    composes one :class:`Transition` per hop via :func:`transition` —
+    preserving the "single producer of Transition value objects"
+    invariant (sc_001).
+
+    ``**fields`` (``error``, ``pr_url``, ``completed_at``, …) are
+    applied to the **final** hop only; intermediate hops carry no extra
+    fields. Apply the returned list in order through
+    ``persistence.apply_transition()`` — each hop's ``from_state``
+    matches the previous hop's ``to_state``, so the optimistic
+    concurrency check composes across the chain.
+
+    Args:
+        build: An object exposing ``status: BuildState`` and
+            ``build_id: str`` (same contract as :func:`transition`).
+        to_state: Target :class:`BuildState`.
+        **fields: Optional fields recorded on the final hop's
+            :class:`Transition` (see :func:`transition`).
+
+    Returns:
+        Transitions in application order. Empty when ``build.status``
+        already equals ``to_state`` (idempotent re-delivery no-op).
+
+    Raises:
+        InvalidTransitionError: No path exists from ``build.status`` to
+            ``to_state`` (e.g. out of a terminal state — Group C "no
+            resurrection from terminal").
+    """
+    from_state: BuildState = build.status
+    build_id: str = build.build_id
+
+    if from_state is to_state:
+        return []
+
+    # Breadth-first shortest path over TRANSITION_TABLE. Neighbours are
+    # expanded in sorted order so the chosen path is deterministic when
+    # two paths tie on length.
+    predecessor: dict[BuildState, BuildState] = {}
+    frontier: list[BuildState] = [from_state]
+    seen: set[BuildState] = {from_state}
+    while frontier and to_state not in predecessor:
+        next_frontier: list[BuildState] = []
+        for state in frontier:
+            for neighbour in sorted(TRANSITION_TABLE[state]):
+                if neighbour in seen:
+                    continue
+                seen.add(neighbour)
+                predecessor[neighbour] = state
+                next_frontier.append(neighbour)
+        frontier = next_frontier
+
+    if to_state not in predecessor:
+        raise InvalidTransitionError(build_id, from_state, to_state)
+
+    path: list[BuildState] = [to_state]
+    while path[-1] is not from_state:
+        path.append(predecessor[path[-1]])
+    path.reverse()
+
+    class _Cursor:
+        """Minimal ``build``-shaped shim advancing along the path."""
+
+        def __init__(self, status: BuildState) -> None:
+            self.build_id = build_id
+            self.status = status
+
+    transitions: list[Transition] = []
+    for hop_index, hop_target in enumerate(path[1:], start=1):
+        hop_fields = fields if hop_index == len(path) - 1 else {}
+        transitions.append(
+            transition(_Cursor(path[hop_index - 1]), hop_target, **hop_fields)
+        )
+    return transitions
