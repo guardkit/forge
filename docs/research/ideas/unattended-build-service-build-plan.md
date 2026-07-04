@@ -34,9 +34,22 @@
   the autobuild sibling-repo constraint); jarvis v1 feature YAML
   **FEAT-28FF** validated (5 waves, smoke gates after waves 2/3/4); v1.1
   YAMLs deliberately deferred until the live v1 checkpoint (TASK-JNB-004)
-  passes. Report: `.claude/reviews/TASK-REV-C951-review-report.md`. Next:
-  `/feature-build FEAT-28FF` in the jarvis repo (bot `/invite` to
-  #forge-builds still pending for the checkpoint).
+  passes. Report: `.claude/reviews/TASK-REV-C951-review-report.md`.
+  **v1 SHIPPED + CHECKPOINT PASSED (2026-07-04):** FEAT-28FF built (7/7
+  Coach-approved), merged to jarvis main (`736399b`, suite 2419/0), deployed
+  to the GB10; live evidence in #forge-builds — queued 07:14/11:07, RUNNING
+  09:58, complete (PASSED) 09:58/11:07, exactly-once held throughout.
+  TASK-JNB-004 completed with evidence record; TASK-JNB-009 (hardening
+  validation) still pending operator. The checkpoint doubled as the deferred
+  TASK-ABW-OPS validation and surfaced 5 forge wire-dispatch bugs (filed:
+  `tasks/backlog/forge-wire-dispatch-fixes/TASK-FWD-001..004` + ABW-002),
+  the jarvis NATS-user pipeline grant (fixed, nats-infrastructure `d252c35`),
+  and the GB10 sidecar harness default (attended override GUARDKIT_HARNESS=sdk
+  + coach-model argv removal — revert for P2, tracked in TASK-FWD-004).
+  **v1.1 PLANNED:** jarvis `FEAT-BF39` (103→104→105→107 live validation) +
+  forge `FEAT-1872` (101→102→106), both validated with venv-explicit smoke
+  gates. Next: `/feature-build FEAT-BF39` (jarvis) and `/feature-build
+  FEAT-1872` (forge), then TASK-JNB-107 live approve/reject from the phone.
 - **Substrate/fork decision:** `ADR-ARCH-033` (runner's direct-shell path
   ratified as interim; coach-score population gap is the UBS-002 prerequisite).
 - **Next per this plan (visibility before autonomy):** FEAT-UBS-003

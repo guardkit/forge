@@ -1,0 +1,59 @@
+id: FEAT-1872
+name: 'Jarvis Notification Bridge v1.1 (forge side: ApprovalSubscriber wiring + build-cancelled
+  emit)'
+description: 'v1.1 forge half of FEAT-UBS-003: production wiring of the dormant-but-complete
+  ApprovalSubscriber into the serve runtime (first mark_resume_pending call sites),
+  wiring publish_build_cancelled onto the three CANCELLED transitions (closes ASSUM-010),
+  and integration tests over the production chain incl. the approve-vs-expiry race.
+  Gated on the passed v1 checkpoint (TASK-JNB-004, 2026-07-04). Shared approver identity:
+  forge expected_approver must equal jarvis slack_decided_by (config-alignment AC).'
+created: '2026-07-04T11:10:50.646064'
+status: planned
+complexity: 6
+estimated_tasks: 3
+tasks:
+- id: TASK-JNB-101
+  name: ApprovalSubscriber production wiring into the serve runtime
+  file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-101-forge-approvalsubscriber-production-wiring-into-.md
+  complexity: 7
+  dependencies: []
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 170
+- id: TASK-JNB-102
+  name: Emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)
+  file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-102-forge-emit-build-cancelled-on-cancelled-transiti.md
+  complexity: 5
+  dependencies:
+  - TASK-JNB-101
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 75
+- id: TASK-JNB-106
+  name: v1.1 scenario tests over the production wiring
+  file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-106-forge-v1-1-scenario-tests-over-the-production-wi.md
+  complexity: 5
+  dependencies:
+  - TASK-JNB-101
+  - TASK-JNB-102
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 75
+orchestration:
+  parallel_groups:
+  - - TASK-JNB-101
+  - - TASK-JNB-102
+  - - TASK-JNB-106
+  estimated_duration_minutes: 320
+  recommended_parallel: 1
+
+smoke_gates:
+  after_wave: [1, 2, 3]
+  command: |
+    set -e
+    ./.venv/bin/python -m pytest tests -x -q
+  expected_exit: 0
+  timeout: 600

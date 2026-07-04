@@ -7,7 +7,7 @@ updated: 2026-07-03T15:30:00Z
 priority: high
 task_type: feature
 parent_review: TASK-REV-C951
-feature_id: pending-v1.1
+feature_id: FEAT-1872
 version: v1.1
 wave: 8
 repo: forge
