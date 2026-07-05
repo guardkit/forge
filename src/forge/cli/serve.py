@@ -301,9 +301,25 @@ def bind_production_dispatch_chain(
         to :data:`compose_dispatch_chain`.
     """
 
-    from forge.cli import _serve_deps_gating
-    from forge.cli._serve_deps import build_pipeline_consumer_deps
+    from forge.cli import _serve_deps_gating, _serve_gate_activation
+    from forge.cli._serve_deps import (
+        build_pipeline_consumer_deps,
+        build_serve_resume_launcher,
+    )
     from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
+    from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
+
+    def _gate_wall_clock() -> Any:
+        """Composition-root wall clock for the TASK-GATE-D659 gate.
+
+        The single injected ``() -> datetime`` seam shared by the gate's
+        SQLite adapters (``stage_log`` timestamps) and the mirrored
+        publisher's ``build-paused`` ``paused_at`` — clock hygiene keeps
+        wall-clock reads at this one boot seam.
+        """
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc)
 
     async def _compose(client: Any) -> None:
         # TASK-FORGE-FRR-PEBR-WIREUP — hoist publisher construction up
@@ -341,17 +357,40 @@ def bind_production_dispatch_chain(
         # jarvis JARVIS_SLACK_DECIDED_BY verbatim). Soft-fail: a v1.1
         # approval-wiring defect must never brick v1 dispatch boot —
         # the ERROR log line is the operator's probe (TASK-JNB-107).
+        # TASK-GATE-D659 — the SQLite gate adapters (repository + state
+        # machine) compose the tested lifecycle facades so the live
+        # ``gate_check`` path runs against the real DB. Built once per boot
+        # (they share a build-keyed pause handoff) and threaded into the
+        # dispatch closure so ``maybe_gate_build`` can pause / resume the
+        # real builds row.
+        gate_repository, gate_state_machine = build_sqlite_gate_adapters(
+            sqlite_pool, clock=_gate_wall_clock
+        )
+
+        gate_parts: Any = None
         try:
-            _serve_deps_gating.bind_gate_parts(
+            gate_parts = _serve_deps_gating.bind_gate_parts(
                 _serve_deps_gating.build_approval_gate_parts(
                     client,
                     forge_config,
                     emitter=emitter,
-                    bridge_registry=(
-                        bridge_wireup_parts.registry
-                        if bridge_wireup_parts is not None
-                        else None
-                    ),
+                    # TASK-GATE-D659 R1 — static exactly-one-resume-emit
+                    # owner: the daemon subscriber owns the build-resumed
+                    # emit. A paused build never creates a bridge registry
+                    # row (the observer is registered only AFTER approval),
+                    # so the subscriber's PEB-006 resume-emit suppression
+                    # probe MUST stay disabled — pass ``bridge_registry=None``
+                    # unconditionally. Reintroduce a non-None registry only
+                    # once a runner-side activation point can pre-create the
+                    # registry row before the pause (plan §Future).
+                    bridge_registry=None,
+                    # Refresh loop stays DISABLED for v1 (plan
+                    # "Refresh-loop decision"): a raw-publisher refresh would
+                    # mint request_ids with no superseding build-paused and
+                    # break long pauses. The SQLite ``gate_repository`` is
+                    # threaded into ``make_gate_check_deps`` instead (via the
+                    # dispatch closure), NOT into the parts.
+                    repository=None,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
@@ -362,6 +401,37 @@ def bind_production_dispatch_chain(
                 exc,
             )
 
+        # TASK-GATE-D659 §D4.2 — re-arm every PAUSED build's approval
+        # round-trip. Spawned AFTER bind_gate_parts so a LIVE response
+        # subscriber exists before ANY PAUSED approval is re-emitted
+        # (arm-before-post; closes the C1 boot-order tap-drop). rearm owns
+        # BOTH PAUSED re-emits; the two boot reconcile seams suppress theirs.
+        # Soft-fail: a rearm defect must never brick v1 dispatch boot.
+        if gate_parts is not None:
+            try:
+                resume_launcher = build_serve_resume_launcher(
+                    sqlite_pool,
+                    forge_config,
+                    lifecycle_emitter=emitter,
+                    async_task_starter=async_task_starter,
+                )
+                await _serve_gate_activation.rearm_paused_gates(
+                    parts=gate_parts,
+                    sqlite_pool=sqlite_pool,
+                    gate_repository=gate_repository,
+                    gate_state_machine=gate_state_machine,
+                    resume_launcher=resume_launcher,
+                    client=client,
+                    clock=_gate_wall_clock,
+                )
+            except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+                logger.error(
+                    "forge-serve: rearm_paused_gates FAILED (%s) — paused "
+                    "builds were NOT re-armed this boot; they stay PAUSED "
+                    "until the next restart",
+                    exc,
+                )
+
         deps = build_pipeline_consumer_deps(
             client,
             forge_config,
@@ -370,6 +440,9 @@ def bind_production_dispatch_chain(
             register_ack_handle=register_ack_handle,
             terminal_publish_ledger=terminal_publish_ledger,
             publisher=publisher,
+            gate_repository=gate_repository,
+            gate_state_machine=gate_state_machine,
+            gate_clock=_gate_wall_clock,
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first
@@ -712,9 +785,7 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         # fatal — the daemon should never start "invisible" to the
         # fleet supervisor.
         await register_on_boot(fleet_client)
-        logger.info(
-            "forge-serve: fleet registration published agent_id=%s", AGENT_ID
-        )
+        logger.info("forge-serve: fleet registration published agent_id=%s", AGENT_ID)
 
         # Step 2 + 3 — ASSUM-009 / F1: BOTH reconciliations must run
         # before the durable consumer attaches, so a redelivered

@@ -80,7 +80,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
 from forge.adapters.nats.pipeline_publisher import PipelinePublisher
@@ -111,7 +112,11 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["build_pipeline_consumer_deps", "is_terminal_status"]
+__all__ = [
+    "build_pipeline_consumer_deps",
+    "build_serve_resume_launcher",
+    "is_terminal_status",
+]
 
 
 #: Set of canonical ``builds.status`` string values that count as
@@ -217,6 +222,134 @@ def _build_is_duplicate_terminal(
     return is_duplicate_terminal
 
 
+def _utc_now() -> datetime:
+    """Composition-root wall clock for the gate.
+
+    The gate's SQLite adapters and mirrored publisher need an injected
+    ``() -> datetime`` (clock hygiene). Production has no earlier injected
+    clock at daemon boot, so this named function is the single
+    composition-root wall-clock seam — mirrors the ``GateCheckDeps.clock``
+    default and the ``_serve_deps_gating`` cancelled-emit timestamp. Tests
+    thread a deterministic clock via ``build_pipeline_consumer_deps``.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _build_resume_launcher(
+    forward_context_builder: Any,
+    stage_log_recorder: Any,
+    state_channel: Any,
+    lifecycle_emitter: Any,
+    async_task_starter: AsyncTaskStarter | None,
+) -> Callable[..., Any]:
+    """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
+
+    TASK-GATE-D659 (plan §R1 / §D4.2): the "launch" half of dispatch is
+    factored out so BOTH the live approve path (this Wave) and the Wave-3
+    boot-time rearm resume path drive the SAME
+    :func:`dispatch_autobuild_async` call with the five Wave-2
+    collaborators — the build row already exists (recorded at dispatch or
+    restored on boot) so re-recording it is neither needed nor legal.
+    """
+
+    async def launch(
+        *, build_id: str, feature_id: str, correlation_id: str | None
+    ) -> Any:
+        if async_task_starter is None:
+            raise RuntimeError(
+                "build_pipeline_consumer_deps: launch was invoked but no "
+                "async_task_starter was wired. Production wiring lives in "
+                "TASK-FW10-008 (Supervisor + AsyncSubAgentMiddleware); tests "
+                "should pass a fake starter via the kwarg."
+            )
+        return await dispatch_autobuild_async(
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            forward_context_builder=forward_context_builder,
+            async_task_starter=async_task_starter,
+            stage_log_recorder=stage_log_recorder,
+            state_channel=state_channel,
+            lifecycle_emitter=lifecycle_emitter,
+        )
+
+    return launch
+
+
+def build_serve_resume_launcher(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: ForgeConfig,
+    *,
+    lifecycle_emitter: PipelineLifecycleEmitter,
+    async_task_starter: AsyncTaskStarter | None,
+) -> Callable[..., Any]:
+    """Compose the boot-time rearm resume launcher (TASK-GATE-D659 §D4.2).
+
+    The Wave-3 ``rearm_paused_gates`` sweep needs the SAME "launch" half of
+    dispatch the live approve path uses — :func:`dispatch_autobuild_async` with
+    the five Wave-2 collaborators, minus ``record_pending_build`` (the row is
+    already PAUSED, restored on boot). This factory composes the four SQLite-
+    bound collaborators (forward-context builder, stage-log recorder,
+    state-channel initialiser) against ``sqlite_pool`` + ``forge_config`` and
+    threads the shared ``lifecycle_emitter``, returning the same
+    ``launch(*, build_id, feature_id, correlation_id)`` closure
+    :func:`_build_resume_launcher` produces.
+
+    Kept as a thin public seam (rather than reaching into the private
+    ``dispatch_build`` composition) so ``serve.py::_compose`` can build the
+    launcher at the rearm spawn site without re-deriving the deps graph.
+    """
+    stage_log_reader = build_stage_log_reader(sqlite_pool)
+    forward_context_builder = build_forward_context_builder(
+        stage_log_reader, forge_config
+    )
+    stage_log_recorder = build_stage_log_recorder(sqlite_pool)
+    state_channel = build_autobuild_state_initialiser(sqlite_pool)
+    return _build_resume_launcher(
+        forward_context_builder,
+        stage_log_recorder,
+        state_channel,
+        lifecycle_emitter,
+        async_task_starter,
+    )
+
+
+def _read_build_status(
+    sqlite_pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+) -> "BuildState | None":
+    """Return the ``builds.status`` for ``(feature_id, correlation_id)`` or ``None``.
+
+    Used by the R2 two-arm ``DuplicateBuildError`` handling to decide
+    whether a duplicate delivery should ack (row terminal) or hold the
+    slot without acking (row PAUSED / in-flight).
+    """
+    try:
+        with sqlite_pool._reader() as cx:
+            row = cx.execute(
+                "SELECT status FROM builds WHERE feature_id = ? "
+                "AND correlation_id = ?",
+                (feature_id, correlation_id),
+            ).fetchone()
+    except sqlite3.Error as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "dispatch_build: status read failed for feature_id=%s "
+            "correlation_id=%s (%s); treating as non-terminal (hold slot)",
+            feature_id,
+            correlation_id,
+            exc,
+        )
+        return None
+    if row is None:
+        return None
+    raw = row[0] if not hasattr(row, "keys") else row["status"]
+    if isinstance(raw, BuildState):
+        return raw
+    return BuildState(raw)
+
+
 def _build_dispatch_build(
     sqlite_pool: SqliteLifecyclePersistence,
     forward_context_builder: Any,
@@ -224,38 +357,57 @@ def _build_dispatch_build(
     state_channel: Any,
     lifecycle_emitter: Any,
     async_task_starter: AsyncTaskStarter | None,
+    *,
+    gate_repository: Any = None,
+    gate_state_machine: Any = None,
+    gate_clock: Callable[[], datetime] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
     The closure persists a ``QUEUED`` ``builds`` row (so downstream
-    crash-recovery has a durable record of the dispatch attempt) and
-    then calls :func:`dispatch_autobuild_async` with the three Wave-2
-    Protocol collaborators. The ack callback handed to the closure is
-    threaded onto the ``async_tasks`` state-channel via
-    :class:`AutobuildStateInitialiser` (DDR-006); terminal-only ack of
-    the JetStream message itself is the responsibility of the runner's
-    terminal lifecycle transition, not the dispatcher.
+    crash-recovery has a durable record of the dispatch attempt), runs the
+    TASK-GATE-D659 pre-dispatch approval gate (:func:`maybe_gate_build`),
+    and only launches the autobuild runner on gate approval. On a gate
+    terminal (reject / expiry / hard-stop) it acks the JetStream slot and
+    never launches; while paused it holds the slot un-acked (the runner is
+    launched by the R1 approve callback).
     """
+    launch = _build_resume_launcher(
+        forward_context_builder,
+        stage_log_recorder,
+        state_channel,
+        lifecycle_emitter,
+        async_task_starter,
+    )
+    clock = gate_clock or _utc_now
 
-    async def dispatch_build(payload: "BuildQueuedPayload", ack_callback):
-        """Persist + dispatch one accepted ``BuildQueuedPayload``.
+    async def dispatch_build(
+        payload: "BuildQueuedPayload",
+        ack_callback,
+        register_observer=None,
+    ):
+        """Persist + gate + dispatch one accepted ``BuildQueuedPayload``.
 
         Workflow:
 
-        1. ``record_pending_build(payload)`` — durable QUEUED row;
-           translates the unique-index violation on
-           ``(feature_id, correlation_id)`` into
-           :class:`~forge.lifecycle.persistence.DuplicateBuildError`.
-           A duplicate here implies a benign race against
-           ``is_duplicate_terminal`` for an in-flight build; we log
-           and return without re-dispatching.
-        2. :func:`dispatch_autobuild_async` — launches the long-
-           running :data:`~forge.pipeline.dispatchers.autobuild_async.AUTOBUILD_RUNNER_NAME`
-           AsyncSubAgent with the three Wave-2 collaborators.
+        1. ``record_pending_build(payload)`` — durable QUEUED row.
+           ``DuplicateBuildError`` is resolved with the R2 three-arm rule
+           (plan §D4.5): a **terminal** row acks the slot (self-healing
+           duplicate-terminal), an **INTERRUPTED** row (crash-mid-hop) is
+           re-dispatched into the lifecycle on its existing build_id, and a
+           **PAUSED / in-flight** row is skipped WITHOUT acking (the
+           FEAT-FORGE-010 held-slot invariant).
+        2. :func:`maybe_gate_build` — the pre-dispatch approval gate (R1:
+           runs BEFORE any observer is registered or the runner launched).
+        3. On approve/override/auto → register the ack handle via
+           ``register_observer`` (R1 deferred registration) and launch;
+           on gate-terminal → ack the slot, never launch; while the gate
+           already owns the build (already paused) → hold the slot.
 
-        ``ack_callback`` is intentionally *not* called here; it is
-        invoked by the terminal-state transition inside
-        ``autobuild_runner`` (DDR-007 wiring lands in TASK-FW10-008).
+        ``register_observer`` is the R1 deferred bridge-registration
+        closure the consumer passes when the lifecycle bridge is wired;
+        it is invoked ONLY on the approve → launch path so no observer is
+        live during the pause. ``None`` (no bridge) skips registration.
         """
         # Local import to avoid pinning this module's import surface to
         # nats_core when the deps factory is imported during CLI
@@ -274,41 +426,164 @@ def _build_dispatch_build(
         try:
             build_id = sqlite_pool.record_pending_build(payload)
         except DuplicateBuildError as exc:
-            # Duplicate means a row already exists for this
-            # ``(feature_id, correlation_id)``. The consumer's
-            # ``is_duplicate_terminal`` filter already screens out the
-            # terminal half; reaching here means the row is in flight,
-            # so we let the live build run rather than spawn a second
-            # one. Log so the race is visible to operators.
+            # R2 refined to THREE arms (plan §D4.5, arch-review C2): the
+            # consumer's ``is_duplicate_terminal`` filter already screened the
+            # terminal half, but a redelivery mid-pause (or a restart) races
+            # here. Read the row and branch:
+            #   * terminal → ack (self-heals; releases the slot);
+            #   * INTERRUPTED → re-enter the lifecycle (crash-mid-hop): a row
+            #     left INTERRUPTED inside the QUEUED→…→PAUSED hop window would,
+            #     under arm 2's skip-WITHOUT-ack, wedge the consumer forever
+            #     (max_ack_pending=1). Re-dispatch instead — ``maybe_gate_build``
+            #     drives INTERRUPTED→PREPARING→RUNNING via ``transition_chain``.
+            #   * PAUSED / in-flight → skip WITHOUT ack — the held slot is
+            #     load-bearing (FEAT-FORGE-010); the pause / rearm path owns
+            #     the eventual terminal ack.
+            status = _read_build_status(
+                sqlite_pool,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
+            )
+            if status is not None and status in TERMINAL_STATES:
+                logger.info(
+                    "dispatch_build: duplicate TERMINAL build feature_id=%s "
+                    "correlation_id=%s status=%s (%s); acking to release "
+                    "the queue slot",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    status.value,
+                    exc,
+                )
+                await ack_callback()
+                return
+            if status is BuildState.INTERRUPTED:
+                # Arm 3 — crash-mid-hop redispatch. ``record_pending_build``
+                # cannot re-insert the row, so re-derive the deterministic
+                # build_id and fall through to the gate flow on the EXISTING
+                # row. Never skip-without-ack (that is the wedge C2 fixes).
+                from forge.lifecycle.identifiers import derive_build_id
+
+                build_id = derive_build_id(payload.feature_id, payload.queued_at)
+                logger.info(
+                    "dispatch_build: duplicate INTERRUPTED build feature_id=%s "
+                    "correlation_id=%s build_id=%s (%s); re-dispatching into "
+                    "the lifecycle (crash-mid-hop recovery)",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    build_id,
+                    exc,
+                )
+                # Fall through to the gate flow on the EXISTING row.
+            else:
+                logger.warning(
+                    "dispatch_build: duplicate active build feature_id=%s "
+                    "correlation_id=%s status=%s (%s); holding the queue "
+                    "slot WITHOUT ack (held-slot invariant)",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    status.value if status is not None else "unknown",
+                    exc,
+                )
+                return
+
+        # --- Pre-dispatch approval gate (TASK-GATE-D659, R1) -------------
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+
+        parts = _serve_deps_gating.bound_gate_parts()
+        if parts is None or gate_repository is None or gate_state_machine is None:
+            # Soft-fail: the approval seam is not wired (a v1.1 gate defect
+            # must never brick v1 dispatch — see serve.py _compose). Fall
+            # back to legacy no-gate launch so the build still runs.
             logger.warning(
-                "dispatch_build: duplicate active build for "
-                "feature_id=%s correlation_id=%s (%s); skipping dispatch",
-                payload.feature_id,
-                payload.correlation_id,
-                exc,
+                "dispatch_build: approval gate not wired (parts=%s repo=%s "
+                "sm=%s) for build_id=%s; launching WITHOUT a gate (legacy)",
+                parts is not None,
+                gate_repository is not None,
+                gate_state_machine is not None,
+                build_id,
+            )
+            if register_observer is not None:
+                await _safe_register_observer(register_observer, build_id)
+            await launch(
+                build_id=build_id,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
             )
             return
 
-        logger.info(
-            "dispatch_build: persisted QUEUED row build_id=%s "
-            "feature_id=%s correlation_id=%s; dispatching autobuild",
-            build_id,
-            payload.feature_id,
-            payload.correlation_id,
-        )
-
-        await dispatch_autobuild_async(
+        outcome = await _serve_gate_activation.maybe_gate_build(
+            parts=parts,
+            sqlite_pool=sqlite_pool,
+            gate_repository=gate_repository,
+            gate_state_machine=gate_state_machine,
             build_id=build_id,
             feature_id=payload.feature_id,
             correlation_id=payload.correlation_id,
-            forward_context_builder=forward_context_builder,
-            async_task_starter=async_task_starter,
-            stage_log_recorder=stage_log_recorder,
-            state_channel=state_channel,
-            lifecycle_emitter=lifecycle_emitter,
+            clock=clock,
         )
 
+        if outcome in (
+            _serve_gate_activation.ALREADY_PAUSED,
+            _serve_gate_activation.HOLD_SLOT,
+        ):
+            # Hold the slot — no launch, no ack, and (crucially) no build-failed
+            # emit. ALREADY_PAUSED: a rearm / redelivery re-entry the rearm path
+            # owns. HOLD_SLOT: the SQLite PAUSED row is durable but the AGENTS
+            # publish failed (rearm re-emits next boot) or a synthetic hop lost
+            # the race to a concurrent terminal write (the other writer is
+            # authoritative). Letting either escape to handle_message would emit
+            # a factually-wrong build-failed and prematurely ack.
+            return
+
+        if _serve_gate_activation.outcome_launches(outcome):
+            # Approve / override / auto → R1 deferred observer registration
+            # (adjacent to launch, so identity resolves the fresh run) then
+            # launch the autobuild runner.
+            logger.info(
+                "dispatch_build: gate approved build_id=%s outcome=%s; "
+                "registering observer + launching autobuild",
+                build_id,
+                outcome.value,
+            )
+            if register_observer is not None:
+                await _safe_register_observer(register_observer, build_id)
+            await launch(
+                build_id=build_id,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
+            )
+        else:
+            # Gate terminal (reject / expiry / hard-stop) — the build never
+            # started; ack the slot so the next queued build proceeds and
+            # never register the bridge observer.
+            logger.info(
+                "dispatch_build: gate terminal build_id=%s outcome=%s; "
+                "acking slot, not launching",
+                build_id,
+                outcome.value,
+            )
+            await ack_callback()
+
     return dispatch_build
+
+
+async def _safe_register_observer(register_observer, build_id: str) -> None:
+    """Invoke the R1 deferred bridge-registration closure, never raising.
+
+    Registration is best-effort (the bridge owns its own observability and
+    the legacy ack path still works), so a raising ``register_observer``
+    must not abort the launch — mirrors the consumer's pre-relocation
+    ``register_ack_handle`` guard.
+    """
+    try:
+        await register_observer()
+    except Exception as exc:  # noqa: BLE001 — best-effort registration
+        logger.warning(
+            "dispatch_build: deferred observer registration raised (%s) for "
+            "build_id=%s; continuing with legacy ack_callback fallback",
+            exc,
+            build_id,
+        )
 
 
 def _build_publish_build_failed(
@@ -432,6 +707,9 @@ def build_pipeline_consumer_deps(
     register_ack_handle: InFlightAckRegistry | None = None,
     terminal_publish_ledger: TerminalPublishLedger | None = None,
     publisher: PipelinePublisher | None = None,
+    gate_repository: Any = None,
+    gate_state_machine: Any = None,
+    gate_clock: Callable[[], datetime] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -557,6 +835,9 @@ def build_pipeline_consumer_deps(
         state_channel=state_channel,
         lifecycle_emitter=emitter,
         async_task_starter=async_task_starter,
+        gate_repository=gate_repository,
+        gate_state_machine=gate_state_machine,
+        gate_clock=gate_clock,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,

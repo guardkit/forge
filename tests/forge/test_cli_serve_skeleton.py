@@ -23,7 +23,6 @@ import click
 import pytest
 from click.testing import CliRunner
 
-
 # ---------------------------------------------------------------------------
 # AC-001: forge serve --help shows the serve subcommand
 # ---------------------------------------------------------------------------
@@ -59,9 +58,9 @@ class TestSubcommandRegistration:
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0, result.output
         for expected in ("queue", "status", "history", "cancel", "skip", "serve"):
-            assert expected in result.output, (
-                f"expected {expected!r} in --help output; got:\n{result.output}"
-            )
+            assert (
+                expected in result.output
+            ), f"expected {expected!r} in --help output; got:\n{result.output}"
 
     def test_serve_command_is_registered_on_main_group(self) -> None:
         from forge.cli.main import main
@@ -171,14 +170,10 @@ class TestServeConfigModel:
 
         cfg = ServeConfig.from_env(
             {
-                "FORGE_AUTOBUILD_RUNNER_URL": (
-                    "http://forge-autobuild-runner:8124"
-                ),
+                "FORGE_AUTOBUILD_RUNNER_URL": ("http://forge-autobuild-runner:8124"),
             }
         )
-        assert cfg.autobuild_runner_url == (
-            "http://forge-autobuild-runner:8124"
-        )
+        assert cfg.autobuild_runner_url == ("http://forge-autobuild-runner:8124")
         # Untouched fields fall back to defaults.
         assert cfg.nats_url == "nats://127.0.0.1:4222"
         assert cfg.healthz_port == 8080
@@ -217,9 +212,7 @@ class TestSubscriptionState:
         state = SubscriptionState()
 
         async def _concurrent_flips() -> None:
-            await asyncio.gather(
-                *(state.set_live(i % 2 == 0) for i in range(64))
-            )
+            await asyncio.gather(*(state.set_live(i % 2 == 0) for i in range(64)))
 
         asyncio.run(_concurrent_flips())
         # Final value is deterministic for the loop body above (last
@@ -252,9 +245,7 @@ class _StubNatsClient:
     async def register_agent(self, manifest: object) -> None:
         self.register_calls.append(manifest)
 
-    async def deregister_agent(
-        self, agent_id: str, reason: str = "shutdown"
-    ) -> None:
+    async def deregister_agent(self, agent_id: str, reason: str = "shutdown") -> None:
         self.deregister_calls.append((agent_id, reason))
 
 
@@ -411,9 +402,9 @@ class TestRunServeBootOrder:
         _asyncio.run(serve_module._run_serve(config, state))
 
         # Exactly one connect on the startup path.
-        assert len(connect_calls) == 1, (
-            f"AC violated: expected 1 nats_connect call; got {connect_calls!r}"
-        )
+        assert (
+            len(connect_calls) == 1
+        ), f"AC violated: expected 1 nats_connect call; got {connect_calls!r}"
         # The shared client was passed into run_daemon.
         assert captured_clients == [stub_client]
 
@@ -459,12 +450,8 @@ class TestRunServeBootOrder:
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -528,12 +515,8 @@ class TestRunServeBootOrder:
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -561,19 +544,11 @@ class TestRunServeBootOrder:
 
         from forge.cli import serve as serve_module
 
-        assert inspect.iscoroutinefunction(
-            serve_module.recovery_reconcile_on_boot
-        )
-        assert inspect.iscoroutinefunction(
-            serve_module.consumer_reconcile_on_boot
-        )
+        assert inspect.iscoroutinefunction(serve_module.recovery_reconcile_on_boot)
+        assert inspect.iscoroutinefunction(serve_module.consumer_reconcile_on_boot)
         # Calling them with a stub client must not raise.
-        _asyncio.run(
-            serve_module.recovery_reconcile_on_boot(_StubNatsClient())
-        )
-        _asyncio.run(
-            serve_module.consumer_reconcile_on_boot(_StubNatsClient())
-        )
+        _asyncio.run(serve_module.recovery_reconcile_on_boot(_StubNatsClient()))
+        _asyncio.run(serve_module.consumer_reconcile_on_boot(_StubNatsClient()))
 
 
 # ---------------------------------------------------------------------------
@@ -623,12 +598,8 @@ class TestRunServeFleetRegistration:
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -689,12 +660,8 @@ class TestRunServeFleetRegistration:
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
         monkeypatch.setattr(serve_module, "register_on_boot", _fake_register)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -748,12 +715,8 @@ class TestRunServeFleetRegistration:
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -803,12 +766,8 @@ class TestRunServeFleetRegistration:
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
         monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
-        monkeypatch.setattr(
-            serve_module, "recovery_reconcile_on_boot", _fake_recovery
-        )
-        monkeypatch.setattr(
-            serve_module, "consumer_reconcile_on_boot", _fake_consumer
-        )
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _fake_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _fake_consumer)
         monkeypatch.setattr(serve_module, "run_daemon", _fake_daemon)
         monkeypatch.setattr(serve_module, "run_healthz_server", _fake_healthz)
 
@@ -860,3 +819,128 @@ class TestMainModuleRegistersServe:
         assert hasattr(module, "ServeConfig")
         assert hasattr(module, "SubscriptionState")
         assert hasattr(module, "serve_cmd")
+
+
+# ---------------------------------------------------------------------------
+# TASK-GATE-D659 §D4 — production boot wiring binds BOTH reconcile seams
+# (no warning-stub default) and pins the JetStream ack_wait.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStartAsyncTaskTool:
+    """``StructuredTool`` stand-in exposing ``.name`` / ``.func`` / ``.coroutine``.
+
+    ``_resolve_async_task_starter`` → ``build_async_task_starter`` asserts the
+    tool has callable ``func`` + ``coroutine`` at composition time; these are
+    never invoked (the test exercises composition only).
+    """
+
+    def __init__(self, name: str = "start_async_task") -> None:
+        self.name = name
+
+    def func(
+        self, *, description: str, subagent_type: str, runtime: object
+    ) -> object:  # pragma: no cover - placeholder, never invoked
+        raise AssertionError("func should not be invoked by this test")
+
+    async def coroutine(
+        self, *, description: str, subagent_type: str, runtime: object
+    ) -> object:  # pragma: no cover - placeholder, never invoked
+        raise AssertionError("coroutine should not be invoked by this test")
+
+
+class _FakeMiddleware:
+    """Stand-in for :class:`AsyncSubAgentMiddleware` exposing a tools tuple."""
+
+    def __init__(self, tool_names: tuple[str, ...] = ("start_async_task",)) -> None:
+        self.tools = tuple(_FakeStartAsyncTaskTool(n) for n in tool_names)
+
+
+class TestProductionBootBindsReconcileSeams:
+    """§D4.1-2 / §D4.4: production wiring rebinds both boot reconcile seams."""
+
+    def test_bind_production_serve_rebinds_both_reconcile_seams(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+
+        # Capture the module-level seams so the production rebind cannot leak
+        # into sibling test modules (the smoke tests await these seams).
+        original_recovery = serve_module.recovery_reconcile_on_boot
+        original_consumer = serve_module.consumer_reconcile_on_boot
+        original_compose = serve_module.compose_dispatch_chain
+
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            MagicMock(return_value=_FakeMiddleware()),
+        )
+        # Avoid importing the real deps graph — stub the dispatch-chain factory.
+        monkeypatch.setattr(
+            serve_module,
+            "bind_production_dispatch_chain",
+            lambda **kw: (lambda client: None),
+        )
+
+        serve_config = ServeConfig(
+            db_path=tmp_path / "forge.db",
+            autobuild_runner_url="http://forge-autobuild-runner:8124",
+        )
+        try:
+            serve_production._reset_for_tests()
+            serve_production.bind_production_serve(serve_config, MagicMock())
+
+            # Both seams are now the production closures, NOT the default
+            # warning-stub no-ops.
+            assert (
+                serve_module.recovery_reconcile_on_boot
+                is not serve_module._default_recovery_reconcile_on_boot
+            )
+            assert (
+                serve_module.consumer_reconcile_on_boot
+                is not serve_module._default_consumer_reconcile_on_boot
+            )
+            assert callable(serve_module.recovery_reconcile_on_boot)
+            assert callable(serve_module.consumer_reconcile_on_boot)
+        finally:
+            serve_production._reset_for_tests()
+            serve_module.recovery_reconcile_on_boot = original_recovery
+            serve_module.consumer_reconcile_on_boot = original_consumer
+            serve_module.compose_dispatch_chain = original_compose
+
+    def test_default_seams_are_still_no_op_warning_stubs_before_binding(
+        self,
+    ) -> None:
+        # The MODULE-LEVEL defaults stay the receipt-only no-ops until
+        # bind_production_serve runs (the smoke tests depend on this).
+        from forge.cli import serve as serve_module
+
+        assert (
+            serve_module._default_recovery_reconcile_on_boot.__name__
+            == "_default_recovery_reconcile_on_boot"
+        )
+        assert (
+            serve_module._default_consumer_reconcile_on_boot.__name__
+            == "_default_consumer_reconcile_on_boot"
+        )
+
+    def test_attach_consumer_pins_ack_wait_to_contract_value(self) -> None:
+        # §"Broker posture": the durable ConsumerConfig pins ack_wait to
+        # ACK_WAIT_SECONDS (1h) so a paused build's un-acked build-queued
+        # message is not redelivered every 30s (server default).
+        from forge.adapters.nats.pipeline_consumer import ACK_WAIT_SECONDS
+
+        daemon_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "src"
+            / "forge"
+            / "cli"
+            / "_serve_daemon.py"
+        )
+        source = daemon_src.read_text(encoding="utf-8")
+        assert "ack_wait=ACK_WAIT_SECONDS" in source
+        assert ACK_WAIT_SECONDS >= 3600

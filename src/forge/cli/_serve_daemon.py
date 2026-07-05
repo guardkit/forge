@@ -57,6 +57,7 @@ import logging
 import signal
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
+from forge.adapters.nats.pipeline_consumer import ACK_WAIT_SECONDS
 from forge.cli._serve_config import ServeConfig
 from forge.cli._serve_state import SubscriptionState
 
@@ -157,9 +158,7 @@ async def _default_nats_connect(servers: str) -> Any:
     try:
         import nats  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - covered via the seam
-        raise RuntimeError(
-            "nats client not installed — `pip install nats-py`"
-        ) from exc
+        raise RuntimeError("nats client not installed — `pip install nats-py`") from exc
     return await nats.connect(servers=servers)
 
 
@@ -194,9 +193,7 @@ async def _default_dispatch(msg: _MsgLike) -> None:
 
         envelope = MessageEnvelope.model_validate_json(msg.data)
     except Exception as exc:  # noqa: BLE001 — log + ack + drop, never raise
-        logger.warning(
-            "forge-serve: dropping unparseable envelope (%s)", exc
-        )
+        logger.warning("forge-serve: dropping unparseable envelope (%s)", exc)
         await msg.ack()
         return
 
@@ -252,6 +249,15 @@ async def _attach_consumer(client: Any, durable_name: str) -> Any:
         ack_policy=AckPolicy.EXPLICIT,
         filter_subject=BUILD_QUEUED_SUBJECT_FILTER,
         max_ack_pending=MAX_ACK_PENDING,
+        # TASK-GATE-D659 (contract §2.2 / plan "Broker posture"): pin
+        # ``ack_wait`` to 1h. Without it nats-py falls back to the 30s
+        # server default, so a build paused at the pre-dispatch approval
+        # gate would have its un-acked build-queued message redelivered
+        # every 30s (a redelivery storm against the held queue slot).
+        # The pause holds the slot un-acked for the full approval window
+        # per FEAT-FORGE-010; ``ack_wait`` MUST exceed
+        # ``approval.max_wait_seconds`` (operator guidance).
+        ack_wait=ACK_WAIT_SECONDS,
     )
     return await js.pull_subscribe(
         subject=BUILD_QUEUED_SUBJECT_FILTER,
@@ -332,9 +338,7 @@ async def _consume_forever(
     """
     while not stop_event.is_set():
         try:
-            msgs = await sub.fetch(
-                PULL_BATCH_SIZE, timeout=PULL_TIMEOUT_SECONDS
-            )
+            msgs = await sub.fetch(PULL_BATCH_SIZE, timeout=PULL_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             # No messages this tick — yield to let stop_event flip.
             await asyncio.sleep(0)
@@ -437,9 +441,7 @@ async def run_daemon(
                     pending_client = None
                 else:
                     iteration_client = await nats_connect(config.nats_url)
-                sub = await _attach_consumer(
-                    iteration_client, config.durable_name
-                )
+                sub = await _attach_consumer(iteration_client, config.durable_name)
                 await state.set_live(True)
                 # Successful attach resets the backoff so the next outage
                 # starts from RECONNECT_INITIAL_BACKOFF rather than the
@@ -472,9 +474,7 @@ async def run_daemon(
                     try:
                         await sub.unsubscribe()
                     except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "forge-serve: unsubscribe error (%s)", exc
-                        )
+                        logger.debug("forge-serve: unsubscribe error (%s)", exc)
                 if iteration_client is not None:
                     try:
                         await asyncio.wait_for(
@@ -482,9 +482,7 @@ async def run_daemon(
                             timeout=SHUTDOWN_TIMEOUT_SECONDS,
                         )
                     except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
-                        logger.debug(
-                            "forge-serve: client.close error (%s)", exc
-                        )
+                        logger.debug("forge-serve: client.close error (%s)", exc)
     finally:
         await state.set_live(False)
 

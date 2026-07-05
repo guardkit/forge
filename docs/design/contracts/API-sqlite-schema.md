@@ -178,6 +178,31 @@ On boot, `reconcile_on_boot()` returns builds whose status is not terminal:
 | `FINALISING` | Mark `INTERRUPTED` with warning — PR creation may have succeeded; operator reconciles manually |
 | `COMPLETE`/`FAILED`/`CANCELLED`/`SKIPPED` | Ack any residual JetStream message; no-op |
 
+### 6.1 Boot-actor ownership (TASK-GATE-D659 §D4)
+
+With the daemon-side pre-dispatch approval gate live, three **distinct** boot
+actors run in a fixed order, each owning a disjoint slice of the recovery
+matrix. The split closes the arch-review C1 boot-order tap-drop (a PAUSED
+approval re-emitted before any response subscriber exists is silently dropped
+on core NATS) and the C2 crash-mid-hop wedge.
+
+| Boot actor | Runs at | Owns | PAUSED re-emit |
+|---|---|---|---|
+| `lifecycle.recovery.reconcile_on_boot` | boot step 2 (before compose) | `PREPARING`/`RUNNING`/`FINALISING` → `INTERRUPTED` + `build-failed` | **Suppressed** — passed a no-op `ApprovalRepublisher` (INFO log per suppressed row); recovery.py is otherwise unmodified |
+| `adapters.nats.pipeline_consumer.reconcile_on_boot` | boot step 3 (before compose) | in-flight / `INTERRUPTED` redelivery redispatch (Branch-2) | **Suppressed** — empty `iter_paused_builds`; no-op re-emit fns |
+| `cli._serve_gate_activation.rearm_paused_gates` | boot step 3.5 (`_compose`, live subscriber armed) | re-arming every `PAUSED` build's approval round-trip | **Owner of BOTH** — re-emits the `ApprovalRequestPayload` (verbatim persisted `request_id` + `correlation_id`) FIRST and `pipeline.build-paused.{feature_id}` SECOND, **arm-before-post** (the response subscription is provably live before either re-emit reaches the wire) |
+
+So the `PAUSED` row in the table above resolves as: **status stays `PAUSED`; both
+the approval request AND `pipeline.build-paused` are re-emitted verbatim (same
+`request_id`, same `correlation_id`) by `rearm_paused_gates` only** — satisfying
+`API-nats-pipeline-events §4` + `FEAT-FORGE-010:245-249` (build-paused
+re-emitted) and this section's original intent (request re-emitted, verbatim
+id). A crash inside the `QUEUED → … → PAUSED` synthetic-hop window leaves an
+`INTERRUPTED` row that re-enters the lifecycle via the consumer twin seam
+(Branch-2) or, on the first post-boot redelivery, `dispatch_build`'s three-arm
+`INTERRUPTED → redispatch` (never skip-without-ack, which would wedge the
+`max_ack_pending=1` consumer).
+
 ---
 
 ## 7. Backup + Retention

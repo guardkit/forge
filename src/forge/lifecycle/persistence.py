@@ -892,6 +892,93 @@ class SqliteLifecyclePersistence:
         self.apply_transition(transition)
 
     # ------------------------------------------------------------------
+    # Write API — refresh_pending_approval_request_id (TASK-GATE-D659)
+    # ------------------------------------------------------------------
+
+    def refresh_pending_approval_request_id(
+        self, build_id: str, request_id: str
+    ) -> None:
+        """Update a PAUSED row's ``pending_approval_request_id`` in place.
+
+        The defer round-trip re-publishes with ``attempt_count + 1`` — a
+        fresh ``request_id`` — while the build **stays PAUSED**. There is
+        no state transition, so :meth:`mark_paused` (RUNNING → PAUSED) is
+        illegal here; this method issues a **status-preserving** UPDATE of
+        ``pending_approval_request_id`` alone. It deliberately does *not*
+        touch ``status``, keeping the single-transition-owner rule intact
+        (``apply_transition`` remains the sole ``builds.status`` writer).
+
+        The UPDATE is guarded by ``AND status = 'PAUSED'`` so a concurrent
+        terminal transition landing between the caller's PAUSED precheck and
+        this write cannot stamp a fresh request_id onto an already-terminal
+        row (single-owner discipline). On a 0-row UPDATE the row is re-read:
+        a genuinely missing build is a caller bug (``RuntimeError``); a row
+        that a concurrent writer moved out of PAUSED is a soft no-op (log +
+        return), matching the module's other concurrent-terminal handling.
+
+        Args:
+            build_id: The paused build whose pending request id is being
+                refreshed.
+            request_id: The new (next-attempt) approval-request id.
+
+        Raises:
+            ValueError: If either argument is empty.
+            RuntimeError: If no row matches ``build_id`` at all — a refresh
+                against a non-existent build is a caller bug, not a silent
+                no-op. A row that exists but is non-PAUSED (terminal) is NOT
+                an error: it is logged and skipped.
+        """
+        if not build_id:
+            raise ValueError(
+                "refresh_pending_approval_request_id: build_id must be non-empty"
+            )
+        if not request_id:
+            raise ValueError(
+                "refresh_pending_approval_request_id: request_id must be non-empty"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            cursor = self._cx.execute(
+                """
+                UPDATE builds
+                   SET pending_approval_request_id = ?
+                 WHERE build_id = ?
+                   AND status = ?
+                """,
+                (request_id, build_id, BuildState.PAUSED.value),
+            )
+            if cursor.rowcount == 0:
+                # No PAUSED row matched. Re-read (still inside the txn) to
+                # tell a missing build from a concurrent-terminal race.
+                row = self._cx.execute(
+                    "SELECT status FROM builds WHERE build_id = ?",
+                    (build_id,),
+                ).fetchone()
+                self._cx.execute("ROLLBACK;")
+                if row is None:
+                    raise RuntimeError(
+                        "refresh_pending_approval_request_id: no build row for "
+                        f"build_id={build_id!r}"
+                    )
+                current = row["status"] if isinstance(row, sqlite3.Row) else row[0]
+                logger.warning(
+                    "refresh_pending_approval_request_id: refresh skipped: "
+                    "build_id=%s is %s, not PAUSED (a concurrent terminal "
+                    "transition is authoritative)",
+                    build_id,
+                    current,
+                )
+                return
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
     # Read API — read_status
     # ------------------------------------------------------------------
 

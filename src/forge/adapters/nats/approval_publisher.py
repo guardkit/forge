@@ -355,6 +355,15 @@ def build_recovery_approval_envelope(build: BuildRow) -> MessageEnvelope:
     return MessageEnvelope(
         source_id=AGENT_ID,
         event_type=EventType.APPROVAL_REQUEST,
+        # TASK-GATE-D659 correlation landmine: the live pause path stamps
+        # ``deps.correlation_id`` on its request envelope
+        # (``_build_request_envelope``), but this recovery/rearm builder
+        # previously left it unset — so the subscriber's step-2b guard
+        # (refuses only when BOTH sides are non-None and mismatched) saw a
+        # null on the re-emit and a real value on the responder echo. Stamp
+        # the build's ``correlation_id`` verbatim so boot re-emits thread
+        # the same correlation context as the original pause.
+        correlation_id=build.correlation_id,
         payload=payload.model_dump(mode="json"),
     )
 

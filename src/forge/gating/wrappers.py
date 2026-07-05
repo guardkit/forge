@@ -87,6 +87,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from forge.adapters.langgraph import resume_value_as
 from forge.gating.identity import derive_request_id
+from forge.gating.sqlite_adapters import StaleTransitionError
 from forge.gating.models import (
     CalibrationAdjustment,
     ConstitutionalRule,
@@ -565,7 +566,67 @@ async def gate_check(
         artefact_paths=artefact_paths,
     )
 
-    # Await Rich's response.
+    # Await Rich's response and dispatch on the decision. Extracted into
+    # the public :func:`await_and_dispatch` so the boot-time rearm path
+    # (TASK-GATE-D659 Wave 3) can reuse the *exact* four-step
+    # chain/dedup/emit tail without duplicating it.
+    return await await_and_dispatch(
+        deps=deps,
+        build_id=build_id,
+        stage_label=stage_label,
+        decision=decision,
+        feature_id=feature_id,
+        attempt_count=attempt_count,
+        artefact_paths=artefact_paths,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API: await_and_dispatch — the response-await + dispatch tail.
+# ---------------------------------------------------------------------------
+
+
+async def await_and_dispatch(
+    *,
+    deps: GateCheckDeps,
+    build_id: str,
+    stage_label: str,
+    decision: GateDecision,
+    feature_id: str,
+    attempt_count: int,
+    artefact_paths: tuple[str, ...],
+) -> tuple[GateOutcome, GateDecision]:
+    """Await the approval response and dispatch it to the state machine.
+
+    This is the shared tail of the pause round-trip — pure refactor of the
+    former ``gate_check`` body (no behaviour change): it awaits the
+    subscriber, applies the max-wait ceiling fallback on ``None``, and
+    otherwise rehydrates the typed response and hands it to
+    :func:`_dispatch_response`. Both the live pre-dispatch path and the
+    boot-time rearm path call it, so the four-step responder chain, dedup,
+    and cancel/resume emits stay identical across the two entry points.
+
+    On the max-wait cancel leg a :class:`StaleTransitionError` (the row went
+    terminal under a concurrent CLI-cancel before we cancelled) is softened
+    to a WARNING and returned without raising — the same posture
+    :meth:`StateMachine.transition_to_running` takes on its optimistic
+    ``RuntimeError``. Without the catch the error would escape into
+    ``handle_message``'s generic handler and mis-emit ``build-failed`` after
+    a correct ``build-cancelled``.
+
+    Args:
+        deps: The gate dependency bundle.
+        build_id: The paused build's identifier.
+        stage_label: The gated stage label.
+        decision: The persisted :class:`GateDecision` motivating the pause.
+        feature_id: ``FEAT-XXXX`` of the build (threaded onto defer
+            re-publishes).
+        attempt_count: The current attempt counter (defer increments it).
+        artefact_paths: Reviewer artefact paths carried onto re-publishes.
+
+    Returns:
+        The ``(outcome, decision)`` pair — identical to ``gate_check``'s.
+    """
     raw = await deps.subscriber.await_response(
         build_id,
         stage_label=stage_label,
@@ -578,9 +639,18 @@ async def gate_check(
         # ceiling"). ASSUM-003 defers the ceiling-fallback to the
         # pipeline-config feature; we currently apply a CANCELLED
         # transition with REASON_MAX_WAIT so the build doesn't dangle.
-        await deps.state_machine.transition_to_cancelled(
-            build_id=build_id, reason=REASON_MAX_WAIT
-        )
+        try:
+            await deps.state_machine.transition_to_cancelled(
+                build_id=build_id, reason=REASON_MAX_WAIT
+            )
+        except StaleTransitionError:
+            logger.warning(
+                "await_and_dispatch: max-wait cancel superseded by a "
+                "concurrent terminal for build_id=%s — returning TIMED_OUT "
+                "without a second build-cancelled emit",
+                build_id,
+            )
+            return GateOutcome.TIMED_OUT, decision
         await deps.repository.mark_cancelled(build_id=build_id, reason=REASON_MAX_WAIT)
         await _publish_cancelled_best_effort(
             deps,
@@ -813,9 +883,24 @@ async def _dispatch_response(
     if decision_kind == "reject":
         reason = response.notes or REASON_REJECT
         await deps.repository.mark_cancelled(build_id=build_id, reason=reason)
-        await deps.state_machine.transition_to_cancelled(
-            build_id=build_id, reason=reason
-        )
+        try:
+            await deps.state_machine.transition_to_cancelled(
+                build_id=build_id, reason=reason
+            )
+        except StaleTransitionError:
+            # A concurrent terminal (e.g. CLI-cancel) beat this reject to
+            # the row. Soften to a WARNING and return without a second
+            # build-cancelled emit — the concurrent writer owns its own
+            # terminal signal. (arch-review M2: without the catch this
+            # escapes into handle_message's generic handler and mis-emits
+            # build-failed after a correct build-cancelled.)
+            logger.warning(
+                "gate_check: reject cancel superseded by a concurrent "
+                "terminal for build_id=%s — returning CANCELLED without a "
+                "second build-cancelled emit",
+                build_id,
+            )
+            return GateOutcome.CANCELLED, decision
         # TASK-JNB-102: terminal wire signal for the phone loop — the
         # operator who tapped Reject receives build-cancelled, never
         # build-resumed (the resume emit is decision-gated upstream).
@@ -866,37 +951,16 @@ async def _dispatch_response(
             correlation_id=deps.correlation_id,
         )
         await deps.publisher.publish_request(envelope)
-        # Fall back into the wait loop. We recurse via a fresh
-        # await_response call rather than looping inline so the
-        # state-machine remains in PAUSED across the re-publish (no
-        # transition_to_paused is needed — we never left PAUSED).
-        raw = await deps.subscriber.await_response(
-            build_id,
-            stage_label=stage_label,
-            attempt_count=next_attempt,
-            timeout_seconds=deps.per_attempt_wait_seconds,
-        )
-        if raw is None:
-            await deps.state_machine.transition_to_cancelled(
-                build_id=build_id, reason=REASON_MAX_WAIT
-            )
-            await deps.repository.mark_cancelled(
-                build_id=build_id, reason=REASON_MAX_WAIT
-            )
-            await _publish_cancelled_best_effort(
-                deps,
-                build_id=build_id,
-                reason=REASON_MAX_WAIT,
-                cancelled_by=SOURCE_ID,
-            )
-            return GateOutcome.TIMED_OUT, decision
-        next_response = resume_value_as(ApprovalResponsePayload, raw)
-        return await _dispatch_response(
+        # Re-enter the shared await+dispatch tail with the incremented
+        # attempt (arch-review DRY minor: the defer branch's await/dispatch
+        # duplication is consolidated into :func:`await_and_dispatch`). The
+        # state machine stays PAUSED across the re-publish — no
+        # transition_to_paused is needed because we never left PAUSED.
+        return await await_and_dispatch(
             deps=deps,
             build_id=build_id,
             stage_label=stage_label,
             decision=decision,
-            response=next_response,
             feature_id=feature_id,
             attempt_count=next_attempt,
             artefact_paths=artefact_paths,
@@ -1056,7 +1120,9 @@ __all__ = [
     "REASON_REJECT",
     "RulesReader",
     "SOURCE_ID",
+    "StaleTransitionError",
     "StateMachine",
+    "await_and_dispatch",
     "cli_cancel_build",
     "cli_skip_stage",
     "gate_check",

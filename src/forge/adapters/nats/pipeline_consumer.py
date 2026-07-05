@@ -117,8 +117,24 @@ IsDuplicateTerminal = Callable[[str, str], Awaitable[bool]]
 terminated (``COMPLETE | FAILED | CANCELLED | SKIPPED``) and the consumer
 should ack-and-skip."""
 
-DispatchBuild = Callable[[BuildQueuedPayload, AckCallback], Awaitable[None]]
-"""``async (payload, ack_callback) -> None`` — pipeline state-machine entry."""
+RegisterObserver = Callable[[], Awaitable[None]]
+"""``async () -> None`` — TASK-GATE-D659 R1 deferred bridge-registration.
+
+The consumer builds this closure (it captures the accepted build's
+:class:`BuildAckHandle` + identity) and hands it to ``dispatch_build``.
+``dispatch_build`` invokes it ONLY on the approve → launch path so no
+bridge observer is live while the build is paused at the pre-dispatch
+approval gate. ``None`` (no bridge wired) means "skip registration"."""
+
+DispatchBuild = Callable[..., Awaitable[None]]
+"""``async (payload, ack_callback[, register_observer]) -> None``.
+
+Pipeline state-machine entry. The optional third argument is the
+TASK-GATE-D659 R1 :data:`RegisterObserver` deferred-registration closure;
+the consumer passes it only when the bridge is wired
+(``register_ack_handle`` is not ``None``). Legacy two-argument callers
+(unit-test doubles, the crash-recovery redelivery path) are unaffected —
+the consumer omits the third argument when no bridge is wired."""
 
 PublishBuildFailed = Callable[..., Awaitable[None]]
 """``async (failure_payload, feature_id, *, correlation_id) -> None``.
@@ -516,25 +532,28 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     ack_handle = make_msg_ack_handle(msg)
     ack_callback = _ack_callback_from_handle(ack_handle)
 
+    # TASK-GATE-D659 R1 — DEFER bridge-observer registration until AFTER
+    # the pre-dispatch approval gate approves. Previously the consumer
+    # registered the ack handle HERE (before dispatch); a build that
+    # paused at the gate then had a live observer during the multi-minute
+    # pause, which (a) resolved stale async_tasks rows and fetch-replayed
+    # a dead run's terminal (false BuildStarted/BuildComplete + early ack
+    # + detach mid-pause), or (b) identity-timed-out and popped the handle
+    # so no observer survived the approve. Instead we build a
+    # ``register_observer`` closure and hand it to ``dispatch_build``,
+    # which invokes it ONLY on the approve → launch path so the observer
+    # spawns adjacent to the fresh run. When no bridge is wired
+    # (``register_ack_handle is None`` — unit tests, legacy paths) the
+    # closure is ``None`` and the call stays two-argument, preserving the
+    # F010F sync-raise ack fallback below.
+    register_observer: RegisterObserver | None = None
     if deps.register_ack_handle is not None:
-        try:
-            await deps.register_ack_handle(
-                payload.feature_id,
-                payload.correlation_id,
-                ack_handle,
-            )
-        except Exception as reg_exc:
-            # Registration failure is non-fatal: the bridge owns its
-            # own observability, and the legacy ack_callback path is
-            # still wired. Log at WARNING and continue with dispatch.
-            logger.warning(
-                "pipeline_consumer: register_ack_handle raised (%s) for "
-                "feature_id=%s correlation_id=%s; continuing with "
-                "legacy ack_callback fallback",
-                reg_exc,
-                payload.feature_id,
-                payload.correlation_id,
-            )
+        register_observer = _make_deferred_registration(
+            deps.register_ack_handle,
+            feature_id=payload.feature_id,
+            correlation_id=payload.correlation_id,
+            handle=ack_handle,
+        )
 
     logger.info(
         "pipeline_consumer: dispatching build feature_id=%s correlation_id=%s "
@@ -542,10 +561,13 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         payload.feature_id,
         payload.correlation_id,
         payload.originating_adapter,
-        "wired" if deps.register_ack_handle is not None else "fallback",
+        "wired (deferred)" if deps.register_ack_handle is not None else "fallback",
     )
     try:
-        await deps.dispatch_build(payload, ack_callback)
+        if register_observer is not None:
+            await deps.dispatch_build(payload, ack_callback, register_observer)
+        else:
+            await deps.dispatch_build(payload, ack_callback)
     except Exception as exc:
         # TASK-FW10-009 / Group C "dispatch error contained": the state
         # machine raised out of the dispatch path before reaching a
@@ -656,6 +678,40 @@ def _ack_callback_from_handle(handle: BuildAckHandle) -> AckCallback:
         await handle.ack()
 
     return _ack
+
+
+def _make_deferred_registration(
+    register_ack_handle: InFlightAckRegistry,
+    *,
+    feature_id: str,
+    correlation_id: str,
+    handle: BuildAckHandle,
+) -> RegisterObserver:
+    """Return the TASK-GATE-D659 R1 deferred bridge-registration closure.
+
+    The returned ``async () -> None`` closure registers ``handle`` against
+    ``(feature_id, correlation_id)`` in the bridge's in-flight store. It is
+    handed to ``dispatch_build``, which invokes it ONLY on the approve →
+    launch path so no bridge observer exists while the build is paused at
+    the pre-dispatch approval gate. Registration is best-effort: a raising
+    registry is swallowed and logged (the legacy ack_callback path still
+    works) — the same non-fatal posture the pre-relocation call had.
+    """
+
+    async def _register() -> None:
+        try:
+            await register_ack_handle(feature_id, correlation_id, handle)
+        except Exception as reg_exc:  # noqa: BLE001 — non-fatal registration
+            logger.warning(
+                "pipeline_consumer: deferred register_ack_handle raised (%s) "
+                "for feature_id=%s correlation_id=%s; continuing with legacy "
+                "ack_callback fallback",
+                reg_exc,
+                feature_id,
+                correlation_id,
+            )
+
+    return _register
 
 
 def _safe_envelope_feature(envelope: MessageEnvelope) -> str | None:
@@ -1079,6 +1135,7 @@ __all__ = [
     "RESTART_FROM_PREPARING_STATES",
     "ReconcileDeps",
     "ReconcileReport",
+    "RegisterObserver",
     "STREAM_NAME",
     "TERMINAL_BUILD_STATES",
     "UNKNOWN_FEATURE_ID",

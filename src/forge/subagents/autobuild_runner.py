@@ -81,7 +81,15 @@ import shutil
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, get_args, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Protocol,
+    get_args,
+    runtime_checkable,
+)
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
@@ -464,11 +472,16 @@ def build_stage_complete_kwargs(state: AutobuildState) -> dict[str, str]:
 #: only the wire emit is suppressed (e.g. ``starting`` is observable via
 #: ``async_tasks`` but produces no separate envelope).
 #:
-#: ``awaiting_approval`` routes to ``emit_paused`` (DDR-007 pause publish)
-#: and the canonical resume edge ``awaiting_approval → running_wave``
-#: routes to ``emit_resumed`` (DDR-007 resume publish). The latter is
-#: keyed on the *destination* lifecycle plus a transition hint passed in
-#: ``state.waiting_for is None`` semantics.
+#: ``awaiting_approval`` routes to ``emit_paused`` (DDR-007 pause publish).
+#: Resume-emit ownership does NOT live here: the daemon subscriber seam
+#: (``forge.adapters.nats.approval_subscriber``, FW10-010) is the single
+#: ``pipeline.build-resumed`` emit owner, firing on the real approve/override
+#: decision. The former runner-side resume special-case (the C1
+#: ``mark_resume_pending`` / ``_resume_pending`` mechanism) was removed by
+#: TASK-GATE-D659 §D5: the ``LifecycleEmitterAdapter`` is never constructed in
+#: production (the sidecar runs in a separate process with no forge.db / NATS),
+#: so the mechanism was dead-and-broken (DDR-007:46 places the resume emit in
+#: the subscriber path). The ``awaiting_approval → emit_paused`` row stays.
 LIFECYCLE_TO_PIPELINE_EMIT: dict[str, str | None] = {
     "starting": None,
     "planning_waves": None,
@@ -491,16 +504,20 @@ class LifecycleEmitterAdapter:
     sync entry point to the async ``emit_*`` coroutines on the wrapped
     :class:`PipelineLifecycleEmitter`.
 
-    Routing table (TASK-FW10-010):
+    Routing table (TASK-FW10-010; resume special-case removed by
+    TASK-GATE-D659 §D5):
 
     * ``awaiting_approval`` → ``emit_paused`` (publishes
       ``pipeline.build-paused.<feature_id>``).
-    * ``running_wave`` reached *after* ``awaiting_approval`` (via the
-      ``_resume_pending`` flag set by :meth:`mark_resume_pending`) →
-      ``emit_resumed`` (publishes ``pipeline.build-resumed.<feature_id>``).
     * ``completed`` / ``cancelled`` / ``failed`` → terminal emits.
     * Other lifecycles are observable via the ``async_tasks`` channel
       only; the adapter is a no-op for them so this task stays scoped.
+
+    Resume-emit ownership: ``pipeline.build-resumed`` is emitted **only** by
+    the daemon subscriber seam (FW10-010), on the real approve/override
+    decision. The former runner-side resume edge (``mark_resume_pending`` /
+    ``_resume_pending``) was dead-and-broken in production (this adapter is
+    never constructed sidecar-side) and has been removed.
 
     Failure-mode contract (DDR-007 §Failure-mode contract, ADR-ARCH-008):
     every scheduled coroutine is wrapped so any :class:`PublishFailure`
@@ -529,14 +546,6 @@ class LifecycleEmitterAdapter:
         self._emitter = emitter
         self._ctx = ctx
         self._loop = loop
-        # Track whether the previous lifecycle was awaiting_approval so
-        # the next running_wave transition knows it is a resume edge,
-        # not an initial entry into running_wave. The runner's own
-        # ``state.waiting_for`` field clears on resume but is per-state;
-        # this flag is per-adapter and survives across _update_state calls.
-        self._resume_pending: bool = False
-        # Last lifecycle observed (for transition awareness).
-        self._last_lifecycle: str | None = None
 
     # ------------------------------------------------------------------
     # SubagentEmitter Protocol
@@ -556,22 +565,6 @@ class LifecycleEmitterAdapter:
         try:
             method_name = LIFECYCLE_TO_PIPELINE_EMIT.get(state.lifecycle)
 
-            # Resume edge: awaiting_approval → running_wave fires emit_resumed.
-            if (
-                state.lifecycle == "running_wave"
-                and self._last_lifecycle == "awaiting_approval"
-                and self._resume_pending
-            ):
-                method_name = "emit_resumed"
-                self._resume_pending = False
-
-            # Track the awaiting_approval entry so the next running_wave
-            # transition is recognised as a resume.
-            if state.lifecycle == "awaiting_approval":
-                self._resume_pending = True
-
-            self._last_lifecycle = state.lifecycle
-
             if method_name is None:
                 # No publish for this lifecycle — async_tasks channel
                 # write already happened in _update_state, which is the
@@ -590,19 +583,6 @@ class LifecycleEmitterAdapter:
                 state.lifecycle,
                 exc,
             )
-
-    def mark_resume_pending(self) -> None:
-        """Force the next ``running_wave`` transition to be treated as resume.
-
-        Used by the approval-subscriber wiring when it knows a resume is
-        imminent (e.g. an approval response just matched). Production
-        wiring relies on the natural ``awaiting_approval → running_wave``
-        edge to flip this flag automatically; this helper exists for
-        exotic recovery paths where the lifecycle was not observed
-        moving through ``awaiting_approval`` in this adapter instance
-        (daemon restart with rehydrated state).
-        """
-        self._resume_pending = True
 
     # ------------------------------------------------------------------
     # Coroutine builders — one per emit method we route to
@@ -639,14 +619,6 @@ class LifecycleEmitterAdapter:
                 rationale=state.waiting_for or "autobuild paused for approval",
                 approval_subject=(f"agents.approval.forge.{state.build_id}"),
                 paused_at=now_iso,
-            )
-        if method_name == "emit_resumed":
-            return emit(
-                self._ctx,
-                stage_label="awaiting_approval",
-                decision="approve",
-                responder="approval-subscriber",
-                resumed_at=now_iso,
             )
         if method_name == "emit_complete":
             return emit(
@@ -1199,7 +1171,9 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
         )
         return None
 
-    base_dir_raw = os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
+    base_dir_raw = (
+        os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
+    )
     base_dir = Path(base_dir_raw).expanduser().resolve()
     candidate = (base_dir / basename).resolve()
 
@@ -1215,8 +1189,7 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
 
     if not candidate.is_dir():
         logger.warning(
-            "autobuild_runner: resolved repo path %s is not a directory "
-            "(repo=%r)",
+            "autobuild_runner: resolved repo path %s is not a directory " "(repo=%r)",
             candidate,
             repo_raw,
         )
@@ -1283,7 +1256,9 @@ def _resolve_autobuild_timeout_seconds() -> float:
     return parsed
 
 
-def _build_failed_snapshot(payload: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
+def _build_failed_snapshot(
+    payload: Mapping[str, Any], *, reason: str
+) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
     The bridge translator's :func:`_build_failed`
@@ -1346,7 +1321,9 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     feature_id_raw = payload.get("feature_id")
     if not isinstance(feature_id_raw, str) or not feature_id_raw.strip():
         return _snapshot_update(
-            _build_failed_snapshot(payload, reason="missing feature_id in launch payload")
+            _build_failed_snapshot(
+                payload, reason="missing feature_id in launch payload"
+            )
         )
     feature_id = feature_id_raw.strip()
 
@@ -1534,9 +1511,7 @@ def _route_after_running_wave(state: AutobuildRunnerState) -> str:
     feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
     async_tasks = state.get("async_tasks") or {}
     snapshot = async_tasks.get(feature_id) if isinstance(async_tasks, Mapping) else None
-    lifecycle = (
-        snapshot.get("lifecycle") if isinstance(snapshot, Mapping) else None
-    )
+    lifecycle = snapshot.get("lifecycle") if isinstance(snapshot, Mapping) else None
     if lifecycle == "failed":
         return "failed"
     return "completed"

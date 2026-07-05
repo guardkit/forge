@@ -46,7 +46,6 @@ from forge.pipeline.build_ack_handle import (
     make_msg_ack_handle,
 )
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -165,11 +164,23 @@ class TestAckHandleRegistration:
     async def test_register_ack_handle_called_with_identity_pair(
         self, forge_config: ForgeConfig, feature_yaml: Path
     ) -> None:
+        # TASK-GATE-D659 R1: registration is DEFERRED. The consumer no
+        # longer registers pre-dispatch; it hands dispatch_build a
+        # ``register_observer`` closure (3rd arg) that dispatch_build
+        # invokes only on the approve → launch path. Invoking the closure
+        # is what performs the registration with the identity pair.
         msg = _make_msg(_envelope_bytes(_valid_payload(feature_yaml)))
         register = AsyncMock()
-        deps, _ = _make_deps(forge_config, register_ack_handle=register)
+        deps, mocks = _make_deps(forge_config, register_ack_handle=register)
 
         await handle_message(msg, deps)
+
+        register.assert_not_awaited()
+        args = mocks["dispatch_build"].await_args.args
+        assert len(args) == 3, "consumer must pass the register_observer closure"
+        register_observer = args[2]
+
+        await register_observer()
 
         register.assert_awaited_once()
         feature_id, correlation_id, handle = register.await_args.args
@@ -200,12 +211,15 @@ class TestAckHandleRegistration:
         self, forge_config: ForgeConfig, feature_yaml: Path
     ) -> None:
         # The lifecycle bridge will eventually call handle.ack() — that
-        # MUST drive the underlying msg.ack exactly once.
+        # MUST drive the underlying msg.ack exactly once. R1: the handle is
+        # obtained by invoking the deferred register_observer closure.
         msg = _make_msg(_envelope_bytes(_valid_payload(feature_yaml)))
         register = AsyncMock()
-        deps, _ = _make_deps(forge_config, register_ack_handle=register)
+        deps, mocks = _make_deps(forge_config, register_ack_handle=register)
 
         await handle_message(msg, deps)
+        register_observer = mocks["dispatch_build"].await_args.args[2]
+        await register_observer()
         _, _, handle = register.await_args.args
 
         msg.ack.assert_not_called()

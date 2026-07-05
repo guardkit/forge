@@ -1,11 +1,11 @@
 ---
 id: TASK-GATE-D659
 title: "Gate activation: real build pauses at an approval gate, phone round-trip, restart-safe"
-status: design_approved
+status: in_review
 created: 2026-07-05T16:45:00Z
-updated: 2026-07-05T16:55:00Z
-previous_state: in_progress
-state_transition_reason: "Phase 2.8 checkpoint approved (design-only)"
+updated: 2026-07-05T21:20:00Z
+previous_state: design_approved
+state_transition_reason: "Phase 5 complete: all 3 waves implemented, quality gates passed (in_review)"
 design:
   status: approved
   approved_at: "2026-07-05T18:05:00Z"
@@ -44,9 +44,16 @@ complexity_evaluation:
   user_decision: create_as_is
   user_justification: "Operator brief: single task first; /task-work --design-only decides the split (via /feature-plan if >1 task)"
 test_results:
-  status: pending
-  coverage: null
-  last_run: null
+  status: passed
+  coverage: "AC-mapped scenario suites (no numeric coverage run); ~2,680 test LOC"
+  last_run: 2026-07-05T21:18:00Z
+  summary: "2986 passed, 4 skipped (tests/forge + tests/cli); 3 new gate suites green; 8 integration failures are pre-existing external-infra (Postgres/Docker/live-NATS-auth), not this task"
+implementation:
+  waves_completed: [1, 2, 3]
+  review: "Phase 5 code-review: 1 critical + 2 major + 2 minor found, ALL fixed with regression tests (bounded rearm arm-wait, hold-slot on publish/hop failure, status-guarded refresh, dead emit_resumed branch removed)"
+  plan_audit: docs/state/TASK-GATE-D659/plan_audit.md
+  new_src: [gating/sqlite_adapters.py, gating/degraded.py, cli/_serve_gate_activation.py, cli/_cancel_gate_inject.py]
+  git: "uncommitted — working tree only (commit deferred to operator)"
 ---
 
 # Task: Gate activation — real build pauses at an approval gate, phone round-trip, restart-safe
@@ -176,44 +183,44 @@ uncommitted TASK-FWD-004 revert shifts autobuild_runner.py by -7 vs older docs).
 
 ## Acceptance Criteria
 
-- [ ] A real forge build dispatched through the production daemon reaches a
+- [x] A real forge build dispatched through the production daemon reaches a
       gate and enters PAUSED (SQLite `builds.status=PAUSED` +
       `pending_approval_request_id` set) with `ApprovalRequestPayload`
       published on `agents.approval.forge.{build_id}` AND `BuildPausedPayload`
       on `pipeline.build-paused.{feature_id}` (jarvis dual-envelope contract).
-- [ ] APPROVE (decided_by string-equal `expected_approver`, default `"rich"`)
+- [x] APPROVE (decided_by string-equal `expected_approver`, default `"rich"`)
       resumes the build: PAUSED→RUNNING, exactly one `build-resumed` on the
       wire (decision/responder real values), work proceeds.
-- [ ] REJECT cancels: CANCELLED in SQLite FIRST, then `build-cancelled`
+- [x] REJECT cancels: CANCELLED in SQLite FIRST, then `build-cancelled`
       (JNB-102 seam) — zero `build-resumed` envelopes.
-- [ ] Window expiry (REASON_MAX_WAIT) cancels with `build-cancelled`.
-- [ ] Daemon restart mid-pause: boot re-emits the approval request with the
+- [x] Window expiry (REASON_MAX_WAIT) cancels with `build-cancelled`.
+- [x] Daemon restart mid-pause: boot re-emits the approval request with the
       VERBATIM persisted request_id (+ correlation_id stamped), the operator
       can still decide, and the decision is consumed and drives the
       transition (post-restart response consumer exists).
-- [ ] Spoofed/mismatched responder, correlation, or stale request_id →
+- [x] Spoofed/mismatched responder, correlation, or stale request_id →
       refused, zero transitions, zero emits (four-step chain intact).
-- [ ] `gate_check` gains its first production call site; gating stack config
+- [x] `gate_check` gains its first production call site; gating stack config
       remains ADR-ARCH-019-compliant (no static stage registry) and
       ADR-ARCH-026-compliant (constitutional targets force MANDATORY).
-- [ ] C1 disposition implemented per approved design (fix or removal — no
+- [x] C1 disposition implemented per approved design (fix or removal — no
       silently-dead documented mechanism remains).
-- [ ] `expected_approver` stays pinned `"rich"` unless deliberately re-pinned
+- [x] `expected_approver` stays pinned `"rich"` unless deliberately re-pinned
       with operator notification (OPS-001 alignment).
 
 ## Test Requirements
 
-- [ ] Scenario tests over the PRODUCTION wiring (template:
+- [x] Scenario tests over the PRODUCTION wiring (template:
       `tests/integration/test_jnb101_production_wiring.py` — real parts over
       `InMemoryNats`, real `PipelineLifecycleEmitter`, order-log asserting
       envelope-before-transition), covering every AC above including the
       restart scenario (kill/recreate composition, re-arm, decide, resume).
-- [ ] SQLite adapter tests against a tmp DB proving semantic parity with the
+- [x] SQLite adapter tests against a tmp DB proving semantic parity with the
       in-memory fakes (`tests/integration/conftest.py:226,299`), incl.
       idempotency and the single-transition-owner rule.
-- [ ] Boot-binding test: serve composition binds `recovery_reconcile_on_boot`
+- [x] Boot-binding test: serve composition binds `recovery_reconcile_on_boot`
       (no warning stub in production wiring).
-- [ ] Suite stays green under the scoped pytest-9 baseline (see live-validation
+- [x] Suite stays green under the scoped pytest-9 baseline (see live-validation
       handoff §6 flags); new code passes the clock-hygiene guard
       (`Clock.now()`, never `datetime.now()`).
 
@@ -234,5 +241,32 @@ uncommitted TASK-FWD-004 revert shifts autobuild_runner.py by -7 vs older docs).
 
 ## Implementation Notes
 
-Populated by /task-work. Design-first: no implementation before the
-activation-point design (D1-D7) is approved.
+Implemented via `/task-work --implement-only` (all 3 waves, one session) against
+the approved v2 plan. Daemon-side PRE-DISPATCH gate (D1): `maybe_gate_build`
+runs `gate_check` after `record_pending_build`, before launch, in a degraded/
+honest posture (empty readers + `degraded_dispatch_gate_model` → MANDATORY_
+HUMAN_APPROVAL), so every dispatched build pauses for phone approval.
+
+- **Wave 1** (foundations): `gating/sqlite_adapters.py` (repo+SM over the SQLite
+  facades, shared `_PauseHandoff`, single-transition-owner, `StaleTransitionError`),
+  `parse_request_id`, `await_and_dispatch` public refactor of the gate tail,
+  `refresh_pending_approval_request_id` facade, recovery-envelope correlation
+  stamp, `gating/degraded.py`.
+- **Wave 2** (live round-trip — JNB-107 unblock): `maybe_gate_build` +
+  idempotency pre-read, `_MirroredApprovalPublisher` (AGENTS request → PIPELINE
+  build-paused), R1 deferred observer registration, R2 state-conditional ack,
+  `_compose` wiring (`repository=None` to parts / SQLite repo to deps,
+  `bridge_registry=None`), `ack_wait` pin.
+- **Wave 3** (restart + closure): `rearm_paused_gates` (arm-before-post),
+  boot-seam bindings (no-op ApprovalRepublisher; suppressed-PAUSED consumer
+  twin seam), three-arm duplicate (INTERRUPTED→redispatch), C1 removal,
+  CLI-cancel synthetic-reject injector, API-sqlite-schema §6 note, DF-007 draft.
+- **Phase 5 review fixes**: bounded `rearm` arm-wait (was unbounded → boot-wedge
+  risk); hold-slot on ApprovalPublishError / concurrent-terminal hop (was
+  spurious build-failed + premature ack); status-guarded `refresh_pending`;
+  dead `emit_resumed` branch removed.
+
+Residuals / follow-ups: see `docs/state/TASK-GATE-D659/plan_audit.md`.
+Cross-repo unverifiable-here items: JNB-107 live-run checklist (plan §Checklist),
+GB10 durable `ack_wait` recreation. **DF-007 draft awaits operator sign-off.**
+Changes are in the working tree only — **not committed** (deferred to operator).

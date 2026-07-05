@@ -385,6 +385,11 @@ class TestPausedRequestIdVerbatim:
         # the publisher's subject resolver works downstream.
         assert envelope.payload["details"]["build_id"] == build_id
         assert envelope.payload["details"]["feature_id"] == "FEAT-PA-001"
+        # TASK-GATE-D659 correlation landmine: the recovery/rearm envelope
+        # now stamps BuildRow.correlation_id verbatim so the subscriber's
+        # step-2b guard sees a matching value on the boot re-emit (pre-fix
+        # this was None → the live responder echo would look mismatched).
+        assert envelope.correlation_id == "corr-pa"
 
     def test_paused_without_request_id_records_failure(
         self, persistence: SqliteLifecyclePersistence

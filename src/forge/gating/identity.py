@@ -49,9 +49,9 @@ from __future__ import annotations
 
 # AC-007: only standard-library imports — nothing from ``nats_core``,
 # ``nats-py``, or ``langgraph``.
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
-__all__ = ["derive_request_id"]
+__all__ = ["derive_request_id", "parse_request_id"]
 
 
 # Characters that are RFC 3986 unreserved but problematic for NATS
@@ -125,3 +125,69 @@ def derive_request_id(
         f":{_encode_component(stage_label)}"
         f":{attempt_count}"
     )
+
+
+def parse_request_id(request_id: str) -> tuple[str, str, int]:
+    """Invert :func:`derive_request_id`.
+
+    ``derive_request_id`` emits ``f"{enc(build_id)}:{enc(stage_label)}:
+    {attempt_count}"`` where ``enc`` percent-encodes every reserved
+    character (including ``:``) via ``urllib.parse.quote(safe="")`` and
+    then additionally escapes ``.`` and ``~``. Because the encoded
+    ``build_id`` / ``stage_label`` components can never contain a literal
+    ``:``, the output holds *exactly* two ``:`` separators, so splitting on
+    ``:`` recovers the three fields unambiguously. ``urllib.parse.unquote``
+    reverses both the ``quote`` step and the extra ``%2E`` / ``%7E``
+    escapes (they decode straight back to ``.`` / ``~``), making this the
+    exact inverse of the forward derivation.
+
+    Used by the rearm path (TASK-GATE-D659): the persisted
+    ``pending_approval_request_id`` is the durable home of the paused
+    build's ``(stage_label, attempt_count)`` pair — parsing it back avoids
+    a second SQLite column.
+
+    Args:
+        request_id: A ``request_id`` produced by :func:`derive_request_id`.
+
+    Returns:
+        The ``(build_id, stage_label, attempt_count)`` triple that would
+        re-derive ``request_id`` exactly.
+
+    Raises:
+        ValueError: If ``request_id`` is empty, does not contain exactly
+            two ``:`` separators, or the final component is not a
+            non-negative integer. Callers (rearm) log ERROR and skip the
+            row on a legacy / unparseable id.
+    """
+    if not request_id:
+        raise ValueError("parse_request_id: request_id must be a non-empty string")
+
+    parts = request_id.split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            "parse_request_id: expected exactly two ':' separators "
+            f"(three fields); got {len(parts)} field(s) in {request_id!r}"
+        )
+
+    encoded_build, encoded_stage, raw_attempt = parts
+    try:
+        attempt_count = int(raw_attempt)
+    except ValueError as exc:
+        raise ValueError(
+            "parse_request_id: attempt_count component is not an integer: "
+            f"{raw_attempt!r} in {request_id!r}"
+        ) from exc
+    if attempt_count < 0:
+        raise ValueError(
+            "parse_request_id: attempt_count must be non-negative; got "
+            f"{attempt_count!r} in {request_id!r}"
+        )
+
+    build_id = unquote(encoded_build)
+    stage_label = unquote(encoded_stage)
+    if not build_id or not stage_label:
+        raise ValueError(
+            "parse_request_id: decoded build_id / stage_label must be "
+            f"non-empty; got build_id={build_id!r} stage_label={stage_label!r}"
+        )
+    return build_id, stage_label, attempt_count

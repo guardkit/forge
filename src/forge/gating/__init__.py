@@ -23,7 +23,7 @@ Re-exports:
   and error types for the reasoning branch.
 """
 
-from .identity import derive_request_id
+from .identity import derive_request_id, parse_request_id
 from .models import (
     CalibrationAdjustment,
     ConstitutionalRule,
@@ -59,4 +59,5 @@ __all__ = [
     "ResponseKind",
     "derive_request_id",
     "evaluate_gate",
+    "parse_request_id",
 ]

@@ -491,28 +491,37 @@ class TestPublishFailureContract:
 
 
 # ---------------------------------------------------------------------------
-# Resume edge: awaiting_approval → running_wave fires emit_resumed
+# Resume-emit ownership (TASK-GATE-D659 §D5): the C1 runner-side resume edge
+# was removed — the adapter no longer exposes ``mark_resume_pending`` and the
+# ``awaiting_approval → running_wave`` transition fires NO ``build-resumed``.
+# Resume-emit is owned solely by the daemon subscriber seam (FW10-010).
 # ---------------------------------------------------------------------------
 
 
-class TestLifecycleAdapterResumeEdge:
-    """The adapter recognises the canonical resume edge in lifecycle order."""
+class TestC1ResumeEdgeRemoved:
+    """§D5 retirement: the runner-side resume special-case is gone."""
 
-    def test_resume_edge_publishes_build_resumed(self) -> None:
-        """awaiting_approval → running_wave fires the resumed publish."""
+    def test_adapter_no_longer_exposes_mark_resume_pending(self) -> None:
+        """The dead-and-broken C1 helper was removed from the adapter."""
+        emitter, _nc = _build_emitter()
+        adapter = LifecycleEmitterAdapter(emitter, _make_ctx())
+        assert not hasattr(adapter, "mark_resume_pending")
+        assert not hasattr(adapter, "_resume_pending")
+        assert not hasattr(adapter, "_last_lifecycle")
+
+    def test_awaiting_approval_to_running_wave_emits_no_build_resumed(self) -> None:
+        """The runner-side resume edge no longer publishes build-resumed."""
         emitter, nc = _build_emitter()
-        ctx = _make_ctx()
-        adapter = LifecycleEmitterAdapter(emitter, ctx)
+        adapter = LifecycleEmitterAdapter(emitter, _make_ctx())
 
         state = _make_state(lifecycle="running_wave")
-        # First go to awaiting_approval (sets _resume_pending).
         state = _update_state(state, lifecycle="awaiting_approval", emitter=adapter)
-        # Then resume: awaiting_approval → running_wave fires resumed.
         _update_state(state, lifecycle="running_wave", emitter=adapter)
 
         subjects = [s for s, _ in nc.published]
+        # The pause still emits; the resume does NOT (subscriber seam owns it).
         assert "pipeline.build-paused.FEAT-X" in subjects
-        assert "pipeline.build-resumed.FEAT-X" in subjects
+        assert "pipeline.build-resumed.FEAT-X" not in subjects
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +631,9 @@ class TestBridgeWiredSkipsResumeEmit:
             correlation_id="corr-001",
         )
 
-        with caplog.at_level(logging.INFO, logger="forge.adapters.nats.approval_subscriber"):
+        with caplog.at_level(
+            logging.INFO, logger="forge.adapters.nats.approval_subscriber"
+        ):
             await sub._on_envelope(  # type: ignore[attr-defined]
                 build_id=ctx.build_id, envelope=envelope
             )
@@ -728,8 +739,7 @@ class TestBridgeWiredSkipsResumeEmit:
             f"silently drop the resume envelope; got {resumed}"
         )
         assert any(
-            "bridge_registry_lookup raised" in r.getMessage()
-            for r in caplog.records
+            "bridge_registry_lookup raised" in r.getMessage() for r in caplog.records
         ), "TASK-FRR-PEB-006: lookup failure must log at WARNING"
 
 

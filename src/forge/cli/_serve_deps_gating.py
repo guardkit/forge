@@ -34,19 +34,16 @@ but never constructed in production — its first real wiring:
      (``bridge_registry_lookup``), so the subscriber defers its emit
      when the lifecycle bridge owns the build's resume envelope.
 
-AC-3 note (recorded deviation): the task names
-``autobuild_runner.mark_resume_pending`` as the resume-emit mechanism.
-The pre-implementation architectural review proved that mechanism
-broken for its own cited scenario — ``LifecycleEmitterAdapter``'s
-routing guard requires ``_last_lifecycle == "awaiting_approval"``,
-which a freshly-constructed adapter (the daemon-restart case
-``mark_resume_pending`` exists for) never has — on an adapter path that
-is dead in production (never constructed; stripped from the sidecar
-launch payload). The AC's intent — ``build-resumed`` emitted on
-approve/override decision dispatch, exactly once, with real
-decision/responder values — is satisfied here through the subscriber's
-own FW10-010 seam instead. See
-``docs/state/TASK-JNB-101/implementation_plan.md``.
+AC-3 note (recorded deviation): the JNB-101 task text named
+``autobuild_runner.mark_resume_pending`` as the resume-emit mechanism. The
+pre-implementation architectural review proved that mechanism broken for its
+own cited scenario, and TASK-GATE-D659 §D5 has since **removed** it entirely —
+``LifecycleEmitterAdapter`` is never constructed in production (the sidecar
+runs in a separate process with no forge.db / NATS), so the resume special-case
+was dead-and-broken. The resume-emit is owned **solely** by this subscriber
+seam (FW10-010): ``build-resumed`` is emitted on approve/override decision
+dispatch, exactly once, with the real decision/responder values. See
+``docs/state/TASK-JNB-101/implementation_plan.md`` and TASK-GATE-D659 §D5.
 
 DDR-007: every emit failure inside the subscriber's resume path is
 WARNING + continue; SQLite stays authoritative. DDR-027: dedup and

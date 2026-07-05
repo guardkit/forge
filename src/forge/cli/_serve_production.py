@@ -350,6 +350,237 @@ def _build_lifecycle_bridge_wireup_parts(
     )
 
 
+# ---------------------------------------------------------------------------
+# Boot reconcile seam bindings (TASK-GATE-D659 §D4.1-2 / §D4.4, "Step 6.8")
+# ---------------------------------------------------------------------------
+#
+# THREE-ACTOR OWNERSHIP BOUNDARY at boot (arch-review C1 + C2):
+#
+#   1. ``recovery.reconcile_on_boot`` (the SQLite recovery matrix) — owns the
+#      PREPARING / RUNNING / FINALISING → INTERRUPTED transitions and their
+#      ``build-failed`` emits. Its PAUSED approval re-emit is SUPPRESSED here
+#      via a no-op :class:`_NoopApprovalRepublisher` (recovery.py itself is
+#      unmodified) because re-emitting the approval request before any response
+#      subscriber exists drops the operator's tap on core NATS (C1 tap-drop).
+#   2. ``pipeline_consumer.reconcile_on_boot`` (the JetStream twin seam) — owns
+#      the in-flight / INTERRUPTED redelivery redispatch (Branch-2). Its PAUSED
+#      scan is SUPPRESSED (empty enumerator + no-op re-emit fns) because rearm
+#      owns PAUSED. Its redelivery *drain* is deferred to the live consumer +
+#      the ``dispatch_build`` three-arm INTERRUPTED→redispatch (single-consumer
+#      rule err 10100 — a boot-time pull subscription would collide with the
+#      daemon's own durable attach; the third arm heals crash-mid-hop rows on
+#      the first post-boot redelivery).
+#   3. ``rearm_paused_gates`` (spawned from ``serve._compose``, AFTER the two
+#      reconciles + with a LIVE response subscriber) — owns BOTH PAUSED
+#      re-emits (approval request + build-paused) and the re-armed round-trip.
+
+
+class _NoopApprovalRepublisher:
+    """No-op :class:`ApprovalRepublisher` for the boot recovery seam (§D4.1).
+
+    ``recovery.reconcile_on_boot`` calls ``publish_request`` once per PAUSED
+    row. Swallowing it (INFO log) suppresses recovery's PAUSED approval re-emit
+    so it cannot fire before a subscriber exists (C1). ``rearm_paused_gates``
+    re-emits for real, arm-before-post, once ``_compose`` has bound a live
+    subscriber.
+    """
+
+    async def publish_request(self, envelope: Any) -> None:
+        build_id: Any = None
+        payload = getattr(envelope, "payload", None)
+        if isinstance(payload, dict):
+            details = payload.get("details")
+            if isinstance(details, dict):
+                build_id = details.get("build_id")
+        logger.info(
+            "forge-serve: recovery boot seam SUPPRESSING PAUSED approval "
+            "re-emit for build_id=%s — rearm_paused_gates owns it (live "
+            "subscriber, arm-before-post)",
+            build_id,
+        )
+
+
+def _build_recovery_reconcile_seam(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: ForgeConfig,
+) -> Any:
+    """Return the production ``recovery_reconcile_on_boot`` closure (§D4.1).
+
+    Binds :func:`forge.lifecycle.recovery.reconcile_on_boot` to a
+    :class:`PipelineFailurePublisher` built from the boot client and a no-op
+    :class:`ApprovalRepublisher` (PAUSED approval re-emit suppressed — rearm
+    owns it). recovery.py stays unmodified.
+    """
+
+    async def _recovery_reconcile_on_boot(client: Any) -> None:
+        from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
+        from forge.lifecycle.recovery import reconcile_on_boot as _recovery_reconcile
+
+        publisher, _emitter = build_publisher_and_emitter(
+            client, config=forge_config.pipeline
+        )
+        report = await _recovery_reconcile(
+            sqlite_pool, publisher, _NoopApprovalRepublisher()
+        )
+        logger.info(
+            "forge-serve: recovery reconcile complete (interrupted=%d "
+            "paused_suppressed=%d skipped=%d failures=%d)",
+            report.interrupted_count,
+            report.paused_reissued_count,
+            report.skipped_count,
+            len(report.failures),
+        )
+
+    return _recovery_reconcile_on_boot
+
+
+def _build_consumer_reconcile_seam(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: ForgeConfig,
+    async_task_starter: AsyncTaskStarter | None,
+) -> Any:
+    """Return the production ``consumer_reconcile_on_boot`` closure (§D4.4).
+
+    Binds :func:`forge.adapters.nats.pipeline_consumer.reconcile_on_boot` with:
+
+    * PAUSED scan SUPPRESSED — ``iter_paused_builds`` empty and the two re-emit
+      fns are no-ops (rearm owns PAUSED; documented ownership boundary above).
+    * redelivery drain DEFERRED — ``fetch_redeliveries`` returns an empty batch
+      so no boot-time pull subscription collides with the daemon's own durable
+      attach (single-consumer rule, err 10100). Crash-mid-hop INTERRUPTED rows
+      heal on the first post-boot redelivery via ``dispatch_build``'s three-arm
+      INTERRUPTED→redispatch. The Branch-2 collaborators are wired correctly so
+      the machinery is honest and a future change may enable the boot drain.
+    """
+
+    async def _consumer_reconcile_on_boot(client: Any) -> None:
+        from forge.adapters.nats.pipeline_consumer import (
+            ReconcileDeps,
+            reconcile_on_boot as _consumer_reconcile,
+        )
+        from forge.cli._serve_deps import build_pipeline_consumer_deps
+
+        consumer_deps = build_pipeline_consumer_deps(
+            client,
+            forge_config,
+            sqlite_pool,
+            async_task_starter=async_task_starter,
+        )
+
+        async def _fetch_redeliveries() -> list[Any]:
+            # Deferred to the live consumer + the third-arm redispatch (see the
+            # closure docstring): a boot-time pull subscription would collide
+            # with the daemon's durable attach (single-consumer rule).
+            return []
+
+        async def _read_build_state(feature_id: str, correlation_id: str) -> str | None:
+            return _read_build_state_by_identity(
+                sqlite_pool, feature_id=feature_id, correlation_id=correlation_id
+            )
+
+        async def _mark_interrupted_and_reset(
+            feature_id: str, correlation_id: str
+        ) -> None:
+            _interrupt_and_reset_to_preparing(
+                sqlite_pool, feature_id=feature_id, correlation_id=correlation_id
+            )
+
+        async def _empty_paused() -> list[Any]:
+            return []  # PAUSED scan suppressed — rearm owns PAUSED.
+
+        async def _noop_build_paused(_payload: Any) -> None:
+            return None
+
+        async def _noop_approval_request(_payload: Any, _subject: str) -> None:
+            return None
+
+        deps = ReconcileDeps(
+            consumer_deps=consumer_deps,
+            fetch_redeliveries=_fetch_redeliveries,
+            read_build_state=_read_build_state,
+            mark_interrupted_and_reset=_mark_interrupted_and_reset,
+            iter_paused_builds=_empty_paused,
+            publish_build_paused=_noop_build_paused,
+            publish_approval_request=_noop_approval_request,
+        )
+        report = await _consumer_reconcile(deps)
+        logger.info(
+            "forge-serve: consumer reconcile complete (restarted=%d "
+            "acked_terminal=%d paused_scan_suppressed=%d) — PAUSED owned by "
+            "rearm_paused_gates; redelivery drain deferred to live consumer",
+            report.restarted_in_flight,
+            report.acked_terminal,
+            report.paused_scan_re_emitted,
+        )
+
+    return _consumer_reconcile_on_boot
+
+
+def _read_build_state_by_identity(
+    sqlite_pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+) -> str | None:
+    """Return the ``builds.status`` string for an identity, or ``None``."""
+    from forge.lifecycle.state_machine import BuildState
+
+    with sqlite_pool._reader() as cx:
+        row = cx.execute(
+            "SELECT status FROM builds WHERE feature_id = ? AND correlation_id = ?",
+            (feature_id, correlation_id),
+        ).fetchone()
+    if row is None:
+        return None
+    raw = row[0] if not hasattr(row, "keys") else row["status"]
+    return raw.value if isinstance(raw, BuildState) else raw
+
+
+def _interrupt_and_reset_to_preparing(
+    sqlite_pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+) -> None:
+    """Mark an in-flight row INTERRUPTED then reset it to PREPARING.
+
+    The Branch-2 ``MarkInterruptedAndReset`` collaborator. Composes both hops
+    through :meth:`SqliteLifecyclePersistence.apply_transition` (single writer
+    of ``builds.status``). Only exercised if a boot-time redelivery drain is
+    ever enabled (see :func:`_build_consumer_reconcile_seam`).
+    """
+    from forge.lifecycle.persistence import Build
+    from forge.lifecycle.state_machine import (
+        BuildState,
+        transition_chain,
+    )
+
+    with sqlite_pool._reader() as cx:
+        row = cx.execute(
+            "SELECT build_id, status FROM builds WHERE feature_id = ? "
+            "AND correlation_id = ?",
+            (feature_id, correlation_id),
+        ).fetchone()
+    if row is None:  # pragma: no cover - defensive
+        return
+    build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
+    raw = row[1] if not hasattr(row, "keys") else row["status"]
+    current = raw if isinstance(raw, BuildState) else BuildState(raw)
+
+    if current is not BuildState.INTERRUPTED:
+        for hop in transition_chain(
+            Build(build_id=build_id, status=current),
+            BuildState.INTERRUPTED,
+            error="crash-mid-hop: reset to PREPARING for redispatch",
+        ):
+            sqlite_pool.apply_transition(hop)
+    for hop in transition_chain(
+        Build(build_id=build_id, status=BuildState.INTERRUPTED),
+        BuildState.PREPARING,
+    ):
+        sqlite_pool.apply_transition(hop)
+
+
 def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
     """Return an :class:`AsyncTaskStarter` adapter over ``middleware.tools``.
 
@@ -565,6 +796,19 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
         bridge_wireup_parts=bridge_wireup_parts,
     )
     serve_module.compose_dispatch_chain = composer
+
+    # Step 7.5 (TASK-GATE-D659 §D4.1-2 / §D4.4 "Step 6.8") — bind BOTH boot
+    # reconcile seams to production wiring so the receipt-only default no-op
+    # stubs are unreachable at boot. See the module-level THREE-ACTOR
+    # OWNERSHIP BOUNDARY note: recovery gets a no-op ApprovalRepublisher
+    # (PAUSED approval re-emit suppressed) and the consumer twin seam runs
+    # with its PAUSED scan suppressed (rearm owns PAUSED).
+    serve_module.recovery_reconcile_on_boot = _build_recovery_reconcile_seam(
+        sqlite_pool, forge_config
+    )
+    serve_module.consumer_reconcile_on_boot = _build_consumer_reconcile_seam(
+        sqlite_pool, forge_config, async_task_starter
+    )
 
     # Step 8 — close any previous binding's writer connection cleanly.
     previous = _bound_resources
