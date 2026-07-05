@@ -398,6 +398,12 @@ class GateCheckDeps:
     reasoning_model_call: Callable[[str], str]
     clock: Callable[[], datetime] | None = None
     per_attempt_wait_seconds: int | None = None
+    # TASK-JNB-101: the build's pipeline correlation_id, stamped onto
+    # every outbound ApprovalRequestPayload envelope so responders can
+    # echo it and the subscriber's correlation guard (step 2b of the
+    # four-step chain) has a real value to match against. ``None``
+    # preserves the pre-JNB-101 envelope shape (no correlation).
+    correlation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +477,7 @@ async def gate_check(
     if not stage_label:
         raise ValueError("stage_label must be a non-empty string")
     if attempt_count < 0:
-        raise ValueError(
-            f"attempt_count must be non-negative, got {attempt_count!r}"
-        )
+        raise ValueError(f"attempt_count must be non-negative, got {attempt_count!r}")
 
     # 1. Read priors.
     priors = await deps.priors_reader.read_priors(
@@ -568,9 +572,7 @@ async def gate_check(
         await deps.state_machine.transition_to_cancelled(
             build_id=build_id, reason=REASON_MAX_WAIT
         )
-        await deps.repository.mark_cancelled(
-            build_id=build_id, reason=REASON_MAX_WAIT
-        )
+        await deps.repository.mark_cancelled(build_id=build_id, reason=REASON_MAX_WAIT)
         return GateOutcome.TIMED_OUT, decision
 
     response = resume_value_as(ApprovalResponsePayload, raw)
@@ -651,6 +653,7 @@ async def _atomic_pause_and_publish(
         feature_id=feature_id,
         request_id=request_id,
         artefact_paths=artefact_paths,
+        correlation_id=deps.correlation_id,
     )
     await deps.publisher.publish_request(envelope)
 
@@ -661,6 +664,7 @@ def _build_request_envelope(
     feature_id: str,
     request_id: str,
     artefact_paths: tuple[str, ...],
+    correlation_id: str | None = None,
 ) -> MessageEnvelope:
     """Build the :class:`MessageEnvelope` carrying an approval request.
 
@@ -699,6 +703,7 @@ def _build_request_envelope(
     envelope = MessageEnvelope(
         source_id=SOURCE_ID,
         event_type=EventType.APPROVAL_REQUEST,
+        correlation_id=correlation_id,
         payload=payload.model_dump(mode="json"),
     )
     return envelope
@@ -745,9 +750,7 @@ async def _dispatch_response(
     decision_kind = response.decision
 
     if decision_kind == "approve":
-        await deps.repository.mark_resumed(
-            build_id=build_id, stage_label=stage_label
-        )
+        await deps.repository.mark_resumed(build_id=build_id, stage_label=stage_label)
         await deps.state_machine.transition_to_running(build_id=build_id)
         return GateOutcome.RESUMED, decision
 
@@ -795,6 +798,7 @@ async def _dispatch_response(
             feature_id=feature_id,
             request_id=new_request_id,
             artefact_paths=artefact_paths,
+            correlation_id=deps.correlation_id,
         )
         await deps.publisher.publish_request(envelope)
         # Fall back into the wait loop. We recurse via a fresh
@@ -832,8 +836,7 @@ async def _dispatch_response(
     # ever reaches us. Surface a typed error so a future schema drift
     # does not silently fall through to a no-op.
     raise ValueError(
-        f"Unsupported approval decision={decision_kind!r} "
-        f"for build_id={build_id!r}"
+        f"Unsupported approval decision={decision_kind!r} for build_id={build_id!r}"
     )
 
 
@@ -870,6 +873,7 @@ async def recover_paused_builds(deps: GateCheckDeps) -> list[str]:
             feature_id=snap.feature_id,
             request_id=snap.request_id,  # PERSISTED — not re-derived
             artefact_paths=snap.artefact_paths,
+            correlation_id=snap.correlation_id,
         )
         try:
             await deps.publisher.publish_request(envelope)
@@ -949,9 +953,7 @@ async def cli_skip_stage(deps: GateCheckDeps, *, build_id: str) -> None:
         raise
 
 
-async def _lookup_paused(
-    *, deps: GateCheckDeps, build_id: str
-) -> PausedBuildSnapshot:
+async def _lookup_paused(*, deps: GateCheckDeps, build_id: str) -> PausedBuildSnapshot:
     """Return the paused-build snapshot for ``build_id`` or raise.
 
     Linear scan — the paused-builds set is bounded by the configured
@@ -962,9 +964,7 @@ async def _lookup_paused(
     for snap in snapshots:
         if snap.build_id == build_id:
             return snap
-    raise LookupError(
-        f"cli bridge: no paused build found for build_id={build_id!r}"
-    )
+    raise LookupError(f"cli bridge: no paused build found for build_id={build_id!r}")
 
 
 __all__ = [

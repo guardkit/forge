@@ -3,7 +3,12 @@ id: TASK-JNB-101
 title: 'forge: ApprovalSubscriber production wiring into the serve runtime'
 status: in_review
 created: 2026-07-03 15:30:00+00:00
-updated: 2026-07-03 15:30:00+00:00
+updated: 2026-07-05 00:00:00+00:00
+state_note: >-
+  2026-07-05: moved backlog -> in_progress by the Fable forge-JNB session.
+  The autobuild_state block below is a stale false-green from 2026-07-04
+  (turn approved with "Files actual: 0" - nothing was built; verified in
+  the jnb-live-roundtrip handoff). Implemented via interactive /task-work.
 priority: high
 task_type: feature
 parent_review: TASK-REV-C951
@@ -62,6 +67,52 @@ This is the first v1.1 wave, hard-gated behind the live v1 checkpoint (TASK-JNB-
 ## Test Requirements
 
 Plain pytest only — NO pytest-bdd `.feature` glue (operator decision 2026-07-03; eliminates a known silent-false-green class). Test classes mirror the spec scenario names for the reply-path validation scenarios (approve-resumes-once, reject-cancels, defer-republish-with-refreshed-request-id, window-expiry-cancels, ceiling-breach-cancels, spoofed/mismatched-reply-refused, config-alignment). Use in-memory NATS fakes for the subscriber; drive `await_response` through the real injected `ApprovalGateDeps.subscriber` rather than mocking the chain. Run via `.venv/bin/python -m pytest` from the forge repo root.
+
+## Implementation Deviations (recorded 2026-07-05, interactive /task-work)
+
+1. **AC-3 mechanism replaced (intent fully satisfied).** AC-3 names
+   `autobuild_runner.mark_resume_pending` as the resume-emit mechanism. The
+   pre-implementation architectural review (scored the v1 plan 64/100)
+   proved that mechanism broken for its own cited scenario:
+   `LifecycleEmitterAdapter`'s routing guard requires
+   `_last_lifecycle == "awaiting_approval"`, which a freshly-constructed
+   adapter (the daemon-restart case `mark_resume_pending` exists for) never
+   has — and the adapter path is dead in production (never constructed;
+   `lifecycle_emitter` stripped from the sidecar launch payload). The
+   intent — `build-resumed` emitted on approve/override dispatch, exactly
+   once, with real decision/responder values — is satisfied via the
+   subscriber's own FW10-010 seam: `make_gate_check_deps` binds the daemon's
+   `PipelineLifecycleEmitter` + `BuildContext` + `expected_correlation_id`
+   into every `await_response` call (`_BoundContextSubscriber`). The emit is
+   awaited BEFORE the wait loop returns (on the wire before PAUSED→RUNNING)
+   and gained a decision gate: only approve/override emit — a reject would
+   otherwise have rendered resumed-then-cancelled on the phone. The
+   `mark_resume_pending` guard bug is a documented follow-up for the
+   runner-side pause-activation task.
+2. **wrappers.py gained additive correlation threading (review-driven).**
+   The outbound `ApprovalRequestPayload` envelope previously carried no
+   correlation_id, so jarvis had nothing to echo and the four-step chain's
+   correlation step was inert against real traffic. Added
+   `GateCheckDeps.correlation_id` (default None) + `correlation_id`
+   parameter on the envelope builder, stamped at all three publish sites
+   (pause, defer republish, boot recovery — recovery uses the persisted
+   snapshot's value). Validation-chain logic and `await_response` internals
+   untouched.
+3. **Latent activation (in-scope boundary).** `gate_check` still has no
+   production caller — this task constructs and injects the seam
+   (`ApprovalGateParts` bound in serve's `_compose`); the activation point
+   (plus production SQLite GateRepository/StateMachine adapters and the
+   `reconcile_on_boot` binding) are documented follow-ups in
+   `docs/state/TASK-JNB-101/implementation_plan.md`.
+4. **Review-process note.** The multi-lens review workflow's contract lens
+   and all adversarial verifiers hit a Fable usage limit mid-run
+   (2026-07-05); 3/4 lenses completed and their 10 raw findings were
+   verified inline by the session (7 fixed — bridge-probe correlation match,
+   newest-row refresh selection, correlation threading, override-quadrant
+   test, serve-compose seam tests + DDR-007 soft-fail guard, refresh-closure
+   tests, 5s test budgets; 3 assessed not-defects — black-vs-ruff formatter
+   letter, latent activation, and the task-file recording gap which this
+   section closes).
 
 ## Implementation Notes
 

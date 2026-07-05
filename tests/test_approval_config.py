@@ -149,6 +149,7 @@ class TestApprovalYamlRoundTrip:
             "approval": {
                 "default_wait_seconds": 120,
                 "max_wait_seconds": 1800,
+                "expected_approver": "rich",
             },
             "permissions": {
                 "filesystem": {
@@ -182,6 +183,7 @@ class TestApprovalYamlRoundTrip:
             "approval": {
                 "default_wait_seconds": 300,
                 "max_wait_seconds": 3600,
+                "expected_approver": "rich",
             },
             # ``queue`` was added by TASK-PSM-003 — the round-trip dump now
             # always includes it, so this "all sections" test must declare
@@ -227,6 +229,60 @@ class TestApprovalYamlRoundTrip:
         roundtripped = cfg.model_dump(mode="json")
 
         assert roundtripped == original
+
+
+# ---------------------------------------------------------------------------
+# TASK-JNB-101: expected_approver — the APPROVER_IDENTITY contract
+# (config-alignment AC).
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedApprover:
+    """TASK-JNB-101 config-alignment AC.
+
+    ``ApprovalConfig.expected_approver`` is the forge half of the
+    APPROVER_IDENTITY contract: its value must string-equal (verbatim —
+    no trimming, no case folding) the jarvis ``JARVIS_SLACK_DECIDED_BY``
+    setting, or every phone approval is silently refused. The pinned
+    shared value is ``"rich"`` (operator-chosen 2026-07-04); jarvis's
+    ``.env.example`` documents the same pin on its side.
+    """
+
+    def test_model_defines_expected_approver(self) -> None:
+        assert "expected_approver" in ApprovalConfig.model_fields
+
+    def test_default_is_pinned_to_rich(self) -> None:
+        # THE config-alignment assertion: the forge default and the
+        # jarvis JARVIS_SLACK_DECIDED_BY value must both be exactly
+        # "rich". Changing this default without changing the jarvis
+        # side breaks every phone approval SILENTLY (WARNING-level
+        # forge log only) — see TASK-JNB-107's troubleshooting notes.
+        assert ApprovalConfig().expected_approver == "rich"
+
+    def test_pin_is_exact_verbatim_string(self) -> None:
+        # Guard the failure modes the wire contract cannot surface:
+        # whitespace or case drift would silently refuse approvals
+        # because forge compares with ``!=`` on the raw string.
+        value = ApprovalConfig().expected_approver
+        assert value is not None
+        assert value == value.strip()
+        assert value == value.lower()
+
+    def test_yaml_override_is_respected(self) -> None:
+        cfg = ApprovalConfig.model_validate({"expected_approver": "someone"})
+        assert cfg.expected_approver == "someone"
+
+    def test_explicit_none_enables_permissive_mode(self) -> None:
+        # None = permissive dev mode (any decided_by accepted) — must
+        # remain expressible for single-deployment dev loops.
+        cfg = ApprovalConfig.model_validate({"expected_approver": None})
+        assert cfg.expected_approver is None
+
+    def test_forge_config_default_carries_the_pin(self) -> None:
+        cfg = ForgeConfig.model_validate(
+            {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
+        )
+        assert cfg.approval.expected_approver == "rich"
 
 
 # ---------------------------------------------------------------------------

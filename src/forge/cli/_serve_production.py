@@ -168,6 +168,12 @@ class LifecycleBridgeWireupParts:
     run_state_fetcher: RunStateFetcher
     terminal_publish_ledger: TerminalPublishLedger
     build_state_recorder: "BuildStateRecorder"
+    # TASK-JNB-101 — public registry handle so the approval-gate wiring
+    # can bind ``ApprovalSubscriberDeps.bridge_registry_lookup`` to the
+    # same registry instance the bridge itself consults (the bridge only
+    # keeps it privately; reaching into ``bridge._registry`` from the
+    # compose closure would be an encapsulation violation).
+    registry: BridgeRegistry
 
 
 def _build_async_tasks_identity_provider(
@@ -340,6 +346,7 @@ def _build_lifecycle_bridge_wireup_parts(
         run_state_fetcher=run_state_fetcher,
         terminal_publish_ledger=terminal_publish_ledger,
         build_state_recorder=build_state_recorder,
+        registry=registry,
     )
 
 

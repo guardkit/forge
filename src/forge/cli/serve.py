@@ -301,6 +301,7 @@ def bind_production_dispatch_chain(
         to :data:`compose_dispatch_chain`.
     """
 
+    from forge.cli import _serve_deps_gating
     from forge.cli._serve_deps import build_pipeline_consumer_deps
     from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 
@@ -310,7 +311,7 @@ def bind_production_dispatch_chain(
         # publisher instance as ``publish_build_failed`` (no-double-
         # emit invariant). The emitter is rebuilt against the same
         # publisher inside ``build_pipeline_consumer_deps``.
-        publisher, _emitter = build_publisher_and_emitter(
+        publisher, emitter = build_publisher_and_emitter(
             client, config=forge_config.pipeline
         )
 
@@ -330,6 +331,36 @@ def bind_production_dispatch_chain(
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
+
+        # TASK-JNB-101 — construct the approval-gate collaborators
+        # against the same shared client + emitter and anchor them
+        # module-level. This is the production injection seam for
+        # ``GateCheckDeps.subscriber`` (the four-step reply-validation
+        # chain); ``expected_approver`` comes from forge.yaml
+        # ``approval.expected_approver`` (pinned 'rich' — must equal
+        # jarvis JARVIS_SLACK_DECIDED_BY verbatim). Soft-fail: a v1.1
+        # approval-wiring defect must never brick v1 dispatch boot —
+        # the ERROR log line is the operator's probe (TASK-JNB-107).
+        try:
+            _serve_deps_gating.bind_gate_parts(
+                _serve_deps_gating.build_approval_gate_parts(
+                    client,
+                    forge_config,
+                    emitter=emitter,
+                    bridge_registry=(
+                        bridge_wireup_parts.registry
+                        if bridge_wireup_parts is not None
+                        else None
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            logger.error(
+                "forge-serve: approval gate parts construction FAILED "
+                "(%s) — daemon continues WITHOUT the approval reply "
+                "seam; phone approvals will not resolve until fixed",
+                exc,
+            )
 
         deps = build_pipeline_consumer_deps(
             client,

@@ -197,6 +197,25 @@ class ApprovalConfig(BaseModel):
             "ceiling (ASSUM-003) is deferred to ``forge-pipeline-config``."
         ),
     )
+    expected_approver: str | None = Field(
+        default="rich",
+        description=(
+            "APPROVER_IDENTITY contract (TASK-JNB-101/104) — the only "
+            "``decided_by`` value the production ApprovalSubscriber "
+            "accepts. Must string-equal the jarvis "
+            "``JARVIS_SLACK_DECIDED_BY`` setting VERBATIM (no trimming, "
+            "no case folding — jarvis publishes it untouched and forge "
+            "compares with ``!=``); a mismatch silently refuses every "
+            "phone approval with only a WARNING log on the forge side. "
+            "Pinned shared value: 'rich' (operator-chosen 2026-07-04). "
+            "``None`` = permissive mode (any responder accepted — dev "
+            "only, never production). NOTE: this default flips "
+            "deployments that omit the ``approval:`` block from "
+            "permissive to enforcing; deploying a forge.yaml carrying "
+            "this key before the image that defines it fails boot "
+            "loudly (extra='forbid')."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_default_not_above_max(self) -> ApprovalConfig:

@@ -716,6 +716,20 @@ class ApprovalSubscriber:
         # returns ``False``), the subscriber's emit fires — preserving
         # FW10-010's behaviour for tests/deploys that don't run the
         # bridge.
+        # TASK-JNB-101: the resume emit fires ONLY for decisions that
+        # actually resume the build (approve / override). A ``reject``
+        # terminates in CANCELLED — its wire signal is
+        # ``pipeline.build-cancelled`` (TASK-JNB-102), and emitting
+        # build-resumed first would render resumed-then-cancelled on the
+        # operator's phone. A ``defer`` re-publishes the request and the
+        # build stays paused. Both still enqueue below so the wait loop
+        # dispatches the decision.
+        if publish_ctx is not None and payload.decision not in (
+            "approve",
+            "override",
+        ):
+            publish_ctx = None
+
         if publish_ctx is not None:
             emitter, ctx, _expected_corr, stage_label = publish_ctx
             if self._bridge_owns_resume_for(

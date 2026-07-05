@@ -150,6 +150,26 @@ Per ADR-ARCH-021:
 | Rich runs `forge cancel FEAT-XXX` while paused | NATS `agents.command.forge` receives cancel; resume subscriber injects synthetic `ApprovalResponsePayload(decision="reject", responder="rich", reason="cli cancel")`; graph resumes, state → CANCELLED. |
 | Rich runs `forge skip FEAT-XXX` | Synthetic `ApprovalResponsePayload(decision="override", responder="rich", reason="cli skip")`; graph resumes, specific stage skipped. |
 
+### 7.1 Responder identity — `forge.yaml.approval.expected_approver` (TASK-JNB-101)
+
+The production `ApprovalSubscriber` accepts a response only when its
+`decided_by` **string-equals `approval.expected_approver` verbatim** — no
+trimming, no case folding (jarvis publishes `JARVIS_SLACK_DECIDED_BY`
+untouched; forge compares with `!=`). The pinned shared value is **`rich`**
+(operator-chosen 2026-07-04) and is the model default, so a forge.yaml that
+omits the key still enforces it. `expected_approver: null` selects permissive
+mode (any responder — dev only). A mismatch is **silent** from the operator's
+view: jarvis logs `slack_reply_decision_published`, forge logs
+`approval_subscriber: unrecognised responder … NOT resuming`, and the build
+stays paused — TASK-JNB-107's first troubleshooting step is checking these
+two values. Deploy-order note: `ApprovalConfig` is `extra="forbid"`, so a
+forge.yaml carrying this key boots only on images that define the field.
+
+Resume-emit note (TASK-JNB-101): `pipeline.build-resumed` is published only
+for `approve` / `override` decisions. A `reject` terminates in CANCELLED and
+signals via `pipeline.build-cancelled` (TASK-JNB-102); `defer` re-publishes
+the request and stays paused.
+
 ---
 
 ## 8. Constitutional Rule — PR Review

@@ -956,6 +956,14 @@ class TestClockHygiene:
             "src/forge/adapters/nats/fleet_watcher.py",
             r"^await asyncio\.sleep\(interval_s\)$",
         ),
+        # ApprovalSubscriber FW10-010 resume emit — ``resumed_at`` is a
+        # wire-payload wall-clock timestamp, not TTL/dedup logic (the
+        # subscriber's timing logic is Clock-injected). Made
+        # production-reachable by TASK-JNB-101; pre-existing use.
+        (
+            "src/forge/adapters/nats/approval_subscriber.py",
+            r"^resumed_at=datetime\.now\(timezone\.utc\)\.isoformat\(\),$",
+        ),
         # SystemClock.now — production Clock.now implementation.
         (
             "src/forge/discovery/protocol.py",

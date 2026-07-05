@@ -633,6 +633,13 @@ approval:
   auto_approve_threshold: 999.0   # impossibly high → always flag
   hard_stop_threshold: -1.0
   max_wait_seconds: 60            # keep the test snappy
+  # TASK-JNB-101: the decided_by identity the subscriber accepts. Model
+  # default is "rich" — must string-equal jarvis JARVIS_SLACK_DECIDED_BY
+  # VERBATIM or every phone approval is silently refused. NOTE the
+  # permissive->enforcing flip: deployments omitting the approval block
+  # now enforce "rich" by default. extra="forbid" also means this key
+  # only boots on images that define the field.
+  expected_approver: rich
 
 queue:
   default_mode: a                  # Mode A is the simplest to drive end-to-end
