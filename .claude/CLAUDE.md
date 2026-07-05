@@ -1,3 +1,5 @@
+> **Fleet decisions:** read `../ai-transition/docs/decisions/REGISTER.md` (sibling repo) before architectural or cross-repo changes. Cross-cutting decisions are indexed there, not in this repo.
+
 # LangChain DeepAgents — Pipeline Orchestrator
 
 A pipeline orchestrator agent using DeepAgents two-model architecture.
