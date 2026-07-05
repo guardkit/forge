@@ -1,9 +1,17 @@
 ---
 id: TASK-JNB-106
 title: 'forge: v1.1 scenario tests over the production wiring'
-status: blocked
+status: in_review
 created: 2026-07-03 15:30:00+00:00
-updated: 2026-07-03 15:30:00+00:00
+updated: 2026-07-05 00:00:00+00:00
+state_note: >-
+  2026-07-05: implemented via interactive /task-work by the Fable forge-JNB
+  session after TASK-JNB-101 (e003201) and TASK-JNB-102 (bc1366d) landed.
+  The autobuild_state block below records a 2026-07-04 errored autobuild
+  turn ("Files actual: 0") - nothing was built then. Suite:
+  tests/integration/test_jnb106_v11_scenarios.py (7 named scenario tests
+  + expiry-wins race leg + collect-only guard). Audit:
+  docs/state/TASK-JNB-106/plan_audit.md.
 priority: high
 task_type: testing
 parent_review: TASK-REV-C951
