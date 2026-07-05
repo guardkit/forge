@@ -1382,13 +1382,6 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         feature_id,
         "--fresh",
         "--verbose",
-        # 2026-06-21: route the Coach role to the fine-tuned bundle-format model
-        # (coach-ft-v3 — llama-swap always-on slot, serve-validated FA 0%/FF 6.7%).
-        # Player + specialists stay on the default model. Reverse by deleting these
-        # two argv items + restarting forge-autobuild-runner. See
-        # agentic-dataset-factory/domains/coach-agent/RESULTS-coach-v3.md.
-        "--coach-model",
-        "coach-ft-v3",
     ]
 
     logger.info(

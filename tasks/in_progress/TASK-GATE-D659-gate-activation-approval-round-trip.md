@@ -1,9 +1,11 @@
 ---
 id: TASK-GATE-D659
 title: "Gate activation: real build pauses at an approval gate, phone round-trip, restart-safe"
-status: backlog
+status: in_progress
 created: 2026-07-05T16:45:00Z
-updated: 2026-07-05T16:45:00Z
+updated: 2026-07-05T16:55:00Z
+previous_state: backlog
+state_transition_reason: "task-work --design-only execution"
 priority: critical
 task_type: feature
 tags: [gating, approval, feat-bf39-v1.1, jnb-107-blocker, feat-1872]
