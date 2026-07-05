@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from forge.adapters.nats.approval_publisher import ApprovalPublisher
@@ -452,6 +453,7 @@ def make_gate_check_deps(
         A fully-typed :class:`GateCheckDeps` ready for ``gate_check``.
     """
     subscriber: Any = parts.subscriber
+    publish_cancelled = None
     if ctx is not None and parts.emitter is not None:
         subscriber = _BoundContextSubscriber(
             parts.subscriber,
@@ -459,6 +461,21 @@ def make_gate_check_deps(
             build_context=ctx,
             expected_correlation_id=ctx.correlation_id,
         )
+        emitter = parts.emitter
+        build_ctx = ctx
+
+        # TASK-JNB-102: bind the best-effort build-cancelled publisher
+        # over the build's context so the gate wrapper's CANCELLED
+        # transitions (reject / max-wait) signal the phone loop.
+        # ``emit_cancelled`` already swallows PublishFailure
+        # (_safe_publish); the wrapper adds its own DDR-007 guard.
+        async def publish_cancelled(*, reason: str, cancelled_by: str) -> None:
+            await emitter.emit_cancelled(
+                build_ctx,
+                reason=reason,
+                cancelled_by=cancelled_by,
+                cancelled_at=datetime.now(timezone.utc).isoformat(),
+            )
 
     return GateCheckDeps(
         priors_reader=priors_reader,
@@ -477,6 +494,7 @@ def make_gate_check_deps(
         # a real value to enforce — without this the four-step chain's
         # correlation step is inert against real jarvis traffic.
         correlation_id=ctx.correlation_id if ctx is not None else None,
+        publish_cancelled=publish_cancelled,
     )
 
 

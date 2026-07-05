@@ -346,14 +346,10 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         status=BuildState(row["status"]),
         queued_at=datetime.fromisoformat(row["queued_at"]),
         started_at=(
-            datetime.fromisoformat(row["started_at"])
-            if row["started_at"]
-            else None
+            datetime.fromisoformat(row["started_at"]) if row["started_at"] else None
         ),
         completed_at=(
-            datetime.fromisoformat(row["completed_at"])
-            if row["completed_at"]
-            else None
+            datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
         ),
         pr_url=row["pr_url"],
         error=row["error"],
@@ -722,9 +718,7 @@ class SqliteLifecyclePersistence:
     # Read API — pick_next_pending (TASK-MBC8-009)
     # ------------------------------------------------------------------
 
-    def pick_next_pending(
-        self, project: str | None = None
-    ) -> BuildRow | None:
+    def pick_next_pending(self, project: str | None = None) -> BuildRow | None:
         """Return the oldest QUEUED build for ``project`` in FIFO order.
 
         TASK-MBC8-009 / FEAT-FORGE-008 acceptance criterion: the queue
@@ -768,9 +762,7 @@ class SqliteLifecyclePersistence:
     # Write API — queue_build (TASK-MBC8-001)
     # ------------------------------------------------------------------
 
-    def queue_build(
-        self, payload: Any, *, mode: BuildMode | str | None = None
-    ) -> str:
+    def queue_build(self, payload: Any, *, mode: BuildMode | str | None = None) -> str:
         """Mode-aware alias of :meth:`record_pending_build`.
 
         TASK-MBC8-001 surfaces a ``queue_build`` entry-point that accepts
@@ -808,8 +800,7 @@ class SqliteLifecyclePersistence:
         """
         if not isinstance(entry, StageLogEntry):
             raise TypeError(
-                "record_stage requires a StageLogEntry; got "
-                f"{type(entry).__name__}"
+                f"record_stage requires a StageLogEntry; got {type(entry).__name__}"
             )
 
         try:
@@ -888,10 +879,10 @@ class SqliteLifecyclePersistence:
             (build_id,),
         ).fetchone()
         if row is None:
-            raise RuntimeError(
-                f"mark_paused: no build row for build_id={build_id!r}"
-            )
-        current_state = BuildState(row["status"] if isinstance(row, sqlite3.Row) else row[0])
+            raise RuntimeError(f"mark_paused: no build row for build_id={build_id!r}")
+        current_state = BuildState(
+            row["status"] if isinstance(row, sqlite3.Row) else row[0]
+        )
 
         transition = compose_transition(
             Build(build_id=build_id, status=current_state),
@@ -1025,6 +1016,34 @@ class SqliteLifecyclePersistence:
         return [_row_to_build_row(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Read API — get_build_row (TASK-JNB-102)
+    # ------------------------------------------------------------------
+
+    def get_build_row(self, build_id: str) -> BuildRow | None:
+        """Return the full builds row for ``build_id``, or ``None``.
+
+        Read-only accessor added for the TASK-JNB-102 CLI
+        build-cancelled notifier, which needs ``feature_id`` (subject
+        token) and ``correlation_id`` (payload field) that
+        :class:`~forge.pipeline.cli_steering.BuildSnapshot` does not
+        carry. General-purpose: any caller holding only a ``build_id``
+        may hydrate the row through this method.
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+        """
+        if not build_id:
+            raise ValueError("get_build_row: build_id must be non-empty")
+        with self._reader() as cx:
+            row = cx.execute(
+                "SELECT * FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_build_row(row)
+
+    # ------------------------------------------------------------------
     # Read API — read_stages
     # ------------------------------------------------------------------
 
@@ -1128,9 +1147,7 @@ class SqliteLifecyclePersistence:
         has never produced a build.
         """
         if not feature_id:
-            raise ValueError(
-                "find_active_or_recent: feature_id must be non-empty"
-            )
+            raise ValueError("find_active_or_recent: feature_id must be non-empty")
 
         active_values = tuple(s.value for s in ACTIVE_STATES)
         active_placeholders = ",".join(["?"] * len(active_values))
@@ -1190,8 +1207,7 @@ class SqliteBuildSnapshotReader:
         """Read the build's coarse lifecycle classification from SQLite."""
         if not build_id:
             raise ValueError(
-                "SqliteBuildSnapshotReader.get_snapshot: build_id must be "
-                "non-empty"
+                "SqliteBuildSnapshotReader.get_snapshot: build_id must be non-empty"
             )
         with self._persistence._reader() as cx:
             row = cx.execute(
@@ -1273,8 +1289,7 @@ class SqliteBuildCanceller:
         """Transition the build to terminal ``CANCELLED`` with ``rationale``."""
         if not build_id:
             raise ValueError(
-                "SqliteBuildCanceller.mark_cancelled: build_id must be "
-                "non-empty"
+                "SqliteBuildCanceller.mark_cancelled: build_id must be non-empty"
             )
         # Read the current state under the writer connection.
         row = self._persistence._cx.execute(
@@ -1333,8 +1348,7 @@ class SqliteBuildResumer:
         """Transition the build from ``PAUSED`` back to ``RUNNING``."""
         if not build_id:
             raise ValueError(
-                "SqliteBuildResumer.resume_after_skip: build_id must be "
-                "non-empty"
+                "SqliteBuildResumer.resume_after_skip: build_id must be non-empty"
             )
         row = self._persistence._cx.execute(
             "SELECT status FROM builds WHERE build_id = ?",
@@ -1553,8 +1567,7 @@ class AsyncTaskCanceller:
     def cancel_async_task(self, task_id: str) -> Any:
         if not task_id:
             raise ValueError(
-                "AsyncTaskCanceller.cancel_async_task: task_id must be "
-                "non-empty"
+                "AsyncTaskCanceller.cancel_async_task: task_id must be non-empty"
             )
         return self._cancel(task_id)
 

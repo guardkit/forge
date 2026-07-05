@@ -204,9 +204,7 @@ class FakeBuildResumer:
         build_id: str,
         skipped_stage: StageClass,
     ) -> Any:
-        self.resumed.append(
-            {"build_id": build_id, "skipped_stage": skipped_stage}
-        )
+        self.resumed.append({"build_id": build_id, "skipped_stage": skipped_stage})
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +312,7 @@ class TestHandlerExists:
 
         assert isinstance(handler.constitutional_guard, ConstitutionalGuard)
         assert (
-            handler.constitutional_guard.constitutional_stages
-            == CONSTITUTIONAL_STAGES
+            handler.constitutional_guard.constitutional_stages == CONSTITUTIONAL_STAGES
         )
 
 
@@ -383,10 +380,7 @@ class TestHandleCancelPausePath:
 
         assert len(build_canceller.cancelled) == 1
         assert build_canceller.cancelled[0]["build_id"] == paused_build_id
-        assert (
-            "FEAT-FORGE-004 ASSUM-005"
-            in build_canceller.cancelled[0]["rationale"]
-        )
+        assert "FEAT-FORGE-004 ASSUM-005" in build_canceller.cancelled[0]["rationale"]
 
     def test_handle_cancel_during_pause_does_not_invoke_async_canceller(
         self,
@@ -656,9 +650,7 @@ class TestHandleSkipRefused:
         handler: CliSteeringHandler,
         build_id: str,
     ) -> None:
-        outcome = handler.handle_skip(
-            build_id, StageClass.PULL_REQUEST_REVIEW
-        )
+        outcome = handler.handle_skip(build_id, StageClass.PULL_REQUEST_REVIEW)
 
         assert isinstance(outcome, SkipOutcome)
         assert outcome.status is SkipStatus.REFUSED_CONSTITUTIONAL
@@ -675,10 +667,7 @@ class TestHandleSkipRefused:
 
         assert len(skip_recorder.refused) == 1
         assert skip_recorder.refused[0]["build_id"] == build_id
-        assert (
-            skip_recorder.refused[0]["stage"]
-            is StageClass.PULL_REQUEST_REVIEW
-        )
+        assert skip_recorder.refused[0]["stage"] is StageClass.PULL_REQUEST_REVIEW
         assert skip_recorder.skipped == []
 
     def test_handle_skip_refused_does_not_resume_build(
@@ -697,15 +686,10 @@ class TestHandleSkipRefused:
         handler: CliSteeringHandler,
         build_id: str,
     ) -> None:
-        outcome = handler.handle_skip(
-            build_id, StageClass.PULL_REQUEST_REVIEW
-        )
+        outcome = handler.handle_skip(build_id, StageClass.PULL_REQUEST_REVIEW)
 
         assert isinstance(outcome.guard_decision, SkipDecision)
-        assert (
-            outcome.guard_decision.verdict
-            is SkipVerdict.REFUSED_CONSTITUTIONAL
-        )
+        assert outcome.guard_decision.verdict is SkipVerdict.REFUSED_CONSTITUTIONAL
         assert outcome.guard_decision.stage is StageClass.PULL_REQUEST_REVIEW
 
     def test_handle_skip_refused_rationale_quotes_guard_rationale(
@@ -713,9 +697,7 @@ class TestHandleSkipRefused:
         handler: CliSteeringHandler,
         build_id: str,
     ) -> None:
-        outcome = handler.handle_skip(
-            build_id, StageClass.PULL_REQUEST_REVIEW
-        )
+        outcome = handler.handle_skip(build_id, StageClass.PULL_REQUEST_REVIEW)
 
         # Cite ADR-ARCH-026 + name the stage; the guard's rationale
         # itself names ADR-ARCH-026, so the templated wrapper inherits
@@ -827,9 +809,7 @@ class TestHandleSkipPermitted:
             constitutional_guard=empty_guard,
         )
 
-        outcome = empty_handler.handle_skip(
-            build_id, StageClass.PULL_REQUEST_REVIEW
-        )
+        outcome = empty_handler.handle_skip(build_id, StageClass.PULL_REQUEST_REVIEW)
 
         assert outcome.status is SkipStatus.SKIPPED
         assert skip_recorder.skipped[0]["stage"] is StageClass.PULL_REQUEST_REVIEW
@@ -897,9 +877,7 @@ class TestHandleDirectiveQueued:
         task_id: str,
         task_updater: FakeAsyncTaskUpdater,
     ) -> None:
-        handler.handle_directive(
-            build_id, feature_id, "increase test coverage to 90%"
-        )
+        handler.handle_directive(build_id, feature_id, "increase test coverage to 90%")
 
         assert len(task_updater.appends) == 1
         assert task_updater.appends[0] == {
@@ -932,9 +910,7 @@ class TestHandleDirectiveQueued:
         feature_id: str,
         task_id: str,
     ) -> None:
-        outcome = handler.handle_directive(
-            build_id, feature_id, "use semver"
-        )
+        outcome = handler.handle_directive(build_id, feature_id, "use semver")
 
         expected = DIRECTIVE_QUEUED_RATIONALE.format(
             build_id=build_id,
@@ -967,9 +943,7 @@ class TestHandleDirectiveNoAutobuild:
             lifecycle=BuildLifecycle.OTHER_RUNNING,
         )
 
-        outcome = handler.handle_directive(
-            build_id, "FEAT-NA", "speed things up"
-        )
+        outcome = handler.handle_directive(build_id, "FEAT-NA", "speed things up")
 
         assert outcome.status is DirectiveStatus.NO_ACTIVE_AUTOBUILD
         assert outcome.is_queued is False
@@ -989,9 +963,7 @@ class TestHandleDirectiveNoAutobuild:
             paused_feature_id="FEAT-NA",
         )
 
-        outcome = handler.handle_directive(
-            build_id, "FEAT-NA", "speed things up"
-        )
+        outcome = handler.handle_directive(build_id, "FEAT-NA", "speed things up")
 
         assert outcome.status is DirectiveStatus.NO_ACTIVE_AUTOBUILD
         assert task_updater.appends == []
@@ -1014,9 +986,7 @@ class TestHandleDirectiveNoAutobuild:
             active_autobuild_feature_id="FEAT-OTHER",
         )
 
-        outcome = handler.handle_directive(
-            build_id, "FEAT-NA", "speed things up"
-        )
+        outcome = handler.handle_directive(build_id, "FEAT-NA", "speed things up")
 
         assert outcome.status is DirectiveStatus.NO_ACTIVE_AUTOBUILD
         assert task_updater.appends == []
@@ -1032,9 +1002,7 @@ class TestHandleDirectiveNoAutobuild:
             lifecycle=BuildLifecycle.OTHER_RUNNING,
         )
 
-        outcome = handler.handle_directive(
-            build_id, "FEAT-NA", "speed things up"
-        )
+        outcome = handler.handle_directive(build_id, "FEAT-NA", "speed things up")
 
         expected = DIRECTIVE_NO_AUTOBUILD_RATIONALE.format(
             build_id=build_id,
@@ -1107,3 +1075,187 @@ class TestInputValidation:
         )
         with pytest.raises(ValueError, match="active_autobuild_task_id"):
             handler.handle_cancel("build-bad-2")
+
+
+# ---------------------------------------------------------------------------
+# TASK-JNB-102 — cancelled_notifier seam (build-cancelled wire signal)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SpyCancelledNotifier:
+    """Records notify_cancelled calls; optionally raises (DDR-007 probe)."""
+
+    calls: list[dict[str, str]] = field(default_factory=list)
+    raise_on_call: bool = False
+
+    def notify_cancelled(
+        self, *, build_id: str, reason: str, cancelled_by: str
+    ) -> None:
+        if self.raise_on_call:
+            raise RuntimeError("nats down")
+        self.calls.append(
+            {
+                "build_id": build_id,
+                "reason": reason,
+                "cancelled_by": cancelled_by,
+            }
+        )
+
+
+class TestCancelledNotifierSeam:
+    """TASK-JNB-102: each cancel branch fires the notifier exactly once.
+
+    The notifier is best-effort and fires strictly AFTER
+    ``mark_cancelled``; the TERMINAL no-op never fires it; a raising
+    notifier is swallowed with a WARNING (DDR-007 — the SQLite
+    transition stands).
+    """
+
+    def _spy(self, handler: CliSteeringHandler) -> _SpyCancelledNotifier:
+        spy = _SpyCancelledNotifier()
+        handler.cancelled_notifier = spy
+        return spy
+
+    def test_pause_reject_branch_notifies_once_with_responder(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        snapshot_reader.snapshots["b-1"] = BuildSnapshot(
+            build_id="b-1",
+            lifecycle=BuildLifecycle.PAUSED_AT_GATE,
+            paused_stage=StageClass.PULL_REQUEST_REVIEW,
+            paused_feature_id="FEAT-X",
+        )
+        spy = self._spy(handler)
+
+        handler.handle_cancel("b-1", reason="stop it", responder="rich")
+
+        assert spy.calls == [
+            {"build_id": "b-1", "reason": "stop it", "cancelled_by": "rich"}
+        ]
+
+    def test_autobuild_branch_notifies_once(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        snapshot_reader.snapshots["b-2"] = BuildSnapshot(
+            build_id="b-2",
+            lifecycle=BuildLifecycle.AUTOBUILD_RUNNING,
+            active_autobuild_task_id="task-9",
+            active_autobuild_feature_id="FEAT-X",
+        )
+        spy = self._spy(handler)
+
+        handler.handle_cancel("b-2", reason=None, responder="rich")
+
+        assert spy.calls == [
+            {"build_id": "b-2", "reason": "cli cancel", "cancelled_by": "rich"}
+        ]
+
+    def test_other_running_branch_notifies_with_defaults(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        snapshot_reader.snapshots["b-3"] = BuildSnapshot(
+            build_id="b-3",
+            lifecycle=BuildLifecycle.OTHER_RUNNING,
+        )
+        spy = self._spy(handler)
+
+        handler.handle_cancel("b-3")
+
+        assert spy.calls == [
+            {
+                "build_id": "b-3",
+                "reason": "cli cancel",
+                "cancelled_by": "forge-cli",
+            }
+        ]
+
+    def test_terminal_noop_never_notifies(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        snapshot_reader.snapshots["b-4"] = BuildSnapshot(
+            build_id="b-4",
+            lifecycle=BuildLifecycle.TERMINAL,
+        )
+        spy = self._spy(handler)
+
+        outcome = handler.handle_cancel("b-4", responder="rich")
+
+        assert outcome.status is CancelStatus.NOOP_ALREADY_TERMINAL
+        assert spy.calls == []
+
+    def test_default_none_notifier_preserves_pre_jnb102_behaviour(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        snapshot_reader.snapshots["b-5"] = BuildSnapshot(
+            build_id="b-5",
+            lifecycle=BuildLifecycle.OTHER_RUNNING,
+        )
+        assert handler.cancelled_notifier is None
+
+        outcome = handler.handle_cancel("b-5")
+
+        assert outcome.status is CancelStatus.CANCELLED_DIRECT
+
+    def test_raising_notifier_is_swallowed_after_mark_cancelled(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+        build_canceller: FakeBuildCanceller,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        snapshot_reader.snapshots["b-6"] = BuildSnapshot(
+            build_id="b-6",
+            lifecycle=BuildLifecycle.OTHER_RUNNING,
+        )
+        handler.cancelled_notifier = _SpyCancelledNotifier(raise_on_call=True)
+
+        with caplog.at_level(logging.WARNING):
+            outcome = handler.handle_cancel("b-6", responder="rich")
+
+        # SQLite transition already recorded; no exception propagated.
+        assert outcome.status is CancelStatus.CANCELLED_DIRECT
+        assert len(build_canceller.cancelled) == 1
+        assert any("build-cancelled notify failed" in r.message for r in caplog.records)
+
+    def test_notifier_fires_strictly_after_mark_cancelled(
+        self,
+        handler: CliSteeringHandler,
+        snapshot_reader: FakeSnapshotReader,
+    ) -> None:
+        # AC wording: transition-then-publish. Shared order log pins
+        # the sequencing so a regression that emitted before the
+        # SQLite write would fail here.
+        order: list[str] = []
+
+        class _OrderedCanceller:
+            def mark_cancelled(self, build_id: str, rationale: str) -> Any:
+                order.append("mark_cancelled")
+                return {"build_id": build_id, "state": "CANCELLED"}
+
+        class _OrderedNotifier:
+            def notify_cancelled(self, **_: Any) -> None:
+                order.append("notify_cancelled")
+
+        snapshot_reader.snapshots["b-7"] = BuildSnapshot(
+            build_id="b-7",
+            lifecycle=BuildLifecycle.OTHER_RUNNING,
+        )
+        handler.build_canceller = _OrderedCanceller()
+        handler.cancelled_notifier = _OrderedNotifier()
+
+        handler.handle_cancel("b-7")
+
+        assert order == ["mark_cancelled", "notify_cancelled"]

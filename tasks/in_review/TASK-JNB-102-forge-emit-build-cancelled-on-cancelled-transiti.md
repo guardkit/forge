@@ -3,7 +3,17 @@ id: TASK-JNB-102
 title: 'forge: emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)'
 status: in_review
 created: 2026-07-03 15:30:00+00:00
-updated: 2026-07-03 15:30:00+00:00
+updated: 2026-07-05 00:00:00+00:00
+state_note: >-
+  2026-07-05: implemented via interactive /task-work by the Fable forge-JNB
+  session (backlog -> in_progress -> in_review same day). The
+  autobuild_state block below is a stale false-green from 2026-07-04
+  (turn approved with "Files actual: 0" - nothing was built then).
+  Implementation notes: forge cancel now emits FOR REAL via the
+  queue.publish sync one-shot pattern (row enrichment through the new
+  SqliteLifecyclePersistence.get_build_row); gating emits are bound in
+  make_gate_check_deps over the build context. Review findings + recorded
+  follow-ups: docs/state/TASK-JNB-102/plan_audit.md.
 priority: high
 task_type: feature
 parent_review: TASK-REV-C951

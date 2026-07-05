@@ -67,7 +67,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from forge.pipeline.constitutional_guard import (
     ConstitutionalGuard,
@@ -97,7 +97,10 @@ __all__ = [
     "BuildSnapshotReader",
     "CancelOutcome",
     "CancelStatus",
+    "CancelledNotifier",
     "CliSteeringHandler",
+    "DEFAULT_CLI_CANCELLED_BY",
+    "DEFAULT_CLI_CANCEL_REASON",
     "DirectiveOutcome",
     "DirectiveStatus",
     "PauseRejectResolver",
@@ -231,8 +234,7 @@ CANCEL_DIRECT_RATIONALE = (
 )
 
 CANCEL_NOOP_TERMINAL_RATIONALE = (
-    "CLI cancel on build {build_id!r}: build is already terminal; "
-    "no-op."
+    "CLI cancel on build {build_id!r}: build is already terminal; no-op."
 )
 
 SKIP_RECORDED_RATIONALE = (
@@ -581,6 +583,36 @@ class BuildResumer(Protocol):
         ...
 
 
+#: Fallback identity/reason stamped on the build-cancelled wire signal
+#: when the CLI caller supplies none (TASK-JNB-102). ``responder`` is
+#: normally ``os.getlogin()`` from ``forge cancel``; the constant keeps
+#: the payload honest for programmatic callers.
+DEFAULT_CLI_CANCELLED_BY: str = "forge-cli"
+DEFAULT_CLI_CANCEL_REASON: str = "cli cancel"
+
+
+@runtime_checkable
+class CancelledNotifier(Protocol):
+    """Best-effort ``pipeline.build-cancelled`` notifier (TASK-JNB-102).
+
+    Implementations own payload enrichment: the handler's
+    :class:`BuildSnapshot` carries neither ``correlation_id`` nor (on
+    the OTHER_RUNNING branch) ``feature_id``, so the production
+    implementation looks the build row up by ``build_id`` and builds
+    the :class:`~nats_core.events.BuildCancelledPayload` from it (see
+    ``forge.cli.runtime``). Raising is permitted — the handler wraps
+    every call in a DDR-007 swallow+log guard.
+    """
+
+    def notify_cancelled(  # pragma: no cover - protocol stub
+        self,
+        *,
+        build_id: str,
+        reason: str,
+        cancelled_by: str,
+    ) -> None: ...
+
+
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
@@ -626,6 +658,13 @@ class CliSteeringHandler:
     skip_recorder: StageSkipRecorder
     build_resumer: BuildResumer
     constitutional_guard: ConstitutionalGuard = None  # type: ignore[assignment]
+    # TASK-JNB-102 (ASSUM-010 closure): optional best-effort
+    # ``pipeline.build-cancelled`` notifier, invoked AFTER
+    # ``mark_cancelled`` on each of the three cancel branches (never on
+    # the TERMINAL no-op). ``None`` = no emit. The call is guarded by
+    # :meth:`_notify_cancelled_best_effort` — a raising notifier logs a
+    # WARNING and the SQLite transition stands (DDR-007).
+    cancelled_notifier: "CancelledNotifier | None" = None
 
     def __post_init__(self) -> None:
         # ``ConstitutionalGuard`` is constructed lazily so callers can
@@ -634,6 +673,37 @@ class CliSteeringHandler:
         # constructor kwarg.
         if self.constitutional_guard is None:
             self.constitutional_guard = ConstitutionalGuard()
+
+    def _notify_cancelled_best_effort(
+        self,
+        *,
+        build_id: str,
+        reason: str | None,
+        responder: str | None,
+    ) -> None:
+        """Fire the build-cancelled notifier without ever raising.
+
+        TASK-JNB-102 / DDR-007: invoked strictly AFTER
+        ``build_canceller.mark_cancelled`` — the SQLite ledger is
+        already authoritative; a notifier failure is a WARNING, never a
+        rollback or an exception into the CLI flow.
+        """
+        if self.cancelled_notifier is None:
+            return
+        try:
+            self.cancelled_notifier.notify_cancelled(
+                build_id=build_id,
+                reason=reason or DEFAULT_CLI_CANCEL_REASON,
+                cancelled_by=responder or DEFAULT_CLI_CANCELLED_BY,
+            )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 swallow+log
+            logger.warning(
+                "cli_steering.handle_cancel: build-cancelled notify "
+                "failed build_id=%s err=%s — SQLite transition stands "
+                "(DDR-007)",
+                build_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # AC-002 — handle_cancel
@@ -689,8 +759,7 @@ class CliSteeringHandler:
         """
         if not build_id:
             raise ValueError(
-                "CliSteeringHandler.handle_cancel: build_id must be a "
-                "non-empty string"
+                "CliSteeringHandler.handle_cancel: build_id must be a non-empty string"
             )
 
         snapshot = self.snapshot_reader.get_snapshot(build_id)
@@ -728,6 +797,9 @@ class CliSteeringHandler:
             self.build_canceller.mark_cancelled(
                 build_id=build_id,
                 rationale=rationale,
+            )
+            self._notify_cancelled_best_effort(
+                build_id=build_id, reason=reason, responder=responder
             )
             logger.info(
                 "cli_steering.handle_cancel: pause-reject path for build_id=%s "
@@ -768,6 +840,9 @@ class CliSteeringHandler:
                 build_id=build_id,
                 rationale=rationale,
             )
+            self._notify_cancelled_best_effort(
+                build_id=build_id, reason=reason, responder=responder
+            )
             logger.info(
                 "cli_steering.handle_cancel: autobuild-cancel path for "
                 "build_id=%s task_id=%s feature_id=%s",
@@ -795,9 +870,11 @@ class CliSteeringHandler:
                 build_id=build_id,
                 rationale=rationale,
             )
+            self._notify_cancelled_best_effort(
+                build_id=build_id, reason=reason, responder=responder
+            )
             logger.info(
-                "cli_steering.handle_cancel: direct-cancel path for "
-                "build_id=%s",
+                "cli_steering.handle_cancel: direct-cancel path for build_id=%s",
                 build_id,
             )
             return CancelOutcome(
@@ -866,8 +943,7 @@ class CliSteeringHandler:
         """
         if not build_id:
             raise ValueError(
-                "CliSteeringHandler.handle_skip: build_id must be a "
-                "non-empty string"
+                "CliSteeringHandler.handle_skip: build_id must be a non-empty string"
             )
 
         guard_decision = self.constitutional_guard.veto_skip(stage)

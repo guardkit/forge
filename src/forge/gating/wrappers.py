@@ -404,6 +404,15 @@ class GateCheckDeps:
     # four-step chain) has a real value to match against. ``None``
     # preserves the pre-JNB-101 envelope shape (no correlation).
     correlation_id: str | None = None
+    # TASK-JNB-102 (ASSUM-010 closure): optional best-effort publisher
+    # for ``pipeline.build-cancelled`` on the CANCELLED transitions this
+    # module drives (reject decision, max-wait breach). Bound at the
+    # composition root to ``PipelineLifecycleEmitter.emit_cancelled``
+    # over the build's context; ``None`` = no emit (pre-v1.1 shape).
+    # Always invoked AFTER the SQLite transition and never allowed to
+    # raise into the gate flow (DDR-007 — see
+    # :func:`_publish_cancelled_best_effort`).
+    publish_cancelled: Callable[..., Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +582,12 @@ async def gate_check(
             build_id=build_id, reason=REASON_MAX_WAIT
         )
         await deps.repository.mark_cancelled(build_id=build_id, reason=REASON_MAX_WAIT)
+        await _publish_cancelled_best_effort(
+            deps,
+            build_id=build_id,
+            reason=REASON_MAX_WAIT,
+            cancelled_by=SOURCE_ID,
+        )
         return GateOutcome.TIMED_OUT, decision
 
     response = resume_value_as(ApprovalResponsePayload, raw)
@@ -723,6 +738,47 @@ def _resume_options_for(mode: GateMode) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Internal: best-effort build-cancelled publish (TASK-JNB-102, DDR-007).
+# ---------------------------------------------------------------------------
+
+
+async def _publish_cancelled_best_effort(
+    deps: GateCheckDeps,
+    *,
+    build_id: str,
+    reason: str,
+    cancelled_by: str,
+) -> None:
+    """Invoke ``deps.publish_cancelled`` without ever raising.
+
+    ASSUM-010 closure: the CANCELLED transitions in this module gain a
+    ``pipeline.build-cancelled`` wire signal so the operator who tapped
+    Reject (or whose approval window lapsed) receives terminal
+    confirmation on the phone. Contract (DDR-007):
+
+    * called strictly AFTER the SQLite transition — the ledger is
+      already authoritative when the publish is attempted;
+    * a ``None`` callback is a silent no-op (pre-v1.1 composition);
+    * any exception is logged at WARNING and swallowed — no rollback,
+      no retry loop, the transition stands.
+    """
+    if deps.publish_cancelled is None:
+        return
+    try:
+        await deps.publish_cancelled(reason=reason, cancelled_by=cancelled_by)
+    except Exception as exc:  # noqa: BLE001 — DDR-007 swallow+log
+        logger.warning(
+            "gate_check: build-cancelled publish failed build_id=%s "
+            "reason=%r cancelled_by=%r err=%s — SQLite transition stands "
+            "(DDR-007)",
+            build_id,
+            reason,
+            cancelled_by,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Internal: dispatch a typed ApprovalResponsePayload to the state machine.
 # ---------------------------------------------------------------------------
 
@@ -759,6 +815,15 @@ async def _dispatch_response(
         await deps.repository.mark_cancelled(build_id=build_id, reason=reason)
         await deps.state_machine.transition_to_cancelled(
             build_id=build_id, reason=reason
+        )
+        # TASK-JNB-102: terminal wire signal for the phone loop — the
+        # operator who tapped Reject receives build-cancelled, never
+        # build-resumed (the resume emit is decision-gated upstream).
+        await _publish_cancelled_best_effort(
+            deps,
+            build_id=build_id,
+            reason=reason,
+            cancelled_by=response.decided_by,
         )
         return GateOutcome.CANCELLED, decision
 
@@ -817,6 +882,12 @@ async def _dispatch_response(
             )
             await deps.repository.mark_cancelled(
                 build_id=build_id, reason=REASON_MAX_WAIT
+            )
+            await _publish_cancelled_best_effort(
+                deps,
+                build_id=build_id,
+                reason=REASON_MAX_WAIT,
+                cancelled_by=SOURCE_ID,
             )
             return GateOutcome.TIMED_OUT, decision
         next_response = resume_value_as(ApprovalResponsePayload, raw)
