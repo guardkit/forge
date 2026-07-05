@@ -1,9 +1,9 @@
 ---
 id: TASK-JNB-101
-title: "forge: ApprovalSubscriber production wiring into the serve runtime"
-status: backlog
-created: 2026-07-03T15:30:00Z
-updated: 2026-07-03T15:30:00Z
+title: 'forge: ApprovalSubscriber production wiring into the serve runtime'
+status: in_review
+created: 2026-07-03 15:30:00+00:00
+updated: 2026-07-03 15:30:00+00:00
 priority: high
 task_type: feature
 parent_review: TASK-REV-C951
@@ -13,8 +13,29 @@ wave: 7
 repo: forge
 implementation_mode: task-work
 complexity: 7
-dependencies: [TASK-JNB-004]
-tags: [ubs-003, jarvis-notification-bridge, slack, v1.1]
+dependencies:
+- TASK-JNB-004
+tags:
+- ubs-003
+- jarvis-notification-bridge
+- slack
+- v1.1
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-1872
+  base_branch: main
+  started_at: '2026-07-04T15:28:35.552865'
+  last_updated: '2026-07-04T15:42:04.694149'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-04T15:28:35.552865'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: forge: ApprovalSubscriber production wiring into the serve runtime

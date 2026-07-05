@@ -1,9 +1,9 @@
 ---
 id: TASK-JNB-106
-title: "forge: v1.1 scenario tests over the production wiring"
-status: backlog
-created: 2026-07-03T15:30:00Z
-updated: 2026-07-03T15:30:00Z
+title: 'forge: v1.1 scenario tests over the production wiring'
+status: blocked
+created: 2026-07-03 15:30:00+00:00
+updated: 2026-07-03 15:30:00+00:00
 priority: high
 task_type: testing
 parent_review: TASK-REV-C951
@@ -13,8 +13,30 @@ wave: 9
 repo: forge
 implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-JNB-101, TASK-JNB-102]
-tags: [ubs-003, jarvis-notification-bridge, slack, v1.1]
+dependencies:
+- TASK-JNB-101
+- TASK-JNB-102
+tags:
+- ubs-003
+- jarvis-notification-bridge
+- slack
+- v1.1
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-1872
+  base_branch: main
+  started_at: '2026-07-04T17:01:02.084404'
+  last_updated: '2026-07-04T17:10:46.307235'
+  turns:
+  - turn: 1
+    decision: error
+    feedback: null
+    timestamp: '2026-07-04T17:01:02.084404'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: false
 ---
 
 # Task: forge: v1.1 scenario tests over the production wiring

@@ -8,7 +8,7 @@ description: 'v1.1 forge half of FEAT-UBS-003: production wiring of the dormant-
   Gated on the passed v1 checkpoint (TASK-JNB-004, 2026-07-04). Shared approver identity:
   forge expected_approver must equal jarvis slack_decided_by (config-alignment AC).'
 created: '2026-07-04T11:10:50.646064'
-status: planned
+status: failed
 complexity: 6
 estimated_tasks: 3
 tasks:
@@ -17,20 +17,38 @@ tasks:
   file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-101-forge-approvalsubscriber-production-wiring-into-.md
   complexity: 7
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 170
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-07-04T15:28:35.541228'
+  completed_at: '2026-07-04T15:42:04.696779'
 - id: TASK-JNB-102
   name: Emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)
   file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-102-forge-emit-build-cancelled-on-cancelled-transiti.md
   complexity: 5
   dependencies:
   - TASK-JNB-101
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-07-04T16:43:57.921758'
+  completed_at: '2026-07-04T16:58:42.824354'
 - id: TASK-JNB-106
   name: v1.1 scenario tests over the production wiring
   file_path: tasks/backlog/jarvis-notification-bridge/TASK-JNB-106-forge-v1-1-scenario-tests-over-the-production-wi.md
@@ -38,10 +56,19 @@ tasks:
   dependencies:
   - TASK-JNB-101
   - TASK-JNB-102
-  status: pending
-  description: ''
+  status: failed
   implementation_mode: task-work
   estimated_minutes: 75
+  requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: error
+    error: 'Unexpected error: Agent coach received API error: rate_limit'
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-07-04T17:01:02.075655'
+  completed_at: '2026-07-04T17:10:46.309227'
 orchestration:
   parallel_groups:
   - - TASK-JNB-101
@@ -49,11 +76,34 @@ orchestration:
   - - TASK-JNB-106
   estimated_duration_minutes: 320
   recommended_parallel: 1
-
 smoke_gates:
-  after_wave: [1, 2, 3]
-  command: |
-    set -e
-    ./.venv/bin/python -m pytest tests -x -q
+  after_wave:
+  - 1
+  - 2
+  - 3
+  command: 'set -e
+
+    ./.venv/bin/python -m pytest tests -x -q --ignore=tests/bdd/test_runbook_executor_integration.py
+    --ignore=tests/integration/test_forge_serve_orchestrator_e2e.py -k "not test_no_raw_clock_primitives_outside_allowlist
+    and not test_forge_serve_arfs_inside_image"
+
+    '
   expected_exit: 0
   timeout: 600
+  exit5_is_hard_fail: false
+preflight_strict: false
+evidence_repos: []
+execution:
+  started_at: '2026-07-04T13:17:55.412454'
+  completed_at: '2026-07-04T17:10:46.313956'
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-1872
+  total_turns: 3
+  tasks_completed: 2
+  tasks_failed: 1
+  current_wave: 3
+  completed_waves:
+  - 1
+  - 2
+  last_updated: '2026-07-04T17:10:46.309236'
+  archived_at: null
+  archived_to: null

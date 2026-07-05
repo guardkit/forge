@@ -1,9 +1,9 @@
 ---
 id: TASK-JNB-102
-title: "forge: emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)"
-status: backlog
-created: 2026-07-03T15:30:00Z
-updated: 2026-07-03T15:30:00Z
+title: 'forge: emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)'
+status: in_review
+created: 2026-07-03 15:30:00+00:00
+updated: 2026-07-03 15:30:00+00:00
 priority: high
 task_type: feature
 parent_review: TASK-REV-C951
@@ -13,8 +13,29 @@ wave: 8
 repo: forge
 implementation_mode: task-work
 complexity: 5
-dependencies: [TASK-JNB-101]
-tags: [ubs-003, jarvis-notification-bridge, slack, v1.1]
+dependencies:
+- TASK-JNB-101
+tags:
+- ubs-003
+- jarvis-notification-bridge
+- slack
+- v1.1
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /Users/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-1872
+  base_branch: main
+  started_at: '2026-07-04T16:43:57.936440'
+  last_updated: '2026-07-04T16:58:42.821654'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-04T16:43:57.936440'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # Task: forge: emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)
