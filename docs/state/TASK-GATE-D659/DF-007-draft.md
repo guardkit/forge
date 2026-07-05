@@ -1,12 +1,11 @@
 # DF-007 (DRAFT) — Gates travel with the agent, not the caller
 
-> **STATUS: DRAFT — pending operator sign-off before filing to
-> `../ai-transition/docs/decisions/`.** DF-007 is RESERVED in the fleet
-> `REGISTER.md` with no body text; TASK-GATE-D659 is plausibly its filing
-> trigger. There is a trigger-wording conflict between `REGISTER.md` and the
-> plan-of-record (noted below) that the operator must resolve before this
-> decision is filed. Do **not** copy this file into the sibling `ai-transition`
-> repo until sign-off.
+> **STATUS: ACCEPTED & FILED 2026-07-05 (Rich).** Filed to
+> `../ai-transition/docs/decisions/DECISION-DF-007-gates-travel-with-the-agent-not-the-caller.md`
+> and indexed in the fleet `REGISTER.md` (DF-007 → Accepted). The
+> trigger-wording conflict was reconciled on acceptance (§ "Trigger-wording
+> reconciliation" in the filed record); TASK-GATE-D659 is confirmed as the
+> trigger. This file is retained as the source draft for provenance.
 
 - **Framing precedent:** DF-009 (gate-property framing).
 - **Source task:** TASK-GATE-D659 — daemon-side pre-dispatch approval gate,
