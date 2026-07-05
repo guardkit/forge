@@ -1,11 +1,21 @@
 ---
 id: TASK-GATE-D659
 title: "Gate activation: real build pauses at an approval gate, phone round-trip, restart-safe"
-status: in_progress
+status: design_approved
 created: 2026-07-05T16:45:00Z
 updated: 2026-07-05T16:55:00Z
-previous_state: backlog
-state_transition_reason: "task-work --design-only execution"
+previous_state: in_progress
+state_transition_reason: "Phase 2.8 checkpoint approved (design-only)"
+design:
+  status: approved
+  approved_at: "2026-07-05T18:05:00Z"
+  approved_by: human
+  implementation_plan: docs/state/TASK-GATE-D659/implementation_plan.md
+  implementation_plan_version: v2
+  architectural_review_score: 66
+  complexity_score: 8
+  execution_shape: "one task, three internally-green waves (operator choice at checkpoint)"
+  design_notes: "3-designer/3-judge panel -> predispatch + R1/R2 repairs + grafts; arch review C1/C2/M1/M2 folded"
 priority: critical
 task_type: feature
 tags: [gating, approval, feat-bf39-v1.1, jnb-107-blocker, feat-1872]
