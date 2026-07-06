@@ -3,8 +3,10 @@
 **Feature ID (fleet):** FEAT-SPL-002 (Sovereign Planning Loop, Session 3)
 **Stack**: python
 **Generated**: 2026-07-06T10:03:20Z (autonomous Fable session, `--auto`)
-**Scenarios**: 29 total (9 smoke, 0 regression)
-**Assumptions**: 16 total (0 high / 0 medium / 16 low confidence)
+**Revised**: 2026-07-06 — TASK-REV-83E4 decision panel (+4 scenarios: RT-03/04/05/08;
+7 assumptions amended in the manifest; report at `.claude/reviews/TASK-REV-83E4-review-report.md`)
+**Scenarios**: 33 total (9 smoke, 0 regression)
+**Assumptions**: 16 total (0 high / 0 medium / 16 low confidence; 7 panel-amended, all deferred)
 **Review required**: Yes — REVIEW REQUIRED: all assumptions unconfirmed (--auto mode); Rich reviews the manifest
 
 ## Scope
@@ -31,8 +33,8 @@ target terminal replaces it as configuration.
 |----------|-------|
 | Key examples (@key-example) | 8 |
 | Boundary conditions (@boundary) | 5 |
-| Negative cases (@negative) | 7 |
-| Edge cases (@edge-case) | 9 |
+| Negative cases (@negative) | 8 |
+| Edge cases (@edge-case) | 12 |
 
 ## Deferred Items
 

@@ -3,6 +3,9 @@
 # Stack: python
 # Assumptions: 16 (see mode-p-planning-chain_assumptions.yaml)
 # Generated: 2026-07-06T10:03:20Z
+# Revised: 2026-07-06 (TASK-REV-83E4 decision panel: +4 scenarios — RT-03 intake
+# trust boundary, RT-04 restart-after-escalation, RT-05 boot recovery of
+# non-paused runs, RT-08 handoff idempotency; 29 -> 33)
 # Session: ACTION 7, Fable window (autonomous, --auto; all assumptions deferred for Rich)
 # Decisions honoured: DF-009 (attendance = gate property), DF-007 (gates travel with the
 # agent), DF-004 (fallbacks:[] audit), DF-006 (frontier = escalation subcontractor),
@@ -31,6 +34,7 @@ Feature: Mode P Planning Chain
   # Why: The front door — a queued planning request must become a durable,
   # identity-pinned planning run (DF-009: the originator's identity drives the gate).
   # [ASSUMPTION: confidence=low] Planning runs are persisted as their own durable run records keyed by the request's correlation id, separate from feature-build rows (ASSUM-001).
+  @task:TASK-MP-008
   @key-example @smoke
   Scenario: A queued planning request starts a durable planning run
     Given a planning request from the originator has been published to the planning queue
@@ -41,6 +45,7 @@ Feature: Mode P Planning Chain
 
   # Why: Stage 1 — the Product Owner runs on the LOCAL specialist and its
   # Coach evidence is captured for the human gate.
+  @task:TASK-MP-009
   @key-example @smoke
   Scenario: The product owner stage is dispatched to the local specialist and coach-scored
     Given a planning run is ready to start
@@ -52,6 +57,7 @@ Feature: Mode P Planning Chain
   # Why: The heart of DF-009 — completed product docs PAUSE the run at an
   # identity-pinned checkpoint; pause is durable BEFORE the request goes out.
   # [ASSUMPTION: confidence=low] The checkpoint composes with the existing approval-gate machinery via a planning stage label; the expected approver is the run's pinned originating user verbatim (ASSUM-002, ASSUM-003).
+  @task:TASK-MP-004B
   @key-example @smoke
   Scenario: Completed product docs pause the run at the product docs checkpoint
     Given the product owner stage has completed for a planning run
@@ -63,6 +69,7 @@ Feature: Mode P Planning Chain
   # Why: The v1 terminal — approval turns product docs into committed spec
   # inputs plus the exact attended command, and the run row says PLANNED-HANDOFF.
   # [ASSUMPTION: confidence=low] Handoff commits feature_spec_inputs/<correlation-id>.md on a planning branch in the target repository; the notification is published for the Slack bridge to render, containing the exact attended /feature-spec command (ASSUM-006, ASSUM-007, ASSUM-008).
+  @task:TASK-MP-006
   @key-example @smoke
   Scenario: Approval by the originator advances the run to the planned handoff
     Given a planning run is paused at the product docs checkpoint
@@ -75,6 +82,7 @@ Feature: Mode P Planning Chain
 
   # Why: DF-009 v1 hard rule — the checkpoint NEVER approves on its own,
   # regardless of how good the evidence looks.
+  @task:TASK-MP-004B
   @key-example @smoke
   Scenario: The product docs checkpoint never approves on its own
     Given the product owner stage completed with strong coach evidence
@@ -84,6 +92,7 @@ Feature: Mode P Planning Chain
 
   # Why: Rejection is a first-class decision — it must end the run cleanly
   # with nothing committed anywhere.
+  @task:TASK-MP-004B
   @key-example
   Scenario: Rejection at the checkpoint cancels the run without committing anything
     Given a planning run is paused at the product docs checkpoint
@@ -94,6 +103,7 @@ Feature: Mode P Planning Chain
 
   # Why: Scope success criterion 2 — every step of the path is auditable.
   # [ASSUMPTION: confidence=low] The audit trail lives in the same durable stage-history store as builds, with originator and approver identities on the transitions (ASSUM-016).
+  @task:TASK-MP-002
   @key-example
   Scenario: The planning run's history records every transition with its identities
     Given a planning run has advanced from intake to planned-handoff
@@ -103,6 +113,7 @@ Feature: Mode P Planning Chain
 
   # Why: D4/D13 constitutional rule — Mode P is a pure function; no reasoning
   # model ever decides the next step of the chain.
+  @task:TASK-MP-003
   @key-example
   Scenario: Planning runs never consult a reasoning model to advance the chain
     Given a planning run advances through intake, the product owner stage, the checkpoint and the handoff
@@ -116,6 +127,7 @@ Feature: Mode P Planning Chain
 
   # Why: Just-inside the escalation threshold — patience, not escalation.
   # [ASSUMPTION: confidence=low] Reaching the escalation threshold re-targets the approval to the escalation approver instead of cancelling; the escalated approval has its own ceiling (ASSUM-004).
+  @task:TASK-MP-005
   @boundary
   Scenario: A checkpoint wait just inside the escalation threshold does not escalate
     Given a planning run is paused at the product docs checkpoint
@@ -126,6 +138,7 @@ Feature: Mode P Planning Chain
 
   # Why: Just-outside — the threshold trips escalation to Rich, and the run
   # stays alive rather than dying the way a build-gate timeout would.
+  @task:TASK-MP-005
   @boundary @smoke
   Scenario: A checkpoint wait reaching the escalation threshold escalates to the escalation approver
     Given a planning run is paused at the product docs checkpoint
@@ -136,6 +149,7 @@ Feature: Mode P Planning Chain
 
   # Why: The escalated wait also ends — at ITS ceiling the run dies as timed
   # out; it is never auto-approved (DF-009).
+  @task:TASK-MP-005
   @boundary @negative
   Scenario: An escalated approval that reaches its own ceiling cancels the run as timed out
     Given a planning run has escalated to the escalation approver
@@ -146,6 +160,7 @@ Feature: Mode P Planning Chain
   # Why: Bounded rounds — at the defer cap the checkpoint escalates instead of
   # looping forever (the anti-lag pressure valve from the SPL scope).
   # [ASSUMPTION: confidence=low] The defer-round cap is 3 per the SPL scope's dialogue cycle cap (ASSUM-005).
+  @task:TASK-MP-005
   @boundary
   Scenario: A run deferred at the checkpoint up to the cap escalates instead of another round
     Given a planning run has been deferred at the product docs checkpoint the maximum number of times
@@ -154,6 +169,7 @@ Feature: Mode P Planning Chain
 
   # Why: target repository is optional on the wire — absence falls back to
   # configured default, never to a guess.
+  @task:TASK-MP-006
   @boundary
   Scenario: A planning request without a target repository hands off to the configured default repository
     Given a planning request that names no target repository
@@ -167,6 +183,7 @@ Feature: Mode P Planning Chain
 
   # Why: DF-009 identity pinning — only the expected approver's verbatim
   # identity may decide; anyone else is refused silently-but-logged.
+  @task:TASK-MP-004B
   @negative @smoke
   Scenario: An approval from someone other than the expected approver is refused
     Given a planning run is paused at the product docs checkpoint awaiting the originator
@@ -175,6 +192,7 @@ Feature: Mode P Planning Chain
     And the refused response should be logged
 
   # Why: Poison-pill protection — bad input must never wedge planning intake.
+  @task:TASK-MP-008
   @negative
   Scenario: A malformed planning request is rejected without wedging intake
     Given a malformed message arrives on the planning queue
@@ -183,9 +201,23 @@ Feature: Mode P Planning Chain
     And the message should be acknowledged so later planning requests still flow
     And the rejection should be logged
 
+  # Why: RT-03 (TASK-REV-83E4 panel) — the frozen wire contract applies NO
+  # validation to the correlation id, yet it becomes a run key, a file path
+  # segment, a branch name and a subject token; planning intake is the trust
+  # boundary and must validate before any such use.
+  @task:TASK-MP-008
+  @negative @security
+  Scenario: A planning request with an invalid correlation id is rejected without wedging intake
+    Given a planning request whose correlation id is blank, oversized or contains path or reference separators
+    When the daemon processes the request
+    Then no planning run should be created
+    And the request should be acknowledged so later planning requests still flow
+    And the rejection should be logged
+
   # Why: DF-004 — the audit is the thing that makes "local-only" enforceable;
   # a cloud fallback anywhere in planning model resolution is a loud failure.
   # [ASSUMPTION: confidence=low] The audit runs at daemon boot; a violation disables Mode P intake loudly while build intake boots normally (ASSUM-011).
+  @task:TASK-MP-009
   @negative @smoke
   Scenario: A cloud fallback in planning model resolution fails the planning audit loudly
     Given planning model resolution is configured with a cloud fallback
@@ -197,6 +229,7 @@ Feature: Mode P Planning Chain
   # Why: DF-006 default posture — frontier is opt-in; disabled means the
   # flagged output goes straight to the human, with no outside call.
   # [ASSUMPTION: confidence=low] Flag-for-review derives from the existing dispatch-outcome contract (degraded outcomes flag); no new numeric threshold is introduced (ASSUM-013).
+  @task:TASK-MP-007
   @negative
   Scenario: No frontier second opinion is sought when the toggle is disabled
     Given the frontier second opinion is not enabled
@@ -207,6 +240,7 @@ Feature: Mode P Planning Chain
 
   # Why: DF-006 degrade rule — an unreachable frontier can never block or
   # dilute the human gate.
+  @task:TASK-MP-007
   @negative
   Scenario: An unreachable frontier service degrades to forced human review
     Given the frontier second opinion is enabled
@@ -217,6 +251,7 @@ Feature: Mode P Planning Chain
 
   # Why: A dispatch failure is a structured, attributable outcome — never a
   # silent stall, never collateral damage to other runs.
+  @task:TASK-MP-003
   @negative
   Scenario: A product owner dispatch failure records a failed run rather than a silent stall
     Given a planning run is ready to start
@@ -226,6 +261,7 @@ Feature: Mode P Planning Chain
 
   # Why: The handoff touches a real repository — failure must be visible and
   # the run must not claim success.
+  @task:TASK-MP-006
   @negative
   Scenario: A handoff that cannot commit to the target repository fails visibly
     Given a planning run has been approved at the product docs checkpoint
@@ -241,6 +277,7 @@ Feature: Mode P Planning Chain
   # Why: The build-plan validation case — kill the daemon mid-pause; the
   # checkpoint must survive restart and still be answerable (DF-007 re-arm).
   # [ASSUMPTION: confidence=low] Planning intake acknowledges the queue message once the run is durably recorded; recovery is driven from the durable run records, not from queue redelivery (ASSUM-015).
+  @task:TASK-MP-009
   @edge-case @smoke
   Scenario: A daemon restart while paused re-arms the checkpoint and preserves the pause
     Given a planning run is paused at the product docs checkpoint
@@ -249,8 +286,42 @@ Feature: Mode P Planning Chain
     And the approval request should be re-issued exactly once by the recovery process
     And an approval after the restart should resume the run to its handoff
 
+  # Why: RT-04 (TASK-REV-83E4 panel) — escalation state must be durable; a
+  # restart must re-arm to the CURRENT expected approver, not silently revert
+  # to the originator, and elapsed wait must not reset (escalation-DoS guard).
+  @task:TASK-MP-009
+  @edge-case
+  Scenario: A daemon restart after an escalation re-arms the checkpoint to the escalation approver
+    Given a planning run whose checkpoint has escalated to the escalation approver
+    When the daemon restarts
+    Then the run should still be paused after the restart
+    And the re-issued approval request should name the escalation approver as the expected approver
+    And the escalation wait already elapsed should not be reset by the restart
+
+  # Why: RT-05 (TASK-REV-83E4 panel) — ack-on-persist means queue redelivery can
+  # never re-drive a stuck run; boot recovery must therefore own non-paused runs.
+  @task:TASK-MP-009
+  @edge-case
+  Scenario: A planning run interrupted before its stage dispatch is recovered at boot
+    Given a planning run was durably recorded but the daemon died before dispatching its first stage
+    When the daemon restarts
+    Then boot recovery should re-drive or fail the run with a structured reason
+    And the run should not remain stuck as queued forever
+
+  # Why: RT-08 (TASK-REV-83E4 panel) — a crash between the branch commit and the
+  # run-record update must not fail a run whose work actually succeeded.
+  @task:TASK-MP-006
+  @edge-case
+  Scenario: Re-executing an approved handoff that already committed is idempotent
+    Given an approved planning run whose planning branch and spec inputs already exist in the target repository
+    When the handoff is executed again
+    Then the handoff should verify the existing content and proceed
+    And the run should be recorded as planned-handoff
+    And no duplicate commit should be created
+
   # Why: The message bus is not the ledger — a bus outage mid-pause loses
   # nothing because the run's state is SQLite-authoritative.
+  @task:TASK-MP-009
   @edge-case
   Scenario: A message-bus outage during a paused run does not lose the run
     Given a planning run is paused at the product docs checkpoint
@@ -261,6 +332,7 @@ Feature: Mode P Planning Chain
   # Why: At-least-once delivery — a redelivered planning request must not
   # spawn a sibling run.
   # [ASSUMPTION: confidence=low] Duplicate detection is keyed on the correlation id of the planning request (ASSUM-014).
+  @task:TASK-MP-008
   @edge-case
   Scenario: A redelivered planning request does not create a second run
     Given a planning run already exists for a request's correlation id
@@ -270,6 +342,7 @@ Feature: Mode P Planning Chain
 
   # Why: Two front doors, one daemon — planning intake must not consume or
   # block build intake, and vice versa.
+  @task:TASK-MP-009
   @edge-case
   Scenario: Planning intake and build intake coexist without interference
     Given a build request and a planning request are queued at the same time
@@ -280,6 +353,7 @@ Feature: Mode P Planning Chain
 
   # Why: A race between a valid approval and the escalation threshold must
   # resolve to exactly one outcome.
+  @task:TASK-MP-005
   @edge-case
   Scenario: An approval that races the escalation threshold resolves to a single outcome
     Given a planning run is paused and its escalation threshold is about to be reached
@@ -288,6 +362,7 @@ Feature: Mode P Planning Chain
     And the run should not undergo two conflicting transitions
 
   # Why: Terminal is terminal — late responses must bounce off a finished run.
+  @task:TASK-MP-004B
   @edge-case
   Scenario: An approval response for a run that already ended is ignored
     Given a planning run has already been cancelled
@@ -298,6 +373,7 @@ Feature: Mode P Planning Chain
   # Why: Mode boundary — a planning run that somehow accumulates build-stage
   # history is a violation, not a curiosity (mirror of the Mode B guard).
   # [ASSUMPTION: confidence=low] Mode P's permitted stages are exactly the planning chain; all build stages are forbidden in planning runs (ASSUM-009).
+  @task:TASK-MP-003
   @edge-case @security
   Scenario: A planning run never advances into build stages
     Given a planning run whose recorded history contains a build stage entry
@@ -308,6 +384,7 @@ Feature: Mode P Planning Chain
   # Why: The description's explicit guard — Mode P is a DISTINCT mode; the
   # product owner stage stays forbidden for feature builds while planning
   # runs are permitted to use it.
+  @task:TASK-MP-003
   @edge-case
   Scenario: The product owner stage is permitted in planning runs while feature builds still forbid it
     Given feature builds forbid the product owner stage
@@ -317,6 +394,7 @@ Feature: Mode P Planning Chain
 
   # Why: DF-006 escalation contract — the frontier sees a compressed
   # structured brief, never the raw conversation, and the human still decides.
+  @task:TASK-MP-007
   @edge-case @security
   Scenario: A frontier second opinion receives only a compressed structured brief
     Given the frontier second opinion is enabled

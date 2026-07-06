@@ -1,0 +1,154 @@
+id: FEAT-3ED2
+name: Mode P Planning Chain
+description: 'FEAT-SPL-002: forge Mode P planning chain — planning intake consumer,
+  durable planning_runs store, pure-function planner, local PO dispatch (Coach-scored),
+  identity-pinned product_docs checkpoint with escalation, registry-indirected PLANNED-HANDOFF
+  terminal, DF-004 audit, DF-006 frontier second opinion'
+created: '2026-07-06T11:29:00.709202'
+status: planned
+complexity: 7
+estimated_tasks: 11
+tasks:
+- id: TASK-MP-001
+  name: PlanningConfig section and DF-004 audit
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-001-planning-config-and-df004-audit.md
+  complexity: 4
+  dependencies: []
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 50
+- id: TASK-MP-002
+  name: planning_runs durable store (schema_v3)
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-002-planning-runs-durable-store.md
+  complexity: 6
+  dependencies: []
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 113
+- id: TASK-MP-003
+  name: Planning chain data and pure-function planner
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-003-planning-chain-data-and-planner.md
+  complexity: 5
+  dependencies: []
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 75
+- id: TASK-MP-004A
+  name: Planning-backed gate protocol adapters
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-004A-planning-gate-adapters.md
+  complexity: 4
+  dependencies:
+  - TASK-MP-002
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 50
+- id: TASK-MP-004B
+  name: product_docs checkpoint flow
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-004B-product-docs-checkpoint.md
+  complexity: 5
+  dependencies:
+  - TASK-MP-004A
+  - TASK-MP-003
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 75
+- id: TASK-MP-005
+  name: Escalation and defer-cap policy
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-005-escalation-and-defer-policy.md
+  complexity: 6
+  dependencies:
+  - TASK-MP-004B
+  - TASK-MP-001
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 113
+- id: TASK-MP-006
+  name: PLANNED-HANDOFF terminal and registry
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-006-planned-handoff-terminal.md
+  complexity: 6
+  dependencies:
+  - TASK-MP-001
+  - TASK-MP-002
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 113
+- id: TASK-MP-007
+  name: DF-006 frontier second opinion
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-007-frontier-second-opinion.md
+  complexity: 4
+  dependencies:
+  - TASK-MP-004B
+  - TASK-MP-001
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 50
+- id: TASK-MP-008
+  name: Planning intake consumer
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-008-planning-intake-consumer.md
+  complexity: 5
+  dependencies:
+  - TASK-MP-001
+  - TASK-MP-002
+  - TASK-MP-003
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 75
+- id: TASK-MP-009
+  name: Serve composition and recovery
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-009-serve-composition-and-recovery.md
+  complexity: 7
+  dependencies:
+  - TASK-MP-004B
+  - TASK-MP-005
+  - TASK-MP-006
+  - TASK-MP-007
+  - TASK-MP-008
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 170
+- id: TASK-MP-010
+  name: Live-daemon operator validation
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-010-live-daemon-operator-validation.md
+  complexity: 3
+  dependencies:
+  - TASK-MP-009
+  status: pending
+  description: ''
+  implementation_mode: direct
+  estimated_minutes: 33
+orchestration:
+  parallel_groups:
+  - - TASK-MP-001
+    - TASK-MP-002
+    - TASK-MP-003
+  - - TASK-MP-004A
+    - TASK-MP-006
+    - TASK-MP-008
+  - - TASK-MP-004B
+  - - TASK-MP-005
+    - TASK-MP-007
+  - - TASK-MP-009
+  - - TASK-MP-010
+  estimated_duration_minutes: 917
+  recommended_parallel: 3
+
+# R3 feature-level smoke gate (TASK-REV-83E4 PS-007): tests/forge/planning is
+# created by Wave 1 tasks; tests/forge/config exists on main today — temporal
+# sequencing satisfied for both firing points.
+smoke_gates:
+  after_wave: [2, 5, 6]
+  command: |
+    set -e
+    python -m pytest tests/forge/planning tests/forge/config -q
+  expected_exit: 0
+  timeout: 300
