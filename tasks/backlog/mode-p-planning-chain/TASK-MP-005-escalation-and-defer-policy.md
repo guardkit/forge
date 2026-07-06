@@ -2,7 +2,7 @@
 id: TASK-MP-005
 title: Escalation, wait ceilings, and defer-cap semantics (durable, clock-injected)
 task_type: feature
-status: backlog
+status: in_review
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
@@ -10,8 +10,29 @@ wave: 4
 implementation_mode: task-work
 complexity: 6
 estimated_minutes: 80
-dependencies: [TASK-MP-004B, TASK-MP-001]
-tags: [mode-p, escalation, df-009]
+dependencies:
+- TASK-MP-004B
+- TASK-MP-001
+tags:
+- mode-p
+- escalation
+- df-009
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
+  base_branch: main
+  started_at: '2026-07-06T13:40:59.204771'
+  last_updated: '2026-07-06T13:51:33.911650'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-06T13:40:59.204771'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-MP-005 — Escalation, wait ceilings, and defer-cap semantics

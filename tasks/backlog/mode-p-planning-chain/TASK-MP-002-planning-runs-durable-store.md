@@ -2,7 +2,7 @@
 id: TASK-MP-002
 title: planning_runs durable store (additive schema_v3 + state machine + history)
 task_type: feature
-status: backlog
+status: in_review
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
@@ -11,7 +11,26 @@ implementation_mode: task-work
 complexity: 6
 estimated_minutes: 85
 dependencies: []
-tags: [mode-p, persistence, sqlite]
+tags:
+- mode-p
+- persistence
+- sqlite
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
+  base_branch: main
+  started_at: '2026-07-06T12:58:39.986049'
+  last_updated: '2026-07-06T13:09:40.917407'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-06T12:58:39.986049'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-MP-002 — planning_runs durable store (additive schema_v3 + state machine + history)

@@ -2,7 +2,7 @@
 id: TASK-MP-004A
 title: Planning-backed gate protocol adapters (GateRepository/StateMachine over planning_runs)
 task_type: feature
-status: backlog
+status: in_review
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
@@ -10,8 +10,28 @@ wave: 2
 implementation_mode: task-work
 complexity: 4
 estimated_minutes: 45
-dependencies: [TASK-MP-002]
-tags: [mode-p, gating, adapters]
+dependencies:
+- TASK-MP-002
+tags:
+- mode-p
+- gating
+- adapters
+autobuild_state:
+  current_turn: 1
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
+  base_branch: main
+  started_at: '2026-07-06T13:13:47.130944'
+  last_updated: '2026-07-06T13:30:48.769950'
+  turns:
+  - turn: 1
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-06T13:13:47.130944'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-MP-004A — Planning-backed gate protocol adapters

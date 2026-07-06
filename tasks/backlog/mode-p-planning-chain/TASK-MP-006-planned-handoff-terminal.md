@@ -1,8 +1,9 @@
 ---
 id: TASK-MP-006
-title: PLANNED-HANDOFF terminal + registry (idempotent, GitRunner-injected, sanitised notification)
+title: PLANNED-HANDOFF terminal + registry (idempotent, GitRunner-injected, sanitised
+  notification)
 task_type: feature
-status: backlog
+status: in_review
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
@@ -10,8 +11,79 @@ wave: 2
 implementation_mode: task-work
 complexity: 6
 estimated_minutes: 80
-dependencies: [TASK-MP-001, TASK-MP-002]
-tags: [mode-p, handoff, terminal]
+dependencies:
+- TASK-MP-001
+- TASK-MP-002
+tags:
+- mode-p
+- handoff
+- terminal
+autobuild_state:
+  current_turn: 3
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
+  base_branch: main
+  started_at: '2026-07-06T13:13:47.119938'
+  last_updated: '2026-07-06T13:31:35.324842'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: '- 8 tests failed with ''Expected mock to have been awaited once. Awaited
+      0 times.'' This indicates async protocol violations - methods expected to be
+      awaited were called synchronously or not called at all. File: tests/forge/planning/test_handoff.py
+      (TestProtocolSatisfaction.test_reposi...): Review async/await usage in src/forge/planning/handoff.py.
+      Ensure: (1) async methods are defined with ''async def'', (2) all async method
+      calls use ''await'', (3) test mocks correctly expect async or sync based on
+      actual implementation. Run pytest locally to reproduce the 8 failures and fix
+      each systematically.
+
+      - Evidence gathering aborted (gathering_status: partial_gate_abort) before independent
+      verification, coverage measurement, or BDD oracle execution. No independent
+      confirmation of Player''s self-reported test results.: Fix test failures first.
+      Once tests pass, the orchestrator will complete full evidence gathering including
+      independent test verification and coverage measurement.'
+    timestamp: '2026-07-06T13:13:47.119938'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
+      \ Player claim: Player claimed file src/forge/adapters/nats/planning_consumer.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/planning/gate_adapters.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
+      \ severity=should_fix): Player claim: Player claimed file src/forge/planning/handoff.py.\
+      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
+      \ for it \u2014 the Player claimed work on a file it did not actually modify\
+      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
+      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
+      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
+      \ a turn-rejecting fabrication..\n... and 5 more issues"
+    timestamp: '2026-07-06T13:19:54.275842'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-06T13:24:27.601832'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-MP-006 — PLANNED-HANDOFF terminal + terminal registry
