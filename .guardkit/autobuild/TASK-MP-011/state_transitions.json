@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-MP-011-serve-boot-wiring.md",
     "timestamp": "2026-07-06T13:27:29.870598+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-MP-011",
+    "pre_path": "tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md",
+    "post_path": "tasks/design_approved/TASK-MP-011-serve-boot-wiring.md",
+    "timestamp": "2026-07-06T13:36:44.403495+00:00",
+    "kind": "design_approved_transition"
   }
 ]
