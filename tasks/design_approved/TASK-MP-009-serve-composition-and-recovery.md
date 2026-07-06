@@ -1,17 +1,25 @@
 ---
-id: TASK-MP-009
-title: Serve composition + boot audit gating + planning rearm/boot-sweep recovery
-task_type: integration
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 7
+dependencies:
+- TASK-MP-004B
+- TASK-MP-005
+- TASK-MP-006
+- TASK-MP-007
+- TASK-MP-008
+estimated_minutes: 90
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 5
+id: TASK-MP-009
 implementation_mode: task-work
-complexity: 7
-estimated_minutes: 90
-dependencies: [TASK-MP-004B, TASK-MP-005, TASK-MP-006, TASK-MP-007, TASK-MP-008]
-tags: [mode-p, serve, recovery]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- serve
+- recovery
+task_type: integration
+title: Serve composition + boot audit gating + planning rearm/boot-sweep recovery
+wave: 5
 ---
 
 # TASK-MP-009 — Serve composition + boot audit gating + recovery

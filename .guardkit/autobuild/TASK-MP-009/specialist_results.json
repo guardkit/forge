@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "failed",
+    "duration_seconds": 0.5585930559318513,
+    "error": "tests failed (deterministic Phase 4): Error detail:\n    ^^^^^^^^^^^^^^^^\nE   AttributeError: 'SqlitePlanningRunStore' object has no attribute 'create_run'\n_____ TestRestartAfterEscalation.test_escal",
+    "tests_run": 9,
+    "tests_failed": 5,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Error detail:\n    ^^^^^^^^^^^^^^^^\nE   AttributeError: 'SqlitePlanningRunStore' object has no attribute 'create_run'\n_____ TestRestartAfterEscalation.test_escalation_preserved_across_restart ______\nte",
+    "quality_gates_passed": false
+  },
+  "phase_5": {
+    "status": "skipped",
+    "duration_seconds": 0.0,
+    "error": "phase_4 status=failed",
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

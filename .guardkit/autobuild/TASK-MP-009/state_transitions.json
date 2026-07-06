@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-MP-009",
+    "pre_path": "tasks/backlog/TASK-MP-009-serve-composition-and-recovery.md",
+    "post_path": "tasks/design_approved/TASK-MP-009-serve-composition-and-recovery.md",
+    "timestamp": "2026-07-06T12:52:25.026891+00:00",
+    "kind": "design_approved_transition"
+  }
+]
