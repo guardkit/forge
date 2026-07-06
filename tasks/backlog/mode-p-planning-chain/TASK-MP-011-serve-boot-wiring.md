@@ -2,7 +2,7 @@
 id: TASK-MP-011
 title: Wire Mode P planning composition into serve boot (call-site pin)
 task_type: integration
-status: backlog
+status: in_review
 parent_review: TASK-REV-83E4
 feature_ref: FEAT-SPL-002
 wave: 1
@@ -10,7 +10,80 @@ implementation_mode: task-work
 complexity: 4
 estimated_minutes: 45
 dependencies: []
-tags: [mode-p, serve, wiring, fix]
+tags:
+- mode-p
+- serve
+- wiring
+- fix
+autobuild_state:
+  current_turn: 3
+  max_turns: 5
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F
+  base_branch: main
+  started_at: '2026-07-06T14:27:29.864289'
+  last_updated: '2026-07-06T14:53:09.737050'
+  turns:
+  - turn: 1
+    decision: feedback
+    feedback: '- Deterministic honesty record (claim_audit, severity=critical): Player
+      claim: Player claimed file `src/forge/cli/serve.py. Actual: Path absent from
+      ''git status --porcelain'' so ''git add -A'' would not stage it. Probes: path_exists=False;
+      gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed
+      work on a file that does not exist on disk..
+
+      - Deterministic honesty record (claim_audit, severity=critical): Player claim:
+      Player claimed file `tests/cli/test_serve_planning_wiring.py. Actual: Path absent
+      from ''git status --porcelain'' so ''git add -A'' would not stage it. Probes:
+      path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely
+      cause: the Player claimed work on a file that does not exist on disk..
+
+      - Player report contains malformed file paths with backtick prefixes (e.g.,
+      ''`src/forge/cli/serve.py'', ''`tests/cli/test_serve_planning_wiring.py'') in
+      files_modified and files_created lists. These are not valid file paths and triggered
+      honesty verification failures.: Remove markdown formatting from file path strings
+      in the Player report. File paths should be plain strings without backticks,
+      quotes, or other markup. Use either absolute paths or relative paths consistently,
+      but never include markdown backticks in the path strings themselves.
+
+      ... and 4 more issues'
+    timestamp: '2026-07-06T14:27:29.864289'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 2
+    decision: feedback
+    feedback: "- Deterministic honesty record (claim_audit, severity=critical): Player\
+      \ claim: Player claimed file `src/forge/cli/serve.py. Actual: Path absent from\
+      \ 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False;\
+      \ gitignore_match=no rule matched; tracked=no. Most likely cause: the Player\
+      \ claimed work on a file that does not exist on disk..\n- Deterministic honesty\
+      \ record (claim_audit, severity=critical): Player claim: Player claimed file\
+      \ `tests/cli/test_serve_planning_wiring.py. Actual: Path absent from 'git status\
+      \ --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False;\
+      \ gitignore_match=no rule matched; tracked=no. Most likely cause: the Player\
+      \ claimed work on a file that does not exist on disk..\n- Deterministic honesty\
+      \ record (claim_audit_unmodified, severity=should_fix): Player claim: Player\
+      \ claimed file src/forge/cli/serve.py. Actual: Path is tracked in git but 'git\
+      \ status --porcelain' shows no change for it \u2014 the Player claimed work\
+      \ on a file it did not actually modify this turn. Most likely cause: the report\
+      \ writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/\
+      \ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side\
+      \ filter; this is a warning, not a turn-rejecting fabrication..\n... and 4 more\
+      \ issues"
+    timestamp: '2026-07-06T14:36:44.399251'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
+  - turn: 3
+    decision: approve
+    feedback: null
+    timestamp: '2026-07-06T14:43:04.691909'
+    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
+      actual: 0'
+    player_success: true
+    coach_success: true
 ---
 
 # TASK-MP-011 — Wire Mode P planning composition into serve boot

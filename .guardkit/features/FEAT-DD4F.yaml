@@ -4,7 +4,7 @@ description: 'TASK-MP-011: wire compose_planning_consumer_and_dispatch + recover
   into serve boot with a call-site pin test (FEAT-3ED2 merge-review finding: PS-002
   dead-code gap)'
 created: '2026-07-06T14:27:18.875602'
-status: planned
+status: completed
 complexity: 4
 estimated_tasks: 1
 tasks:
@@ -13,12 +13,36 @@ tasks:
   file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md
   complexity: 4
   dependencies: []
-  status: pending
-  description: ''
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
+  requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-07-06T14:27:29.857156'
+  completed_at: '2026-07-06T14:53:09.739776'
 orchestration:
   parallel_groups:
   - - TASK-MP-011
   estimated_duration_minutes: 50
   recommended_parallel: 1
+preflight_strict: false
+evidence_repos: []
+execution:
+  started_at: '2026-07-06T14:27:29.439603'
+  completed_at: '2026-07-06T14:53:09.742866'
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F
+  total_turns: 3
+  tasks_completed: 1
+  tasks_failed: 0
+  current_wave: 1
+  completed_waves:
+  - 1
+  last_updated: '2026-07-06T14:53:09.741973'
+  archived_at: null
+  archived_to: null
