@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from forge.gating.identity import derive_request_id
 from forge.gating.models import GateDecision, GateMode
 from forge.gating.wrappers import PausedBuildSnapshot
 from forge.planning.gate_adapters import (
@@ -93,15 +94,21 @@ def clock() -> Mock:
 
 
 @pytest.fixture
-def repository(store: SqlitePlanningRunStore, clock: Mock) -> PlanningGateRepository:
-    """Create a PlanningGateRepository for testing."""
-    return PlanningGateRepository(store, clock=clock)
+def adapters(store: SqlitePlanningRunStore, clock: Mock) -> tuple:
+    """Create a pair of adapters with shared handoff."""
+    return build_planning_gate_adapters(store, clock=clock)
 
 
 @pytest.fixture
-def state_machine(store: SqlitePlanningRunStore) -> PlanningStateMachine:
-    """Create a PlanningStateMachine for testing."""
-    return PlanningStateMachine(store)
+def repository(adapters: tuple) -> PlanningGateRepository:
+    """Extract repository from adapters pair."""
+    return adapters[0]
+
+
+@pytest.fixture
+def state_machine(adapters: tuple) -> PlanningStateMachine:
+    """Extract state machine from adapters pair."""
+    return adapters[1]
 
 
 class TestProtocolSatisfaction:
@@ -158,21 +165,26 @@ class TestRecordPausedBuild:
         decision = GateDecision(
             build_id=f"plan-{correlation_id}",
             stage_label="product_docs",
-            target_kind="task",
-            target_identifier="TASK-001",
+            target_kind="local_tool",
+            target_identifier="product_docs_tool",
             mode=GateMode.AUTO_APPROVE,
             rationale="Test decision",
-            coach_score=95.0,
-            threshold_applied=80.0,
+            coach_score=0.95,
+            threshold_applied=0.80,
             decided_at=clock(),
         )
 
         # Act: Record paused build
+        request_id = derive_request_id(
+            build_id=f"plan-{correlation_id}",
+            stage_label="product_docs",
+            attempt_count=0,
+        )
         await repository.record_paused_build(
             build_id=f"plan-{correlation_id}",
             feature_id="FEAT-TEST",
             stage_label="product_docs",
-            request_id="plan-test-corr-123.product_docs.0",
+            request_id=request_id,
             attempt_count=0,
             decision=decision,
         )
@@ -184,7 +196,7 @@ class TestRecordPausedBuild:
             (correlation_id,),
         ).fetchone()
         assert row is not None
-        assert row[0] == "plan-test-corr-123.product_docs.0"
+        assert row[0] == request_id
         assert row[1] == clock().isoformat()
 
     @pytest.mark.asyncio
@@ -210,12 +222,12 @@ class TestRecordPausedBuild:
         decision = GateDecision(
             build_id=f"plan-{correlation_id}",
             stage_label="product_docs",
-            target_kind="task",
-            target_identifier="TASK-001",
+            target_kind="local_tool",
+            target_identifier="product_docs_tool",
             mode=GateMode.HARD_STOP,
             rationale="Needs review",
-            coach_score=65.0,
-            threshold_applied=80.0,
+            coach_score=0.65,
+            threshold_applied=0.80,
             decided_at=clock(),
         )
 
@@ -261,23 +273,26 @@ class TestListPausedBuilds:
         decision = GateDecision(
             build_id=f"plan-{correlation_id}",
             stage_label="product_docs",
-            target_kind="task",
-            target_identifier="TASK-001",
+            target_kind="local_tool",
+            target_identifier="product_docs_tool",
             mode=GateMode.HARD_STOP,
-            result="pause_required",
-            coach_score=70.0,
-            threshold_applied=80.0,
+            rationale="Review required",
+            coach_score=0.70,
+            threshold_applied=0.80,
             decided_at=clock(),
-            decision_narrative="Review required",
-            targets=[],
         )
 
         await repository.record_decision(decision)
+        request_id = derive_request_id(
+            build_id=f"plan-{correlation_id}",
+            stage_label="product_docs",
+            attempt_count=0,
+        )
         await repository.record_paused_build(
             build_id=f"plan-{correlation_id}",
             feature_id="FEAT-TEST",
             stage_label="product_docs",
-            request_id="plan-test-corr-789.product_docs.0",
+            request_id=request_id,
             attempt_count=0,
             decision=decision,
         )
@@ -298,7 +313,7 @@ class TestListPausedBuilds:
         assert snapshot.build_id == f"plan-{correlation_id}"
         assert snapshot.feature_id == "FEAT-TEST"
         assert snapshot.stage_label == "product_docs"
-        assert snapshot.request_id == "plan-test-corr-789.product_docs.0"
+        assert snapshot.request_id == request_id
         assert snapshot.attempt_count == 0
         assert snapshot.correlation_id == correlation_id
         assert isinstance(snapshot.decision_snapshot, GateDecision)
@@ -309,7 +324,7 @@ class TestStateTransitions:
 
     @pytest.mark.asyncio
     async def test_transition_to_paused_delegates_to_store(
-        self, state_machine: PlanningStateMachine, store: SqlitePlanningRunStore
+        self, repository: PlanningGateRepository, state_machine: PlanningStateMachine, store: SqlitePlanningRunStore, clock: Mock
     ) -> None:
         """transition_to_paused delegates to store's CAS transition."""
         # Arrange: Create a running planning run
@@ -325,6 +340,27 @@ class TestStateTransitions:
             correlation_id=correlation_id,
             to_state=PlanningState.RUNNING,
             actor_identity="system",
+        )
+
+        # Need to call record_paused_build first to set up the handoff
+        decision = GateDecision(
+            build_id=f"plan-{correlation_id}",
+            stage_label="product_docs",
+            target_kind="task",
+            target_identifier="TASK-001",
+            mode=GateMode.HARD_STOP,
+            rationale="Test pause",
+            coach_score=70.0,
+            threshold_applied=80.0,
+            decided_at=clock(),
+        )
+        await repository.record_paused_build(
+            build_id=f"plan-{correlation_id}",
+            feature_id="FEAT-TEST",
+            stage_label="product_docs",
+            request_id="plan-test-corr-sm1.product_docs.0",
+            attempt_count=0,
+            decision=decision,
         )
 
         # Act: Transition to paused
@@ -359,6 +395,12 @@ class TestStateTransitions:
         store.transition(
             correlation_id=correlation_id,
             to_state=PlanningState.RUNNING,
+            actor_identity="system",
+        )
+        # Transition through PAUSED to get to CANCELLED (RUNNING→CANCELLED is not allowed)
+        store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.PAUSED,
             actor_identity="system",
         )
         store.transition(

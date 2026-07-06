@@ -1,0 +1,126 @@
+{
+  "task_id": "TASK-MP-008",
+  "turn": 1,
+  "decision": "feedback",
+  "issues": [
+    {
+      "severity": "should_fix",
+      "category": "honesty",
+      "description": "Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file .guardkit/bdd/TASK-MP-006_junit.xml. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..",
+      "details": {
+        "source": "deterministic_honesty_gate",
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file .guardkit/bdd/TASK-MP-006_junit.xml",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix"
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "honesty",
+      "description": "Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/adapters/nats/planning_consumer.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..",
+      "details": {
+        "source": "deterministic_honesty_gate",
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/adapters/nats/planning_consumer.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix"
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "honesty",
+      "description": "Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/planning/gate_adapters.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..",
+      "details": {
+        "source": "deterministic_honesty_gate",
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/gate_adapters.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix"
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "honesty",
+      "description": "Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/planning/handoff.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..",
+      "details": {
+        "source": "deterministic_honesty_gate",
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/handoff.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix"
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "honesty",
+      "description": "Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file tests/forge/planning/test_handoff.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..",
+      "details": {
+        "source": "deterministic_honesty_gate",
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/planning/test_handoff.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix"
+      }
+    },
+    {
+      "type": "test_failure",
+      "severity": "critical",
+      "description": "Test suite failed with 5 failures. quality_gates.tests_passed: false, tests.tests_failed: 5. Player reported tests_passed: true, contradicting the orchestrator's independent test execution.",
+      "requirement": "All acceptance criteria require passing tests for verification",
+      "suggestion": "Debug and fix all 5 test failures. Check test output for specific failure messages. Ensure test assertions match actual implementation behavior."
+    },
+    {
+      "type": "missing_requirement",
+      "severity": "critical",
+      "description": "Evidence gathering aborted with status 'partial_gate_abort'. Multiple evidence fields are null (bdd, independent_tests, wiring, coverage). A specialist_substrate error shows test-orchestrator phase failed with Pydantic ValidationError on GateDecision.target_kind.",
+      "requirement": "Complete evidence gathering required for AC verification",
+      "suggestion": "Investigate the test infrastructure failure. The Pydantic error suggests a contract mismatch in the gate decision payload. Ensure the test harness is functioning correctly before re-running."
+    },
+    {
+      "type": "code_quality",
+      "severity": "major",
+      "description": "Player claimed 5 files in files_modified that git shows as unchanged: .guardkit/bdd/TASK-MP-006_junit.xml, src/forge/adapters/nats/planning_consumer.py, src/forge/planning/gate_adapters.py, src/forge/planning/handoff.py, tests/forge/planning/test_handoff.py. Honesty check shows 5 claim_audit_unmodified discrepancies.",
+      "requirement": "AC-007 (implicitly: accurate reporting)",
+      "suggestion": "Only report files you actually modified. The actual modified files appear to be in the worktree: .guardkit/worktrees/FEAT-3ED2/src/forge/adapters/nats/planning_consumer.py and .guardkit/worktrees/FEAT-3ED2/tests/forge/adapters/test_planning_consumer.py. Do not sweep orchestrator-managed paths or paths from other tasks into your report."
+    }
+  ],
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed (5 failures). Player claims TestValidPayloadPersistence verifies row creation, field values (originating_user verbatim, expected_approver initialized), and call-order predicate (ack after store write), but test suite did not pass."
+    },
+    {
+      "criterion_id": "AC-002",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed. Player claims TestMalformedPayloadHandling verifies malformed bytes -> ack + zero rows + logged rejection, and no-wedge predicate (subsequent valid messages process normally), but test suite did not pass."
+    },
+    {
+      "criterion_id": "AC-003",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed. Player claims TestCorrelationIdValidation with parametrized tests for invalid patterns (blank, >128 chars, /, .., ~^:?*[, whitespace) -> ack + zero rows + logged rejection (RT-03 trust boundary), but test suite did not pass."
+    },
+    {
+      "criterion_id": "AC-004",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed. Player claims TestRedeliveryDeduplication verifies non-terminal redelivery (ack, still one row) and terminal redelivery (ack + notification to originator, RT-10), but test suite did not pass. Notification mechanism integration unverified."
+    },
+    {
+      "criterion_id": "AC-005",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed. Player claims PLANNING_QUEUED_SUBJECT_FILTER defined as 'pipeline.planning-queued.*' (distinct from build filter) and TestSubjectFilterSeparation with AST inspection for forbidden imports (dispatch_build/maybe_gate_build/pipeline_consumer), but test suite did not pass. PS-003 err-10100 guard unverified."
+    },
+    {
+      "criterion_id": "AC-006",
+      "result": "rejected",
+      "notes": "Cannot verify: tests failed. Player claims handle_planning_message wraps all exception paths (envelope parse, payload parse, store write, notification publish) in try/except with log + ack, and TestErrorHandling verifies never-raises predicate, but test suite did not pass. Exception-swallow contract unverified."
+    },
+    {
+      "criterion_id": "AC-007",
+      "result": "rejected",
+      "notes": "Cannot verify: no lint evidence in bundle. Player claims 'ruff check --fix' and 'ruff format' passed with zero errors, but evidence_bundle contains no lint/format results. Additionally, claim_audit discrepancies raise questions about which files were actually modified."
+    }
+  ],
+  "rationale": "Mandatory feedback due to hard test failures (5 failures, quality_gates.tests_passed: false) and partial evidence gathering abort (gathering_status: partial_gate_abort). Cannot verify any acceptance criterion without passing tests. Player's self-reported tests_passed: true contradicts orchestrator's independent test execution. Additional concerns: 5 claim_audit honesty discrepancies (should_fix severity) where Player claimed unmodified files, and specialist_substrate infrastructure failure (Pydantic ValidationError in test-orchestrator phase). Per Guard #5 (GATHERING-STATUS), null evidence fields are ABSENT SIGNAL - no approval on absence of failure."
+}

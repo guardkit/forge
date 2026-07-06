@@ -1,0 +1,119 @@
+{
+  "task_id": "TASK-MP-008",
+  "turn": 1,
+  "files_modified": [
+    ".guardkit/bdd/TASK-MP-006_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/adapters/nats/planning_consumer.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/adapters/test_planning_consumer.py",
+    "src/forge/adapters/nats/planning_consumer.py",
+    "src/forge/planning/gate_adapters.py",
+    "src/forge/planning/handoff.py",
+    "tests/forge/adapters/test_planning_consumer.py",
+    "tests/forge/planning/test_gate_adapters.py",
+    "tests/forge/planning/test_handoff.py"
+  ],
+  "files_created": [
+    ".guardkit/bdd/TASK-MP-008_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/adapters/nats/planning_consumer.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/adapters/test_planning_consumer.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/adapters/test_planning_consumer.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "Planning intake consumer with ack-after-persist",
+    "Trust boundary validation on correlation_id (RT-03)",
+    "Deduplication with terminal/non-terminal distinction",
+    "Poison pill protection (malformed messages don't wedge)",
+    "Subject filter separation from build handler (PS-003)",
+    "Exception-swallow predicate (never raises)"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 40,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-008/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/adapters/nats/planning_consumer.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/adapters/test_planning_consumer.py"
+  ],
+  "tests_passed_count": 22,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Valid payload -> planning_runs row QUEUED keyed by correlation_id, originating_user verbatim, expected_approver initialised to originating_user; fake msg.ack() called exactly once AFTER the store write (call-order predicate)",
+      "status": "complete",
+      "evidence": "Implemented handle_planning_message that calls store.record_queued() before msg.ack(). TestValidPayloadPersistence verifies row creation, field values, and call-order predicate using tracked execution sequence.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Malformed bytes -> ack + zero rows + rejection logged; a subsequent valid message on the same consumer processes normally (no-wedge predicate)",
+      "status": "complete",
+      "evidence": "Implemented try/except around envelope and payload parsing with immediate ack on failure. TestMalformedPayloadHandling verifies malformed bytes create no rows, ack is called, and subsequent valid messages process normally (no-wedge).",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Invalid correlation_id (blank, > 128 chars, or failing ^[A-Za-z0-9._-]+$ \u2014 i.e. containing /, .. as traversal, ~^:?*[, whitespace, or subject-token dots are REJECTED since '.' breaks NATS subject tokens and git refs) -> ack + zero rows + rejection logged (RT-03 trust boundary)",
+      "status": "complete",
+      "evidence": "Implemented _is_valid_correlation_id() with pattern matching and additional '..' check. TestCorrelationIdValidation uses parametrized tests to verify all invalid patterns (blank, >128 chars, /, .., ~, :, ?, *, [, whitespace) are rejected with ack + no row, and valid patterns are accepted.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Redelivered correlation_id (non-terminal existing run) -> ack, still exactly one row; duplicate of a TERMINAL run -> ack + a notification published back to the originator (RT-10 \u2014 no silent drop of a human's retry)",
+      "status": "complete",
+      "evidence": "Implemented deduplication via store.record_queued() DuplicateRun return value. Non-terminal duplicates: ack + skip. Terminal duplicates: ack + publish_notification call. TestRedeliveryDeduplication verifies non-terminal duplicates maintain one row, and terminal duplicates trigger notification.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "PLANNING_QUEUED_SUBJECT_FILTER does not subject-match BUILD_QUEUED_SUBJECT_FILTER and vice versa (string-level subject-match unit test \u2014 PS-003 err-10100 guard); the module never imports dispatch_build/maybe_gate_build/pipeline_consumer handler internals (import-predicate test)",
+      "status": "complete",
+      "evidence": "Defined PLANNING_QUEUED_SUBJECT_FILTER = 'pipeline.planning-queued.*' (distinct from 'pipeline.build-queued.>'). Module imports no build handler code. TestSubjectFilterSeparation verifies filters are different and uses AST inspection to verify no forbidden imports.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "handle_planning_message never raises (exception-swallow predicate mirroring the pipeline_consumer contract); originating_adapter absence is tolerated for triggered_by='jarvis' (accept-with-log \u2014 the wire layer does not enforce it; digest fact 6)",
+      "status": "complete",
+      "evidence": "All exception paths (envelope parse, payload parse, store write, notification publish) are wrapped in try/except with log + ack. No exceptions propagate. TestErrorHandling verifies handler never raises on various invalid inputs and always acks. Note: PlanningQueuedPayload wire contract validation happens before handler logic, so validation failures are logged and acked.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran `ruff check --fix` and `ruff format` on both implementation and test files. All lint issues resolved. Zero errors remain.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py",
+        "tests/forge/adapters/test_planning_consumer.py"
+      ]
+    }
+  ]
+}

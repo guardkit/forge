@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-MP-006-planned-handoff-terminal.md",
     "timestamp": "2026-07-06T12:13:47.138180+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-MP-006",
+    "pre_path": "tasks/backlog/mode-p-planning-chain/TASK-MP-006-planned-handoff-terminal.md",
+    "post_path": "tasks/design_approved/TASK-MP-006-planned-handoff-terminal.md",
+    "timestamp": "2026-07-06T12:19:54.277956+00:00",
+    "kind": "design_approved_transition"
   }
 ]

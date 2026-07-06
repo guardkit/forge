@@ -10,7 +10,6 @@ Test coverage for the planning-queued consumer handler:
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,13 +20,11 @@ import pytest
 from nats_core.envelope import EventType, MessageEnvelope
 
 from forge.adapters.nats.planning_consumer import (
-    CORRELATION_ID_PATTERN,
-    PLANNING_DURABLE_NAME,
     PLANNING_QUEUED_SUBJECT_FILTER,
     PlanningConsumerDeps,
     handle_planning_message,
 )
-from forge.planning.run_store import DuplicateRun, SqlitePlanningRunStore
+from forge.planning.run_store import SqlitePlanningRunStore
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -114,7 +111,9 @@ def _valid_planning_payload() -> dict[str, Any]:
     }
 
 
-def _envelope_bytes(payload: dict[str, Any], correlation_id: str = CORRELATION_ID) -> bytes:
+def _envelope_bytes(
+    payload: dict[str, Any], correlation_id: str = CORRELATION_ID
+) -> bytes:
     """Create MessageEnvelope bytes from payload."""
     envelope = MessageEnvelope(
         message_id="msg-test-001",
@@ -176,7 +175,9 @@ class TestValidPayloadPersistence:
         row_dict = dict(row)
         assert row_dict["state"] == "QUEUED"
         assert row_dict["originating_user"] == "rich"
-        assert row_dict["expected_approver"] == "rich"  # Initialized to originating_user
+        assert (
+            row_dict["expected_approver"] == "rich"
+        )  # Initialized to originating_user
         assert row_dict["request_text"] == "Build a user authentication system"
         assert row_dict["triggered_by"] == "cli"
 
@@ -426,7 +427,9 @@ class TestRedeliveryDeduplication:
         )
         row = cursor.fetchone()
         assert row is not None
-        assert row[0] == "PLANNED_HANDOFF", f"State should be PLANNED_HANDOFF, got {row[0]}"
+        assert row[0] == "PLANNED_HANDOFF", (
+            f"State should be PLANNED_HANDOFF, got {row[0]}"
+        )
 
         # Now send duplicate message
         msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
@@ -470,7 +473,9 @@ class TestSubjectFilterSeparation:
         from pathlib import Path
 
         # Read the planning_consumer.py source
-        module_path = Path(sys.modules["forge.adapters.nats.planning_consumer"].__file__)
+        module_path = Path(
+            sys.modules["forge.adapters.nats.planning_consumer"].__file__
+        )
         source = module_path.read_text()
         tree = ast.parse(source)
 
@@ -581,4 +586,6 @@ def test_correlation_id_pattern_regex() -> None:
         "a" * 129,  # Too long
     ]
     for test_id in invalid:
-        assert not _is_valid_correlation_id(test_id), f"Should reject invalid: {test_id}"
+        assert not _is_valid_correlation_id(test_id), (
+            f"Should reject invalid: {test_id}"
+        )

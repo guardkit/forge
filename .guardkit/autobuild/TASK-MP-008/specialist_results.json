@@ -1,14 +1,14 @@
 {
   "phase_4": {
     "status": "failed",
-    "duration_seconds": 0.9751826729625463,
-    "error": "tests failed (deterministic Phase 4): Error detail:\n    assert last_event[1] == 65.0\nE   assert 0.65 == 65.0\n_____ TestListPausedBuilds.test_list_paused_builds_reconstructs_snapshots ______\ntests/fo",
+    "duration_seconds": 0.9095356690231711,
+    "error": "tests failed (deterministic Phase 4): Error detail:\n    decision = GateDecision(\nE   pydantic_core._pydantic_core.ValidationError: 2 validation errors for GateDecision\nE   target_kind\nE     Input sh",
     "tests_run": 47,
-    "tests_failed": 3,
+    "tests_failed": 5,
     "tests_skipped": 0,
     "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python",
     "coverage_pct": 0.0,
-    "output_summary": "Error detail:\n    assert last_event[1] == 65.0\nE   assert 0.65 == 65.0\n_____ TestListPausedBuilds.test_list_paused_builds_reconstructs_snapshots ______\ntests/forge/planning/test_gate_adapters.py:314: ",
+    "output_summary": "Error detail:\n    decision = GateDecision(\nE   pydantic_core._pydantic_core.ValidationError: 2 validation errors for GateDecision\nE   target_kind\nE     Input should be 'local_tool', 'fleet_capability'",
     "quality_gates_passed": false
   },
   "phase_5": {
