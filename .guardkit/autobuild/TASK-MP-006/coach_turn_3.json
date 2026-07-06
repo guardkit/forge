@@ -1,0 +1,73 @@
+{
+  "task_id": "TASK-MP-006",
+  "turn": 3,
+  "decision": "approve",
+  "validation_results": {
+    "requirements_met": [
+      "Registry-based terminal lookup with 'planned-handoff' default",
+      "File creation on planning/{cid} branch via GitRunner",
+      "Sanitized notification payload (RT-09 injection guard)",
+      "Target repo resolution with default fallback",
+      "GitRunner failure handling with structured errors",
+      "Idempotent re-execution (RT-08)",
+      "Zero GitRunner invocations for cancelled/rejected runs",
+      "All files pass lint/format checks"
+    ],
+    "tests_run": true,
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/adapters/test_planning_consumer.py tests/forge/planning/test_gate_adapters.py tests/forge/planning/test_handoff.py -v --tb=short",
+    "test_output_summary": "47 tests passed in 0.44s covering registry indirection, handoff handling, notification sanitization, target repo resolution, GitRunner failure handling, idempotency, and cancelled-run guards",
+    "code_quality": "All modified files pass project-configured ruff lint and format checks with zero errors",
+    "edge_cases_covered": [
+      "Fake handler injection purely via registry (zero code edits)",
+      "Hostile request_text injection guard (RT-09)",
+      "Unresolvable target repo handling",
+      "GitRunner failures with structured errors",
+      "Idempotent re-execution with matching content",
+      "Cancelled and rejected runs skip GitRunner"
+    ]
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "result": "verified",
+      "notes": "Tests test_registry_lookup_by_string_key, test_registry_default_key_is_planned_handoff, and test_fake_handler_injection_via_registry passed. Independent verification confirms registry indirection with zero planner/checkpoint module edits required."
+    },
+    {
+      "criterion_id": "AC-002",
+      "result": "verified",
+      "notes": "Test test_approved_run_creates_file_on_branch passed, verifying feature_spec_inputs/{cid}.md creation on branch planning/{cid} via injected GitRunner, PLANNED_HANDOFF state transition, and handoff_branch/handoff_path recording with tmp_path isolation."
+    },
+    {
+      "criterion_id": "AC-003",
+      "result": "verified",
+      "notes": "Tests test_notification_contains_committed_path_and_feature_spec_command and test_notification_never_interpolates_raw_request_text passed. Injection guard verified with hostile input \"'; rm -rf /; echo 'pwned\" - raw request_text never interpolated into command or message fields."
+    },
+    {
+      "criterion_id": "AC-004",
+      "result": "verified",
+      "notes": "Tests test_target_repo_none_uses_default and test_unresolvable_repo_fails_with_structured_reason passed. Confirms target_repo=None falls back to default_target_repo, unresolvable repos transition to FAILED with structured reason and zero GitRunner invocations."
+    },
+    {
+      "criterion_id": "AC-005",
+      "result": "verified",
+      "notes": "Tests test_gitrunner_failure_transitions_to_failed and test_gitrunner_failure_notification_published passed. GitRunner failures trigger FAILED state with failure_reason, notification_type='failure', and no handoff_branch/handoff_path recording."
+    },
+    {
+      "criterion_id": "AC-006",
+      "result": "verified",
+      "notes": "Test test_idempotent_reexecution_no_duplicate_commit passed. RecordingGitRunner test double confirms re-execution with matching content produces no duplicate commit (call_count remains at 1). Order confirmed: commit -> record -> notify."
+    },
+    {
+      "criterion_id": "AC-007",
+      "result": "verified",
+      "notes": "Tests test_cancelled_run_zero_git_invocations and test_rejected_run_zero_git_invocations passed. Early exit for terminal states (CANCELLED, FAILED) before GitRunner invocation confirmed with call_count == 0 assertions."
+    },
+    {
+      "criterion_id": "AC-008",
+      "result": "verified",
+      "notes": "All quality gates passed. Evidence bundle confirms all modified files pass project-configured lint/format checks with zero errors."
+    }
+  ],
+  "rationale": "All 8 acceptance criteria verified through independent test execution (47 tests passed). Implementation satisfies requirements with proper RT-09 injection guard, RT-08 idempotency, GitRunner protocol injection for testability, and zero lint/format errors. Honesty discrepancies are reporting issues (files_modified list includes orchestrator-managed paths) with honesty_score=1.0, not fabrications - actual work independently verified. Advisory issues noted for process improvement but don't block approval."
+}
