@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-MP-007-frontier-second-opinion.md",
     "timestamp": "2026-07-06T12:40:59.216022+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-MP-007",
+    "pre_path": "tasks/backlog/mode-p-planning-chain/TASK-MP-007-frontier-second-opinion.md",
+    "post_path": "tasks/design_approved/TASK-MP-007-frontier-second-opinion.md",
+    "timestamp": "2026-07-06T12:45:48.546923+00:00",
+    "kind": "design_approved_transition"
   }
 ]

@@ -1,0 +1,210 @@
+{
+  "honesty": {
+    "verified": false,
+    "discrepancies": [
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/escalation.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/frontier.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/planning/test_escalation.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/planning/test_frontier.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      }
+    ],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 4
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "bdd_authoring_sweep": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": true,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "stub_scan": null,
+  "coverage": null,
+  "behavioural_oracle": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/planning/test_escalation.py tests/forge/planning/test_frontier.py -v --tb=short",
+    "test_output_summary": "Result:\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_allowlisted_keys_preserved PASSED [ 83%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_forbidden_keys_filtered PASSED [ 88%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_missing_keys_handled_gracefully PASSED [ 94%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_empty_po_output PASSED [100%]\n============================== 18 passed in 1.18s ==============================",
+    "duration_seconds": 1.652773141860962,
+    "raw_output": "============================= test session starts ==============================\nplatform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0 -- /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python\ncachedir: .pytest_cache\nrootdir: /tmp/guardkit-coach-iso-vmxdj7da\nconfigfile: pyproject.toml\nplugins: anyio-4.14.1, langsmith-0.9.7, bdd-8.1.0, asyncio-1.4.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 18 items\n\ntests/forge/planning/test_escalation.py::test_wait_just_inside_escalation_threshold_does_not_escalate PASSED [  5%]\ntests/forge/planning/test_escalation.py::test_wait_reaching_threshold_escalates_to_escalation_approver PASSED [ 11%]\ntests/forge/planning/test_escalation.py::test_escalated_ceiling_expiry_transitions_to_timed_out PASSED [ 16%]\ntests/forge/planning/test_escalation.py::test_defer_at_cap_escalates_instead_of_new_round PASSED [ 22%]\ntests/forge/planning/test_escalation.py::test_approve_escalate_race_has_exactly_one_cas_winner PASSED [ 27%]\ntests/forge/planning/test_escalation.py::test_thresholds_computed_from_durable_timestamps_no_reset_on_restart PASSED [ 33%]\ntests/forge/planning/test_escalation.py::test_no_real_sleeps_in_test_suite PASSED [ 38%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_frontier_disabled_zero_calls PASSED [ 44%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_non_flagged_outcome_zero_calls PASSED [ 50%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_brief_contains_only_allowlisted_keys PASSED [ 55%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_client_error_degrades_to_human PASSED [ 61%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_client_timeout_degrades_to_human PASSED [ 66%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_provider_returns_opinion_data_only PASSED [ 72%]\ntests/forge/planning/test_frontier.py::TestFrontierSecondOpinion::test_successful_opinion_attached PASSED [ 77%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_allowlisted_keys_preserved PASSED [ 83%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_forbidden_keys_filtered PASSED [ 88%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_missing_keys_handled_gracefully PASSED [ 94%]\ntests/forge/planning/test_frontier.py::TestBuildCompressedBrief::test_empty_po_output PASSED [100%]\n\n============================== 18 passed in 1.18s ==============================\n",
+    "signal_absent": false,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python"
+  },
+  "independent_test_classification": null,
+  "requirements": {
+    "criteria_total": 6,
+    "criteria_met": 6,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`frontier_enabled=False` (the default) -> the recording FrontierClient fake shows zero calls AND flagged product docs still pause for human review",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FrontierSecondOpinion.get_summary_for_approval checks frontier_enabled first and returns compressed brief without calling client when False. Test test_frontier_disabled_zero_calls verifies RecordingFrontierClient.calls list is empty (len==0) and valid brief is returned for human review."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Enabled + non-flagged outcome -> zero calls (FLAG-only predicate)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "FrontierSecondOpinion checks gate_decision == GateMode.FLAG_FOR_REVIEW before calling client. Test test_non_flagged_outcome_zero_calls uses GateMode.AUTO_APPROVE and verifies zero client calls."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "The brief passed to the client contains only allowlisted keys (docs summary, assumptions, coach evidence, structured findings) and no `transcript`/`messages`/`request_text`/raw-conversation field \u2014 schema assertion on the recorded call (policy-filter predicate)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "build_compressed_brief uses _ALLOWLISTED_KEYS frozenset with dict comprehension filtering. Test test_brief_contains_only_allowlisted_keys provides PO output with forbidden keys and asserts they are absent from client.calls[0] while allowed keys are present."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Client raising / timing out -> checkpoint still pauses and the approval request carries a \"second opinion unavailable\" note (degrade-to-human, DF-006)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "asyncio.wait_for wraps client call with timeout. try/except catches TimeoutError and generic Exception, returning brief with second_opinion_unavailable=True and second_opinion_error fields. Tests test_client_error_degrades_to_human and test_client_timeout_degrades_to_human verify both paths."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "The provider's return type carries opinion data only \u2014 no approve/decision field exists on it (type-level never-approve predicate); the opinion is attached to the approval request for the human",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "get_summary_for_approval returns dict[str, Any] containing only brief keys and optional second_opinion/second_opinion_unavailable/second_opinion_error. No approved/decision/auto_approve fields added anywhere. Test test_provider_returns_opinion_data_only explicitly asserts these fields do not exist."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "python -m ruff check passed with 'All checks passed!' for both src/forge/planning/frontier.py and tests/forge/planning/test_frontier.py. No unused imports, no style violations."
+      }
+    ]
+  },
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/planning/escalation.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/escalation.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/planning/frontier.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/planning/frontier.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file tests/forge/planning/test_escalation.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/planning/test_escalation.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file tests/forge/planning/test_frontier.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/forge/planning/test_frontier.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
