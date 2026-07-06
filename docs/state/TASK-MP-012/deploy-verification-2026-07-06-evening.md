@@ -92,3 +92,52 @@ Rich tapped Approve (~21:30:46 UTC) on the FEAT-8BA35C prompt. Result chain:
    gone. With the 1800s window (addendum 2) and the fact that responses store
    despite the timeout, the NEXT tap should complete the round-trip; jarvis
    will cosmetically mis-report it as failed until JNB-111 lands.
+
+## Addendum 4 (2026-07-06 22:35 UTC) — unfreeze verified; loop proven to the last hop
+
+The frozen ack window expired exactly on schedule (22:28:32 UTC):
+1. Stale seq-127 redelivery **deduped cleanly** — "duplicate already-terminal
+   build ... ack + skip". No double-dispatch (positive evidence for the
+   duplicate-terminal guard on this path).
+2. `smoke-bbf0ffcf` dispatched immediately → `build-FEAT-96A391-20260706214251`
+   PAUSED at the gate under the new `default_wait=1800s`.
+3. jarvis delivered the prompt WITH buttons at 22:28:32
+   (`slack_pause_message_upgraded_with_buttons`), zero delivery failures.
+4. Operator asleep by design — the prompt times out ~22:58:32 UTC
+   (harmless CANCELLED + phone terminal signal).
+
+**Every hop of the loop is now individually live-proven** — dispatch → gate
+pause → prompt+buttons → tap → authorized truthful response STORED on the
+broker (AGENTS#894) → [gate resolution: the only unexercised hop, blocked
+tonight solely by expired gates] → cancellation terminal signal delivery.
+
+Morning sequence: (1) review + land jarvis TASK-JNB-111 (task-work ran
+overnight; fixes the cosmetic publish mis-report) → restart jarvis →
+(2) dispatch a fresh smoke and run the formal JNB-107 scenarios (approve /
+reject / unauthorized) inside the 30-min window → (3) MP-010 pre-flights:
+JARVIS_NATS_PASSWORD rotation, `planning.enabled=true` + escalation config
+(NB: `escalation_approver` must be a Slack member ID — JNB-110 review note).
+
+Re-dispatch snippet (from the forge venv; publishes an enveloped
+BuildQueuedPayload; requires requested_at/queued_at):
+```
+set -a; source ~/.config/guardkit/jarvis.env; set +a
+.venv/bin/python - <<'PY'
+import asyncio, os, uuid; from datetime import datetime, timezone
+import nats
+from nats_core.envelope import MessageEnvelope, EventType
+from nats_core.events import BuildQueuedPayload
+corr=f"smoke-{uuid.uuid4()}"; now=datetime.now(timezone.utc)
+p=BuildQueuedPayload(feature_id="FEAT-96A391", repo="guardkit/forge", branch="main",
+  feature_yaml_path="features/FEAT-96A391/fix-task.yaml", triggered_by="cli",
+  originating_adapter="cli-wrapper", correlation_id=corr, requested_at=now, queued_at=now)
+env=MessageEnvelope(source_id="ops-live-check", event_type=EventType.BUILD_QUEUED,
+  correlation_id=corr, payload=p.model_dump(mode="json"))
+async def m():
+    nc=await nats.connect(os.environ["JARVIS_NATS_URL"], user=os.environ["JARVIS_NATS_USER"],
+                          password=os.environ["JARVIS_NATS_PASSWORD"])
+    ack=await nc.jetstream().publish(f"pipeline.build-queued.{p.feature_id}", env.model_dump_json().encode())
+    print("published", corr, ack.stream, ack.seq); await nc.close()
+asyncio.run(m())
+PY
+```
