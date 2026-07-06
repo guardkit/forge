@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "passed",
+    "duration_seconds": 0.6474451649701223,
+    "error": null,
+    "tests_run": 8,
+    "tests_failed": 0,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Result:\ntests/forge/planning/test_checkpoint.py::test_wrong_responder_identity_stays_paused PASSED [ 62%]\ntests/forge/planning/test_checkpoint.py::test_late_response_for_terminal_run_is_refused PASSED",
+    "quality_gates_passed": true
+  },
+  "phase_5": {
+    "status": "passed",
+    "duration_seconds": 146.13432620000094,
+    "error": null,
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

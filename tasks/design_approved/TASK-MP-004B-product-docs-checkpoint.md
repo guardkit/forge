@@ -1,17 +1,22 @@
 ---
-id: TASK-MP-004B
-title: product_docs checkpoint flow (pause-before-wire, per-run approver, never auto-approve)
-task_type: feature
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 5
+dependencies:
+- TASK-MP-004A
+- TASK-MP-003
+estimated_minutes: 55
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 3
+id: TASK-MP-004B
 implementation_mode: task-work
-complexity: 5
-estimated_minutes: 55
-dependencies: [TASK-MP-004A, TASK-MP-003]
-tags: [mode-p, checkpoint, df-009]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- checkpoint
+- df-009
+task_type: feature
+title: product_docs checkpoint flow (pause-before-wire, per-run approver, never auto-approve)
+wave: 3
 ---
 
 # TASK-MP-004B — product_docs checkpoint flow

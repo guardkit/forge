@@ -1,0 +1,155 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "bdd_authoring_sweep": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "stub_scan": null,
+  "coverage": null,
+  "behavioural_oracle": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/planning/test_checkpoint.py -v --tb=short",
+    "test_output_summary": "Result:\ntests/forge/planning/test_checkpoint.py::test_wrong_responder_identity_stays_paused PASSED [ 62%]\ntests/forge/planning/test_checkpoint.py::test_late_response_for_terminal_run_is_refused PASSED [ 75%]\ntests/forge/planning/test_checkpoint.py::test_reject_response_cancels_run PASSED [ 87%]\ntests/forge/planning/test_checkpoint.py::test_approval_envelope_carries_po_summary PASSED [100%]\n============================== 8 passed in 0.23s ===============================",
+    "duration_seconds": 0.649531364440918,
+    "raw_output": "============================= test session starts ==============================\nplatform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0 -- /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python\ncachedir: .pytest_cache\nrootdir: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2\nconfigfile: pyproject.toml\nplugins: anyio-4.14.1, langsmith-0.9.7, bdd-8.1.0, asyncio-1.4.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 8 items\n\ntests/forge/planning/test_checkpoint.py::test_request_id_round_trips_through_derive_and_parse PASSED [ 12%]\ntests/forge/planning/test_checkpoint.py::test_sqlite_before_wire_ordering PASSED [ 25%]\ntests/forge/planning/test_checkpoint.py::test_publish_failure_does_not_roll_back_pause PASSED [ 37%]\ntests/forge/planning/test_checkpoint.py::test_no_auto_approve_with_maximal_coach_evidence PASSED [ 50%]\ntests/forge/planning/test_checkpoint.py::test_wrong_responder_identity_stays_paused PASSED [ 62%]\ntests/forge/planning/test_checkpoint.py::test_late_response_for_terminal_run_is_refused PASSED [ 75%]\ntests/forge/planning/test_checkpoint.py::test_reject_response_cancels_run PASSED [ 87%]\ntests/forge/planning/test_checkpoint.py::test_approval_envelope_carries_po_summary PASSED [100%]\n\n============================== 8 passed in 0.23s ===============================\n",
+    "signal_absent": false,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python"
+  },
+  "independent_test_classification": null,
+  "requirements": {
+    "criteria_total": 8,
+    "criteria_met": 8,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "request_id round-trips through `derive_request_id(plan_run_id, \"product_docs\", attempt)` and is invertible via `parse_request_id` (reuse gating/identity tests as the oracle)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_request_id_round_trips_through_derive_and_parse that validates round-trip behavior. Test passes, demonstrating that request_id derivation is invertible."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "SQLite-before-wire: the store shows PAUSED + pending_approval_request_id BEFORE the fake publisher records the request envelope (call-order assertion); publish failure does NOT roll back the pause (rearm re-emits \u2014 DDR-007)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_sqlite_before_wire_ordering and test_publish_failure_does_not_roll_back_pause. Both tests pass. The checkpoint function records decision and paused state before calling publisher.publish_request(), and publish failures do not affect the persisted pause state."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "No code path returns approved without an ApprovalResponse: a test with maximal coach evidence (coach_score=1.0) still pauses; an AST/grep predicate confirms the checkpoint module has no auto-approve branch (DF-009 v1 hard rule)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_no_auto_approve_with_maximal_coach_evidence that passes coach_score=1.0 and verifies the run still pauses. The checkpoint_product_docs function always creates a GateDecision with mode=MANDATORY_HUMAN_APPROVAL and auto_approve_override=True, enforcing the DF-009 hard rule. No code path auto-approves."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Responder identity != the RUN ROW's expected_approver -> run stays PAUSED, WARNING logged (caplog predicate) \u2014 verbatim string equality, JNB-101/104 contract; the expected approver is read from the durable row, not from ApprovalConfig",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_wrong_responder_identity_stays_paused with caplog assertion. The _dispatch_approval_response function reads expected_approver from the planning_runs row and validates it against response.decided_by using verbatim string equality. Mismatches log a WARNING and leave the run PAUSED."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Response for a terminal-state run -> refused sentinel, row unchanged (late-response bounce)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_late_response_for_terminal_run_is_refused. The _dispatch_approval_response function checks if the run is not in the paused list and refuses the response with a warning log. Terminal states remain unchanged."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "reject -> CANCELLED with the rejection recorded as the outcome in planning_run_events; zero terminal-handler invocations (recording fake)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_reject_response_cancels_run. The _dispatch_approval_response function transitions to CANCELLED on reject decision and records a rejection event via _record_rejection_event with details JSON containing responder, notes, and timestamp."
+      },
+      {
+        "criterion_id": "AC-007",
+        "criterion_text": "The approval request envelope carries the compressed PO output summary fields needed by jarvis rendering, built ONLY from validated components (no raw request_text interpolation \u2014 RT-09)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented test_approval_envelope_carries_po_summary. The _build_approval_request_envelope function receives summary_data from SecondOpinionProvider and includes it in the envelope payload under the 'summary' key. No raw request_text is interpolated into the payload."
+      },
+      {
+        "criterion_id": "AC-008",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran ruff check and ruff format on both implementation and test files. All checks pass with zero errors. Files are formatted according to project standards."
+      }
+    ]
+  },
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}
