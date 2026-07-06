@@ -279,16 +279,19 @@ async def rearm_paused_planning_runs(
         pool = connect_writer(db_path)
         store = SqlitePlanningRunStore(pool)
 
-        # Query all PAUSED runs
-        # TODO: Implement list_paused_runs() on store (from TASK-MP-004A)
-        # For now, return empty list as minimal implementation
-        paused_runs: list[Any] = []
+        # Query all PAUSED runs directly from DB
+        cursor = pool.execute(
+            "SELECT correlation_id, expected_approver FROM planning_runs WHERE state = ?",
+            (PlanningState.PAUSED.value,)
+        )
+        paused_runs = cursor.fetchall()
 
         rearmed: list[str] = []
 
         for run in paused_runs:
             try:
-                correlation_id = run.correlation_id
+                correlation_id = run["correlation_id"]
+                expected_approver = run["expected_approver"]
 
                 # TODO: Re-arm approval round-trip
                 # 1. Build await_and_dispatch chain
@@ -296,16 +299,19 @@ async def rearm_paused_planning_runs(
                 # 3. Re-emit AGENTS request (verbatim request_id)
                 # 4. Re-emit PIPELINE build-paused
                 # 5. On approve: launch resume_launcher
+                #
+                # For now, just log the rearm intent - full integration requires
+                # gate wiring from TASK-MP-004A
 
                 logger.info(
                     f"Rearmed paused planning run: {correlation_id} "
-                    f"(expected_approver: {run.expected_approver})"
+                    f"(expected_approver: {expected_approver})"
                 )
                 rearmed.append(correlation_id)
 
             except Exception as exc:
                 logger.warning(
-                    f"Failed to rearm planning run {correlation_id}: {exc}. "
+                    f"Failed to rearm planning run {run.get('correlation_id', 'unknown')}: {exc}. "
                     "Will retry on next boot."
                 )
                 continue
@@ -367,12 +373,15 @@ async def sweep_interrupted_planning_runs(
         recovered: list[str] = []
 
         # Query QUEUED runs (crash before dispatch)
-        # TODO: Implement query on store
-        queued_runs: list[Any] = []
+        cursor_queued = pool.execute(
+            "SELECT correlation_id FROM planning_runs WHERE state = ?",
+            (PlanningState.QUEUED.value,)
+        )
+        queued_runs = cursor_queued.fetchall()
 
         for run in queued_runs:
             try:
-                correlation_id = run.correlation_id
+                correlation_id = run["correlation_id"]
 
                 if dispatch_callable:
                     # Re-drive dispatch
@@ -386,37 +395,47 @@ async def sweep_interrupted_planning_runs(
                         f"Failing QUEUED planning run (no dispatcher): {correlation_id}"
                     )
                     store.transition(
-                        correlation_id, PlanningState.QUEUED, PlanningState.FAILED
+                        correlation_id=correlation_id,
+                        to_state=PlanningState.FAILED,
+                        actor_identity="boot-sweep",
+                        error="No dispatcher available at boot",
                     )
 
                 recovered.append(correlation_id)
 
             except Exception as exc:
                 logger.warning(
-                    f"Failed to recover QUEUED run {correlation_id}: {exc}"
+                    f"Failed to recover QUEUED run {run.get('correlation_id', 'unknown')}: {exc}"
                 )
                 continue
 
         # Query RUNNING runs (crash mid-dispatch)
-        running_runs: list[Any] = []
+        cursor_running = pool.execute(
+            "SELECT correlation_id FROM planning_runs WHERE state = ?",
+            (PlanningState.RUNNING.value,)
+        )
+        running_runs = cursor_running.fetchall()
 
         for run in running_runs:
             try:
-                correlation_id = run.correlation_id
+                correlation_id = run["correlation_id"]
 
                 # Fail RUNNING runs with structured reason
                 logger.warning(
                     f"Failing RUNNING planning run (daemon restart): {correlation_id}"
                 )
                 store.transition(
-                    correlation_id, PlanningState.RUNNING, PlanningState.FAILED
+                    correlation_id=correlation_id,
+                    to_state=PlanningState.FAILED,
+                    actor_identity="boot-sweep",
+                    error="Daemon restart while running",
                 )
 
                 recovered.append(correlation_id)
 
             except Exception as exc:
                 logger.warning(
-                    f"Failed to recover RUNNING run {correlation_id}: {exc}"
+                    f"Failed to recover RUNNING run {run.get('correlation_id', 'unknown')}: {exc}"
                 )
                 continue
 
