@@ -1,0 +1,156 @@
+{
+  "task_id": "TASK-MP-011",
+  "timestamp": "2026-07-06T14:32:06.365833",
+  "completed": false,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "implementation in TDD mode. Let me begin with the RED phase - writing failing tests first.",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 0,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/src/forge/cli/serve.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/tests/cli/test_serve_planning_wiring.py",
+    "`src/forge/cli/serve.py",
+    "src/forge/cli/serve.py"
+  ],
+  "files_created": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/.guardkit/autobuild/TASK-MP-011/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/tests/cli/test_serve_planning_wiring.py",
+    "`tests/cli/test_serve_planning_wiring.py"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/.guardkit/autobuild/TASK-MP-011/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/src/forge/cli/serve.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/tests/cli/test_serve_planning_wiring.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/tests/cli/test_serve_planning_wiring.py",
+    "`tests/cli/test_serve_planning_wiring.py"
+  ],
+  "summary": "Implementation completed",
+  "sdk_turns": {
+    "turns_used": 35,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "integration",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Call-site pin: a test monkeypatches `forge.cli._serve_planning.compose_planning_consumer_and_dispatch` (and the two recovery functions) with recording fakes, drives the PRODUCTION composition path in `serve.py` (`bind_production_dispatch_chain`/`_compose`) with a `planning.enabled=True` config and fakes for the NATS client/SQLite pool, and asserts the composition fake was invoked exactly once with the loaded PlanningConfig \u2014 proving the production path, not the module, is wired",
+      "status": "complete",
+      "evidence": "Implemented test_planning_enabled_invokes_composition_with_config which monkeypatches all three planning functions (compose, sweep, rearm) and drives bind_production_dispatch_chain with planning.enabled=True. Test verifies composition fake is called exactly once and receives PlanningConfig via kwargs. Test passes.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Recovery order: the recording fakes show sweep and rearm are invoked after composition, and rearm is invoked at most once (single re-emit owner preserved)",
+      "status": "complete",
+      "evidence": "Implemented test_recovery_functions_invoked_after_composition which tracks invocation order across all three functions using ordered wrapper fakes. Test verifies order is [compose, sweep, rearm] and that rearm is called exactly once. Test passes.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`planning.enabled=False` (default config) \u2192 zero invocations of any planning function, and the full existing `tests/cli/` suite remains green",
+      "status": "complete",
+      "evidence": "Implemented test_planning_disabled_means_zero_invocations which verifies zero calls to any planning function when planning.enabled=False. Also verified all 97 existing serve tests pass unmodified. Implementation guards planning wiring with if forge_config.planning.enabled check.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Soft-fail: the composition fake raising -> the build dispatch chain still binds successfully and the error is logged (caplog predicate); daemon boot is never bricked by planning wiring (DDR-007)",
+      "status": "complete",
+      "evidence": "Implemented test_composition_error_does_not_break_dispatch_chain_binding which injects a raising fake and verifies build_pipeline_consumer_deps is still called and error is logged. Implementation wraps planning wiring in try/except with logger.error call, mirroring gate-parts soft-fail pattern. Test passes.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "`src/forge/cli/serve.py` diff is additive-only: the Supervisor construction and all existing composition steps are untouched (existing serve tests pass unmodified)",
+      "status": "complete",
+      "evidence": "Changes to serve.py are strictly additive: added 3 imports and inserted planning wiring block (26 lines) after gate rearm, before deps build. No existing code modified. All 97 existing tests in tests/cli/test_serve*.py pass unmodified. Test test_existing_serve_module_structure_preserved verifies key exports unchanged.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran ruff check and black --check on both src/forge/cli/serve.py and tests/cli/test_serve_planning_wiring.py. All checks pass with zero errors after fixing unused imports and running black formatter.",
+      "test_file": "tests/cli/test_serve_planning_wiring.py",
+      "implementation_files": [
+        "src/forge/cli/serve.py",
+        "tests/cli/test_serve_planning_wiring.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 1.42096404498443
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 186.25587062095292
+    }
+  ]
+}

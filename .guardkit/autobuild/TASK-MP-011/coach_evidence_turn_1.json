@@ -1,0 +1,77 @@
+{
+  "honesty": {
+    "verified": false,
+    "discrepancies": [
+      {
+        "claim_type": "claim_audit",
+        "player_claim": "Player claimed file `src/forge/cli/serve.py",
+        "actual_value": "Path absent from 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed work on a file that does not exist on disk.",
+        "severity": "critical",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit",
+        "player_claim": "Player claimed file `tests/cli/test_serve_planning_wiring.py",
+        "actual_value": "Path absent from 'git status --porcelain' so 'git add -A' would not stage it. Probes: path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed work on a file that does not exist on disk.",
+        "severity": "critical",
+        "ignore_rule": null
+      }
+    ],
+    "honesty_score": 0.875,
+    "resolved_paths": [
+      {
+        "claimed": "`tests/cli/test_serve_planning_wiring.py",
+        "resolved_to": "tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md",
+        "task_id": "TASK-MP-011"
+      },
+      {
+        "claimed": "`src/forge/cli/serve.py",
+        "resolved_to": "tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md",
+        "task_id": "TASK-MP-011"
+      },
+      {
+        "claimed": "`tests/cli/test_serve_planning_wiring.py",
+        "resolved_to": "tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md",
+        "task_id": "TASK-MP-011"
+      }
+    ],
+    "should_fix_count": 0
+  },
+  "gathering_status": "partial_honesty_abort",
+  "gathering_error": null,
+  "quality_gates": null,
+  "coverage_details": null,
+  "plan_audit": null,
+  "bdd": null,
+  "bdd_authoring_sweep": null,
+  "arch_review": null,
+  "tests": null,
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "stub_scan": null,
+  "coverage": null,
+  "behavioural_oracle": null,
+  "independent_tests": null,
+  "independent_test_classification": null,
+  "requirements": null,
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "integration",
+  "profile_name": "integration"
+}
