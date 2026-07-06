@@ -15,7 +15,16 @@ composing the existing :mod:`forge.adapters.git.operations` primitives
    never touched (ASSUM-006). ``git worktree add -b`` creates the new
    branch from the repo's current HEAD; ``--force`` re-attaches to an
    existing branch left checked out by a crashed prior attempt.
-3. **Never raises** (ADR-ARCH-025): every failure becomes
+3. **Checkout-collision guard (TASK-MP-013)**: before the ``--force``
+   re-attach, ``git worktree list --porcelain`` is consulted; if the
+   handoff branch is checked out in ANY live worktree of the target repo
+   (including the main working copy), the re-attach is REFUSED with a
+   failed result carrying the ``handoff-branch-checked-out`` marker —
+   otherwise the handoff commit would silently advance the branch under
+   an operator's live checkout. Worktrees whose directory no longer
+   exists (or that git marks ``prunable``) are the orphaned crash
+   leftovers ``--force`` exists for and do NOT block.
+4. **Never raises** (ADR-ARCH-025): every failure becomes
    ``GitOpResult(status="failed", ...)``.
 
 No push in v1 (ASSUM-006): the branch stays local to the target working
@@ -108,6 +117,31 @@ class WorktreeGitRunner:
                         operation=_OPERATION,
                         sha=sha,
                         exit_code=0,
+                    )
+
+                # TASK-MP-013: refuse the --force re-attach when the branch
+                # is checked out in any live worktree (main working copy
+                # included) — the handoff commit would silently advance the
+                # branch under the operator's checkout. Runs AFTER the
+                # RT-08 idempotency probe: identical content means zero
+                # mutations, so an idempotent re-handoff is never blocked.
+                blocker = await self._blocking_checkout(repo, branch)
+                if blocker is not None:
+                    logger.error(
+                        "handoff-branch-checked-out: refusing --force "
+                        "re-attach of branch %s; blocking worktree: %s",
+                        branch,
+                        blocker,
+                    )
+                    return GitOpResult(
+                        status="failed",
+                        operation=_OPERATION,
+                        stderr=(
+                            f"handoff-branch-checked-out: branch {branch} is "
+                            f"checked out at {blocker}; release or prune that "
+                            "checkout, then retry the handoff"
+                        ),
+                        exit_code=-1,
                     )
 
             self._worktrees_root.mkdir(parents=True, exist_ok=True)
@@ -231,6 +265,47 @@ class WorktreeGitRunner:
             cwd=str(repo),
         )
         return res.exit_code == 0
+
+    async def _blocking_checkout(self, repo: Path, branch: str) -> str | None:
+        """Path of a live worktree holding ``branch`` checked out, or None.
+
+        Parses ``git worktree list --porcelain`` (blank-line-separated
+        entries: ``worktree <path>``, optional ``branch refs/heads/<name>``,
+        optional ``prunable ...``). Entries whose directory is gone or that
+        git marks prunable are orphaned crash leftovers and do not block
+        (TASK-MP-013 AC4). Fails safe: if the porcelain command itself
+        fails, returns a descriptive marker so the caller refuses the
+        ``--force`` re-attach rather than mutating an unverifiable branch.
+        """
+        res = await self._execute(
+            command=["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo),
+        )
+        if res.exit_code != 0:
+            return (
+                "<unverifiable: 'git worktree list --porcelain' exited "
+                f"{res.exit_code}: {_failure_stderr(res.stderr, res.stdout)}>"
+            )
+
+        branch_ref = f"refs/heads/{branch}"
+        path: str | None = None
+        holds_branch = False
+        prunable = False
+        # Trailing sentinel flushes the final entry (porcelain output may
+        # or may not end with a blank line).
+        for line in [*(res.stdout or "").splitlines(), ""]:
+            if not line.strip():
+                if path and holds_branch and not prunable and Path(path).is_dir():
+                    return path
+                path, holds_branch, prunable = None, False, False
+                continue
+            if line.startswith("worktree "):
+                path = line[len("worktree ") :]
+            elif line.strip() == f"branch {branch_ref}":
+                holds_branch = True
+            elif line.startswith("prunable"):
+                prunable = True
+        return None
 
     async def _show_file(self, repo: Path, branch: str, file_path: str) -> str | None:
         res = await self._execute(
