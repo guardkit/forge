@@ -69,6 +69,7 @@ __all__ = [
     "PLANNING_DURABLE_NAME",
     "PLANNING_QUEUED_SUBJECT_FILTER",
     "compose_planning_consumer_and_dispatch",
+    "make_drive_spawner",
     "rearm_paused_planning_runs",
     "sweep_interrupted_planning_runs",
 ]
@@ -107,6 +108,59 @@ _PLANNING_PAUSE_FEATURE_ID: str = "FEAT-PLANNING"
 
 DispatchCallable = Callable[..., Awaitable[Any]]
 """``async (correlation_id, ...) -> None`` — fire-and-forget chain re-drive."""
+
+
+# ---------------------------------------------------------------------------
+# Per-run drive spawner (per-cid mutual exclusion)
+# ---------------------------------------------------------------------------
+
+
+def make_drive_spawner(
+    driver: Any,
+    supervise: Callable[[Any, str], None],
+) -> Callable[..., None]:
+    """Build the per-correlation_id deduplicating drive spawner.
+
+    Per-run mutual exclusion: sweep + rearm + intake (including
+    non-terminal duplicate redelivery, TASK-MP-014) can each ask to
+    drive the same correlation_id — a second concurrent driver would
+    arm duplicate approval waiters and race the handoff (TASK-MP-012
+    review finding). While a drive task for a correlation_id is live,
+    further spawn requests for it are no-ops.
+
+    Module-level (not a composition closure) so tests can exercise the
+    real dedup against a real driver.
+
+    Args:
+        driver: The composed :class:`PlanningRunDriver`.
+        supervise: ``(task, label) -> None`` background-task registrar.
+
+    Returns:
+        ``spawn(correlation_id, *, republish=False) -> None``
+    """
+    live_drives: dict[str, asyncio.Task[Any]] = {}
+
+    def _spawn_drive(correlation_id: str, *, republish: bool = False) -> None:
+        existing = live_drives.get(correlation_id)
+        if existing is not None and not existing.done():
+            logger.info(
+                "planning composition: drive already live for %s; "
+                "skipping duplicate spawn",
+                correlation_id,
+            )
+            return
+        task = asyncio.create_task(
+            driver.drive(correlation_id, republish_pending=republish)
+        )
+        live_drives[correlation_id] = task
+        task.add_done_callback(
+            lambda t, cid=correlation_id: (
+                live_drives.pop(cid, None) if live_drives.get(cid) is t else None
+            )
+        )
+        supervise(task, f"drive:{correlation_id}")
+
+    return _spawn_drive
 
 
 # ---------------------------------------------------------------------------
@@ -648,32 +702,10 @@ async def compose_planning_consumer_and_dispatch(
             )
         )
 
-        # Per-run mutual exclusion: sweep + rearm + intake can each ask to
-        # drive the same correlation_id (e.g. sweep re-drives a RUNNING run
-        # that pauses before rearm scans PAUSED rows) — a second concurrent
-        # driver would arm duplicate approval waiters and race the handoff
-        # (TASK-MP-012 review finding).
-        live_drives: dict[str, asyncio.Task[Any]] = {}
-
-        def _spawn_drive(correlation_id: str, *, republish: bool = False) -> None:
-            existing = live_drives.get(correlation_id)
-            if existing is not None and not existing.done():
-                logger.info(
-                    "planning composition: drive already live for %s; "
-                    "skipping duplicate spawn",
-                    correlation_id,
-                )
-                return
-            task = asyncio.create_task(
-                driver.drive(correlation_id, republish_pending=republish)
-            )
-            live_drives[correlation_id] = task
-            task.add_done_callback(
-                lambda t, cid=correlation_id: (
-                    live_drives.pop(cid, None) if live_drives.get(cid) is t else None
-                )
-            )
-            _supervise(task, f"drive:{correlation_id}")
+        # Per-run mutual exclusion — see make_drive_spawner (TASK-MP-012
+        # review finding; extracted module-level in TASK-MP-014 so tests
+        # exercise the real dedup).
+        _spawn_drive = make_drive_spawner(driver, _supervise)
 
         async def dispatch_stage_callable(correlation_id: str, **kwargs: Any) -> None:
             """Fire-and-forget chain (re-)drive for one planning run."""

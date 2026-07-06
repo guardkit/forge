@@ -20,6 +20,7 @@ import pytest
 from nats_core.envelope import EventType, MessageEnvelope
 
 from forge.adapters.nats.planning_consumer import (
+    NAK_REDELIVERY_DELAY_SECONDS,
     PLANNING_QUEUED_SUBJECT_FILTER,
     PlanningConsumerDeps,
     handle_planning_message,
@@ -613,7 +614,31 @@ class TestStoreFailureRedelivery:
             await handle_planning_message(msg, deps)
 
         msg.ack.assert_not_awaited()
-        msg.nak.assert_awaited_once()
+        # Delay bounds the redelivery hot-loop under persistent store
+        # failure (2026-07-06 pre-commit review, carried LOW).
+        msg.nak.assert_awaited_once_with(delay=NAK_REDELIVERY_DELAY_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_store_failure_nak_without_delay_support_still_naks(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """A nak() without the delay parameter still gets called bare."""
+        naks: list[str] = []
+
+        async def legacy_nak() -> None:  # no delay parameter
+            naks.append("nak")
+
+        msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        msg.nak = legacy_nak
+        deps = _make_deps(store)
+
+        with patch.object(
+            store, "record_queued", side_effect=RuntimeError("SQLITE_BUSY")
+        ):
+            await handle_planning_message(msg, deps)
+
+        msg.ack.assert_not_awaited()
+        assert naks == ["nak"]
 
     @pytest.mark.asyncio
     async def test_store_failure_without_nak_leaves_unacked(
@@ -656,9 +681,11 @@ class TestOnRecordedCallback:
         assert recorded == [CORRELATION_ID]
 
     @pytest.mark.asyncio
-    async def test_on_recorded_not_fired_for_duplicates(
+    async def test_on_recorded_refired_for_non_terminal_duplicate(
         self, store: SqlitePlanningRunStore
     ) -> None:
+        """TASK-MP-014: a redelivered non-terminal duplicate re-kicks the
+        driver — redelivery means the original kick may have been lost."""
         recorded: list[str] = []
 
         async def on_recorded(correlation_id: str) -> None:
@@ -674,7 +701,107 @@ class TestOnRecordedCallback:
             _make_msg(_envelope_bytes(_valid_planning_payload())), deps
         )
 
-        assert recorded == [CORRELATION_ID], "duplicate must not re-kick the driver"
+        assert recorded == [CORRELATION_ID, CORRELATION_ID], (
+            "non-terminal duplicate must re-kick the driver (TASK-MP-014)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_kick_queued_run_resumes_on_redelivery(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """TASK-MP-014: a QUEUED run whose original kick died resumes on
+        redelivery — no daemon restart (boot sweep) required."""
+        kicks: list[str] = []
+        kick_dies = True
+
+        async def on_recorded(correlation_id: str) -> None:
+            if kick_dies:
+                raise RuntimeError("daemon died mid-kick")
+            kicks.append(correlation_id)
+
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+
+        # Original delivery: run persisted + acked, but the kick is lost.
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+        assert kicks == []
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None and run["state"] == "QUEUED"
+
+        # JetStream redelivery (e.g. the ack was also lost): the duplicate
+        # path must re-kick, resuming the run without a restart.
+        kick_dies = False
+        msg2 = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        await handle_planning_message(msg2, deps)
+
+        msg2.ack.assert_awaited_once()
+        assert kicks == [CORRELATION_ID], (
+            "lost-kick QUEUED run must resume on redelivery"
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_recorded_not_fired_for_terminal_duplicate(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """RT-10 unchanged: terminal duplicate → ack + notification, NO kick."""
+        from forge.planning.states import PlanningState
+
+        recorded: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            recorded.append(correlation_id)
+
+        notification = AsyncMock()
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=notification, on_recorded=on_recorded
+        )
+
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+        store.transition(
+            correlation_id=CORRELATION_ID,
+            to_state=PlanningState.RUNNING,
+            actor_identity="system",
+        )
+        store.transition(
+            correlation_id=CORRELATION_ID,
+            to_state=PlanningState.PLANNED_HANDOFF,
+            actor_identity="system",
+        )
+
+        msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        await handle_planning_message(msg, deps)
+
+        msg.ack.assert_awaited_once()
+        notification.assert_awaited_once()
+        assert recorded == [CORRELATION_ID], (
+            "terminal duplicate must NOT re-kick the driver"
+        )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_kick_exception_never_wedges_intake(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """A driver defect on the duplicate re-kick must not raise out."""
+
+        async def on_recorded(correlation_id: str) -> None:
+            raise RuntimeError("driver defect")
+
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+
+        msg2 = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        await handle_planning_message(msg2, deps)  # must not raise
+
+        msg2.ack.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_on_recorded_exception_never_wedges_intake(

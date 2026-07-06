@@ -11,6 +11,9 @@ Key differences from pipeline_consumer:
 - No path allowlist (no feature_yaml_path)
 - No dispatch to state machine (just store)
 - Terminal duplicate → notification (RT-10)
+- Non-terminal duplicate → ack + re-kick driver (TASK-MP-014): redelivery
+  is the signal the original kick may have died; the composition's per-cid
+  dedup makes the re-kick a no-op when a drive is already live
 
 References:
 - TASK-MP-008 — this task brief
@@ -60,6 +63,13 @@ PLANNING_DURABLE_NAME: str = "forge-serve-planning"
 #: - 1-128 characters
 CORRELATION_ID_PATTERN: str = r"^[A-Za-z0-9_-]{1,128}$"
 
+#: Redelivery delay requested on nak after a store-write failure.
+#: Without it a persistent store failure (disk full, corrupt db) makes
+#: JetStream redeliver immediately in a hot loop (2026-07-06 pre-commit
+#: review, carried LOW). 5s bounds the loop while keeping transient
+#: SQLITE_BUSY recovery prompt.
+NAK_REDELIVERY_DELAY_SECONDS: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -97,7 +107,14 @@ async def _nak_or_leave_unacked(msg: _MsgLike, correlation_id: str) -> None:
     nak = getattr(msg, "nak", None)
     if callable(nak):
         try:
-            await nak()
+            try:
+                # nats-py supports a redelivery delay; without one a
+                # persistent store failure hot-loops (carried LOW,
+                # 2026-07-06 pre-commit review).
+                await nak(delay=NAK_REDELIVERY_DELAY_SECONDS)
+            except TypeError:
+                # Fakes / older clients without the delay parameter.
+                await nak()
             return
         except Exception:  # noqa: BLE001 — fall through to no-ack
             logger.warning(
@@ -110,6 +127,31 @@ async def _nak_or_leave_unacked(msg: _MsgLike, correlation_id: str) -> None:
         "JetStream will redeliver after ack_wait",
         correlation_id,
     )
+
+
+async def _kick_driver(
+    deps: PlanningConsumerDeps, correlation_id: str, *, context: str
+) -> None:
+    """Invoke the post-ack driver kick; a driver defect never wedges intake.
+
+    Called for fresh runs (TASK-MP-012) and for redelivered non-terminal
+    duplicates (TASK-MP-014) — redelivery means the original kick may have
+    been lost, and the composition's per-cid dedup makes a concurrent
+    re-kick a no-op. If the kick raises, the run stays in its durable
+    state for boot-sweep/rearm re-drive.
+    """
+    if deps.on_recorded is None:
+        return
+    try:
+        await deps.on_recorded(correlation_id)
+    except Exception:  # noqa: BLE001 — driver defect never wedges intake
+        logger.exception(
+            "planning_consumer: on_recorded callback raised for %s "
+            "correlation_id=%s; run stays in durable state for "
+            "boot-sweep/rearm re-drive",
+            context,
+            correlation_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +169,13 @@ class PlanningConsumerDeps:
             duplicate retries (RT-10). If None, terminal duplicates are
             logged but no notification is sent.
         on_recorded: Optional async callback invoked with the
-            correlation_id AFTER a fresh run is durably recorded and the
-            message acked. The production composition uses this to kick
-            the planning chain driver (TASK-MP-012). Exceptions are
-            caught and logged — a driver defect never wedges intake.
+            correlation_id AFTER the message is acked, for a fresh run
+            durably recorded (TASK-MP-012) OR a redelivered duplicate of
+            a NON-terminal run (TASK-MP-014 — the original kick may have
+            been lost; the composition's per-cid dedup makes a concurrent
+            re-kick a no-op). The production composition uses this to
+            kick the planning chain driver. Exceptions are caught and
+            logged — a driver defect never wedges intake.
     """
 
     store: SqlitePlanningRunStore
@@ -180,8 +225,10 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
        No store write, no wedge.
     2. *Invalid correlation_id* → ack + log rejection (RT-03).
        No store write, no wedge.
-    3. *Duplicate non-terminal run* → ack + idempotent skip.
-       No second row, no notification.
+    3. *Duplicate non-terminal run* → ack + driver re-kick (TASK-MP-014).
+       No second row, no notification; the re-kick resumes a lost-kick
+       run and is deduped per-cid by the composition when a drive is
+       already live.
     4. *Duplicate terminal run* → ack + notification (RT-10).
        No second row, notification published to originator.
     5. *Accepted planning request* → store write + ack AFTER persist.
@@ -286,16 +333,23 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
                         notify_exc,
                         correlation_id,
                     )
-        else:
-            # Non-terminal duplicate → idempotent skip
-            logger.info(
-                "planning_consumer: duplicate non-terminal run correlation_id=%s "
-                "existing_state=%s; acking and skipping",
-                correlation_id,
-                result.existing_state,
-            )
+            await msg.ack()
+            return
 
+        # Non-terminal duplicate → ack + re-kick the driver (TASK-MP-014).
+        # Redelivery is exactly the signal the original kick may have died
+        # (ack lost, daemon crashed in the ack window): without a re-kick a
+        # QUEUED run stalls until the next daemon restart's boot sweep. The
+        # composition's per-cid dedup guarantees at-most-one active driver,
+        # so a concurrent in-flight drive makes this a no-op.
+        logger.info(
+            "planning_consumer: duplicate non-terminal run correlation_id=%s "
+            "existing_state=%s; acking and re-kicking driver",
+            correlation_id,
+            result.existing_state,
+        )
         await msg.ack()
+        await _kick_driver(deps, correlation_id, context="non-terminal duplicate")
         return
 
     # --- 6. Success: ack AFTER persist (ASSUM-015) -----------------------
@@ -311,19 +365,12 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
     # --- 7. Kick the planning chain driver (TASK-MP-012) -----------------
     # Post-ack by design: the run is durably QUEUED, so a driver defect
     # loses nothing — the boot sweep re-drives QUEUED runs.
-    if deps.on_recorded is not None:
-        try:
-            await deps.on_recorded(correlation_id)
-        except Exception:  # noqa: BLE001 — driver defect never wedges intake
-            logger.exception(
-                "planning_consumer: on_recorded callback raised for "
-                "correlation_id=%s; run stays QUEUED for boot-sweep re-drive",
-                correlation_id,
-            )
+    await _kick_driver(deps, correlation_id, context="fresh run")
 
 
 __all__ = [
     "CORRELATION_ID_PATTERN",
+    "NAK_REDELIVERY_DELAY_SECONDS",
     "PLANNING_DURABLE_NAME",
     "PLANNING_QUEUED_SUBJECT_FILTER",
     "PlanningConsumerDeps",

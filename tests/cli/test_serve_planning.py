@@ -691,3 +691,142 @@ class TestPlanningPauseMirror:
         assert re.fullmatch(r"FEAT-[A-Z0-9]{3,12}", paused.feature_id)
         assert paused.build_id == "plan-mir-1"  # the jarvis join key
         assert paused.correlation_id == "mir-1"
+
+
+# ---------------------------------------------------------------------------
+# TASK-MP-014: mid-run duplicate intake must not double-dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateIntakeNoDoubleDispatch:
+    """A redelivered non-terminal duplicate re-kicks the driver, but the
+    composition's per-cid dedup (make_drive_spawner) guarantees at-most-one
+    active driver — so a duplicate arriving while the driver is actively
+    mid-run must not produce a second PO dispatch or approval request."""
+
+    @pytest.mark.asyncio
+    async def test_mid_run_duplicate_intake_single_po_dispatch_and_approval(
+        self, tmp_db: Path
+    ) -> None:
+        from nats_core.events import ApprovalResponsePayload
+
+        from forge.adapters.nats.planning_consumer import (
+            PlanningConsumerDeps,
+            handle_planning_message,
+        )
+        from forge.cli._serve_planning import make_drive_spawner
+        from forge.gating.identity import derive_request_id
+        from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
+        from tests.forge.adapters.test_planning_consumer import (
+            _envelope_bytes,
+            _make_msg,
+            _valid_planning_payload,
+        )
+        from tests.forge.planning.test_driver import (
+            FakePublisher,
+            FakeSecondOpinion,
+            MutableClock,
+            RecordingGitRunner,
+            ScriptedSubscriber,
+        )
+
+        cid = "plan-abc123"  # matches _valid_planning_payload's correlation_id
+        pool = connect_writer(tmp_db)
+        store = SqlitePlanningRunStore(pool)
+        clock = MutableClock()
+        repository, state_machine = build_planning_gate_adapters(store, clock=clock)
+        publisher = FakePublisher()
+        git = RecordingGitRunner()
+
+        # PO dispatch blocks until released — pins the driver mid-run.
+        po_started = asyncio.Event()
+        po_release = asyncio.Event()
+        po_calls: list[str] = []
+
+        async def dispatch_po(*, plan_run_id: str, correlation_id: str) -> Any:
+            po_calls.append(correlation_id)
+            po_started.set()
+            await po_release.wait()
+            return SimpleNamespace(
+                outcome=SimpleNamespace(value="completed"),
+                coach_score=0.9,
+                criterion_breakdown={"docs_summary": "the product docs"},
+                detection_findings=(),
+                reason=None,
+            )
+
+        approve = ApprovalResponsePayload(
+            request_id=derive_request_id(
+                build_id=f"plan-{cid}", stage_label="product_docs", attempt_count=0
+            ),
+            decision="approve",
+            decided_by=RICH,
+        )
+
+        def subscriber_factory(expected_approver: Any, armed: Any) -> Any:
+            return ScriptedSubscriber([approve], armed)
+
+        async def publish_notification(c: str, message: str, level: str) -> None:
+            pass
+
+        driver = PlanningRunDriver(
+            PlanningDriverDeps(
+                store=store,
+                repository=repository,
+                state_machine=state_machine,
+                approval_publisher=publisher,
+                subscriber_factory=subscriber_factory,
+                dispatch_product_owner=dispatch_po,
+                second_opinion_provider=FakeSecondOpinion(),
+                git_runner=git,
+                planning_config=PlanningConfig(
+                    enabled=True,
+                    escalation_approver=ESCALATION_APPROVER,
+                    target_repo_paths={"appmilla/example": "/srv/repos/example"},
+                ),
+                clock=clock,
+                publish_notification=publish_notification,
+            )
+        )
+
+        # The REAL composition dedup, wired exactly as _on_recorded is.
+        drive_tasks: list[Any] = []
+
+        def supervise(task: Any, label: str) -> None:
+            drive_tasks.append(task)
+
+        spawn = make_drive_spawner(driver, supervise)
+
+        async def on_recorded(correlation_id: str) -> None:
+            spawn(correlation_id)
+
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+
+        # First intake: run recorded, driver kicked, now blocked in PO.
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+        await asyncio.wait_for(po_started.wait(), timeout=5)
+
+        # Duplicate intake while the driver is actively mid-run.
+        msg2 = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        await handle_planning_message(msg2, deps)
+        msg2.ack.assert_awaited_once()
+        await asyncio.sleep(0)  # give any (wrongly) spawned second drive a tick
+
+        assert po_calls == [cid], "duplicate must not double-dispatch the PO"
+        assert len(drive_tasks) == 1, "per-cid dedup must skip the second spawn"
+
+        # Release the PO; the single driver completes the chain.
+        po_release.set()
+        await asyncio.wait_for(asyncio.gather(*drive_tasks), timeout=5)
+
+        run = store.get_run(cid)
+        assert run is not None
+        assert run["state"] == PlanningState.PLANNED_HANDOFF.value
+        assert po_calls == [cid], "exactly one PO dispatch end-to-end"
+        assert len(publisher.envelopes) == 1, (
+            "exactly one approval request on the wire (request_id dedup holds)"
+        )
