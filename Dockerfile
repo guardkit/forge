@@ -88,7 +88,7 @@ COPY --from=nats-core / /tmp/nats-core
 RUN test -d /tmp/nats-core/src/nats_core || (echo "nats-core layout invalid" >&2; exit 1)
 
 # Install nats-core from the BuildKit context BEFORE forge so pip's
-# resolver treats nats-core>=0.3.0,<0.4 (declared in pyproject.toml)
+# resolver treats nats-core>=0.3.0,<0.6 (declared in pyproject.toml)
 # as already-satisfied. Without this step, pip would attempt to fetch
 # the malformed PyPI 0.2.0 wheel (TASK-FIX-F0E6) and the install would
 # fail with ``ModuleNotFoundError: No module named 'nats_core'`` at

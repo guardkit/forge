@@ -23,7 +23,13 @@ dependencies = [
     "langgraph-api~=0.8.0",
     "langchain-community>=0.4,<0.5",
     "langchain-anthropic>=1.4,<2",
-    "nats-core>=0.3.0,<0.5",
+    # nats-core: widened <0.5 -> <0.6 (TASK-GATE-D659 follow-up). The
+    # 0.4.0 -> 0.5.0 delta is purely additive (PLANNING_QUEUED EventType +
+    # PlanningQueuedPayload + topic; __version__ drift fix) — no existing
+    # payload/EventType/topic/envelope behaviour changed. forge's full suite
+    # passes against the 0.5.0 sibling source. Keep the <0.6 upper bound so a
+    # future 0.6 (potentially breaking) requires a deliberate re-widen + retest.
+    "nats-core>=0.3.0,<0.6",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     # TASK-FIX-F09A1 (per TASK-REV-F09A §Reproduction C): `click` and `rich`
