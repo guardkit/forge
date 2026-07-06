@@ -230,3 +230,8 @@ __marimo__/
 
 # GuardKit autobuild per-run review summaries (regenerated, like events.jsonl)
 .guardkit/autobuild/*/review-summary.md
+
+# guardkit/claude worktrees must never be committed as gitlinks (2026-07-06;
+# tracked nats-core symlink above predates this and stays)
+.guardkit/worktrees/FEAT-*
+.claude/worktrees/
