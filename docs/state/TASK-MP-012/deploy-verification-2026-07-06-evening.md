@@ -73,3 +73,22 @@ jarvis publishes as `decided_by` once JNB-110 is deployed). Code default
    phone prompt with the 30-minute window. The stale seq-127 redelivery
    lands first and should dedupe against the CANCELLED build row — if it
    instead double-dispatches, that is FWD-001/002 evidence.
+
+## Addendum 3 (2026-07-06 ~22:15 UTC) — the first real tap, and the no-ack discovery
+
+Rich tapped Approve (~21:30:46 UTC) on the FEAT-8BA35C prompt. Result chain:
+1. jarvis handled it perfectly: allowlist auth, truthful identity — the
+   response is STORED in the broker (AGENTS #894: `decision=approve`,
+   `decided_by=U03QR8WKT29`, correct subject + envelope). Contract v2 works.
+2. But jarvis logged `slack_reply_publish_failed` (TimeoutError) and restored
+   the buttons: the AGENTS stream is `no_ack: true` (core request-reply
+   traffic on `agents.>` — PubAcks would collide), so `js.publish` NEVER gets
+   an ack there. Reproduced 3/3 by probe; messages store anyway. Forge's own
+   ApprovalPublisher core-publishes (approval_publisher.py:487) — jarvis's
+   `js.publish` is the outlier. Fix filed: jarvis TASK-JNB-111 (core publish
+   + flush; blocks JNB-107 sign-off, though taps DO deliver meanwhile).
+3. The tap failed to resolve the gate only because FEAT-8BA35C had already
+   TIMED_OUT at 21:28:32 under the old 300s window — the armed subscriber was
+   gone. With the 1800s window (addendum 2) and the fact that responses store
+   despite the timeout, the NEXT tap should complete the round-trip; jarvis
+   will cosmetically mis-report it as failed until JNB-111 lands.
