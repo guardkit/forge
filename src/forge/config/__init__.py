@@ -17,6 +17,8 @@ from .models import (
     ForgeConfig,
     PermissionsConfig,
     PipelineConfig,
+    PlanningConfig,
+    PlanningModelResolution,
     QueueConfig,
 )
 
@@ -29,6 +31,8 @@ __all__ = [
     "ForgeConfig",
     "PermissionsConfig",
     "PipelineConfig",
+    "PlanningConfig",
+    "PlanningModelResolution",
     "QueueConfig",
     "load_config",
 ]

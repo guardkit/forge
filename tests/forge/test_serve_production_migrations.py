@@ -231,9 +231,7 @@ class TestBootLogEmitsAppliedCount:
     ) -> None:
         from forge.cli import _serve_production as serve_production
 
-        with caplog.at_level(
-            logging.INFO, logger="forge.cli._serve_production"
-        ):
+        with caplog.at_level(logging.INFO, logger="forge.cli._serve_production"):
             serve_production.bind_production_serve(serve_config, fake_forge_config)
 
         applied_lines = [
@@ -245,8 +243,9 @@ class TestBootLogEmitsAppliedCount:
             "Expected an INFO log line containing 'SQLite migration' "
             f"after fresh-DB bind; got: {[r.getMessage() for r in caplog.records]!r}"
         )
-        # Two bundled migrations (schema.sql + schema_v2.sql) → applied=2.
-        assert "applied 2" in applied_lines[0], applied_lines[0]
+        # Three bundled migrations (schema.sql + schema_v2.sql + schema_v3.sql,
+        # the latter added by FEAT-SPL-002 Mode P) → applied=3.
+        assert "applied 3" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +271,7 @@ class TestRebindIdempotency:
 
         # Second bind — capture only this call's log records.
         caplog.clear()
-        with caplog.at_level(
-            logging.INFO, logger="forge.cli._serve_production"
-        ):
+        with caplog.at_level(logging.INFO, logger="forge.cli._serve_production"):
             serve_production.bind_production_serve(serve_config, fake_forge_config)
 
         applied_lines = [

@@ -1,63 +1,25 @@
 ---
-id: TASK-MP-009
-title: Serve composition + boot audit gating + planning rearm/boot-sweep recovery
-task_type: integration
-status: in_review
-parent_review: TASK-REV-83E4
-feature_id: FEAT-3ED2
-feature_ref: FEAT-SPL-002
-wave: 5
-implementation_mode: task-work
 complexity: 7
-estimated_minutes: 90
 dependencies:
 - TASK-MP-004B
 - TASK-MP-005
 - TASK-MP-006
 - TASK-MP-007
 - TASK-MP-008
+estimated_minutes: 90
+feature_id: FEAT-3ED2
+feature_ref: FEAT-SPL-002
+id: TASK-MP-009
+implementation_mode: task-work
+parent_review: TASK-REV-83E4
+status: design_approved
 tags:
 - mode-p
 - serve
 - recovery
-autobuild_state:
-  current_turn: 2
-  max_turns: 5
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
-  base_branch: main
-  started_at: '2026-07-06T13:52:25.022472'
-  last_updated: '2026-07-06T14:13:31.135791'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: "- 5 tests failed with AttributeError: 'SqlitePlanningRunStore' object\
-      \ has no attribute 'create_run'. Tests in tests/cli/test_serve_planning.py call\
-      \ create_run() which doesn't exist on the store object. Player correctly identified\
-      \ this as API mismatch \u2014 should use record_queued() instead.: Update test\
-      \ setup to use the correct API method record_queued() instead of create_run().\
-      \ Review SqlitePlanningRunStore interface to ensure tests call actual methods.\n\
-      - Evidence gathering aborted with status 'partial_gate_abort'. Cannot independently\
-      \ verify which tests passed. independent_tests field is null (ABSENT SIGNAL\
-      \ per Guard #6).: Fix test failures so evidence gathering can complete successfully.\
-      \ All tests must pass before acceptance criteria can be independently verified.\n\
-      - Player acknowledges 4 of 8 acceptance criteria incomplete: AC-001 (restart\
-      \ re-arm), AC-002 (restart-after-escalation), AC-003 (boot sweep RT-05), AC-004\
-      \ (bus failure resilience). Implementation exists but tests do not pass.: Complete\
-      \ the test API integration for the acknowledged incomplete criteria. Once tests\
-      \ pass, all 8 ACs can be verified.\n... and 1 more issues"
-    timestamp: '2026-07-06T13:52:25.022472'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: approve
-    feedback: null
-    timestamp: '2026-07-06T14:01:57.312866'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
+task_type: integration
+title: Serve composition + boot audit gating + planning rearm/boot-sweep recovery
+wave: 5
 ---
 
 # TASK-MP-009 — Serve composition + boot audit gating + recovery

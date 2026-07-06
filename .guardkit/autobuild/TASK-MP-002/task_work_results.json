@@ -1,0 +1,195 @@
+{
+  "task_id": "TASK-MP-002",
+  "timestamp": "2026-07-06T13:05:19.484666",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation** in TDD mode.",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 21,
+    "tests_failed": 0,
+    "coverage": 100.0,
+    "coverage_met": true,
+    "all_passed": true
+  },
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/lifecycle/migrations.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_states.py",
+    "src/forge/config/__init__.py",
+    "src/forge/config/models.py",
+    "src/forge/lifecycle/migrations.py"
+  ],
+  "files_created": [
+    ".guardkit/bdd/TASK-MP-002_junit.xml",
+    ".guardkit/bdd/TASK-MP-003_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/lifecycle/schema_v3.sql",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/run_store.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/states.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_run_store.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_states.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/unit/lifecycle/test_schema_v3_migration.py",
+    "src/forge/lifecycle/schema_v3.sql",
+    "src/forge/planning/__init__.py",
+    "src/forge/planning/audit.py",
+    "src/forge/planning/planner.py",
+    "src/forge/planning/run_store.py",
+    "src/forge/planning/states.py",
+    "tests/forge/planning/test_planner.py",
+    "tests/forge/planning/test_planning_mode_p.py",
+    "tests/forge/planning/test_run_store.py",
+    "tests/forge/planning/test_states.py",
+    "tests/unit/lifecycle/test_schema_v3_migration.py"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-002/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/lifecycle/migrations.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/lifecycle/schema_v3.sql",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/run_store.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/states.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_run_store.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_states.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/unit/lifecycle/test_schema_v3_migration.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_run_store.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_states.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/unit/lifecycle/test_schema_v3_migration.py"
+  ],
+  "summary": "21 tests passed, 100.0% coverage, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 39,
+    "max_turns": 160,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Migration is additive: applying v3 to a v2 database leaves builds/stage_log schemas byte-identical (PRAGMA-based schema assertion in a test that applies v2 then v3 to a tmp_path db)",
+      "status": "complete",
+      "evidence": "Created schema_v3.sql as additive-only migration with two new tables (planning_runs, planning_run_events). The migration does not modify existing builds or stage_log tables. Test test_migration_v3_is_additive_leaves_builds_unchanged and test_migration_v3_is_additive_leaves_stage_log_unchanged verify byte-identical schemas before and after v3 migration.",
+      "test_file": "tests/unit/lifecycle/test_schema_v3_migration.py",
+      "implementation_files": [
+        "src/forge/lifecycle/schema_v3.sql"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "SqlitePlanningRunStore.record_queued(payload_fields) is idempotent on correlation_id: second call returns a DuplicateRun sentinel (distinguishing terminal vs non-terminal existing state, for TASK-MP-008's RT-10 notification), creates no second row",
+      "status": "complete",
+      "evidence": "Implemented record_queued() method in SqlitePlanningRunStore that checks for existing correlation_id before insert. Returns DuplicateRun dataclass on duplicate with is_terminal flag to distinguish terminal vs non-terminal states. Test test_record_queued_is_idempotent_on_correlation_id and test_duplicate_run_distinguishes_terminal_from_non_terminal verify idempotency and sentinel behavior.",
+      "test_file": "tests/forge/planning/test_run_store.py",
+      "implementation_files": [
+        "src/forge/planning/run_store.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Every state transition writes a planning_run_events row carrying the acting identity (originator on QUEUED, decided_by on checkpoint decisions)",
+      "status": "complete",
+      "evidence": "Implemented _record_event() private method that is called on every state transition (including initial QUEUED). The method writes to planning_run_events with correlation_id, stage_label, status, actor_identity, and other fields. Test test_transition_writes_planning_run_events_row verifies event recording.",
+      "test_file": "tests/forge/planning/test_run_store.py",
+      "implementation_files": [
+        "src/forge/planning/run_store.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Transitions enforce a PLANNING_TRANSITIONS map (states.py StrEnum + dict, mirroring the state_machine.py sole-producer pattern) via CAS: UPDATE planning_runs SET state=? ... WHERE correlation_id=? AND state=? with affected-rows discipline \u2014 affected==1 wins, ==0 returns a refused sentinel (never raises); terminal states (FAILED/CANCELLED/TIMED_OUT/PLANNED_HANDOFF) accept no transitions",
+      "status": "complete",
+      "evidence": "Created states.py with PlanningState StrEnum and PLANNING_TRANSITIONS dict defining allowed state moves. Implemented transition() method using CAS (compare-and-swap) with WHERE correlation_id=? AND state=? clause. Method checks affected rows: 1=success, 0=refused (returns TransitionRefused sentinel). Terminal states defined with empty transition sets. Tests test_transition_enforces_valid_moves_via_cas, test_terminal_states_refuse_all_transitions, test_cas_transition_affected_rows_discipline, and test_cas_race_only_one_transition_wins verify CAS behavior.",
+      "test_file": "tests/forge/planning/test_run_store.py",
+      "implementation_files": [
+        "src/forge/planning/states.py",
+        "src/forge/planning/run_store.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "Durability: rows written by one store instance are read back by a second instance opened on the same tmp_path SQLite file; originating_user and expected_approver persist verbatim",
+      "status": "complete",
+      "evidence": "Implemented SqlitePlanningRunStore with proper SQLite connection handling. Test test_durability_across_store_instances creates two separate store instances on the same database file and verifies data written by first instance is readable by second instance with all fields (originating_user, expected_approver) persisting correctly.",
+      "test_file": "tests/forge/planning/test_run_store.py",
+      "implementation_files": [
+        "src/forge/planning/run_store.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "defer_count, paused_at, escalated_at, expected_approver are all updatable columns (durable escalation state \u2014 RT-04)",
+      "status": "complete",
+      "evidence": "Implemented update_escalation() method in SqlitePlanningRunStore that updates defer_count, paused_at, escalated_at, and expected_approver columns. Schema includes these columns with appropriate types (INTEGER for defer_count, TEXT for timestamps and expected_approver). Test test_updatable_columns_persist verifies all four fields can be updated and persist correctly.",
+      "test_file": "tests/forge/planning/test_run_store.py",
+      "implementation_files": [
+        "src/forge/planning/run_store.py",
+        "src/forge/lifecycle/schema_v3.sql"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran black formatter on all created files (reformatted 2 files) and ruff linter (fixed 1 unused import). All files now pass lint/format checks with zero errors. Verification command: 'python -m ruff check' and 'python -m black --check' both pass cleanly.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/states.py",
+        "src/forge/planning/run_store.py",
+        "src/forge/lifecycle/schema_v3.sql",
+        "tests/forge/planning/test_states.py",
+        "tests/forge/planning/test_run_store.py",
+        "tests/unit/lifecycle/test_schema_v3_migration.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 0.7143343520583585
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 163.38482566399034
+    }
+  ]
+}

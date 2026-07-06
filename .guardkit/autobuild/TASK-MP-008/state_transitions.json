@@ -1,0 +1,16 @@
+[
+  {
+    "task_id": "TASK-MP-008",
+    "pre_path": "tasks/backlog/TASK-MP-008-planning-intake-consumer.md",
+    "post_path": "tasks/design_approved/TASK-MP-008-planning-intake-consumer.md",
+    "timestamp": "2026-07-06T12:13:47.141268+00:00",
+    "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-MP-008",
+    "pre_path": "tasks/backlog/mode-p-planning-chain/TASK-MP-008-planning-intake-consumer.md",
+    "post_path": "tasks/design_approved/TASK-MP-008-planning-intake-consumer.md",
+    "timestamp": "2026-07-06T12:23:23.418993+00:00",
+    "kind": "design_approved_transition"
+  }
+]

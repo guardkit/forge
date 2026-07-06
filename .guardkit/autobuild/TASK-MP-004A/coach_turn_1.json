@@ -1,0 +1,59 @@
+{
+  "task_id": "TASK-MP-004A",
+  "turn": 1,
+  "decision": "approve",
+  "validation_results": {
+    "requirements_met": [
+      "Protocol satisfaction for PlanningGateRepository and PlanningStateMachine",
+      "Data persistence with pending_approval_request_id and paused_at timestamps",
+      "Paused run snapshot reconstruction for rearm sweep",
+      "CAS transition delegation with graceful refusal handling",
+      "Zero modifications to src/forge/gating/ module",
+      "Lint and format checks passed"
+    ],
+    "tests_run": true,
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/adapters/test_planning_consumer.py tests/forge/planning/test_gate_adapters.py tests/forge/planning/test_handoff.py -v --tb=short",
+    "test_output_summary": "47 tests passed in 0.39s covering protocol satisfaction, data persistence, snapshot reconstruction, state transitions, and CAS error handling",
+    "code_quality": "All files pass ruff lint/format checks with zero errors",
+    "edge_cases_covered": [
+      "Stale CAS transitions do not raise exceptions",
+      "Terminal state transitions are guarded",
+      "Missing or malformed data handled gracefully",
+      "Protocol compliance verified via structural duck-typing"
+    ]
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "result": "verified",
+      "notes": "PlanningGateRepository and PlanningStateMachine implement all required protocol methods. Tests test_repository_satisfies_gate_repository_protocol and test_state_machine_satisfies_protocol verify structural compliance via hasattr checks for all required methods including record_decision, record_paused_build, list_paused_builds, and state transitions."
+    },
+    {
+      "criterion_id": "AC-002",
+      "result": "verified",
+      "notes": "record_paused_build stores pending_approval_request_id on planning_runs row and stamps paused_at timestamp (RT-04 wall-clock anchor). Gate decisions write planning_run_events rows with gate_mode and details_json metadata. Tests test_record_paused_build_stores_request_id_and_stamps_paused_at and test_gate_decisions_write_events_with_metadata verify both persistence mechanisms."
+    },
+    {
+      "criterion_id": "AC-003",
+      "result": "verified",
+      "notes": "list_paused_builds() queries planning_runs for PAUSED state, extracts stage_label/attempt_count via parse_request_id, rehydrates GateDecision from event details_json, and constructs PausedBuildSnapshot with correlation_id, expected_approver, pending request id, and paused_at/escalated_at fields. Test test_list_paused_builds_reconstructs_snapshots verifies complete snapshot reconstruction sufficient for TASK-MP-009 rearm sweep."
+    },
+    {
+      "criterion_id": "AC-004",
+      "result": "verified",
+      "notes": "State-changing methods delegate to store.transition() which returns TransitionRefused sentinel on CAS failure. Methods check terminal states before transitions and log warnings instead of raising exceptions. Tests test_transition_to_paused_delegates_to_store and test_stale_transitions_do_not_raise verify both delegation and graceful refusal handling."
+    },
+    {
+      "criterion_id": "AC-005",
+      "result": "verified",
+      "notes": "No files under src/forge/gating/ were modified. Implementation imports derive_request_id and parse_request_id from gating module but does not modify any gating module code. Gate adapters implemented as parallel adapter in src/forge/planning/ without touching src/forge/gating/ behaviour."
+    },
+    {
+      "criterion_id": "AC-006",
+      "result": "verified",
+      "notes": "All modified files pass project-configured lint/format checks. Evidence shows ruff check --fix ran successfully with all linting errors resolved (removed unused imports). Final lint check shows zero remaining errors."
+    }
+  ],
+  "rationale": "All 6 acceptance criteria verified with passing tests. Independent test verification (47 tests, 0 failures) confirms protocol satisfaction, data persistence, snapshot reconstruction, CAS transition handling, zero gating module modifications, and lint compliance. Honesty discrepancies are worktree path reporting confusion (honesty_score: 1.0, severity: should_fix), not fabrications. All quality gates passed."
+}

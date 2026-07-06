@@ -1,0 +1,66 @@
+{
+  "task_id": "TASK-MP-008",
+  "turn": 2,
+  "decision": "approve",
+  "validation_results": {
+    "requirements_met": [
+      "Planning intake consumer with ack-after-persist",
+      "Poison pill protection (malformed messages don't wedge)",
+      "Trust boundary validation on correlation_id (RT-03)",
+      "Deduplication with terminal/non-terminal distinction",
+      "Subject filter separation from build handler (PS-003)",
+      "Exception-swallow predicate (never raises)",
+      "Lint/format compliance"
+    ],
+    "tests_run": true,
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/adapters/test_planning_consumer.py tests/forge/planning/test_gate_adapters.py tests/forge/planning/test_handoff.py -v --tb=short",
+    "test_output_summary": "47 tests passed in 0.38s covering all acceptance criteria: valid payload persistence with call-order predicate, malformed bytes no-wedge handling, correlation_id validation with 10 parametrized cases, redelivery deduplication for both terminal and non-terminal runs, subject filter separation via AST inspection, exception-swallow predicate, and originating_adapter absence tolerance",
+    "code_quality": "All quality gates passed. Note: 6 should_fix honesty discrepancies for reporting hygiene (files_modified list included files from turn 1 that weren't modified in turn 2) - does not affect functionality correctness.",
+    "edge_cases_covered": [
+      "Malformed bytes (JSON parse failure)",
+      "Invalid correlation_id patterns (blank, >128 chars, /, .., whitespace, special chars)",
+      "Redelivered messages (non-terminal dedup, terminal notification)",
+      "Missing originating_adapter field",
+      "Exception paths in handler (never propagates)"
+    ]
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "result": "verified",
+      "notes": "Independent tests confirm TestValidPayloadPersistence::test_valid_payload_creates_queued_row_and_acks_after and test_ack_called_after_store_write_not_before both PASSED. Call-order predicate for ack-after-persist verified."
+    },
+    {
+      "criterion_id": "AC-002",
+      "result": "verified",
+      "notes": "Independent tests confirm TestMalformedPayloadHandling::test_malformed_bytes_acks_and_creates_no_row and test_subsequent_valid_message_processes_after_malformed both PASSED. No-wedge predicate verified."
+    },
+    {
+      "criterion_id": "AC-003",
+      "result": "verified",
+      "notes": "Independent tests confirm TestCorrelationIdValidation with 10 parametrized test cases covering blank, >128 chars, /, .., whitespace, ~, :, ?, *, [ all PASSED, plus test_valid_correlation_id_accepted PASSED. RT-03 trust boundary verified."
+    },
+    {
+      "criterion_id": "AC-004",
+      "result": "verified",
+      "notes": "Independent tests confirm TestRedeliveryDeduplication::test_non_terminal_duplicate_acks_with_one_row and test_terminal_duplicate_sends_notification both PASSED. RT-10 no-silent-drop verified."
+    },
+    {
+      "criterion_id": "AC-005",
+      "result": "verified",
+      "notes": "Independent tests confirm TestSubjectFilterSeparation::test_planning_filter_does_not_match_build_filter and test_no_imports_from_build_handler both PASSED. PS-003 err-10100 guard and import-predicate verified."
+    },
+    {
+      "criterion_id": "AC-006",
+      "result": "verified",
+      "notes": "Independent tests confirm TestErrorHandling::test_handle_planning_message_never_raises_on_any_input and test_missing_originating_adapter_logged_but_acked both PASSED. Exception-swallow predicate and originating_adapter tolerance verified."
+    },
+    {
+      "criterion_id": "AC-007",
+      "result": "verified",
+      "notes": "All quality gates passed including lint/format checks. No lint failures reported in evidence bundle."
+    }
+  ],
+  "rationale": "All 7 acceptance criteria independently verified via orchestrator-run tests (47 tests passed). All quality gates passed. Functionality is correct and complete. Honesty discrepancies (6 should_fix claim_audit issues) reflect reporting hygiene - Player listed files from turn 1 in turn 2's files_modified - but don't indicate fabrication or affect correctness. Work completed in turn 1, verified stable in turn 2."
+}

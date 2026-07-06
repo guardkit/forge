@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-MP-002",
+    "pre_path": "tasks/backlog/TASK-MP-002-planning-runs-durable-store.md",
+    "post_path": "tasks/design_approved/TASK-MP-002-planning-runs-durable-store.md",
+    "timestamp": "2026-07-06T11:58:39.999268+00:00",
+    "kind": "design_approved_transition"
+  }
+]

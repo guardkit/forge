@@ -1,0 +1,16 @@
+[
+  {
+    "task_id": "TASK-MP-001",
+    "pre_path": "tasks/backlog/TASK-MP-001-planning-config-and-df004-audit.md",
+    "post_path": "tasks/design_approved/TASK-MP-001-planning-config-and-df004-audit.md",
+    "timestamp": "2026-07-06T11:58:39.994629+00:00",
+    "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-MP-001",
+    "pre_path": "tasks/backlog/mode-p-planning-chain/TASK-MP-001-planning-config-and-df004-audit.md",
+    "post_path": "tasks/design_approved/TASK-MP-001-planning-config-and-df004-audit.md",
+    "timestamp": "2026-07-06T12:07:29.644764+00:00",
+    "kind": "design_approved_transition"
+  }
+]

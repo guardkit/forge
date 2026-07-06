@@ -214,6 +214,22 @@ class TestApprovalYamlRoundTrip:
                     },
                 },
             },
+            # ``planning`` was added by FEAT-SPL-002 (Mode P) — like ``queue``
+            # and ``budget`` above, the unfiltered round-trip dump now always
+            # includes it, so this test must declare it with default values.
+            "planning": {
+                "enabled": False,
+                "escalation_approver": None,
+                "originator_wait_seconds": 300,
+                "escalated_wait_seconds": 1800,
+                "defer_cap": 3,
+                "default_target_repo": None,
+                "target_repo_paths": {},
+                "terminal": "planned-handoff",
+                "frontier_enabled": False,
+                "frontier_timeout_seconds": 30,
+                "model_resolution": {"model": None, "fallbacks": []},
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

@@ -1,0 +1,157 @@
+{
+  "task_id": "TASK-MP-008",
+  "timestamp": "2026-07-06T13:24:50.711682",
+  "completed": true,
+  "phases": {},
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 22,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    ".guardkit/bdd/TASK-MP-006_junit.xml",
+    ".guardkit/bdd/TASK-MP-008_junit.xml",
+    "src/forge/adapters/nats/planning_consumer.py",
+    "src/forge/planning/gate_adapters.py",
+    "src/forge/planning/handoff.py",
+    "tests/forge/adapters/test_planning_consumer.py",
+    "tests/forge/planning/test_gate_adapters.py",
+    "tests/forge/planning/test_handoff.py"
+  ],
+  "files_created": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-008/player_turn_2.json"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-008/player_turn_2.json"
+  ],
+  "tests_written": [],
+  "summary": "22 tests passed",
+  "sdk_turns": {
+    "turns_used": 3,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "integration",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "Valid payload -> planning_runs row QUEUED keyed by correlation_id, originating_user verbatim, expected_approver initialised to originating_user; fake msg.ack() called exactly once AFTER the store write (call-order predicate)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. handle_planning_message calls store.record_queued() before msg.ack(). TestValidPayloadPersistence verifies row creation, field values, and call-order predicate. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Malformed bytes -> ack + zero rows + rejection logged; a subsequent valid message on the same consumer processes normally (no-wedge predicate)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. Try/except around envelope and payload parsing with immediate ack on failure. TestMalformedPayloadHandling verifies no-wedge behavior. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Invalid correlation_id (blank, > 128 chars, or failing ^[A-Za-z0-9._-]+$ \u2014 i.e. containing /, .. as traversal, ~^:?*[, whitespace, or subject-token dots are REJECTED since '.' breaks NATS subject tokens and git refs) -> ack + zero rows + rejection logged (RT-03 trust boundary)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. _is_valid_correlation_id() validates pattern and '..' check. TestCorrelationIdValidation uses parametrized tests for all invalid patterns. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Redelivered correlation_id (non-terminal existing run) -> ack, still exactly one row; duplicate of a TERMINAL run -> ack + a notification published back to the originator (RT-10 \u2014 no silent drop of a human's retry)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. Deduplication via store.record_queued() DuplicateRun return value. Non-terminal: ack + skip. Terminal: ack + publish_notification. TestRedeliveryDeduplication verifies both paths. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "PLANNING_QUEUED_SUBJECT_FILTER does not subject-match BUILD_QUEUED_SUBJECT_FILTER and vice versa (string-level subject-match unit test \u2014 PS-003 err-10100 guard); the module never imports dispatch_build/maybe_gate_build/pipeline_consumer handler internals (import-predicate test)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. PLANNING_QUEUED_SUBJECT_FILTER = 'pipeline.planning-queued.*' distinct from build filter. No build handler imports. TestSubjectFilterSeparation verifies via AST inspection. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "handle_planning_message never raises (exception-swallow predicate mirroring the pipeline_consumer contract); originating_adapter absence is tolerated for triggered_by='jarvis' (accept-with-log \u2014 the wire layer does not enforce it; digest fact 6)",
+      "status": "complete",
+      "evidence": "Implemented in turn 1. All exception paths wrapped in try/except with log + ack. No exceptions propagate. TestErrorHandling verifies never-raises behavior. Verified in turn 2: tests still pass.",
+      "test_file": "tests/forge/adapters/test_planning_consumer.py",
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-007",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Completed in turn 1. Ran ruff check --fix and ruff format on implementation and test files. All lint issues resolved. Verified in turn 2: no new lint issues.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/adapters/nats/planning_consumer.py",
+        "tests/forge/adapters/test_planning_consumer.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 0.8175729890353978
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 204.23368917801417
+    }
+  ]
+}

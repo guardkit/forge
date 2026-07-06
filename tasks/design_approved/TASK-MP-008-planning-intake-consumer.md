@@ -1,76 +1,31 @@
 ---
-id: TASK-MP-008
-title: Planning intake consumer (ack-on-persist, trust-boundary validation, dedup,
-  poison-pill)
-task_type: integration
-status: in_review
-parent_review: TASK-REV-83E4
-feature_id: FEAT-3ED2
-feature_ref: FEAT-SPL-002
-wave: 2
-implementation_mode: task-work
 complexity: 5
-estimated_minutes: 70
+consumer_context:
+- consumes: SqlitePlanningRunStore
+  driver: sqlite3
+  format_note: record_queued must be idempotent on correlation_id and return a DuplicateRun
+    sentinel distinguishing terminal vs non-terminal existing runs
+  framework: sqlite3 (house SQLite adapter pattern)
+  task: TASK-MP-002
 dependencies:
 - TASK-MP-001
 - TASK-MP-002
 - TASK-MP-003
+estimated_minutes: 70
+feature_id: FEAT-3ED2
+feature_ref: FEAT-SPL-002
+id: TASK-MP-008
+implementation_mode: task-work
+parent_review: TASK-REV-83E4
+status: design_approved
 tags:
 - mode-p
 - nats
 - intake
-consumer_context:
-- task: TASK-MP-002
-  consumes: SqlitePlanningRunStore
-  framework: sqlite3 (house SQLite adapter pattern)
-  driver: sqlite3
-  format_note: record_queued must be idempotent on correlation_id and return a DuplicateRun
-    sentinel distinguishing terminal vs non-terminal existing runs
-autobuild_state:
-  current_turn: 2
-  max_turns: 5
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
-  base_branch: main
-  started_at: '2026-07-06T13:13:47.125243'
-  last_updated: '2026-07-06T13:29:40.650194'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix):\
-      \ Player claim: Player claimed file .guardkit/bdd/TASK-MP-006_junit.xml. Actual:\
-      \ Path is tracked in git but 'git status --porcelain' shows no change for it\
-      \ \u2014 the Player claimed work on a file it did not actually modify this turn.\
-      \ Most likely cause: the report writer swept an orchestrator-managed path (e.g.\
-      \ a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
-      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
-      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
-      \ severity=should_fix): Player claim: Player claimed file src/forge/adapters/nats/planning_consumer.py.\
-      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
-      \ for it \u2014 the Player claimed work on a file it did not actually modify\
-      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
-      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
-      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
-      \ a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified,\
-      \ severity=should_fix): Player claim: Player claimed file src/forge/planning/gate_adapters.py.\
-      \ Actual: Path is tracked in git but 'git status --porcelain' shows no change\
-      \ for it \u2014 the Player claimed work on a file it did not actually modify\
-      \ this turn. Most likely cause: the report writer swept an orchestrator-managed\
-      \ path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified.\
-      \ Defence-in-depth for the agent_invoker-side filter; this is a warning, not\
-      \ a turn-rejecting fabrication..\n... and 5 more issues"
-    timestamp: '2026-07-06T13:13:47.125243'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: approve
-    feedback: null
-    timestamp: '2026-07-06T13:23:23.416828'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
+task_type: integration
+title: Planning intake consumer (ack-on-persist, trust-boundary validation, dedup,
+  poison-pill)
+wave: 2
 ---
 
 # TASK-MP-008 — Planning intake consumer

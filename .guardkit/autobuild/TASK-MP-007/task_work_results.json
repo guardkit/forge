@@ -1,0 +1,150 @@
+{
+  "task_id": "TASK-MP-007",
+  "timestamp": "2026-07-06T13:47:56.880844",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Fix Implementation Issues",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 11,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": true
+  },
+  "files_modified": [
+    ".guardkit/bdd/TASK-MP-007_junit.xml",
+    "src/forge/planning/escalation.py",
+    "src/forge/planning/frontier.py",
+    "tests/forge/planning/test_escalation.py",
+    "tests/forge/planning/test_frontier.py"
+  ],
+  "files_created": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-007/player_turn_2.json"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-007/player_turn_2.json"
+  ],
+  "tests_written": [],
+  "summary": "11 tests passed, all quality gates passed",
+  "sdk_turns": {
+    "turns_used": 15,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "frontier_enabled=False (the default) -> the recording FrontierClient fake shows zero calls AND flagged product docs still pause for human review",
+      "status": "complete",
+      "evidence": "FrontierSecondOpinion.get_summary_for_approval checks frontier_enabled first and returns compressed brief without calling client when False. Test test_frontier_disabled_zero_calls verifies RecordingFrontierClient.calls list is empty (len==0) and valid brief is returned for human review.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Enabled + non-flagged outcome -> zero calls (FLAG-only predicate)",
+      "status": "complete",
+      "evidence": "FrontierSecondOpinion checks gate_decision == GateMode.FLAG_FOR_REVIEW before calling client. Test test_non_flagged_outcome_zero_calls uses GateMode.AUTO_APPROVE and verifies zero client calls.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "The brief passed to the client contains only allowlisted keys (docs summary, assumptions, coach evidence, structured findings) and no transcript/messages/request_text/raw-conversation field",
+      "status": "complete",
+      "evidence": "build_compressed_brief uses _ALLOWLISTED_KEYS frozenset with dict comprehension filtering. Test test_brief_contains_only_allowlisted_keys provides PO output with forbidden keys and asserts they are absent from client.calls[0] while allowed keys are present.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Client raising / timing out -> checkpoint still pauses and the approval request carries a 'second opinion unavailable' note (degrade-to-human, DF-006)",
+      "status": "complete",
+      "evidence": "asyncio.wait_for wraps client call with timeout. try/except catches TimeoutError and generic Exception, returning brief with second_opinion_unavailable=True and second_opinion_error fields. Tests test_client_error_degrades_to_human and test_client_timeout_degrades_to_human verify both paths.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "The provider's return type carries opinion data only \u2014 no approve/decision field exists on it (type-level never-approve predicate); the opinion is attached to the approval request for the human",
+      "status": "complete",
+      "evidence": "get_summary_for_approval returns dict[str, Any] containing only brief keys and optional second_opinion/second_opinion_unavailable/second_opinion_error. No approved/decision/auto_approve fields added anywhere. Test test_provider_returns_opinion_data_only explicitly asserts these fields do not exist.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "python -m ruff check passed with 'All checks passed!' for both src/forge/planning/frontier.py and tests/forge/planning/test_frontier.py. No unused imports, no style violations.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/frontier.py",
+        "tests/forge/planning/test_frontier.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 1.6657618089811876
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 152.99819429998752
+    }
+  ]
+}

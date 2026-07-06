@@ -1,65 +1,22 @@
 ---
-id: TASK-MP-007
-title: DF-006 frontier second opinion (FLAG-only, policy-filtered brief, degrade-to-human)
-task_type: feature
-status: in_review
-parent_review: TASK-REV-83E4
-feature_id: FEAT-3ED2
-feature_ref: FEAT-SPL-002
-wave: 4
-implementation_mode: task-work
 complexity: 4
-estimated_minutes: 55
 dependencies:
 - TASK-MP-004B
 - TASK-MP-001
+estimated_minutes: 55
+feature_id: FEAT-3ED2
+feature_ref: FEAT-SPL-002
+id: TASK-MP-007
+implementation_mode: task-work
+parent_review: TASK-REV-83E4
+status: design_approved
 tags:
 - mode-p
 - frontier
 - df-006
-autobuild_state:
-  current_turn: 2
-  max_turns: 5
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
-  base_branch: main
-  started_at: '2026-07-06T13:40:59.209840'
-  last_updated: '2026-07-06T13:52:24.972010'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: '- Type mismatch: code returns boolean True instead of EscalationOutcome.ESCALATED
-      enum value. Test failure: ''assert outcome == EscalationOutcome.ESCALATED''
-      failed with ''AssertionError: assert True == <EscalationOutcome.ESCALATED: ''escalated''>''.
-      This suggests the escalation module integration with frontier is incorrect,
-      or return types don''t match the expected enum structure.: Review escalation.py
-      integration with frontier.py. Ensure FrontierSecondOpinion.get_summary_for_approval
-      returns the correct dict structure, not boolean values. Verify all code paths
-      return expected types matching the SecondOpinionProvider protocol.
-
-      - 3 tests failed in total. Tests are the authoritative oracle for acceptance
-      criteria verification. Without passing tests, no AC can be independently verified.:
-      Fix the type mismatch issue identified above, then re-run the full test suite.
-      Ensure all tests pass before resubmitting.
-
-      - Coverage requirement not met: coverage_met=false with coverage_required=true.
-      The quality gate for test coverage was not satisfied.: After fixing test failures,
-      verify coverage thresholds are met. Ensure all branches, error paths, and edge
-      cases have test coverage per project configuration.
-
-      ... and 1 more issues'
-    timestamp: '2026-07-06T13:40:59.209840'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: approve
-    feedback: null
-    timestamp: '2026-07-06T13:45:48.544779'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
+task_type: feature
+title: DF-006 frontier second opinion (FLAG-only, policy-filtered brief, degrade-to-human)
+wave: 4
 ---
 
 # TASK-MP-007 — DF-006 frontier second opinion

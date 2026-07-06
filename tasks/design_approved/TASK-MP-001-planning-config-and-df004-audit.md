@@ -1,69 +1,20 @@
 ---
-id: TASK-MP-001
-title: PlanningConfig section + DF-004 planning model-resolution audit
-task_type: feature
-status: in_review
-parent_review: TASK-REV-83E4
+complexity: 4
+dependencies: []
+estimated_minutes: 60
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 1
+id: TASK-MP-001
 implementation_mode: task-work
-complexity: 4
-estimated_minutes: 60
-dependencies: []
+parent_review: TASK-REV-83E4
+status: design_approved
 tags:
 - mode-p
 - config
 - df-004
-autobuild_state:
-  current_turn: 2
-  max_turns: 5
-  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2
-  base_branch: main
-  started_at: '2026-07-06T12:58:39.978407'
-  last_updated: '2026-07-06T13:13:47.077145'
-  turns:
-  - turn: 1
-    decision: feedback
-    feedback: '- Deterministic honesty record (claim_audit, severity=critical): Player
-      claim: Player claimed file `src/forge/config/models.py. Actual: Path absent
-      from ''git status --porcelain'' so ''git add -A'' would not stage it. Probes:
-      path_exists=False; gitignore_match=no rule matched; tracked=no. Most likely
-      cause: the Player claimed work on a file that does not exist on disk..
-
-      - Deterministic honesty record (claim_audit, severity=critical): Player claim:
-      Player claimed file `src/forge/planning/audit.py. Actual: Path absent from ''git
-      status --porcelain'' so ''git add -A'' would not stage it. Probes: path_exists=False;
-      gitignore_match=no rule matched; tracked=no. Most likely cause: the Player claimed
-      work on a file that does not exist on disk..
-
-      - Evidence gathering aborted with status ''partial_honesty_abort'' due to malformed
-      file paths in Player report. The Player''s files_modified and files_created
-      lists contain backtick-prefixed entries (e.g., ''`src/forge/config/models.py''
-      and ''`src/forge/planning/audit.py'') that the honesty checker correctly identified
-      as non-existent paths. These appear to be markdown formatting artifacts accidentally
-      included as literal path strings. All independent verification (tests, coverage,
-      quality gates, architectural review) is null/absent.: Remove the malformed backtick-prefixed
-      file path entries from files_modified and files_created lists. Keep only the
-      correctly-formatted absolute paths (e.g., ''/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/models.py'')
-      or relative paths without backtick prefixes (e.g., ''src/forge/config/models.py'').
-      Once the report is corrected, the orchestrator will re-run evidence gathering
-      to provide independent verification.
-
-      ... and 2 more issues'
-    timestamp: '2026-07-06T12:58:39.978407'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
-  - turn: 2
-    decision: approve
-    feedback: null
-    timestamp: '2026-07-06T13:07:29.640135'
-    player_summary: 'Implementation via task-work delegation. Files planned: 0, Files
-      actual: 0'
-    player_success: true
-    coach_success: true
+task_type: feature
+title: PlanningConfig section + DF-004 planning model-resolution audit
+wave: 1
 ---
 
 # TASK-MP-001 — PlanningConfig section + DF-004 planning model-resolution audit

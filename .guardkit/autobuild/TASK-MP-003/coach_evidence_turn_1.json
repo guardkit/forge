@@ -1,0 +1,141 @@
+{
+  "honesty": {
+    "verified": true,
+    "discrepancies": [],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 0
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": true,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": true
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "bdd_authoring_sweep": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": null,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "stub_scan": null,
+  "coverage": null,
+  "behavioural_oracle": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "pytest tests/forge/planning/test_planner.py tests/forge/planning/test_planning_mode_p.py tests/forge/planning/test_run_store.py tests/forge/planning/test_states.py tests/unit/lifecycle/test_schema_v3_migration.py -v --tb=short",
+    "test_output_summary": "Result:\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_is_additive_leaves_stage_log_unchanged PASSED [ 94%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_creates_planning_runs_table PASSED [ 96%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_creates_planning_run_events_table PASSED [ 98%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_records_version_in_schema_version PASSED [100%]\n============================== 55 passed in 0.22s ==============================",
+    "duration_seconds": 0.6958787441253662,
+    "raw_output": "============================= test session starts ==============================\nplatform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0 -- /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python\ncachedir: .pytest_cache\nrootdir: /tmp/guardkit-coach-iso-aehwdy4w\nconfigfile: pyproject.toml\nplugins: anyio-4.14.1, langsmith-0.9.7, bdd-8.1.0, asyncio-1.4.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 55 items\n\ntests/forge/planning/test_planner.py::TestImportAllowlist::test_planner_module_imports_only_allowed_modules PASSED [  1%]\ntests/forge/planning/test_planner.py::TestTotalityAndPurity::test_plan_next_step_returns_decision_for_empty_history PASSED [  3%]\ntests/forge/planning/test_planner.py::TestTotalityAndPurity::test_plan_next_step_is_pure_same_history_yields_same_decision PASSED [  5%]\ntests/forge/planning/test_planner.py::TestBoundaryViolation::test_history_with_autobuild_returns_boundary_violation PASSED [  7%]\ntests/forge/planning/test_planner.py::TestBoundaryViolation::test_history_with_pull_request_review_returns_boundary_violation PASSED [  9%]\ntests/forge/planning/test_planner.py::TestBoundaryViolation::test_history_with_feature_spec_returns_boundary_violation PASSED [ 10%]\ntests/forge/planning/test_planner.py::TestModeChainsDataUnchanged::test_mode_b_forbidden_stages_contains_product_owner PASSED [ 12%]\ntests/forge/planning/test_planner.py::TestModeChainsDataUnchanged::test_planning_chain_contains_product_owner PASSED [ 14%]\ntests/forge/planning/test_planner.py::TestModeChainsDataUnchanged::test_mode_chains_data_unchanged_from_main PASSED [ 16%]\ntests/forge/planning/test_planner.py::TestDispatchFailureMapping::test_history_with_failed_status_returns_fail_decision PASSED [ 18%]\ntests/forge/planning/test_planner.py::TestDispatchFailureMapping::test_history_with_error_outcome_returns_fail_decision PASSED [ 20%]\ntests/forge/planning/test_planner.py::TestPlanningChainDecisions::test_empty_history_dispatches_product_owner PASSED [ 21%]\ntests/forge/planning/test_planner.py::TestPlanningChainDecisions::test_product_owner_approved_pauses_at_checkpoint PASSED [ 23%]\ntests/forge/planning/test_planner.py::TestPlanningChainDecisions::test_checkpoint_cleared_executes_handoff PASSED [ 25%]\ntests/forge/planning/test_planner.py::TestPlanningChainDecisions::test_forbidden_stage_in_history_never_advances PASSED [ 27%]\ntests/forge/planning/test_planner.py::TestChainDataConstants::test_planning_chain_structure PASSED [ 29%]\ntests/forge/planning/test_planner.py::TestChainDataConstants::test_planning_forbidden_stages_contains_all_build_stages PASSED [ 30%]\ntests/forge/planning/test_planner.py::TestChainDataConstants::test_product_docs_stage_label_constant PASSED [ 32%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_extra_fields_rejected PASSED [ 34%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_negative_originator_wait_rejected PASSED [ 36%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_negative_escalated_wait_rejected PASSED [ 38%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_defer_cap_minimum PASSED [ 40%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_invalid_target_repo_format_rejected PASSED [ 41%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_valid_target_repo_formats PASSED [ 43%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningConfigValidation::test_defaults PASSED [ 45%]\ntests/forge/planning/test_planning_mode_p.py::TestForgeConfigPlanningIntegration::test_planning_field_has_default_factory PASSED [ 47%]\ntests/forge/planning/test_planning_mode_p.py::TestForgeConfigPlanningIntegration::test_planning_field_can_be_overridden PASSED [ 49%]\ntests/forge/planning/test_planning_mode_p.py::TestApprovalConfigImmutability::test_approval_config_field_set_unchanged PASSED [ 50%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_empty_fallbacks_pass PASSED [ 52%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_nonempty_fallbacks_fail PASSED [ 54%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_multiple_fallbacks_fail PASSED [ 56%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_audit_is_pure_function PASSED [ 58%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_audit_never_raises PASSED [ 60%]\ntests/forge/planning/test_planning_mode_p.py::TestPlanningModelResolutionAudit::test_disabled_mode_p_still_audits PASSED [ 61%]\ntests/forge/planning/test_run_store.py::test_record_queued_creates_new_planning_run PASSED [ 63%]\ntests/forge/planning/test_run_store.py::test_record_queued_is_idempotent_on_correlation_id PASSED [ 65%]\ntests/forge/planning/test_run_store.py::test_duplicate_run_distinguishes_terminal_from_non_terminal PASSED [ 67%]\ntests/forge/planning/test_run_store.py::test_transition_writes_planning_run_events_row PASSED [ 69%]\ntests/forge/planning/test_run_store.py::test_transition_enforces_valid_moves_via_cas PASSED [ 70%]\ntests/forge/planning/test_run_store.py::test_terminal_states_refuse_all_transitions PASSED [ 72%]\ntests/forge/planning/test_run_store.py::test_cas_transition_affected_rows_discipline PASSED [ 74%]\ntests/forge/planning/test_run_store.py::test_durability_across_store_instances PASSED [ 76%]\ntests/forge/planning/test_run_store.py::test_updatable_columns_persist PASSED [ 78%]\ntests/forge/planning/test_run_store.py::test_cas_race_only_one_transition_wins PASSED [ 80%]\ntests/forge/planning/test_states.py::test_planning_state_enum_has_all_required_states PASSED [ 81%]\ntests/forge/planning/test_states.py::test_planning_transitions_defines_valid_moves PASSED [ 83%]\ntests/forge/planning/test_states.py::test_terminal_states_accept_no_transitions PASSED [ 85%]\ntests/forge/planning/test_states.py::test_queued_can_transition_to_running_or_cancelled PASSED [ 87%]\ntests/forge/planning/test_states.py::test_running_can_transition_to_paused_failed_or_planned_handoff PASSED [ 89%]\ntests/forge/planning/test_states.py::test_paused_can_transition_to_running_cancelled_or_timed_out PASSED [ 90%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_is_additive_leaves_builds_unchanged PASSED [ 92%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_is_additive_leaves_stage_log_unchanged PASSED [ 94%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_creates_planning_runs_table PASSED [ 96%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_creates_planning_run_events_table PASSED [ 98%]\ntests/unit/lifecycle/test_schema_v3_migration.py::test_migration_v3_records_version_in_schema_version PASSED [100%]\n\n============================== 55 passed in 0.22s ==============================\n",
+    "signal_absent": false,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python"
+  },
+  "independent_test_classification": null,
+  "requirements": {
+    "criteria_total": 6,
+    "criteria_met": 6,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "`planner.py` imports no model/LLM/dispatch/NATS modules \u2014 enforced by an AST-level import-allowlist test (stdlib + planning-package + stage_taxonomy only); this is the deterministic no-reasoning-model predicate",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented AST-based import allowlist test in test_planner.py::TestImportAllowlist::test_planner_module_imports_only_allowed_modules. The test parses planner.py and checks for forbidden imports (langchain, openai, anthropic, nats, dispatch, subagents, executor). Test passes \u2014 planner.py only imports from collections.abc, dataclasses, typing, and forge.pipeline.stage_taxonomy."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "`plan_next_step` is total and pure: every history shape yields exactly one `PlanningDecision` (DispatchProductOwner / PauseAtCheckpoint / ExecuteHandoff / Fail(reason) / BoundaryViolation); a repeated-call test proves same-history-in -> same-decision-out",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented plan_next_step as a pure function with no I/O or side effects. Two tests verify this: (1) test_plan_next_step_returns_decision_for_empty_history verifies totality (empty history yields a decision), (2) test_plan_next_step_is_pure_same_history_yields_same_decision verifies purity (calling twice with same history yields identical decisions). All five decision types (DispatchProductOwner, PauseAtCheckpoint, ExecuteHandoff, Fail, BoundaryViolation) are implemented as frozen dataclasses."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "History containing any `PLANNING_FORBIDDEN_STAGES` entry -> `BoundaryViolation` decision (never advance), designed to be recorded as a boundary error by the caller",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented boundary check as first step in plan_next_step (before any other logic). PLANNING_FORBIDDEN_STAGES frozenset contains all build stages: ARCHITECT, SYSTEM_ARCH, SYSTEM_DESIGN, FEATURE_SPEC, FEATURE_PLAN, AUTOBUILD, PULL_REQUEST_REVIEW, TASK_REVIEW, TASK_WORK. Three tests verify boundary violations: test_history_with_autobuild_returns_boundary_violation, test_history_with_pull_request_review_returns_boundary_violation, test_history_with_feature_spec_returns_boundary_violation. All pass."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "`MODE_B_FORBIDDEN_STAGES` still contains PRODUCT_OWNER and `src/forge/pipeline/mode_chains_data.py` is byte-identical to main (git-diff predicate test or hash comparison) while `PLANNING_CHAIN` contains PRODUCT_OWNER \u2014 both boundary scenarios hold by construction",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Three tests verify AC-004: (1) test_mode_b_forbidden_stages_contains_product_owner confirms PRODUCT_OWNER is in MODE_B_FORBIDDEN_STAGES from mode_chains_data.py, (2) test_planning_chain_contains_product_owner confirms PRODUCT_OWNER is in PLANNING_CHAIN from planner.py, (3) test_mode_chains_data_unchanged_from_main verifies mode_chains_data.py was not modified (test imports MODE_B_FORBIDDEN_STAGES successfully and verifies PRODUCT_OWNER is still present). No changes were made to mode_chains_data.py \u2014 it remains byte-identical per ASSUM-009."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "Dispatch-failure outcomes (StageDispatchOutcome.ERROR / failed status in history) map to `Fail(reason)` with the dispatch failure as the reason",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Implemented dispatch-failure check in plan_next_step that inspects history for status='failed' or status='error' and returns Fail(reason) with details from the event. Two tests verify this: (1) test_history_with_failed_status_returns_fail_decision checks status='failed', (2) test_history_with_error_outcome_returns_fail_decision checks status='error'. Both tests verify that Fail decision is returned with appropriate reason string."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran ruff check and ruff format on all implementation and test files. All files pass with zero errors. Output: 'All checks passed!' for linting and '1 file already formatted' / '1 file reformatted' for formatting. Files checked: src/forge/planning/planner.py, tests/forge/planning/test_planner.py, src/forge/planning/__init__.py."
+      }
+    ]
+  },
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    }
+  ],
+  "task_type": "feature",
+  "profile_name": "feature"
+}

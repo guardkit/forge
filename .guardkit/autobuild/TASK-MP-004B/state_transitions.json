@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-MP-004B",
+    "pre_path": "tasks/backlog/TASK-MP-004B-product-docs-checkpoint.md",
+    "post_path": "tasks/design_approved/TASK-MP-004B-product-docs-checkpoint.md",
+    "timestamp": "2026-07-06T12:31:36.126964+00:00",
+    "kind": "design_approved_transition"
+  }
+]
