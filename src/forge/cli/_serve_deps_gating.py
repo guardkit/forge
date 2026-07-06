@@ -233,8 +233,17 @@ def build_approval_gate_parts(
     if bridge_registry is not None:
         bridge_registry_lookup = _make_bridge_registry_lookup(bridge_registry)
 
+    # TASK-JNB-109: the subscriber is written against the envelope-aware
+    # nats_core subscribe contract, but the daemon's shared client is the
+    # RAW nats.aio client (callback would bind to the ``queue`` parameter
+    # and the handler would receive a raw Msg, not a MessageEnvelope) —
+    # the reply path could never receive a phone approval live. The
+    # adapter is the single conversion point; the publisher/injector keep
+    # the raw client (core publish is signature-compatible).
+    from forge.adapters.nats.envelope_subscribe import EnvelopeSubscribeClient
+
     deps_kwargs: dict[str, Any] = {
-        "nats_client": client,
+        "nats_client": EnvelopeSubscribeClient(client),
         "config": approval_config,
         "publish_refresh": publish_refresh,
         "expected_approver": expected_approver,

@@ -10,7 +10,7 @@ estimated_tasks: 1
 tasks:
 - id: TASK-MP-011
   name: Wire Mode P planning composition into serve boot
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md
+  file_path: tasks/in_review/TASK-MP-011-serve-boot-wiring.md
   complexity: 4
   dependencies: []
   status: completed

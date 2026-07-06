@@ -256,6 +256,44 @@ class NatsSpecialistDispatchAdapter:
     # ReplyChannel surface — subscribe / unsubscribe per correlation
     # ------------------------------------------------------------------
 
+    async def subscribe(self, correlation_key: str, deliver: Any) -> str:
+        """:class:`~forge.dispatch.correlation.ReplyChannel` conformance.
+
+        Called by :meth:`CorrelationRegistry.bind`. The registry
+        registers the binding BEFORE awaiting this method, so the
+        ``matched_agent_id`` needed to derive the result subject is
+        resolved from the registry itself
+        (:meth:`CorrelationRegistry.matched_agent_for`) — this closes
+        the TASK-SAD-011 bridge gap that previously left the adapter
+        unpluggable as the registry's transport (TASK-MP-012).
+
+        ``deliver`` is accepted per the protocol but unused: inbound
+        replies are forwarded to ``self._registry.deliver_reply`` by
+        :meth:`_on_reply_received`, and the registry passes exactly that
+        bound method here — the sink is identical by construction.
+
+        Returns the ``correlation_key`` as the opaque subscription
+        handle (``unsubscribe`` tears down by key).
+        """
+        matched_agent_id = self._registry.matched_agent_for(correlation_key)
+        if matched_agent_id is None:
+            raise LookupError(
+                f"subscribe: no binding registered for correlation key "
+                f"{correlation_key!r}; ReplyChannel.subscribe must be "
+                "driven through CorrelationRegistry.bind"
+            )
+        await self.subscribe_reply(matched_agent_id, correlation_key)
+        return correlation_key
+
+    async def unsubscribe(self, subscription: Any) -> None:
+        """:class:`~forge.dispatch.correlation.ReplyChannel` conformance.
+
+        ``subscription`` is the correlation_key handle returned by
+        :meth:`subscribe`. Idempotent, never raises past the boundary
+        (delegates to :meth:`unsubscribe_reply`).
+        """
+        await self.unsubscribe_reply(str(subscription))
+
     async def subscribe_reply(
         self, matched_agent_id: str, correlation_key: str
     ) -> None:

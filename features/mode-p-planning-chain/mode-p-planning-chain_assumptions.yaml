@@ -38,8 +38,8 @@ assumptions:
     scenario: "A checkpoint wait reaching the escalation threshold escalates to the escalation approver"
     assumption: "Reaching the first wait threshold re-targets the approval to the escalation approver instead of cancelling (unlike the build gate, whose max-wait ceiling cancels with REASON_MAX_WAIT); the escalated approval has its own ceiling, and breaching that cancels the run as timed out, never auto-approving"
     confidence: low
-    basis: "The Session-3 charter says 'escalation to Rich on timeout/cap'; the existing build-gate ceiling behaviour is cancel-only and ApprovalConfig's docstring explicitly defers ceiling semantics. Exact thresholds and single-vs-multi escalation hop need confirmation. [AMENDED by TASK-REV-83E4: thresholds are evaluated via an injected clock over durable wall-clock anchors (paused_at/escalated_at row columns); expected_approver is durably re-targeted BEFORE the re-publish; restart re-arms to the CURRENT approver without resetting elapsed wait; single escalation hop in v1.]"
-    human_response: "deferred"
+    basis: "The Session-3 charter says 'escalation to Rich on timeout/cap'; the existing build-gate ceiling behaviour is cancel-only and ApprovalConfig's docstring explicitly defers ceiling semantics. Exact thresholds and single-vs-multi escalation hop need confirmation. [AMENDED by TASK-REV-83E4: thresholds are evaluated via an injected clock over durable wall-clock anchors (paused_at/escalated_at row columns); expected_approver is durably re-targeted BEFORE the re-publish; restart re-arms to the CURRENT approver without resetting elapsed wait; single escalation hop in v1.] [RATIFIED by Rich 2026-07-06 (TASK-MP-012 session): originator_wait_seconds=3600 (1h), escalated_wait_seconds=14400 (4h) — replaces the build-invented 300s/1800s; PlanningConfig defaults updated; set explicitly in the GB10 config regardless.]"
+    human_response: "accepted"
 
   - id: "ASSUM-005"
     scenario: "A run deferred at the checkpoint up to the cap escalates instead of another round"

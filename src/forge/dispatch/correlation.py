@@ -219,6 +219,22 @@ class CorrelationRegistry:
         binding.subscription_active = True
         return binding
 
+    def matched_agent_for(self, correlation_key: str) -> Optional[str]:
+        """Return the ``matched_agent_id`` bound to ``correlation_key``.
+
+        Transport implementations that need the agent id to derive a
+        reply subject (e.g. ``agents.result.{agent_id}.{key}``) may call
+        this from inside :meth:`ReplyChannel.subscribe` — :meth:`bind`
+        registers the binding BEFORE awaiting the transport subscribe,
+        so the lookup always succeeds on the bind path (TASK-MP-012 —
+        closes the TASK-SAD-011 registry↔NATS-adapter bridge gap without
+        changing the :class:`ReplyChannel` protocol).
+
+        Returns ``None`` when no binding exists for the key.
+        """
+        binding = self._bindings.get(correlation_key)
+        return binding.matched_agent_id if binding is not None else None
+
     def deliver_reply(
         self,
         correlation_key: str,

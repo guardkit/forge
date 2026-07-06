@@ -11,7 +11,7 @@ estimated_tasks: 11
 tasks:
 - id: TASK-MP-001
   name: PlanningConfig section and DF-004 audit
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-001-planning-config-and-df004-audit.md
+  file_path: tasks/in_review/TASK-MP-001-planning-config-and-df004-audit.md
   complexity: 4
   dependencies: []
   status: completed
@@ -29,7 +29,7 @@ tasks:
   completed_at: '2026-07-06T13:13:47.081045'
 - id: TASK-MP-002
   name: planning_runs durable store (schema_v3)
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-002-planning-runs-durable-store.md
+  file_path: tasks/in_review/TASK-MP-002-planning-runs-durable-store.md
   complexity: 6
   dependencies: []
   status: completed
@@ -47,7 +47,7 @@ tasks:
   completed_at: '2026-07-06T13:13:47.084754'
 - id: TASK-MP-003
   name: Planning chain data and pure-function planner
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-003-planning-chain-data-and-planner.md
+  file_path: tasks/in_review/TASK-MP-003-planning-chain-data-and-planner.md
   complexity: 5
   dependencies: []
   status: completed
@@ -65,7 +65,7 @@ tasks:
   completed_at: '2026-07-06T13:13:47.087942'
 - id: TASK-MP-004A
   name: Planning-backed gate protocol adapters
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-004A-planning-gate-adapters.md
+  file_path: tasks/in_review/TASK-MP-004A-planning-gate-adapters.md
   complexity: 4
   dependencies:
   - TASK-MP-002
@@ -84,7 +84,7 @@ tasks:
   completed_at: '2026-07-06T13:31:35.327569'
 - id: TASK-MP-004B
   name: product_docs checkpoint flow
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-004B-product-docs-checkpoint.md
+  file_path: tasks/in_review/TASK-MP-004B-product-docs-checkpoint.md
   complexity: 5
   dependencies:
   - TASK-MP-004A
@@ -104,7 +104,7 @@ tasks:
   completed_at: '2026-07-06T13:40:59.156346'
 - id: TASK-MP-005
   name: Escalation and defer-cap policy
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-005-escalation-and-defer-policy.md
+  file_path: tasks/in_review/TASK-MP-005-escalation-and-defer-policy.md
   complexity: 6
   dependencies:
   - TASK-MP-004B
@@ -124,7 +124,7 @@ tasks:
   completed_at: '2026-07-06T13:52:24.974318'
 - id: TASK-MP-006
   name: PLANNED-HANDOFF terminal and registry
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-006-planned-handoff-terminal.md
+  file_path: tasks/in_review/TASK-MP-006-planned-handoff-terminal.md
   complexity: 6
   dependencies:
   - TASK-MP-001
@@ -144,7 +144,7 @@ tasks:
   completed_at: '2026-07-06T13:31:35.331162'
 - id: TASK-MP-007
   name: DF-006 frontier second opinion
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-007-frontier-second-opinion.md
+  file_path: tasks/in_review/TASK-MP-007-frontier-second-opinion.md
   complexity: 4
   dependencies:
   - TASK-MP-004B
@@ -164,7 +164,7 @@ tasks:
   completed_at: '2026-07-06T13:52:24.981778'
 - id: TASK-MP-008
   name: Planning intake consumer
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-008-planning-intake-consumer.md
+  file_path: tasks/in_review/TASK-MP-008-planning-intake-consumer.md
   complexity: 5
   dependencies:
   - TASK-MP-001
@@ -185,7 +185,7 @@ tasks:
   completed_at: '2026-07-06T13:31:35.334516'
 - id: TASK-MP-009
   name: Serve composition and recovery
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-009-serve-composition-and-recovery.md
+  file_path: tasks/in_review/TASK-MP-009-serve-composition-and-recovery.md
   complexity: 7
   dependencies:
   - TASK-MP-004B
@@ -208,7 +208,7 @@ tasks:
   completed_at: '2026-07-06T14:13:31.138286'
 - id: TASK-MP-010
   name: Live-daemon operator validation
-  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-010-live-daemon-operator-validation.md
+  file_path: tasks/backlog/TASK-MP-010-live-daemon-operator-validation.md
   complexity: 3
   dependencies:
   - TASK-MP-009

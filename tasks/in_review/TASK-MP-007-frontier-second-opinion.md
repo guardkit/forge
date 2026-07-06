@@ -9,7 +9,7 @@ feature_ref: FEAT-SPL-002
 id: TASK-MP-007
 implementation_mode: task-work
 parent_review: TASK-REV-83E4
-status: design_approved
+status: in_review
 tags:
 - mode-p
 - frontier

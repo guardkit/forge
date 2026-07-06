@@ -250,6 +250,8 @@ def bind_production_dispatch_chain(
     sqlite_pool: Any,
     async_task_starter: Any | None = None,
     bridge_wireup_parts: "LifecycleBridgeWireupParts | None" = None,
+    db_path: Any | None = None,
+    nats_url: str | None = None,
 ) -> ComposeDispatchChainFn:
     """Return a :data:`ComposeDispatchChainFn` bound to the production deps.
 
@@ -437,27 +439,41 @@ def bind_production_dispatch_chain(
                     exc,
                 )
 
-        # TASK-MP-011 — wire Mode P planning composition into serve boot.
-        # Guarded by config.planning.enabled to keep default path zero-cost.
-        # Soft-fail: planning composition failure never bricks daemon boot (DDR-007).
-        # Mirrors gate-parts soft-fail posture (serve.py:396-402).
+        # TASK-MP-011/TASK-MP-012 — wire Mode P planning composition into
+        # serve boot. Guarded by config.planning.enabled to keep the default
+        # path zero-cost. Soft-fail: planning composition failure never
+        # bricks daemon boot (DDR-007). Mirrors the gate-parts posture above.
+        # Call contract pinned by tests/cli/test_serve_planning_wiring.py
+        # with SIGNATURE-BINDING fakes — a kwargs drift here fails CI
+        # (the TASK-MP-011 permissive-fake gap, closed).
         if forge_config.planning.enabled:
             try:
-                await compose_planning_consumer_and_dispatch(
-                    client=client,
-                    planning_config=forge_config.planning,
-                    sqlite_pool=sqlite_pool,
+                if db_path is None:
+                    raise RuntimeError(
+                        "planning.enabled=true but no db_path was threaded "
+                        "into bind_production_dispatch_chain — planning "
+                        "cannot compose"
+                    )
+                planning_composition = await compose_planning_consumer_and_dispatch(
+                    db_path=db_path,
+                    nats_client=client,
                     config=forge_config,
+                    nats_url=nats_url,
+                )
+                planning_dispatch = (
+                    planning_composition.dispatch_callable
+                    if planning_composition is not None
+                    else None
                 )
                 await sweep_interrupted_planning_runs(
-                    sqlite_pool=sqlite_pool,
-                    client=client,
-                    planning_config=forge_config.planning,
+                    db_path,
+                    dispatch_callable=planning_dispatch,
                 )
                 await rearm_paused_planning_runs(
-                    sqlite_pool=sqlite_pool,
-                    client=client,
-                    planning_config=forge_config.planning,
+                    db_path,
+                    client,
+                    forge_config.planning,
+                    composition=planning_composition,
                 )
             except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
                 logger.error(

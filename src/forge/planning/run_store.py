@@ -308,7 +308,7 @@ class SqlitePlanningRunStore:
         cursor = self._connection.execute(
             f"""
             UPDATE planning_runs
-            SET {', '.join(update_fields)}
+            SET {", ".join(update_fields)}
             WHERE correlation_id = ? AND state = ?
             """,
             update_values,
@@ -347,7 +347,8 @@ class SqlitePlanningRunStore:
         paused_at: str | None = None,
         escalated_at: str | None = None,
         expected_approver: str | None = None,
-    ) -> None:
+        expected_state: PlanningState | None = None,
+    ) -> bool:
         """Update escalation-related fields (AC-006).
 
         Used by RT-04 durable escalation state tracking.
@@ -364,6 +365,17 @@ class SqlitePlanningRunStore:
             Timestamp when run was escalated.
         expected_approver:
             New expected approver designation.
+        expected_state:
+            Optional CAS guard — the UPDATE only applies while the run is
+            still in this state (``AND state = ?``), so a concurrent
+            approve (PAUSED → RUNNING) cannot be stamped over
+            (TASK-MP-012 — approve-vs-escalate race).
+
+        Returns
+        -------
+        bool:
+            True if a row was updated, False if the CAS guard refused
+            (or the run does not exist).
         """
         update_fields = []
         update_values: list[Any] = []
@@ -382,19 +394,74 @@ class SqlitePlanningRunStore:
             update_values.append(expected_approver)
 
         if not update_fields:
-            return  # Nothing to update
+            return True  # Nothing to update
 
+        where_clause = "WHERE correlation_id = ?"
         update_values.append(correlation_id)
+        if expected_state is not None:
+            where_clause += " AND state = ?"
+            update_values.append(expected_state.value)
 
-        self._connection.execute(
+        cursor = self._connection.execute(
             f"""
             UPDATE planning_runs
-            SET {', '.join(update_fields)}
-            WHERE correlation_id = ?
+            SET {", ".join(update_fields)}
+            {where_clause}
             """,
             update_values,
         )
         self._connection.commit()
+        return cursor.rowcount > 0
+
+    def update_pending_approval_request_id(
+        self, correlation_id: str, request_id: str
+    ) -> None:
+        """Persist the current pending approval request_id for a run.
+
+        Used by escalation / defer re-publish so a post-restart rearm
+        re-emits the CURRENT request_id, never a stale pre-escalation one
+        (TASK-MP-012 — post-merge review correctness finding).
+
+        Parameters
+        ----------
+        correlation_id:
+            The planning run to update.
+        request_id:
+            The freshly derived request_id to persist.
+        """
+        self._connection.execute(
+            """
+            UPDATE planning_runs
+            SET pending_approval_request_id = ?
+            WHERE correlation_id = ?
+            """,
+            (request_id, correlation_id),
+        )
+        self._connection.commit()
+
+    def get_run(self, correlation_id: str) -> sqlite3.Row | None:
+        """Public accessor: fetch a planning run row by correlation_id."""
+        return self._get_run(correlation_id)
+
+    def list_runs_by_state(self, state: PlanningState) -> list[sqlite3.Row]:
+        """Return all planning run rows currently in ``state``."""
+        cursor = self._connection.execute(
+            "SELECT * FROM planning_runs WHERE state = ?",
+            (state.value,),
+        )
+        return list(cursor.fetchall())
+
+    def list_events(self, correlation_id: str) -> list[sqlite3.Row]:
+        """Return all planning_run_events rows for a run, oldest first."""
+        cursor = self._connection.execute(
+            """
+            SELECT * FROM planning_run_events
+            WHERE correlation_id = ?
+            ORDER BY id ASC
+            """,
+            (correlation_id,),
+        )
+        return list(cursor.fetchall())
 
     def _get_run(self, correlation_id: str) -> sqlite3.Row | None:
         """Fetch a planning run by correlation_id.
@@ -419,7 +486,7 @@ class SqlitePlanningRunStore:
         coach_score: float | None = None,
         actor_identity: str | None = None,
         details_json: str | None = None,
-    ) -> None:
+    ) -> int:
         """Write a planning_run_events row (AC-003).
 
         Parameters
@@ -438,9 +505,14 @@ class SqlitePlanningRunStore:
             Who/what performed this action.
         details_json:
             Optional JSON details.
+
+        Returns
+        -------
+        int:
+            The rowid of the inserted event (usable as a stage-log entry id).
         """
         recorded_at = datetime.now(timezone.utc).isoformat()
-        self._connection.execute(
+        cursor = self._connection.execute(
             """
             INSERT INTO planning_run_events (
                 correlation_id, stage_label, status, gate_mode, coach_score,
@@ -459,6 +531,7 @@ class SqlitePlanningRunStore:
             ),
         )
         self._connection.commit()
+        return int(cursor.lastrowid or 0)
 
 
 __all__ = [

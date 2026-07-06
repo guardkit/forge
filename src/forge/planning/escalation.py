@@ -41,12 +41,31 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable
 
+from forge.gating.identity import derive_request_id, parse_request_id
+from forge.planning.checkpoint import build_planning_approval_envelope
 from forge.planning.states import PlanningState
 
 if TYPE_CHECKING:  # pragma: no cover
     from forge.planning.run_store import SqlitePlanningRunStore
 
 logger = logging.getLogger(__name__)
+
+
+def _next_attempt_count(existing_request_id: str | None) -> int:
+    """Derive the next attempt count from the persisted request_id."""
+    if not existing_request_id:
+        return 1
+    try:
+        _, _, attempt_count = parse_request_id(existing_request_id)
+        return attempt_count + 1
+    except ValueError:
+        logger.warning(
+            "_next_attempt_count: could not parse existing request_id %s; "
+            "using attempt=1",
+            existing_request_id,
+        )
+        return 1
+
 
 __all__ = [
     "EscalationPolicy",
@@ -136,20 +155,22 @@ async def evaluate_escalation_phase(
         elapsed = (current_time - paused_at).total_seconds()
 
         if elapsed >= policy.originator_wait_seconds:
-            # Threshold reached - escalate
-            if publisher is not None and plan_run_id is not None:
-                return await _escalate_to_secondary_approver(
-                    store=store,
-                    correlation_id=correlation_id,
-                    escalation_approver=policy.escalation_approver,
-                    clock=clock,
-                    publisher=publisher,
-                    plan_run_id=plan_run_id,
-                    feature_id=feature_id or "unknown",
-                )
-            else:
-                # Publisher not provided (validation mode)
-                return EscalationOutcome.ESCALATED
+            # Threshold reached — escalate. The durable re-target is
+            # persisted even when no publisher is provided, so a caller
+            # treating ESCALATED as done never re-escalates every poll
+            # (TASK-MP-012 — post-merge review correctness finding).
+            # CAS on PAUSED closes the approve-vs-escalate race on the
+            # phase-1 path (the phase-2 timeout already had it).
+            return await _escalate_to_secondary_approver(
+                store=store,
+                correlation_id=correlation_id,
+                escalation_approver=policy.escalation_approver,
+                clock=clock,
+                expected_from_state=PlanningState.PAUSED,
+                publisher=publisher,
+                plan_run_id=plan_run_id,
+                feature_id=feature_id or "unknown",
+            )
         else:
             # Still within originator window
             return EscalationOutcome.CONTINUE_WAITING
@@ -225,6 +246,21 @@ async def handle_defer_request(
     defer_count = row["defer_count"] or 0
 
     if defer_count >= policy.defer_cap:
+        if not policy.escalation_approver:
+            # No escalation target configured — re-targeting to "" would
+            # make the run unapprovable (TASK-MP-012 review finding).
+            # Keep the pause with the current approver; the wait ceiling
+            # times the run out.
+            logger.warning(
+                "handle_defer_request: defer_count=%d at cap=%d for %s but "
+                "no escalation_approver configured; keeping current approver "
+                "(run will time out at the wait ceiling)",
+                defer_count,
+                policy.defer_cap,
+                correlation_id,
+            )
+            return EscalationOutcome.CONTINUE_WAITING
+
         # At cap - escalate instead of deferring
         logger.info(
             "handle_defer_request: defer_count=%d at cap=%d; escalating %s",
@@ -238,17 +274,40 @@ async def handle_defer_request(
             correlation_id=correlation_id,
             escalation_approver=policy.escalation_approver,
             clock=clock,
+            expected_from_state=PlanningState.PAUSED,
             publisher=publisher,
             plan_run_id=plan_run_id,
             feature_id=feature_id,
         )
     else:
-        # Increment defer count and re-publish
+        # Increment defer count, reset the phase-1 window (a new approval
+        # round gets a fresh originator wait — TASK-MP-012), and persist
+        # the new round's request_id BEFORE re-publishing.
         new_defer_count = defer_count + 1
-        store.update_escalation(
-            correlation_id=correlation_id,
-            defer_count=new_defer_count,
+        new_attempt = _next_attempt_count(row["pending_approval_request_id"])
+        new_request_id = derive_request_id(
+            build_id=plan_run_id,
+            stage_label="product_docs",
+            attempt_count=new_attempt,
         )
+
+        # A new round gets a fresh window: reset the ACTIVE phase's anchor
+        # (phase 2 anchors on escalated_at — resetting only paused_at would
+        # silently truncate the escalated round, TASK-MP-012 review finding).
+        now_iso = clock().isoformat()
+        if row["escalated_at"] is not None:
+            store.update_escalation(
+                correlation_id=correlation_id,
+                defer_count=new_defer_count,
+                escalated_at=now_iso,
+            )
+        else:
+            store.update_escalation(
+                correlation_id=correlation_id,
+                defer_count=new_defer_count,
+                paused_at=now_iso,
+            )
+        store.update_pending_approval_request_id(correlation_id, new_request_id)
 
         # Record defer event
         store._record_event(
@@ -256,17 +315,46 @@ async def handle_defer_request(
             stage_label="planning-deferred",
             status="DEFERRED",
             actor_identity=row["expected_approver"],
-            details_json=json.dumps({"defer_count": new_defer_count}),
+            details_json=json.dumps(
+                {"defer_count": new_defer_count, "request_id": new_request_id}
+            ),
         )
 
         logger.info(
-            "handle_defer_request: deferred %s (defer_count=%d)",
+            "handle_defer_request: deferred %s (defer_count=%d, new round "
+            "request_id=%s)",
             correlation_id,
             new_defer_count,
+            new_request_id,
         )
 
-        # TODO: Re-publish approval request for new round
-        # For now, return CONTINUE_WAITING to indicate defer was handled
+        # Re-publish approval request for the new round (RT-04: durable
+        # state above precedes the wire; publish failure keeps the pause,
+        # rearm re-emits the persisted id). publisher=None → the caller
+        # owns the re-emit (the driver publishes AFTER its response waiter
+        # is armed — arm-before-post, TASK-MP-012 review finding).
+        if publisher is None:
+            return EscalationOutcome.CONTINUE_WAITING
+
+        envelope = build_planning_approval_envelope(
+            request_id=new_request_id,
+            plan_run_id=plan_run_id,
+            feature_id=feature_id,
+            stage_label="product_docs",
+            summary_data={"deferred": True, "defer_count": new_defer_count},
+            expected_approver=row["expected_approver"],
+            attempt_count=new_attempt,
+            checkpoint_type="product_docs_deferred",
+        )
+        try:
+            await publisher.publish_request(envelope)
+        except Exception:  # noqa: BLE001 — DDR-007
+            logger.exception(
+                "handle_defer_request: re-publish failed for %s; pause "
+                "persists, rearm will re-emit",
+                new_request_id,
+            )
+
         return EscalationOutcome.CONTINUE_WAITING
 
 
@@ -302,31 +390,32 @@ async def _escalate_to_secondary_approver(
     """
     row = store._get_run(correlation_id)
     if row is None:
-        logger.error("_escalate_to_secondary_approver: run %s not found", correlation_id)
+        logger.error(
+            "_escalate_to_secondary_approver: run %s not found", correlation_id
+        )
         return EscalationOutcome.CONTINUE_WAITING
-
-    # Check CAS precondition if provided
-    if expected_from_state is not None:
-        current_state = PlanningState(row["state"])
-        if current_state != expected_from_state:
-            logger.warning(
-                "_escalate_to_secondary_approver: CAS check failed for %s "
-                "(expected=%s, actual=%s)",
-                correlation_id,
-                expected_from_state.value,
-                current_state.value,
-            )
-            return EscalationOutcome.CONTINUE_WAITING
 
     current_time = clock()
     escalated_at = current_time.isoformat()
 
-    # Durably update expected_approver and escalated_at (RT-04: before publish)
-    store.update_escalation(
+    # Durably update expected_approver and escalated_at (RT-04: before
+    # publish). The optional expected_from_state guard is enforced at the
+    # SQL level (`AND state = ?`) so a concurrent approve that just moved
+    # PAUSED → RUNNING wins the race and escalation backs off.
+    updated = store.update_escalation(
         correlation_id=correlation_id,
         expected_approver=escalation_approver,
         escalated_at=escalated_at,
+        expected_state=expected_from_state,
     )
+    if not updated:
+        logger.warning(
+            "_escalate_to_secondary_approver: CAS refused for %s "
+            "(expected=%s); a concurrent transition won — not escalating",
+            correlation_id,
+            expected_from_state.value if expected_from_state else None,
+        )
+        return EscalationOutcome.CONTINUE_WAITING
 
     # Record escalation event BEFORE re-publish
     details = {
@@ -351,54 +440,30 @@ async def _escalate_to_secondary_approver(
         escalation_approver,
     )
 
-    # Re-publish approval request with incremented attempt
+    # Derive the escalated round's request_id and persist it BEFORE any
+    # publish, so a post-escalation restart re-emits the CURRENT id and
+    # later attempt derivations never re-parse a stale one (TASK-MP-012 —
+    # post-merge review correctness finding).
+    attempt_count = _next_attempt_count(row["pending_approval_request_id"])
+    request_id = derive_request_id(
+        build_id=plan_run_id if plan_run_id else f"plan-{correlation_id}",
+        stage_label="product_docs",
+        attempt_count=attempt_count,
+    )
+    store.update_pending_approval_request_id(correlation_id, request_id)
+
+    # Re-publish approval request with incremented attempt (wire-valid
+    # envelope shared with the checkpoint — single source of truth).
     if publisher is not None and plan_run_id is not None:
-        from forge.gating.identity import derive_request_id
-        from nats_core.envelope import EventType, MessageEnvelope
-
-        # Increment attempt count (read from existing pending_approval_request_id)
-        existing_request_id = row["pending_approval_request_id"]
-        attempt_count = 0
-        if existing_request_id:
-            from forge.gating.identity import parse_request_id
-
-            try:
-                _, _, attempt_count = parse_request_id(existing_request_id)
-                attempt_count += 1
-            except ValueError:
-                logger.warning(
-                    "_escalate_to_secondary_approver: could not parse existing "
-                    "request_id %s; using attempt=1",
-                    existing_request_id,
-                )
-                attempt_count = 1
-
-        request_id = derive_request_id(
-            build_id=plan_run_id,
+        envelope = build_planning_approval_envelope(
+            request_id=request_id,
+            plan_run_id=plan_run_id,
+            feature_id=feature_id or "unknown",
             stage_label="product_docs",
+            summary_data={"escalated": True, "escalated_to": escalation_approver},
+            expected_approver=escalation_approver,
             attempt_count=attempt_count,
-        )
-
-        # Build escalated approval request envelope
-        correlation_id_short = (
-            plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
-        )
-
-        payload = {
-            "request_id": request_id,
-            "run_id": plan_run_id,
-            "feature_id": feature_id,
-            "stage_label": "product_docs",
-            "summary": {"escalated": True, "escalated_to": escalation_approver},
-            "checkpoint_type": "product_docs_escalated",
-            "attempt_count": attempt_count,
-        }
-
-        envelope = MessageEnvelope(
-            source_id="forge-planning",
-            event_type=EventType.APPROVAL_REQUEST,
-            correlation_id=correlation_id_short,
-            payload=payload,
+            checkpoint_type="product_docs_escalated",
         )
 
         try:

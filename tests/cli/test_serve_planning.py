@@ -128,9 +128,7 @@ def tmp_db(tmp_path: Path) -> Path:
 class TestPlanningAuditGating:
     """AC-6: Config with non-empty planning fallbacks -> audit fails, planning not started."""
 
-    def test_fallback_audit_failure_prevents_planning_start(
-        self, tmp_db: Path
-    ) -> None:
+    def test_fallback_audit_failure_prevents_planning_start(self, tmp_db: Path) -> None:
         """Planning audit with fallbacks fails loudly and planning never starts."""
         # Arrange: config with fallbacks (DF-004 violation)
         config = _make_planning_config()
@@ -230,19 +228,61 @@ class TestRestartAfterEscalation:
             to_state=PlanningState.PAUSED,
             actor_identity=RICH,
         )
-        # TODO: Mark as escalated in real implementation
-
-        # Act: rearm
-        broker = EventLogNats()
-        config = _make_planning_config()
-
-        rearmed = await rearm_paused_planning_runs(
-            tmp_db, broker, config.planning, clock=FixedClock()
+        # Mark as escalated (durable re-target, TASK-MP-005/012)
+        store.update_escalation(
+            correlation_id=CORRELATION_ID,
+            expected_approver=ESCALATION_APPROVER,
+            escalated_at=FROZEN.isoformat(),
         )
 
-        # Assert: expected_approver is escalation approver
-        # This test will be completed when escalation tracking is available
-        assert len(rearmed) >= 1
+        # Act: rearm through a composition whose driver records resumes
+        # (TASK-MP-012: rearm spawns driver.drive(republish_pending=True);
+        # without a composition nothing can be re-armed).
+        from forge.cli._serve_planning import PlanningCompositionResult
+
+        class _RecordingDriver:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool]] = []
+
+            async def drive(
+                self, correlation_id: str, *, republish_pending: bool = False
+            ) -> None:
+                self.calls.append((correlation_id, republish_pending))
+
+        broker = EventLogNats()
+        config = _make_planning_config()
+        driver = _RecordingDriver()
+        composition = PlanningCompositionResult(
+            consumer_name="forge-serve-planning",
+            subject_filter="pipeline.planning-queued.*",
+            dispatch_callable=None,
+            audit_passed=True,
+            driver=driver,
+            store=store,
+            background_tasks=set(),
+        )
+
+        rearmed = await rearm_paused_planning_runs(
+            tmp_db,
+            broker,
+            config.planning,
+            composition=composition,
+            clock=FixedClock(),
+        )
+
+        # Let the spawned resume task run to completion
+        pending = list(composition.background_tasks or [])
+        if pending:
+            await asyncio.gather(*pending)
+
+        # Assert: the escalated run was re-armed exactly once with the
+        # verbatim-republish flag, and its durable re-target survived.
+        assert rearmed == [CORRELATION_ID]
+        assert driver.calls == [(CORRELATION_ID, True)]
+        run = store._get_run(CORRELATION_ID)
+        assert run is not None
+        assert run["expected_approver"] == ESCALATION_APPROVER
+        assert run["escalated_at"] == FROZEN.isoformat()
 
 
 class TestBootSweepInterruptedRuns:
@@ -403,7 +443,10 @@ class TestBuildPlanningIsolation:
 
         # Assert: planning consumer uses separate durable name
         assert result is not None
-        assert "planning" in str(result).lower() or result.get("consumer_name") == "forge-serve-planning"
+        assert (
+            "planning" in str(result).lower()
+            or result.get("consumer_name") == "forge-serve-planning"
+        )
 
 
 class TestPlanningDisabledByDefault:
@@ -413,10 +456,12 @@ class TestPlanningDisabledByDefault:
     async def test_planning_disabled_returns_none(self, tmp_db: Path) -> None:
         """With planning.enabled=False, composition returns None."""
         # Arrange: config with planning disabled
-        config = ForgeConfig.model_validate({
-            "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
-            "planning": {"enabled": False},
-        })
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                "planning": {"enabled": False},
+            }
+        )
 
         broker = InMemoryNats()
 
@@ -443,3 +488,206 @@ class TestLintCompliance:
         assert hasattr(_serve_planning, "compose_planning_consumer_and_dispatch")
         assert hasattr(_serve_planning, "rearm_paused_planning_runs")
         assert hasattr(_serve_planning, "sweep_interrupted_planning_runs")
+
+
+# ---------------------------------------------------------------------------
+# TASK-MP-012: the durable consumer is actually bound on the wire
+# ---------------------------------------------------------------------------
+
+
+class _FakePullSubscription:
+    async def fetch(self, batch: int, timeout: float) -> list[Any]:
+        raise asyncio.TimeoutError  # idle wire
+
+
+class _FakeJetStream:
+    def __init__(self) -> None:
+        self.pull_subscribes: list[dict[str, Any]] = []
+
+    async def pull_subscribe(
+        self, *, subject: str, durable: str, stream: str, config: Any
+    ) -> _FakePullSubscription:
+        self.pull_subscribes.append(
+            {
+                "subject": subject,
+                "durable": durable,
+                "stream": stream,
+                "config": config,
+            }
+        )
+        return _FakePullSubscription()
+
+
+class JetStreamNats(InMemoryNats):
+    """InMemoryNats with a recording JetStream context."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.js = _FakeJetStream()
+
+    def jetstream(self) -> _FakeJetStream:
+        return self.js
+
+
+class TestDurableConsumerBind:
+    """Post-merge review CRITICAL: the durable was declared, never bound."""
+
+    @pytest.mark.asyncio
+    async def test_compose_binds_forge_serve_planning_durable(
+        self, tmp_db: Path
+    ) -> None:
+        broker = JetStreamNats()
+        config = _make_planning_config()
+
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
+        )
+
+        try:
+            assert result is not None
+            assert result.audit_passed
+            assert result.subscription is not None
+            assert result.consumer_task is not None
+            assert result.driver is not None
+            assert callable(result.dispatch_callable)
+
+            assert len(broker.js.pull_subscribes) == 1
+            bind = broker.js.pull_subscribes[0]
+            assert bind["durable"] == "forge-serve-planning"
+            assert bind["stream"] == "PIPELINE"
+            assert bind["subject"] == "pipeline.planning-queued.*"
+            # TASK-GATE-D659 lesson: never the 30s nats-py default
+            assert bind["config"].ack_wait == 3600.0
+            assert bind["config"].max_ack_pending == 1
+            assert bind["config"].filter_subject == "pipeline.planning-queued.*"
+        finally:
+            for task in list(result.background_tasks or []):
+                task.cancel()
+            await asyncio.gather(
+                *(result.background_tasks or []), return_exceptions=True
+            )
+
+    @pytest.mark.asyncio
+    async def test_compose_without_jetstream_logs_loudly_but_composes(
+        self, tmp_db: Path, caplog: Any
+    ) -> None:
+        """A client with no JetStream context cannot silently run non-durable."""
+        caplog.set_level(logging.ERROR)
+        broker = EventLogNats()  # no jetstream()
+        config = _make_planning_config()
+
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
+        )
+
+        try:
+            assert result is not None
+            assert result.subscription is None
+            assert result.consumer_task is None
+            assert any("JetStream" in rec.message for rec in caplog.records), (
+                "missing loud no-JetStream error"
+            )
+        finally:
+            for task in list(result.background_tasks or []):
+                task.cancel()
+            await asyncio.gather(
+                *(result.background_tasks or []), return_exceptions=True
+            )
+
+
+# ---------------------------------------------------------------------------
+# TASK-MP-012 review fixes: non-destructive sweep + jarvis-conformant mirror
+# ---------------------------------------------------------------------------
+
+
+class TestSweepWithoutDispatcherIsNonDestructive:
+    """One bad boot must not terminally destroy pending planning runs."""
+
+    @pytest.mark.asyncio
+    async def test_no_dispatcher_leaves_queued_and_running_in_place(
+        self, tmp_db: Path, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.ERROR)
+        pool = connect_writer(tmp_db)
+        store = SqlitePlanningRunStore(pool)
+        store.record_queued(
+            correlation_id="swp-q1",
+            originating_user=RICH,
+            expected_approver=RICH,
+            request_text="queued run",
+            triggered_by="cli",
+        )
+        store.record_queued(
+            correlation_id="swp-r1",
+            originating_user=RICH,
+            expected_approver=RICH,
+            request_text="running run",
+            triggered_by="cli",
+        )
+        store.transition(
+            correlation_id="swp-r1",
+            to_state=PlanningState.RUNNING,
+            actor_identity=RICH,
+        )
+
+        recovered = await sweep_interrupted_planning_runs(
+            tmp_db, dispatch_callable=None
+        )
+
+        assert recovered == []
+        assert store._get_run("swp-q1")["state"] == PlanningState.QUEUED.value
+        assert store._get_run("swp-r1")["state"] == PlanningState.RUNNING.value
+        assert any("NO dispatcher" in rec.message for rec in caplog.records), (
+            "missing loud no-dispatcher error"
+        )
+
+
+class TestPlanningPauseMirror:
+    """The build-paused mirror must survive jarvis's ForgeNotification pattern."""
+
+    @pytest.mark.asyncio
+    async def test_mirror_uses_jarvis_conformant_feature_id(self) -> None:
+        import json
+        import re
+
+        from forge.cli._serve_planning import _PlanningPausePublisher
+        from forge.planning.checkpoint import build_planning_approval_envelope
+        from nats_core.envelope import MessageEnvelope
+        from nats_core.events import BuildPausedPayload
+
+        class _Inner:
+            def __init__(self) -> None:
+                self.envelopes: list[Any] = []
+
+            async def publish_request(self, envelope: Any) -> None:
+                self.envelopes.append(envelope)
+
+        inner = _Inner()
+        broker = EventLogNats()
+        publisher = _PlanningPausePublisher(
+            inner, nats_client=broker, clock=FixedClock()
+        )
+
+        envelope = build_planning_approval_envelope(
+            request_id="plan-mir-1:product_docs:0",
+            plan_run_id="plan-mir-1",
+            feature_id="plan-mir-1",
+            stage_label="product_docs",
+            summary_data={"title": "docs"},
+            expected_approver=RICH,
+        )
+        await publisher.publish_request(envelope)
+
+        # Approval request FIRST, then exactly one build-paused mirror
+        assert inner.envelopes == [envelope]
+        pub_events = [s for kind, s in broker.events if kind == "pub"]
+        assert pub_events == ["pipeline.build-paused.FEAT-PLANNING"]
+
+        body = broker.published["pipeline.build-paused.FEAT-PLANNING"][-1]
+        mirror = MessageEnvelope.model_validate_json(body)
+        paused = BuildPausedPayload.model_validate(mirror.payload)
+        # jarvis ForgeNotification pins feature_id to this pattern; a
+        # non-conformant value is WARN-dropped and no Slack pause renders.
+        assert re.fullmatch(r"FEAT-[A-Z0-9]{3,12}", paused.feature_id)
+        assert paused.build_id == "plan-mir-1"  # the jarvis join key
+        assert paused.correlation_id == "mir-1"

@@ -170,9 +170,7 @@ class FrontierSecondOpinion:
             # Success — attach opinion data (AC-005: data only, no approval)
             result = dict(brief)
             result["second_opinion"] = opinion
-            logger.info(
-                "frontier second opinion: received for %s", plan_run_id
-            )
+            logger.info("frontier second opinion: received for %s", plan_run_id)
             return result
 
         except asyncio.TimeoutError:

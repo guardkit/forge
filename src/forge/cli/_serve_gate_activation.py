@@ -600,11 +600,21 @@ async def rearm_paused_gates(
             )
 
             # Per-build arm signal — fires once the response subscription is
-            # live.
+            # live. TASK-JNB-109: the raw daemon client must be adapted to
+            # the envelope-aware subscribe surface the subscriber expects
+            # (same fix as build_approval_gate_parts — without it the
+            # rearm-path callback binds to the raw client's ``queue``
+            # parameter and no response is ever received).
+            from forge.adapters.nats.envelope_subscribe import (
+                EnvelopeSubscribeClient,
+            )
+
             armed = asyncio.Event()
             arming_subscriber = ApprovalSubscriber(
                 ApprovalSubscriberDeps(
-                    nats_client=_ArmSignallingClient(client, armed),
+                    nats_client=_ArmSignallingClient(
+                        EnvelopeSubscribeClient(client), armed
+                    ),
                     config=parts.approval_config,
                     publish_refresh=None,
                     expected_approver=parts.expected_approver,

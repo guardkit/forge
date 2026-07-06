@@ -29,12 +29,34 @@ the composed system against the live GB10 deployment. AutoBuild MUST skip this t
 ## Preconditions
 
 - TASK-MP-009 merged; forge-prod image rebuilt and deployed on the gate+planning code
+- **TASK-MP-012 merged first** (2026-07-06 post-merge review: the merged Mode P
+  library had no working production path — boot kwargs TypeError, unbound durable,
+  stub dispatch/rearm. TASK-MP-012 implements the wiring; this task would fail at
+  step 1 without it.)
 - **TASK-FWD-004 completed first** (duplicate `forge-autobuild-runner` unit on the
   GB10 can double-dispatch during any live run — RT-12)
+  - *2026-07-06 partial-completion note*: the **unit-disable half is DONE**
+    (`forge-autobuild-runner` disabled on the GB10, 2026-07-06). Still open:
+    (a) the attended-run override revert (P2-scoped — does NOT gate this task)
+    and (b) the `JARVIS_NATS_PASSWORD` rotation, which **DOES still gate this
+    task** — MP-010 exercises the jarvis approval round-trip on NATS and must
+    not run against a leaked credential.
 - Live db is `~/forge-prod-state/.forge` (NOT `~/forge-state`); schema_v3 migration
   applies on boot — verify a backup exists before the first boot on the new image
 - `planning.enabled=true` + planning config (escalation approver, target_repo_paths)
   deployed config-before-image; NATS creds via `~/.config/forge/nats.env`
+  - *2026-07-06 (TASK-MP-012 / decisions session)*: set the ratified wait
+    thresholds EXPLICITLY in the GB10 config — `originator_wait_seconds: 3600`,
+    `escalated_wait_seconds: 14400` (ASSUM-004 ratified; defaults now match but
+    live configs pin policy values). The composition also needs the NATS URL
+    threaded (ServeConfig.nats_url — automatic in production wiring) for the
+    dedicated fleet-watcher client, and a `product_owner_specialist` capability
+    must be registered in the fleet or every PO dispatch degrades to
+    `no_specialist_resolvable`.
+- **TASK-JNB-110 (jarvis truthful decided_by) decided 2026-07-06** — jarvis must
+  send the clicker's Slack member ID and forge.yaml `approval.expected_approver`
+  must be Rich's member ID BEFORE this validation, so the round-trip validates
+  the final identity contract once (see AC-3).
 
 ## Required operator follow-up
 

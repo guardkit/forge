@@ -794,6 +794,13 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
         sqlite_pool=sqlite_pool,
         async_task_starter=async_task_starter,
         bridge_wireup_parts=bridge_wireup_parts,
+        # TASK-MP-012: Mode P planning opens its own writer connection
+        # from the db path (the planning store is separate from the
+        # lifecycle facade held in sqlite_pool), and a dedicated
+        # nats_core fleet client from the URL (the raw daemon client
+        # lacks the fleet watcher's subscribe/watch_fleet surface).
+        db_path=config.db_path,
+        nats_url=config.nats_url,
     )
     serve_module.compose_dispatch_chain = composer
 

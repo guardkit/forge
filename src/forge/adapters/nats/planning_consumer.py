@@ -49,13 +49,16 @@ PLANNING_QUEUED_SUBJECT_FILTER: str = "pipeline.planning-queued.*"
 PLANNING_DURABLE_NAME: str = "forge-serve-planning"
 
 #: Correlation ID validation pattern (RT-03 trust boundary).
-#: - Alphanumeric, underscore, hyphen, dot only
+#: - Alphanumeric, underscore, hyphen only
+#: - No dot: a dotted correlation_id fragments the approval subject
+#:   ``agents.approval.forge.plan-{cid}`` past jarvis's 4-token gate,
+#:   silently dropping the approval (TASK-MP-012 — post-merge review
+#:   wire-topology finding; no legitimate producer uses dots)
 #: - No forward slash (path traversal)
-#: - No consecutive dots (parent traversal)
 #: - No NATS subject-breaking chars (~^:?*[)
 #: - No whitespace
 #: - 1-128 characters
-CORRELATION_ID_PATTERN: str = r"^[A-Za-z0-9._-]{1,128}$"
+CORRELATION_ID_PATTERN: str = r"^[A-Za-z0-9_-]{1,128}$"
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +72,44 @@ terminal duplicate retry (RT-10)."""
 
 @runtime_checkable
 class _MsgLike(Protocol):
-    """Minimal slice of nats.aio.msg.Msg we depend on."""
+    """Minimal slice of nats.aio.msg.Msg we depend on.
+
+    ``nak`` is looked up dynamically (``getattr``) so fakes without it
+    still satisfy the protocol — a missing ``nak`` degrades to no-ack,
+    which JetStream redelivers after ack_wait.
+    """
 
     data: bytes
 
     async def ack(self) -> None:  # pragma: no cover - protocol stub
         ...
+
+
+async def _nak_or_leave_unacked(msg: _MsgLike, correlation_id: str) -> None:
+    """Request redelivery for a message whose store write failed.
+
+    Prefers an explicit ``nak()`` (immediate redelivery signal); if the
+    message type has none, simply NOT acking lets JetStream redeliver
+    after the consumer's ack_wait. Either way the request is NOT lost —
+    the previous ack-on-store-failure behaviour dropped it permanently
+    (TASK-MP-012 — post-merge review correctness finding).
+    """
+    nak = getattr(msg, "nak", None)
+    if callable(nak):
+        try:
+            await nak()
+            return
+        except Exception:  # noqa: BLE001 — fall through to no-ack
+            logger.warning(
+                "planning_consumer: nak() raised for correlation_id=%s; "
+                "leaving unacked for ack_wait redelivery",
+                correlation_id,
+            )
+    logger.info(
+        "planning_consumer: leaving message unacked for correlation_id=%s; "
+        "JetStream will redeliver after ack_wait",
+        correlation_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +126,16 @@ class PlanningConsumerDeps:
         publish_notification: Optional notification publisher for terminal
             duplicate retries (RT-10). If None, terminal duplicates are
             logged but no notification is sent.
+        on_recorded: Optional async callback invoked with the
+            correlation_id AFTER a fresh run is durably recorded and the
+            message acked. The production composition uses this to kick
+            the planning chain driver (TASK-MP-012). Exceptions are
+            caught and logged — a driver defect never wedges intake.
     """
 
     store: SqlitePlanningRunStore
     publish_notification: PublishNotification | None = None
+    on_recorded: Callable[[str], Awaitable[None]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -207,14 +248,17 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             target_repo=payload.target_repo,
         )
     except Exception as exc:
-        # Store write failed — log and ack to prevent wedge
+        # Store write failed (e.g. transient SQLITE_BUSY) — request
+        # redelivery instead of acking, so the planning request is not
+        # permanently dropped (ASSUM-015 grounds the ack on the run being
+        # durably recorded; this path is precisely when it was NOT).
         logger.error(
             "planning_consumer: store.record_queued raised (%s) for "
-            "correlation_id=%s; acking to prevent wedge",
+            "correlation_id=%s; requesting redelivery (nak/no-ack)",
             exc,
             correlation_id,
         )
-        await msg.ack()
+        await _nak_or_leave_unacked(msg, correlation_id)
         return
 
     # --- 5. Handle duplicate (terminal vs non-terminal) ------------------
@@ -263,6 +307,19 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
         payload.triggered_by,
     )
     await msg.ack()
+
+    # --- 7. Kick the planning chain driver (TASK-MP-012) -----------------
+    # Post-ack by design: the run is durably QUEUED, so a driver defect
+    # loses nothing — the boot sweep re-drives QUEUED runs.
+    if deps.on_recorded is not None:
+        try:
+            await deps.on_recorded(correlation_id)
+        except Exception:  # noqa: BLE001 — driver defect never wedges intake
+            logger.exception(
+                "planning_consumer: on_recorded callback raised for "
+                "correlation_id=%s; run stays QUEUED for boot-sweep re-drive",
+                correlation_id,
+            )
 
 
 __all__ = [

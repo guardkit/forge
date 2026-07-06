@@ -547,14 +547,24 @@ class PlanningConfig(BaseModel):
         ),
     )
     originator_wait_seconds: int = Field(
-        default=300,
+        default=3600,
         ge=0,
-        description="Wait time for originator approval (seconds, non-negative).",
+        description=(
+            "Wait time for originator approval (seconds, non-negative). "
+            "1h ratified by Rich 2026-07-06 (ASSUM-004 amendment, "
+            "TASK-MP-012): long enough for a human answering a phone ping, "
+            "so escalation stays the exception, not the common path."
+        ),
     )
     escalated_wait_seconds: int = Field(
-        default=1800,
+        default=14400,
         ge=0,
-        description="Wait time for escalated approval (seconds, non-negative).",
+        description=(
+            "Wait time for escalated approval (seconds, non-negative). "
+            "4h ratified by Rich 2026-07-06 (ASSUM-004 amendment, "
+            "TASK-MP-012): bounds the escalated window inside a working "
+            "day; TIMED_OUT is cheap (resubmission is one Slack message)."
+        ),
     )
     defer_cap: int = Field(
         default=3,

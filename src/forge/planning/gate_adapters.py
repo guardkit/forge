@@ -368,7 +368,9 @@ class PlanningGateRepository:
         # Fallback to planning feature ID
         return "FEAT-SPL-002"
 
-    def _rehydrate_decision(self, correlation_id: str, stage_label: str) -> GateDecision:
+    def _rehydrate_decision(
+        self, correlation_id: str, stage_label: str
+    ) -> GateDecision:
         """Return the persisted decision, or a degraded fallback.
 
         Args:

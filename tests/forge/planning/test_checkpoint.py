@@ -585,11 +585,18 @@ async def test_approval_envelope_carries_po_summary(tmp_db: sqlite3.Connection):
     assert len(publisher.envelopes) == 1
     envelope = publisher.envelopes[0]
 
-    # Should have payload with summary fields
+    # TASK-MP-012: the envelope is now a WIRE-VALID ApprovalRequestPayload —
+    # the PO summary rides inside details["summary"] and the payload
+    # validates against the frozen nats-core model (jarvis JNB-103 contract).
+    from nats_core.events import ApprovalRequestPayload
+
     payload = envelope.payload
-    assert "summary" in payload or any(key in payload for key in summary_data.keys()), (
-        "Envelope should carry PO summary data"
+    validated = ApprovalRequestPayload.model_validate(payload)
+    assert validated.details["build_id"] == plan_run_id  # publisher subject key
+    assert validated.details["summary"] == summary_data, (
+        "Envelope should carry PO summary data in details.summary"
     )
+    assert validated.details["expected_approver"] == "rich"
 
     # Verify no raw request_text interpolation (RT-09)
     request_text_in_payload = any(

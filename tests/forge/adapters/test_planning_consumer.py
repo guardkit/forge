@@ -14,7 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from nats_core.envelope import EventType, MessageEnvelope
@@ -319,7 +319,6 @@ class TestCorrelationIdValidation:
         valid_ids = [
             "simple-id",
             "with_underscore",
-            "with.dot",
             "MixedCase123",
             "a" * 128,  # Exactly 128 chars
         ]
@@ -555,8 +554,9 @@ class TestErrorHandling:
 def test_correlation_id_pattern_regex() -> None:
     """Verify CORRELATION_ID_PATTERN validation via _is_valid_correlation_id.
 
-    Note: The raw regex allows consecutive dots, but _is_valid_correlation_id
-    adds an additional check for '..' to prevent parent traversal.
+    TASK-MP-012: dots are rejected outright — a dotted correlation_id
+    fragments the approval subject past jarvis's 4-token gate (silent
+    drop), so the pattern excludes '.' entirely.
     """
     from forge.adapters.nats.planning_consumer import _is_valid_correlation_id
 
@@ -565,7 +565,6 @@ def test_correlation_id_pattern_regex() -> None:
         "simple",
         "with-dashes",
         "with_underscores",
-        "with.dots",
         "MixedCase123",
         "a" * 128,
     ]
@@ -575,6 +574,7 @@ def test_correlation_id_pattern_regex() -> None:
     # Invalid cases
     invalid = [
         "",
+        "with.dots",  # dots fragment the approval subject (TASK-MP-012)
         "has/slash",
         "has space",
         "has~tilde",
@@ -589,3 +589,105 @@ def test_correlation_id_pattern_regex() -> None:
         assert not _is_valid_correlation_id(test_id), (
             f"Should reject invalid: {test_id}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TASK-MP-012: nak-on-store-failure + on_recorded driver kick
+# ---------------------------------------------------------------------------
+
+
+class TestStoreFailureRedelivery:
+    """A transient store failure must NOT permanently drop the request."""
+
+    @pytest.mark.asyncio
+    async def test_store_failure_naks_instead_of_acking(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        msg.nak = AsyncMock()
+        deps = _make_deps(store)
+
+        with patch.object(
+            store, "record_queued", side_effect=RuntimeError("SQLITE_BUSY")
+        ):
+            await handle_planning_message(msg, deps)
+
+        msg.ack.assert_not_awaited()
+        msg.nak.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_store_failure_without_nak_leaves_unacked(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """No nak() available -> no ack either; ack_wait redelivers."""
+        msg = AsyncMock()
+        msg.data = _envelope_bytes(_valid_planning_payload())
+        del msg.nak  # AsyncMock auto-creates attributes; remove it
+        deps = _make_deps(store)
+
+        with patch.object(
+            store, "record_queued", side_effect=RuntimeError("SQLITE_BUSY")
+        ):
+            await handle_planning_message(msg, deps)
+
+        msg.ack.assert_not_awaited()
+
+
+class TestOnRecordedCallback:
+    """TASK-MP-012: the composition kicks the chain driver post-ack."""
+
+    @pytest.mark.asyncio
+    async def test_on_recorded_fires_after_successful_persist(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        recorded: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            recorded.append(correlation_id)
+
+        msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+
+        await handle_planning_message(msg, deps)
+
+        msg.ack.assert_awaited_once()
+        assert recorded == [CORRELATION_ID]
+
+    @pytest.mark.asyncio
+    async def test_on_recorded_not_fired_for_duplicates(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        recorded: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            recorded.append(correlation_id)
+
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+        await handle_planning_message(
+            _make_msg(_envelope_bytes(_valid_planning_payload())), deps
+        )
+
+        assert recorded == [CORRELATION_ID], "duplicate must not re-kick the driver"
+
+    @pytest.mark.asyncio
+    async def test_on_recorded_exception_never_wedges_intake(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        async def on_recorded(correlation_id: str) -> None:
+            raise RuntimeError("driver defect")
+
+        msg = _make_msg(_envelope_bytes(_valid_planning_payload()))
+        deps = PlanningConsumerDeps(
+            store=store, publish_notification=None, on_recorded=on_recorded
+        )
+
+        await handle_planning_message(msg, deps)  # must not raise
+
+        msg.ack.assert_awaited_once()

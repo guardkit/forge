@@ -23,6 +23,7 @@ import pytest
 from nats_core.envelope import MessageEnvelope
 
 from forge.planning.escalation import (
+    handle_defer_request,
     EscalationOutcome,
     EscalationPolicy,
     evaluate_escalation_phase,
@@ -400,10 +401,9 @@ async def test_approve_escalate_race_has_exactly_one_cas_winner(
     )
 
     # Exactly one should succeed
-    successes = sum([
-        approve_result is None,
-        escalate_result == EscalationOutcome.ESCALATED
-    ])
+    successes = sum(
+        [approve_result is None, escalate_result == EscalationOutcome.ESCALATED]
+    )
     assert successes == 1
 
     # If approve won, state is RUNNING
@@ -475,3 +475,89 @@ async def test_no_real_sleeps_in_test_suite():
 
     elapsed = time.time() - start
     assert elapsed < 0.1  # Should be nearly instant
+
+
+# ---------------------------------------------------------------------------
+# TASK-MP-012 review fixes: window resets, empty-approver guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase2_defer_resets_escalated_window(tmp_db: sqlite3.Connection):
+    """A defer AFTER escalation refreshes escalated_at (fresh phase-2 window)."""
+    from forge.planning.run_store import SqlitePlanningRunStore
+
+    store = SqlitePlanningRunStore(tmp_db)
+    paused_at = datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC)
+    old_escalated_at = datetime(2026, 7, 6, 12, 5, 0, tzinfo=UTC)
+    now = datetime(2026, 7, 6, 12, 30, 0, tzinfo=UTC)
+    _create_paused_run(
+        tmp_db,
+        "esc-defer-1",
+        "alice",
+        paused_at,
+        defer_count=0,
+        escalated_at=old_escalated_at,
+    )
+
+    policy = EscalationPolicy(
+        originator_wait_seconds=300,
+        escalated_wait_seconds=1800,
+        escalation_approver="alice",
+        defer_cap=3,
+    )
+    publisher = _FakePublisher()
+
+    outcome = await handle_defer_request(
+        store=store,
+        correlation_id="esc-defer-1",
+        policy=policy,
+        clock=lambda: now,
+        publisher=publisher,
+        plan_run_id="plan-esc-defer-1",
+        feature_id="plan-esc-defer-1",
+    )
+
+    assert outcome == EscalationOutcome.CONTINUE_WAITING
+    row = store._get_run("esc-defer-1")
+    assert row["escalated_at"] == now.isoformat(), (
+        "phase-2 defer must refresh the escalated window anchor"
+    )
+    assert row["defer_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_defer_at_cap_without_escalation_approver_keeps_approver(
+    tmp_db: sqlite3.Connection,
+):
+    """At-cap defer with no escalation target must not re-target to ''."""
+    from forge.planning.run_store import SqlitePlanningRunStore
+
+    store = SqlitePlanningRunStore(tmp_db)
+    paused_at = datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC)
+    _create_paused_run(tmp_db, "esc-cap-1", "james", paused_at, defer_count=3)
+
+    policy = EscalationPolicy(
+        originator_wait_seconds=300,
+        escalated_wait_seconds=1800,
+        escalation_approver="",  # driver maps None -> ""
+        defer_cap=3,
+    )
+    publisher = _FakePublisher()
+
+    outcome = await handle_defer_request(
+        store=store,
+        correlation_id="esc-cap-1",
+        policy=policy,
+        clock=lambda: paused_at,
+        publisher=publisher,
+        plan_run_id="plan-esc-cap-1",
+        feature_id="plan-esc-cap-1",
+    )
+
+    assert outcome == EscalationOutcome.CONTINUE_WAITING
+    row = store._get_run("esc-cap-1")
+    assert row["expected_approver"] == "james", (
+        "run must stay approvable by the current approver"
+    )
+    assert row["escalated_at"] is None

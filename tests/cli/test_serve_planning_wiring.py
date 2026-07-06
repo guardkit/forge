@@ -1,18 +1,22 @@
-"""Call-site pin tests for Mode P planning wiring into serve boot (TASK-MP-011).
+"""Call-site pin tests for Mode P planning wiring into serve boot (TASK-MP-011/012).
 
 These tests verify:
-1. AC-001: Call-site pin with monkeypatching proves production wiring
+1. AC-001: Call-site pin with SIGNATURE-BINDING fakes proves production wiring
 2. AC-002: Recovery order (sweep and rearm after composition, rearm once)
 3. AC-003: Default config (enabled=False) means zero invocations
 4. AC-004: Soft-fail - composition errors don't break daemon boot
 5. AC-005: Additive-only changes (existing tests pass)
 
-All tests use fakes and monkeypatching to verify the production composition path
-in serve.py is wired correctly, following patterns from test_serve_deps_gating.py.
+TASK-MP-012: the fakes bind their recorded arguments against the REAL
+functions' signatures (``inspect.signature(...).bind(...)``) inside
+``__call__`` — a kwargs drift at the serve.py call site now fails CI
+instead of being swallowed by ``*args/**kwargs`` fakes (the exact
+PS-002 "green-but-dead" gap the post-merge review confirmed).
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
 from typing import Any
@@ -21,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from forge.adapters.sqlite import connect_writer
+from forge.cli import _serve_planning
 from forge.cli.serve import bind_production_dispatch_chain
 from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations as lifecycle_migrations
@@ -28,16 +33,32 @@ from forge.lifecycle import migrations as lifecycle_migrations
 logger = logging.getLogger(__name__)
 
 
-class RecordingFake:
-    """Recording fake for tracking invocation order and arguments."""
+#: The three real planning entry points whose signatures the fakes pin.
+_REAL_PLANNING_FNS = {
+    "compose": _serve_planning.compose_planning_consumer_and_dispatch,
+    "sweep": _serve_planning.sweep_interrupted_planning_runs,
+    "rearm": _serve_planning.rearm_paused_planning_runs,
+}
+
+
+class SignatureBindingFake:
+    """Recording fake that BINDS calls against the real function's signature.
+
+    TASK-MP-012: ``inspect.signature(real_fn).bind(*args, **kwargs)``
+    raises TypeError the moment serve.py's call site drifts from the
+    real signature — structurally closing the permissive ``**kwargs``
+    gap that let the TASK-MP-011 wiring ship dead.
+    """
 
     def __init__(self, name: str, should_raise: bool = False) -> None:
         self.name = name
+        self.signature = inspect.signature(_REAL_PLANNING_FNS[name])
         self.invocations: list[tuple[str, Any]] = []
         self.should_raise = should_raise
 
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Record invocation and optionally raise."""
+        """Bind against the real signature, record, optionally raise."""
+        self.signature.bind(*args, **kwargs)  # TypeError on call-site drift
         self.invocations.append((self.name, {"args": args, "kwargs": kwargs}))
         if self.should_raise:
             raise RuntimeError(f"{self.name} fake error")
@@ -50,6 +71,10 @@ class RecordingFake:
     def call_count(self) -> int:
         """Return number of invocations."""
         return len(self.invocations)
+
+
+# Backwards-compatible alias (older tests referenced RecordingFake).
+RecordingFake = SignatureBindingFake
 
 
 class FakeNatsClient:
@@ -132,7 +157,7 @@ class TestCallSitePin:
 
             # Create composition function and invoke
             compose_fn = bind_production_dispatch_chain(
-                forge_config=config, sqlite_pool=pool
+                forge_config=config, sqlite_pool=pool, db_path=tmp_db
             )
             await compose_fn(fake_client)
 
@@ -142,11 +167,15 @@ class TestCallSitePin:
         )
         assert compose_fake.call_count() == 1, "compose called more than once"
 
-        # Assert: PlanningConfig was passed (check kwargs has config-like keys)
+        # Assert: the REAL keyword names were used (signature-bound above),
+        # and the config/db_path/nats_client values are the production ones.
         invocation = compose_fake.invocations[0]
         kwargs = invocation[1]["kwargs"]
-        assert "planning_config" in kwargs or "config" in kwargs, (
-            "PlanningConfig not passed to compose"
+        bound = compose_fake.signature.bind(*invocation[1]["args"], **kwargs).arguments
+        assert bound["config"] is config, "ForgeConfig not passed to compose"
+        assert bound["db_path"] == tmp_db, "db_path not threaded to compose"
+        assert bound["nats_client"] is fake_client, (
+            "shared NATS client not passed to compose"
         )
 
 
@@ -203,7 +232,7 @@ class TestRecoveryOrder:
             mock_publisher.return_value = (MagicMock(), MagicMock())
 
             compose_fn = bind_production_dispatch_chain(
-                forge_config=config, sqlite_pool=pool
+                forge_config=config, sqlite_pool=pool, db_path=tmp_db
             )
             await compose_fn(fake_client)
 
@@ -253,7 +282,7 @@ class TestDefaultConfigZeroInvocations:
             mock_publisher.return_value = (MagicMock(), MagicMock())
 
             compose_fn = bind_production_dispatch_chain(
-                forge_config=config, sqlite_pool=pool
+                forge_config=config, sqlite_pool=pool, db_path=tmp_db
             )
             await compose_fn(fake_client)
 
@@ -304,7 +333,7 @@ class TestSoftFail:
             mock_publisher.return_value = (MagicMock(), MagicMock())
 
             compose_fn = bind_production_dispatch_chain(
-                forge_config=config, sqlite_pool=pool
+                forge_config=config, sqlite_pool=pool, db_path=tmp_db
             )
             # Should NOT raise
             await compose_fn(fake_client)

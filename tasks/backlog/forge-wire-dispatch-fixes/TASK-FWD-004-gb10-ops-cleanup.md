@@ -20,6 +20,9 @@ The operator must perform these on the GB10, then mark complete via
 - **Disable the duplicate unit**: `forge-autobuild-runner.service` races
   `forge-langgraph-sidecar` for port 8124 at every boot (no env contract;
   idles when it loses). `systemctl --user disable forge-autobuild-runner`.
+  - ✅ **DONE 2026-07-06** — unit disabled on the GB10 (recorded here per the
+    house lesson: runtime re-pins need committed artifacts; supersedes the
+    "still enabled" line in the D659 deploy-verification of the same date).
 - **Before P2 local-inference validation, revert the attended-run overrides**:
   restore the two `--coach-model coach-ft-v3` argv lines in
   `src/forge/subagents/autobuild_runner.py` (uncommitted deletion on the GB10

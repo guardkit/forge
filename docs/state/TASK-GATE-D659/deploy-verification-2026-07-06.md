@@ -42,3 +42,16 @@ Remaining JNB-107 pre-flight (unchanged): TASK-JNB-OPS-001, and assessment of
 TASK-FWD-002/003/004 (`tasks/backlog/forge-wire-dispatch-fixes/` — FWD-004's
 duplicate `forge-autobuild-runner` systemd unit was still **enabled** on the
 GB10 as of 2026-07-06).
+
+---
+
+## Addendum (2026-07-06, later same day — TASK-MP-012)
+
+The `forge-autobuild-runner` systemd unit referenced above as "still
+**enabled**" was **disabled on the GB10 later on 2026-07-06**
+(`systemctl --user disable forge-autobuild-runner`). The dated completion
+tick lives on TASK-FWD-004's first checklist item
+(`tasks/backlog/forge-wire-dispatch-fixes/TASK-FWD-004-gb10-ops-cleanup.md`).
+FWD-004's remaining steps (attended-run override revert — P2-scoped — and
+the `JARVIS_NATS_PASSWORD` rotation) stay open; the rotation still gates
+TASK-MP-010 (see that task's precondition note).

@@ -30,18 +30,27 @@ import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
+from dataclasses import dataclass
+
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.gating.models import GateDecision, GateMode
 from forge.planning.states import PlanningState
-from nats_core.envelope import MessageEnvelope
-from nats_core.events import ApprovalResponsePayload
+from nats_core.envelope import EventType, MessageEnvelope
+from nats_core.events import ApprovalRequestPayload, ApprovalResponsePayload
 
 if TYPE_CHECKING:  # pragma: no cover
+    from forge.planning.escalation import EscalationPolicy
+    from forge.planning.run_store import SqlitePlanningRunStore
     from forge.gating.wrappers import GateRepository, StateMachine
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["checkpoint_product_docs", "SecondOpinionProvider"]
+__all__ = [
+    "checkpoint_product_docs",
+    "build_planning_approval_envelope",
+    "PlanningEscalationContext",
+    "SecondOpinionProvider",
+]
 
 # Terminal states that accept no outgoing transitions
 _TERMINAL_STATES = {
@@ -113,7 +122,11 @@ async def checkpoint_product_docs(
         RuntimeError: If publisher fails (after pause is persisted).
     """
     stage_label = "product_docs"
-    attempt_count = 0  # TODO: TASK-MP-005 will increment on defer
+    # Attempt 0 is correct for the INITIAL checkpoint (deterministic
+    # request_id, idempotent re-drive). Defer/escalation rounds derive
+    # attempt+1 in forge.planning.escalation (_next_attempt_count) and
+    # persist it via update_pending_approval_request_id (TASK-MP-012).
+    attempt_count = 0
 
     # Derive deterministic request_id (AC-001)
     request_id = derive_request_id(
@@ -185,19 +198,38 @@ async def checkpoint_product_docs(
         request_id,
     )
 
-    # Get validated PO summary from second opinion provider (AC-007)
-    summary_data = await second_opinion_provider.get_summary_for_approval(
-        plan_run_id=plan_run_id,
-        stage_label=stage_label,
-    )
+    # Get validated PO summary from second opinion provider (AC-007).
+    # The pause above is already durably committed — a provider defect must
+    # not strand the run PAUSED with no approval request on the wire, so
+    # degrade to a summary-unavailable brief instead of propagating.
+    try:
+        summary_data = await second_opinion_provider.get_summary_for_approval(
+            plan_run_id=plan_run_id,
+            stage_label=stage_label,
+        )
+    except Exception:  # noqa: BLE001 — degrade, never strand the pause
+        logger.exception(
+            "checkpoint_product_docs: second opinion provider raised for %s; "
+            "degrading to summary-unavailable brief",
+            plan_run_id,
+        )
+        summary_data = {"summary_unavailable": True}
+
+    # Per-run approver pinning (RT-04): the envelope names the RUN ROW's
+    # expected_approver so jarvis can render who is being asked.
+    correlation_id = plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
+    expected_approver = await _read_expected_approver(repository, correlation_id)
 
     # Build approval request envelope with compressed summary (RT-09: no raw interpolation)
-    envelope = _build_approval_request_envelope(
+    envelope = build_planning_approval_envelope(
         request_id=request_id,
         plan_run_id=plan_run_id,
         feature_id=feature_id,
         stage_label=stage_label,
         summary_data=summary_data,
+        expected_approver=expected_approver,
+        attempt_count=attempt_count,
+        coach_score=coach_evidence.get("coach_score") if coach_evidence else None,
     )
 
     # Publish approval request (publish failure does NOT roll back pause)
@@ -216,46 +248,99 @@ async def checkpoint_product_docs(
         raise
 
 
-def _build_approval_request_envelope(
+def build_planning_approval_envelope(
     *,
     request_id: str,
     plan_run_id: str,
     feature_id: str,
     stage_label: str,
     summary_data: dict[str, Any],
+    expected_approver: str | None = None,
+    attempt_count: int = 0,
+    coach_score: float | None = None,
+    rationale: str | None = None,
+    checkpoint_type: str = "product_docs",
 ) -> MessageEnvelope:
-    """Build approval request envelope with validated PO summary.
+    """Build a WIRE-VALID planning approval request envelope.
+
+    The payload is a frozen nats-core :class:`ApprovalRequestPayload`
+    (agent_id / action_description / risk_level / details all present) so
+    jarvis's JNB-103 capture validates it instead of WARN-dropping, and
+    ``details["build_id"]`` is set so the production
+    :class:`~forge.adapters.nats.approval_publisher.ApprovalPublisher`
+    can resolve the subject ``agents.approval.forge.{plan_run_id}``
+    (TASK-MP-012 — post-merge review wire-topology finding).
+
+    Escalation and defer re-publish import this same builder — it is the
+    single source of truth for the planning approval envelope shape.
 
     Args:
-        request_id: Deterministic request ID.
-        plan_run_id: Planning run identifier.
-        feature_id: Feature identifier.
-        stage_label: Stage label.
-        summary_data: Validated PO output summary from provider.
+        request_id: Deterministic request ID (derive_request_id).
+        plan_run_id: Namespaced run identifier (``plan-{correlation_id}``).
+        feature_id: Feature identifier for tracing.
+        stage_label: Stage label for this checkpoint.
+        summary_data: Validated PO output summary (RT-09: never raw text).
+        expected_approver: The RUN ROW's pinned approver, named in details.
+        attempt_count: Defer/escalation round counter.
+        coach_score: Optional coach score for jarvis rendering.
+        rationale: Optional human-readable pause rationale.
+        checkpoint_type: Checkpoint discriminator for jarvis rendering.
 
     Returns:
         MessageEnvelope ready for publishing.
     """
-    from nats_core.envelope import EventType
-
-    # Extract correlation_id from namespaced run_id
     correlation_id = plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
 
-    payload = {
-        "request_id": request_id,
-        "run_id": plan_run_id,
+    details: dict[str, Any] = {
+        # REQUIRED by ApprovalPublisher.publish_request subject resolution.
+        "build_id": plan_run_id,
         "feature_id": feature_id,
         "stage_label": stage_label,
+        "gate_mode": GateMode.MANDATORY_HUMAN_APPROVAL.value,
+        "coach_score": coach_score,
+        "rationale": rationale
+        or "Product docs checkpoint requires human approval (DF-009)",
         "summary": summary_data,  # Validated components only (RT-09)
-        "checkpoint_type": "product_docs",
+        "checkpoint_type": checkpoint_type,
+        # Spec: "an approval request should be sent naming the originator
+        # as the expected approver" (mode-p-planning-chain.feature:66).
+        "expected_approver": expected_approver,
+        "attempt_count": attempt_count,
     }
 
+    payload = ApprovalRequestPayload(
+        request_id=request_id,
+        agent_id="forge",
+        action_description=(
+            f"Mode P planning checkpoint {stage_label!r} for run "
+            f"{plan_run_id!r} awaits approval by "
+            f"{expected_approver or 'a human approver'}"
+        ),
+        risk_level="medium",
+        details=details,
+    )
+
     return MessageEnvelope(
-        source_id="forge-planning",
+        source_id="forge",
         event_type=EventType.APPROVAL_REQUEST,
         correlation_id=correlation_id,
-        payload=payload,
+        payload=payload.model_dump(mode="json"),
     )
+
+
+@dataclass(frozen=True)
+class PlanningEscalationContext:
+    """Collaborators the defer branch needs to route into the escalation policy.
+
+    Threading this into :func:`_dispatch_approval_response` wires the
+    TASK-MP-005 escalation module to the dispatch tail (TASK-MP-012 —
+    the two shipped in the same merge but were never connected).
+    """
+
+    store: "SqlitePlanningRunStore"
+    policy: "EscalationPolicy"
+    publisher: Any
+    feature_id: str
 
 
 async def _dispatch_approval_response(
@@ -264,13 +349,15 @@ async def _dispatch_approval_response(
     repository: GateRepository,
     state_machine: StateMachine,
     clock: Callable[[], datetime],
-) -> None:
+    escalation_context: PlanningEscalationContext | None = None,
+) -> str:
     """Dispatch approval response to appropriate handler.
 
     Implements the planning-specific approval dispatch tail:
     - Approve: PAUSED → RUNNING (AC-004 identity check)
     - Reject: PAUSED → CANCELLED with rejection recorded (AC-006)
-    - Defer: (TASK-MP-005 will implement escalation)
+    - Defer: routed to the escalation policy when ``escalation_context``
+      is provided (below-cap: new approval round; at-cap: escalate)
     - Late responses: Terminal state bounce (AC-005)
 
     Args:
@@ -278,6 +365,11 @@ async def _dispatch_approval_response(
         repository: Gate repository for persistence.
         state_machine: State machine for transitions.
         clock: Clock for timestamps.
+        escalation_context: Optional collaborators for the defer branch.
+
+    Returns:
+        Outcome discriminator: one of ``"approved"``, ``"rejected"``,
+        ``"deferred"``, ``"overridden"``, ``"refused"``, ``"unknown"``.
     """
     request_id = response.request_id
     decision = response.decision
@@ -298,7 +390,7 @@ async def _dispatch_approval_response(
             "_dispatch_approval_response: unparseable request_id=%s; skipping",
             request_id,
         )
-        return
+        return "refused"
 
     # Extract correlation_id
     if not build_id.startswith("plan-"):
@@ -306,7 +398,7 @@ async def _dispatch_approval_response(
             "_dispatch_approval_response: build_id %s not namespaced with plan-; skipping",
             build_id,
         )
-        return
+        return "refused"
 
     correlation_id = build_id[5:]
 
@@ -327,7 +419,7 @@ async def _dispatch_approval_response(
             "assuming terminal or invalid; refusing response",
             build_id,
         )
-        return
+        return "refused"
 
     # Read expected_approver from the snapshot's underlying store
     # We need access to the planning_runs row
@@ -341,7 +433,7 @@ async def _dispatch_approval_response(
             "_dispatch_approval_response: could not read expected_approver for %s",
             correlation_id,
         )
-        return
+        return "refused"
 
     # AC-004: Validate responder identity against expected_approver
     if responder != expected_approver:
@@ -352,7 +444,7 @@ async def _dispatch_approval_response(
             responder,
             expected_approver,
         )
-        return
+        return "refused"
 
     # Dispatch based on decision
     if decision == "approve":
@@ -363,6 +455,7 @@ async def _dispatch_approval_response(
             build_id,
             responder,
         )
+        return "approved"
 
     elif decision == "reject":
         # AC-006: Reject → CANCELLED with rejection recorded
@@ -387,14 +480,37 @@ async def _dispatch_approval_response(
             build_id,
             responder,
         )
+        return "rejected"
 
     elif decision == "defer":
-        # TASK-MP-005 will implement defer + escalation
-        logger.info(
-            "_dispatch_approval_response: defer received for %s; "
-            "escalation policy not yet implemented (TASK-MP-005)",
-            build_id,
+        if escalation_context is None:
+            logger.warning(
+                "_dispatch_approval_response: defer received for %s but no "
+                "escalation context wired; defer is a no-op",
+                build_id,
+            )
+            return "deferred"
+
+        # Late import breaks the checkpoint <-> escalation module cycle
+        # (escalation imports build_planning_approval_envelope from here).
+        from forge.planning.escalation import handle_defer_request
+
+        await handle_defer_request(
+            store=escalation_context.store,
+            correlation_id=correlation_id,
+            policy=escalation_context.policy,
+            clock=clock,
+            publisher=escalation_context.publisher,
+            plan_run_id=build_id,
+            feature_id=escalation_context.feature_id,
         )
+        logger.info(
+            "_dispatch_approval_response: defer for %s routed to escalation "
+            "policy by %s",
+            build_id,
+            responder,
+        )
+        return "deferred"
 
     elif decision == "override":
         await repository.mark_overridden(
@@ -408,6 +524,7 @@ async def _dispatch_approval_response(
             build_id,
             responder,
         )
+        return "overridden"
 
     else:
         logger.warning(
@@ -415,6 +532,7 @@ async def _dispatch_approval_response(
             decision,
             build_id,
         )
+        return "unknown"
 
 
 async def _read_expected_approver(
