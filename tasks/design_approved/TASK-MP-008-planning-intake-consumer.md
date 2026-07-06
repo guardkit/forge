@@ -1,23 +1,31 @@
 ---
-id: TASK-MP-008
-title: Planning intake consumer (ack-on-persist, trust-boundary validation, dedup, poison-pill)
-task_type: integration
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 5
+consumer_context:
+- consumes: SqlitePlanningRunStore
+  driver: sqlite3
+  format_note: record_queued must be idempotent on correlation_id and return a DuplicateRun
+    sentinel distinguishing terminal vs non-terminal existing runs
+  framework: sqlite3 (house SQLite adapter pattern)
+  task: TASK-MP-002
+dependencies:
+- TASK-MP-001
+- TASK-MP-002
+- TASK-MP-003
+estimated_minutes: 70
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 2
+id: TASK-MP-008
 implementation_mode: task-work
-complexity: 5
-estimated_minutes: 70
-dependencies: [TASK-MP-001, TASK-MP-002, TASK-MP-003]
-tags: [mode-p, nats, intake]
-consumer_context:
-  - task: TASK-MP-002
-    consumes: SqlitePlanningRunStore
-    framework: "sqlite3 (house SQLite adapter pattern)"
-    driver: "sqlite3"
-    format_note: "record_queued must be idempotent on correlation_id and return a DuplicateRun sentinel distinguishing terminal vs non-terminal existing runs"
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- nats
+- intake
+task_type: integration
+title: Planning intake consumer (ack-on-persist, trust-boundary validation, dedup,
+  poison-pill)
+wave: 2
 ---
 
 # TASK-MP-008 — Planning intake consumer

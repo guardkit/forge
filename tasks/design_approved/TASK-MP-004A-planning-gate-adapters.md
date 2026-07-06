@@ -1,17 +1,21 @@
 ---
-id: TASK-MP-004A
-title: Planning-backed gate protocol adapters (GateRepository/StateMachine over planning_runs)
-task_type: feature
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 4
+dependencies:
+- TASK-MP-002
+estimated_minutes: 45
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 2
+id: TASK-MP-004A
 implementation_mode: task-work
-complexity: 4
-estimated_minutes: 45
-dependencies: [TASK-MP-002]
-tags: [mode-p, gating, adapters]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- gating
+- adapters
+task_type: feature
+title: Planning-backed gate protocol adapters (GateRepository/StateMachine over planning_runs)
+wave: 2
 ---
 
 # TASK-MP-004A — Planning-backed gate protocol adapters

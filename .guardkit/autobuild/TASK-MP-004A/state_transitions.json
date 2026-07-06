@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-MP-004A",
+    "pre_path": "tasks/backlog/TASK-MP-004A-planning-gate-adapters.md",
+    "post_path": "tasks/design_approved/TASK-MP-004A-planning-gate-adapters.md",
+    "timestamp": "2026-07-06T12:13:47.144187+00:00",
+    "kind": "design_approved_transition"
+  }
+]

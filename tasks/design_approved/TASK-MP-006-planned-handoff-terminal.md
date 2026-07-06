@@ -1,17 +1,23 @@
 ---
-id: TASK-MP-006
-title: PLANNED-HANDOFF terminal + registry (idempotent, GitRunner-injected, sanitised notification)
-task_type: feature
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 6
+dependencies:
+- TASK-MP-001
+- TASK-MP-002
+estimated_minutes: 80
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 2
+id: TASK-MP-006
 implementation_mode: task-work
-complexity: 6
-estimated_minutes: 80
-dependencies: [TASK-MP-001, TASK-MP-002]
-tags: [mode-p, handoff, terminal]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- handoff
+- terminal
+task_type: feature
+title: PLANNED-HANDOFF terminal + registry (idempotent, GitRunner-injected, sanitised
+  notification)
+wave: 2
 ---
 
 # TASK-MP-006 — PLANNED-HANDOFF terminal + terminal registry

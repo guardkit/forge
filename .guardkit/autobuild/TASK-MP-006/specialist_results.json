@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "failed",
+    "duration_seconds": 0.870453666895628,
+    "error": "tests failed (deterministic Phase 4): Error detail:\n    raise AssertionError(msg)\nE   AssertionError: Expected mock to have been awaited once. Awaited 0 times.\n_ TestProtocolSatisfaction.test_reposi",
+    "tests_run": 47,
+    "tests_failed": 8,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Error detail:\n    raise AssertionError(msg)\nE   AssertionError: Expected mock to have been awaited once. Awaited 0 times.\n_ TestProtocolSatisfaction.test_repository_satisfies_gate_repository_protocol ",
+    "quality_gates_passed": false
+  },
+  "phase_5": {
+    "status": "skipped",
+    "duration_seconds": 0.0,
+    "error": "phase_4 status=failed",
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}
