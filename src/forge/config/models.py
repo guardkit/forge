@@ -485,6 +485,142 @@ class BudgetConfig(BaseModel):
             ) from exc
 
 
+class PlanningModelResolution(BaseModel):
+    """Model resolution configuration for Mode P planning (FEAT-SPL-002).
+
+    DF-004 (fleet REGISTER): planning model resolution can never silently
+    escalate to cloud. The ``fallbacks`` list must remain empty; any non-empty
+    value is flagged by ``audit_planning_model_resolution`` in
+    ``src/forge/planning/audit.py``.
+
+    The audit is deliberately NOT a Pydantic validator — a validator would
+    brick the whole daemon on violation, contradicting ASSUM-011's "build
+    intake unaffected" (DDR-007 soft-fail posture).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Primary planning model identifier. None means use the "
+            "specialist-agent default."
+        ),
+    )
+    fallbacks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "FORBIDDEN per DF-004 — must remain empty. Cloud escalation is not "
+            "permitted for planning models. See audit_planning_model_resolution."
+        ),
+    )
+
+
+class PlanningConfig(BaseModel):
+    """Configuration for Mode P planning approval-routing (FEAT-SPL-002).
+
+    This config surface is deliberately separate from ``ApprovalConfig`` —
+    ``ApprovalConfig`` is closed (extra='forbid', docstring forbids escalation
+    fields) and governs the build-gating approval protocol (FEAT-FORGE-004).
+    Mode P planning has different routing needs and must not pollute that
+    surface.
+
+    Defaults are chosen for safe opt-in: ``enabled=False`` ensures planning
+    intake is deliberate; ``frontier_enabled=False`` keeps DF-006 frontier
+    client gated until explicitly configured.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for Mode P planning intake. False = planning "
+            "requests are rejected at the boundary."
+        ),
+    )
+    escalation_approver: str | None = Field(
+        default=None,
+        description=(
+            "Identity of the human approver for escalated planning requests. "
+            "None = no escalation routing configured."
+        ),
+    )
+    originator_wait_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="Wait time for originator approval (seconds, non-negative).",
+    )
+    escalated_wait_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="Wait time for escalated approval (seconds, non-negative).",
+    )
+    defer_cap: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Maximum number of times a planning request can be deferred back "
+            "to the originator before terminal action is taken."
+        ),
+    )
+    default_target_repo: str | None = Field(
+        default=None,
+        description=(
+            "Default target repository for planning requests that don't "
+            "specify one. Format: 'org/name' (validated when set)."
+        ),
+    )
+    target_repo_paths: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Mapping of 'org/name' repository identifiers to absolute local "
+            "working-copy paths. Used for handoff to local build."
+        ),
+    )
+    terminal: str = Field(
+        default="planned-handoff",
+        description=(
+            "Terminal state name for successfully completed planning workflow."
+        ),
+    )
+    frontier_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable DF-006 frontier client for planning model access. "
+            "False = frontier disabled."
+        ),
+    )
+    frontier_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        description="Timeout for frontier client requests (seconds, >= 1).",
+    )
+    model_resolution: PlanningModelResolution = Field(
+        default_factory=PlanningModelResolution,
+        description=(
+            "Planning model resolution configuration. See DF-004 audit for "
+            "fallback restrictions."
+        ),
+    )
+
+    @field_validator("default_target_repo")
+    @classmethod
+    def _validate_repo_format(cls, v: str | None) -> str | None:
+        """Validate repository format matches org/name pattern."""
+        if v is None:
+            return v
+
+        import re
+
+        pattern = r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+        if not re.match(pattern, v):
+            raise ValueError(
+                f"default_target_repo must match pattern 'org/name', got: {v!r}"
+            )
+        return v
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -505,6 +641,13 @@ class ForgeConfig(BaseModel):
         description=(
             "FEAT-UBS-002 budget-guard profiles. Defaults to attended "
             "(caps off); operators opt into unattended caps per profile."
+        ),
+    )
+    planning: PlanningConfig = Field(
+        default_factory=PlanningConfig,
+        description=(
+            "FEAT-SPL-002 Mode P planning approval-routing configuration. "
+            "Defaults to disabled (enabled=False) for safe opt-in."
         ),
     )
     permissions: PermissionsConfig = Field(
@@ -537,6 +680,8 @@ __all__ = [
     "ForgeConfig",
     "PermissionsConfig",
     "PipelineConfig",
+    "PlanningConfig",
+    "PlanningModelResolution",
     "QueueConfig",
 ]
 

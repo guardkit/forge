@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-MP-003",
+    "pre_path": "tasks/backlog/TASK-MP-003-planning-chain-data-and-planner.md",
+    "post_path": "tasks/design_approved/TASK-MP-003-planning-chain-data-and-planner.md",
+    "timestamp": "2026-07-06T11:58:40.000547+00:00",
+    "kind": "design_approved_transition"
+  }
+]

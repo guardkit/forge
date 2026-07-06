@@ -1,0 +1,117 @@
+{
+  "task_id": "TASK-MP-001",
+  "turn": 1,
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/models.py",
+    "`src/forge/config/models.py",
+    "src/forge/config/__init__.py",
+    "src/forge/config/models.py",
+    "src/forge/lifecycle/migrations.py"
+  ],
+  "files_created": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/audit.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py",
+    "`src/forge/planning/audit.py",
+    "src/forge/lifecycle/schema_v3.sql",
+    "src/forge/planning/__init__.py",
+    "src/forge/planning/audit.py",
+    "src/forge/planning/planner.py",
+    "src/forge/planning/run_store.py",
+    "src/forge/planning/states.py",
+    "tests/forge/planning/test_planner.py",
+    "tests/forge/planning/test_planning_mode_p.py",
+    "tests/forge/planning/test_run_store.py",
+    "tests/forge/planning/test_states.py",
+    "tests/unit/lifecycle/test_schema_v3_migration.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "PlanningConfig model with all specified fields and validators",
+    "PlanningModelResolution sub-model with model and fallbacks fields",
+    "ForgeConfig.planning field with default_factory",
+    "ApprovalConfig immutability verified (byte-identical to main)",
+    "audit_planning_model_resolution pure function with DF-004 enforcement",
+    "PlanningAuditResult dataclass for audit results",
+    "Comprehensive test suite (16 tests, all passing)",
+    "src/forge/planning/__init__.py with re-exports",
+    "src/forge/config/__init__.py updated with PlanningConfig exports",
+    "All code passes lint and format checks"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 32,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-001/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/models.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/audit.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py"
+  ],
+  "tests_passed_count": 16,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`PlanningConfig` exists in `src/forge/config/models.py` with `model_config = ConfigDict(extra=\"forbid\")` and exactly these fields: `enabled: bool = False` (intake-is-deliberate), `escalation_approver: str | None = None`, `originator_wait_seconds: int` (ge=0), `escalated_wait_seconds: int` (ge=0), `defer_cap: int = 3` (ge=1), `default_target_repo: str | None = None` (org/name-validated when set, mirroring the wire pattern `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`), `target_repo_paths: dict[str, str] = {}` (org/name -> absolute local working-copy path), `terminal: str = \"planned-handoff\"`, `frontier_enabled: bool = False`, `frontier_timeout_seconds: int`, `model_resolution: PlanningModelResolution` (sub-model: `model: str | None = None`, `fallbacks: list[str] = []`)",
+      "status": "complete",
+      "evidence": "Created PlanningConfig and PlanningModelResolution models in src/forge/config/models.py with all specified fields, validators, and default values. Model uses ConfigDict(extra='forbid'). Field validators enforce org/name pattern for default_target_repo and non-negative constraints on wait times. All defaults match specification.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`ForgeConfig` gains an optional `planning: PlanningConfig` field with `default_factory` (house shape, models.py:488-510); **`ApprovalConfig` is byte-identical to main** (verified by test comparing against its current field set \u2014 no new fields, no edits)",
+      "status": "complete",
+      "evidence": "Added planning: PlanningConfig field to ForgeConfig with default_factory=PlanningConfig. ApprovalConfig remains unchanged (3 fields: default_wait_seconds, max_wait_seconds, expected_approver). Test TestApprovalConfigImmutability.test_approval_config_field_set_unchanged verifies the exact field set.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`audit_planning_model_resolution(config: PlanningConfig) -> PlanningAuditResult` in `src/forge/planning/audit.py` is a pure function (no I/O, no raising): non-empty `fallbacks` -> violation result naming DF-004; empty -> pass; result carries a human-readable reason string",
+      "status": "complete",
+      "evidence": "Implemented audit_planning_model_resolution as a pure function in src/forge/planning/audit.py. Returns PlanningAuditResult dataclass (frozen=True) with passed, violation, and reason fields. Empty fallbacks return passed=True; non-empty return passed=False with violation='DF-004'. Function is deterministic, performs no I/O, and never raises exceptions.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/planning/audit.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Defaults verified by test: `enabled=False`, `frontier_enabled=False`, `defer_cap=3`",
+      "status": "complete",
+      "evidence": "Test TestPlanningConfigValidation.test_defaults verifies all default values: enabled=False, frontier_enabled=False, defer_cap=3, escalation_approver=None, default_target_repo=None, target_repo_paths={}, terminal='planned-handoff', model_resolution.model=None, model_resolution.fallbacks=[].",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "All modified/created files pass ruff linter (ruff check) and formatter (ruff format --check) with zero errors. Verified for src/forge/planning/audit.py, src/forge/config/models.py, src/forge/config/__init__.py, and tests/forge/planning/test_planning_mode_p.py.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/audit.py",
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py",
+        "tests/forge/planning/test_planning_mode_p.py"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,164 @@
+{
+  "task_id": "TASK-MP-001",
+  "timestamp": "2026-07-06T13:03:12.815369",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 16,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/models.py",
+    "`src/forge/config/models.py",
+    "src/forge/config/__init__.py",
+    "src/forge/config/models.py",
+    "src/forge/lifecycle/migrations.py"
+  ],
+  "files_created": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/audit.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py",
+    "`src/forge/planning/audit.py",
+    "src/forge/lifecycle/schema_v3.sql",
+    "src/forge/planning/__init__.py",
+    "src/forge/planning/audit.py",
+    "src/forge/planning/planner.py",
+    "src/forge/planning/run_store.py",
+    "src/forge/planning/states.py",
+    "tests/forge/planning/test_planner.py",
+    "tests/forge/planning/test_planning_mode_p.py",
+    "tests/forge/planning/test_run_store.py",
+    "tests/forge/planning/test_states.py",
+    "tests/unit/lifecycle/test_schema_v3_migration.py"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-001/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/config/models.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/__init__.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/audit.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_planning_mode_p.py"
+  ],
+  "summary": "16 tests passed",
+  "sdk_turns": {
+    "turns_used": 32,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "`PlanningConfig` exists in `src/forge/config/models.py` with `model_config = ConfigDict(extra=\"forbid\")` and exactly these fields: `enabled: bool = False` (intake-is-deliberate), `escalation_approver: str | None = None`, `originator_wait_seconds: int` (ge=0), `escalated_wait_seconds: int` (ge=0), `defer_cap: int = 3` (ge=1), `default_target_repo: str | None = None` (org/name-validated when set, mirroring the wire pattern `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`), `target_repo_paths: dict[str, str] = {}` (org/name -> absolute local working-copy path), `terminal: str = \"planned-handoff\"`, `frontier_enabled: bool = False`, `frontier_timeout_seconds: int`, `model_resolution: PlanningModelResolution` (sub-model: `model: str | None = None`, `fallbacks: list[str] = []`)",
+      "status": "complete",
+      "evidence": "Created PlanningConfig and PlanningModelResolution models in src/forge/config/models.py with all specified fields, validators, and default values. Model uses ConfigDict(extra='forbid'). Field validators enforce org/name pattern for default_target_repo and non-negative constraints on wait times. All defaults match specification.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "`ForgeConfig` gains an optional `planning: PlanningConfig` field with `default_factory` (house shape, models.py:488-510); **`ApprovalConfig` is byte-identical to main** (verified by test comparing against its current field set \u2014 no new fields, no edits)",
+      "status": "complete",
+      "evidence": "Added planning: PlanningConfig field to ForgeConfig with default_factory=PlanningConfig. ApprovalConfig remains unchanged (3 fields: default_wait_seconds, max_wait_seconds, expected_approver). Test TestApprovalConfigImmutability.test_approval_config_field_set_unchanged verifies the exact field set.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "`audit_planning_model_resolution(config: PlanningConfig) -> PlanningAuditResult` in `src/forge/planning/audit.py` is a pure function (no I/O, no raising): non-empty `fallbacks` -> violation result naming DF-004; empty -> pass; result carries a human-readable reason string",
+      "status": "complete",
+      "evidence": "Implemented audit_planning_model_resolution as a pure function in src/forge/planning/audit.py. Returns PlanningAuditResult dataclass (frozen=True) with passed, violation, and reason fields. Empty fallbacks return passed=True; non-empty return passed=False with violation='DF-004'. Function is deterministic, performs no I/O, and never raises exceptions.",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/planning/audit.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Defaults verified by test: `enabled=False`, `frontier_enabled=False`, `defer_cap=3`",
+      "status": "complete",
+      "evidence": "Test TestPlanningConfigValidation.test_defaults verifies all default values: enabled=False, frontier_enabled=False, defer_cap=3, escalation_approver=None, default_target_repo=None, target_repo_paths={}, terminal='planned-handoff', model_resolution.model=None, model_resolution.fallbacks=[].",
+      "test_file": "tests/forge/planning/test_planning_mode_p.py",
+      "implementation_files": [
+        "src/forge/config/models.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "All modified/created files pass ruff linter (ruff check) and formatter (ruff format --check) with zero errors. Verified for src/forge/planning/audit.py, src/forge/config/models.py, src/forge/config/__init__.py, and tests/forge/planning/test_planning_mode_p.py.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/audit.py",
+        "src/forge/config/models.py",
+        "src/forge/config/__init__.py",
+        "tests/forge/planning/test_planning_mode_p.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 1.547808040981181
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 181.87477932602633
+    }
+  ]
+}
