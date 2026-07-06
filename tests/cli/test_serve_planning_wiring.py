@@ -137,17 +137,17 @@ class TestCallSitePin:
             await compose_fn(fake_client)
 
         # Assert: composition fake was invoked exactly once
-        assert (
-            compose_fake.was_called()
-        ), "compose_planning_consumer_and_dispatch not called"
+        assert compose_fake.was_called(), (
+            "compose_planning_consumer_and_dispatch not called"
+        )
         assert compose_fake.call_count() == 1, "compose called more than once"
 
         # Assert: PlanningConfig was passed (check kwargs has config-like keys)
         invocation = compose_fake.invocations[0]
         kwargs = invocation[1]["kwargs"]
-        assert (
-            "planning_config" in kwargs or "config" in kwargs
-        ), "PlanningConfig not passed to compose"
+        assert "planning_config" in kwargs or "config" in kwargs, (
+            "PlanningConfig not passed to compose"
+        )
 
 
 class TestRecoveryOrder:
@@ -258,9 +258,9 @@ class TestDefaultConfigZeroInvocations:
             await compose_fn(fake_client)
 
         # Assert: zero invocations of any planning function
-        assert (
-            not compose_fake.was_called()
-        ), "compose called when planning.enabled=False"
+        assert not compose_fake.was_called(), (
+            "compose called when planning.enabled=False"
+        )
         assert not sweep_fake.was_called(), "sweep called when planning.enabled=False"
         assert not rearm_fake.was_called(), "rearm called when planning.enabled=False"
 
@@ -310,14 +310,14 @@ class TestSoftFail:
             await compose_fn(fake_client)
 
         # Assert: error was logged
-        assert any(
-            "planning" in rec.message.lower() for rec in caplog.records
-        ), "Planning error not logged"
+        assert any("planning" in rec.message.lower() for rec in caplog.records), (
+            "Planning error not logged"
+        )
 
         # Assert: build dispatch chain was still bound (mock_build_deps was called)
-        assert (
-            mock_build_deps.called
-        ), "build_pipeline_consumer_deps not called after planning error"
+        assert mock_build_deps.called, (
+            "build_pipeline_consumer_deps not called after planning error"
+        )
 
 
 class TestAdditiveOnly:
