@@ -1,0 +1,176 @@
+{
+  "honesty": {
+    "verified": false,
+    "discrepancies": [
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/cli/serve.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      },
+      {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/cli/test_serve_planning_wiring.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+        "severity": "should_fix",
+        "ignore_rule": null
+      }
+    ],
+    "honesty_score": 1.0,
+    "resolved_paths": [],
+    "should_fix_count": 2
+  },
+  "gathering_status": "complete",
+  "gathering_error": null,
+  "quality_gates": {
+    "tests_passed": true,
+    "coverage_met": true,
+    "arch_review_passed": true,
+    "plan_audit_passed": true,
+    "tests_required": true,
+    "coverage_required": false,
+    "arch_review_required": false,
+    "plan_audit_required": true,
+    "all_gates_passed": true
+  },
+  "coverage_details": {
+    "coverage_met": null,
+    "line_coverage": null,
+    "branch_coverage": null,
+    "line_threshold": null,
+    "branch_threshold": null,
+    "coverage_required": false
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "bdd": null,
+  "bdd_authoring_sweep": null,
+  "arch_review": null,
+  "tests": {
+    "tests_passed": true,
+    "tests_required": true,
+    "tests_run": null,
+    "tests_failed": 0,
+    "all_passed": true,
+    "requires_infrastructure": []
+  },
+  "wiring": null,
+  "mocked_seam": null,
+  "spec_gap": null,
+  "stub_scan": null,
+  "coverage": null,
+  "behavioural_oracle": null,
+  "independent_tests": {
+    "tests_passed": true,
+    "test_command": "pytest tests/cli/test_serve_planning_wiring.py -v --tb=short",
+    "test_output_summary": "Result:\ntests/cli/test_serve_planning_wiring.py::TestRecoveryOrder::test_recovery_functions_invoked_after_composition PASSED [ 40%]\ntests/cli/test_serve_planning_wiring.py::TestDefaultConfigZeroInvocations::test_planning_disabled_means_zero_invocations PASSED [ 60%]\ntests/cli/test_serve_planning_wiring.py::TestSoftFail::test_composition_error_does_not_break_dispatch_chain_binding PASSED [ 80%]\ntests/cli/test_serve_planning_wiring.py::TestAdditiveOnly::test_existing_serve_module_structure_preserved PASSED [100%]\n============================== 5 passed in 0.16s ===============================",
+    "duration_seconds": 0.5419182777404785,
+    "raw_output": "============================= test session starts ==============================\nplatform linux -- Python 3.11.15, pytest-9.1.1, pluggy-1.6.0 -- /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/.venv/bin/python\ncachedir: .pytest_cache\nrootdir: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F\nconfigfile: pyproject.toml\nplugins: anyio-4.14.1, langsmith-0.9.7, bdd-8.1.0, asyncio-1.4.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 5 items\n\ntests/cli/test_serve_planning_wiring.py::TestCallSitePin::test_planning_enabled_invokes_composition_with_config PASSED [ 20%]\ntests/cli/test_serve_planning_wiring.py::TestRecoveryOrder::test_recovery_functions_invoked_after_composition PASSED [ 40%]\ntests/cli/test_serve_planning_wiring.py::TestDefaultConfigZeroInvocations::test_planning_disabled_means_zero_invocations PASSED [ 60%]\ntests/cli/test_serve_planning_wiring.py::TestSoftFail::test_composition_error_does_not_break_dispatch_chain_binding PASSED [ 80%]\ntests/cli/test_serve_planning_wiring.py::TestAdditiveOnly::test_existing_serve_module_structure_preserved PASSED [100%]\n\n============================== 5 passed in 0.16s ===============================\n",
+    "signal_absent": false,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/.venv/bin/python"
+  },
+  "independent_test_classification": null,
+  "requirements": {
+    "criteria_total": 6,
+    "criteria_met": 6,
+    "all_criteria_met": true,
+    "missing": [],
+    "criteria_results": [
+      {
+        "criterion_id": "AC-001",
+        "criterion_text": "Call-site pin: a test monkeypatches `forge.cli._serve_planning.compose_planning_consumer_and_dispatch` (and the two recovery functions) with recording fakes, drives the PRODUCTION composition path in `serve.py` (`bind_production_dispatch_chain`/`_compose`) with a `planning.enabled=True` config and fakes for the NATS client/SQLite pool, and asserts the composition fake was invoked exactly once with the loaded PlanningConfig \u2014 proving the production path, not the module, is wired",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test test_planning_enabled_invokes_composition_with_config verifies production wiring by monkeypatching the three planning functions and driving bind_production_dispatch_chain with planning.enabled=True. Test asserts composition fake called exactly once with PlanningConfig. Test passes."
+      },
+      {
+        "criterion_id": "AC-002",
+        "criterion_text": "Recovery order: the recording fakes show sweep and rearm are invoked after composition, and rearm is invoked at most once (single re-emit owner preserved)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test test_recovery_functions_invoked_after_composition tracks invocation order using ordered wrapper fakes. Asserts order is [compose, sweep, rearm] and rearm called exactly once. Test passes."
+      },
+      {
+        "criterion_id": "AC-003",
+        "criterion_text": "`planning.enabled=False` (default config) \u2192 zero invocations of any planning function, and the full existing `tests/cli/` suite remains green",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test test_planning_disabled_means_zero_invocations verifies zero calls to any planning function when planning.enabled=False. Implementation guards planning wiring with if forge_config.planning.enabled check at serve.py:444. All 97 tests in tests/cli/ pass including 92 pre-existing tests."
+      },
+      {
+        "criterion_id": "AC-004",
+        "criterion_text": "Soft-fail: the composition fake raising -> the build dispatch chain still binds successfully and the error is logged (caplog predicate); daemon boot is never bricked by planning wiring (DDR-007)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Test test_composition_error_does_not_break_dispatch_chain_binding injects a raising fake and verifies build_pipeline_consumer_deps is still called and error is logged. Implementation wraps planning wiring in try/except at serve.py:445-468 with logger.error. Test passes."
+      },
+      {
+        "criterion_id": "AC-005",
+        "criterion_text": "`src/forge/cli/serve.py` diff is additive-only: the Supervisor construction and all existing composition steps are untouched (existing serve tests pass unmodified)",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Planning wiring inserted at serve.py:440-468 between gate rearm and deps build. No existing code modified. All 92 pre-existing tests in tests/cli/test_serve*.py pass unmodified. Test test_existing_serve_module_structure_preserved verifies key exports unchanged."
+      },
+      {
+        "criterion_id": "AC-006",
+        "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+        "result": "verified",
+        "status": "verified",
+        "evidence": "Ran ruff check on src/forge/cli/serve.py and tests/cli/test_serve_planning_wiring.py: All checks passed. Ran black --check: 2 files would be left unchanged. Zero lint or format errors."
+      }
+    ]
+  },
+  "runtime_parity": null,
+  "evidence_repo_tests": [],
+  "severity_recommendations": [],
+  "advisory_issues": [
+    {
+      "severity": "warning",
+      "category": "agent_invocations_advisory",
+      "description": "Advisory (non-blocking): task-work produced a report with 2 of 3 expected agent invocations. Missing phases: 3 (Implementation). Consider invoking these agents via the Task tool to strengthen stack-specific quality:\n- Phase 3: `the stack-specific Phase-3 specialist` (Implementation)",
+      "details": {
+        "missing_phases": [
+          "3"
+        ],
+        "expected_phases": 3,
+        "actual_invocations": 2
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file src/forge/cli/serve.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file src/forge/cli/serve.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    },
+    {
+      "severity": "should_fix",
+      "category": "claim_audit",
+      "description": "Player-claimed file is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player likely swept an orchestrator-managed path into files_modified. Player claimed file tests/cli/test_serve_planning_wiring.py. Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication.",
+      "details": {
+        "claim_type": "claim_audit_unmodified",
+        "player_claim": "Player claimed file tests/cli/test_serve_planning_wiring.py",
+        "actual_value": "Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication."
+      }
+    }
+  ],
+  "task_type": "integration",
+  "profile_name": "integration"
+}

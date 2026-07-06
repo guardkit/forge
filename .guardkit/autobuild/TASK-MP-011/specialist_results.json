@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "passed",
+    "duration_seconds": 0.6214564829133451,
+    "error": null,
+    "tests_run": 5,
+    "tests_failed": 0,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-DD4F/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Result:\ntests/cli/test_serve_planning_wiring.py::TestRecoveryOrder::test_recovery_functions_invoked_after_composition PASSED [ 40%]\ntests/cli/test_serve_planning_wiring.py::TestDefaultConfigZeroInvoca",
+    "quality_gates_passed": true
+  },
+  "phase_5": {
+    "status": "passed",
+    "duration_seconds": 291.32969190203585,
+    "error": null,
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

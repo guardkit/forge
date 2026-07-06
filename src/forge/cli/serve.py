@@ -72,6 +72,11 @@ from forge.cli._serve_config import (
 from forge.cli._serve_daemon import run_daemon
 from forge.cli._serve_dispatcher import make_handle_message_dispatcher
 from forge.cli._serve_healthz import run_healthz_server
+from forge.cli._serve_planning import (
+    compose_planning_consumer_and_dispatch,
+    rearm_paused_planning_runs,
+    sweep_interrupted_planning_runs,
+)
 from forge.cli._serve_state import SubscriptionState
 from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
@@ -429,6 +434,36 @@ def bind_production_dispatch_chain(
                     "forge-serve: rearm_paused_gates FAILED (%s) — paused "
                     "builds were NOT re-armed this boot; they stay PAUSED "
                     "until the next restart",
+                    exc,
+                )
+
+        # TASK-MP-011 — wire Mode P planning composition into serve boot.
+        # Guarded by config.planning.enabled to keep default path zero-cost.
+        # Soft-fail: planning composition failure never bricks daemon boot (DDR-007).
+        # Mirrors gate-parts soft-fail posture (serve.py:396-402).
+        if forge_config.planning.enabled:
+            try:
+                await compose_planning_consumer_and_dispatch(
+                    client=client,
+                    planning_config=forge_config.planning,
+                    sqlite_pool=sqlite_pool,
+                    config=forge_config,
+                )
+                await sweep_interrupted_planning_runs(
+                    sqlite_pool=sqlite_pool,
+                    client=client,
+                    planning_config=forge_config.planning,
+                )
+                await rearm_paused_planning_runs(
+                    sqlite_pool=sqlite_pool,
+                    client=client,
+                    planning_config=forge_config.planning,
+                )
+            except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+                logger.error(
+                    "forge-serve: planning composition FAILED (%s) — daemon "
+                    "continues WITHOUT planning consumer; Mode P will not "
+                    "process planning-queued messages until fixed",
                     exc,
                 )
 

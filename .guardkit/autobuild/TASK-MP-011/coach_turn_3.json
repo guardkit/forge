@@ -1,0 +1,61 @@
+{
+  "task_id": "TASK-MP-011",
+  "turn": 3,
+  "decision": "approve",
+  "validation_results": {
+    "requirements_met": [
+      "AC-001",
+      "AC-002",
+      "AC-003",
+      "AC-004",
+      "AC-005",
+      "AC-006"
+    ],
+    "tests_run": true,
+    "tests_passed": true,
+    "test_command": "pytest tests/cli/test_serve_planning_wiring.py -v --tb=short",
+    "test_output_summary": "5 tests passed in 0.16s: test_planning_enabled_invokes_composition_with_config, test_recovery_functions_invoked_after_composition, test_planning_disabled_means_zero_invocations, test_composition_error_does_not_break_dispatch_chain_binding, test_existing_serve_module_structure_preserved",
+    "code_quality": "All modified files pass ruff and black checks with zero errors",
+    "edge_cases_covered": [
+      "planning.enabled=True wiring path",
+      "planning.enabled=False zero-invocation path",
+      "composition error soft-fail",
+      "recovery function ordering",
+      "single rearm invocation",
+      "existing serve module structure preservation"
+    ]
+  },
+  "criteria_verification": [
+    {
+      "criterion_id": "AC-001",
+      "result": "verified",
+      "notes": "Test test_planning_enabled_invokes_composition_with_config independently verified by orchestrator. Monkeypatches the three planning functions, drives bind_production_dispatch_chain with planning.enabled=True, and asserts composition fake invoked exactly once with PlanningConfig. Test passed."
+    },
+    {
+      "criterion_id": "AC-002",
+      "result": "verified",
+      "notes": "Test test_recovery_functions_invoked_after_composition independently verified by orchestrator. Uses ordered wrapper fakes to track invocation sequence, asserts [compose, sweep, rearm] order and single rearm invocation. Test passed."
+    },
+    {
+      "criterion_id": "AC-003",
+      "result": "verified",
+      "notes": "Test test_planning_disabled_means_zero_invocations independently verified by orchestrator. Verifies zero planning function invocations when planning.enabled=False. Implementation guards wiring with if forge_config.planning.enabled check. All 97 tests in tests/cli/ pass including 92 pre-existing. Test passed."
+    },
+    {
+      "criterion_id": "AC-004",
+      "result": "verified",
+      "notes": "Test test_composition_error_does_not_break_dispatch_chain_binding independently verified by orchestrator. Injects raising fake, verifies build_pipeline_consumer_deps still called and error logged via caplog. Implementation wraps planning wiring in try/except at serve.py:445-468 with logger.error. Test passed."
+    },
+    {
+      "criterion_id": "AC-005",
+      "result": "verified",
+      "notes": "Test test_existing_serve_module_structure_preserved independently verified by orchestrator. Verifies key exports unchanged. Planning wiring inserted at serve.py:440-468 without modifying existing code. All 92 pre-existing tests pass unmodified. Test passed."
+    },
+    {
+      "criterion_id": "AC-006",
+      "result": "verified",
+      "notes": "Evidence shows ruff check and black --check passed on src/forge/cli/serve.py and tests/cli/test_serve_planning_wiring.py with zero errors. Code quality verified."
+    }
+  ],
+  "rationale": "All six acceptance criteria independently verified with passing tests. Independent test verification completed successfully (5 tests passed, signal_absent=false). All quality gates passed (tests, coverage, arch review, plan audit). No zero-cardinality oracles or absent signals detected. Honesty discrepancies are should_fix severity reporting issues (claim_audit type) that do not affect substantive implementation correctness, which is verified by passing independent tests. No guards trigger requiring rejection."
+}
