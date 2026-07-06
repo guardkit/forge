@@ -1,0 +1,24 @@
+id: FEAT-DD4F
+name: Mode P serve boot wiring fix
+description: 'TASK-MP-011: wire compose_planning_consumer_and_dispatch + recovery
+  into serve boot with a call-site pin test (FEAT-3ED2 merge-review finding: PS-002
+  dead-code gap)'
+created: '2026-07-06T14:27:18.875602'
+status: planned
+complexity: 4
+estimated_tasks: 1
+tasks:
+- id: TASK-MP-011
+  name: Wire Mode P planning composition into serve boot
+  file_path: tasks/backlog/mode-p-planning-chain/TASK-MP-011-serve-boot-wiring.md
+  complexity: 4
+  dependencies: []
+  status: pending
+  description: ''
+  implementation_mode: task-work
+  estimated_minutes: 50
+orchestration:
+  parallel_groups:
+  - - TASK-MP-011
+  estimated_duration_minutes: 50
+  recommended_parallel: 1
