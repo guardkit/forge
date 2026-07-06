@@ -1,0 +1,16 @@
+{
+  "task_id": "TASK-MP-005",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "c57cad2b7b875832b648b652e6ef90fd790f39c6",
+      "timestamp": "2026-07-06T13:51:33.907291",
+      "tests_passed": true,
+      "test_count": 18,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false,
+      "evidence_commits": {}
+    }
+  ],
+  "last_updated": "2026-07-06T13:51:33.907386"
+}
