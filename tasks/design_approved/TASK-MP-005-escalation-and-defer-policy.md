@@ -1,17 +1,22 @@
 ---
-id: TASK-MP-005
-title: Escalation, wait ceilings, and defer-cap semantics (durable, clock-injected)
-task_type: feature
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 6
+dependencies:
+- TASK-MP-004B
+- TASK-MP-001
+estimated_minutes: 80
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 4
+id: TASK-MP-005
 implementation_mode: task-work
-complexity: 6
-estimated_minutes: 80
-dependencies: [TASK-MP-004B, TASK-MP-001]
-tags: [mode-p, escalation, df-009]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- escalation
+- df-009
+task_type: feature
+title: Escalation, wait ceilings, and defer-cap semantics (durable, clock-injected)
+wave: 4
 ---
 
 # TASK-MP-005 — Escalation, wait ceilings, and defer-cap semantics

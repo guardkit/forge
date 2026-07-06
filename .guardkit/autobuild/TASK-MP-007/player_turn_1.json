@@ -1,0 +1,108 @@
+{
+  "task_id": "TASK-MP-007",
+  "turn": 1,
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "files_created": [
+    ".guardkit/bdd/TASK-MP-007_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/frontier.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py",
+    "src/forge/planning/escalation.py",
+    "src/forge/planning/frontier.py",
+    "tests/forge/planning/test_escalation.py",
+    "tests/forge/planning/test_frontier.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "FrontierClient Protocol for dependency injection",
+    "build_compressed_brief function with field allowlist",
+    "FrontierSecondOpinion implementing SecondOpinionProvider",
+    "frontier_enabled=False default behavior (zero calls)",
+    "FLAG_FOR_REVIEW predicate (FLAG-only firing)",
+    "Field allowlist policy (no transcript/messages/request_text/raw_conversation)",
+    "Error/timeout degradation to human review",
+    "Never-approve type-level enforcement",
+    "Comprehensive unit tests with RecordingFrontierClient fake"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": 26,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-007/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/frontier.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "tests_passed_count": 11,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "frontier_enabled=False (the default) -> the recording FrontierClient fake shows zero calls AND flagged product docs still pause for human review",
+      "status": "complete",
+      "evidence": "Implemented FrontierSecondOpinion.get_summary_for_approval with early return when frontier_enabled=False. Test test_frontier_disabled_zero_calls verifies zero calls to client and valid brief returned for human review.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Enabled + non-flagged outcome -> zero calls (FLAG-only predicate)",
+      "status": "complete",
+      "evidence": "Implemented gate decision check that only calls frontier when gate_decision == GateMode.FLAG_FOR_REVIEW. Test test_non_flagged_outcome_zero_calls verifies zero calls when gate mode is AUTO_APPROVE.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "The brief passed to the client contains only allowlisted keys (docs summary, assumptions, coach evidence, structured findings) and no transcript/messages/request_text/raw-conversation field",
+      "status": "complete",
+      "evidence": "Implemented build_compressed_brief function with _ALLOWLISTED_KEYS frozenset containing only docs_summary, assumptions, coach_evidence, structured_findings. Test test_brief_contains_only_allowlisted_keys verifies forbidden keys are filtered out from the brief passed to client.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Client raising / timing out -> checkpoint still pauses and the approval request carries a 'second opinion unavailable' note (degrade-to-human, DF-006)",
+      "status": "complete",
+      "evidence": "Implemented try/except around client call with asyncio.wait_for timeout enforcement. On TimeoutError or Exception, returns brief with second_opinion_unavailable=True and second_opinion_error fields. Tests test_client_error_degrades_to_human and test_client_timeout_degrades_to_human verify both error paths.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "The provider's return type carries opinion data only \u2014 no approve/decision field exists on it (type-level never-approve predicate); the opinion is attached to the approval request for the human",
+      "status": "complete",
+      "evidence": "FrontierSecondOpinion.get_summary_for_approval returns dict[str, Any] with only brief and optional second_opinion fields. No approved/decision/auto_approve fields are ever added. Test test_provider_returns_opinion_data_only asserts these fields do not exist in the return value.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran ruff check on both source and test files with zero errors. All imports are used, no unused variables, code follows project style guide.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/frontier.py",
+        "tests/forge/planning/test_frontier.py"
+      ]
+    }
+  ]
+}

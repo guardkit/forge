@@ -1,0 +1,161 @@
+{
+  "task_id": "TASK-MP-007",
+  "timestamp": "2026-07-06T13:44:35.200490",
+  "completed": true,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "Implementation",
+      "completed": true
+    }
+  },
+  "quality_gates": {
+    "tests_passing": false,
+    "tests_passed": 18,
+    "tests_failed": 3,
+    "coverage": 0.0,
+    "coverage_met": false,
+    "all_passed": false,
+    "reconciled_from_specialist": true
+  },
+  "files_modified": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "files_created": [
+    ".guardkit/bdd/TASK-MP-007_junit.xml",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/frontier.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py",
+    "src/forge/planning/escalation.py",
+    "src/forge/planning/frontier.py",
+    "tests/forge/planning/test_escalation.py",
+    "tests/forge/planning/test_frontier.py"
+  ],
+  "files_authored": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.guardkit/autobuild/TASK-MP-007/player_turn_1.json",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/src/forge/planning/frontier.py",
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "tests_written": [
+    "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/tests/forge/planning/test_frontier.py"
+  ],
+  "summary": "11 tests passed",
+  "sdk_turns": {
+    "turns_used": 26,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 0,
+    "missing_phases": [
+      "3",
+      "4",
+      "5"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 0 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n  - Phase 4 (Testing)\n  - Phase 5 (Code Review)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2753 Phase 4 (Phase 4): test-orchestrator\n\u274c Phase 5 (Phase 5): SKIPPED (Not invoked)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "frontier_enabled=False (the default) -> the recording FrontierClient fake shows zero calls AND flagged product docs still pause for human review",
+      "status": "complete",
+      "evidence": "Implemented FrontierSecondOpinion.get_summary_for_approval with early return when frontier_enabled=False. Test test_frontier_disabled_zero_calls verifies zero calls to client and valid brief returned for human review.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Enabled + non-flagged outcome -> zero calls (FLAG-only predicate)",
+      "status": "complete",
+      "evidence": "Implemented gate decision check that only calls frontier when gate_decision == GateMode.FLAG_FOR_REVIEW. Test test_non_flagged_outcome_zero_calls verifies zero calls when gate mode is AUTO_APPROVE.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "The brief passed to the client contains only allowlisted keys (docs summary, assumptions, coach evidence, structured findings) and no transcript/messages/request_text/raw-conversation field",
+      "status": "complete",
+      "evidence": "Implemented build_compressed_brief function with _ALLOWLISTED_KEYS frozenset containing only docs_summary, assumptions, coach_evidence, structured_findings. Test test_brief_contains_only_allowlisted_keys verifies forbidden keys are filtered out from the brief passed to client.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "Client raising / timing out -> checkpoint still pauses and the approval request carries a 'second opinion unavailable' note (degrade-to-human, DF-006)",
+      "status": "complete",
+      "evidence": "Implemented try/except around client call with asyncio.wait_for timeout enforcement. On TimeoutError or Exception, returns brief with second_opinion_unavailable=True and second_opinion_error fields. Tests test_client_error_degrades_to_human and test_client_timeout_degrades_to_human verify both error paths.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-005",
+      "criterion_text": "The provider's return type carries opinion data only \u2014 no approve/decision field exists on it (type-level never-approve predicate); the opinion is attached to the approval request for the human",
+      "status": "complete",
+      "evidence": "FrontierSecondOpinion.get_summary_for_approval returns dict[str, Any] with only brief and optional second_opinion fields. No approved/decision/auto_approve fields are ever added. Test test_provider_returns_opinion_data_only asserts these fields do not exist in the return value.",
+      "test_file": "tests/forge/planning/test_frontier.py",
+      "implementation_files": [
+        "src/forge/planning/frontier.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-006",
+      "criterion_text": "All modified files pass project-configured lint/format checks with zero errors",
+      "status": "complete",
+      "evidence": "Ran ruff check on both source and test files with zero errors. All imports are used, no unused variables, code follows project style guide.",
+      "test_file": null,
+      "implementation_files": [
+        "src/forge/planning/frontier.py",
+        "tests/forge/planning/test_frontier.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "failed",
+      "source": "orchestrator",
+      "duration_seconds": 1.6992942009819672,
+      "error": "tests failed (deterministic Phase 4): Error detail:\n    assert outcome == EscalationOutcome.ESCALATED\nE   AssertionError: assert True == <EscalationOutcome.ESCALATED: 'escalated'>\nE    +  where <Esc"
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "skipped",
+      "source": "orchestrator",
+      "duration_seconds": 0.0,
+      "error": "phase_4 status=failed"
+    }
+  ]
+}

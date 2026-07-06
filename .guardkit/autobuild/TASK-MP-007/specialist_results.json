@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "failed",
+    "duration_seconds": 1.6992942009819672,
+    "error": "tests failed (deterministic Phase 4): Error detail:\n    assert outcome == EscalationOutcome.ESCALATED\nE   AssertionError: assert True == <EscalationOutcome.ESCALATED: 'escalated'>\nE    +  where <Esc",
+    "tests_run": 18,
+    "tests_failed": 3,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-3ED2/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Error detail:\n    assert outcome == EscalationOutcome.ESCALATED\nE   AssertionError: assert True == <EscalationOutcome.ESCALATED: 'escalated'>\nE    +  where <EscalationOutcome.ESCALATED: 'escalated'> =",
+    "quality_gates_passed": false
+  },
+  "phase_5": {
+    "status": "skipped",
+    "duration_seconds": 0.0,
+    "error": "phase_4 status=failed",
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

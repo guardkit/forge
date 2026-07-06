@@ -1,17 +1,22 @@
 ---
-id: TASK-MP-007
-title: DF-006 frontier second opinion (FLAG-only, policy-filtered brief, degrade-to-human)
-task_type: feature
-status: backlog
-parent_review: TASK-REV-83E4
+complexity: 4
+dependencies:
+- TASK-MP-004B
+- TASK-MP-001
+estimated_minutes: 55
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002
-wave: 4
+id: TASK-MP-007
 implementation_mode: task-work
-complexity: 4
-estimated_minutes: 55
-dependencies: [TASK-MP-004B, TASK-MP-001]
-tags: [mode-p, frontier, df-006]
+parent_review: TASK-REV-83E4
+status: design_approved
+tags:
+- mode-p
+- frontier
+- df-006
+task_type: feature
+title: DF-006 frontier second opinion (FLAG-only, policy-filtered brief, degrade-to-human)
+wave: 4
 ---
 
 # TASK-MP-007 — DF-006 frontier second opinion
