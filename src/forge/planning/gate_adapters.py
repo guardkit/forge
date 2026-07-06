@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable
@@ -319,10 +318,11 @@ class PlanningGateRepository:
                 continue
 
             decision = self._rehydrate_decision(correlation_id, stage_label)
+            feature_id = self._extract_feature_id(correlation_id)
             snapshots.append(
                 PausedBuildSnapshot(
                     build_id=_build_run_id(correlation_id),
-                    feature_id="FEAT-SPL-002",  # Planning feature ID
+                    feature_id=feature_id,
                     stage_label=stage_label,
                     request_id=request_id,
                     attempt_count=attempt_count,
@@ -332,6 +332,41 @@ class PlanningGateRepository:
             )
 
         return snapshots
+
+    def _extract_feature_id(self, correlation_id: str) -> str:
+        """Extract feature_id from gate_pause details.
+
+        Args:
+            correlation_id: The planning run ID.
+
+        Returns:
+            The feature_id from gate_pause details, or "FEAT-SPL-002" as fallback.
+        """
+        conn = self._store._connection
+        events = conn.execute(
+            """
+            SELECT details_json FROM planning_run_events
+            WHERE correlation_id = ?
+            ORDER BY recorded_at ASC
+            """,
+            (correlation_id,),
+        ).fetchall()
+
+        for (details_json,) in events:
+            if not details_json:
+                continue
+            try:
+                details = json.loads(details_json)
+                gate_pause = details.get("gate_pause")
+                if isinstance(gate_pause, dict):
+                    feature_id = gate_pause.get("feature_id")
+                    if feature_id:
+                        return feature_id
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        # Fallback to planning feature ID
+        return "FEAT-SPL-002"
 
     def _rehydrate_decision(self, correlation_id: str, stage_label: str) -> GateDecision:
         """Return the persisted decision, or a degraded fallback.

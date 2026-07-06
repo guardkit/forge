@@ -8,7 +8,6 @@ the gate Protocol contracts over SqlitePlanningRunStore.
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -17,13 +16,12 @@ import pytest
 
 from forge.gating.identity import derive_request_id
 from forge.gating.models import GateDecision, GateMode
-from forge.gating.wrappers import PausedBuildSnapshot
 from forge.planning.gate_adapters import (
     PlanningGateRepository,
     PlanningStateMachine,
     build_planning_gate_adapters,
 )
-from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
+from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
 
 
@@ -244,7 +242,7 @@ class TestRecordPausedBuild:
         # Last event should have gate metadata
         last_event = events[-1]
         assert last_event[0] == "HARD_STOP"
-        assert last_event[1] == 65.0
+        assert last_event[1] == 0.65
 
 
 class TestListPausedBuilds:
@@ -346,19 +344,24 @@ class TestStateTransitions:
         decision = GateDecision(
             build_id=f"plan-{correlation_id}",
             stage_label="product_docs",
-            target_kind="task",
-            target_identifier="TASK-001",
+            target_kind="local_tool",
+            target_identifier="product_docs_tool",
             mode=GateMode.HARD_STOP,
             rationale="Test pause",
-            coach_score=70.0,
-            threshold_applied=80.0,
+            coach_score=0.70,
+            threshold_applied=0.80,
             decided_at=clock(),
+        )
+        request_id = derive_request_id(
+            build_id=f"plan-{correlation_id}",
+            stage_label="product_docs",
+            attempt_count=0,
         )
         await repository.record_paused_build(
             build_id=f"plan-{correlation_id}",
             feature_id="FEAT-TEST",
             stage_label="product_docs",
-            request_id="plan-test-corr-sm1.product_docs.0",
+            request_id=request_id,
             attempt_count=0,
             decision=decision,
         )

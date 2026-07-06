@@ -1,0 +1,33 @@
+{
+  "id": "TURN-FEAT-3ED2-2",
+  "feature_id": "FEAT-3ED2",
+  "task_id": "TASK-MP-006",
+  "turn_number": 2,
+  "player_summary": "Implementation attempt",
+  "player_decision": "feedback",
+  "coach_decision": "feedback",
+  "coach_feedback": "- Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/adapters/nats/planning_consumer.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/planning/gate_adapters.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..\n- Deterministic honesty record (claim_audit_unmodified, severity=should_fix): Player claim: Player claimed file src/forge/planning/handoff.py. Actual: Path is tracked in git but 'git status --porcelain' shows no change for it \u2014 the Player claimed work on a file it did not actually modify this turn. Most likely cause: the report writer swept an orchestrator-managed path (e.g. a file under .guardkit/autobuild/ or tasks/<state>/) into files_modified. Defence-in-depth for the agent_invoker-side filter; this is a warning, not a turn-rejecting fabrication..\n... and 5 more issues",
+  "mode": "continuing_work",
+  "blockers_found": [],
+  "progress_summary": "Turn 2: feedback",
+  "acceptance_criteria_status": {},
+  "files_modified": [
+    ".guardkit/bdd/TASK-MP-006_junit.xml",
+    "src/forge/adapters/nats/planning_consumer.py",
+    "src/forge/planning/gate_adapters.py",
+    "src/forge/planning/handoff.py",
+    "tests/forge/adapters/test_planning_consumer.py",
+    "tests/forge/planning/test_gate_adapters.py",
+    "tests/forge/planning/test_handoff.py",
+    ".guardkit/bdd/TASK-MP-008_junit.xml"
+  ],
+  "tests_passed": null,
+  "tests_failed": null,
+  "coverage": null,
+  "arch_score": null,
+  "started_at": "2026-07-06T13:24:27.579916",
+  "completed_at": "2026-07-06T13:24:27.579916",
+  "duration_seconds": null,
+  "lessons_from_turn": [],
+  "what_to_try_next": null
+}
