@@ -141,3 +141,26 @@ async def m():
 asyncio.run(m())
 PY
 ```
+
+## Addendum 5 (2026-07-07 06:48 UTC) — FIRST COMPLETED PHONE APPROVAL ROUND-TRIP
+
+Rich tapped Approve on `build-FEAT-96A391-20260707063340` (dispatched 06:33:40,
+prompt+buttons same second). At **06:48:17 UTC, all hops in one second**:
+- jarvis `slack_reply_decision_published` — decision=approve, correct
+  `.response` subject, NO publish failure (TASK-JNB-111's core-publish fix,
+  first live use);
+- forge ApprovalSubscriber accepted the response (verbatim
+  `decided_by=U03QR8WKT29` == per-config `expected_approver` — identity
+  contract v2 validated live) and published **build-resumed**;
+- `maybe_gate_build: gate decided outcome=RESUMED` →
+  `dispatch_build: gate approved … registering observer + launching autobuild`
+  — the tap resumed and launched a real build;
+- the toy build then ran and FAILED (its feature yaml does not exist in the
+  container checkout — expected; the failure IS the terminal signal).
+
+**JNB-107 scenario 1 (approve loop): VALIDATED.** Window-breach (scenario 4):
+validated ×11 with phone terminal delivery. Remaining for formal JNB-107
+completion: scenario 2 (reject → CANCELLED in SQLite first, then phone
+signal) and scenario 3 (unauthorized click from a non-operator account →
+ephemeral refusal, nothing published) — then `/task-complete TASK-JNB-107`
+and SPL **Gate G1 flips to PASS**. Re-dispatch snippet: addendum 4.
