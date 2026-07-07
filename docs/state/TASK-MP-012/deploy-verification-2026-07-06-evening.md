@@ -164,3 +164,17 @@ completion: scenario 2 (reject → CANCELLED in SQLite first, then phone
 signal) and scenario 3 (unauthorized click from a non-operator account →
 ephemeral refusal, nothing published) — then `/task-complete TASK-JNB-107`
 and SPL **Gate G1 flips to PASS**. Re-dispatch snippet: addendum 4.
+
+## Addendum 6 (2026-07-07 07:00 UTC) — JNB-107 scenario 2 (reject): VALIDATED
+
+`build-FEAT-96A391-20260707065958` (dispatched 06:59:58, prompt+buttons same
+second). Rich tapped Reject; at 07:00:30, one second end-to-end: jarvis
+`slack_reply_decision_published` decision=reject (no publish failure) → forge
+`gate decided outcome=CANCELLED` → `gate terminal … acking slot, not
+launching` (no autobuild) → ledger CANCELLED (authoritative-first per
+DDR-007) → build-cancelled terminal on the phone.
+
+**JNB-107 scoreboard: scenario 1 (approve) ✅ · scenario 2 (reject) ✅ ·
+scenario 4 (window breach) ✅ ×11 · scenario 3 (unauthorized click) remaining
+— needs a tap from a non-allowlisted Slack account. Then
+`/task-complete TASK-JNB-107` → SPL Gate G1 PASS.**
