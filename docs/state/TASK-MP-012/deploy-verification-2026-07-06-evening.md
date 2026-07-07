@@ -178,3 +178,23 @@ DDR-007) → build-cancelled terminal on the phone.
 scenario 4 (window breach) ✅ ×11 · scenario 3 (unauthorized click) remaining
 — needs a tap from a non-allowlisted Slack account. Then
 `/task-complete TASK-JNB-107` → SPL Gate G1 PASS.**
+
+## Addendum 7 (2026-07-07 07:16 UTC) — JNB-107 scenario 3: VALIDATED. ALL FOUR SCENARIOS COMPLETE.
+
+`build-FEAT-96A391-20260707071334`: unauthorized tap from the second account
+(U0BFNQ969U1) at 07:14:20 → allowlist refusal, WARN
+`slack_reply_unauthorized_click`, ephemeral "You are not authorized to decide
+forge approvals from Slack" (operator-confirmed on screen), ZERO publishes,
+build stayed PAUSED. Then the operator's real account approved the SAME
+prompt at 07:16:31 → decision accepted → `gate decided outcome=RESUMED` →
+autobuild launched → ledger RUNNING. "Paused and still approvable after an
+unauthorized attempt" proven on one prompt.
+
+**JNB-107 LIVE VALIDATION COMPLETE:**
+scenario 1 (approve→resume→launch→terminal) ✅ 07:48 ·
+scenario 2 (reject→ledger-first CANCELLED, no launch) ✅ 08:00 ·
+scenario 3 (unauthorized refusal, then operator approve) ✅ 08:16 ·
+scenario 4 (window breach→cancel→phone signal) ✅ ×11.
+Zero `err_code 10100` across the session (JNB-107 AC). Remaining formality:
+`/task-complete TASK-JNB-107` (jarvis session) → **SPL Gate G1: PASS** —
+UBS-003 v1.1 formally shipped.
