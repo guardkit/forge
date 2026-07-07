@@ -1,9 +1,12 @@
 ---
 id: TASK-JNB-109
 title: "Envelope-subscribe adapter: fix the build gate's approval reply path over the raw NATS client"
-status: in_review
+status: completed
 created: 2026-07-06T20:45:00Z
-updated: 2026-07-06T21:15:00Z
+updated: 2026-07-07T09:15:00Z
+completed: 2026-07-07T09:15:00Z
+completed_location: tasks/completed/TASK-JNB-109/
+state_transition_reason: "Rollup 2026-07-07 (Rich's instruction, ops session): JNB-107 live validation complete 2026-07-07 (all four scenarios, Gate G1 PASS) validated the gate/approval chain; Mode P assumptions all 16 accepted by Rich 2026-07-07 (1909a40); MP-010 remains the live planning validation."
 priority: high
 task_type: implementation
 repo: forge

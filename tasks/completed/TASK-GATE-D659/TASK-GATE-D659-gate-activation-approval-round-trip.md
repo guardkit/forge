@@ -1,11 +1,13 @@
 ---
 id: TASK-GATE-D659
 title: "Gate activation: real build pauses at an approval gate, phone round-trip, restart-safe"
-status: in_review
+status: completed
 created: 2026-07-05T16:45:00Z
-updated: 2026-07-05T21:20:00Z
-previous_state: design_approved
-state_transition_reason: "Phase 5 complete: all 3 waves implemented, quality gates passed (in_review)"
+updated: 2026-07-07T09:15:00Z
+completed: 2026-07-07T09:15:00Z
+completed_location: tasks/completed/TASK-GATE-D659/
+previous_state: in_review
+state_transition_reason: "Rollup 2026-07-07 (Rich's instruction, ops session): JNB-107 live validation complete 2026-07-07 (all four scenarios, Gate G1 PASS) validated the gate/approval chain; Mode P assumptions all 16 accepted by Rich 2026-07-07 (1909a40); MP-010 remains the live planning validation."
 design:
   status: approved
   approved_at: "2026-07-05T18:05:00Z"

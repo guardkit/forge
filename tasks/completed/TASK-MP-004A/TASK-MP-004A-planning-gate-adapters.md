@@ -2,7 +2,7 @@
 id: TASK-MP-004A
 title: Planning-backed gate protocol adapters (GateRepository/StateMachine over planning_runs)
 task_type: feature
-status: in_review
+status: completed
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002

@@ -2,7 +2,7 @@
 id: TASK-MP-002
 title: planning_runs durable store (additive schema_v3 + state machine + history)
 task_type: feature
-status: in_review
+status: completed
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002

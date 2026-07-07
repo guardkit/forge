@@ -1,9 +1,12 @@
 ---
 id: TASK-JNB-106
 title: 'forge: v1.1 scenario tests over the production wiring'
-status: in_review
+status: completed
 created: 2026-07-03 15:30:00+00:00
-updated: 2026-07-05 00:00:00+00:00
+updated: 2026-07-07T09:15:00Z
+completed: 2026-07-07T09:15:00Z
+completed_location: tasks/completed/TASK-JNB-106/
+state_transition_reason: "Rollup 2026-07-07 (Rich's instruction, ops session): JNB-107 live validation complete 2026-07-07 (all four scenarios, Gate G1 PASS) validated the gate/approval chain; Mode P assumptions all 16 accepted by Rich 2026-07-07 (1909a40); MP-010 remains the live planning validation."
 state_note: >-
   2026-07-05: implemented via interactive /task-work by the Fable forge-JNB
   session after TASK-JNB-101 (e003201) and TASK-JNB-102 (bc1366d) landed.

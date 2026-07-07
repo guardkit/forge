@@ -1,9 +1,12 @@
 ---
 id: TASK-JNB-102
 title: 'forge: emit build-cancelled on CANCELLED transitions (ASSUM-010 closure)'
-status: in_review
+status: completed
 created: 2026-07-03 15:30:00+00:00
-updated: 2026-07-05 00:00:00+00:00
+updated: 2026-07-07T09:15:00Z
+completed: 2026-07-07T09:15:00Z
+completed_location: tasks/completed/TASK-JNB-102/
+state_transition_reason: "Rollup 2026-07-07 (Rich's instruction, ops session): JNB-107 live validation complete 2026-07-07 (all four scenarios, Gate G1 PASS) validated the gate/approval chain; Mode P assumptions all 16 accepted by Rich 2026-07-07 (1909a40); MP-010 remains the live planning validation."
 state_note: >-
   2026-07-05: implemented via interactive /task-work by the Fable forge-JNB
   session (backlog -> in_progress -> in_review same day). The

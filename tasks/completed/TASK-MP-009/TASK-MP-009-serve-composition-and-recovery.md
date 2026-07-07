@@ -12,7 +12,7 @@ feature_ref: FEAT-SPL-002
 id: TASK-MP-009
 implementation_mode: task-work
 parent_review: TASK-REV-83E4
-status: in_review
+status: completed
 tags:
 - mode-p
 - serve

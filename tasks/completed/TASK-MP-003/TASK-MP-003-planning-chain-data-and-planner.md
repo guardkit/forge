@@ -2,7 +2,7 @@
 id: TASK-MP-003
 title: Planning chain data + pure-function Mode P planner
 task_type: feature
-status: in_review
+status: completed
 parent_review: TASK-REV-83E4
 feature_id: FEAT-3ED2
 feature_ref: FEAT-SPL-002

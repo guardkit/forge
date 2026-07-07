@@ -8,7 +8,7 @@ description: 'v1.1 forge half of FEAT-UBS-003: production wiring of the dormant-
   Gated on the passed v1 checkpoint (TASK-JNB-004, 2026-07-04). Shared approver identity:
   forge expected_approver must equal jarvis slack_decided_by (config-alignment AC).'
 created: '2026-07-04T11:10:50.646064'
-status: failed
+status: completed  # 2026-07-07 rollup: autobuild attempt failed 07-05; tasks delivered via /task-work (JNB-101 e003201, JNB-102 bc1366d, JNB-106 3fc6d41+ff2489c) and live-validated by JNB-107 (Gate G1 PASS)
 complexity: 6
 estimated_tasks: 3
 tasks:
