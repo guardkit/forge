@@ -2,6 +2,14 @@
 
 ## Ideation session capture · 19 June 2026 · Claude Desktop
 
+> **Graduated 2026-07-08.** The output-side decisions D11–D15 in this capture are register-filed
+> as clauses **DF-014.1–.5**
+> (`ai-transition/docs/decisions/DECISION-DF-014-output-side-spine-graduated-d11-d15-by-substance.md`,
+> ACCEPTED by Rich 2026-07-08). **Cite DF-014.n, never bare D-ids** — this doc's D11–D15 numbering
+> collides with two sibling D-namespaces (the conversation-starter's runbook D11–D15 and
+> Workstream-A's D1–D14; DF-014 §1 documents the collision). This copy is **witness W1**: the
+> substance is graduated; no table's wording is canonized. D1–D10 are unaffected.
+
 ---
 
 ## Purpose of this document

@@ -4,6 +4,14 @@
 
 > **Reconstruction note (2 July 2026).** The original of this document was produced in the 19–20 June "FinProxy architecture and deployment model" session but only ever delivered as a Claude Desktop download — the Filesystem MCP write did not land, so it never reached the repo, even though the three companion conversation-starters and the session wrap-up all cite it as their strategic anchor. This file is a faithful reconstruction from the conversation transcript. Decisions **D1–D10** are recovered near-verbatim; **D11–D15** are reconstructed from the "decisions to graduate" summary and the companion `forge-output-loop-conversation-starter.md` / `output-loop-exemplar-scope.md`, where the verbatim rows were lost — their *substance* is faithful but the exact wording may differ from the original. Cross-check against those companions before treating any D11–D15 row as canonical.
 
+> **Graduated 2026-07-08.** The D11–D15 substance is register-filed as clauses **DF-014.1–.5**
+> (`ai-transition/docs/decisions/DECISION-DF-014-output-side-spine-graduated-d11-d15-by-substance.md`,
+> ACCEPTED by Rich 2026-07-08). **Cite DF-014.n, never bare D-ids.** This copy is **witness W2**
+> — DF-014 §1 records that its reconstructed D11–D15 table diverges from the 06-23 committed copy
+> (witness W1, `../factory-scaling-and-output-bottleneck-findings.md`) including on what D14 was,
+> and flags this note's "never reached the repo" premise against W1's existence as an open
+> provenance question (DF-014 §1 Finding 3, unadjudicated at acceptance). D1–D10 are unaffected.
+
 ---
 
 ## Purpose of this document
