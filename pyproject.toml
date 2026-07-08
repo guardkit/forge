@@ -23,13 +23,17 @@ dependencies = [
     "langgraph-api~=0.8.0",
     "langchain-community>=0.4,<0.5",
     "langchain-anthropic>=1.4,<2",
-    # nats-core: widened <0.5 -> <0.6 (TASK-GATE-D659 follow-up). The
-    # 0.4.0 -> 0.5.0 delta is purely additive (PLANNING_QUEUED EventType +
-    # PlanningQueuedPayload + topic; __version__ drift fix) — no existing
-    # payload/EventType/topic/envelope behaviour changed. forge's full suite
-    # passes against the 0.5.0 sibling source. Keep the <0.6 upper bound so a
-    # future 0.6 (potentially breaking) requires a deliberate re-widen + retest.
-    "nats-core>=0.3.0,<0.6",
+    # nats-core: widened <0.6 -> <0.7 (WS1 Session I). The 0.5.0 -> 0.6.0 delta
+    # is purely additive (planning lifecycle + spec-ready handoff EventTypes +
+    # payloads; plan-{cid} approval-topic convention; NotificationPayload
+    # round-trip fields; ApprovalResponsePayload.dispositions; originating_adapter
+    # validate_default fix) — no existing payload/EventType/topic/envelope
+    # behaviour changed, EXCEPT the deliberate tightening that a jarvis-triggered
+    # queued payload with an OMITTED originating_adapter now fails at the wire
+    # (forge always publishes an explicit adapter, so no forge path regresses).
+    # forge's full suite passes against the 0.6.0 sibling source. Keep the <0.7
+    # upper bound so a future 0.7 requires a deliberate re-widen + retest.
+    "nats-core>=0.3.0,<0.7",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     # TASK-FIX-F09A1 (per TASK-REV-F09A §Reproduction C): `click` and `rich`
