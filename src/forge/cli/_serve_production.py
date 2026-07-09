@@ -65,7 +65,11 @@ from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
-    from forge.lifecycle_bridge.wireup import BuildStateRecorder, IdentityProvider
+    from forge.lifecycle_bridge.wireup import (
+        BuildIdResolver,
+        BuildStateRecorder,
+        IdentityProvider,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +178,11 @@ class LifecycleBridgeWireupParts:
     # keeps it privately; reaching into ``bridge._registry`` from the
     # compose closure would be an encapsulation violation).
     registry: BridgeRegistry
+    # FWD-002 (WS3-S6) — resolves the durable ``builds.build_id`` for the
+    # synthetic identity-unresolved build-failed so the terminal write hits
+    # the real queued row. Optional so unit-tier parts constructions (which
+    # never publish a synthetic terminal) need not supply it.
+    build_id_resolver: "BuildIdResolver | None" = None
 
 
 def _build_async_tasks_identity_provider(
@@ -281,6 +290,46 @@ def _build_async_tasks_identity_provider(
     return _provider
 
 
+def _build_build_id_resolver(
+    *,
+    sqlite_pool: SqliteLifecyclePersistence,
+) -> "BuildIdResolver":
+    """Return a ``async (feature_id, correlation_id) -> build_id | None``.
+
+    FWD-002 (WS3-S6): the observer's synthetic identity-unresolved
+    ``build-failed`` must carry the durable ``builds.build_id`` (not the
+    feature_id) so the terminal write hits the real queued row and releases
+    the feature's next dispatch. The ``(feature_id, correlation_id)`` pair is
+    the ASSUM-014 unique key on ``builds``; newest-first ordering mirrors the
+    identity provider's stale-row defence. Transport/SQLite errors downgrade
+    to ``None`` so the observer falls back to feature_id rather than raising
+    inside the deadline handler.
+    """
+
+    async def _resolve(feature_id: str, correlation_id: str) -> str | None:
+        try:
+            row = sqlite_pool.connection.execute(
+                "SELECT build_id FROM builds WHERE feature_id = ? "
+                "AND correlation_id = ? ORDER BY queued_at DESC, rowid DESC "
+                "LIMIT 1",
+                (feature_id, correlation_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "_build_id_resolver: SQLite read failed for feature_id=%s "
+                "correlation_id=%s (%s); treating as None",
+                feature_id,
+                correlation_id,
+                exc,
+            )
+            return None
+        if row is None:
+            return None
+        return row[0] if not hasattr(row, "keys") else row["build_id"]
+
+    return _resolve
+
+
 def _build_lifecycle_bridge_wireup_parts(
     *,
     sqlite_pool: SqliteLifecyclePersistence,
@@ -337,6 +386,10 @@ def _build_lifecycle_bridge_wireup_parts(
     # it the row stays QUEUED past terminal and exists_active_build
     # wedges the feature's next dispatch (2026-07-04 GB10 gap).
     build_state_recorder = build_build_state_recorder(sqlite_pool)
+    # FWD-002 — resolves the durable build_id for the synthetic
+    # identity-unresolved build-failed the observer publishes at the
+    # per-build deadline.
+    build_id_resolver = _build_build_id_resolver(sqlite_pool=sqlite_pool)
 
     return LifecycleBridgeWireupParts(
         bridge=bridge,
@@ -347,6 +400,7 @@ def _build_lifecycle_bridge_wireup_parts(
         terminal_publish_ledger=terminal_publish_ledger,
         build_state_recorder=build_state_recorder,
         registry=registry,
+        build_id_resolver=build_id_resolver,
     )
 
 
@@ -416,18 +470,29 @@ def _build_recovery_reconcile_seam(
         from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
         from forge.lifecycle.recovery import reconcile_on_boot as _recovery_reconcile
 
+        from forge.lifecycle.recovery import (
+            DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
+        )
+
         publisher, _emitter = build_publisher_and_emitter(
             client, config=forge_config.pipeline
         )
+        # FWD-003: sweep stale QUEUED rows (orphans whose build-queued
+        # message is long gone) so they stop blocking exists_active_build.
         report = await _recovery_reconcile(
-            sqlite_pool, publisher, _NoopApprovalRepublisher()
+            sqlite_pool,
+            publisher,
+            _NoopApprovalRepublisher(),
+            stale_queued_threshold_seconds=DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
         )
         logger.info(
             "forge-serve: recovery reconcile complete (interrupted=%d "
-            "paused_suppressed=%d skipped=%d failures=%d)",
+            "paused_suppressed=%d skipped=%d stale_queued_interrupted=%d "
+            "failures=%d)",
             report.interrupted_count,
             report.paused_reissued_count,
             report.skipped_count,
+            report.stale_queued_interrupted_count,
             len(report.failures),
         )
 

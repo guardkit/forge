@@ -147,9 +147,7 @@ class MissingCorrelationIdError(ValueError):
     """
 
 
-def attach_correlation_id_to_v1_payload(
-    payload: object, correlation_id: str
-) -> None:
+def attach_correlation_id_to_v1_payload(payload: object, correlation_id: str) -> None:
     """Attach ``correlation_id`` to a Pydantic v1 payload post-construction.
 
     The v1 lifecycle payloads (``BuildStartedPayload``,
@@ -515,7 +513,9 @@ class StreamEventTranslator:
     # Payload constructors — one per typed envelope
     # ------------------------------------------------------------------
 
-    def _build_started(self, snap: _Snapshot, correlation_id: str) -> BuildStartedPayload:
+    def _build_started(
+        self, snap: _Snapshot, correlation_id: str
+    ) -> BuildStartedPayload:
         payload = BuildStartedPayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
@@ -524,7 +524,9 @@ class StreamEventTranslator:
         attach_correlation_id_to_v1_payload(payload, correlation_id)
         return payload
 
-    def _build_complete(self, snap: _Snapshot, correlation_id: str) -> BuildCompletePayload:
+    def _build_complete(
+        self, snap: _Snapshot, correlation_id: str
+    ) -> BuildCompletePayload:
         total = snap.tasks_completed + snap.tasks_failed
         if total < 1:
             # BuildCompletePayload requires tasks_total >= 1 — synthesise
@@ -542,6 +544,35 @@ class StreamEventTranslator:
             pr_url=None,
             duration_seconds=0,
             summary="autobuild completed (sse)",
+        )
+        attach_correlation_id_to_v1_payload(payload, correlation_id)
+        return payload
+
+    def build_synthetic_failed(
+        self,
+        *,
+        feature_id: str,
+        build_id: str,
+        correlation_id: str,
+        failure_reason: str,
+        recoverable: bool,
+    ) -> BuildFailedPayload:
+        """Build a synthetic ``BuildFailedPayload`` (AC-2 single-owner seam).
+
+        FWD-002 (WS3-S6): the wireup's identity-unresolved deadline handler
+        must publish a terminal ``build-failed`` for a build that never
+        produced an SSE stream — so there is no ``_Snapshot`` to translate.
+        Payload construction is the translator's job (AC-2: the wireup MUST
+        NOT construct pipeline payloads), so this public factory owns the
+        synthetic shape and mirrors :meth:`_build_failed`'s correlation-id
+        attachment.
+        """
+        payload = BuildFailedPayload(
+            feature_id=feature_id,
+            build_id=build_id,
+            failure_reason=failure_reason,
+            recoverable=recoverable,
+            failed_task_id=None,
         )
         attach_correlation_id_to_v1_payload(payload, correlation_id)
         return payload
@@ -595,7 +626,9 @@ class StreamEventTranslator:
             correlation_id=correlation_id,
         )
 
-    def _build_resumed(self, snap: _Snapshot, correlation_id: str) -> BuildResumedPayload:
+    def _build_resumed(
+        self, snap: _Snapshot, correlation_id: str
+    ) -> BuildResumedPayload:
         return BuildResumedPayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
@@ -643,9 +676,7 @@ class StreamEventTranslator:
             )
 
     @staticmethod
-    def _infer_feature_id(
-        stream_part: StreamPart, context: BuildContext
-    ) -> str | None:
+    def _infer_feature_id(stream_part: StreamPart, context: BuildContext) -> str | None:
         """Pull a feature_id from the stream data, falling back to the context.
 
         :class:`BuildContext` carries ``feature_id`` directly, so the

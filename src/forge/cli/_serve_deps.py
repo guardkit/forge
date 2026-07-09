@@ -456,18 +456,55 @@ def _build_dispatch_build(
                 )
                 await ack_callback()
                 return
-            if status is BuildState.INTERRUPTED:
-                # Arm 3 — crash-mid-hop redispatch. ``record_pending_build``
-                # cannot re-insert the row, so re-derive the deterministic
-                # build_id and fall through to the gate flow on the EXISTING
-                # row. Never skip-without-ack (that is the wedge C2 fixes).
+            # Is the pre-dispatch approval gate wired this boot? The
+            # runless-re-dispatch arms below rely on ``maybe_gate_build``
+            # driving QUEUED/INTERRUPTED → RUNNING via ``transition_chain``
+            # BEFORE the runner launches. When the gate is soft-failed
+            # (DDR-007, serve._compose) dispatch falls back to the legacy
+            # no-gate launch, which does NOT advance ``builds.status`` — a
+            # LIVE build then keeps its row at QUEUED/INTERRUPTED for the
+            # whole run, so re-dispatching a redelivery would DOUBLE-LAUNCH
+            # it (FWD-003 merge-review finding). Re-dispatch only when the
+            # gate is wired; otherwise hold the slot (safe; the gate re-wires
+            # next boot).
+            from forge.cli._serve_deps_gating import (
+                bound_gate_parts as _bound_gate_parts,
+            )
+
+            gate_wired = (
+                _bound_gate_parts() is not None
+                and gate_repository is not None
+                and gate_state_machine is not None
+            )
+            if gate_wired and status in (
+                BuildState.INTERRUPTED,
+                BuildState.QUEUED,
+            ):
+                # Arm 3 (crash-mid-hop) extended by FWD-003
+                # (restart-mid-dispatch): an INTERRUPTED row (crash inside a
+                # QUEUED→…→PAUSED hop) OR a row still QUEUED (the original
+                # dispatch was interrupted BEFORE it progressed the row — the
+                # 2026-07-06 restart-mid-dispatch freeze, deploy-record
+                # c042bee) is RUNLESS: no live run streams it and no pause
+                # owns the eventual ack. In the GATED path a live build has
+                # already advanced past QUEUED (→ RUNNING), so a QUEUED/
+                # INTERRUPTED duplicate here is definitively runless.
+                # ``record_pending_build`` cannot re-insert, so re-derive the
+                # deterministic build_id and fall through to the gate flow on
+                # the EXISTING row (``maybe_gate_build`` drives it forward).
+                # Never skip-WITHOUT-ack for these: under
+                # ``max_ack_pending=1`` the un-acked redelivery wedges the
+                # consumer until the 1h ``ack_wait`` expiry (the freeze
+                # self-cleared only at expiry; the 123f1f7 unfreeze note).
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
                 logger.info(
-                    "dispatch_build: duplicate INTERRUPTED build feature_id=%s "
+                    "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "
-                    "the lifecycle (crash-mid-hop recovery)",
+                    "the lifecycle (runless re-dispatch — restart/crash-"
+                    "mid-dispatch recovery)",
+                    status.value,
                     payload.feature_id,
                     payload.correlation_id,
                     build_id,
@@ -475,13 +512,21 @@ def _build_dispatch_build(
                 )
                 # Fall through to the gate flow on the EXISTING row.
             else:
+                # Held slot (skip WITHOUT ack). Covers PAUSED (the pause /
+                # rearm path owns the eventual terminal ack, FEAT-FORGE-010),
+                # any genuinely live PREPARING/RUNNING/FINALISING row, AND —
+                # per the gate_wired guard above — a QUEUED/INTERRUPTED
+                # duplicate while the gate is unwired (where re-dispatch would
+                # double-launch a live no-gate build).
                 logger.warning(
                     "dispatch_build: duplicate active build feature_id=%s "
-                    "correlation_id=%s status=%s (%s); holding the queue "
-                    "slot WITHOUT ack (held-slot invariant)",
+                    "correlation_id=%s status=%s gate_wired=%s (%s); holding "
+                    "the queue slot WITHOUT ack (held-slot invariant — a "
+                    "pause / live run owns the eventual terminal ack)",
                     payload.feature_id,
                     payload.correlation_id,
                     status.value if status is not None else "unknown",
+                    gate_wired,
                     exc,
                 )
                 return

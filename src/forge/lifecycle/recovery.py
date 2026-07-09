@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 from forge.lifecycle.persistence import (
@@ -115,9 +116,20 @@ if TYPE_CHECKING:  # pragma: no cover — import-time only
 
 logger = logging.getLogger(__name__)
 
+#: FWD-003 (WS3-S6) — a QUEUED ``builds`` row older than this is treated as
+#: an orphan at boot and marked INTERRUPTED (removing it from
+#: ``ACTIVE_STATES`` so it stops blocking ``exists_active_build`` — the
+#: "7 stale QUEUED rows for FEAT-9E59 block dispatch indefinitely" gap) and
+#: leaving it re-pickable via arm-3 re-dispatch if its message ever
+#: redelivers. Generous by default: legitimate queue latency is seconds to
+#: minutes, and the freeze self-cleared at the 1h ack_wait — 6h is well
+#: past any live-but-slow build, so a live build is never mis-cleared.
+DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS: float = 6 * 60 * 60
+
 
 __all__ = [
     "ApprovalRepublisher",
+    "DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS",
     "PipelineFailurePublisher",
     "RecoveryReport",
     "reconcile_on_boot",
@@ -165,6 +177,9 @@ class RecoveryReport:
     finalising_warnings: list[str] = field(default_factory=list)
     failures: list[tuple[str, Exception]] = field(default_factory=list)
     skipped_count: int = 0
+    #: FWD-003 — stale QUEUED rows (older than the threshold) marked
+    #: INTERRUPTED so they stop blocking ``exists_active_build``.
+    stale_queued_interrupted_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +369,9 @@ async def reconcile_on_boot(
     persistence: SqliteLifecyclePersistence,
     publisher: PipelineFailurePublisher,
     approval_publisher: ApprovalRepublisher,
+    *,
+    now: datetime | None = None,
+    stale_queued_threshold_seconds: float | None = None,
 ) -> RecoveryReport:
     """Reconcile every non-terminal build per ``API-sqlite-schema.md §6``.
 
@@ -385,6 +403,15 @@ async def reconcile_on_boot(
     """
     report = RecoveryReport()
     builds = persistence.read_non_terminal_builds()
+    # FWD-003: resolve the stale-QUEUED cutoff once per pass. When no
+    # threshold is supplied the QUEUED branch stays the pre-existing no-op
+    # (backward-compatible; existing recovery tests are unaffected).
+    resolved_now = now if now is not None else datetime.now(UTC)
+    stale_cutoff: datetime | None = (
+        resolved_now - timedelta(seconds=stale_queued_threshold_seconds)
+        if stale_queued_threshold_seconds is not None
+        else None
+    )
 
     for build in builds:
         try:
@@ -394,6 +421,7 @@ async def reconcile_on_boot(
                 publisher,
                 approval_publisher,
                 report,
+                stale_cutoff=stale_cutoff,
             )
         except Exception as exc:  # noqa: BLE001 — blanket catch is intentional
             # Failure isolation (AC): record + continue. The exception
@@ -409,10 +437,11 @@ async def reconcile_on_boot(
 
     logger.info(
         "recovery complete: interrupted=%d paused_reissued=%d "
-        "skipped=%d warnings=%d failures=%d",
+        "skipped=%d stale_queued_interrupted=%d warnings=%d failures=%d",
         report.interrupted_count,
         report.paused_reissued_count,
         report.skipped_count,
+        report.stale_queued_interrupted_count,
         len(report.finalising_warnings),
         len(report.failures),
     )
@@ -425,13 +454,46 @@ async def _reconcile_one(
     publisher: PipelineFailurePublisher,
     approval_publisher: ApprovalRepublisher,
     report: RecoveryReport,
+    *,
+    stale_cutoff: datetime | None = None,
 ) -> None:
     """Dispatch a single non-terminal build to its per-state handler."""
     status = build.status
 
     if status is BuildState.QUEUED:
-        # JetStream redelivers if the original message was unacked; no
-        # local action required.
+        # A live QUEUED row's build-queued message is still un-acked and
+        # JetStream redelivers it; no local action required (the redelivery
+        # re-dispatches via dispatch_build's runless-re-dispatch arm).
+        #
+        # FWD-003: EXCEPT a row queued before ``stale_cutoff`` — its message
+        # is gone (long past the 1h ack_wait) yet the row stays QUEUED,
+        # counting toward ``exists_active_build`` and blocking the feature's
+        # next dispatch indefinitely (the "7 stale QUEUED for FEAT-9E59"
+        # gap). Mark it INTERRUPTED: that removes it from ACTIVE_STATES
+        # (un-blocking dispatch) while keeping it re-pickable via arm-3
+        # re-dispatch if a message ever redelivers — strictly safer than
+        # terminalising, which would drop a live-but-slow build.
+        if stale_cutoff is not None and build.queued_at < stale_cutoff:
+            transition = compose_transition(
+                Build(build_id=build.build_id, status=BuildState.QUEUED),
+                BuildState.INTERRUPTED,
+                error=(
+                    "stale-queued: exceeded the boot-reconcile threshold; "
+                    "cleared from the active set"
+                ),
+            )
+            persistence.apply_transition(transition)
+            report.stale_queued_interrupted_count += 1
+            logger.warning(
+                "recovery: stale QUEUED build_id=%s feature_id=%s "
+                "queued_at=%s older than cutoff=%s; marked INTERRUPTED to "
+                "un-block dispatch (FWD-003)",
+                build.build_id,
+                build.feature_id,
+                build.queued_at.isoformat(),
+                stale_cutoff.isoformat(),
+            )
+            return
         report.skipped_count += 1
         return
 

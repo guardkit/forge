@@ -107,6 +107,9 @@ from forge.pipeline.stage_taxonomy import PER_FEATURE_STAGES, StageClass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
+    from datetime import datetime
+
+    from forge.config.models import BudgetGuards
     from forge.pipeline import PipelineLifecycleEmitter
     from forge.pipeline.mode_b_planner import (
         ModeBChainPlanner,
@@ -179,6 +182,12 @@ class TurnOutcome(StrEnum):
         NO_OP: The reasoning model declined to choose any stage (returned
             ``None``). This is distinct from ``WAITING``: the model
             actively reasoned about an empty action.
+        PAUSED_BUDGET: An unattended-profile Mode C build breached a
+            :class:`~forge.config.models.BudgetGuards` cap (review cycles /
+            wall-clock / tokens / coach score). The supervisor refused to
+            dispatch the next cycle, escalated a ``risk_level="high"``
+            approval request, and paused the build (UBS-002). Never fired
+            for attended profiles (caps off, ASSUM-010).
     """
 
     DISPATCHED = "dispatched"
@@ -188,6 +197,7 @@ class TurnOutcome(StrEnum):
     REFUSED_CONSTITUTIONAL = "refused_constitutional"
     TERMINAL = "terminal"
     NO_OP = "no_op"
+    PAUSED_BUDGET = "paused_budget"
 
 
 class BuildState(StrEnum):
@@ -473,9 +483,7 @@ class ModeCHistoryReader(Protocol):
         """Return the Mode C stage history for ``build_id``."""
         ...
 
-    def has_commits(
-        self, build_id: str
-    ) -> bool:  # pragma: no cover - protocol stub
+    def has_commits(self, build_id: str) -> bool:  # pragma: no cover - protocol stub
         """Return ``True`` iff the build's worktree carries one or more commits.
 
         Drives the Mode C planner's clean-follow-up-review branch
@@ -607,13 +615,11 @@ class Supervisor:
     ) = None
     mode_c_planner: ModeCCyclePlanner | None = None
     mode_c_history_reader: ModeCHistoryReader | None = None
-    mode_c_terminal_handler: (
-        Callable[..., Awaitable[ModeCTerminalDecision]] | None
-    ) = None
+    mode_c_terminal_handler: Callable[..., Awaitable[ModeCTerminalDecision]] | None = (
+        None
+    )
     mode_c_commit_probe: CommitProbe | None = None
-    fix_task_context_builder: (
-        Callable[[str, str, Any], Mapping[str, Any]] | None
-    ) = None
+    fix_task_context_builder: Callable[[str, str, Any], Mapping[str, Any]] | None = None
     # ----- TASK-FW10-008: AsyncSubAgentMiddleware tool surface --------
     # ``tools`` carries the ``AsyncSubAgentMiddleware`` start/check/
     # update/cancel/list tools so the supervisor's reasoning model can
@@ -633,6 +639,30 @@ class Supervisor:
     # SQLite row stays intact per ADR-ARCH-008).
     tools: tuple[Any, ...] = field(default_factory=tuple)
     lifecycle_emitter: PipelineLifecycleEmitter | None = None
+
+    # ----- FEAT-UBS-002: unattended budget-guard enforcement ----------
+    # The resolved :class:`BudgetGuards` for the build. ``None`` (or an
+    # ``attended`` caps-off profile) makes the guard a strict no-op —
+    # ModeCCyclePlanner behaviour is byte-for-byte unchanged (ASSUM-010).
+    # Production resolves this from ``config.budget`` (default_profile =
+    # ``attended`` = caps off), so the guard is inert until an operator
+    # selects an unattended profile.
+    budget_guards: "BudgetGuards | None" = None
+    #: Name of the resolved profile, stamped on the escalation payload.
+    budget_profile_name: str = "attended"
+    #: ``() -> datetime`` wall-clock + ``(build_id) -> datetime | None``
+    #: start-time reader for the wall-clock cap. When either is absent the
+    #: wall-clock cap is treated as unenforceable (0.0 elapsed), never a
+    #: breach.
+    budget_wall_clock: "Callable[[], datetime] | None" = None
+    budget_started_at_reader: "Callable[[str], datetime | None] | None" = None
+    #: ``async (build_id, feature_id, payload, verdict, metrics) -> None`` —
+    #: publishes the risk=high approval request and pauses the build
+    #: (SQLite PAUSED + ``emit_paused_then_interrupt``, ADR-ARCH-021
+    #: ordering). Injected by the daemon so the supervisor stays decoupled
+    #: from the wire / SQLite specifics; ``None`` still enforces by
+    #: refusing the dispatch (never a silent continue).
+    budget_pause: "Callable[..., Awaitable[None]] | None" = None
 
     # Stage groupings — pre-computed once so per-turn routing is a
     # single dict lookup rather than a chain of ``in`` checks.
@@ -872,9 +902,7 @@ class Supervisor:
         # 6. Constitutional guard for PULL_REQUEST_REVIEW.
         gate_decision: AutoApproveDecision | None = None
         if choice.stage is StageClass.PULL_REQUEST_REVIEW and choice.auto_approve:
-            gate_decision = self.constitutional_guard.veto_auto_approve(
-                choice.stage
-            )
+            gate_decision = self.constitutional_guard.veto_auto_approve(choice.stage)
             if gate_decision.verdict is AutoApproveVerdict.REFUSED:
                 logger.warning(
                     "supervisor.next_turn: constitutional veto on auto-approve "
@@ -896,9 +924,7 @@ class Supervisor:
                 return report
 
         # 7. Route to the dispatcher.
-        dispatch_result = await self._dispatch(
-            build_id=build_id, choice=choice
-        )
+        dispatch_result = await self._dispatch(build_id=build_id, choice=choice)
 
         # 8. Successful dispatch — assemble the report.
         report = TurnReport(
@@ -1013,9 +1039,7 @@ class Supervisor:
         # by ASSUM-006 but the sequencer enforces the same invariant).
         if chosen_stage is StageClass.AUTOBUILD:
             if chosen_feature_id is None:
-                refusal = (
-                    "MODE_B AUTOBUILD chosen without feature_id; refusing"
-                )
+                refusal = "MODE_B AUTOBUILD chosen without feature_id; refusing"
                 logger.warning(
                     "supervisor.next_turn (MODE_B): %s build_id=%s",
                     refusal,
@@ -1060,9 +1084,7 @@ class Supervisor:
             feature_id=chosen_feature_id,
             rationale=rationale,
         )
-        dispatch_result = await self._dispatch(
-            build_id=build_id, choice=choice
-        )
+        dispatch_result = await self._dispatch(build_id=build_id, choice=choice)
         report = TurnReport(
             outcome=TurnOutcome.DISPATCHED,
             build_id=build_id,
@@ -1115,8 +1137,7 @@ class Supervisor:
                 build_id=build_id,
                 permitted_stages=frozenset(MODE_B_CHAIN),
                 rationale=(
-                    plan.rationale
-                    or "MODE_B planner returned no next_stage; awaiting"
+                    plan.rationale or "MODE_B planner returned no next_stage; awaiting"
                 ),
             )
             self._record_safe(report)
@@ -1201,9 +1222,7 @@ class Supervisor:
         is not (yet) populated; callers treat that as a misuse.
         """
         try:
-            features = list(
-                self.ordering_stage_log_reader.feature_catalogue(build_id)
-            )
+            features = list(self.ordering_stage_log_reader.feature_catalogue(build_id))
         except Exception:  # noqa: BLE001 — defensive read
             return None
         if not features:
@@ -1330,6 +1349,21 @@ class Supervisor:
             self._record_safe(report)
             return report
 
+        # FEAT-UBS-002 — unattended budget-guard enforcement. Evaluated at
+        # the cyclic TASK_REVIEW step (the follow-up review the planner just
+        # chose): if an unattended profile has breached a cap, refuse the
+        # dispatch, escalate a risk=high approval, and pause instead of
+        # spending another cycle. A no-op for attended / unwired profiles.
+        if chosen_stage is StageClass.TASK_REVIEW:
+            budget_report = await self._enforce_mode_c_budget(
+                build_id=build_id,
+                build_state=build_state,
+                history=history,
+                permitted=permitted,
+            )
+            if budget_report is not None:
+                return budget_report
+
         # TASK_REVIEW / TASK_WORK route through the subprocess dispatcher.
         # TASK_WORK carries the fix-task ref; the
         # :class:`ForwardContextBuilder` (TASK-MBC8-005) is consulted
@@ -1341,10 +1375,7 @@ class Supervisor:
             "feature_id": None,
             "rationale": rationale,
         }
-        if (
-            chosen_stage is StageClass.TASK_WORK
-            and plan.next_fix_task is not None
-        ):
+        if chosen_stage is StageClass.TASK_WORK and plan.next_fix_task is not None:
             dispatcher_kwargs["fix_task"] = plan.next_fix_task
             if self.fix_task_context_builder is not None:
                 try:
@@ -1365,9 +1396,7 @@ class Supervisor:
                         build_id,
                     )
 
-        dispatch_result = await self.subprocess_dispatcher(
-            **dispatcher_kwargs
-        )
+        dispatch_result = await self.subprocess_dispatcher(**dispatcher_kwargs)
         report = TurnReport(
             outcome=TurnOutcome.DISPATCHED,
             build_id=build_id,
@@ -1378,6 +1407,132 @@ class Supervisor:
         )
         self._record_safe(report)
         return report
+
+    async def _enforce_mode_c_budget(
+        self,
+        *,
+        build_id: str,
+        build_state: BuildState,
+        history: "Sequence[ModeCStageEntry]",
+        permitted: frozenset[StageClass],
+    ) -> "TurnReport | None":
+        """Evaluate the unattended budget guard (FEAT-UBS-002).
+
+        Returns a :class:`TurnReport` with outcome ``PAUSED_BUDGET`` when a
+        cap is breached (dispatch refused, escalation published, build
+        paused), or ``None`` when the build may proceed. A strict no-op for
+        an unwired / attended (caps-off) profile so ModeCCyclePlanner
+        behaviour is byte-for-byte unchanged (ASSUM-010).
+        """
+        guards = self.budget_guards
+        if guards is None or not guards.caps_enabled:
+            return None
+
+        # Idempotency: an already-PAUSED build has already been escalated —
+        # re-evaluating (e.g. a caller re-runs next_turn before observing the
+        # pause) must NOT re-fire ``budget_pause`` (same deterministic
+        # request_id) AND must NOT dispatch the next cycle. Park it: return
+        # WAITING so the outer loop stays put until an approval resumes the
+        # build (merge-review hardening — the future daemon driver must not
+        # re-dispatch a paused build regardless).
+        if build_state is BuildState.PAUSED:
+            report = TurnReport(
+                outcome=TurnOutcome.WAITING,
+                build_id=build_id,
+                permitted_stages=permitted,
+                chosen_stage=StageClass.TASK_REVIEW,
+                rationale="MODE_C build already PAUSED; budget guard parks it",
+            )
+            self._record_safe(report)
+            return report
+
+        from forge.pipeline.budget_guard import (
+            BuildBudgetMetrics,
+            build_budget_breach_approval_payload,
+            count_review_cycles,
+            evaluate_budget,
+        )
+
+        review_cycles = count_review_cycles(
+            history,
+            is_review=lambda e: e.stage_class == StageClass.TASK_REVIEW,
+        )
+        metrics = BuildBudgetMetrics(
+            review_cycles=review_cycles,
+            elapsed_wallclock_seconds=self._budget_elapsed_seconds(build_id),
+            # tokens / coach-score stay unmeasured today (ADR-ARCH-033); the
+            # caps for them are inert until the runner populates a real value.
+            tokens_used=None,
+            last_coach_score=None,
+        )
+        verdict = evaluate_budget(guards, metrics)
+        if verdict.ok:
+            return None
+
+        feature_id = self._mode_feature_id_for(build_id) or ""
+        # Deterministic per-breach request_id (review_cycles disambiguates a
+        # wall-clock re-breach on a later cycle).
+        request_id = f"budget-{build_id}-{review_cycles}"
+        payload = build_budget_breach_approval_payload(
+            request_id=request_id,
+            build_id=build_id,
+            feature_id=feature_id,
+            profile_name=self.budget_profile_name,
+            verdict=verdict,
+            metrics=metrics,
+        )
+        logger.warning(
+            "supervisor.next_turn (MODE_C): budget guard breach for "
+            "build_id=%s profile=%s cap=%s (%s); refusing dispatch and "
+            "escalating a risk=high approval (UBS-002)",
+            build_id,
+            self.budget_profile_name,
+            verdict.breached_cap,
+            verdict.detail,
+        )
+        if self.budget_pause is not None:
+            # Publishes the risk=high approval + pauses (SQLite PAUSED +
+            # emit_paused_then_interrupt). Never silent — a pause failure
+            # still returns PAUSED_BUDGET so the outer loop stops dispatching.
+            await self.budget_pause(
+                build_id=build_id,
+                feature_id=feature_id,
+                payload=payload,
+                verdict=verdict,
+                metrics=metrics,
+            )
+        else:
+            logger.warning(
+                "supervisor.next_turn (MODE_C): budget breach for build_id=%s "
+                "but no budget_pause collaborator wired — enforcing by "
+                "refusing the dispatch only (no escalation published)",
+                build_id,
+            )
+
+        report = TurnReport(
+            outcome=TurnOutcome.PAUSED_BUDGET,
+            build_id=build_id,
+            permitted_stages=permitted,
+            chosen_stage=StageClass.TASK_REVIEW,
+            chosen_feature_id=feature_id or None,
+            rationale=verdict.detail,
+        )
+        self._record_safe(report)
+        return report
+
+    def _budget_elapsed_seconds(self, build_id: str) -> float:
+        """Wall-clock consumed by the build, or ``0.0`` when unmeasurable.
+
+        Requires BOTH an injected wall-clock and a start-time reader; absent
+        either, the wall-clock cap is unenforceable (0.0 → never a breach),
+        never a false pause.
+        """
+        if self.budget_wall_clock is None or self.budget_started_at_reader is None:
+            return 0.0
+        started = self.budget_started_at_reader(build_id)
+        if started is None:
+            return 0.0
+        return max(0.0, (self.budget_wall_clock() - started).total_seconds())
 
     async def _mode_c_resolve_terminal(
         self,
@@ -1407,9 +1562,7 @@ class Supervisor:
         # terminal (CLEAN_REVIEW or FAILED), prefer the handler's view
         # since it has access to the commit probe. Fall back to the
         # planner's rationale if the handler is not wired.
-        handler = (
-            self.mode_c_terminal_handler or _default_mode_c_evaluate_terminal
-        )
+        handler = self.mode_c_terminal_handler or _default_mode_c_evaluate_terminal
         try:
             decision = await handler(
                 build,

@@ -57,13 +57,13 @@ from forge.lifecycle_bridge.translation import (
 from forge.lifecycle_bridge.wireup import (
     DEFAULT_DEADLINE_SECONDS,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    IDENTITY_UNRESOLVED_FAILURE_REASON,
     LifecycleBridgeWireup,
     TERMINAL_PAYLOAD_TYPES,
 )
 from forge.persistence.migrations import lifecycle_bridge_registry as bridge_migration
 from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.build_ack_handle import BuildAckHandle
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -329,14 +329,10 @@ class TestObserverPublishesViaPublisher:
                 tasks_failed=0,
             ),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
-        await wireup.register_ack_handle(
-            feature_id, "corr-rt", handle
-        )
+        await wireup.register_ack_handle(feature_id, "corr-rt", handle)
         await _drain_observer(wireup, feature_id)
 
         fake_publisher.publish_build_started.assert_awaited()
@@ -367,14 +363,10 @@ class TestObserverPublishesViaPublisher:
                 tasks_failed=1,
             ),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
-        await wireup.register_ack_handle(
-            feature_id, "corr-fail", handle
-        )
+        await wireup.register_ack_handle(feature_id, "corr-fail", handle)
         await _drain_observer(wireup, feature_id)
 
         fake_publisher.publish_build_failed.assert_awaited()
@@ -403,9 +395,7 @@ class TestObserverPublishesViaPublisher:
                 tasks_completed=1,
             ),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
         await wireup.register_ack_handle(feature_id, "corr-rec", handle)
@@ -477,13 +467,9 @@ class TestTerminalArrivalAcksAndDetaches:
         feature_id = "FEAT-TERM-OK"
         parts = [
             _state_part(feature_id, lifecycle="running_wave"),
-            _state_part(
-                feature_id, lifecycle="completed", tasks_completed=1
-            ),
+            _state_part(feature_id, lifecycle="completed", tasks_completed=1),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
         await wireup.register_ack_handle(feature_id, "corr-tx", handle)
@@ -502,13 +488,9 @@ class TestTerminalArrivalAcksAndDetaches:
         feature_id = "FEAT-TERM-FAIL"
         parts = [
             _state_part(feature_id, lifecycle="running_wave"),
-            _state_part(
-                feature_id, lifecycle="failed", tasks_failed=1
-            ),
+            _state_part(feature_id, lifecycle="failed", tasks_failed=1),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
         await wireup.register_ack_handle(feature_id, "corr-tf", handle)
@@ -528,9 +510,7 @@ class TestTerminalArrivalAcksAndDetaches:
             _state_part(feature_id, lifecycle="running_wave"),
             _state_part(feature_id, lifecycle="cancelled"),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
 
         await wireup.register_ack_handle(feature_id, "corr-tc", handle)
@@ -553,9 +533,7 @@ class TestTerminalArrivalAcksAndDetaches:
             _state_part(feature_id, lifecycle="running_wave"),
             _state_part(feature_id, lifecycle="completed", tasks_completed=1),
         ]
-        wireup = _build_wireup(
-            bridge, translator, fake_publisher, parts=parts
-        )
+        wireup = _build_wireup(bridge, translator, fake_publisher, parts=parts)
         handle = _make_handle()
         handle.ack.side_effect = RuntimeError("ack transport error")
 
@@ -624,9 +602,7 @@ class TestSupervisorResponsiveness:
         await wireup.shutdown()
 
         with pytest.raises(RuntimeError, match="shutting down"):
-            await wireup.register_ack_handle(
-                "FEAT-LATE", "corr-late", _make_handle()
-            )
+            await wireup.register_ack_handle("FEAT-LATE", "corr-late", _make_handle())
 
 
 # ---------------------------------------------------------------------------
@@ -665,9 +641,7 @@ class TestShutdownDrainsObservers:
         await wireup.shutdown()
         elapsed = loop.time() - start
 
-        assert elapsed < 5.0, (
-            f"shutdown took {elapsed:.3f}s; AC-6 requires ≤5s"
-        )
+        assert elapsed < 5.0, f"shutdown took {elapsed:.3f}s; AC-6 requires ≤5s"
         assert wireup.active_observer_count() == 0
 
     @pytest.mark.asyncio
@@ -687,9 +661,7 @@ class TestShutdownDrainsObservers:
             identity_poll_interval_seconds=0.0,
             identity_resolution_attempts=1,
         )
-        await wireup.register_ack_handle(
-            "FEAT-CXL", "corr-cxl", _make_handle()
-        )
+        await wireup.register_ack_handle("FEAT-CXL", "corr-cxl", _make_handle())
         task = wireup.get_observer_task("FEAT-CXL")
         assert task is not None and not task.done()
 
@@ -728,9 +700,7 @@ class TestShutdownDrainsObservers:
             identity_resolution_attempts=1,
             shutdown_timeout_seconds=0.1,
         )
-        await wireup.register_ack_handle(
-            "FEAT-TMO", "corr-tmo", _make_handle()
-        )
+        await wireup.register_ack_handle("FEAT-TMO", "corr-tmo", _make_handle())
 
         # Should return cleanly via the timeout branch.
         await wireup.shutdown()
@@ -819,3 +789,144 @@ class TestModuleSurface:
 
     def test_default_deadline_is_300_seconds(self) -> None:
         assert DEFAULT_DEADLINE_SECONDS == 300
+
+
+# ---------------------------------------------------------------------------
+# FWD-002 (WS3-S6) — identity-unresolved-at-deadline publishes build-failed
+# ---------------------------------------------------------------------------
+
+
+def _never_resolves():
+    async def _provider(_feature_id: str) -> tuple[str, str] | None:
+        return None
+
+    return _provider
+
+
+def _build_identity_unresolved_wireup(
+    bridge,
+    translator,
+    fake_publisher,
+    *,
+    deadline_seconds: float = 0.15,
+    build_id_resolver=None,
+):
+    return LifecycleBridgeWireup(
+        bridge=bridge,
+        translator=translator,
+        publisher=fake_publisher,
+        stream_source=_make_stream_source([]),
+        identity_provider=_never_resolves(),
+        deadline_seconds=deadline_seconds,  # type: ignore[arg-type]
+        identity_resolution_attempts=1,
+        identity_poll_interval_seconds=0.01,
+        build_id_resolver=build_id_resolver,
+    )
+
+
+class TestIdentityUnresolvedPublishesBuildFailed:
+    """FWD-002: a build whose identity never resolves is not a silent loop."""
+
+    @pytest.mark.asyncio
+    async def test_deadline_fires_and_publishes_build_failed(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # AC-2: identity 404s -> deadline fires -> build-failed envelope.
+        async def _resolver(feature_id: str, correlation_id: str) -> str:
+            return "build-real-123"
+
+        wireup = _build_identity_unresolved_wireup(
+            bridge, translator, fake_publisher, build_id_resolver=_resolver
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-IDU", "corr-idu", handle)
+        await _drain_observer(wireup, "FEAT-IDU", timeout=2.0)
+
+        # A synthetic build-failed was published exactly once ...
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert isinstance(sent, BuildFailedPayload)
+        assert sent.feature_id == "FEAT-IDU"
+        assert sent.failure_reason == IDENTITY_UNRESOLVED_FAILURE_REASON
+        # ... carrying the DURABLE build_id from the resolver (so the
+        # terminal write hits the real queued row, not feature_id).
+        assert sent.build_id == "build-real-123"
+        # ... and the inbound message was acked (slot released).
+        handle.ack.assert_awaited_once()
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_no_resolver_falls_back_to_feature_id(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # Without a resolver the synthetic terminal still publishes — the
+        # no-silent-stuck-build invariant holds regardless of build_id.
+        wireup = _build_identity_unresolved_wireup(
+            bridge, translator, fake_publisher, build_id_resolver=None
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-NOR", "corr-nor", handle)
+        await _drain_observer(wireup, "FEAT-NOR", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.build_id == "FEAT-NOR"
+        handle.ack.assert_awaited_once()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_identity_resolved_during_wait_streams_no_failure(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # A slow dispatch that surfaces identity DURING the deadline wait
+        # must NOT be failed — the observer proceeds to stream instead.
+        calls = {"n": 0}
+
+        async def _slow_provider(_feature_id: str) -> tuple[str, str] | None:
+            calls["n"] += 1
+            # First (initial budget) poll misses; a later poll resolves.
+            if calls["n"] >= 2:
+                return ("thread-late", "run-late")
+            return None
+
+        wireup = LifecycleBridgeWireup(
+            bridge=bridge,
+            translator=translator,
+            publisher=fake_publisher,
+            stream_source=_make_stream_source([]),
+            identity_provider=_slow_provider,
+            deadline_seconds=2,
+            identity_resolution_attempts=1,
+            identity_poll_interval_seconds=0.01,
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-SLOW", "corr-slow", handle)
+        await _drain_observer(wireup, "FEAT-SLOW", timeout=2.0)
+
+        # No identity-unresolved build-failed — the stream (empty) closed
+        # cleanly and the observer left the message for JetStream redelivery.
+        fake_publisher.publish_build_failed.assert_not_awaited()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_publish_failure_leaves_message_unacked(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # If the synthetic build-failed publish fails, the inbound message
+        # is left un-acked (JetStream redelivery / next-boot recovery
+        # retries) — never a silent drop.
+        fake_publisher.publish_build_failed = AsyncMock(
+            side_effect=RuntimeError("broker down")
+        )
+        wireup = _build_identity_unresolved_wireup(bridge, translator, fake_publisher)
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-PFAIL", "corr-pfail", handle)
+        await _drain_observer(wireup, "FEAT-PFAIL", timeout=2.0)
+
+        handle.ack.assert_not_awaited()
+        await wireup.shutdown()

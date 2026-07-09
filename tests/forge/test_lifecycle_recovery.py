@@ -225,6 +225,98 @@ def _read_error(persistence: SqliteLifecyclePersistence, build_id: str) -> str |
 
 
 # ---------------------------------------------------------------------------
+# FWD-003 (WS3-S6) — stale-QUEUED boot reconcile un-blocks dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestStaleQueuedReconcile:
+    """A QUEUED row past the stale threshold is cleared from the active set."""
+
+    def test_stale_queued_marked_interrupted_and_unblocks_dispatch(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        # A QUEUED row queued long ago (its build-queued message is gone)
+        # blocks exists_active_build → the feature's next dispatch. The
+        # stale reconcile marks it INTERRUPTED (not active), un-blocking it,
+        # while keeping it re-pickable via arm-3 redelivery (no data loss).
+        queued_at = datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC)
+        build_id = persistence.record_pending_build(
+            _make_payload(
+                feature_id="FEAT-STALE", correlation_id="c-stale", queued_at=queued_at
+            )
+        )
+        assert persistence.exists_active_build("FEAT-STALE") is True
+
+        publisher = _RecordingPipelinePublisher()
+        approval = _RecordingApprovalPublisher()
+        report = asyncio.run(
+            reconcile_on_boot(
+                persistence,
+                publisher,
+                approval,
+                now=datetime(2026, 4, 27, 13, 0, 0, tzinfo=UTC),  # +1h
+                stale_queued_threshold_seconds=1800,  # 30min cutoff
+            )
+        )
+
+        assert _read_status(persistence, build_id) == "INTERRUPTED"
+        assert report.stale_queued_interrupted_count == 1
+        assert report.skipped_count == 0
+        # The row no longer blocks the feature's next dispatch.
+        assert persistence.exists_active_build("FEAT-STALE") is False
+        # No terminal publish — INTERRUPTED is a recoverable, non-terminal
+        # state (strictly safer than terminalising a live-but-slow build).
+        assert publisher.published_failed == []
+
+    def test_fresh_queued_row_is_left_untouched(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        # Guardrail: a recently-queued build (within the threshold) MUST NOT
+        # be swept — legitimate queue latency is not an orphan.
+        queued_at = datetime(2026, 4, 27, 12, 50, 0, tzinfo=UTC)
+        build_id = persistence.record_pending_build(
+            _make_payload(
+                feature_id="FEAT-FRESH", correlation_id="c-fresh", queued_at=queued_at
+            )
+        )
+        publisher = _RecordingPipelinePublisher()
+        approval = _RecordingApprovalPublisher()
+        report = asyncio.run(
+            reconcile_on_boot(
+                persistence,
+                publisher,
+                approval,
+                now=datetime(2026, 4, 27, 13, 0, 0, tzinfo=UTC),  # +10min
+                stale_queued_threshold_seconds=1800,  # 30min cutoff
+            )
+        )
+
+        assert _read_status(persistence, build_id) == "QUEUED"
+        assert report.stale_queued_interrupted_count == 0
+        assert report.skipped_count == 1
+
+    def test_no_threshold_leaves_queued_untouched_backward_compat(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        # Without a threshold the QUEUED branch is the pre-existing no-op —
+        # existing recovery callers/tests are unaffected.
+        build_id = persistence.record_pending_build(
+            _make_payload(
+                feature_id="FEAT-BC",
+                correlation_id="c-bc",
+                queued_at=datetime(2020, 1, 1, tzinfo=UTC),
+            )
+        )
+        publisher = _RecordingPipelinePublisher()
+        approval = _RecordingApprovalPublisher()
+        report = asyncio.run(reconcile_on_boot(persistence, publisher, approval))
+
+        assert _read_status(persistence, build_id) == "QUEUED"
+        assert report.stale_queued_interrupted_count == 0
+        assert report.skipped_count == 1
+
+
+# ---------------------------------------------------------------------------
 # AC-001 + AC-005 + AC-010: full per-state recovery matrix
 # ---------------------------------------------------------------------------
 

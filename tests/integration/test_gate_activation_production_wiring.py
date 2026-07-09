@@ -615,6 +615,28 @@ def _bound_dispatch_deps(
     return deps
 
 
+def _unwired_dispatch_deps(
+    nats: InMemoryNats,
+    pool: SqliteLifecyclePersistence,
+    starter: _FakeStarter,
+):
+    """Deps with the approval gate NOT wired (DDR-007 soft-fail state).
+
+    Models the boot where ``build_approval_gate_parts`` was caught by the
+    DDR-007 guard: ``bound_gate_parts()`` is None and no gate adapters are
+    threaded, so dispatch runs the legacy no-gate launch path.
+    """
+    _serve_deps_gating._reset_for_tests()  # bound_gate_parts() -> None
+    cfg = _forge_config()
+    return build_pipeline_consumer_deps(
+        nats,
+        cfg,
+        pool,
+        async_task_starter=starter,
+        # gate_repository / gate_state_machine omitted → gate_wired False.
+    )
+
+
 class TestDispatchWiring:
     @pytest.mark.asyncio
     async def test_dispatch_gates_then_launches_on_approve_and_registers_observer(
@@ -723,6 +745,96 @@ class TestDispatchWiring:
         assert acked == []
         assert starter.launches == []
         assert _row(pool, build_id)[0] == BuildState.PAUSED.value
+
+    @pytest.mark.asyncio
+    async def test_restart_mid_dispatch_freeze_queued_redelivery_redispatches(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        # FWD-003 — the 2026-07-06 restart-mid-dispatch freeze, reproduced.
+        #
+        # Freeze shape (deploy-record c042bee + the 123f1f7 unfreeze note):
+        # forge restarted mid-dispatch, BEFORE the QUEUED row progressed to
+        # PREPARING. On restart the build-queued message redelivered; the
+        # builds row was still QUEUED. Under max_ack_pending=1 the old
+        # behaviour hit the "duplicate active build" arm and skipped WITHOUT
+        # ack — so the un-acked redelivery wedged the single-consumer queue
+        # until the 1h ack_wait expiry (the queue "self-cleared only at
+        # expiry").
+        #
+        # After FWD-003 a QUEUED duplicate is RUNLESS and re-dispatches on the
+        # existing build_id: the redelivery drives the gate → approve →
+        # launch instead of spinning silently.
+        starter = _FakeStarter()
+        deps = _bound_dispatch_deps(nats, pool, starter)
+        payload = _make_payload()
+
+        # First dispatch was interrupted before it progressed the row: seed a
+        # bare QUEUED row (record_pending_build's effect) and stop there.
+        build_id = pool.record_pending_build(payload)
+        assert _row(pool, build_id)[0] == BuildState.QUEUED.value
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        registered: list[bool] = []
+
+        async def _register_observer() -> None:
+            registered.append(True)
+
+        # The redelivery — record_pending_build raises DuplicateBuildError
+        # (row already QUEUED). The freeze fix re-dispatches through the gate.
+        task = asyncio.create_task(
+            deps.dispatch_build(payload, _ack, _register_observer)
+        )
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id),
+            decision="approve",
+        )
+        await asyncio.wait_for(task, timeout=5.0)
+
+        # UN-WEDGED: the redelivery re-dispatched (gate ran → approve →
+        # launch) rather than skip-WITHOUT-ack. Observer registered on the
+        # approve → launch path; the row advanced past QUEUED to RUNNING.
+        assert len(starter.launches) == 1
+        assert starter.launches[0]["build_id"] == build_id
+        assert registered == [True]
+        assert _row(pool, build_id)[0] == BuildState.RUNNING.value
+
+    @pytest.mark.asyncio
+    async def test_queued_redelivery_holds_slot_when_gate_unwired_no_double_launch(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        # FWD-003 merge-review regression guard: in the DDR-007 no-gate
+        # soft-fail path the legacy launch does NOT advance builds.status, so
+        # a LIVE build keeps its row at QUEUED. A redelivery must therefore
+        # NOT re-dispatch (that would double-launch the live build) — it holds
+        # the slot. The runless-re-dispatch arm is gated on the gate being
+        # wired precisely to avoid this.
+        starter = _FakeStarter()
+        deps = _unwired_dispatch_deps(nats, pool, starter)
+        payload = _make_payload()
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        # First delivery: legacy no-gate launch; row stays QUEUED (no gate
+        # hops to advance it).
+        await asyncio.wait_for(deps.dispatch_build(payload, _ack), timeout=5.0)
+        build_id = derive_build_id(FEATURE_ID, QUEUED_AT)
+        assert len(starter.launches) == 1
+        assert _row(pool, build_id)[0] == BuildState.QUEUED.value
+
+        # Redelivery of the identical payload while the build is LIVE (row
+        # still QUEUED). Must HOLD the slot — no second launch, no ack.
+        await asyncio.wait_for(deps.dispatch_build(payload, _ack), timeout=5.0)
+        assert len(starter.launches) == 1, "must NOT double-launch a live build"
+        assert acked == []
 
     @pytest.mark.asyncio
     async def test_duplicate_delivery_post_terminal_is_acked(

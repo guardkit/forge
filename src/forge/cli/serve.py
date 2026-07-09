@@ -351,6 +351,7 @@ def bind_production_dispatch_chain(
                 identity_provider=bridge_wireup_parts.identity_provider,
                 run_state_fetcher=bridge_wireup_parts.run_state_fetcher,
                 build_state_recorder=bridge_wireup_parts.build_state_recorder,
+                build_id_resolver=bridge_wireup_parts.build_id_resolver,
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
@@ -391,13 +392,26 @@ def bind_production_dispatch_chain(
                     # once a runner-side activation point can pre-create the
                     # registry row before the pause (plan §Future).
                     bridge_registry=None,
-                    # Refresh loop stays DISABLED for v1 (plan
-                    # "Refresh-loop decision"): a raw-publisher refresh would
-                    # mint request_ids with no superseding build-paused and
-                    # break long pauses. The SQLite ``gate_repository`` is
-                    # threaded into ``make_gate_check_deps`` instead (via the
-                    # dispatch closure), NOT into the parts.
-                    repository=None,
+                    # WS3-S6 (2026-07-09) — refresh-on-timeout WIRED LIVE.
+                    # D659 shipped the real SQLite ``gate_repository`` at
+                    # ``build_sqlite_gate_adapters`` above; thread it into the
+                    # parts so the subscriber's API §7 refresh loop is live.
+                    # Without it ``publish_refresh`` stayed None and a pause
+                    # gave up after ONE ``default_wait_seconds`` window (300s)
+                    # instead of waiting the full ``max_wait_seconds`` (1h) —
+                    # single-window pauses silently expired well before the
+                    # operator's phone round-trip and before the 1h JetStream
+                    # ack_wait (FWD-003). With it, the subscriber re-derives
+                    # + persists + re-publishes the current ``request_id`` each
+                    # window up to ``max_wait_seconds``; boot recovery re-emits
+                    # the persisted (refreshed) id. The refresh re-publish uses
+                    # the raw approval publisher (no build-paused mirror), which
+                    # is correct: jarvis JNB-103 joins request→paused on
+                    # ``build_id`` (not ``request_id``), so the original pause's
+                    # build-paused keeps the prompt rendered while the refresh
+                    # only supersedes the request envelope + extends forge's
+                    # wait. The prior "keep disabled for v1" note is superseded.
+                    repository=gate_repository,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection

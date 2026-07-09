@@ -54,9 +54,11 @@ from forge.pipeline.mode_b_planner import (
     ModeBChainPlanner,
     StageEntry as ModeBStageEntry,
 )
+from forge.config.models import BudgetGuards
 from forge.pipeline.mode_c_planner import (
     FixTaskRef as ModeCFixTaskRef,
     ModeCCyclePlanner,
+    ModeCPlan,
     StageEntry as ModeCStageEntry,
 )
 from forge.pipeline.mode_chains_data import (
@@ -89,7 +91,6 @@ from forge.pipeline.terminal_handlers.mode_c import (
     ModeCTerminal as ModeCHandlerTerminal,
     ModeCTerminalDecision,
 )
-
 
 # ---------------------------------------------------------------------------
 # Coroutine driver — replaces pytest-asyncio
@@ -158,13 +159,9 @@ class FakeAutobuildState:
 
 @dataclass
 class FakeAsyncTaskReader:
-    states_by_build: dict[str, list[FakeAutobuildState]] = field(
-        default_factory=dict
-    )
+    states_by_build: dict[str, list[FakeAutobuildState]] = field(default_factory=dict)
 
-    def list_autobuild_states(
-        self, build_id: str
-    ) -> Iterable[FakeAutobuildState]:
+    def list_autobuild_states(self, build_id: str) -> Iterable[FakeAutobuildState]:
         return list(self.states_by_build.get(build_id, []))
 
 
@@ -274,9 +271,7 @@ class RecordingPRReviewGate:
 class FakeModeBHistoryReader:
     histories: dict[str, list[ModeBStageEntry]] = field(default_factory=dict)
 
-    def get_mode_b_history(
-        self, build_id: str
-    ) -> Sequence[ModeBStageEntry]:
+    def get_mode_b_history(self, build_id: str) -> Sequence[ModeBStageEntry]:
         return list(self.histories.get(build_id, []))
 
 
@@ -295,9 +290,7 @@ class FakeModeCHistoryReader:
     histories: dict[str, list[ModeCStageEntry]] = field(default_factory=dict)
     commits: dict[str, bool] = field(default_factory=dict)
 
-    def get_mode_c_history(
-        self, build_id: str
-    ) -> Sequence[ModeCStageEntry]:
+    def get_mode_c_history(self, build_id: str) -> Sequence[ModeCStageEntry]:
         return list(self.histories.get(build_id, []))
 
     def has_commits(self, build_id: str) -> bool:
@@ -654,9 +647,7 @@ class TestModeBPostAutobuildRouting:
         # supervisor uses the injected handler rather than the default.
         captured: list[Any] = []
 
-        def custom_handler(
-            build: Any, history: Sequence[Any]
-        ) -> ModeBPostAutobuild:
+        def custom_handler(build: Any, history: Sequence[Any]) -> ModeBPostAutobuild:
             captured.append({"build_id": build.build_id, "n": len(history)})
             return ModeBPostAutobuild(
                 route=MODE_B_NO_OP,
@@ -669,10 +660,10 @@ class TestModeBPostAutobuildRouting:
         supervisor, doubles = _build_supervisor()
         supervisor.mode_b_post_autobuild = custom_handler  # type: ignore[assignment]
         doubles["mode_reader"].modes["build-CUST"] = BuildMode.MODE_B
-        doubles["mode_b_history"].histories["build-CUST"] = (
-            TestModeBPostAutobuildRouting()._approved_autobuild_history(
-                changed_files_count=0
-            )
+        doubles["mode_b_history"].histories[
+            "build-CUST"
+        ] = TestModeBPostAutobuildRouting()._approved_autobuild_history(
+            changed_files_count=0
         )
 
         report = _run(supervisor.next_turn("build-CUST"))
@@ -1028,3 +1019,131 @@ class TestModeMisconfiguration:
 
         assert report.outcome is TurnOutcome.WAITING
         assert doubles["subprocess"].calls == []
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 — unattended budget-guard enforcement in the Mode C loop
+# ---------------------------------------------------------------------------
+
+
+class _AlwaysReviewPlanner:
+    """Fake Mode C planner that always chooses a follow-up TASK_REVIEW.
+
+    Isolates the budget-guard enforcement from the real planner's
+    history heuristics — the thing under test is the cap check, not the
+    planner's stage selection.
+    """
+
+    def plan_next_stage(self, build, history, *, has_commits):  # noqa: ANN001
+        return ModeCPlan(
+            permitted_stages=frozenset(MODE_C_CHAIN),
+            next_stage=StageClass.TASK_REVIEW,
+            rationale="follow-up review (fake planner)",
+        )
+
+
+def _review_entries(n: int) -> list[ModeCStageEntry]:
+    return [
+        ModeCStageEntry(stage_class=StageClass.TASK_REVIEW, status="approved")
+        for _ in range(n)
+    ]
+
+
+class TestModeCBudgetEnforcement:
+    """UBS-002: an unattended profile at a cap pauses + escalates."""
+
+    def _unattended(self, *, max_review_cycles: int):
+        supervisor, doubles = _build_supervisor()
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+        supervisor.budget_guards = BudgetGuards(max_review_cycles=max_review_cycles)
+        supervisor.budget_profile_name = "unattended"
+        recorder: list[dict[str, Any]] = []
+
+        async def _pause(**kwargs: Any) -> None:
+            recorder.append(kwargs)
+
+        supervisor.budget_pause = _pause
+        return supervisor, doubles, recorder
+
+    def test_review_cycle_breach_pauses_and_escalates_risk_high(self) -> None:
+        # GATE (AC-01): a Mode C build under an unattended profile that
+        # reaches max_review_cycles pauses and emits a risk=high approval
+        # whose details.reason == "budget_guard_breach"; NOT dispatched.
+        supervisor, doubles, recorder = self._unattended(max_review_cycles=2)
+        doubles["mode_reader"].modes["build-BUDGET"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-BUDGET"] = _review_entries(2)
+
+        report = _run(supervisor.next_turn("build-BUDGET"))
+
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+        # Enforcement: the next cycle was NOT dispatched.
+        assert doubles["subprocess"].calls == []
+        # Escalation: one risk=high, budget_guard_breach approval published.
+        assert len(recorder) == 1
+        payload = recorder[0]["payload"]
+        assert payload.risk_level == "high"
+        assert payload.details["reason"] == "budget_guard_breach"
+        assert payload.details["breached_cap"] == "max_review_cycles"
+
+    def test_under_cap_dispatches_normally(self) -> None:
+        supervisor, doubles, recorder = self._unattended(max_review_cycles=5)
+        doubles["mode_reader"].modes["build-UNDER"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-UNDER"] = _review_entries(1)
+
+        report = _run(supervisor.next_turn("build-UNDER"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert recorder == []
+        assert len(doubles["subprocess"].calls) == 1
+
+    def test_attended_profile_caps_off_never_pauses(self) -> None:
+        # AC-03: an attended (caps-off) profile is never paused by the guard
+        # even with a review history that would breach an unattended cap —
+        # ModeCCyclePlanner behaviour is byte-for-byte unchanged (ASSUM-010).
+        supervisor, doubles = _build_supervisor()
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+        supervisor.budget_guards = BudgetGuards()  # no caps → caps_enabled False
+        supervisor.budget_profile_name = "attended"
+        recorder: list[dict[str, Any]] = []
+
+        async def _pause(**kwargs: Any) -> None:  # pragma: no cover - never called
+            recorder.append(kwargs)
+
+        supervisor.budget_pause = _pause
+        doubles["mode_reader"].modes["build-ATT"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-ATT"] = _review_entries(9)
+
+        report = _run(supervisor.next_turn("build-ATT"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert recorder == []
+        assert len(doubles["subprocess"].calls) == 1
+
+    def test_no_guards_wired_is_noop(self) -> None:
+        # Default (budget_guards is None): pure no-op, normal dispatch.
+        supervisor, doubles = _build_supervisor()
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+        doubles["mode_reader"].modes["build-NG"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-NG"] = _review_entries(9)
+
+        report = _run(supervisor.next_turn("build-NG"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert len(doubles["subprocess"].calls) == 1
+
+    def test_already_paused_build_is_not_re_escalated(self) -> None:
+        # Idempotency (merge-review hardening): a build already PAUSED at cap
+        # must NOT re-fire budget_pause (same deterministic request_id) when
+        # next_turn is re-run before the pause is observed.
+        supervisor, doubles, recorder = self._unattended(max_review_cycles=2)
+        doubles["mode_reader"].modes["build-REPAUSE"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-REPAUSE"] = _review_entries(2)
+        doubles["state_reader"].states["build-REPAUSE"] = BuildState.PAUSED
+
+        report = _run(supervisor.next_turn("build-REPAUSE"))
+
+        # No escalation, no dispatch — the already-paused build stays parked
+        # (WAITING), never re-escalated with the same request_id.
+        assert recorder == []
+        assert doubles["subprocess"].calls == []
+        assert report.outcome is TurnOutcome.WAITING

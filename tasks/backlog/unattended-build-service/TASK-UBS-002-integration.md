@@ -10,8 +10,48 @@ complexity: 6
 dependencies:
   - FEAT-UBS-002-skeleton  # config models + budget_guard module + CLI flag (landed)
   - TASK-ABW-OPS           # produces the autobuild transcript → coach-score gap
-status: pending
+status: in_review
+updated: 2026-07-09T00:00:00Z
 ---
+
+> **✅ ENFORCEMENT SEAM DONE 2026-07-09 (WS3-S6) — §1 built + demonstrably
+> enforcing on a fixture run; §2/§3 dispositioned below.**
+>
+> **§1 supervisor enforcement seam (done):** `Supervisor` gained DI fields
+> `budget_guards` / `budget_profile_name` / `budget_wall_clock` /
+> `budget_started_at_reader` / `budget_pause`, and a new
+> `TurnOutcome.PAUSED_BUDGET`. At the follow-up `TASK_REVIEW` cyclic step
+> `_next_turn_mode_c` calls `_enforce_mode_c_budget`: computes
+> `BuildBudgetMetrics` (review_cycles via `count_review_cycles`, elapsed via
+> `_budget_elapsed_seconds`, tokens/coach-score `None`), runs
+> `evaluate_budget`, and on a breach refuses the dispatch, builds the
+> `risk_level="high"` `build_budget_breach_approval_payload`
+> (`details.reason == "budget_guard_breach"`), invokes the injected
+> `budget_pause` (publish + pause), and returns `PAUSED_BUDGET`. **Strict
+> no-op for attended / caps-off / unwired profiles (ASSUM-010 intact).**
+> GATE met: `TestModeCBudgetEnforcement` (5 tests) — breach→pause+risk-high,
+> under-cap→dispatch, attended→no-op, no-guards→no-op, and (merge-review
+> hardening) already-PAUSED→WAITING (never re-escalate with the same
+> deterministic request_id, never dispatch a paused build) — green; full
+> supervisor suite green.
+>
+> **§2 profile carriage (DEFERRED, per the task's own "until then
+> default_profile"):** the `builds.profile` column + `record_pending_build`
+> / `_row_to_build_row` / `BuildRow` carriage is NOT built this session —
+> the daemon would resolve `config.budget.resolve(default_profile)` (=
+> `attended` = caps off = safe no-op) until it lands. Remaining production
+> hookup: wire `budget_guards` + a `budget_pause` callback (SQLite PAUSED +
+> `emit_paused_then_interrupt`, ADR-ARCH-021 order) into `build_supervisor`
+> — currently blocked because `build_supervisor` does not yet wire
+> `mode_c_planner` at all (Mode C is dormant in the production supervisor
+> builder), so the enforcement is fixture-demonstrable but dormant in prod
+> until Mode C is live. This matches the task's own note: "cannot be
+> end-to-end validated without a real Mode C run."
+>
+> **§3 coach-score floor (no change, as scoped):** `last_coach_score` stays
+> `None` (ADR-ARCH-033); the `min_coach_score` branch is inert and
+> activates automatically when the runner feeds a real score. No
+> `budget_guard` change needed.
 
 # TASK-UBS-002-integration — connect the budget guard to the live build loop
 

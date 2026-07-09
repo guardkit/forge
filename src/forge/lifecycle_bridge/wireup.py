@@ -160,6 +160,22 @@ DEFAULT_DEADLINE_SECONDS: int = 300
 #: a slow SSE peer.
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: float = 5.0
 
+#: FWD-002 (WS3-S6) — ``failure_reason`` stamped onto the synthetic
+#: ``build-failed`` the observer publishes when a build's identity never
+#: resolves within the per-build deadline. A build stuck on unresolved
+#: identity (e.g. a dispatch that never wrote its ``async_tasks`` row, the
+#: 2026-07-04 FEAT-9E59 shape) would otherwise leave the queued message to
+#: redeliver and re-loop forever with the operator's phone frozen on
+#: "queued" — a silent stuck build. ``recoverable=True`` because a fresh
+#: re-queue can succeed once the dispatch path is healthy.
+IDENTITY_UNRESOLVED_FAILURE_REASON: str = "identity-unresolved"
+
+#: ``async (feature_id, correlation_id) -> build_id | None`` — resolves the
+#: durable ``builds.build_id`` for a synthetic terminal so the terminal
+#: write hits the right row (un-wedging dispatch). Production wires a
+#: SQLite reader; unit tiers omit it and fall back to ``feature_id``.
+BuildIdResolver = Callable[[str, str], Awaitable["str | None"]]
+
 
 #: Tuple of typed payload classes that mark a terminal lifecycle. When
 #: the observer loop sees a payload whose type is in this tuple it
@@ -403,6 +419,7 @@ class LifecycleBridgeWireup:
         identity_poll_interval_seconds: float = 1.0,
         shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         clock: Callable[[], datetime] | None = None,
+        build_id_resolver: "BuildIdResolver | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -448,6 +465,10 @@ class LifecycleBridgeWireup:
         )
         self._shutdown_timeout_seconds = max(0.0, float(shutdown_timeout_seconds))
         self._clock = clock if clock is not None else self._default_clock
+        # FWD-002 — resolves the durable build_id for the synthetic
+        # identity-unresolved build-failed. ``None`` (unit tiers) falls back
+        # to feature_id; production wires a SQLite reader.
+        self._build_id_resolver = build_id_resolver
         # Per-feature observer tasks. Keyed on ``feature_id`` (AC-5);
         # supervisor queries answered from the bridge's in-memory dict
         # never traverse this map.
@@ -625,7 +646,22 @@ class LifecycleBridgeWireup:
         correlation_id = context.correlation_id
         try:
             identity = await self._wait_for_identity(feature_id)
-            thread_id, run_id = identity if identity is not None else (None, None)
+            if identity is None:
+                # FWD-002 (WS3-S6): identity did not resolve within the
+                # initial poll budget. Do NOT fall through to stream with
+                # ``(None, None)`` ids and exit silently — that leaves the
+                # queued message un-acked, JetStream redelivers, and the
+                # re-registered observer repeats the same non-resolution: a
+                # silent infinite loop with the operator's phone frozen on
+                # "queued" (the 2026-07-04 FEAT-9E59 shape). Keep polling to
+                # the per-build deadline (a slow dispatch may still surface
+                # the run); if identity STILL never resolves, publish a
+                # synthetic build-failed and ack — never spin silently.
+                identity = await self._await_identity_until_deadline(context)
+                if identity is None:
+                    await self._publish_identity_unresolved_failure(context, handle)
+                    return
+            thread_id, run_id = identity
 
             # AC-2 / AC-4 (TASK-FRR-PEB-008): wrap the SSE iteration
             # in a reconnect loop driven by :class:`ReconnectPolicy`.
@@ -1384,11 +1420,146 @@ class LifecycleBridgeWireup:
                 await asyncio.sleep(self._identity_poll_interval_seconds)
         logger.info(
             "wireup._wait_for_identity: identity unresolved for "
-            "feature_id=%s after %d attempts; observer exits",
+            "feature_id=%s after %d attempts; extending to the per-build "
+            "deadline (FWD-002)",
             feature_id,
             self._identity_resolution_attempts,
         )
         return None
+
+    async def _await_identity_until_deadline(
+        self, context: BuildContext
+    ) -> tuple[str, str] | None:
+        """Keep polling identity until the per-build deadline (FWD-002).
+
+        The initial :meth:`_wait_for_identity` budget (a few fast polls) is
+        deliberately short for the common case where the run's
+        ``async_tasks`` row is written moments after registration. When it
+        exhausts without resolving, this method extends the wait to the
+        per-build deadline (``self._deadline_seconds``) so a merely-slow
+        dispatch still gets picked up rather than being declared failed.
+
+        The budget is measured on the event loop's monotonic clock — NOT
+        the injected wall-clock — so a deterministic ``FixedClock`` (used
+        for ``deadline_at`` display/registry hygiene) cannot wedge this
+        loop, and tests pin a small ``deadline_seconds`` for fast runs.
+
+        Returns the resolved ``(thread_id, run_id)`` pair, or ``None`` when
+        the deadline elapses (or shutdown begins) with identity still
+        unresolved.
+        """
+        feature_id = context.feature_id
+        loop = asyncio.get_event_loop()
+        budget_deadline = loop.time() + float(self._deadline_seconds)
+        while not self._shutting_down and loop.time() < budget_deadline:
+            # Sleep first: the initial fast-poll budget just ran, so the row
+            # is very unlikely to appear within the same tick.
+            remaining = budget_deadline - loop.time()
+            await asyncio.sleep(
+                min(self._identity_poll_interval_seconds, max(0.0, remaining))
+            )
+            if self._shutting_down:
+                break
+            try:
+                identity = await self._identity_provider(feature_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "wireup._await_identity_until_deadline: identity_provider "
+                    "raised (%s) for feature_id=%s; treating as None",
+                    exc,
+                    feature_id,
+                )
+                identity = None
+            if identity is not None:
+                logger.info(
+                    "wireup._await_identity_until_deadline: identity resolved "
+                    "for feature_id=%s during the deadline wait; resuming "
+                    "the SSE observer",
+                    feature_id,
+                )
+                return identity
+        return None
+
+    async def _publish_identity_unresolved_failure(
+        self, context: BuildContext, handle: BuildAckHandle
+    ) -> None:
+        """Publish a synthetic ``build-failed`` for an unresolved identity.
+
+        FWD-002 (WS3-S6): a build whose identity never resolves within the
+        per-build deadline is genuinely stuck (the dispatch never produced a
+        run) — emit a terminal ``build-failed`` so the operator's phone
+        leaves the "queued" state and the queue slot is released, instead of
+        redelivering into a silent infinite loop.
+
+        The terminal sequence mirrors :meth:`_on_terminal`: publish first
+        (recording the terminal ``builds`` row via
+        :meth:`_publish_event`'s write-back), then ack + detach on a
+        successful publish. On a publish failure the inbound message is left
+        un-acked so JetStream redelivery / the next boot's recovery retries —
+        never a silent drop.
+        """
+        feature_id = context.feature_id
+        build_id = await self._resolve_build_id(feature_id, context.correlation_id)
+        # AC-2: payload construction is the translator's job — the wireup
+        # never constructs pipeline payloads. The translator's public
+        # synthetic factory also attaches the correlation_id (T3 AC-6).
+        payload = self._translator.build_synthetic_failed(
+            feature_id=feature_id,
+            build_id=build_id,
+            correlation_id=context.correlation_id,
+            failure_reason=IDENTITY_UNRESOLVED_FAILURE_REASON,
+            recoverable=True,
+        )
+
+        logger.warning(
+            "wireup: feature_id=%s identity unresolved past the per-build "
+            "deadline; publishing synthetic build-failed (reason=%s "
+            "build_id=%s) — a silent stuck build is being terminalised "
+            "(FWD-002)",
+            feature_id,
+            IDENTITY_UNRESOLVED_FAILURE_REASON,
+            build_id,
+        )
+        published = await self._publish_event(payload, feature_id)
+        if published:
+            await self._on_terminal(handle, feature_id, context.correlation_id)
+        else:
+            logger.warning(
+                "wireup: synthetic build-failed publish FAILED for "
+                "feature_id=%s; leaving the inbound message un-acked so "
+                "JetStream redelivery / next-boot recovery retries",
+                feature_id,
+            )
+
+    async def _resolve_build_id(self, feature_id: str, correlation_id: str) -> str:
+        """Resolve the durable ``builds.build_id`` for a synthetic terminal.
+
+        Production wires a SQLite reader so the terminal write hits the real
+        queued row (un-wedging the feature's next dispatch). Without a
+        resolver (unit tiers), or when the read misses, fall back to
+        ``feature_id`` so the synthetic terminal still publishes — the
+        primary FWD-002 invariant (no silent stuck build) holds regardless.
+        """
+        if self._build_id_resolver is not None:
+            try:
+                resolved = await self._build_id_resolver(feature_id, correlation_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "wireup._resolve_build_id: resolver raised (%s) for "
+                    "feature_id=%s; falling back to feature_id",
+                    exc,
+                    feature_id,
+                )
+                resolved = None
+            if resolved:
+                return resolved
+        logger.warning(
+            "wireup._resolve_build_id: no durable build_id for feature_id=%s "
+            "(resolver=%s); using feature_id as the synthetic build_id",
+            feature_id,
+            "wired" if self._build_id_resolver is not None else "absent",
+        )
+        return feature_id
 
     # ------------------------------------------------------------------
     # Shutdown — drain observer tasks within timeout

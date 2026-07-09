@@ -200,9 +200,12 @@ def build_approval_gate_parts(
             subscriber's refresh-on-timeout loop (API §7) is enabled:
             the refreshed ``request_id`` is re-derived, persisted (so
             boot recovery re-emits the *current* id), and re-published.
-            ``None`` (production today — no SQLite adapter exists yet)
-            disables refresh: waits are single-window, matching the
-            pre-existing integration-test behaviour.
+            ``None`` disables refresh: waits are single-window, matching
+            the pre-existing integration-test behaviour. **Production
+            wires the real D659 SQLite adapter here (WS3-S6, 2026-07-09):
+            ``serve.py`` threads the ``build_sqlite_gate_adapters``
+            ``gate_repository`` in so long pauses wait the full
+            ``max_wait_seconds`` instead of expiring after one window.**
         project: Optional NATS multi-tenancy scope; ``None`` matches the
             rest of the serve composition.
         subscriber_clock: Optional monotonic :class:`Clock` override for
