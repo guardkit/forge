@@ -54,6 +54,7 @@ __all__ = [
     "CONSTITUTIONAL_STAGES",
     "PER_FEATURE_STAGES",
     "PER_FIX_TASK_STAGES",
+    "POST_REVIEW_STAGES",
 ]
 
 
@@ -79,13 +80,27 @@ class StageClass(StrEnum):
     FEATURE_PLAN = "feature-plan"
     AUTOBUILD = "autobuild"
     PULL_REQUEST_REVIEW = "pull-request-review"
-    # FEAT-FORGE-008 Mode C extensions — appended at the end so the Mode A
-    # iteration order above is byte-for-byte preserved (StageOrderingGuard
-    # in TASK-MAG7-003 relies on the leading eight members staying put).
-    # The per-fix-task fan-out of TASK_WORK is handled by the cycle
-    # planner in TASK-MBC8-004, not by this enum.
+    # FEAT-FORGE-008 Mode C extensions — appended after the leading eight so
+    # the Mode A iteration order above is byte-for-byte preserved
+    # (StageOrderingGuard in TASK-MAG7-003 relies on the leading eight members
+    # staying put). The per-fix-task fan-out of TASK_WORK is handled by the
+    # cycle planner in TASK-MBC8-004, not by this enum.
     TASK_REVIEW = "task-review"
     TASK_WORK = "task-work"
+    # WS2-B8 output-side (deploy) stages — the last-mile taxonomy after
+    # PULL_REQUEST_REVIEW (scope-design §4). They are appended at the end so
+    # the leading eight (and the Mode C tail) keep their positions. They are
+    # ordering-expressed via STAGE_PREREQUISITES (DEPLOY ← PULL_REQUEST_REVIEW,
+    # LIVE_GATE ← DEPLOY) but are DELIBERATELY excluded from every mode chain,
+    # PER_FEATURE_STAGES, and the Mode A/B/C reasoning-loop permitted set
+    # (see POST_REVIEW_STAGES below): they are dispatched by the standalone
+    # DeployStageRunner (forge.deploy.stage), config-gated on
+    # ``deploy.enabled`` (default False, disabled in production until V1), not
+    # by the greenfield reasoning loop. This keeps Mode A/B/C dispatch
+    # byte-identical while giving V1 canonical stage names for the stage log
+    # and the fleet dashboard.
+    DEPLOY = "deploy"
+    LIVE_GATE = "live-gate"
 
 
 #: Stage prerequisite map.
@@ -124,6 +139,14 @@ STAGE_PREREQUISITES: dict[StageClass, list[StageClass]] = {
     # by this map — the prerequisite expressed here is the *class*-level
     # ordering that ``StageOrderingGuard`` consumes.
     StageClass.TASK_WORK: [StageClass.TASK_REVIEW],
+    # WS2-B8 output-side ordering (scope-design §4): DEPLOY follows
+    # PULL_REQUEST_REVIEW, LIVE_GATE follows DEPLOY. These rows make the
+    # ordering canonical, but the two stages are filtered out of the
+    # reasoning-loop permitted set (POST_REVIEW_STAGES) — the DeployStageRunner
+    # is their only dispatcher, so this map never causes the greenfield
+    # supervisor to offer them.
+    StageClass.DEPLOY: [StageClass.PULL_REQUEST_REVIEW],
+    StageClass.LIVE_GATE: [StageClass.DEPLOY],
 }
 
 
@@ -169,3 +192,18 @@ PER_FEATURE_STAGES: frozenset[StageClass] = frozenset(
 #: distinguish per-fix-task stages from per-feature stages
 #: (:data:`PER_FEATURE_STAGES`) and pipeline-wide stages.
 PER_FIX_TASK_STAGES: frozenset[StageClass] = frozenset({StageClass.TASK_WORK})
+
+
+#: Output-side (post-review) stages — the WS2-B8 last-mile taxonomy.
+#:
+#: ``DEPLOY`` and ``LIVE_GATE`` follow ``PULL_REQUEST_REVIEW`` in
+#: :data:`STAGE_PREREQUISITES`, but they are dispatched by the standalone
+#: :class:`forge.deploy.stage.DeployStageRunner` (config-gated on
+#: ``deploy.enabled``), **never** by the Mode A/B/C greenfield reasoning loop.
+#: :meth:`StageOrderingGuard.next_dispatchable` filters this set out of its
+#: default walk so the reasoning-loop permitted set is byte-for-byte unchanged
+#: by their addition to the enum — a stage in this set is only ever reached
+#: through the deploy runner, which checks prerequisites explicitly.
+POST_REVIEW_STAGES: frozenset[StageClass] = frozenset(
+    {StageClass.DEPLOY, StageClass.LIVE_GATE}
+)

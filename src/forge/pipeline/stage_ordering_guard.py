@@ -43,6 +43,7 @@ from typing import Iterable, Protocol, runtime_checkable
 
 from forge.pipeline.stage_taxonomy import (
     PER_FEATURE_STAGES,
+    POST_REVIEW_STAGES,
     STAGE_PREREQUISITES,
     StageClass,
 )
@@ -271,8 +272,17 @@ class StageOrderingGuard:
             prerequisites if prerequisites is not None else STAGE_PREREQUISITES
         )
 
+        # WS2-B8: the output-side stages (DEPLOY, LIVE_GATE) live in the
+        # StageClass enum for canonical naming, but they are dispatched by the
+        # standalone DeployStageRunner (config-gated), never by the greenfield
+        # reasoning loop. Exclude them from the default walk so adding them to
+        # the enum leaves the Mode A/B/C permitted set byte-for-byte unchanged.
+        # An explicit ``stages=`` caller (e.g. a future deploy-aware walk) can
+        # still opt them in.
         candidate_stages: Iterable[StageClass] = (
-            stages if stages is not None else list(StageClass)
+            stages
+            if stages is not None
+            else [s for s in StageClass if s not in POST_REVIEW_STAGES]
         )
         for stage in candidate_stages:
             if prerequisites is None:

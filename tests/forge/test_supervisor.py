@@ -842,7 +842,17 @@ class TestDispatchRouting:
         # would otherwise hit the loud-fail ``TypeError`` at
         # ``supervisor.py:1555``. This is the regression net for
         # FEAT-FORGE-008 + F008-VAL-003 (TASK_REVIEW / TASK_WORK).
+        #
+        # WS2-B8: the output-side stages (POST_REVIEW_STAGES = DEPLOY,
+        # LIVE_GATE) are dispatched by the standalone DeployStageRunner, NOT the
+        # greenfield reasoning loop — they deliberately have no supervisor
+        # routing branch. They are excluded here and their correct rejection is
+        # asserted separately below.
+        from forge.pipeline.stage_taxonomy import POST_REVIEW_STAGES
+
         for stage in StageClass:
+            if stage in POST_REVIEW_STAGES:
+                continue
             feature_id = "FEAT-META" if stage in PER_FEATURE_STAGES else None
             choice = DispatchChoice(
                 stage=stage,
@@ -858,6 +868,26 @@ class TestDispatchRouting:
                         f"Supervisor._dispatch — every enum member needs one"
                     )
                 raise
+
+    @pytest.mark.asyncio
+    async def test_supervisor_rejects_output_side_stages(
+        self,
+        supervisor: Supervisor,
+    ) -> None:
+        # WS2-B8 safety net: if a DEPLOY / LIVE_GATE choice ever reaches the
+        # supervisor (it cannot — next_dispatchable filters POST_REVIEW_STAGES),
+        # the reasoning-loop dispatcher must loud-fail rather than silently
+        # dispatch a deploy. The DeployStageRunner is their only dispatcher.
+        from forge.pipeline.stage_taxonomy import POST_REVIEW_STAGES
+
+        for stage in POST_REVIEW_STAGES:
+            choice = DispatchChoice(
+                stage=stage,
+                feature_id=None,
+                rationale="output-side stage must be rejected by the supervisor",
+            )
+            with pytest.raises(TypeError, match="no routing for stage"):
+                await supervisor._dispatch(build_id="build-meta", choice=choice)
 
 
 # ---------------------------------------------------------------------------

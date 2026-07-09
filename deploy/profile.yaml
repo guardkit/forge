@@ -1,0 +1,48 @@
+# Deploy profile — fleet-memory NAS (WS2-B8 exemplar; scope-design §4)
+#
+# The committed B8 exemplar profile: the FEAT-FMDR subject (fleet-memory on the
+# NAS — zero blast radius, D14). Per-repo deploy profiles live in each target
+# repo as `deploy/profile.yaml`; this copy is forge's canonical example + the
+# fixture the B8 dry-run gate loads. It parameterizes the deploy stage over the
+# already-proven fleet-memory deploy.sh / smoke.sh scripts (the executor wraps
+# vetted scripts, never inline shell — the D12 safety property).
+#
+# Field list mirrors scope-design §4 verbatim. Secrets are register REFS ONLY —
+# names, never values (WS5 owns the values; the FLEET_MEMORY_PG_DSN leak of
+# 2026-07-04 is exactly why).
+
+env_id: fleet-memory-nas
+
+hosts:
+  - host: nas
+    role: postgres
+
+# The FMDR deploy_compose step wraps the vetted deploy.sh (which runs
+# docker compose against docker-compose.yml). `script`/`env_file` are the
+# B8→B10 bridge (see the dated reconcile note in
+# docs/state/WS2-B8/deploy-profile-format-reconcile-note-2026-07-09.md).
+compose:
+  file: deploy/nas/docker-compose.yml
+  script: deploy.sh
+  env_file: .env.deploy
+
+# Register-key REFS only (names). The NAS Postgres DSN is resolved by the
+# deploy script from .env.deploy at run time; the value never enters this
+# profile, the deploy record, or any payload.
+secret_injection:
+  - FLEET_MEMORY_PG_DSN
+
+# smoke.sh is fleet-memory's health verdict (GATES G3–G5: pg_isready +
+# pgvector, network path, backed-up volume; exit non-zero on any fail).
+health_checks:
+  - cmd: smoke.sh
+    expected: "exit 0"
+
+# cwd for the wrapped scripts (relative to the fleet-memory checkout root).
+cwd: deploy/nas
+
+# fleet-memory is a Postgres container: no realm import, no llama-swap models,
+# no GPU reservation, no broker contract. A minimal profile is valid — the
+# richer sections (realm_import / models_required / reservation /
+# broker_contract_ref / seed_fixture_contract) are exercised by the
+# lpa-platform-poc and study-tutor profiles (scope-design §4).

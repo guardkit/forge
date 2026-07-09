@@ -141,10 +141,14 @@ class TestStageClassExtensions:
         assert StageClass.TASK_REVIEW.value == "task-review"
         assert StageClass.TASK_WORK.value == "task-work"
 
-    def test_task_review_and_task_work_appended_at_end(self) -> None:
+    def test_task_review_and_task_work_appended_after_leading_eight(self) -> None:
         names = [m.name for m in StageClass]
-        # The last two members are the Mode C extensions, in that order.
-        assert names[-2:] == ["TASK_REVIEW", "TASK_WORK"]
+        # The Mode C extensions follow the leading eight (positions 9-10). WS2-B8
+        # appended the two output-side stages (DEPLOY, LIVE_GATE) after them, so
+        # they are no longer the final members — but they keep their positions
+        # relative to the leading eight (the StageOrderingGuard invariant).
+        assert names[8:10] == ["TASK_REVIEW", "TASK_WORK"]
+        assert names[-2:] == ["DEPLOY", "LIVE_GATE"]
 
     def test_mode_a_iteration_prefix_unchanged(self) -> None:
         names = [m.name for m in StageClass]
@@ -179,8 +183,16 @@ class TestStagePrerequisitesTaskWork:
         assert StageClass.TASK_REVIEW not in STAGE_PREREQUISITES
 
     def test_only_one_new_row_added(self) -> None:
-        # The seven Mode A keys plus TASK_WORK gives eight keys total.
-        assert len(STAGE_PREREQUISITES) == 8
+        # The seven Mode A keys plus TASK_WORK gives eight keys; WS2-B8 adds
+        # the two output-side rows (DEPLOY ← PULL_REQUEST_REVIEW,
+        # LIVE_GATE ← DEPLOY) for ten total. The two new rows are filtered out
+        # of the reasoning-loop permitted set (POST_REVIEW_STAGES), so Mode
+        # A/B/C dispatch is unchanged despite the additional prerequisite rows.
+        assert len(STAGE_PREREQUISITES) == 10
+        assert STAGE_PREREQUISITES[StageClass.DEPLOY] == [
+            StageClass.PULL_REQUEST_REVIEW
+        ]
+        assert STAGE_PREREQUISITES[StageClass.LIVE_GATE] == [StageClass.DEPLOY]
 
 
 # ---------------------------------------------------------------------------

@@ -248,6 +248,15 @@ class TestYamlRoundTrip:
                 "frontier_timeout_seconds": 30,
                 "model_resolution": {"model": None, "fallbacks": []},
             },
+            # ``deploy`` was added by WS2-B8 (output-side stages) — like
+            # ``planning`` above, the unfiltered round-trip dump always includes
+            # it, so this test declares it with default values.
+            "deploy": {
+                "enabled": False,
+                "run_live_gate": True,
+                "reservation_backend": "none",
+                "deploy_record_dir": "docs/state",
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

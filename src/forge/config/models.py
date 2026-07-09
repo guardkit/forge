@@ -31,7 +31,7 @@ pure declarative schema layer.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -631,6 +631,59 @@ class PlanningConfig(BaseModel):
         return v
 
 
+class DeployStageConfig(BaseModel):
+    """Configuration for the WS2-B8 output-side deploy + live-gate stages.
+
+    Deliberately separate from ``ApprovalConfig`` (build-gating) and
+    ``PlanningConfig`` (Mode P) — the deploy stage is a distinct concern with
+    its own opt-in switch. Defaults are chosen for safe opt-in: ``enabled=False``
+    means the DEPLOY / LIVE_GATE stages are DISABLED in production until V1
+    (scope-design §4 + DF-017 note: the go-live gate is discharged, but the
+    stages still default off until validation). Flag OFF is a byte-for-byte
+    no-op — nothing in the pipeline dispatches a deploy.
+
+    The reservation backend is swappable (scope Q2: NATS KV lease vs a DF-002
+    ledger extension) — v1 ships the ``none`` (in-process) backend; ``kv`` is
+    reserved for the real GB10-GPU lease and is not wired here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the output-side DEPLOY + LIVE_GATE stages. "
+            "False = the stages are inert (disabled in production until V1); "
+            "flag OFF is a byte-for-byte no-op."
+        ),
+    )
+    run_live_gate: bool = Field(
+        default=True,
+        description=(
+            "Whether the LIVE_GATE stage runs after a successful DEPLOY. "
+            "When False, a deploy completes without a live-gate verdict "
+            "(deploy-only profiles, e.g. a headless service with no walk)."
+        ),
+    )
+    reservation_backend: Literal["none", "kv"] = Field(
+        default="none",
+        description=(
+            "Reservation-lease backend (scope Q2, swappable): 'none' = the "
+            "in-process lease (v1); 'kv' = a NATS KV lease (reserved, not wired "
+            "here). The DeployStageRunner takes/releases the profile's "
+            "reservation.resource through this backend."
+        ),
+    )
+    deploy_record_dir: str = Field(
+        default="docs/state",
+        description=(
+            "Directory (repo-relative) under which F7 deploy records are "
+            "written: <deploy_record_dir>/<task>/deploy-record-<date>.md "
+            "(the MP-012 addenda pattern)."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -660,6 +713,14 @@ class ForgeConfig(BaseModel):
             "Defaults to disabled (enabled=False) for safe opt-in."
         ),
     )
+    deploy: DeployStageConfig = Field(
+        default_factory=DeployStageConfig,
+        description=(
+            "WS2-B8 output-side deploy + live-gate stage configuration. "
+            "Defaults to disabled (enabled=False) — inert in production "
+            "until V1 (scope-design §4)."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -685,6 +746,7 @@ __all__ = [
     "ApprovalConfig",
     "BudgetConfig",
     "BudgetGuards",
+    "DeployStageConfig",
     "FilesystemPermissions",
     "FleetConfig",
     "ForgeConfig",
