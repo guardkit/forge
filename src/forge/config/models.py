@@ -684,6 +684,75 @@ class DeployStageConfig(BaseModel):
     )
 
 
+class ReviewGateConfig(BaseModel):
+    """Configuration for the WS3-S5 adversarial merge-review gate.
+
+    The gate formalizes the practiced N-reviewers / ≥2-refuters /
+    refuted-by-default / executed-reproduction workflow (LPA-14/15) as an
+    **attended checkpoint** (Q2 = attended-v1, Rich 2026-07-09): the stage
+    assembles the review packet, dispatches the reviewer fan-out, enforces
+    refuted-by-default (a finding without an executed reproduction is
+    structurally unable to reach ``confirmed``), emits the F14
+    review-findings record, and pauses for the human checkpoint's disposition.
+    The pause routes through the EXISTING approval-gate machinery (Gate
+    G1-proven; DF-001/DF-003/DF-009 — identity-pinned attended checkpoint,
+    reviewer-seat SLM localisation is WS4's) via an injected seam that is
+    present but UNWIRED in v1 — the attended operator dispositions the emitted
+    record directly.
+
+    Deliberately separate from ``ApprovalConfig`` (build-gating),
+    ``PlanningConfig`` (Mode P) and ``DeployStageConfig`` (output-side deploy)
+    — the merge gate is a distinct concern with its own opt-in switch. Defaults
+    are chosen for safe opt-in: ``enabled=False`` means the gate is INERT in
+    production (same rollout pattern as ``deploy.enabled``) — nothing dispatches
+    a review and the attended CLI refuses to run until an operator opts in. Flag
+    OFF is a byte-for-byte no-op.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the WS3-S5 adversarial merge gate. False = the "
+            "gate is inert (disabled in production until reviewer-seat SLMs "
+            "land in WS4); flag OFF is a byte-for-byte no-op — nothing "
+            "dispatches a review and the attended CLI refuses to run."
+        ),
+    )
+    dimensions: list[str] = Field(
+        default_factory=lambda: [
+            "spec-fidelity",
+            "correctness",
+            "wire-topology",
+            "assumptions",
+            "tracker-consistency",
+        ],
+        description=(
+            "The review dimensions dispatched in the reviewer fan-out (one "
+            "reviewer per dimension). Default mirrors the DD4F post-merge "
+            "review's five dimensions (LPA-14). Every critical/high finding "
+            "additionally gets ≥2 independent refuters."
+        ),
+    )
+    min_refuters: int = Field(
+        default=2,
+        ge=2,
+        description=(
+            "Minimum independent refuters per critical/high finding (LPA-14). "
+            "Floor is 2 — a finding survives only by surviving refutation."
+        ),
+    )
+    record_dir: str = Field(
+        default="qa",
+        description=(
+            "Directory (repo-relative) under which F14 review-findings records "
+            "are written: <record_dir>/review-<review_id>.yaml (the structured "
+            "form of the docs/reviews/<id>.md review block)."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -721,6 +790,14 @@ class ForgeConfig(BaseModel):
             "until V1 (scope-design §4)."
         ),
     )
+    review_gate: ReviewGateConfig = Field(
+        default_factory=ReviewGateConfig,
+        description=(
+            "WS3-S5 adversarial merge-gate configuration. Defaults to disabled "
+            "(enabled=False) — the attended checkpoint is inert in production "
+            "until reviewer-seat SLMs land in WS4 (Q2 = attended-v1)."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -755,6 +832,7 @@ __all__ = [
     "PlanningConfig",
     "PlanningModelResolution",
     "QueueConfig",
+    "ReviewGateConfig",
 ]
 
 

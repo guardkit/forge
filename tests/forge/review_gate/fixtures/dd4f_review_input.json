@@ -1,0 +1,77 @@
+{
+  "review_id": "FEAT-SPL-002-DD4F-postmerge",
+  "subject": {"kind": "merge", "ref": "d13d88f..1fcb72c"},
+  "findings": [
+    {
+      "id": "F-01",
+      "dimension": "spec-fidelity",
+      "severity": "critical",
+      "summary": "Serve-boot planning wiring (TASK-MP-011/FEAT-DD4F) calls all three planning functions with wrong keyword names — Mode P is dead on arrival even when enabled",
+      "executed_reproduction": "python -c \"from forge.cli._serve_planning import compose_planning_consumer_and_dispatch as c; c(client=None, planning_config=None, sqlite_pool=None, config=None)\" -> TypeError: unexpected keyword argument 'client'; reproduced for sweep_interrupted_planning_runs and rearm_paused_planning_runs; at boot the DDR-007 except swallows it (serve.py:459-465)",
+      "refuter_votes": [
+        {"who": "refuter-A", "verdict": "not_refuted", "note": "signatures at _serve_planning.py:130-136/335-340/239-245 confirm the kwargs do not exist"},
+        {"who": "refuter-B", "verdict": "not_refuted", "note": "MP-011 pin test uses *args/**kwargs fakes; cannot catch it"}
+      ]
+    },
+    {
+      "id": "F-02",
+      "dimension": "correctness",
+      "severity": "high",
+      "summary": "product_owner stage dispatch is a logging stub and the planning intake consumer is never subscribed",
+      "executed_reproduction": "grep -rn 'handle_planning_message' src -> zero production call sites; _serve_planning.py:206-215 is a TODO stub returning None; a PlanningQueuedPayload on pipeline.planning-queued.* is never consumed",
+      "refuter_votes": [
+        {"who": "refuter-A", "verdict": "not_refuted"},
+        {"who": "refuter-B", "verdict": "not_refuted"}
+      ]
+    },
+    {
+      "id": "F-03",
+      "dimension": "wire-topology",
+      "severity": "high",
+      "summary": "checkpoint and escalation approval requests are not valid ApprovalRequestPayload — jarvis JNB-103 capture would WARN-drop them",
+      "executed_reproduction": "checkpoint.py:244-258 payload dict lacks agent_id/action_description/risk_level/details, all REQUIRED by nats_core ApprovalRequestPayload; ApprovalRequestPayload.model_validate(payload) raises ValidationError",
+      "refuter_votes": [
+        {"who": "refuter-A", "verdict": "not_refuted"},
+        {"who": "refuter-B", "verdict": "not_refuted"}
+      ]
+    },
+    {
+      "id": "F-04",
+      "dimension": "correctness",
+      "severity": "high",
+      "summary": "terminal handoff unreachable in production: no GitRunner implementation, no notification publisher, nothing writes the PLANNED_HANDOFF row",
+      "executed_reproduction": "grep -rn 'prepare_branch_and_write' src -> only the Protocol at handoff.py:79; grep 'jarvis.notification' src -> 0 hits; no store.transition(to_state=PLANNED_HANDOFF) writer exists",
+      "refuter_votes": [
+        {"who": "refuter-A", "verdict": "not_refuted"},
+        {"who": "refuter-B", "verdict": "not_refuted"}
+      ]
+    },
+    {
+      "id": "F-05",
+      "dimension": "correctness",
+      "severity": "medium",
+      "summary": "escalation/defer machinery has no production driver: no scheduler evaluates thresholds, and the defer branch is a no-op",
+      "executed_reproduction": "grep -rn 'EscalationPolicy(' src -> 0 hits; no timer evaluates paused_at/escalated_at; handle_defer_request under-cap branch is 'TODO: Re-publish approval request' (escalation.py:268)",
+      "refuter_votes": [
+        {"who": "refuter-A", "verdict": "not_refuted"},
+        {"who": "refuter-B", "verdict": "not_refuted"}
+      ]
+    },
+    {
+      "id": "F-06",
+      "dimension": "assumptions",
+      "severity": "low",
+      "summary": "Requirement 5 deviation (panel-documented): approval routing does NOT extend ApprovalConfig.expected_approver — a sibling PlanningConfig was created, per-run approver = originating_user",
+      "executed_reproduction": "read models.py PlanningConfig docstring ('deliberately separate from ApprovalConfig') + planning_consumer.py:202 initialises expected_approver to payload.originating_user, not 'rich'",
+      "refuter_votes": []
+    },
+    {
+      "id": "F-07",
+      "dimension": "tracker-consistency",
+      "severity": "low",
+      "summary": "Checkpoint reads expected_approver by reaching into repository private attributes (repository._store._connection)",
+      "executed_reproduction": "read checkpoint.py:434-452 (_read_expected_approver) hasattr-probes _store and uses _store._connection directly; any non-PlanningGateRepository adapter silently returns None -> response refused",
+      "refuter_votes": []
+    }
+  ]
+}

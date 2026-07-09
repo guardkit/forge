@@ -238,6 +238,20 @@ class TestApprovalYamlRoundTrip:
                 "reservation_backend": "none",
                 "deploy_record_dir": "docs/state",
             },
+            # ``review_gate`` was added by WS3-S5 (adversarial merge gate); the
+            # unfiltered round-trip dump always includes it, so declare defaults.
+            "review_gate": {
+                "enabled": False,
+                "dimensions": [
+                    "spec-fidelity",
+                    "correctness",
+                    "wire-topology",
+                    "assumptions",
+                    "tracker-consistency",
+                ],
+                "min_refuters": 2,
+                "record_dir": "qa",
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

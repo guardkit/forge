@@ -36,6 +36,7 @@ import click
 from forge.cli import cancel as _cancel
 from forge.cli import history as _history
 from forge.cli import queue as _queue
+from forge.cli import review_gate as _review_gate
 from forge.cli import runbook as _runbook
 from forge.cli import serve as _serve
 from forge.cli import skip as _skip
@@ -95,6 +96,7 @@ main.add_command(_cancel.cancel_cmd)
 main.add_command(_skip.skip_cmd)
 main.add_command(_serve.serve_cmd)
 main.add_command(_runbook.runbook_cmd)
+main.add_command(_review_gate.review_gate_cmd)
 
 
 __all__ = ["CliRuntime", "build_cli_runtime", "main"]

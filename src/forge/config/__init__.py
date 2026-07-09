@@ -20,6 +20,7 @@ from .models import (
     PlanningConfig,
     PlanningModelResolution,
     QueueConfig,
+    ReviewGateConfig,
 )
 
 __all__ = [
@@ -34,5 +35,6 @@ __all__ = [
     "PlanningConfig",
     "PlanningModelResolution",
     "QueueConfig",
+    "ReviewGateConfig",
     "load_config",
 ]
