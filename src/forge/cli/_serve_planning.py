@@ -56,6 +56,7 @@ from forge.adapters.nats.planning_consumer import (
 from forge.adapters.sqlite import connect_writer
 from forge.planning.audit import audit_planning_model_resolution
 from forge.planning.gate_adapters import build_planning_gate_adapters
+from forge.planning.notifications import build_planning_notification_envelope
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
 
@@ -616,8 +617,24 @@ async def compose_planning_consumer_and_dispatch(
         stage_log_writer = _PlanningStageLogWriter(store)
 
         async def dispatch_product_owner(
-            *, plan_run_id: str, correlation_id: str
+            *,
+            plan_run_id: str,
+            correlation_id: str,
+            enrichment: dict[str, Any] | None = None,
         ) -> Any:
+            # ``enrichment`` (the EnrichmentBatch-shaped revision delta) is
+            # durably recorded by the driver as a ``planning-revision`` event
+            # before this re-invoke; the PO's stateless re-invoke reads the
+            # prior JSON + dispositions from that durable trace. Threaded here
+            # for forward-compatibility with a first-class dispatch carrier.
+            if enrichment is not None:
+                logger.info(
+                    "planning composition: PO re-invoke for %s carries an "
+                    "EnrichmentBatch (cycle=%s, %d revisions)",
+                    correlation_id,
+                    enrichment.get("cycle"),
+                    len(enrichment.get("revisions") or ()),
+                )
             return await dispatch_specialist_stage(
                 stage=StageClass.PRODUCT_OWNER,
                 build_id=plan_run_id,
@@ -647,24 +664,28 @@ async def compose_planning_consumer_and_dispatch(
                 )
             )
 
-        # -- notifications (jarvis.notification.slack, frozen 0.5.0) ------
+        # -- notifications (jarvis.notification.slack) --------------------
         async def publish_planning_notification(
             correlation_id: str, message: str, level: str = "info"
         ) -> None:
-            from nats_core.envelope import EventType, MessageEnvelope
-            from nats_core.events import NotificationPayload
+            # Assumption-dialogue projection (TASK-SPL003F-001): project the
+            # durable thread anchor + originator so jarvis threads the message
+            # into the originating conversation. Read from the planning_runs
+            # row (never re-derived); degrade to None when absent (still
+            # visible, unthreaded — never dropped).
+            parent_request_id: str | None = None
+            target_user: str | None = None
+            row = store.get_run(correlation_id)
+            if row is not None:
+                parent_request_id = row["parent_request_id"]
+                target_user = row["originating_user"]
 
-            payload = NotificationPayload(
+            envelope = build_planning_notification_envelope(
+                correlation_id=correlation_id,
                 message=message,
-                level=level,  # type: ignore[arg-type]
-                adapter="slack",
-                correlation_id=correlation_id,
-            )
-            envelope = MessageEnvelope(
-                source_id="forge",
-                event_type=EventType.NOTIFICATION,
-                correlation_id=correlation_id,
-                payload=payload.model_dump(mode="json"),
+                level=level,
+                parent_request_id=parent_request_id,
+                target_user=target_user,
             )
             await nats_client.publish(
                 "jarvis.notification.slack",

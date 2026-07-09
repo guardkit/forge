@@ -68,6 +68,14 @@ from forge.planning.planner import (
     PauseAtCheckpoint,
     plan_next_step,
 )
+from forge.planning.revision import (
+    CYCLE_CAP,
+    REVISION_STAGE_LABEL,
+    assemble_enrichment_batch,
+    dialogue_cycle,
+    normalize_assumptions,
+    parse_dispositions,
+)
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
 
@@ -104,7 +112,27 @@ timeout_seconds)`` (the ApprovalSubscriber surface); ``armed_event`` is set
 the moment the underlying subscription is active (arm-before-post)."""
 
 DispatchProductOwnerFn = Callable[..., Awaitable[Any]]
-"""``async (*, plan_run_id, correlation_id) -> StageDispatchResult``."""
+"""``async (*, plan_run_id, correlation_id, enrichment=None) -> StageDispatchResult``.
+
+``enrichment`` is the EnrichmentBatch-shaped revision delta on an
+assumption-dialogue re-invoke (``None`` on the first dispatch)."""
+
+
+def _extract_assumptions(result: Any) -> list[dict[str, Any]]:
+    """Best-effort projection of PO-surfaced assumptions off a dispatch result.
+
+    The current :class:`StageDispatchResult` shape does not carry assumptions
+    as a first-class field, so this reads an ``assumptions`` attribute when the
+    PO result exposes one and falls back to ``criterion_breakdown['assumptions']``.
+    Empty when neither is present (the checkpoint degrades to a no-assumptions
+    prompt — never a crash).
+    """
+    raw = getattr(result, "assumptions", None)
+    if raw is None:
+        breakdown = getattr(result, "criterion_breakdown", None)
+        if isinstance(breakdown, Mapping):
+            raw = breakdown.get("assumptions")
+    return normalize_assumptions(raw)
 
 
 @dataclass
@@ -281,12 +309,30 @@ class PlanningRunDriver:
     # Chain steps
     # ------------------------------------------------------------------ #
 
-    async def _dispatch_po(self, correlation_id: str, plan_run_id: str) -> bool:
-        """Dispatch the PRODUCT_OWNER specialist stage; record the outcome."""
+    async def _dispatch_po(
+        self,
+        correlation_id: str,
+        plan_run_id: str,
+        *,
+        enrichment: dict[str, Any] | None = None,
+    ) -> bool:
+        """Dispatch the PRODUCT_OWNER specialist stage; record the outcome.
+
+        On an assumption-dialogue revision, ``enrichment`` carries the
+        EnrichmentBatch-shaped delta (prior assumptions + human dispositions);
+        the PO re-invoke is stateless (propose-never-elicit — forge assembles
+        the delta). The delta is threaded to the dispatch collaborator and
+        recorded on the PO event for durability.
+        """
         deps = self._deps
+        # Pass ``enrichment`` only on a revision re-invoke so first-dispatch
+        # collaborators keep their ``(*, plan_run_id, correlation_id)`` shape.
+        extra: dict[str, Any] = {"enrichment": enrichment} if enrichment else {}
         try:
             result = await deps.dispatch_product_owner(
-                plan_run_id=plan_run_id, correlation_id=correlation_id
+                plan_run_id=plan_run_id,
+                correlation_id=correlation_id,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001 — driver never crashes the run silently
             logger.exception(
@@ -311,6 +357,12 @@ class PlanningRunDriver:
                 "structured_findings": [
                     str(f) for f in (getattr(result, "detection_findings", ()) or ())
                 ],
+                # Structured assumptions surfaced by the PO (best-effort — the
+                # result shape carries them when the PO emits confidence-tagged
+                # assumptions; empty otherwise, and the checkpoint degrades to a
+                # no-assumptions prompt). This is the source the checkpoint
+                # projects into details.summary.assumptions (TASK-SPL003F-001).
+                "assumptions": _extract_assumptions(result),
                 "degraded": outcome_value == "degraded",
                 "reason": reason,
             }
@@ -557,6 +609,25 @@ class PlanningRunDriver:
                     ),
                 )
                 return "approved"
+            if outcome == "revise":
+                # Assumption-dialogue revision: assemble the EnrichmentBatch,
+                # cap-3 → escalate, else re-invoke the PO statelessly. The
+                # checkpoint is NOT cleared; the chain re-pauses next cycle.
+                handled = await self._handle_revision(
+                    correlation_id, plan_run_id, response
+                )
+                if handled == "escalated":
+                    # Escalated to Rich — keep waiting on the escalated
+                    # approver (re-emit the escalated request once armed).
+                    needs_republish = True
+                    continue
+                if handled == "revising":
+                    # RUNNING with a fresh PO output — hand back to drive()'s
+                    # main loop, which re-checkpoints with the new cycle.
+                    return "approved"
+                # revision could not be applied (store/dispatch failure) — the
+                # run stays PAUSED; the wait ceiling / rearm recovers it.
+                return "externally_resolved"
             if outcome == "rejected":
                 await self._notify(
                     correlation_id,
@@ -572,6 +643,94 @@ class PlanningRunDriver:
                 continue
             # refused / unknown → keep waiting
             continue
+
+    async def _handle_revision(
+        self, correlation_id: str, plan_run_id: str, response: Any
+    ) -> str:
+        """Apply an assumption-dialogue revision (cap-3 → escalate, else re-invoke).
+
+        Returns ``"escalated"`` (cap reached — escalated to Rich, run stays
+        PAUSED), ``"revising"`` (RUNNING with a fresh PO output — drive()
+        re-checkpoints) or ``"failed"`` (the revision could not be applied).
+        """
+        deps = self._deps
+        dispositions = parse_dispositions(response)
+
+        # Current dialogue cycle = 1 + durable count of recorded revisions.
+        current_cycle = self._dialogue_cycle(correlation_id)
+
+        # Cap-3: a revision that would open a 4th cycle escalates to Rich via
+        # the existing escalation path (durable expected_approver re-target,
+        # checkpoint_type=product_docs_escalated) instead of another round.
+        if current_cycle >= CYCLE_CAP:
+            logger.info(
+                "planning driver: dialogue cap (%d) reached for %s; escalating "
+                "instead of a %dth cycle",
+                CYCLE_CAP,
+                correlation_id,
+                current_cycle + 1,
+            )
+            from forge.planning.escalation import escalate_planning_run
+
+            await escalate_planning_run(
+                store=deps.store,
+                correlation_id=correlation_id,
+                policy=self._policy(deps.planning_config),
+                clock=deps.clock,
+                publisher=None,  # arm-before-post: drive() re-emits once armed
+                plan_run_id=plan_run_id,
+                feature_id=plan_run_id,
+            )
+            return "escalated"
+
+        # Assemble the EnrichmentBatch delta from the prior assumptions + the
+        # human dispositions (forge assembles the delta; the PO does no
+        # elicitation — propose-never-elicit).
+        prior_assumptions = normalize_assumptions(
+            self._latest_po_output(correlation_id).get("assumptions")
+        )
+        next_cycle = current_cycle + 1
+        batch = assemble_enrichment_batch(
+            correlation_id=correlation_id,
+            cycle=next_cycle,
+            prior_assumptions=prior_assumptions,
+            dispositions=dispositions,
+        )
+
+        # Record the revision durably (increments the dialogue-cycle count so
+        # the next checkpoint projects cycle=next_cycle) BEFORE re-dispatching.
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=REVISION_STAGE_LABEL,
+            status="REVISION",
+            actor_identity=response.decided_by,
+            details_json=json.dumps({"cycle": next_cycle, "enrichment_batch": batch}),
+        )
+
+        # PAUSED → RUNNING so the main loop re-dispatches the PO, then re-invoke
+        # the PO statelessly with the assembled delta.
+        try:
+            await deps.state_machine.transition_to_running(build_id=plan_run_id)
+            await deps.repository.mark_resumed(
+                build_id=plan_run_id, stage_label=_PRODUCT_DOCS_STAGE
+            )
+        except Exception:  # noqa: BLE001 — a transition defect must not crash the run
+            logger.exception(
+                "planning driver: revise transition failed for %s", correlation_id
+            )
+            return "failed"
+
+        ok = await self._dispatch_po(correlation_id, plan_run_id, enrichment=batch)
+        return "revising" if ok else "failed"
+
+    def _dialogue_cycle(self, correlation_id: str) -> int:
+        """1-based dialogue cycle from the durable revision-event count.
+
+        Delegates to :func:`revision.dialogue_cycle` — the same arithmetic the
+        checkpoint projects, so the projected ``cycle`` and this cap gate can
+        never diverge.
+        """
+        return dialogue_cycle(self._deps.store.list_events(correlation_id))
 
     async def _handoff(self, row: Any, correlation_id: str) -> None:
         """Execute the planned-handoff terminal (idempotent, RT-08)."""

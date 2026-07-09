@@ -34,6 +34,13 @@ from dataclasses import dataclass
 
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.gating.models import GateDecision, GateMode
+from forge.planning.revision import (
+    aggregate_outcome,
+    dialogue_cycle,
+    dispositions_by_assumption,
+    normalize_assumptions,
+    parse_dispositions,
+)
 from forge.planning.states import PlanningState
 from nats_core.envelope import EventType, MessageEnvelope
 from nats_core.events import ApprovalRequestPayload, ApprovalResponsePayload
@@ -122,11 +129,18 @@ async def checkpoint_product_docs(
         RuntimeError: If publisher fails (after pause is persisted).
     """
     stage_label = "product_docs"
-    # Attempt 0 is correct for the INITIAL checkpoint (deterministic
-    # request_id, idempotent re-drive). Defer/escalation rounds derive
-    # attempt+1 in forge.planning.escalation (_next_attempt_count) and
-    # persist it via update_pending_approval_request_id (TASK-MP-012).
-    attempt_count = 0
+    correlation_id = plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
+    # Attempt 0 for the INITIAL checkpoint (no pending id yet → deterministic,
+    # idempotent re-drive). A revision re-checkpoint (TASK-SPL003F-001) MUST get
+    # a fresh, DISTINCT request_id per dialogue cycle — else the driver's
+    # stale-round guard accepts a redelivered prior-cycle response and jarvis's
+    # JNB-103 capture treats the new prompt as a duplicate (request_id is the
+    # idempotency key). So bump monotonically from the persisted pending id,
+    # exactly as defer/escalation already do (mark_resumed is a no-op, so the
+    # prior cycle's id survives the PAUSED→RUNNING revise transition).
+    attempt_count = _next_checkpoint_attempt(
+        _read_pending_request_id(repository, correlation_id)
+    )
 
     # Derive deterministic request_id (AC-001)
     request_id = derive_request_id(
@@ -217,8 +231,17 @@ async def checkpoint_product_docs(
 
     # Per-run approver pinning (RT-04): the envelope names the RUN ROW's
     # expected_approver so jarvis can render who is being asked.
-    correlation_id = plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
     expected_approver = await _read_expected_approver(repository, correlation_id)
+
+    # Assumption-dialogue projection (TASK-SPL003F-001): read the durable Slack
+    # thread anchor from the planning_runs row (DD-SPL003-1 — never re-derived
+    # or held in transient state), compute the 1-based dialogue cycle from the
+    # durable revision-event count, and surface the PO's structured assumptions.
+    parent_request_id = _read_parent_request_id(repository, correlation_id)
+    cycle = _dialogue_cycle(repository, correlation_id)
+    # ``None`` (not ``[]``) when the checkpoint proposes no assumptions, so the
+    # summary rides through unchanged on the no-dialogue path (RT-09 contract).
+    assumptions = normalize_assumptions(summary_data.get("assumptions")) or None
 
     # Build approval request envelope with compressed summary (RT-09: no raw interpolation)
     envelope = build_planning_approval_envelope(
@@ -230,6 +253,9 @@ async def checkpoint_product_docs(
         expected_approver=expected_approver,
         attempt_count=attempt_count,
         coach_score=coach_evidence.get("coach_score") if coach_evidence else None,
+        parent_request_id=parent_request_id,
+        cycle=cycle,
+        assumptions=assumptions,
     )
 
     # Publish approval request (publish failure does NOT roll back pause)
@@ -260,6 +286,10 @@ def build_planning_approval_envelope(
     coach_score: float | None = None,
     rationale: str | None = None,
     checkpoint_type: str = "product_docs",
+    parent_request_id: str | None = None,
+    cycle: int | None = None,
+    originating_channel: str | None = None,
+    assumptions: list[dict[str, Any]] | None = None,
 ) -> MessageEnvelope:
     """Build a WIRE-VALID planning approval request envelope.
 
@@ -274,6 +304,18 @@ def build_planning_approval_envelope(
     Escalation and defer re-publish import this same builder — it is the
     single source of truth for the planning approval envelope shape.
 
+    Assumption-dialogue projection (TASK-SPL003F-001). When ``assumptions`` is
+    provided, the per-assumption list ``[{id, text, confidence, basis}]`` is
+    projected under ``details.summary.assumptions`` (alongside a
+    ``summary.checkpoint`` label) — the shape jarvis's J02 renders as per-item
+    approve/edit/defer blocks. ``parent_request_id`` (the durable Slack thread
+    anchor, read from the ``planning_runs`` row) and the dialogue ``cycle``
+    number are projected at the top level so jarvis can thread the prompt and
+    render the cycle. The consumer keys detection on ``checkpoint_type``
+    (ASSUM-002), reads ``summary.assumptions`` and ``parent_request_id``, and
+    ignores forge-internal routing keys (``stage_label``/``gate_mode``/… — the
+    producer is a superset of jarvis's J04 contract fixture).
+
     Args:
         request_id: Deterministic request ID (derive_request_id).
         plan_run_id: Namespaced run identifier (``plan-{correlation_id}``).
@@ -285,11 +327,26 @@ def build_planning_approval_envelope(
         coach_score: Optional coach score for jarvis rendering.
         rationale: Optional human-readable pause rationale.
         checkpoint_type: Checkpoint discriminator for jarvis rendering.
+        parent_request_id: Durable Slack thread anchor (planning_runs row).
+        cycle: 1-based dialogue cycle number for jarvis rendering.
+        originating_channel: Originating Slack channel (best-effort context).
+        assumptions: Per-assumption list ``[{id, text, confidence, basis}]``.
 
     Returns:
         MessageEnvelope ready for publishing.
     """
     correlation_id = plan_run_id[5:] if plan_run_id.startswith("plan-") else plan_run_id
+
+    # Assumption-dialogue projection: fold the structured assumptions into the
+    # summary jarvis renders. Only when assumptions are supplied — otherwise
+    # ``summary`` is the raw PO summary unchanged (existing callers / tests).
+    summary_payload: dict[str, Any] = summary_data
+    if assumptions is not None:
+        summary_payload = {
+            **summary_data,
+            "checkpoint": stage_label,
+            "assumptions": assumptions,
+        }
 
     details: dict[str, Any] = {
         # REQUIRED by ApprovalPublisher.publish_request subject resolution.
@@ -300,13 +357,20 @@ def build_planning_approval_envelope(
         "coach_score": coach_score,
         "rationale": rationale
         or "Product docs checkpoint requires human approval (DF-009)",
-        "summary": summary_data,  # Validated components only (RT-09)
+        "summary": summary_payload,  # Validated components only (RT-09)
         "checkpoint_type": checkpoint_type,
         # Spec: "an approval request should be sent naming the originator
         # as the expected approver" (mode-p-planning-chain.feature:66).
         "expected_approver": expected_approver,
         "attempt_count": attempt_count,
+        # Assumption-dialogue anchors (TASK-SPL003F-001). Present on every
+        # planning envelope; None on the non-dialogue re-publish paths, where
+        # jarvis degrades to a top-level channel post (never dropped).
+        "parent_request_id": parent_request_id,
+        "cycle": cycle,
     }
+    if originating_channel is not None:
+        details["originating_channel"] = originating_channel
 
     payload = ApprovalRequestPayload(
         request_id=request_id,
@@ -369,7 +433,10 @@ async def _dispatch_approval_response(
 
     Returns:
         Outcome discriminator: one of ``"approved"``, ``"rejected"``,
-        ``"deferred"``, ``"overridden"``, ``"refused"``, ``"unknown"``.
+        ``"deferred"``, ``"revise"``, ``"overridden"``, ``"refused"``,
+        ``"unknown"``. ``"revise"`` signals the driver to assemble an
+        EnrichmentBatch and statelessly re-invoke the PRODUCT_OWNER
+        (assumption-dialogue revision cycle, keyed on the dispositions).
     """
     request_id = response.request_id
     decision = response.decision
@@ -446,7 +513,64 @@ async def _dispatch_approval_response(
         )
         return "refused"
 
-    # Dispatch based on decision
+    # Assumption-dialogue disposition handling (TASK-SPL003F-001, ASSUM-006).
+    # Parse the per-assumption dispositions (structured 0.7.0 field, or the
+    # ASSUM-003 notes-JSON bridge; defensively empty on a malformed payload),
+    # record them keyed by assumption id (WS4 curation join), and key the
+    # revise-vs-proceed-vs-defer choice on the DISPOSITIONS, never the decision
+    # literal (an override rides in as ``decision="approve"`` carrying
+    # ``modified`` dispositions).
+    dispositions = parse_dispositions(response)
+    if dispositions:
+        _record_disposition_trace(
+            repository=repository,
+            build_id=build_id,
+            stage_label=stage_label,
+            responder=responder,
+            decision=decision,
+            dispositions=dispositions,
+            clock=clock,
+        )
+        # A whole-run reject or an explicit override still wins outright (both
+        # have dedicated decision-literal branches below — reject → CANCELLED,
+        # override → mark_overridden audit — that the dialogue mapping must not
+        # shadow). The dialogue handshake only rides in as decision="approve"
+        # or "defer".
+        if decision not in ("reject", "override"):
+            aggregate = aggregate_outcome(dispositions)
+            if aggregate == "defer":
+                return await _route_defer(
+                    build_id=build_id,
+                    correlation_id=correlation_id,
+                    stage_label=stage_label,
+                    responder=responder,
+                    escalation_context=escalation_context,
+                    clock=clock,
+                )
+            if aggregate == "revise":
+                # The driver owns the cap-3 check, EnrichmentBatch assembly and
+                # the stateless PO re-invoke — it holds the dispatch collaborator
+                # and re-reads the dispositions off the response.
+                logger.info(
+                    "_dispatch_approval_response: revise requested for %s by %s "
+                    "(dispositions carry a modification)",
+                    build_id,
+                    responder,
+                )
+                return "revise"
+            # aggregate == "proceed": all assumptions accepted → clear the
+            # checkpoint regardless of the decision literal.
+            await state_machine.transition_to_running(build_id=build_id)
+            await repository.mark_resumed(build_id=build_id, stage_label=stage_label)
+            logger.info(
+                "_dispatch_approval_response: all assumptions accepted for %s "
+                "by %s; checkpoint cleared",
+                build_id,
+                responder,
+            )
+            return "approved"
+
+    # Dispatch based on decision (no per-assumption dispositions on the wire)
     if decision == "approve":
         await state_machine.transition_to_running(build_id=build_id)
         await repository.mark_resumed(build_id=build_id, stage_label=stage_label)
@@ -483,34 +607,14 @@ async def _dispatch_approval_response(
         return "rejected"
 
     elif decision == "defer":
-        if escalation_context is None:
-            logger.warning(
-                "_dispatch_approval_response: defer received for %s but no "
-                "escalation context wired; defer is a no-op",
-                build_id,
-            )
-            return "deferred"
-
-        # Late import breaks the checkpoint <-> escalation module cycle
-        # (escalation imports build_planning_approval_envelope from here).
-        from forge.planning.escalation import handle_defer_request
-
-        await handle_defer_request(
-            store=escalation_context.store,
+        return await _route_defer(
+            build_id=build_id,
             correlation_id=correlation_id,
-            policy=escalation_context.policy,
+            stage_label=stage_label,
+            responder=responder,
+            escalation_context=escalation_context,
             clock=clock,
-            publisher=escalation_context.publisher,
-            plan_run_id=build_id,
-            feature_id=escalation_context.feature_id,
         )
-        logger.info(
-            "_dispatch_approval_response: defer for %s routed to escalation "
-            "policy by %s",
-            build_id,
-            responder,
-        )
-        return "deferred"
 
     elif decision == "override":
         await repository.mark_overridden(
@@ -568,6 +672,153 @@ async def _read_expected_approver(
         return None
 
     return row[0]
+
+
+def _read_parent_request_id(
+    repository: GateRepository, correlation_id: str
+) -> str | None:
+    """Read the durable Slack thread anchor from the ``planning_runs`` row.
+
+    Reuses the tested public ``store.get_run`` accessor (DD-SPL003-1 — the
+    anchor is never re-derived or held in transient state). Degrades to
+    ``None`` when the repository exposes no store or the run is absent.
+    """
+    if not hasattr(repository, "_store"):
+        return None
+    store = repository._store  # type: ignore[attr-defined]
+    row = store.get_run(correlation_id)
+    return row["parent_request_id"] if row is not None else None
+
+
+def _read_pending_request_id(
+    repository: GateRepository, correlation_id: str
+) -> str | None:
+    """Read the persisted ``pending_approval_request_id`` for a run (or ``None``)."""
+    if not hasattr(repository, "_store"):
+        return None
+    store = repository._store  # type: ignore[attr-defined]
+    row = store.get_run(correlation_id)
+    return row["pending_approval_request_id"] if row is not None else None
+
+
+def _next_checkpoint_attempt(pending_request_id: str | None) -> int:
+    """Monotonic attempt counter for a (re-)checkpoint's ``request_id``.
+
+    ``None`` (no prior pause) → attempt 0, the INITIAL checkpoint's
+    deterministic, idempotent-re-drive value. Otherwise bump the persisted
+    round by one so every new approval round (revise cycle, defer/escalation
+    round) derives a DISTINCT ``request_id``. Unparseable → 0 (fail safe to the
+    initial value rather than colliding).
+    """
+    if not pending_request_id:
+        return 0
+    try:
+        _, _, attempt = parse_request_id(pending_request_id)
+        return attempt + 1
+    except ValueError:
+        return 0
+
+
+def _dialogue_cycle(repository: GateRepository, correlation_id: str) -> int:
+    """Compute the 1-based dialogue cycle from the durable revision-event count.
+
+    Delegates the count arithmetic + label to :func:`revision.dialogue_cycle`
+    (the single source of truth for the cap-3 gate). Survives restarts (no
+    transient counter).
+    """
+    if not hasattr(repository, "_store"):
+        return 1
+    store = repository._store  # type: ignore[attr-defined]
+    return dialogue_cycle(store.list_events(correlation_id))
+
+
+async def _route_defer(
+    *,
+    build_id: str,
+    correlation_id: str,
+    stage_label: str,
+    responder: str,
+    escalation_context: PlanningEscalationContext | None,
+    clock: Callable[[], datetime],
+) -> str:
+    """Route a deferred decision to the escalation policy (shared by the
+    decision-literal ``defer`` branch and the dispositions ``deferred`` path).
+    """
+    if escalation_context is None:
+        logger.warning(
+            "_dispatch_approval_response: defer received for %s but no "
+            "escalation context wired; defer is a no-op",
+            build_id,
+        )
+        return "deferred"
+
+    # Late import breaks the checkpoint <-> escalation module cycle
+    # (escalation imports build_planning_approval_envelope from here).
+    from forge.planning.escalation import handle_defer_request
+
+    await handle_defer_request(
+        store=escalation_context.store,
+        correlation_id=correlation_id,
+        policy=escalation_context.policy,
+        clock=clock,
+        publisher=escalation_context.publisher,
+        plan_run_id=build_id,
+        feature_id=escalation_context.feature_id,
+    )
+    logger.info(
+        "_dispatch_approval_response: defer for %s routed to escalation "
+        "policy by %s",
+        build_id,
+        responder,
+    )
+    return "deferred"
+
+
+def _record_disposition_trace(
+    *,
+    repository: GateRepository,
+    build_id: str,
+    stage_label: str,
+    responder: str,
+    decision: str,
+    dispositions: list[Any],
+    clock: Callable[[], datetime],
+) -> None:
+    """Record a dialogue cycle's dispositions, keyed by assumption id (WS4 join).
+
+    Writes one ``planning_run_events`` row per response carrying per-assumption
+    dispositions so the decisions are recoverable distinctly by assumption id
+    (FEAT-SPL-005 trace spine / the WS4-S7 curation join). The by-id block is
+    the ``planning_outcome`` episode substrate (backward-edge contract §4.1 —
+    ``disposition`` + ``edit_delta`` first-class).
+    """
+    if not hasattr(repository, "_store"):
+        logger.error(
+            "_record_disposition_trace: repository has no _store attribute; "
+            "cannot record dispositions"
+        )
+        return
+
+    store = repository._store  # type: ignore[attr-defined]
+    correlation_id = build_id[5:] if build_id.startswith("plan-") else build_id
+    cycle = _dialogue_cycle(repository, correlation_id)
+
+    details = {
+        "cycle": cycle,
+        "decision": decision,
+        "decided_by": responder,
+        "recorded_at": clock().isoformat(),
+        # keyed by assumption id — recoverable distinctly (WS4 join)
+        "dispositions": dispositions_by_assumption(dispositions),
+    }
+
+    store._record_event(
+        correlation_id=correlation_id,
+        stage_label="planning-dialogue",
+        status="DISPOSITIONS",
+        actor_identity=responder,
+        details_json=json.dumps(details),
+    )
 
 
 async def _record_rejection_event(

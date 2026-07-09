@@ -1,0 +1,32 @@
+{
+  "build_id": "plan-4d5e205f",
+  "feature_id": "FEAT-PLANNING",
+  "checkpoint_type": "product_docs",
+  "expected_approver": "U03QR8WKT29",
+  "attempt_count": 1,
+  "parent_request_id": "1700000000.000100",
+  "cycle": 1,
+  "summary": {
+    "checkpoint": "product_docs",
+    "assumptions": [
+      {
+        "id": "ASSUM-P1",
+        "text": "The planning intake targets a REST API rather than gRPC.",
+        "confidence": "medium",
+        "basis": "No transport constraint stated in the brief; REST is the house default."
+      },
+      {
+        "id": "ASSUM-P2",
+        "text": "Persistence is PostgreSQL, reusing the fleet-memory instance.",
+        "confidence": "low",
+        "basis": "The brief mentions durable state but names no store."
+      },
+      {
+        "id": "ASSUM-P3",
+        "text": "Authentication is delegated to the existing Slack operator allowlist.",
+        "confidence": "high",
+        "basis": "Consistent with the JNB-110 identity contract already in force."
+      }
+    ]
+  }
+}

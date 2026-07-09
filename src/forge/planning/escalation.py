@@ -72,7 +72,53 @@ __all__ = [
     "EscalationOutcome",
     "evaluate_escalation_phase",
     "handle_defer_request",
+    "escalate_planning_run",
 ]
+
+
+def _dialogue_projection(
+    store: SqlitePlanningRunStore, correlation_id: str
+) -> tuple[str | None, int]:
+    """Return ``(parent_request_id, cycle)`` for a run's re-publish envelope.
+
+    ``parent_request_id`` is the durable Slack thread anchor from the
+    planning_runs row (DD-SPL003-1); ``cycle`` is the 1-based dialogue cycle
+    from :func:`revision.dialogue_cycle` (the shared cap-gate arithmetic).
+    Defensive: degrades to ``(None, 1)``.
+    """
+    from forge.planning.revision import dialogue_cycle
+
+    row = store.get_run(correlation_id)
+    parent_request_id = row["parent_request_id"] if row is not None else None
+    return parent_request_id, dialogue_cycle(store.list_events(correlation_id))
+
+
+def _latest_assumptions(
+    store: SqlitePlanningRunStore, correlation_id: str
+) -> list[dict[str, Any]] | None:
+    """Read the latest PO-surfaced assumptions for a defer/escalation re-publish.
+
+    A defer re-prompt and a cap-3 escalation are new approval rounds over the
+    SAME assumptions — the escalated/re-prompted human must see them, not a bare
+    "escalated" stub (TASK-SPL003F-001 review finding). Reads the most recent
+    ``product_owner`` event's ``po_output.assumptions`` from the durable trace;
+    ``None`` when absent (jarvis degrades to a no-assumptions prompt).
+    """
+    from forge.planning.revision import normalize_assumptions
+
+    latest: list[dict[str, Any]] | None = None
+    for event in store.list_events(correlation_id):
+        if event["stage_label"] == "product_owner" and event["status"] == "approved":
+            if not event["details_json"]:
+                continue
+            try:
+                po_output = json.loads(event["details_json"]).get("po_output", {})
+            except (json.JSONDecodeError, ValueError):
+                continue
+            normalized = normalize_assumptions(po_output.get("assumptions"))
+            if normalized:
+                latest = normalized
+    return latest
 
 
 class EscalationOutcome(str, Enum):
@@ -336,6 +382,7 @@ async def handle_defer_request(
         if publisher is None:
             return EscalationOutcome.CONTINUE_WAITING
 
+        parent_request_id, cycle = _dialogue_projection(store, correlation_id)
         envelope = build_planning_approval_envelope(
             request_id=new_request_id,
             plan_run_id=plan_run_id,
@@ -345,6 +392,9 @@ async def handle_defer_request(
             expected_approver=row["expected_approver"],
             attempt_count=new_attempt,
             checkpoint_type="product_docs_deferred",
+            parent_request_id=parent_request_id,
+            cycle=cycle,
+            assumptions=_latest_assumptions(store, correlation_id),
         )
         try:
             await publisher.publish_request(envelope)
@@ -356,6 +406,43 @@ async def handle_defer_request(
             )
 
         return EscalationOutcome.CONTINUE_WAITING
+
+
+async def escalate_planning_run(
+    *,
+    store: SqlitePlanningRunStore,
+    correlation_id: str,
+    policy: EscalationPolicy,
+    clock: Callable[[], datetime],
+    publisher: Any | None = None,
+    plan_run_id: str | None = None,
+    feature_id: str | None = None,
+) -> EscalationOutcome:
+    """Escalate a PAUSED planning run to the escalation approver (public).
+
+    The assumption-dialogue cap-3 path calls this when a revision would open a
+    4th dialogue cycle: durably re-target ``expected_approver`` and re-publish
+    an escalated approval request (``checkpoint_type=product_docs_escalated``).
+    ``publisher=None`` persists the re-target only; the driver re-emits once its
+    response waiter is armed (arm-before-post).
+    """
+    if not policy.escalation_approver:
+        logger.warning(
+            "escalate_planning_run: no escalation_approver configured for %s; "
+            "keeping current approver (run times out at the wait ceiling)",
+            correlation_id,
+        )
+        return EscalationOutcome.CONTINUE_WAITING
+    return await _escalate_to_secondary_approver(
+        store=store,
+        correlation_id=correlation_id,
+        escalation_approver=policy.escalation_approver,
+        clock=clock,
+        expected_from_state=PlanningState.PAUSED,
+        publisher=publisher,
+        plan_run_id=plan_run_id,
+        feature_id=feature_id,
+    )
 
 
 async def _escalate_to_secondary_approver(
@@ -455,6 +542,7 @@ async def _escalate_to_secondary_approver(
     # Re-publish approval request with incremented attempt (wire-valid
     # envelope shared with the checkpoint — single source of truth).
     if publisher is not None and plan_run_id is not None:
+        parent_request_id, cycle = _dialogue_projection(store, correlation_id)
         envelope = build_planning_approval_envelope(
             request_id=request_id,
             plan_run_id=plan_run_id,
@@ -464,6 +552,11 @@ async def _escalate_to_secondary_approver(
             expected_approver=escalation_approver,
             attempt_count=attempt_count,
             checkpoint_type="product_docs_escalated",
+            parent_request_id=parent_request_id,
+            cycle=cycle,
+            # The escalated approver decides the SAME assumptions — surface them
+            # (review finding: cap-3 escalation must not ask Rich to decide blind).
+            assumptions=_latest_assumptions(store, correlation_id),
         )
 
         try:
