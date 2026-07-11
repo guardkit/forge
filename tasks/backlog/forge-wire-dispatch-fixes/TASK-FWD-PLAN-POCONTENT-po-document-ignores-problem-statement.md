@@ -64,3 +64,54 @@ runs produced structurally-valid PO documents whose CONTENT ignored the request:
 - The 76-min vs 8-min session variance (same verb, same model) is worth a look in the
   same pass — run 1 logged 37 `graphiti-core is not installed` fleet-scope failures
   (a retry pathology?); run 2 only a handful.
+## Diagnosis (2026-07-11, follow-ups session)
+
+**Pinned cause: MIXED** — two distinct defects with different roots, plus one aggravating contributor.
+
+1. **Fabricated `source_documents` = template-example-bleed (CONFIRMED).** The greenfield player prompt's own JSON exemplar hardcodes `source_documents[0].filename="problem-statement.md"` (and `feature_spec_inputs` `source_documents=["overview.md"]` / `suggested_context_files=["docs/design/relevant-doc.md"]`). `architect-agent` copied `problem-statement.md` verbatim into its roadmap in one **clean single shot** — reproducing Run 2's exact fabrication. Captured reasoning: *"I'll include `problem-statement.md` with a contribution summary."* Run 1's `product-brief.md`/`api-spec.md` are the same exemplar-copying class. Guards are inert in greenfield (`_audit_source_documents` session.py:281-283 early-returns on empty manifest; the Coach never gets a ground-truth manifest), so fabricated docs ship unchecked.
+
+2. **Off-topic epics (event-ingestion / task-manager) = multi-turn session-loop artifact (NOT delivery, NOT the model single-shot).** The problem_statement is delivered intact and prominent to the player on iteration 1 (full static trace + Player is plain langchain `create_agent`, no summarisation middleware). All 4 resident models — **including the deployed CONTROL qwen36-workhorse via the product-owner-agent alias, temp 0.7, exact 2-section message** — produced **on-topic** git/commits/Slack output. The off-topic domains appear in NO prompt and NO KG (graphiti_query returns `[]` — graphiti-core not installed). The drift emerges only under the live loop (empty KG round-trips + Coach revision loop max=5 + qwen truncation seeding invalid JSON) progressively burying the 1-line statement. Degradation scales with thrash: Run 1 (76 min / 37 graphiti failures) drifted hardest; Run 2 (8 min) drifted mildly.
+
+3. **Aggravating contributor = model choice.** qwen36 is a **reasoning** model; its `<think>` block (11.2k chars) ate the 3000-tok budget and truncated the CONTROL roadmap mid-JSON (`finish_reason=length`). That invalid JSON seeds the revision loop. `architect-agent` (non-reasoning) was the ONLY model to emit a complete valid on-topic roadmap in one shot (`finish_reason=stop`, 1488 tok).
+
+`project_name:""` is a benign deterministic plumbing artifact (`_derive_project_name(docs_path='')`, session.py:533), not a dropped-statement symptom.
+
+### A/B (exact deployed 2-section message; product-owner-agent alias = qwen36-workhorse)
+
+| Model | On-topic | Complete valid roadmap (1-shot) | Fabricated citation | Note |
+|---|---|---|---|---|
+| **qwen36-workhorse** (CONTROL, deployed alias) | Yes | **No** — `finish_reason=length`, `<think>` ate 3000-tok budget, truncated at FEAT-PO-002 | weighed `problem-statement.md` | reasoning-budget problem, not drift |
+| gemma4-coach | Yes (intent) | No — emitted `graphiti_query` then `stop` | — | followed Step 2, paused for tool |
+| **architect-agent** | Yes | **Yes** — `finish_reason=stop`, 1488 tok | **Yes** — copied `problem-statement.md` verbatim | non-reasoning; only complete 1-shot; reproduced Run 2 fabrication clean |
+| tutor-coach | Yes (intent) | No — `graphiti_query` then `stop`, 33 tok | — | tool-first, no drift |
+
+**Verdict:** hypothesis 1 (model drifts) REFUTED; hypothesis 2 (session drops/overrides the statement) DISPROVEN. The content-ignoring is (a) a template-exemplar fabrication attractor + (b) a multi-turn loop degradation, not a delivery bug and not a bad single-shot model.
+
+### Recommendation
+
+- **llama-swap retarget: YES → `architect-agent`** (resident/cheap; NOT gpt-oss). Basis is NOT on-topic superiority (qwen was on-topic) but JSON completeness / no reasoning-truncation: architect emits a complete valid roadmap one-shot where qwen truncates and seeds the revision loop. It is a llama-swap config edit (fenced here) → queue for the alias owner. **Does not alone fix the drift.** Cheaper alternative if keeping qwen36: disable thinking (`enable_thinking=false` / `/no_think`) + raise `max_tokens`.
+- **Specialist-side change: YES** (queue behind FEAT-DF12 Phase A):
+  1. `roles/product-owner/prompts/player_greenfield.md` — strip hardcoded filenames from the Output-Format example (`source_documents`/`feature_spec_inputs` → `[]`). **Highest-confidence fix; kills the fabrication attractor.**
+  2. Soften Step 2 / "Knowledge Graph Integration" to make `graphiti_query` optional (always empty in-container; wastes a loop iteration).
+  3. Add a greenfield guard rejecting non-empty `source_documents` when `docs_path is None`.
+  4. Per acceptance criteria: add value-free per-iteration player-message section logging on ONE live run to pin the drift driver (qwen-truncation-seeding vs pure multi-turn accumulation); single-shot replay can't reproduce the loop. Likely session fix: re-inject `## Problem Statement` into each revision-loop turn so it isn't buried after turn 1.
+  5. Cosmetic: derive greenfield `project_name` from the problem statement / model value (session.py:533).
+
+*All work READ-ONLY on container `specialist-agent-product-owner-agent-1`; one model call per curl to the resident `product-owner-agent` alias, no fleet eviction. Artifacts: `scratchpad/pocontent/` (sys_greenfield.md, user_msg.txt, run.py, resp_*.json, visible_*.txt, evidence_fabricated_citation.txt).*
+## Applied (2026-07-11, follow-ups session)
+
+- **llama-swap retarget EXECUTED**: `product-owner-agent` alias moved
+  qwen36-workhorse → **architect-agent** (routing verified live; backup
+  `config.yaml.bak-20260711-po-alias-retarget`). Rationale: architect-agent was
+  the only resident model to emit a complete, valid, on-topic ProductRoadmap in
+  one shot; qwen36's reasoning blocks consumed the whole completion budget
+  (truncated JSON → Coach revision thrash → drift). Still INTERIM pending a PO
+  fine-tune decision.
+- **Specialist-side changes remain OPEN** (queue behind FEAT-DF12): strip the
+  hardcoded exemplar filenames from `player_greenfield.md` (the fabrication
+  attractor, reproduced clean single-shot); soften the mandatory `graphiti_query`
+  step (graphiti-core absent → always empty); greenfield `project_name`
+  derivation (deterministic '' today); make the anti-fabrication audits
+  greenfield-aware (currently inert on empty manifest).
+- Live re-validation of content quality rides the planning-activation run
+  (jarvis env + planning.enabled:true), queued behind the JNB-009 claim.
