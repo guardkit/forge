@@ -21,7 +21,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from nats_core.envelope import EventType, MessageEnvelope
@@ -40,6 +40,7 @@ from forge.adapters.nats.fleet_watcher import (
 from forge.config.models import FleetConfig
 from forge.discovery.cache import DiscoveryCache
 from forge.discovery.protocol import FleetEventSink
+from forge.discovery.resolve import resolve
 
 # ---------------------------------------------------------------------------
 # Test doubles & helpers
@@ -666,3 +667,122 @@ class TestPublicSurface:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+
+# ---------------------------------------------------------------------------
+# Composed-path regression — TASK-FWD-PLAN-FLEETWATCHER
+#
+# Live symptom (Session A MP-010, 2026-07-11): the planning stack composes
+# the fleet watcher over a real ``nats_core.NATSClient`` whose ``watch_fleet``
+# iterates the nats-py KV watcher. nats-py enqueues a ``None`` init-done
+# sentinel once the initial key set is replayed; ``watch_fleet`` used to
+# access ``entry.operation`` on it and raise ``'NoneType' object has no
+# attribute 'operation'``, which wedged ``FleetWatcher.run``'s reconnect loop
+# so specialist discovery stayed EMPTY and every PRODUCT_OWNER dispatch
+# degraded to ``no_specialist_resolvable``. This drives one real watch update
+# (plus the None sentinel) through the *composed* watcher path — the same
+# ``fleet_watch(nats_core_client, cache)`` wiring _serve_planning.py uses —
+# with no live broker.
+# ---------------------------------------------------------------------------
+
+
+class TestComposedWatcherSpecialistDiscovery:
+    """Regression: the composed watcher populates specialist discovery and
+    survives the nats-py ``None`` init-done sentinel."""
+
+    @staticmethod
+    async def _connect_mock_nats_core_client(watch_entries: list[Any]) -> Any:
+        """Build a real ``nats_core.NATSClient`` whose KV ``watch(">")`` yields
+        ``watch_entries`` — connected against mocks, no live broker."""
+        from nats_core.client import NATSClient
+        from nats_core.config import NATSConfig
+
+        async def _watch_iter() -> Any:
+            for entry in watch_entries:
+                yield entry
+
+        kv = AsyncMock()
+        watcher = MagicMock()
+        watcher.__aiter__ = lambda self: _watch_iter()
+        watcher.stop = AsyncMock()
+        kv.watch = AsyncMock(return_value=watcher)
+
+        js = MagicMock()
+        js.key_value = AsyncMock(return_value=kv)
+
+        nc = AsyncMock()
+        nc.is_connected = True
+        nc.jetstream = MagicMock(return_value=js)
+        nc.subscribe = AsyncMock(return_value=AsyncMock())
+
+        client = NATSClient(NATSConfig(name="forge-serve-planning-fleet-test"))
+        with patch(
+            "nats_core.client.nats.connect",
+            new_callable=AsyncMock,
+            return_value=nc,
+        ):
+            await client.connect()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_composed_watcher_populates_product_owner_specialist(self) -> None:
+        # A real product-owner-agent manifest advertising the
+        # ``product_owner_specialist`` tool capability the PO dispatch resolves.
+        po_manifest = _manifest(
+            "product-owner-agent",
+            tools=[_tool("product_owner_specialist")],
+        )
+        put_entry = MagicMock()
+        put_entry.key = "product-owner-agent"
+        put_entry.value = po_manifest.model_dump_json().encode()
+        put_entry.operation = "PUT"
+
+        # None FIRST — the nats-py init-done sentinel ordering that crashed
+        # the live loop before any real update was delivered.
+        client = await self._connect_mock_nats_core_client([None, put_entry])
+
+        cache = DiscoveryCache()
+        # Compose exactly as _serve_planning.py does.
+        task = asyncio.create_task(watch(client, cache, status_reader=cache))
+        try:
+            for _ in range(50):
+                if "product-owner-agent" in cache:
+                    break
+                await asyncio.sleep(0)
+
+            snapshot = await cache.snapshot()
+            matched_id, resolution = resolve(snapshot, "product_owner_specialist")
+
+            # Discovery populated: the capability resolves (was previously
+            # unresolved → no_specialist_resolvable).
+            assert matched_id == "product-owner-agent"
+            assert resolution.match_source == "tool_exact"
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_composed_watcher_survives_none_only_sentinel(self) -> None:
+        """A None/empty update alone must be skipped without raising and
+        without wedging the loop — discovery simply stays empty until a real
+        PUT arrives."""
+        # Yield only the None sentinel; the watch iterator then drains and the
+        # run loop re-subscribes (bounded by cancellation below).
+        client = await self._connect_mock_nats_core_client([None])
+
+        cache = DiscoveryCache()
+        task = asyncio.create_task(
+            watch(client, cache, reconnect_backoff_seconds=0),
+        )
+        # Let the watch loop process the sentinel + re-enter a few times.
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        # No crash, no entries — the sentinel was skipped cleanly.
+        assert len(cache) == 0
+        assert not task.done()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
