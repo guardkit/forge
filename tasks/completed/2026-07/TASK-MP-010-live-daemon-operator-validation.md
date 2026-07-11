@@ -99,3 +99,30 @@ by **feature-rollup** (FEAT-3ED2 status) — but the operator ACs had **never ru
 **Status truth:** core loop validated to the terminal; MP-010 stays **effectively open** pending
 the two filed gaps — "live planning" / J05 unblock is gated on them. Full evidence:
 `docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md`.
+
+### 2026-07-12 terminal disposition (factory-close coordinator — adjudication, closes the status contradiction)
+
+`status: completed` **STANDS**. The 07-11 reconciliation above recorded the sweep's rollup flip as
+premature ("effectively open pending the two filed gaps") — since then both gaps and the whole
+execution seam behind them were fixed and the composed loop this task exists to validate ran live
+**twice** on the deployed image:
+
+- **Synthetic e2e (2026-07-11, DISPATCHFMT lane):** inject → resolve → envelope dispatch →
+  specialist parse+route → real PO greenfield session → `product_docs` checkpoint PAUSED on real
+  content → identity-pinned approve → **PLANNED_HANDOFF** + `planning/{cid}` branch +
+  `feature_spec_inputs/{cid}.md` written (cid `dfmt229a103d6df1`; forge `6dbf7de..872309b`,
+  nats-core `21e2bd3`).
+- **Real phone loop (2026-07-12, activation lane):** J04 Slack intake → checkpoint PAUSED → jarvis
+  `planning_checkpoint_rendered` → **Rich approved from his phone**
+  (`dialogue_decision_published decided_by=U03QR8WKT29` via slack_reply) → PLANNED_HANDOFF +
+  `feature_spec_inputs` written (run `dfmt4e6490800d3a`; planning now `enabled:true` FOR GOOD).
+
+**AC disposition:** AC-1 ✅ (Session A) · AC-3 ✅ (Session A + re-proven on dfmt4) · AC-4 ✅
+(discharged live, both runs above) · AC-6 ✅ (discharged by the JNB-009 live-probe session: gated
+toy builds paused under the pinned approver, exactly-once, no wedge — jarvis `9200266`, addressed
+to the re-pinned member id, not the stale `rich` literal in the AC text) · **AC-2 / AC-5 / AC-7
+NEVER RUN — explicitly re-scoped OUT** as optional resilience probes (restart-while-paused single
+re-emit; kill-NATS-mid-pause recovery; DF-004 negative probe). They do not block `completed` — the
+composed-loop validation is done — but they are NAMED residue, individually runnable from this
+file, and are carried as named gaps in the Factory-1 record (ai-transition
+`docs/ways-of-working/factory-close-handoff.md` §1 discrepancy 2 resolution).
