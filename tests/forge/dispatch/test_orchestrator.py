@@ -180,6 +180,9 @@ class FakePublisher:
         self,
         attempt: DispatchAttempt,
         parameters: list[DispatchParameter],
+        *,
+        command: str = "dispatch",
+        command_args: dict[str, Any] | None = None,
     ) -> None:
         if self._seq_counter is not None:
             self._seq_counter.append(self._seq_counter[-1] + 1 if self._seq_counter else 1)
@@ -384,9 +387,10 @@ class TestStepOrderInvariant:
         async def _record_publish(
             attempt: DispatchAttempt,
             parameters: list[DispatchParameter],
+            **kwargs: Any,
         ) -> None:
             seq_counter.append(("publish", attempt.correlation_key))  # type: ignore[arg-type]
-            await original_publish(attempt, parameters)
+            await original_publish(attempt, parameters, **kwargs)
 
         publisher.publish_dispatch = _record_publish  # type: ignore[method-assign]
 
@@ -468,9 +472,10 @@ class TestSubscribeBeforePublish:
         async def _record_publish(
             attempt: DispatchAttempt,
             parameters: list[DispatchParameter],
+            **kwargs: Any,
         ) -> None:
             published_event.set()
-            await original_publish(attempt, parameters)
+            await original_publish(attempt, parameters, **kwargs)
 
         publisher.publish_dispatch = _record_publish  # type: ignore[method-assign]
 

@@ -48,16 +48,20 @@ from forge.dispatch.models import (
 from forge.dispatch.persistence import DispatchParameter
 from forge.pipeline.dispatchers.specialist import (
     SPECIALIST_CAPABILITY_BY_STAGE,
+    SPECIALIST_COMMAND_BY_STAGE,
     SPECIALIST_INTENT_BY_STAGE,
+    SPECIALIST_REQUIRED_ARGS_BY_STAGE,
     SPECIALIST_STAGES,
     SpecialistDispatchSurface,
     StageDispatchOutcome,
     StageDispatchResult,
     StageLogWriter,
+    build_specialist_command,
     dispatch_specialist_stage,
 )
 from forge.pipeline.forward_context_builder import (
     ApprovedStageEntry,
+    ContextEntry,
     ForwardContextBuilder,
 )
 from forge.pipeline.stage_taxonomy import StageClass
@@ -118,6 +122,8 @@ class RecordingDispatchSurface:
         intent_pattern: str | None = None,
         build_id: str = "unknown",
         stage_label: str = "unknown",
+        command: str = "dispatch",
+        command_args: dict[str, Any] | None = None,
     ) -> DispatchOutcome:
         self.call_count += 1
         self.last_call = {
@@ -128,6 +134,8 @@ class RecordingDispatchSurface:
             "intent_pattern": intent_pattern,
             "build_id": build_id,
             "stage_label": stage_label,
+            "command": command,
+            "command_args": dict(command_args) if command_args else {},
         }
         if self.outcome is None:
             raise AssertionError("Test forgot to seed RecordingDispatchSurface.outcome")
@@ -585,6 +593,8 @@ class TestStageLogLifecycle:
                 intent_pattern: str | None = None,
                 build_id: str = "unknown",
                 stage_label: str = "unknown",
+                command: str = "dispatch",
+                command_args: dict[str, Any] | None = None,
             ) -> DispatchOutcome:
                 observed_submits_at_dispatch_time.append(len(writer.submits))
                 assert self.outcome is not None
@@ -1011,3 +1021,172 @@ class TestSpecialistIntentThreading:
         assert surface.last_call["capability"] == SPECIALIST_CAPABILITY_BY_STAGE[stage]
         assert surface.last_call["intent_pattern"] == expected_intent
         assert surface.last_call["intent_pattern"] == SPECIALIST_INTENT_BY_STAGE[stage]
+
+
+# ---------------------------------------------------------------------------
+# M2 + M3 (DISPATCHFMT+ S2) — the data-driven dispatch build: a deployed verb
+# plus a dict of that verb's required inputs, per contract decisions D1 + D3.
+# ---------------------------------------------------------------------------
+
+
+_REALISTIC_REQUEST = (
+    "Build a voice-first standup bot that summarises yesterday's git activity "
+    "and reads it back over the office speaker each morning."
+)
+
+
+class TestBuildSpecialistCommand:
+    """`build_specialist_command` — verb + required-input args per stage."""
+
+    def test_product_owner_uses_deployed_greenfield_verb(self) -> None:
+        command, _ = build_specialist_command(
+            StageClass.PRODUCT_OWNER,
+            request_text=_REALISTIC_REQUEST,
+            context_entries=[],
+        )
+        # M2: a real deployed verb (the PO command_map routes "greenfield").
+        assert command == "greenfield"
+        assert command == SPECIALIST_COMMAND_BY_STAGE[StageClass.PRODUCT_OWNER]
+
+    def test_product_owner_threads_request_text_as_problem_statement(self) -> None:
+        command, args = build_specialist_command(
+            StageClass.PRODUCT_OWNER,
+            request_text=_REALISTIC_REQUEST,
+            context_entries=[],
+        )
+        # M3: args is a dict carrying every deployed-required key, non-empty.
+        assert isinstance(args, dict)
+        required = SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.PRODUCT_OWNER]
+        assert all(args.get(name) for name in required)
+        # D1: the greenfield problem_statement IS the raw planning request text.
+        assert args["problem_statement"] == _REALISTIC_REQUEST
+
+    def test_product_owner_strips_and_drops_blank_request_text(self) -> None:
+        # A blank request cannot source problem_statement — the key is absent
+        # (the caller logs it; the deployed router rejects the command).
+        _, args = build_specialist_command(
+            StageClass.PRODUCT_OWNER,
+            request_text="   ",
+            context_entries=[],
+        )
+        assert "problem_statement" not in args
+        # And leading/trailing whitespace on a real request is trimmed.
+        _, args2 = build_specialist_command(
+            StageClass.PRODUCT_OWNER,
+            request_text=f"  {_REALISTIC_REQUEST}  ",
+            context_entries=[],
+        )
+        assert args2["problem_statement"] == _REALISTIC_REQUEST
+
+    def test_product_owner_drops_forward_context_charter(self) -> None:
+        # D3: no deployed greenfield handler reads a generic context arg, so the
+        # "--context" charter entry is dropped — never leaks into the wire args.
+        _, args = build_specialist_command(
+            StageClass.PRODUCT_OWNER,
+            request_text=_REALISTIC_REQUEST,
+            context_entries=[
+                ContextEntry(
+                    flag="--context", value="approved charter blob", kind="text"
+                )
+            ],
+        )
+        assert args == {"problem_statement": _REALISTIC_REQUEST}
+        assert "context" not in args
+
+    def test_architect_uses_deployed_greenfield_verb(self) -> None:
+        command, _ = build_specialist_command(
+            StageClass.ARCHITECT,
+            request_text=_REALISTIC_REQUEST,
+            context_entries=[
+                ContextEntry(flag="--docs_path", value="docs/product", kind="path"),
+                ContextEntry(flag="--scope", value="whole-system", kind="text"),
+            ],
+        )
+        # M2: the architect command_map also routes "greenfield" (overloaded
+        # verb; the target agent disambiguates the handler).
+        assert command == "greenfield"
+        assert command == SPECIALIST_COMMAND_BY_STAGE[StageClass.ARCHITECT]
+
+    def test_architect_sources_required_args_from_forward_context(self) -> None:
+        _, args = build_specialist_command(
+            StageClass.ARCHITECT,
+            request_text=_REALISTIC_REQUEST,
+            context_entries=[
+                ContextEntry(flag="--docs_path", value="docs/product", kind="path"),
+                ContextEntry(flag="--scope", value="whole-system", kind="text"),
+            ],
+        )
+        # M3: every deployed-required architect key present with real values,
+        # sourced by flag-name from the forward-context entries (D3).
+        required = SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.ARCHITECT]
+        assert all(args.get(name) for name in required)
+        assert args["docs_path"] == "docs/product"
+        assert args["scope"] == "whole-system"
+
+    def test_refuses_non_specialist_stage(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            build_specialist_command(
+                StageClass.AUTOBUILD,
+                request_text=_REALISTIC_REQUEST,
+                context_entries=[],
+            )
+        assert "AUTOBUILD".lower() in str(excinfo.value).lower() or (
+            StageClass.AUTOBUILD.value in str(excinfo.value)
+        )
+
+
+class TestDispatchThreadsCommand:
+    """`dispatch_specialist_stage` threads the resolved verb + args on."""
+
+    @pytest.mark.asyncio
+    async def test_product_owner_dispatch_carries_command_and_args(
+        self,
+        builder: ForwardContextBuilder,
+        surface: RecordingDispatchSurface,
+        writer: RecordingStageLogWriter,
+    ) -> None:
+        surface.outcome = _sync_result()
+        await dispatch_specialist_stage(
+            stage=StageClass.PRODUCT_OWNER,
+            build_id=_BUILD_ID,
+            correlation_id=_CORRELATION_ID,
+            forward_context_builder=builder,
+            dispatch_surface=surface,
+            stage_log_writer=writer,
+            request_text=_REALISTIC_REQUEST,
+        )
+        # The resolved deployed verb + dict args reach the dispatch surface,
+        # which stamps them onto the wire CommandPayload (M2 + M3).
+        assert surface.last_call["command"] == "greenfield"
+        assert surface.last_call["command_args"] == {
+            "problem_statement": _REALISTIC_REQUEST
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_request_text_still_dispatches_but_warns(
+        self,
+        builder: ForwardContextBuilder,
+        surface: RecordingDispatchSurface,
+        writer: RecordingStageLogWriter,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        surface.outcome = _sync_result()
+        with caplog.at_level("WARNING"):
+            await dispatch_specialist_stage(
+                stage=StageClass.PRODUCT_OWNER,
+                build_id=_BUILD_ID,
+                correlation_id=_CORRELATION_ID,
+                forward_context_builder=builder,
+                dispatch_surface=surface,
+                stage_log_writer=writer,
+                request_text=None,
+            )
+        # Best-effort: the command is still sent (verb resolves) but with no
+        # problem_statement, and a loud warning names the missing arg.
+        assert surface.last_call["command"] == "greenfield"
+        assert "problem_statement" not in surface.last_call["command_args"]
+        assert any(
+            "missing required deployed arg" in rec.message
+            and "problem_statement" in str(rec.args)
+            for rec in caplog.records
+        )

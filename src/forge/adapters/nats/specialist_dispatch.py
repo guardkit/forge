@@ -115,14 +115,16 @@ SOURCE_AGENT_HEADER: str = "source_agent_id"
 #: Fixed source identifier stamped on every dispatch command.
 REQUESTING_AGENT_ID: str = "forge"
 
-#: Placeholder command verb carried by the :class:`CommandPayload` until the
-#: specialist-verb resolution (M2) is wired in S2. S1 is a **pure envelope
-#: change** — it makes forge publish a structurally valid nats-core
-#: :class:`MessageEnvelope` that the deployed specialist can parse, but it does
-#: NOT yet resolve the Mode-P stage to a real deployed verb (``greenfield`` for
-#: the PO product_docs stage, per contract decision D1). Until S2 replaces it,
-#: the wire carries this sentinel so ``CommandPayload.command`` satisfies its
-#: ``min_length=1`` constraint; it deliberately does not route to a handler.
+#: Default command verb used **only** when a caller does not resolve one — the
+#: production path (:func:`forge.pipeline.dispatchers.specialist.dispatch_specialist_stage`
+#: → :meth:`DispatchOrchestrator.dispatch`) ALWAYS passes the stage-resolved
+#: deployed verb (``greenfield`` for both the PO product_docs stage and the
+#: architect from-scratch stage, per contract decision D1). This sentinel keeps
+#: the ``CommandPayload.command`` ``min_length=1`` constraint satisfied for the
+#: adapter-level tests that exercise the envelope/subject/header seams without
+#: caring about the verb. It does not resolve to any deployed handler, so a
+#: message carrying it would be answered with "Command 'dispatch' is not
+#: supported" — never emitted on the production wire (M2/M3, DISPATCHFMT+ S2).
 DISPATCH_COMMAND_PLACEHOLDER: str = "dispatch"
 
 __all__ = [
@@ -187,8 +189,17 @@ class DispatchCommandPublisher(Protocol):
         self,
         attempt: DispatchAttempt,
         parameters: list[DispatchParameter],
+        *,
+        command: str,
+        command_args: dict[str, Any] | None = None,
     ) -> None:
-        """Publish the dispatch command on the transport."""
+        """Publish the dispatch command on the transport.
+
+        ``command`` is the deployed verb the target agent's command_map
+        routes on (``greenfield`` for both specialist stages, per D1);
+        ``command_args`` is the deployed-handler argument dict (e.g.
+        ``{"problem_statement": ...}`` for the PO greenfield handler).
+        """
         ...
 
 
@@ -408,10 +419,14 @@ class NatsSpecialistDispatchAdapter:
         self,
         attempt: DispatchAttempt,
         parameters: list[DispatchParameter],
+        *,
+        command: str = DISPATCH_COMMAND_PLACEHOLDER,
+        command_args: dict[str, Any] | None = None,
     ) -> None:
         """Publish the dispatch command on ``agents.command.{matched_agent_id}``.
 
-        Wire format (M1 + M5-command fix, DISPATCHFMT+ S1). The deployed
+        Wire format (M1 + M5-command fix, DISPATCHFMT+ S1; verb + dict args,
+        M2 + M3, DISPATCHFMT+ S2). The deployed
         specialist parses every inbound message through
         :class:`nats_core.envelope.MessageEnvelope` in
         ``client.subscribe_with_reply`` **before** the router callback runs;
@@ -432,12 +447,13 @@ class NatsSpecialistDispatchAdapter:
             live on the envelope, not only in headers.
           * ``payload`` — a :class:`nats_core.events.CommandPayload`
             (``command`` / ``args`` / ``correlation_id``) as a plain dict.
-            ``command`` is :data:`DISPATCH_COMMAND_PLACEHOLDER` until the
-            verb-resolution fix (M2) lands in S2; ``args["parameters"]``
-            carries the (already-scrubbed-by-caller) parameter list verbatim.
-            Sensitive parameters carry ``value=None`` so the on-wire form
-            mirrors the persisted-row form, satisfying
-            ``E.sensitive-parameter-hygiene`` end-to-end.
+            ``command`` is the deployed verb the target agent's command_map
+            routes on (``greenfield`` for both specialist stages, per D1);
+            ``args`` is ``command_args`` — the deployed-handler argument dict
+            carrying exactly the keys that handler reads (e.g.
+            ``{"problem_statement": <planning request text>}`` for the PO
+            greenfield handler). The router's ``_check_required_args`` gate
+            enforces those keys (M2 + M3).
 
         * Headers: ``correlation_key`` / ``requesting_agent_id`` /
           ``dispatched_at`` are retained for **tracing only** — nothing in
@@ -447,7 +463,16 @@ class NatsSpecialistDispatchAdapter:
         ``attempt_no``, ``retry_of``, ``matched_agent_id``) is **not** put on
         the wire: the specialist ignores it, ``matched_agent_id`` is already
         the subject, and the reply is re-correlated from forge's own registry.
-        This keeps the minimal canonical CommandPayload wire shape.
+
+        The FEAT-FORGE-003 ``parameters`` list (correlation-id + forward-context
+        audit records) is persisted upstream by
+        :func:`forge.dispatch.persistence.persist_resolution` and is **not**
+        serialised onto the wire: no deployed greenfield handler (PO or
+        architect) reads a ``parameters`` or ``context`` argument, so under
+        contract decision D3 those forward-context records are dropped from the
+        command args. Sensitive parameters therefore never reach the wire at
+        all, satisfying ``E.sensitive-parameter-hygiene`` by construction. The
+        deployed-handler inputs travel exclusively via ``command_args``.
 
         PubAck on the audit stream (when JetStream emits one) is logged
         at DEBUG only — it is **not** routed through
@@ -461,21 +486,14 @@ class NatsSpecialistDispatchAdapter:
             REQUESTING_AGENT_HEADER: REQUESTING_AGENT_ID,
             DISPATCHED_AT_HEADER: self._clock.now().isoformat(),
         }
+        # M2 + M3 (DISPATCHFMT+ S2): the wire carries the stage-resolved
+        # deployed verb and the deployed-handler argument dict. ``parameters``
+        # (correlation-id + forward-context audit records) is persisted
+        # upstream and deliberately NOT serialised here — no deployed
+        # greenfield handler reads it (D3), so it is dropped from the wire.
         command_payload = CommandPayload(
-            # Placeholder verb — S2 (M2) resolves the real deployed verb.
-            command=DISPATCH_COMMAND_PLACEHOLDER,
-            args={
-                "parameters": [
-                    {
-                        "name": parameter.name,
-                        # Sensitive scrub mirrors persistence: the value is
-                        # dropped on the wire too, not just at rest.
-                        "value": None if parameter.sensitive else parameter.value,
-                        "sensitive": parameter.sensitive,
-                    }
-                    for parameter in parameters
-                ],
-            },
+            command=command,
+            args=dict(command_args) if command_args else {},
             correlation_id=attempt.correlation_key,
         )
         envelope = MessageEnvelope(

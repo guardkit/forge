@@ -403,14 +403,17 @@ class TestDispatchHeaders:
         assert parsed.utcoffset() == timezone.utc.utcoffset(parsed), timestamp
 
     @pytest.mark.asyncio
-    async def test_body_carries_scrubbed_parameters_in_command_args(
+    async def test_wire_args_are_command_args_and_never_the_parameters(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         nats_client: FakeNATSClient,
     ) -> None:
-        # Post-S1 the wire body is a nats-core MessageEnvelope wrapping a
-        # CommandPayload; the (already-scrubbed) parameter list is carried
-        # verbatim under ``args["parameters"]`` (S2 restructures it).
+        # M2 + M3 (DISPATCHFMT+ S2, D3): the wire ``CommandPayload.args`` is
+        # EXACTLY ``command_args`` — the deployed-handler argument dict. The
+        # FEAT-FORGE-003 ``parameters`` list (correlation-id + forward-context
+        # audit records) is persisted upstream and NEVER serialised onto the
+        # wire, so no deployed handler is fed a ``parameters`` / ``context``
+        # arg it does not read, and sensitive parameter values cannot leak.
         attempt = _make_attempt(
             correlation_key="ab" * 16,
             matched_agent_id="po-agent",
@@ -419,26 +422,33 @@ class TestDispatchHeaders:
             retry_of="res-41",
         )
         params = [
-            DispatchParameter(name="task", value="lint", sensitive=False),
-            DispatchParameter(name="api_key", value="sk-XXX", sensitive=True),
+            DispatchParameter(name="correlation_id", value="ab" * 16),
+            DispatchParameter(name="context", value="--context=text=charter"),
+            DispatchParameter(name="api_key", value="sk-SECRET", sensitive=True),
         ]
-        await adapter.publish_dispatch(attempt, params)
+        await adapter.publish_dispatch(
+            attempt,
+            params,
+            command="greenfield",
+            command_args={"problem_statement": "a voice-first standup bot"},
+        )
         recorded = nats_client.published[-1]
         envelope = MessageEnvelope.model_validate_json(recorded.body)
         command = CommandPayload.model_validate(envelope.payload)
-        # Sensitive value is dropped on the wire too — mirrors persistence.
-        assert command.args["parameters"] == [
-            {"name": "task", "value": "lint", "sensitive": False},
-            {"name": "api_key", "value": None, "sensitive": True},
-        ]
-        # Forge-local dispatch bookkeeping is NOT put on the wire — the
-        # specialist ignores it and forge re-correlates from its registry.
-        decoded = json.loads(recorded.body.decode("utf-8"))
+        # args == command_args, verbatim; the parameters blob is gone.
+        assert command.args == {"problem_statement": "a voice-first standup bot"}
+        assert "parameters" not in command.args
+        assert "context" not in command.args
+        # No parameter name/value (sensitive or not) reaches the wire body.
+        body_text = recorded.body.decode("utf-8")
+        assert "sk-SECRET" not in body_text
+        assert "api_key" not in body_text
+        assert "charter" not in body_text
+        # Forge-local dispatch bookkeeping is NOT put on the wire either.
+        decoded = json.loads(body_text)
         assert "resolution_id" not in decoded
         assert "attempt_no" not in decoded
         assert "retry_of" not in decoded
-        assert "resolution_id" not in command.args
-        assert "attempt_no" not in command.args
 
 
 # ---------------------------------------------------------------------------
@@ -515,8 +525,9 @@ class TestDispatchEnvelopeWireFormat:
             nats_client.published[-1].body
         )
         command = CommandPayload.model_validate(envelope.payload)
-        # S1 is a pure envelope change: the command is still the placeholder
-        # verb (S2/M2 resolves the real deployed verb, e.g. "greenfield").
+        # This call resolves no verb, so the adapter falls back to the
+        # non-routing placeholder default (production always passes the
+        # stage-resolved ``greenfield`` verb — see TestDispatchDeployedVerb).
         assert command.command == DISPATCH_COMMAND_PLACEHOLDER
         assert len(command.command) >= 1  # CommandPayload min_length contract
         # Correlation is also threaded onto the CommandPayload (the deployed
@@ -538,6 +549,110 @@ class TestDispatchEnvelopeWireFormat:
         assert recorded.headers is not None
         assert recorded.headers[CORRELATION_KEY_HEADER] == key
         envelope = MessageEnvelope.model_validate_json(recorded.body)
+        assert envelope.correlation_id == key
+
+
+# ---------------------------------------------------------------------------
+# M2 + M3 (DISPATCHFMT+ S2): the wire carries the stage-resolved DEPLOYED verb
+# and a dict of the deployed handler's required inputs. Fixtures are the REAL
+# nats-core CommandPayload + the deployed PO command map / required-args tables
+# copied verbatim from the in-container command_router.py (13-day image).
+# ---------------------------------------------------------------------------
+
+
+#: Deployed product-owner command map (verbatim from the in-container
+#: ``command_router.py`` ``_PO_COMMAND_MAP``) — the set of verbs the deployed
+#: PO router will route rather than answering "Command not supported".
+_DEPLOYED_PO_COMMAND_MAP: dict[str, str] = {
+    "idea": "_handle_po_idea",
+    "extract": "_handle_po_extract",
+    "greenfield": "_handle_po_greenfield",
+    "evolve": "_handle_po_evolve",
+    "impact": "_handle_po_impact",
+    "scope": "_handle_po_scope",
+}
+
+#: Deployed PO required-args table (verbatim ``_PO_REQUIRED_ARGS``).
+_DEPLOYED_PO_REQUIRED_ARGS: dict[str, list[str]] = {
+    "idea": ["idea"],
+    "extract": ["docs_path"],
+    "greenfield": ["problem_statement"],
+    "evolve": ["docs_path", "build_plan_path"],
+    "impact": ["docs_path", "build_plan_path", "new_info"],
+    "scope": ["constraint"],
+}
+
+
+class TestDispatchDeployedVerb:
+    """M2/M3 — the wire command names a deployed verb + dict args w/ inputs."""
+
+    @pytest.mark.asyncio
+    async def test_po_greenfield_command_routes_in_deployed_map(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.publish_dispatch(
+            _make_attempt(matched_agent_id="product-owner-agent"),
+            [],
+            command="greenfield",
+            command_args={"problem_statement": "a voice-first standup bot"},
+        )
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        command = CommandPayload.model_validate(envelope.payload)
+        # M2: the verb resolves to a real deployed handler (not "Command not
+        # supported"). The deployed router does ``command_map.get(command)``.
+        assert command.command == "greenfield"
+        assert _DEPLOYED_PO_COMMAND_MAP.get(command.command) == "_handle_po_greenfield"
+
+    @pytest.mark.asyncio
+    async def test_command_args_satisfy_deployed_required_args_gate(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.publish_dispatch(
+            _make_attempt(matched_agent_id="product-owner-agent"),
+            [],
+            command="greenfield",
+            command_args={"problem_statement": "a voice-first standup bot"},
+        )
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        command = CommandPayload.model_validate(envelope.payload)
+        # M3: args is a dict, and every deployed-required key is present with a
+        # non-empty value — the router's ``_check_required_args`` finds none
+        # missing (``[a for a in required if a not in args]`` is empty).
+        assert isinstance(command.args, dict)
+        required = _DEPLOYED_PO_REQUIRED_ARGS[command.command]
+        missing = [arg for arg in required if arg not in command.args]
+        assert missing == []
+        assert command.args["problem_statement"] == "a voice-first standup bot"
+
+    @pytest.mark.asyncio
+    async def test_correlation_id_stays_the_attempt_key(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        key = "ab" * 16
+        await adapter.publish_dispatch(
+            _make_attempt(correlation_key=key),
+            [],
+            command="greenfield",
+            command_args={"problem_statement": "x"},
+        )
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        command = CommandPayload.model_validate(envelope.payload)
+        # S2 preserves the S1 correlation contract: attempt.correlation_key on
+        # BOTH the CommandPayload and the envelope (the router reads
+        # cmd_payload.correlation_id first, envelope.correlation_id second).
+        assert command.correlation_id == key
         assert envelope.correlation_id == key
 
 

@@ -160,6 +160,9 @@ class _FakeDispatchPublisher:
         self,
         attempt: DispatchAttempt,
         parameters: list[DispatchParameter],
+        *,
+        command: str = "dispatch",
+        command_args: dict[str, Any] | None = None,
     ) -> None:
         # Record the publish event. We store a small dict rather than a
         # raw envelope because the suite asserts on the wire-equivalent

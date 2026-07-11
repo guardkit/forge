@@ -635,6 +635,20 @@ async def compose_planning_consumer_and_dispatch(
                     enrichment.get("cycle"),
                     len(enrichment.get("revisions") or ()),
                 )
+            # M2 + M3 (DISPATCHFMT+ S2, D1): thread the raw planning request
+            # text through as the PO greenfield ``problem_statement``. It is the
+            # durable ``request_text`` column on the planning_runs row — never
+            # re-derived. Absent only for a torn/legacy row (the dispatcher logs
+            # loudly and the router rejects the arg-less command).
+            run_row = store.get_run(correlation_id)
+            request_text = run_row["request_text"] if run_row is not None else None
+            if not request_text:
+                logger.error(
+                    "planning composition: no request_text for %s — the PO "
+                    "greenfield problem_statement will be unsourced and the "
+                    "specialist will reject the command",
+                    correlation_id,
+                )
             return await dispatch_specialist_stage(
                 stage=StageClass.PRODUCT_OWNER,
                 build_id=plan_run_id,
@@ -643,6 +657,7 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_surface=orchestrator,
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
+                request_text=request_text,
             )
 
         # -- approval side -------------------------------------------------

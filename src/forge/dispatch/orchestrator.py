@@ -30,7 +30,7 @@ must never re-introduce. Do not re-order without re-reading
 from __future__ import annotations
 
 import logging
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from forge.discovery.cache import DiscoveryCache
 from forge.discovery.resolve import resolve
@@ -57,6 +57,15 @@ logger = logging.getLogger(__name__)
 # resolver default if the upstream constant ever shifts.
 _MIN_CONFIDENCE: float = 0.7
 
+# Fallback command verb for callers that do not resolve a stage-specific one.
+# The production caller
+# (:func:`forge.pipeline.dispatchers.specialist.dispatch_specialist_stage`)
+# ALWAYS passes the deployed verb (``greenfield``, per D1); this default keeps
+# the pure-domain orchestrator decoupled from the adapter's placeholder while
+# giving the ordering tests (which do not care about the verb) an ergonomic
+# call shape. It never routes to a deployed handler (M2/M3, DISPATCHFMT+ S2).
+_DEFAULT_DISPATCH_COMMAND: str = "dispatch"
+
 
 class DispatchCommandPublisher(Protocol):
     """Transport contract for publishing one dispatch command.
@@ -77,6 +86,9 @@ class DispatchCommandPublisher(Protocol):
         self,
         attempt: DispatchAttempt,
         parameters: list[DispatchParameter],
+        *,
+        command: str,
+        command_args: dict[str, Any] | None = None,
     ) -> None:
         """Publish the dispatch command on the transport.
 
@@ -85,6 +97,11 @@ class DispatchCommandPublisher(Protocol):
         ``attempt.correlation_key``), and PubAck handling. PubAck on
         the audit stream is NOT a successful reply — see
         ``C.pubAck-not-success`` in TASK-SAD-003.
+
+        ``command`` is the deployed verb the target agent routes on and
+        ``command_args`` the deployed-handler argument dict (M2 + M3); the
+        ``parameters`` list is the persistence/audit record, scrubbed and
+        written before this call by :func:`persist_resolution`.
         """
         ...
 
@@ -133,6 +150,8 @@ class DispatchOrchestrator:
         intent_pattern: Optional[str] = None,
         build_id: str = "unknown",
         stage_label: str = "unknown",
+        command: str = _DEFAULT_DISPATCH_COMMAND,
+        command_args: dict[str, Any] | None = None,
     ) -> DispatchOutcome:
         """Execute one dispatch attempt.
 
@@ -173,6 +192,15 @@ class DispatchOrchestrator:
                 persisted :class:`CapabilityResolution`.
             stage_label: Stage label propagated onto the persisted
                 resolution.
+            command: Deployed command verb the matched agent's command_map
+                routes on (``greenfield`` for both specialist stages, per D1).
+                Threaded verbatim onto the wire ``CommandPayload.command`` by
+                the publisher (M2). Defaults to a non-routing placeholder for
+                callers that do not resolve a stage verb.
+            command_args: Deployed-handler argument dict — the exact keys the
+                target handler reads (e.g. ``{"problem_statement": ...}`` for
+                the PO greenfield handler). Becomes the wire
+                ``CommandPayload.args`` (M3). ``None`` → an empty dict.
 
         Returns:
             A :data:`DispatchOutcome` — one of :class:`SyncResult`,
@@ -248,7 +276,12 @@ class DispatchOrchestrator:
             attempt_no=attempt_no,
             retry_of=retry_of,
         )
-        await self._publisher.publish_dispatch(attempt, parameters)
+        await self._publisher.publish_dispatch(
+            attempt,
+            parameters,
+            command=command,
+            command_args=command_args,
+        )
 
         # Step 5: wait for the reply (hard cut-off enforced by the
         # timeout coordinator, which also releases the binding on

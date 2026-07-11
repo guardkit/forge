@@ -95,12 +95,15 @@ from forge.pipeline.stage_taxonomy import StageClass
 
 __all__ = [
     "SPECIALIST_CAPABILITY_BY_STAGE",
+    "SPECIALIST_COMMAND_BY_STAGE",
     "SPECIALIST_INTENT_BY_STAGE",
+    "SPECIALIST_REQUIRED_ARGS_BY_STAGE",
     "SPECIALIST_STAGES",
     "SpecialistDispatchSurface",
     "StageDispatchOutcome",
     "StageDispatchResult",
     "StageLogWriter",
+    "build_specialist_command",
     "dispatch_specialist_stage",
 ]
 
@@ -154,6 +157,38 @@ SPECIALIST_STAGES: frozenset[StageClass] = frozenset(
 )
 
 
+#: Deployed command verb per specialist stage (M2, DISPATCHFMT+ S2, contract
+#: D1). Both containers **overload** ``greenfield`` — verified in-container
+#: against the deployed ``command_router.py`` (13-day image / nats-core 0.4.0):
+#:
+#: * the product-owner ``command_map`` routes ``greenfield`` →
+#:   ``_handle_po_greenfield`` (``run_product_session(mode="greenfield")``,
+#:   required arg ``problem_statement``);
+#: * the architect ``command_map`` routes the SAME verb ``greenfield`` →
+#:   ``_handle_greenfield`` (``run_architecture_session``, required args
+#:   ``docs_path`` + ``scope``).
+#:
+#: The target agent (the ``agents.command.{agent_id}`` subject) disambiguates
+#: the two handlers; ``greenfield`` is each role's from-scratch analog (the
+#: architect's other verbs — ``align`` / ``explore`` / ``feasibility`` — are
+#: revise/inspect/quick-check modes, not from-scratch generation).
+SPECIALIST_COMMAND_BY_STAGE: dict[StageClass, str] = {
+    StageClass.PRODUCT_OWNER: "greenfield",
+    StageClass.ARCHITECT: "greenfield",
+}
+
+
+#: Required deployed-handler argument names per specialist stage, mirroring the
+#: deployed ``_PO_REQUIRED_ARGS`` / ``_REQUIRED_ARGS`` tables for the
+#: ``greenfield`` verb (M3). The dispatch build sources a non-empty value for
+#: each of these before the command reaches the wire; the deployed router's
+#: ``_check_required_args`` gate rejects any command missing one of them.
+SPECIALIST_REQUIRED_ARGS_BY_STAGE: dict[StageClass, tuple[str, ...]] = {
+    StageClass.PRODUCT_OWNER: ("problem_statement",),
+    StageClass.ARCHITECT: ("docs_path", "scope"),
+}
+
+
 # Parameter name carrying the build's correlation_id onto the dispatch
 # envelope. Group I @data-integrity asserts that the correlation_id is
 # threaded *unchanged* from the build context onto every dispatch — we
@@ -165,7 +200,99 @@ _CORRELATION_PARAMETER: str = "correlation_id"
 # accepts a list of these on the receiving side; we encode each entry
 # as ``flag=value`` so the path/text discriminator is visible to the
 # Coach reviewer and the parameter shape stays a flat list.
+#
+# D3 (DISPATCHFMT+ S2): these forward-context parameters are persisted for
+# audit but are NOT serialised onto the command wire — no deployed greenfield
+# handler (PO or architect) reads a generic ``context`` / ``parameters``
+# argument (verified in-container). They are dropped from ``command_args``
+# unless a context entry's flag directly names one of the target verb's
+# deployed-read arguments (see :func:`build_specialist_command`).
 _CONTEXT_PARAMETER: str = "context"
+
+
+def build_specialist_command(
+    stage: StageClass,
+    *,
+    request_text: str | None,
+    context_entries: Sequence[ContextEntry],
+) -> tuple[str, dict[str, Any]]:
+    """Resolve the deployed verb + argument dict for one specialist stage.
+
+    This is the data-driven "dispatch build" that fixes M2 (a real deployed
+    verb) and M3 (a ``dict`` args carrying that verb's required inputs),
+    per contract decisions D1 + D3:
+
+    * **command** — :data:`SPECIALIST_COMMAND_BY_STAGE` for the stage
+      (``greenfield`` for both specialist stages; the target agent
+      disambiguates the PO vs architect handler).
+    * **args** — the deployed-handler argument dict:
+
+      - The chain-entry stage (:attr:`StageClass.PRODUCT_OWNER`) has no
+        upstream artefact; its sole required input is the raw planning
+        request text, threaded here as the greenfield ``problem_statement``
+        (D1). ``request_text`` is the verbatim
+        :class:`~forge.planning.run_store` ``request_text`` column value.
+      - Downstream stages source their deployed-read arguments from the
+        forward-context entries whose (dash-normalised) ``flag`` names one of
+        the target verb's required arguments
+        (:data:`SPECIALIST_REQUIRED_ARGS_BY_STAGE`). Forward-context entries
+        that do **not** name a deployed-read argument are dropped — D3, since
+        no deployed greenfield handler reads a generic ``context`` /
+        ``parameters`` argument.
+
+    The build is **best-effort**: a required argument that cannot be sourced is
+    simply absent from the returned dict (the caller logs it and the deployed
+    router's ``_check_required_args`` gate is the single enforcement point).
+    On the live Mode-P planning path ``request_text`` is always populated, so
+    the PO greenfield ``problem_statement`` is always present.
+
+    Args:
+        stage: The specialist stage. Must be in :data:`SPECIALIST_STAGES`.
+        request_text: The raw planning request text (the PO ``problem_statement``
+            source). ``None`` / blank for stages that take no raw request.
+        context_entries: Forward-context entries from
+            :meth:`ForwardContextBuilder.build_for` for this stage.
+
+    Returns:
+        ``(command, args)`` — the wire ``CommandPayload.command`` and
+        ``CommandPayload.args`` the publisher stamps onto the envelope.
+
+    Raises:
+        ValueError: If ``stage`` is not a specialist stage (programming error,
+            mirrors :func:`dispatch_specialist_stage`).
+    """
+    if stage not in SPECIALIST_COMMAND_BY_STAGE:
+        raise ValueError(
+            "build_specialist_command refuses stage="
+            f"{stage!r}; expected one of "
+            f"{sorted(s.value for s in SPECIALIST_STAGES)}",
+        )
+
+    command = SPECIALIST_COMMAND_BY_STAGE[stage]
+    required = SPECIALIST_REQUIRED_ARGS_BY_STAGE.get(stage, ())
+    args: dict[str, Any] = {}
+
+    # Chain-entry stage: the raw request text IS the greenfield problem
+    # statement. Only inject when it names a required arg for this stage
+    # (``problem_statement`` for the product-owner) and carries real content.
+    if (
+        stage is StageClass.PRODUCT_OWNER
+        and request_text is not None
+        and request_text.strip()
+        and "problem_statement" in required
+    ):
+        args["problem_statement"] = request_text.strip()
+
+    # Downstream stages: map a forward-context entry into args ONLY when its
+    # dash-normalised flag names a deployed-read argument of the target verb
+    # (D3). Everything else — the ``--context`` charter/path payloads no
+    # greenfield handler reads — is dropped from the wire.
+    for entry in context_entries:
+        arg_name = entry.flag.lstrip("-")
+        if arg_name in required and entry.value.strip():
+            args.setdefault(arg_name, entry.value)
+
+    return command, args
 
 
 class StageDispatchOutcome(StrEnum):
@@ -266,8 +393,14 @@ class SpecialistDispatchSurface(Protocol):
         intent_pattern: str | None = None,
         build_id: str = "unknown",
         stage_label: str = "unknown",
+        command: str,
+        command_args: dict[str, Any] | None = None,
     ) -> DispatchOutcome:
-        """Dispatch one capability call and return the outcome."""
+        """Dispatch one capability call and return the outcome.
+
+        ``command`` / ``command_args`` are the deployed verb + argument dict
+        the transport stamps onto the wire ``CommandPayload`` (M2 + M3).
+        """
         ...
 
 
@@ -353,6 +486,7 @@ async def dispatch_specialist_stage(
     feature_id: str | None = None,
     attempt_no: int = 1,
     retry_of: str | None = None,
+    request_text: str | None = None,
 ) -> StageDispatchResult:
     """Dispatch one specialist stage (PRODUCT_OWNER or ARCHITECT).
 
@@ -400,6 +534,12 @@ async def dispatch_specialist_stage(
         retry_of: ``resolution_id`` of the prior dispatch attempt this
             one is retrying. Forwarded to the dispatch surface so the
             persistence layer records the retry chain.
+        request_text: The raw planning request text — the source of the
+            product-owner greenfield ``problem_statement`` (D1, M3). Threaded
+            through :func:`build_specialist_command`; the live Mode-P planning
+            composition reads it from the ``planning_runs`` row. ``None`` for
+            callers with no raw request (a warning is logged if a required
+            deployed argument is left unsourced).
 
     Returns:
         A :class:`StageDispatchResult`. The supervisor consumes the
@@ -443,11 +583,41 @@ async def dispatch_specialist_stage(
 
     # Step 3 — flatten into DispatchParameter records. Correlation id
     # comes first so the wire-side header composer (TASK-SAD-010) sees
-    # it before any context payload during parameter iteration.
+    # it before any context payload during parameter iteration. These are
+    # the PERSISTENCE/AUDIT records (scrubbed + written by persist_resolution);
+    # the deployed-handler wire args are built separately below (D3).
     parameters = _build_dispatch_parameters(
         correlation_id=correlation_id,
         context_entries=context_entries,
     )
+
+    # Step 3b — resolve the deployed verb + argument dict (M2 + M3, D1/D3).
+    # ``command`` names a real handler in the target agent's command_map and
+    # ``command_args`` carries exactly the keys that handler reads.
+    command, command_args = build_specialist_command(
+        stage,
+        request_text=request_text,
+        context_entries=context_entries,
+    )
+    missing_args = [
+        name
+        for name in SPECIALIST_REQUIRED_ARGS_BY_STAGE.get(stage, ())
+        if not str(command_args.get(name, "")).strip()
+    ]
+    if missing_args:
+        # Fail-loud observability: the deployed router's _check_required_args
+        # gate will reject this command. On the live planning path request_text
+        # is always populated, so this only fires for degenerate inputs.
+        logger.warning(
+            "dispatch_specialist_stage: stage=%s command=%s missing required "
+            "deployed arg(s) %s — the specialist router will reject this "
+            "command (build_id=%s correlation_id=%s)",
+            stage.value,
+            command,
+            sorted(missing_args),
+            build_id,
+            correlation_id,
+        )
 
     # Step 4 — submit-side stage_log row (AC-006 first half).
     entry_id = stage_log_writer.record_dispatch_submit(
@@ -482,6 +652,8 @@ async def dispatch_specialist_stage(
         intent_pattern=intent_pattern,
         build_id=build_id,
         stage_label=stage.value,
+        command=command,
+        command_args=command_args,
     )
 
     # Step 6 — translate + record reply (AC-006 second half, AC-007).
