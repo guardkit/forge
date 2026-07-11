@@ -568,14 +568,49 @@ class TestDeployedReplyShape:
         assert isinstance(outcome, DispatchError)
         assert outcome.error_explanation  # min_length=1 satisfied
 
-    def test_role_output_absent_degrades_to_empty(self) -> None:
+    def test_role_output_absent_falls_back_to_result_block(self) -> None:
+        # Corrected contract (live capture 2026-07-11): when no
+        # ``role_output`` key exists anywhere, the nested result block IS
+        # the document (unwrapped convention). A wrapped reply that merely
+        # lost its ``role_output`` still yields the remaining block — never
+        # a silently empty document.
         reply = _deployed_success_reply()
         reply["result"].pop("role_output")
         outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
         assert isinstance(outcome, SyncResult)
-        assert outcome.role_output == {}
+        assert outcome.role_output == reply["result"]
         # Coach evidence still extracted.
         assert outcome.coach_score == 0.82
+
+    def test_unwrapped_session_reply_result_is_the_document(self) -> None:
+        # LIVE-CAPTURED shape (2026-07-11, deployed ``_handle_po_greenfield``
+        # fire-and-forget reply, correlation 5998f96a…): the
+        # ``run_product_session`` command paths publish the session return
+        # DIRECTLY as ``ResultPayload.result`` — no ``wrap_role_output``,
+        # no ``role_output`` key, no Coach fields. The whole result block
+        # IS the PO document and must reach ``SyncResult.role_output``.
+        document = {
+            "project_name": "",
+            "mode": "greenfield",
+            "epics": [
+                {
+                    "id": "EPIC-001",
+                    "name": "Core Event Ingestion & Validation",
+                    "features": [{"feature_id": "FEAT-PO-001"}],
+                }
+            ],
+        }
+        reply = {
+            "command": "greenfield",
+            "result": dict(document),
+            "correlation_id": _CORR,
+            "success": True,
+        }
+        outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
+        assert isinstance(outcome, SyncResult)
+        assert outcome.role_output == document
+        # No Coach evidence in the unwrapped shape — None-safe, not fatal.
+        assert outcome.coach_score is None
 
     def test_role_output_may_be_a_list_document(self) -> None:
         # A role whose document serialises as a list (e.g. an ordered set

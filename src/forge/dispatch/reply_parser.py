@@ -226,6 +226,16 @@ def _extract_role_output(
     raw = top if top else nested.get("role_output")
     if isinstance(raw, (dict, list)):
         return raw
+
+    # Unwrapped convention (live-captured 2026-07-11, deployed
+    # ``_handle_po_greenfield``): the ``run_product_session`` command paths
+    # publish the session's return DIRECTLY as ``ResultPayload.result`` —
+    # no ``wrap_role_output`` envelope, so there is no ``role_output`` key
+    # anywhere. In that shape the nested result block IS the document.
+    # Only the wrapped convention carries Coach evidence; a document never
+    # carries an ``error`` key (that is the ``success=False`` path).
+    if nested and "error" not in nested:
+        return nested
     return {}
 
 
