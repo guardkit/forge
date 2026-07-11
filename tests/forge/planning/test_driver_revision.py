@@ -61,8 +61,11 @@ def _po_result(assumptions: list[dict[str, Any]]) -> Any:
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
         coach_score=0.9,
-        criterion_breakdown={"docs_summary": "docs"},
+        criterion_breakdown=[
+            {"criterion": "clarity", "score": 0.9, "weight": 1.0, "rationale": "ok"},
+        ],
         detection_findings=(),
+        role_output={"title": "docs", "problem_statement": "ship a thing"},
         reason=None,
         assumptions=assumptions,
     )

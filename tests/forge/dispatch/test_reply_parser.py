@@ -203,12 +203,32 @@ class TestMissingCoachScore:
 
 
 class TestMalformedEnvelope:
-    """C.malformed-reply-envelope: schema is the source of truth."""
+    """C.malformed-reply-envelope: schema is the source of truth.
 
-    def test_missing_agent_id_yields_dispatch_error(self) -> None:
-        # ``agent_id`` is the sole required envelope field; its absence
-        # must produce a DispatchError, not a SyncResult.
-        payload: dict[str, Any] = {"coach_score": 0.9}
+    DISPATCHFMT+ S4 (M6): the parse-target is the DEPLOYED ``ResultPayload``
+    shape (``command`` / ``result`` / ``correlation_id`` / ``success``), and
+    that reply carries NO top-level ``agent_id`` — source identity lives on
+    the envelope ``source_id`` (read by the transport adapter, D2). A
+    missing ``agent_id`` is therefore NO LONGER a schema failure; the
+    schema gate now only rejects structurally-wrong payloads (e.g. a
+    ``result`` block that is not a dict).
+    """
+
+    def test_missing_agent_id_is_no_longer_a_schema_error(self) -> None:
+        # M6 regression guard: the deployed reply has no top-level
+        # ``agent_id``; a reply lacking one must parse, NOT explode with
+        # ``agent_id(missing)``.
+        payload: dict[str, Any] = {"success": True, "result": {"coach_score": 0.9}}
+        outcome = parse_reply(
+            payload, resolution_id=_RES_ID, attempt_no=_ATTEMPT,
+        )
+        assert isinstance(outcome, SyncResult)
+        assert outcome.coach_score == 0.9
+
+    def test_non_dict_result_block_yields_schema_error(self) -> None:
+        # ``result`` typed as an optional dict — a bare string is
+        # structurally wrong and surfaces as a schema-validation error.
+        payload: dict[str, Any] = {"result": "not-a-dict", "success": True}
         outcome = parse_reply(
             payload, resolution_id=_RES_ID, attempt_no=_ATTEMPT,
         )
@@ -216,50 +236,20 @@ class TestMalformedEnvelope:
         assert "schema validation" in outcome.error_explanation.lower()
 
     def test_malformed_envelope_does_not_extract_coach_fields(self) -> None:
-        # Even when Coach fields are present in a malformed payload,
-        # the parser MUST NOT extract them — schema validation aborts
-        # the pipeline before any extraction step runs.
+        # Even when Coach values ride along in a structurally-malformed
+        # payload, the parser MUST NOT embed them into the error
+        # explanation (no payload-value leakage). ``result`` as a list is
+        # structurally wrong (must be a dict) → schema error before any
+        # extraction runs.
         payload: dict[str, Any] = {
-            # missing agent_id
+            "result": ["not", "a", "dict"],
             "coach_score": 0.99,
-            "criterion_breakdown": {"clarity": 0.9},
-            "detection_findings": [{"rule": "x"}],
         }
         outcome = parse_reply(
             payload, resolution_id=_RES_ID, attempt_no=_ATTEMPT,
         )
         assert isinstance(outcome, DispatchError)
-        # The Coach values must NOT have been embedded into the error
-        # explanation (no payload-value leakage).
         assert "0.99" not in outcome.error_explanation
-        assert "clarity" not in outcome.error_explanation
-
-    def test_schema_validation_runs_before_specialist_error_branch(
-        self,
-    ) -> None:
-        # Order matters: a malformed payload that ALSO carries an
-        # ``error`` key is a schema-validation DispatchError, NOT a
-        # specialist-error DispatchError. The schema is the source of
-        # truth (TASK-SAD-005 implementation note).
-        payload: dict[str, Any] = {
-            # missing agent_id
-            "error": "specialist exploded",
-        }
-        outcome = parse_reply(
-            payload, resolution_id=_RES_ID, attempt_no=_ATTEMPT,
-        )
-        assert isinstance(outcome, DispatchError)
-        # The verbatim specialist message must NOT have been promoted.
-        assert "specialist exploded" not in outcome.error_explanation
-        assert "schema validation" in outcome.error_explanation.lower()
-
-    def test_empty_agent_id_is_rejected(self) -> None:
-        payload = {"agent_id": ""}
-        outcome = parse_reply(
-            payload, resolution_id=_RES_ID, attempt_no=_ATTEMPT,
-        )
-        assert isinstance(outcome, DispatchError)
-        assert "schema validation" in outcome.error_explanation.lower()
 
     def test_coach_score_out_of_range_is_schema_error(self) -> None:
         # A score outside [0, 1] is a schema-validation failure too —
@@ -438,8 +428,160 @@ class TestExtractCoachFieldsHelper:
         assert breakdown == {}
         assert findings == []
 
-    def test_envelope_model_requires_agent_id(self) -> None:
+    def test_envelope_model_no_longer_requires_agent_id(self) -> None:
+        # M6: the deployed ResultPayload shape has no top-level agent_id,
+        # so an empty / agent_id-less payload validates cleanly. Source
+        # identity is carried on the envelope source_id at the adapter.
+        env = SpecialistReplyEnvelope.model_validate({})
+        assert env.success is None
+        assert env.result is None
+
+    def test_envelope_model_rejects_non_dict_result(self) -> None:
         from pydantic import ValidationError as PydValidationError
 
         with pytest.raises(PydValidationError):
-            SpecialistReplyEnvelope.model_validate({})
+            SpecialistReplyEnvelope.model_validate({"result": "not-a-dict"})
+
+
+# ---------------------------------------------------------------------------
+# DISPATCHFMT+ S4 — the EXACT deployed reply shape (M6 + M7 + M10)
+# ---------------------------------------------------------------------------
+
+
+_CORR = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+# The real PO document the deployed specialist produces. Shape is a plain
+# model_dump() dict (JSON-serialisable) — this is what MUST reach the phone
+# checkpoint + PLANNED_HANDOFF, not the Coach breakdown.
+_ROLE_OUTPUT_DOC: dict[str, Any] = {
+    "title": "Voice-first standup bot",
+    "problem_statement": "a voice-first standup bot that reads yesterday's git log aloud",
+    "user_stories": [
+        {"as_a": "developer", "i_want": "yesterday's commits read aloud"},
+    ],
+    "acceptance_criteria": ["reads the git log", "speaks via TTS"],
+}
+
+# The deployed ``wrap_role_output`` result block: role_id, coach_score,
+# criterion_breakdown as a LIST of {criterion, score, weight, rationale},
+# detection_findings, and the REAL document under role_output. Copied
+# verbatim from the in-container ``adapters/result_wrapper.py`` shape.
+_WRAP_ROLE_OUTPUT: dict[str, Any] = {
+    "role_id": "product-owner",
+    "coach_score": 0.82,
+    "criterion_breakdown": [
+        {"criterion": "clarity", "score": 0.9, "weight": 0.5, "rationale": "clear"},
+        {
+            "criterion": "completeness",
+            "score": 0.74,
+            "weight": 0.5,
+            "rationale": "mostly complete",
+        },
+    ],
+    "detection_findings": [
+        {
+            "pattern": "vague-scope",
+            "severity": "low",
+            "description": "scope could be tighter",
+            "location": "problem_statement",
+        },
+    ],
+    "role_output": _ROLE_OUTPUT_DOC,
+}
+
+
+def _deployed_success_reply() -> dict[str, Any]:
+    """The inner ResultPayload dict the adapter forwards to ``parse_reply``.
+
+    Mirrors the deployed router's fire-and-forget branch:
+    ``ResultPayload(command=..., result=wrap_role_output(...),
+    correlation_id=..., success=True)`` — the MessageEnvelope wrapper has
+    already been stripped by the transport adapter (D2).
+    """
+
+    return {
+        "command": "greenfield",
+        "result": dict(_WRAP_ROLE_OUTPUT),
+        "correlation_id": _CORR,
+        "success": True,
+    }
+
+
+def _deployed_failure_reply(error: str = "boom") -> dict[str, Any]:
+    """The deployed failure ResultPayload: ``result={'error': ...}``, success=False."""
+
+    return {
+        "command": "greenfield",
+        "result": {"error": error},
+        "correlation_id": _CORR,
+        "success": False,
+    }
+
+
+class TestDeployedReplyShape:
+    """M6 + M7 + M10: parse the EXACT deployed ResultPayload reply."""
+
+    def test_success_reply_yields_sync_result_with_coach_and_role_output(
+        self,
+    ) -> None:
+        outcome = parse_reply(
+            _deployed_success_reply(), resolution_id=_RES_ID, attempt_no=_ATTEMPT,
+        )
+        assert isinstance(outcome, SyncResult)
+        # M7 — coach_score sourced from the nested wrap_role_output block.
+        assert outcome.coach_score == 0.82
+        # M7 — criterion_breakdown preserved as a LIST (not coerced to {}).
+        assert isinstance(outcome.criterion_breakdown, list)
+        assert outcome.criterion_breakdown == _WRAP_ROLE_OUTPUT["criterion_breakdown"]
+        assert outcome.detection_findings == _WRAP_ROLE_OUTPUT["detection_findings"]
+        # M10 — the REAL document is carried through, non-empty.
+        assert outcome.role_output == _ROLE_OUTPUT_DOC
+        assert outcome.role_output  # non-empty
+
+    def test_failure_reply_yields_dispatch_error_with_nested_explanation(
+        self,
+    ) -> None:
+        # M6 — success=False with result={"error": "boom"} → DispatchError
+        # carrying the specialist's own explanation (from result['error']).
+        outcome = parse_reply(
+            _deployed_failure_reply("boom"),
+            resolution_id=_RES_ID,
+            attempt_no=_ATTEMPT,
+        )
+        assert isinstance(outcome, DispatchError)
+        assert "boom" in outcome.error_explanation
+
+    def test_failure_flag_beats_partial_result_block(self) -> None:
+        # ``success=False`` is authoritative even if a partial result rides
+        # along — the specialist declared failure.
+        reply = _deployed_success_reply()
+        reply["success"] = False
+        reply["result"] = {"error": "coach rejected the doc"}
+        outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
+        assert isinstance(outcome, DispatchError)
+        assert "coach rejected the doc" in outcome.error_explanation
+
+    def test_failure_reply_without_error_detail_is_value_free(self) -> None:
+        reply = _deployed_failure_reply()
+        reply["result"] = {}  # success=False but no error string
+        outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
+        assert isinstance(outcome, DispatchError)
+        assert outcome.error_explanation  # min_length=1 satisfied
+
+    def test_role_output_absent_degrades_to_empty(self) -> None:
+        reply = _deployed_success_reply()
+        reply["result"].pop("role_output")
+        outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
+        assert isinstance(outcome, SyncResult)
+        assert outcome.role_output == {}
+        # Coach evidence still extracted.
+        assert outcome.coach_score == 0.82
+
+    def test_role_output_may_be_a_list_document(self) -> None:
+        # A role whose document serialises as a list (e.g. an ordered set
+        # of sections) is carried through verbatim.
+        reply = _deployed_success_reply()
+        reply["result"]["role_output"] = [{"section": "one"}, {"section": "two"}]
+        outcome = parse_reply(reply, resolution_id=_RES_ID, attempt_no=_ATTEMPT)
+        assert isinstance(outcome, SyncResult)
+        assert outcome.role_output == [{"section": "one"}, {"section": "two"}]

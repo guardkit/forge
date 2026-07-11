@@ -73,8 +73,18 @@ class SyncResult(BaseModel):
         attempt_no: The attempt counter this outcome belongs to.
         coach_score: Optional reviewer score in ``[0.0, 1.0]``. ``None``
             when no coach evaluation was performed.
-        criterion_breakdown: Per-criterion scores as a free-form mapping.
+        criterion_breakdown: Per-criterion Coach scores. The DEPLOYED
+            specialist emits these as a **list** of
+            ``{criterion, score, weight, rationale}`` records
+            (``wrap_role_output``); a bare mapping is also tolerated for
+            older/alternate reply shapes.
         detection_findings: Detector findings emitted during evaluation.
+        role_output: The role's actual product document — the real PO /
+            architect output the specialist produced (the ``role_output``
+            block of the deployed ``wrap_role_output`` reply shape).
+            ``coach_score`` / ``criterion_breakdown`` are *coach evidence*
+            about that document; this field is the document itself. Empty
+            when the specialist emitted no document (M10).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -83,8 +93,9 @@ class SyncResult(BaseModel):
     resolution_id: str = Field(min_length=1)
     attempt_no: int = Field(ge=1)
     coach_score: float | None = Field(default=None, ge=0.0, le=1.0)
-    criterion_breakdown: dict[str, Any] = Field(default_factory=dict)
+    criterion_breakdown: list[Any] | dict[str, Any] = Field(default_factory=dict)
     detection_findings: list[Any] = Field(default_factory=list)
+    role_output: dict[str, Any] | list[Any] = Field(default_factory=dict)
 
 
 class AsyncPending(BaseModel):

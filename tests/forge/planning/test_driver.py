@@ -133,12 +133,25 @@ class FakeSecondOpinion:
         return {"title": "PO docs", "plan_run_id": plan_run_id}
 
 
+# The REAL product document the PO produces (deployed ``role_output`` shape,
+# M10). criterion_breakdown is Coach *evidence* about this document, not the
+# document itself — sourcing docs_summary from it delivered an empty doc.
+_PO_ROLE_OUTPUT: dict[str, Any] = {
+    "title": "the product docs",
+    "problem_statement": "ship a thing",
+    "user_stories": [{"as_a": "user", "i_want": "a thing"}],
+}
+
+
 def _po_result(outcome: str = "completed", coach_score: float = 0.9) -> Any:
     return SimpleNamespace(
         outcome=SimpleNamespace(value=outcome),
         coach_score=coach_score,
-        criterion_breakdown={"docs_summary": "the product docs"},
+        criterion_breakdown=[
+            {"criterion": "clarity", "score": 0.9, "weight": 1.0, "rationale": "ok"},
+        ],
         detection_findings=(),
+        role_output=dict(_PO_ROLE_OUTPUT),
         reason=None,
     )
 

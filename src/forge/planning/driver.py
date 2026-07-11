@@ -351,9 +351,19 @@ class PlanningRunDriver:
         reason = getattr(result, "reason", None)
 
         if outcome_value in ("completed", "degraded"):
+            # M10: the product-doc content is the REAL role_output document
+            # the specialist produced — NOT criterion_breakdown, which is
+            # Coach *evidence* about that document. Sourcing docs_summary
+            # from criterion_breakdown delivered an empty doc to the phone
+            # checkpoint + PLANNED_HANDOFF even after a successful PO run.
+            role_output = getattr(result, "role_output", None) or {}
+            criterion_breakdown = getattr(result, "criterion_breakdown", None) or {}
             po_output: dict[str, Any] = {
-                "coach_evidence": {"coach_score": coach_score},
-                "docs_summary": dict(getattr(result, "criterion_breakdown", {}) or {}),
+                "coach_evidence": {
+                    "coach_score": coach_score,
+                    "criterion_breakdown": criterion_breakdown,
+                },
+                "docs_summary": role_output,
                 "structured_findings": [
                     str(f) for f in (getattr(result, "detection_findings", ()) or ())
                 ],

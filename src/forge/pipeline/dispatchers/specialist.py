@@ -334,10 +334,20 @@ class StageDispatchResult:
             reference back without re-querying the writer.
         coach_score: Parsed Coach score in ``[0.0, 1.0]`` for
             ``COMPLETED``; ``None`` for every other outcome.
-        criterion_breakdown: Per-criterion Coach scores. Empty mapping
-            for non-``COMPLETED`` outcomes.
+        criterion_breakdown: Per-criterion Coach scores. The DEPLOYED
+            specialist emits these as a **list** of
+            ``{criterion, score, weight, rationale}`` records; a mapping is
+            also tolerated for older reply shapes. Empty for
+            non-``COMPLETED`` outcomes. This is Coach *evidence*, not the
+            product document (see ``role_output``).
         detection_findings: Coach detection findings folded into the
             reply. Empty tuple for non-``COMPLETED`` outcomes.
+        role_output: The role's actual product document — the real PO /
+            architect output extracted from the deployed
+            ``wrap_role_output`` reply (M10). This is the content the
+            planning driver threads to the product-docs checkpoint and the
+            PLANNED_HANDOFF; ``coach_score`` / ``criterion_breakdown`` are
+            evidence *about* it. Empty for non-``COMPLETED`` outcomes.
         reason: Human-readable reason for ``DEGRADED``, ``SOFT_TIMEOUT``,
             and ``ERROR`` outcomes; ``None`` for ``COMPLETED``.
 
@@ -354,8 +364,11 @@ class StageDispatchResult:
     correlation_id: str
     stage_log_entry_id: str
     coach_score: float | None = None
-    criterion_breakdown: Mapping[str, Any] = field(default_factory=dict)
+    criterion_breakdown: Mapping[str, Any] | Sequence[Any] = field(
+        default_factory=dict
+    )
     detection_findings: Sequence[Any] = field(default_factory=tuple)
+    role_output: Mapping[str, Any] | Sequence[Any] = field(default_factory=dict)
     reason: str | None = None
 
     # Re-export enum members so AC-007's ``StageDispatchResult.DEGRADED``
@@ -454,7 +467,7 @@ class StageLogWriter(Protocol):
         entry_id: str,
         outcome: StageDispatchOutcome,
         coach_score: float | None,
-        criterion_breakdown: Mapping[str, Any],
+        criterion_breakdown: Mapping[str, Any] | Sequence[Any],
         detection_findings: Sequence[Any],
         reason: str | None,
     ) -> None:
@@ -752,6 +765,21 @@ def _translate_outcome(
         # the specialist intentionally declined to score (e.g. a
         # degraded-mode reply). The gating layer handles ``None``
         # downstream — we copy through verbatim rather than synthesise.
+        # criterion_breakdown may be the deployed LIST shape or a legacy
+        # mapping (M7). Copy-through preserving the concrete container so a
+        # ``dict(list_of_records)`` never explodes.
+        breakdown = outcome.criterion_breakdown
+        breakdown_copy: Mapping[str, Any] | Sequence[Any] = (
+            list(breakdown) if isinstance(breakdown, list) else dict(breakdown)
+        )
+        # role_output is the REAL product document (M10) — copy-through as a
+        # dict or list depending on the deployed role's serialisation.
+        role_output = outcome.role_output
+        role_output_copy: Mapping[str, Any] | Sequence[Any] = (
+            list(role_output)
+            if isinstance(role_output, list)
+            else dict(role_output)
+        )
         return StageDispatchResult(
             outcome=StageDispatchOutcome.COMPLETED,
             stage=stage,
@@ -759,8 +787,9 @@ def _translate_outcome(
             correlation_id=correlation_id,
             stage_log_entry_id=entry_id,
             coach_score=outcome.coach_score,
-            criterion_breakdown=dict(outcome.criterion_breakdown),
+            criterion_breakdown=breakdown_copy,
             detection_findings=tuple(outcome.detection_findings),
+            role_output=role_output_copy,
             reason=None,
         )
 
