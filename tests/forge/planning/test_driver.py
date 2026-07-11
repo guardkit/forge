@@ -176,6 +176,7 @@ def _make_driver(
     po_outcome: str = "completed",
     git_runner: RecordingGitRunner | None = None,
     config: PlanningConfig | None = None,
+    po_result: Any | None = None,
 ) -> tuple[PlanningRunDriver, dict[str, Any]]:
     clock = clock or MutableClock()
     repository, state_machine = build_planning_gate_adapters(store, clock=clock)
@@ -195,6 +196,8 @@ def _make_driver(
 
     async def dispatch_po(*, plan_run_id: str, correlation_id: str) -> Any:
         po_calls.append({"plan_run_id": plan_run_id, "correlation_id": correlation_id})
+        if po_result is not None:
+            return po_result
         return _po_result(po_outcome)
 
     async def publish_notification(cid: str, message: str, level: str) -> None:
@@ -629,3 +632,168 @@ class TestDeferRound:
         ]
         assert request_ids == [_request_id(0), _request_id(1)]
         assert len(ctx["subscribers"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# DISPATCHFMT+ S4 — COACH independent verification (built nothing; drives the
+# FULL chain from the DEPLOYED reply shape to the handoff file content).
+#
+# Fixture rebuilt independently from the in-container
+# ``specialist_agent/adapters/result_wrapper.py`` wrap_role_output shape
+# (role_id / coach_score / criterion_breakdown LIST of
+# {criterion,score,weight,rationale} / detection_findings LIST of
+# {pattern,severity,description,location} / role_output). NOT copied from the
+# builder's fixture. Distinct sentinels prove role_output (the real document),
+# NOT criterion_breakdown (Coach evidence), reaches the PLANNED_HANDOFF doc.
+# ---------------------------------------------------------------------------
+
+
+# The REAL product document — unique sentinel that MUST reach the handoff.
+_COACH_ROLE_OUTPUT_DOC: dict[str, Any] = {
+    "title": "COACH-DOC voice-first standup bot",
+    "problem_statement": "COACH-ROLEOUTPUT-REACHED-HANDOFF-7f3a",
+    "user_stories": [{"as_a": "developer", "i_want": "yesterday's commits read aloud"}],
+    "acceptance_criteria": ["reads the git log", "speaks via TTS"],
+}
+
+# Coach evidence — unique sentinel that MUST NOT be mistaken for the document.
+_COACH_CRITERION_BREAKDOWN: list[dict[str, Any]] = [
+    {
+        "criterion": "COACH-CRITERION-clarity",
+        "score": 0.9,
+        "weight": 0.5,
+        "rationale": "COACH-EVIDENCE-NOT-THE-DOC-b19c",
+    },
+    {
+        "criterion": "COACH-CRITERION-completeness",
+        "score": 0.74,
+        "weight": 0.5,
+        "rationale": "mostly complete",
+    },
+]
+
+# The deployed wrap_role_output() result block, rebuilt from the container.
+_COACH_WRAP_ROLE_OUTPUT: dict[str, Any] = {
+    "role_id": "product-owner",
+    "coach_score": 0.82,
+    "criterion_breakdown": _COACH_CRITERION_BREAKDOWN,
+    "detection_findings": [
+        {
+            "pattern": "vague-scope",
+            "severity": "minor",
+            "description": "scope could be tighter",
+            "location": "problem_statement",
+        },
+    ],
+    "role_output": _COACH_ROLE_OUTPUT_DOC,
+}
+
+
+def _coach_deployed_reply(*, success: bool = True) -> dict[str, Any]:
+    """Inner ResultPayload dict the transport adapter forwards to parse_reply.
+
+    Mirrors the deployed router fire-and-forget branch:
+    ``ResultPayload(command=..., result=wrap_role_output(...),
+    correlation_id=..., success=True)`` with the MessageEnvelope wrapper
+    already stripped (D2).
+    """
+    if success:
+        return {
+            "command": "greenfield",
+            "result": dict(_COACH_WRAP_ROLE_OUTPUT),
+            "correlation_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+            "success": True,
+        }
+    return {
+        "command": "greenfield",
+        "result": {"error": "COACH-FAILURE-boom-e55d"},
+        "correlation_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "success": False,
+    }
+
+
+class TestCoachDeployedReplyReachesHandoff:
+    """S4 COACH: deployed reply → parse → dispatch → driver → handoff file."""
+
+    def test_parse_reply_carries_role_output_and_coach_fields(self) -> None:
+        from forge.dispatch.models import SyncResult
+        from forge.dispatch.reply_parser import parse_reply
+
+        outcome = parse_reply(
+            _coach_deployed_reply(),
+            resolution_id="coach-res-1",
+            attempt_no=1,
+        )
+        assert isinstance(outcome, SyncResult)
+        # coach_score sourced from the nested wrap_role_output block.
+        assert outcome.coach_score == 0.82
+        # criterion_breakdown preserved as the deployed LIST (not coerced).
+        assert isinstance(outcome.criterion_breakdown, list)
+        assert outcome.criterion_breakdown == _COACH_CRITERION_BREAKDOWN
+        assert outcome.detection_findings == _COACH_WRAP_ROLE_OUTPUT["detection_findings"]
+        # The REAL document is carried through verbatim, non-empty.
+        assert outcome.role_output == _COACH_ROLE_OUTPUT_DOC
+
+    def test_failure_reply_becomes_dispatch_error(self) -> None:
+        from forge.dispatch.models import DispatchError
+        from forge.dispatch.reply_parser import parse_reply
+
+        outcome = parse_reply(
+            _coach_deployed_reply(success=False),
+            resolution_id="coach-res-1",
+            attempt_no=1,
+        )
+        assert isinstance(outcome, DispatchError)
+        assert "COACH-FAILURE-boom-e55d" in outcome.error_explanation
+
+    @pytest.mark.asyncio
+    async def test_real_document_not_coach_evidence_reaches_handoff_file(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        # Drive the REAL parser + dispatcher translation, then the REAL driver
+        # end-to-end to PLANNED_HANDOFF, and read the handoff file content the
+        # git runner captured. The document sentinel MUST be present; the Coach
+        # evidence sentinels MUST be absent (M10).
+        from forge.dispatch.reply_parser import parse_reply
+        from forge.pipeline.dispatchers.specialist import (
+            StageDispatchOutcome,
+            _translate_outcome,
+        )
+        from forge.pipeline.stage_taxonomy import StageClass
+
+        sync = parse_reply(
+            _coach_deployed_reply(), resolution_id="coach-res-1", attempt_no=1
+        )
+        stage_result = _translate_outcome(
+            outcome=sync,
+            stage=StageClass.PRODUCT_OWNER,
+            build_id=PLAN_RUN_ID,
+            correlation_id=CID,
+            entry_id="coach-entry-1",
+        )
+        assert stage_result.outcome is StageDispatchOutcome.COMPLETED
+        assert stage_result.role_output == _COACH_ROLE_OUTPUT_DOC
+
+        _queue_run(store)
+        driver, ctx = _make_driver(
+            store,
+            subscriber_scripts=[[_approve(attempt=0)]],
+            po_result=stage_result,
+        )
+
+        await driver.drive(CID)
+
+        run = store.get_run(CID)
+        assert run is not None
+        assert run["state"] == PlanningState.PLANNED_HANDOFF.value
+
+        # The handoff file content the git runner wrote.
+        assert len(ctx["git"].calls) == 1
+        content = ctx["git"].calls[0]["content"]
+
+        # M10 — the REAL product document reached the handoff file.
+        assert "COACH-ROLEOUTPUT-REACHED-HANDOFF-7f3a" in content
+        # M10 — Coach evidence (criterion_breakdown) did NOT masquerade as
+        # the document. This is the exact regression the pre-fix driver had.
+        assert "COACH-EVIDENCE-NOT-THE-DOC-b19c" not in content
+        assert "COACH-CRITERION-clarity" not in content
