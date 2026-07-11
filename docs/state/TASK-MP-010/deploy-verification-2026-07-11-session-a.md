@@ -134,3 +134,37 @@ review/deploy/re-validation:
   all work). forge-prod left healthy on the new image; planning durable deleted; api_test test
   branches removed. **J05 / live-planning: the terminal + crash gaps are cleared; PODISCO (plan
   content) is the remaining Mode-P-quality gap.** Full ai-transition record: exec-plan §8.*
+
+---
+
+## Follow-up addendum 2 (2026-07-11) — PO resolution FULLY fixed (4 layers) + notification ACL; execution layer filed
+
+Chasing PODISCO to the bottom revealed a STACK of masked layers — each fix uncovered the next.
+All DISCOVERY/RESOLUTION layers are now fixed + deployed (forge:latest=`ab9cd331`):
+
+1. **PODISCO — intent threading** (forge `8e24b7d`): the dispatch passed `intent_pattern=None`, so
+   resolve()'s exact-tool→intent-fallback never ran. Added `SPECIALIST_INTENT_BY_STAGE`
+   (PRODUCT_OWNER→`product.*`, ARCHITECT→`architecture.*`) + threaded it. 7 tests.
+2. **fleet_watcher initial-state** (nats-core, pushed + regression test): even with the crash guard
+   (`1dc6cef`), the same loop routed the KV **initial-state replay** entries (`operation=None`,
+   value-bearing) to the DELETE branch → the cache stayed EMPTY on boot. Fixed: value-bearing
+   (`PUT` or `op=None`) upsert; only `DEL`/`PURGE`/valueless delete. Live diag: cache = 5 agents.
+3. **notification ACL** (nats-infra, pushed + broker re-rendered): `forge` granted
+   `jarvis.notification.>` publish (FEAT-SPL-003 return channel — was a `permissions violation`).
+
+**RESULT (verified live):** `discovery.resolve.matched tool=product_owner_specialist
+agent=product-owner-agent source=intent_pattern` — **PO now RESOLVES**; the run goes `RUNNING`
+(specialist actually invoked) instead of degrading instantly. Terminal + notification paths clear.
+
+4. **REMAINING — execution layer (TASK-FWD-PLAN-DISPATCHFMT):** forge publishes to
+   `agents.command.product-owner-agent`, but the specialist parses it as a `MessageEnvelope`
+   (needs `event_type`+`payload`) while forge sends a dispatch-shaped body (`resolution_id`/…) →
+   the specialist rejects it, never replies, the run hangs `RUNNING`. A forge↔specialist
+   EXECUTION-contract mismatch (both repos), and likely NOT the last layer (the whole
+   dispatch→run→result path was never end-to-end tested). Recommend a dedicated forge↔specialist
+   integration pass coordinated with the specialist-agent lane.
+
+**State:** planning reverted `enabled:false`; forge-prod healthy on `ab9cd331` (all resolution +
+terminal + notification fixes live); durable deleted, api_test clean. **Mode P net:** discovery
+resolution ✅, terminal ✅, notification ✅ — the specialist EXECUTION contract (DISPATCHFMT+) is
+the remaining multi-layer work before real plans are produced.*
