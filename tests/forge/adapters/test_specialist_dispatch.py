@@ -13,8 +13,11 @@ Each ``Test*`` class maps to one acceptance criterion (AC) in
 * AC-005 — PubAck on the audit stream does NOT trigger
   ``registry.deliver_reply``.
 * AC-006 — ``unsubscribe_reply`` is idempotent.
-* AC-007 — ``_on_reply_received`` extracts ``source_agent_id`` from msg
-  headers and forwards to ``registry.deliver_reply``; no auth here.
+* AC-007 — ``_on_reply_received`` parses the reply BODY as a nats-core
+  ``MessageEnvelope`` (the DEPLOYED specialist's shape: envelope-wrapped
+  ``ResultPayload``, NO headers), reads source from ``envelope.source_id``,
+  demuxes by the body correlation, and forwards to
+  ``registry.deliver_reply``; no auth here (M4 + M5-reply, DISPATCHFMT+ S3).
 * AC-008 — compatibility seam: a fake NATS client mirroring
   ``tests/bdd/conftest.py:FakeNatsClient`` shape works as a drop-in.
 * AC-009 — lint/format gate (CI-enforced; not asserted here).
@@ -36,7 +39,7 @@ from typing import Any, Awaitable, Callable
 import pytest
 
 from nats_core.envelope import EventType, MessageEnvelope
-from nats_core.events import CommandPayload
+from nats_core.events import CommandPayload, ResultPayload
 
 from forge.adapters.nats import specialist_dispatch as sd_module
 from forge.adapters.nats.specialist_dispatch import (
@@ -246,6 +249,81 @@ def _make_attempt(
     )
 
 
+# The exact success ``result`` dict the DEPLOYED specialist emits — copied
+# verbatim from ``wrap_role_output`` in
+# ``specialist-agent/src/specialist_agent/adapters/result_wrapper.py``
+# (read in-container; the ground truth for the reply-body shape).
+def _wrap_role_output_result(role_id: str = "product-owner") -> dict[str, Any]:
+    return {
+        "role_id": role_id,
+        "coach_score": 0.82,
+        "criterion_breakdown": [
+            {
+                "criterion": "problem-clarity",
+                "score": 0.9,
+                "weight": 0.5,
+                "rationale": "clear problem statement",
+            },
+            {
+                "criterion": "scope-fit",
+                "score": 0.74,
+                "weight": 0.5,
+                "rationale": "scope is bounded",
+            },
+        ],
+        "detection_findings": [
+            {
+                "pattern": "vagueness",
+                "severity": "low",
+                "description": "one under-specified acceptance criterion",
+                "location": "AC-3",
+            }
+        ],
+        "role_output": {"document": "the real role document body"},
+    }
+
+
+def _deployed_reply_bytes(
+    *,
+    correlation_id: str | None,
+    source_id: str = "po-agent",
+    command: str = "greenfield",
+    success: bool = True,
+    result: dict[str, Any] | None = None,
+    envelope_correlation_id: str | None = "__use_body__",
+) -> bytes:
+    """Build the EXACT bytes the deployed specialist publishes on reply.
+
+    Fire-and-forget branch (forge publishes without ``reply_to``): the
+    router envelope-wraps a ``ResultPayload`` and publishes to
+    ``agents.result.{agent_id}`` with NO headers — correlation lives in the
+    body (verified against the in-container ``command_router._publish_result``
+    + ``nats_core`` ``client.publish``).
+
+    ``envelope_correlation_id`` defaults to mirroring the body value (as the
+    deployed ``client.publish(correlation_id=...)`` does); pass an explicit
+    value to exercise the envelope fallback independently of the payload.
+    """
+    payload = ResultPayload(
+        command=command,
+        result=result if result is not None else _wrap_role_output_result(),
+        correlation_id=correlation_id,
+        success=success,
+    )
+    env_corr = (
+        correlation_id
+        if envelope_correlation_id == "__use_body__"
+        else envelope_correlation_id
+    )
+    envelope = MessageEnvelope(
+        source_id=source_id,
+        event_type=EventType.RESULT,
+        correlation_id=env_corr,
+        payload=payload.model_dump(),
+    )
+    return envelope.model_dump_json().encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # AC-001: public surface
 # ---------------------------------------------------------------------------
@@ -273,9 +351,10 @@ class TestPublicSurface:
 
     def test_subject_constants_are_exported(self) -> None:
         assert COMMAND_SUBJECT_TEMPLATE == "agents.command.{agent_id}"
-        assert RESULT_SUBJECT_TEMPLATE == (
-            "agents.result.{agent_id}.{correlation_key}"
-        )
+        # M4 (DISPATCHFMT+ S3): reply subject is the plain 3-token
+        # ``agents.result.{agent_id}`` — correlation is in the body, not
+        # the subject. Aligned to nats-core ``Topics.Agents.RESULT``.
+        assert RESULT_SUBJECT_TEMPLATE == "agents.result.{agent_id}"
 
     def test_header_constants_are_exported(self) -> None:
         assert CORRELATION_KEY_HEADER == "correlation_key"
@@ -302,11 +381,12 @@ class TestSubjectConvention:
         await adapter.subscribe_reply("po-agent", "a" * 32)
         assert len(nats_client.subscriptions) == 1
         last = nats_client.subscriptions[-1]
-        # Verify against the regex from the seam-test stamp.
+        # M4: 3-token reply subject, no correlation suffix.
         assert re.fullmatch(
-            r"agents\.result\.[a-z0-9-]+\.[0-9a-f]{32}",
+            r"agents\.result\.[a-z0-9-]+",
             last.subject,
         ), last.subject
+        assert last.subject == "agents.result.po-agent"
 
     @pytest.mark.asyncio
     async def test_publish_dispatch_uses_singular_command_subject(
@@ -329,8 +409,8 @@ class TestSubjectConvention:
             "agents.command.po"
         )
         assert NatsSpecialistDispatchAdapter.result_subject_for(
-            "po", "f" * 32
-        ) == ("agents.result.po." + "f" * 32)
+            "po"
+        ) == "agents.result.po"
 
 
 # ---------------------------------------------------------------------------
@@ -702,21 +782,32 @@ class TestSubscribeBeforePublish:
     ) -> None:
         # Establish the subscription synchronously (no gate).
         await adapter.subscribe_reply("po-agent", "a" * 32)
-        # Immediately deliver a reply on that subscription.
+        # Immediately deliver a deployed-shape reply on that subscription
+        # (envelope-wrapped ResultPayload, NO headers, body correlation).
         sub = nats_client.subscriptions[-1]
+        result = _wrap_role_output_result()
         msg = _FakeMessage(
             subject=sub.subject,
-            data=b'{"ok": true}',
-            headers={
-                CORRELATION_KEY_HEADER: "a" * 32,
-                SOURCE_AGENT_HEADER: "po-agent",
-            },
+            data=_deployed_reply_bytes(
+                correlation_id="a" * 32, source_id="po-agent", result=result
+            ),
+            headers=None,
         )
         await sub.deliver(msg)
         # The registry observed the forwarded reply — proving the
-        # subscription was active end-to-end before we delivered.
+        # subscription was active end-to-end before we delivered. The
+        # forwarded payload is the inner ResultPayload dict.
         assert recording_registry.delivered == [
-            ("a" * 32, "po-agent", {"ok": True})
+            (
+                "a" * 32,
+                "po-agent",
+                {
+                    "command": "greenfield",
+                    "result": result,
+                    "correlation_id": "a" * 32,
+                    "success": True,
+                },
+            )
         ]
 
     @pytest.mark.asyncio
@@ -845,90 +936,126 @@ class TestUnsubscribeIdempotency:
 
 
 class TestOnReplyReceived:
-    """AC-007 — adapter forwards inbound replies; auth lives in registry."""
+    """AC-007 — adapter parses the reply BODY and forwards; auth in registry."""
 
     @pytest.mark.asyncio
-    async def test_forwards_correlation_key_source_and_payload(
+    async def test_forwards_deployed_shape_reply_by_body_correlation(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         nats_client: FakeNATSClient,
         recording_registry: _RecordingRegistry,
     ) -> None:
+        # The DEPLOYED specialist shape: envelope-wrapped ResultPayload,
+        # NO headers, correlation in the body.
         await adapter.subscribe_reply("po-agent", "a" * 32)
         sub = nats_client.subscriptions[-1]
+        result = _wrap_role_output_result()
         msg = _FakeMessage(
             subject=sub.subject,
-            data=b'{"value": 42}',
-            headers={
-                CORRELATION_KEY_HEADER: "a" * 32,
-                SOURCE_AGENT_HEADER: "po-agent",
-            },
+            data=_deployed_reply_bytes(
+                correlation_id="a" * 32, source_id="po-agent", result=result
+            ),
+            headers=None,
         )
         await adapter._on_reply_received(msg)
+        # Forwarded tuple: (body correlation, envelope source, inner
+        # ResultPayload dict).
         assert recording_registry.delivered == [
-            ("a" * 32, "po-agent", {"value": 42})
+            (
+                "a" * 32,
+                "po-agent",
+                {
+                    "command": "greenfield",
+                    "result": result,
+                    "correlation_id": "a" * 32,
+                    "success": True,
+                },
+            )
         ]
 
     @pytest.mark.asyncio
-    async def test_does_not_authenticate_locally(
+    async def test_source_identity_comes_from_envelope_not_headers(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         recording_registry: _RecordingRegistry,
     ) -> None:
-        # The adapter MUST forward whatever source_agent_id arrived in
-        # the headers — even an obviously-wrong value. Authentication
-        # is the registry's job (TASK-SAD-003 E.reply-source-authenticity).
+        # Source is read from ``envelope.source_id`` (D2) — NOT from any
+        # header. The adapter forwards whatever source it observed, even an
+        # obviously-wrong one; authentication is the registry's job
+        # (TASK-SAD-003 E.reply-source-authenticity). Bogus tracing headers
+        # are present to prove they are ignored.
         msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
-            data=b'{"value": 1}',
-            headers={
-                CORRELATION_KEY_HEADER: "a" * 32,
-                SOURCE_AGENT_HEADER: "imposter-agent",
-            },
-        )
-        await adapter._on_reply_received(msg)
-        assert recording_registry.delivered == [
-            ("a" * 32, "imposter-agent", {"value": 1})
-        ]
-
-    @pytest.mark.asyncio
-    async def test_drops_message_with_missing_correlation_key_header(
-        self,
-        adapter: NatsSpecialistDispatchAdapter,
-        recording_registry: _RecordingRegistry,
-    ) -> None:
-        msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
-            data=b'{"v": 1}',
+            subject="agents.result.po-agent",
+            data=_deployed_reply_bytes(
+                correlation_id="a" * 32, source_id="imposter-agent"
+            ),
             headers={SOURCE_AGENT_HEADER: "po-agent"},
         )
         await adapter._on_reply_received(msg)
-        assert recording_registry.delivered == []
+        assert len(recording_registry.delivered) == 1
+        corr, source, _payload = recording_registry.delivered[0]
+        assert corr == "a" * 32
+        assert source == "imposter-agent"
 
     @pytest.mark.asyncio
-    async def test_drops_message_with_missing_source_agent_header(
+    async def test_demux_prefers_body_result_payload_correlation(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         recording_registry: _RecordingRegistry,
     ) -> None:
+        # ResultPayload.correlation_id wins over envelope.correlation_id.
         msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
-            data=b'{"v": 1}',
-            headers={CORRELATION_KEY_HEADER: "a" * 32},
+            subject="agents.result.po-agent",
+            data=_deployed_reply_bytes(
+                correlation_id="a" * 32,
+                envelope_correlation_id="b" * 32,
+            ),
+        )
+        await adapter._on_reply_received(msg)
+        assert [d[0] for d in recording_registry.delivered] == ["a" * 32]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_envelope_correlation(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        recording_registry: _RecordingRegistry,
+    ) -> None:
+        # ResultPayload carries no correlation_id → demux by envelope.
+        msg = _FakeMessage(
+            subject="agents.result.po-agent",
+            data=_deployed_reply_bytes(
+                correlation_id=None,
+                envelope_correlation_id="c" * 32,
+            ),
+        )
+        await adapter._on_reply_received(msg)
+        assert [d[0] for d in recording_registry.delivered] == ["c" * 32]
+
+    @pytest.mark.asyncio
+    async def test_drops_reply_with_no_correlation_anywhere(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        recording_registry: _RecordingRegistry,
+    ) -> None:
+        # Neither the body ResultPayload nor the envelope carries a
+        # correlation — the reply cannot be demuxed and is dropped.
+        msg = _FakeMessage(
+            subject="agents.result.po-agent",
+            data=_deployed_reply_bytes(
+                correlation_id=None, envelope_correlation_id=None
+            ),
         )
         await adapter._on_reply_received(msg)
         assert recording_registry.delivered == []
 
     @pytest.mark.asyncio
-    async def test_drops_message_with_no_headers(
+    async def test_drops_empty_body(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         recording_registry: _RecordingRegistry,
     ) -> None:
         msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
-            data=b'{"v": 1}',
-            headers=None,
+            subject="agents.result.po-agent", data=b"", headers=None
         )
         await adapter._on_reply_received(msg)
         assert recording_registry.delivered == []
@@ -940,30 +1067,25 @@ class TestOnReplyReceived:
         recording_registry: _RecordingRegistry,
     ) -> None:
         msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
+            subject="agents.result.po-agent",
             data=b"this is not json {",
-            headers={
-                CORRELATION_KEY_HEADER: "a" * 32,
-                SOURCE_AGENT_HEADER: "po-agent",
-            },
+            headers=None,
         )
         await adapter._on_reply_received(msg)
         assert recording_registry.delivered == []
 
     @pytest.mark.asyncio
-    async def test_drops_non_object_payload(
+    async def test_drops_body_that_is_not_a_message_envelope(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         recording_registry: _RecordingRegistry,
     ) -> None:
-        # JSON arrays / scalars are valid JSON but not a dict.
+        # Valid JSON, but missing the required MessageEnvelope fields
+        # (source_id / event_type / payload) — schema validation drops it.
         msg = _FakeMessage(
-            subject="agents.result.po-agent." + "a" * 32,
-            data=b"[1, 2, 3]",
-            headers={
-                CORRELATION_KEY_HEADER: "a" * 32,
-                SOURCE_AGENT_HEADER: "po-agent",
-            },
+            subject="agents.result.po-agent",
+            data=b'{"foo": "bar"}',
+            headers=None,
         )
         await adapter._on_reply_received(msg)
         assert recording_registry.delivered == []
@@ -973,16 +1095,15 @@ class TestOnReplyReceived:
         self,
         adapter: NatsSpecialistDispatchAdapter,
     ) -> None:
-        # A message whose ``headers`` attribute access blows up should
-        # not propagate out of the callback — that would tear down the
+        # A message whose ``data`` attribute access blows up should not
+        # propagate out of the callback — that would tear down the SHARED
         # subscription's task in production.
         class _BrokenMsg:
-            subject = "agents.result.po-agent." + "a" * 32
-            data = b"{}"
+            subject = "agents.result.po-agent"
 
             @property
-            def headers(self) -> dict[str, str]:
-                raise RuntimeError("transient failure reading headers")
+            def data(self) -> bytes:
+                raise RuntimeError("transient failure reading data")
 
         await adapter._on_reply_received(_BrokenMsg())  # must not raise
 
@@ -1058,26 +1179,44 @@ class TestSeamCorrelationKeyOnTheWire:
     """Seam test from TASK-SAD-010 ``Seam Tests`` section.
 
     Verifies the ``CorrelationKey`` contract from TASK-SAD-003 (32 lowercase
-    hex chars) is preserved end-to-end through the subject suffix.
+    hex chars) is preserved end-to-end. Post DISPATCHFMT+ S3 (M4) the key is
+    NOT on the subject — the subject is the 3-token
+    ``agents.result.{agent_id}`` and the key travels in the reply BODY, where
+    the adapter demuxes it back to the awaiting correlation.
     """
 
     @pytest.mark.asyncio
     @pytest.mark.integration_contract("CorrelationKey")
-    async def test_dispatch_subject_format_matches_correlation_key_re(
+    async def test_reply_subject_is_3_token_and_key_demuxes_from_body(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         nats_client: FakeNATSClient,
+        recording_registry: _RecordingRegistry,
     ) -> None:
         # Real registry to fabricate a key in the canonical format.
         registry = CorrelationRegistry(transport=_FakeTransportThatNeverYields())  # type: ignore[arg-type]
         key = registry.fresh_correlation_key()
         await adapter.subscribe_reply("po-agent", key)
 
+        # The subscribed subject is the 3-token form — no key suffix.
         last = nats_client.subscriptions[-1]
-        assert re.fullmatch(
-            r"agents\.result\.[a-z0-9-]+\.[0-9a-f]{32}",
-            last.subject,
-        ), last.subject
+        assert re.fullmatch(r"agents\.result\.[a-z0-9-]+", last.subject), (
+            last.subject
+        )
+        assert last.subject == "agents.result.po-agent"
+
+        # The 32-hex key is preserved through the reply body: a deployed-
+        # shape reply carrying it demuxes back to that correlation.
+        await adapter._on_reply_received(
+            _FakeMessage(
+                subject=last.subject,
+                data=_deployed_reply_bytes(
+                    correlation_id=key, source_id="po-agent"
+                ),
+                headers=None,
+            )
+        )
+        assert [d[0] for d in recording_registry.delivered] == [key]
 
 
 class _FakeTransportThatNeverYields:
@@ -1112,3 +1251,201 @@ class TestModuleExports:
             assert name in sd_module.__all__, (
                 f"{name!r} missing from __all__"
             )
+
+
+# ---------------------------------------------------------------------------
+# M4 + M5-reply (DISPATCHFMT+ S3): shared per-agent subscription + body demux
+# ---------------------------------------------------------------------------
+
+
+class TestSharedSubscriptionLifecycle:
+    """One 3-token subscription per agent serves all concurrent dispatches."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_correlations_share_one_subscription(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.subscribe_reply("po-agent", "a" * 32)
+        await adapter.subscribe_reply("po-agent", "b" * 32)
+        # Two in-flight correlations, ONE underlying NATS subscription.
+        assert len(nats_client.subscriptions) == 1
+        assert nats_client.subscriptions[0].subject == "agents.result.po-agent"
+
+    @pytest.mark.asyncio
+    async def test_shared_subscription_torn_down_only_on_last_release(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.subscribe_reply("po-agent", "a" * 32)
+        await adapter.subscribe_reply("po-agent", "b" * 32)
+        sub = nats_client.subscriptions[0]
+
+        # Releasing the first correlation must NOT tear the shared sub down —
+        # the second is still in flight.
+        await adapter.unsubscribe_reply("a" * 32)
+        assert sub.unsubscribe_calls == 0
+
+        # Releasing the last correlation tears it down exactly once.
+        await adapter.unsubscribe_reply("b" * 32)
+        assert sub.unsubscribe_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_agents_get_distinct_subscriptions(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.subscribe_reply("po-agent", "a" * 32)
+        await adapter.subscribe_reply("architect-agent", "b" * 32)
+        subjects = sorted(s.subject for s in nats_client.subscriptions)
+        assert subjects == [
+            "agents.result.architect-agent",
+            "agents.result.po-agent",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_subscribe_of_same_key_is_a_no_op(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.subscribe_reply("po-agent", "a" * 32)
+        await adapter.subscribe_reply("po-agent", "a" * 32)
+        # Same key twice: never a second NATS subscription, and a single
+        # release still tears the (single) subscription down.
+        assert len(nats_client.subscriptions) == 1
+        await adapter.unsubscribe_reply("a" * 32)
+        assert nats_client.subscriptions[0].unsubscribe_calls == 1
+
+
+def _wire_real_registry(
+    nats_client: FakeNATSClient,
+) -> tuple[NatsSpecialistDispatchAdapter, CorrelationRegistry]:
+    """Wire a real :class:`CorrelationRegistry` to a real adapter.
+
+    The registry is the adapter's reply sink AND the adapter is the
+    registry's transport, so we forward-declare the registry, build the
+    adapter against it, then point the registry's transport at the adapter.
+    ``bind`` then drives ``adapter.subscribe`` → ``subscribe_reply`` on the
+    real code path.
+    """
+
+    class _Deferred:
+        async def subscribe(self, *_a: Any, **_kw: Any) -> Any:  # pragma: no cover
+            raise AssertionError("transport not wired yet")
+
+        async def unsubscribe(self, *_a: Any, **_kw: Any) -> None:  # pragma: no cover
+            raise AssertionError("transport not wired yet")
+
+    registry = CorrelationRegistry(transport=_Deferred())  # type: ignore[arg-type]
+    adapter = NatsSpecialistDispatchAdapter(
+        nats_client=nats_client, registry=registry
+    )
+    registry._transport = adapter  # type: ignore[attr-defined]
+    return adapter, registry
+
+
+class TestConcurrentReplyDemux:
+    """End-to-end through a real registry: headerless deployed-shape replies."""
+
+    @pytest.mark.asyncio
+    async def test_headerless_reply_resolves_the_matching_future(
+        self,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        adapter, registry = _wire_real_registry(nats_client)
+        key = registry.fresh_correlation_key()
+        binding = await registry.bind(key, "po-agent")
+
+        result = _wrap_role_output_result()
+        await nats_client.subscriptions[0].deliver(
+            _FakeMessage(
+                subject="agents.result.po-agent",
+                data=_deployed_reply_bytes(
+                    correlation_id=key, source_id="po-agent", result=result
+                ),
+                headers=None,
+            )
+        )
+        payload = await registry.wait_for_reply(binding, timeout_seconds=1.0)
+        # The awaiting future resolves with the inner ResultPayload dict —
+        # exact deployed shape, from a reply that carried NO headers.
+        assert payload == {
+            "command": "greenfield",
+            "result": result,
+            "correlation_id": key,
+            "success": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_mismatched_correlation_is_dropped(
+        self,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        adapter, registry = _wire_real_registry(nats_client)
+        key = registry.fresh_correlation_key()
+        binding = await registry.bind(key, "po-agent")
+
+        # A reply whose body correlation matches NO in-flight binding is
+        # dropped by the registry — never resolves the waiter, never crashes.
+        other_key = registry.fresh_correlation_key()
+        await nats_client.subscriptions[0].deliver(
+            _FakeMessage(
+                subject="agents.result.po-agent",
+                data=_deployed_reply_bytes(
+                    correlation_id=other_key, source_id="po-agent"
+                ),
+                headers=None,
+            )
+        )
+        payload = await registry.wait_for_reply(binding, timeout_seconds=0.05)
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_dispatches_each_get_their_own_reply(
+        self,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        adapter, registry = _wire_real_registry(nats_client)
+        key1 = registry.fresh_correlation_key()
+        key2 = registry.fresh_correlation_key()
+        binding1 = await registry.bind(key1, "po-agent")
+        binding2 = await registry.bind(key2, "po-agent")
+
+        # Both dispatches to the same agent share ONE subscription.
+        assert len(nats_client.subscriptions) == 1
+        sub = nats_client.subscriptions[0]
+
+        result1 = _wrap_role_output_result(role_id="product-owner")
+        result2 = _wrap_role_output_result(role_id="product-owner")
+        result2["coach_score"] = 0.5  # make the two replies distinguishable
+
+        # Deliver out of order — key2's reply first, then key1's.
+        await sub.deliver(
+            _FakeMessage(
+                subject="agents.result.po-agent",
+                data=_deployed_reply_bytes(
+                    correlation_id=key2, source_id="po-agent", result=result2
+                ),
+                headers=None,
+            )
+        )
+        await sub.deliver(
+            _FakeMessage(
+                subject="agents.result.po-agent",
+                data=_deployed_reply_bytes(
+                    correlation_id=key1, source_id="po-agent", result=result1
+                ),
+                headers=None,
+            )
+        )
+
+        payload1 = await registry.wait_for_reply(binding1, timeout_seconds=1.0)
+        payload2 = await registry.wait_for_reply(binding2, timeout_seconds=1.0)
+        assert payload1 is not None and payload1["correlation_id"] == key1
+        assert payload1["result"] == result1
+        assert payload2 is not None and payload2["correlation_id"] == key2
+        assert payload2["result"] == result2

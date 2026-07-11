@@ -24,8 +24,9 @@ to the dispatch domain:
     - :class:`TestCorrelationAdapterOrderingSeam`
     - :class:`TestOutcomeDownstreamSeam`
 * AC-004: Subject regex assertions match the IMPLEMENTATION-GUIDE §4
-  patterns (``^agents\\.command\\.[a-z0-9-]+$`` and
-  ``^agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32}$``).
+  patterns (``^agents\\.command\\.[a-z0-9-]+$`` and — post DISPATCHFMT+ S3,
+  M4 — the 3-token ``^agents\\.result\\.[a-z0-9-]+$``; correlation moved
+  from the subject suffix into the reply body).
 * AC-005: AST-level test verifies that ``forge/dispatch/*.py`` does NOT
   import :mod:`nats` (any submodule). See
   :class:`TestDispatchNatsAdapterImportSeam`.
@@ -87,9 +88,13 @@ from forge.dispatch.persistence import (
 # trailing alphabet is the agent_id slug (DRD-001..004).
 COMMAND_SUBJECT_RE = re.compile(r"^agents\.command\.[a-z0-9-]+$")
 
-# IMPLEMENTATION-GUIDE §4 — dispatch reply envelope subject. The
-# trailing 32-hex segment is the correlation_key.
-RESULT_SUBJECT_RE = re.compile(r"^agents\.result\.[a-z0-9-]+\.[0-9a-f]{32}$")
+# IMPLEMENTATION-GUIDE §4 — dispatch reply envelope subject. Post
+# DISPATCHFMT+ S3 (M4) this is the plain 3-token
+# ``agents.result.{agent_id}`` (nats-core ``Topics.Agents.RESULT``): the
+# deployed specialist publishes every reply for an agent there and forge
+# demuxes by the body correlation, so there is NO correlation suffix on
+# the subject.
+RESULT_SUBJECT_RE = re.compile(r"^agents\.result\.[a-z0-9-]+$")
 
 # IMPLEMENTATION-GUIDE §4 — CorrelationKey format invariant.
 CORRELATION_KEY_FORMAT_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -450,8 +455,9 @@ class TestDispatchEnvelopeContract:
     The IMPLEMENTATION-GUIDE §4 patterns are:
 
     * ``^agents\\.command\\.[a-z0-9-]+$`` — Forge → specialist command.
-    * ``^agents\\.result\\.[a-z0-9-]+\\.[0-9a-f]{32}$`` — specialist
-      → Forge per-correlation reply.
+    * ``^agents\\.result\\.[a-z0-9-]+$`` — specialist → Forge reply (M4:
+      3-token, shared per agent; the correlation is demuxed from the reply
+      body, not a subject suffix).
 
     We assert against both the canonical templates re-exported from
     ``forge.adapters.nats.specialist_dispatch`` AND against the
@@ -469,10 +475,9 @@ class TestDispatchEnvelopeContract:
         )
 
     def test_result_subject_template_matches_section_4_regex(self) -> None:
-        rendered = RESULT_SUBJECT_TEMPLATE.format(
-            agent_id="po-agent-007",
-            correlation_key="0123456789abcdef0123456789abcdef",
-        )
+        # M4: the reply template is the 3-token ``agents.result.{agent_id}``
+        # — no correlation suffix (correlation is carried in the body).
+        rendered = RESULT_SUBJECT_TEMPLATE.format(agent_id="po-agent-007")
         assert RESULT_SUBJECT_RE.fullmatch(rendered), (
             f"result template rendered {rendered!r}; "
             f"does not match §4 pattern {RESULT_SUBJECT_RE.pattern!r}"
@@ -486,20 +491,9 @@ class TestDispatchEnvelopeContract:
         cmd = NatsSpecialistDispatchAdapter.command_subject_for("agent-42")
         assert COMMAND_SUBJECT_RE.fullmatch(cmd), cmd
 
-        # Use a real registry-generated key so the suffix exercises a
-        # realistic 32-hex value rather than a hand-rolled literal.
-        class _InertChannel:
-            async def subscribe(self, key: str, deliver: Any) -> Any:
-                raise AssertionError("subscribe must not be called")
-
-            async def unsubscribe(self, sub: Any) -> None:
-                raise AssertionError("unsubscribe must not be called")
-
-        registry = CorrelationRegistry(transport=_InertChannel())
-        key = registry.fresh_correlation_key()
-        result = NatsSpecialistDispatchAdapter.result_subject_for(
-            "agent-42", key
-        )
+        # M4: the reply subject builder takes only the agent id — the
+        # 3-token subject carries no correlation suffix.
+        result = NatsSpecialistDispatchAdapter.result_subject_for("agent-42")
         assert RESULT_SUBJECT_RE.fullmatch(result), result
 
     def test_command_regex_rejects_uppercase_agent_id(self) -> None:
@@ -512,16 +506,17 @@ class TestDispatchEnvelopeContract:
             f"§4 regex incorrectly accepted uppercase agent_id: {bad!r}"
         )
 
-    def test_result_regex_rejects_short_correlation_key(self) -> None:
-        # Boundary check: §4 declares the suffix as ``[0-9a-f]{32}`` —
-        # a 31-char or 33-char suffix must be rejected so a malformed
-        # key cannot reach the wire.
-        for length in (31, 33):
-            bad_key = "a" * length
-            bad = f"agents.result.po-agent.{bad_key}"
+    def test_result_regex_rejects_correlation_suffix(self) -> None:
+        # M4 boundary check: the reply subject is the 3-token
+        # ``agents.result.{agent_id}``. A 4-token subject carrying a
+        # trailing correlation segment (the OLD contract) must be rejected
+        # so a producer cannot publish on the wrong, unsubscribed subject.
+        for suffix_len in (31, 32, 33):
+            stray = "a" * suffix_len
+            bad = f"agents.result.po-agent.{stray}"
             assert not RESULT_SUBJECT_RE.fullmatch(bad), (
-                f"§4 regex incorrectly accepted reply with {length}-char "
-                f"correlation key: {bad!r}"
+                f"§4 regex incorrectly accepted a 4-token reply subject "
+                f"with a correlation suffix: {bad!r}"
             )
 
 

@@ -15,15 +15,21 @@ Subject layout
 Direction                         Subject
 ================================  ==================================================
 Forge → specialist (command)      ``agents.command.{matched_agent_id}``
-specialist → Forge (reply)        ``agents.result.{matched_agent_id}.{correlation_key}``
+specialist → Forge (reply)        ``agents.result.{matched_agent_id}``
 ================================  ==================================================
 
 The singular ``agents.command`` / ``agents.result`` convention is the
 fleet-wide adoption (DRD-001..004; FEAT-FORGE-002 ADR adoption recorded
-in Graphiti ``architecture_decisions``). The per-correlation suffix on the
-reply subject means each dispatch attempt owns its own subscription —
-exactly-once and source-authenticity invariants are clean to enforce in
-:class:`CorrelationRegistry` without router-side fan-out.
+in Graphiti ``architecture_decisions``). The reply subject is the plain
+3-token ``agents.result.{agent_id}`` — aligned to nats-core
+``Topics.Agents.RESULT`` — because the DEPLOYED specialist publishes its
+reply there (fire-and-forget branch: forge publishes without ``reply_to``,
+so the router envelope-wraps a ``ResultPayload`` onto that topic with NO
+headers and the correlation carried in the BODY). A single shared
+subscription per agent therefore serves EVERY concurrent in-flight
+dispatch to that agent; the registry demuxes each reply to its awaiting
+future by the body ``correlation_id`` (DISPATCHFMT+ S3, M4 + M5-reply,
+contract decision D2).
 
 Headers on the dispatch command
 -------------------------------
@@ -33,24 +39,36 @@ Headers on the dispatch command
 * ``requesting_agent_id`` — fixed string ``"forge"``.
 * ``dispatched_at`` — ISO 8601 UTC timestamp at publish time.
 
+These are retained for **tracing only** — nothing in the deployed
+parse-target reads them (D2). In particular the reply path does NOT
+require any header: the deployed specialist publishes its reply with no
+headers at all.
+
 Reply correlation lifecycle
 ---------------------------
 
-* :meth:`NatsSpecialistDispatchAdapter.subscribe_reply` is called from
-  :meth:`CorrelationRegistry.bind` (via the wiring established in
-  TASK-SAD-011). It returns ONLY after the underlying NATS subscription
-  is fully established — i.e. the SUB protocol command has been flushed
-  to the server. The orchestrator's subscribe-before-publish invariant
-  depends on this contract.
-* :meth:`unsubscribe_reply` is called from
-  :meth:`CorrelationRegistry.release`. It is idempotent — calling it a
-  second time with the same correlation key is a no-op.
-* :meth:`_on_reply_received` is the per-message callback registered
-  with the NATS subscription. It extracts ``source_agent_id`` from the
-  message headers, decodes the JSON payload, and forwards to
-  :meth:`CorrelationRegistry.deliver_reply`. Authentication is enforced
-  in the registry, **not** here — the adapter simply forwards what it
-  observed.
+* :meth:`NatsSpecialistDispatchAdapter.subscribe_reply` is called (per
+  correlation) from :meth:`CorrelationRegistry.bind`. The reply
+  subscription is **shared per agent**: the first in-flight correlation
+  for an agent establishes the underlying NATS subscription on
+  ``agents.result.{agent_id}`` (returning ONLY after the SUB command has
+  been flushed to the server — the subscribe-before-publish anchor);
+  subsequent concurrent correlations to the same agent reuse it without a
+  second SUB.
+* :meth:`unsubscribe_reply` is called (per correlation) from
+  :meth:`CorrelationRegistry.release`. It removes that correlation from
+  the agent's in-flight set and tears the shared subscription down ONLY
+  when no correlation for that agent remains in flight. It is idempotent —
+  a second call with the same correlation key is a no-op.
+* :meth:`_on_reply_received` is the per-message callback registered with
+  the shared NATS subscription. It parses the body as a nats-core
+  :class:`~nats_core.envelope.MessageEnvelope`, reads source identity from
+  ``envelope.source_id``, demuxes by the BODY correlation
+  (``ResultPayload.correlation_id`` with a fallback to
+  ``envelope.correlation_id``), and forwards to
+  :meth:`CorrelationRegistry.deliver_reply`. Authentication, exactly-once,
+  and the wrong-correlation drop are enforced in the registry, **not**
+  here — the adapter simply forwards what it observed.
 
 PubAck semantics
 ----------------
@@ -59,7 +77,7 @@ JetStream's PubAck (when the audit stream is configured to emit one) is
 treated as a "publish was sent" signal only — it is logged at DEBUG and
 **never** routed through :meth:`CorrelationRegistry.deliver_reply`. The
 binding's outcome is determined by the actual reply payload landing on
-the per-correlation reply subscription. This mirrors the LES1 parity
+the shared reply subscription. This mirrors the LES1 parity
 rule already enforced in :class:`forge.adapters.nats.PipelinePublisher`.
 
 References
@@ -73,12 +91,12 @@ References
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Protocol
 
 from nats_core.envelope import EventType, MessageEnvelope
-from nats_core.events import CommandPayload
+from nats_core.events import CommandPayload, ResultPayload
+from pydantic import ValidationError
 
 from forge.discovery.protocol import Clock, SystemClock
 from forge.dispatch.correlation import CorrelationRegistry
@@ -97,10 +115,15 @@ logger = logging.getLogger(__name__)
 #: Subject template for the Forge → specialist dispatch command.
 COMMAND_SUBJECT_TEMPLATE: str = "agents.command.{agent_id}"
 
-#: Subject template for the specialist → Forge reply.
-RESULT_SUBJECT_TEMPLATE: str = "agents.result.{agent_id}.{correlation_key}"
+#: Subject template for the specialist → Forge reply. The deployed
+#: specialist publishes replies on the plain 3-token
+#: ``agents.result.{agent_id}`` (nats-core ``Topics.Agents.RESULT``);
+#: correlation lives in the reply BODY, not the subject (M4 + M5-reply,
+#: DISPATCHFMT+ S3 — contract decision D2).
+RESULT_SUBJECT_TEMPLATE: str = "agents.result.{agent_id}"
 
 #: Header carrying the per-attempt correlation key (32 lowercase hex).
+#: Command-side tracing only — no consumer depends on it (D2).
 CORRELATION_KEY_HEADER: str = "correlation_key"
 
 #: Header carrying the requesting agent identifier (fixed: ``"forge"``).
@@ -109,7 +132,11 @@ REQUESTING_AGENT_HEADER: str = "requesting_agent_id"
 #: Header carrying the publish-time ISO 8601 UTC timestamp.
 DISPATCHED_AT_HEADER: str = "dispatched_at"
 
-#: Header carrying the replying specialist's agent identifier.
+#: Header that historically carried the replying specialist's agent
+#: identifier. Retained as an exported constant for back-compat, but the
+#: reply path NO LONGER reads it — source identity is taken from
+#: ``MessageEnvelope.source_id`` in the reply BODY (D2). The deployed
+#: specialist publishes replies with no headers at all.
 SOURCE_AGENT_HEADER: str = "source_agent_id"
 
 #: Fixed source identifier stamped on every dispatch command.
@@ -162,17 +189,22 @@ class ReplyChannel(Protocol):
     async def subscribe_reply(
         self, matched_agent_id: str, correlation_key: str
     ) -> None:
-        """Establish a per-correlation reply subscription.
+        """Register ``correlation_key`` on the agent's shared reply sub.
 
         MUST return ONLY after the NATS subscription is fully active —
         i.e. the SUB command has been flushed to the server. The
         :class:`CorrelationRegistry`'s ``bind()`` relies on this
         contract to satisfy the subscribe-before-publish invariant.
+        The subscription is shared across concurrent correlations for the
+        same agent (see the concrete adapter).
         """
         ...
 
     async def unsubscribe_reply(self, correlation_key: str) -> None:
-        """Tear down the per-correlation subscription. MUST be idempotent."""
+        """Release the correlation; tear the shared sub down on the last.
+
+        MUST be idempotent.
+        """
         ...
 
 
@@ -222,9 +254,11 @@ class NatsSpecialistDispatchAdapter:
     * The injected :class:`CorrelationRegistry` — its
       :meth:`~CorrelationRegistry.deliver_reply` is the sink that
       :meth:`_on_reply_received` forwards to.
-    * A per-correlation subscription handle map so
-      :meth:`unsubscribe_reply` can tear down the right subscription
-      without leaking handles.
+    * A per-**agent** shared subscription handle map plus a per-agent set
+      of in-flight correlation keys, so multiple concurrent dispatches to
+      the same agent share ONE reply subscription and
+      :meth:`unsubscribe_reply` tears it down only once the last in-flight
+      correlation for that agent is released — without leaking handles.
 
     Args:
         nats_client: An async NATS client with ``subscribe`` / ``publish``
@@ -251,11 +285,19 @@ class NatsSpecialistDispatchAdapter:
         self._nc = nats_client
         self._registry = registry
         self._clock: Clock = clock if clock is not None else SystemClock()
-        # correlation_key -> opaque subscription handle returned by the
-        # NATS client. The handle has an ``unsubscribe()`` coroutine —
-        # we stash it so unsubscribe_reply can be idempotent without
-        # having to re-derive the subject.
-        self._subscriptions: dict[str, Any] = {}
+        # matched_agent_id -> opaque NATS subscription handle for the ONE
+        # shared 3-token ``agents.result.{agent_id}`` subscription serving
+        # every concurrent in-flight dispatch to that agent. The handle has
+        # an ``unsubscribe()`` coroutine.
+        self._agent_subscriptions: dict[str, Any] = {}
+        # matched_agent_id -> set of correlation keys currently in flight
+        # for that agent. The shared subscription is torn down when this
+        # set becomes empty (D.unsubscribe-on-timeout, refcounted).
+        self._agent_inflight: dict[str, set[str]] = {}
+        # correlation_key -> matched_agent_id, so unsubscribe_reply can find
+        # the owning agent from the key alone (idempotent: a key absent here
+        # has already been released or was never subscribed).
+        self._key_to_agent: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Subject helpers — exposed as static methods so tests can assert
@@ -268,13 +310,14 @@ class NatsSpecialistDispatchAdapter:
         return COMMAND_SUBJECT_TEMPLATE.format(agent_id=matched_agent_id)
 
     @staticmethod
-    def result_subject_for(
-        matched_agent_id: str, correlation_key: str
-    ) -> str:
-        """Build ``agents.result.{matched_agent_id}.{correlation_key}``."""
-        return RESULT_SUBJECT_TEMPLATE.format(
-            agent_id=matched_agent_id, correlation_key=correlation_key
-        )
+    def result_subject_for(matched_agent_id: str) -> str:
+        """Build the 3-token ``agents.result.{matched_agent_id}``.
+
+        The reply subject carries NO correlation suffix — the deployed
+        specialist publishes every reply for an agent on this one subject
+        and forge demuxes by the body correlation (D2, M4).
+        """
+        return RESULT_SUBJECT_TEMPLATE.format(agent_id=matched_agent_id)
 
     # ------------------------------------------------------------------
     # ReplyChannel surface — subscribe / unsubscribe per correlation
@@ -321,49 +364,69 @@ class NatsSpecialistDispatchAdapter:
     async def subscribe_reply(
         self, matched_agent_id: str, correlation_key: str
     ) -> None:
-        """Subscribe to ``agents.result.{matched_agent_id}.{correlation_key}``.
+        """Ensure the shared ``agents.result.{matched_agent_id}`` sub is active.
+
+        The reply subscription is SHARED per agent: the FIRST in-flight
+        correlation for ``matched_agent_id`` opens the underlying NATS
+        subscription on the 3-token subject; subsequent concurrent
+        correlations to the same agent register their key in the agent's
+        in-flight set and reuse the existing subscription (no second SUB).
 
         Returns ONLY after the underlying NATS subscription is fully
         active — i.e. the SUB command has been flushed to the server.
         This is the subscribe-before-publish anchor the orchestrator's
-        invariant depends on (D.subscribe-before-publish-invariant).
+        invariant depends on (D.subscribe-before-publish-invariant). When
+        the subscription already exists, the invariant is trivially
+        satisfied (the SUB was flushed by the first correlation), and the
+        method still awaits a ``flush`` so a same-tick publish observes it.
 
         nats-py's :meth:`Client.subscribe` already awaits the SUB write
         before returning the :class:`Subscription`, but we additionally
-        invoke ``flush`` (when available) so a remote server has
-        observed our SUB before any subsequent publish. ``asyncio.sleep``
-        is **never** used as a synchronisation primitive here — that
-        path was the LES1 anti-pattern.
+        invoke ``flush`` (when available) so a remote server has observed
+        our SUB before any subsequent publish. ``asyncio.sleep`` is
+        **never** used as a synchronisation primitive here — that path was
+        the LES1 anti-pattern.
 
-        If the same ``correlation_key`` is subscribed twice, the second
-        subscription replaces the first — the previous handle is dropped
-        without an explicit unsubscribe, on the assumption that the
-        registry treats double-subscribe as a programming error and
-        callers will not exercise this path. We log a warning so the
-        condition is observable.
+        If the same ``correlation_key`` is subscribed twice this is a
+        no-op past registering the key once — the registry treats a
+        double-subscribe of one key as a programming error; we log a
+        warning so the condition is observable and never open a duplicate
+        NATS subscription for it.
         """
-        subject = self.result_subject_for(matched_agent_id, correlation_key)
+        subject = self.result_subject_for(matched_agent_id)
 
-        if correlation_key in self._subscriptions:
+        if correlation_key in self._key_to_agent:
             logger.warning(
-                "subscribe_reply: replacing existing subscription "
-                "(key=%s, subject=%s); previous handle will be leaked",
+                "subscribe_reply: correlation key already subscribed "
+                "(key=%s, agent=%s); ignoring duplicate subscribe",
                 correlation_key,
-                subject,
+                self._key_to_agent[correlation_key],
             )
+            return
 
-        # Register the inbound callback. nats-py expects an async
-        # callable here — ``_on_reply_received`` is async.
-        subscription = await self._nc.subscribe(
-            subject, cb=self._on_reply_received
+        # Record the correlation as in-flight for this agent BEFORE the
+        # await, so a reply that arrives synchronously inside subscribe()
+        # (or on a subscription already open) can be demuxed to it.
+        self._key_to_agent[correlation_key] = matched_agent_id
+        self._agent_inflight.setdefault(matched_agent_id, set()).add(
+            correlation_key
         )
+
+        # Reuse the shared subscription if this agent already has one —
+        # concurrent dispatches to the same agent do not open a second SUB.
+        if matched_agent_id not in self._agent_subscriptions:
+            # Register the inbound callback. nats-py expects an async
+            # callable here — ``_on_reply_received`` is async.
+            subscription = await self._nc.subscribe(
+                subject, cb=self._on_reply_received
+            )
+            self._agent_subscriptions[matched_agent_id] = subscription
 
         # Belt-and-braces flush so a remote server has observed our SUB
         # before any caller publishes. nats-py's ``Client.subscribe``
         # already serialises the SUB write, but the flush makes the
         # subscribe-before-publish invariant robust against transports
-        # whose ``subscribe`` returns before the SUB lands at the
-        # server.
+        # whose ``subscribe`` returns before the SUB lands at the server.
         flush = getattr(self._nc, "flush", None)
         if flush is not None:
             try:
@@ -380,24 +443,48 @@ class NatsSpecialistDispatchAdapter:
                     exc,
                 )
 
-        self._subscriptions[correlation_key] = subscription
-
     async def unsubscribe_reply(self, correlation_key: str) -> None:
-        """Tear down the per-correlation subscription. Idempotent.
+        """Release one correlation; tear down the shared sub on the last. Idempotent.
 
-        A second call with the same ``correlation_key`` is a no-op —
-        the first call removes the handle from the registry, so the
-        second observes "nothing to unsubscribe" and returns silently.
+        Removes ``correlation_key`` from its agent's in-flight set. The
+        underlying NATS subscription is shared across every concurrent
+        dispatch to that agent, so it is torn down ONLY when no correlation
+        for the agent remains in flight.
 
-        Transport errors during unsubscribe are logged but never
-        re-raised: the registry's release path is sync and cannot
-        meaningfully act on an unsubscribe failure.
+        A second call with the same ``correlation_key`` is a no-op — the
+        first call removes the key from :attr:`_key_to_agent`, so the
+        second observes "nothing to release" and returns silently.
+
+        Transport errors during unsubscribe are logged but never re-raised:
+        the registry's release path is sync and cannot meaningfully act on
+        an unsubscribe failure.
         """
-        subscription = self._subscriptions.pop(correlation_key, None)
-        if subscription is None:
-            # Idempotent path — already torn down (or never subscribed).
+        matched_agent_id = self._key_to_agent.pop(correlation_key, None)
+        if matched_agent_id is None:
+            # Idempotent path — already released (or never subscribed).
             logger.debug(
-                "unsubscribe_reply: no active subscription (key=%s)",
+                "unsubscribe_reply: no in-flight correlation (key=%s)",
+                correlation_key,
+            )
+            return
+
+        in_flight = self._agent_inflight.get(matched_agent_id)
+        if in_flight is not None:
+            in_flight.discard(correlation_key)
+
+        # Other dispatches to this agent still in flight — keep the shared
+        # subscription alive.
+        if in_flight:
+            return
+
+        # Last correlation for this agent — drop the in-flight set and tear
+        # the shared subscription down.
+        self._agent_inflight.pop(matched_agent_id, None)
+        subscription = self._agent_subscriptions.pop(matched_agent_id, None)
+        if subscription is None:
+            logger.debug(
+                "unsubscribe_reply: no active subscription (agent=%s, key=%s)",
+                matched_agent_id,
                 correlation_key,
             )
             return
@@ -407,7 +494,8 @@ class NatsSpecialistDispatchAdapter:
         except Exception:
             logger.exception(
                 "unsubscribe_reply: transport unsubscribe failed "
-                "(key=%s); subscription leak possible",
+                "(agent=%s, key=%s); subscription leak possible",
+                matched_agent_id,
                 correlation_key,
             )
 
@@ -478,7 +566,8 @@ class NatsSpecialistDispatchAdapter:
         at DEBUG only — it is **not** routed through
         :meth:`CorrelationRegistry.deliver_reply`. The orchestrator
         observes dispatch outcome via the actual reply payload landing
-        on the per-correlation subscription.
+        on the agent's shared reply subscription (demuxed by body
+        correlation).
         """
         subject = self.command_subject_for(attempt.matched_agent_id)
         headers = {
@@ -529,83 +618,104 @@ class NatsSpecialistDispatchAdapter:
     # ------------------------------------------------------------------
 
     async def _on_reply_received(self, msg: Any) -> None:
-        """Callback registered with the NATS subscription.
+        """Callback registered with the shared reply subscription.
 
-        Extracts ``source_agent_id`` and ``correlation_key`` from the
-        message headers, decodes the JSON payload body, and forwards to
-        :meth:`CorrelationRegistry.deliver_reply`. The registry enforces
-        source authenticity, exactly-once, and wrong-correlation drops —
-        the adapter must NOT short-circuit on those conditions, because
-        doing so duplicates logic the registry already covers (and would
-        be inconsistent with the registry's contract).
+        Parses the message body as a nats-core
+        :class:`~nats_core.envelope.MessageEnvelope` (the shape the
+        DEPLOYED specialist publishes on ``agents.result.{agent_id}``:
+        an envelope wrapping a :class:`~nats_core.events.ResultPayload`,
+        with NO headers). It then:
 
-        Defensive drops applied here (with WARNING-level logs, never
-        the payload body):
+        * reads reply source identity from ``envelope.source_id`` (D2 —
+          the reply carries no ``source_agent_id`` header);
+        * demuxes by the BODY correlation —
+          ``ResultPayload.correlation_id`` when the payload validates,
+          falling back to ``envelope.correlation_id``;
+        * forwards the inner ``ResultPayload`` dict (``envelope.payload``)
+          to :meth:`CorrelationRegistry.deliver_reply`.
 
-        * Missing ``correlation_key`` or ``source_agent_id`` header —
-          the message cannot be routed; drop.
-        * Payload body is not valid UTF-8 JSON — drop. A future task
-          may surface these as ``DispatchError`` outcomes via the
-          :func:`forge.dispatch.reply_parser.parse_reply` path; for
-          now they are silently dropped at the transport boundary so a
+        The registry enforces source authenticity, exactly-once, and the
+        wrong-correlation drop (a reply whose body correlation matches no
+        in-flight binding is logged and dropped there). The adapter must
+        NOT short-circuit on those conditions — that duplicates registry
+        logic. Because the subscription is shared across every concurrent
+        dispatch to an agent, this body-correlation demux is the ONLY
+        thing routing each reply to the right awaiting future.
+
+        Defensive drops applied here (with WARNING-level logs, never the
+        payload body):
+
+        * Empty body, or a body that is not a valid nats-core
+          ``MessageEnvelope`` (bad UTF-8 / JSON / schema) — drop. A
           malformed message can never crash the subscription's task.
-        * Payload root is not a JSON object — drop for the same reason.
+        * No correlation on either the payload or the envelope — the
+          reply cannot be demuxed; drop.
 
-        The method is ``async def`` because nats-py registers callbacks
-        as awaitable handlers; the actual call to
-        :meth:`CorrelationRegistry.deliver_reply` is sync (the
-        registry's documented contract).
+        The method is ``async def`` because nats-py registers callbacks as
+        awaitable handlers; the actual call to
+        :meth:`CorrelationRegistry.deliver_reply` is sync (the registry's
+        documented contract).
         """
         try:
-            headers = getattr(msg, "headers", None) or {}
-            correlation_key = headers.get(CORRELATION_KEY_HEADER)
-            source_agent_id = headers.get(SOURCE_AGENT_HEADER)
             subject = getattr(msg, "subject", "<unknown>")
-
-            if not correlation_key or not source_agent_id:
+            data = getattr(msg, "data", b"") or b""
+            if not data:
                 logger.warning(
-                    "drop reply: missing required header "
-                    "(subject=%s, has_correlation_key=%s, "
-                    "has_source_agent_id=%s)",
-                    subject,
-                    bool(correlation_key),
-                    bool(source_agent_id),
+                    "drop reply: empty body (subject=%s)", subject
                 )
                 return
 
-            data = getattr(msg, "data", b"") or b""
             try:
-                payload = json.loads(data.decode("utf-8")) if data else {}
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Never log the raw body — it may contain sensitive
-                # values until the dispatcher hands it to the parser.
+                envelope = MessageEnvelope.model_validate_json(data)
+            except (ValidationError, ValueError) as exc:
+                # ``ValueError`` covers UnicodeDecodeError / JSONDecodeError
+                # raised by pydantic's JSON loader. Never log the raw body —
+                # it may carry sensitive values until the dispatcher hands
+                # it to the parser.
                 logger.warning(
-                    "drop reply: malformed payload body "
-                    "(key=%s, error=%s)",
-                    correlation_key,
+                    "drop reply: body is not a valid MessageEnvelope "
+                    "(subject=%s, error=%s)",
+                    subject,
                     exc.__class__.__name__,
                 )
                 return
 
-            if not isinstance(payload, dict):
+            source_agent_id = envelope.source_id
+            payload = envelope.payload
+
+            # Demux by the BODY correlation: prefer the ResultPayload's own
+            # correlation_id, fall back to the envelope correlation_id (D2).
+            body_correlation: str | None = None
+            try:
+                body_correlation = ResultPayload.model_validate(
+                    payload
+                ).correlation_id
+            except ValidationError:
+                # Not a ResultPayload shape — fall through to the envelope
+                # correlation. The registry will drop it if it matches no
+                # in-flight binding.
+                body_correlation = None
+            correlation_key = body_correlation or envelope.correlation_id
+
+            if not correlation_key:
                 logger.warning(
-                    "drop reply: payload root is not a JSON object "
-                    "(key=%s, got=%s)",
-                    correlation_key,
-                    type(payload).__name__,
+                    "drop reply: no correlation on payload or envelope "
+                    "(subject=%s, source=%s)",
+                    subject,
+                    source_agent_id,
                 )
                 return
 
-            # Forward to the registry — synchronous by design (see
-            # CorrelationRegistry.deliver_reply docstring for the
-            # exactly-once rationale).
+            # Forward the inner ResultPayload dict to the registry —
+            # synchronous by design (see CorrelationRegistry.deliver_reply
+            # for the exactly-once + wrong-correlation-drop rationale).
             self._registry.deliver_reply(
                 correlation_key, source_agent_id, payload
             )
         except Exception:  # noqa: BLE001
-            # Subscription callbacks must never raise into nats-py's
-            # task — a raise here would tear down the subscription and
-            # silently lose every subsequent reply on this correlation.
+            # Subscription callbacks must never raise into nats-py's task —
+            # a raise here would tear down the SHARED subscription and
+            # silently lose every subsequent reply for that agent.
             logger.exception(
                 "_on_reply_received: unexpected error; "
                 "reply dropped at transport boundary"
