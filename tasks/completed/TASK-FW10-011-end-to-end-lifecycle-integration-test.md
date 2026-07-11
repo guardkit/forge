@@ -11,7 +11,7 @@ id: TASK-FW10-011
 implementation_mode: task-work
 parent_review: TASK-REV-FW10
 priority: high
-status: design_approved
+status: completed
 tags:
 - integration-test
 - e2e
@@ -22,6 +22,7 @@ task_type: testing
 title: End-to-end lifecycle integration test (build-queued → terminal envelope, all
   subjects)
 wave: 4
+reconciled: "2026-07-11 WS3-S8 sweep — FW10 in completed/; moved by 9ef9138b (FEAT-DEA8 finalize)"
 ---
 
 # TASK-FW10-011 — End-to-end lifecycle integration test

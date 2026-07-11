@@ -9,7 +9,7 @@ id: TASK-FW10-004
 implementation_mode: task-work
 parent_review: TASK-REV-FW10
 priority: high
-status: design_approved
+status: completed
 tags:
 - factory
 - sqlite
@@ -17,6 +17,7 @@ tags:
 task_type: feature
 title: StageLogRecorder production binding to forge.lifecycle.persistence SQLite writer
 wave: 2
+reconciled: "2026-07-11 WS3-S8 sweep — FW10 in completed/; moved by 9ef9138b (FEAT-DEA8 finalize)"
 ---
 
 # TASK-FW10-004 — `StageLogRecorder` production binding

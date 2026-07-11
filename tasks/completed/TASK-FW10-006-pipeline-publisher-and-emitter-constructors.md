@@ -9,7 +9,7 @@ id: TASK-FW10-006
 implementation_mode: task-work
 parent_review: TASK-REV-FW10
 priority: high
-status: design_approved
+status: completed
 tags:
 - factory
 - lifecycle-emitter
@@ -18,6 +18,7 @@ tags:
 task_type: feature
 title: PipelinePublisher and PipelineLifecycleEmitter production constructors
 wave: 2
+reconciled: "2026-07-11 WS3-S8 sweep — FW10 in completed/; moved by 9ef9138b (FEAT-DEA8 finalize)"
 ---
 
 # TASK-FW10-006 — `PipelinePublisher` and `PipelineLifecycleEmitter` production constructors

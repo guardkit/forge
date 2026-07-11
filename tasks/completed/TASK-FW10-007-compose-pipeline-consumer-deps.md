@@ -43,7 +43,7 @@ id: TASK-FW10-007
 implementation_mode: task-work
 parent_review: TASK-REV-FW10
 priority: high
-status: design_approved
+status: completed
 tags:
 - composition
 - deps-factory
@@ -53,6 +53,7 @@ task_type: feature
 title: Compose PipelineConsumerDeps factory and dispatcher closure; replace receipt-only
   stub
 wave: 3
+reconciled: "2026-07-11 WS3-S8 sweep — FW10 in completed/; moved by 9ef9138b (FEAT-DEA8 finalize)"
 ---
 
 # TASK-FW10-007 — Compose `PipelineConsumerDeps` factory + dispatcher closure

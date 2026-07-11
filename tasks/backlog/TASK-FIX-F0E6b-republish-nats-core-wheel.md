@@ -10,7 +10,7 @@ complexity: 5
 task_type: fix
 parent_task: TASK-FIX-F0E6
 scoping_source: tasks/in_progress/TASK-FIX-F0E6-nats-core-import-namespace.md (Decision)
-estimated_effort: 2-4 hours (cross-repo: build, test, republish)
+estimated_effort: "2-4 hours (cross-repo: build, test, republish)"
 test_results:
   status: pending
   coverage: null

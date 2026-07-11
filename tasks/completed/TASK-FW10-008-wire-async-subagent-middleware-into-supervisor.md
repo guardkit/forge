@@ -24,7 +24,7 @@ id: TASK-FW10-008
 implementation_mode: task-work
 parent_review: TASK-REV-FW10
 priority: high
-status: design_approved
+status: completed
 tags:
 - composition
 - supervisor
@@ -34,6 +34,7 @@ task_type: feature
 title: Wire AsyncSubAgentMiddleware into supervisor; thread emitter into autobuild
   dispatcher context
 wave: 3
+reconciled: "2026-07-11 WS3-S8 sweep — FW10 in completed/; moved by 9ef9138b (FEAT-DEA8 finalize)"
 ---
 
 # TASK-FW10-008 — Wire `AsyncSubAgentMiddleware` into the supervisor; thread the emitter through the dispatcher context
