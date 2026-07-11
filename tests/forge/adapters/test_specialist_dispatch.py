@@ -35,10 +35,14 @@ from typing import Any, Awaitable, Callable
 
 import pytest
 
+from nats_core.envelope import EventType, MessageEnvelope
+from nats_core.events import CommandPayload
+
 from forge.adapters.nats import specialist_dispatch as sd_module
 from forge.adapters.nats.specialist_dispatch import (
     COMMAND_SUBJECT_TEMPLATE,
     CORRELATION_KEY_HEADER,
+    DISPATCH_COMMAND_PLACEHOLDER,
     DISPATCHED_AT_HEADER,
     DispatchCommandPublisher,
     NatsSpecialistDispatchAdapter,
@@ -399,11 +403,14 @@ class TestDispatchHeaders:
         assert parsed.utcoffset() == timezone.utc.utcoffset(parsed), timestamp
 
     @pytest.mark.asyncio
-    async def test_payload_is_json_with_attempt_fields(
+    async def test_body_carries_scrubbed_parameters_in_command_args(
         self,
         adapter: NatsSpecialistDispatchAdapter,
         nats_client: FakeNATSClient,
     ) -> None:
+        # Post-S1 the wire body is a nats-core MessageEnvelope wrapping a
+        # CommandPayload; the (already-scrubbed) parameter list is carried
+        # verbatim under ``args["parameters"]`` (S2 restructures it).
         attempt = _make_attempt(
             correlation_key="ab" * 16,
             matched_agent_id="po-agent",
@@ -417,17 +424,121 @@ class TestDispatchHeaders:
         ]
         await adapter.publish_dispatch(attempt, params)
         recorded = nats_client.published[-1]
-        decoded = json.loads(recorded.body.decode("utf-8"))
-        assert decoded["resolution_id"] == "res-42"
-        assert decoded["correlation_key"] == "ab" * 16
-        assert decoded["matched_agent_id"] == "po-agent"
-        assert decoded["attempt_no"] == 2
-        assert decoded["retry_of"] == "res-41"
+        envelope = MessageEnvelope.model_validate_json(recorded.body)
+        command = CommandPayload.model_validate(envelope.payload)
         # Sensitive value is dropped on the wire too — mirrors persistence.
-        assert decoded["parameters"] == [
+        assert command.args["parameters"] == [
             {"name": "task", "value": "lint", "sensitive": False},
             {"name": "api_key", "value": None, "sensitive": True},
         ]
+        # Forge-local dispatch bookkeeping is NOT put on the wire — the
+        # specialist ignores it and forge re-correlates from its registry.
+        decoded = json.loads(recorded.body.decode("utf-8"))
+        assert "resolution_id" not in decoded
+        assert "attempt_no" not in decoded
+        assert "retry_of" not in decoded
+        assert "resolution_id" not in command.args
+        assert "attempt_no" not in command.args
+
+
+# ---------------------------------------------------------------------------
+# M1 + M5-command (DISPATCHFMT+ S1): the wire body is a parseable nats-core
+# MessageEnvelope wrapping a CommandPayload — the deployed specialist's inbound
+# parse (client.subscribe_with_reply -> MessageEnvelope.model_validate_json)
+# must succeed, and the router demuxes on the BODY correlation value.
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchEnvelopeWireFormat:
+    """M1/M5-command — forge publishes a valid nats-core command envelope.
+
+    Fixtures are the REAL nats-core contract types (``MessageEnvelope`` /
+    ``CommandPayload``), which discovery proved byte-identical between the
+    deployed image's nats-core 0.4.0 and repo tip for these surfaces — so
+    a repo-tip parse here == the deployed parse-target.
+    """
+
+    @pytest.mark.asyncio
+    async def test_body_is_a_valid_nats_core_message_envelope(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        # Pre-S1 this body was a bare dict → deployed parse raised
+        # "3 validation errors: source_id / event_type / payload". It must
+        # now parse cleanly as a MessageEnvelope.
+        await adapter.publish_dispatch(
+            _make_attempt(correlation_key="ab" * 16), []
+        )
+        recorded = nats_client.published[-1]
+        envelope = MessageEnvelope.model_validate_json(recorded.body)
+        assert envelope.source_id == REQUESTING_AGENT_ID == "forge"
+
+    @pytest.mark.asyncio
+    async def test_event_type_is_command(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.publish_dispatch(_make_attempt(), [])
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        # Member exists in the deployed nats-core 0.4.0; the router's
+        # step-1 gate requires event_type == COMMAND to route at all.
+        assert envelope.event_type is EventType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_envelope_correlation_id_is_the_attempt_key(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        key = "ab" * 16
+        await adapter.publish_dispatch(_make_attempt(correlation_key=key), [])
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        # D2: the deployed router demuxes replies by the BODY correlation
+        # value, so it MUST live on the envelope (not only in headers).
+        assert envelope.correlation_id == key
+
+    @pytest.mark.asyncio
+    async def test_payload_is_a_valid_command_payload(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        key = "cd" * 16
+        await adapter.publish_dispatch(_make_attempt(correlation_key=key), [])
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        command = CommandPayload.model_validate(envelope.payload)
+        # S1 is a pure envelope change: the command is still the placeholder
+        # verb (S2/M2 resolves the real deployed verb, e.g. "greenfield").
+        assert command.command == DISPATCH_COMMAND_PLACEHOLDER
+        assert len(command.command) >= 1  # CommandPayload min_length contract
+        # Correlation is also threaded onto the CommandPayload (the deployed
+        # router reads cmd_payload.correlation_id first, envelope second).
+        assert command.correlation_id == key
+
+    @pytest.mark.asyncio
+    async def test_headers_are_retained_for_tracing_only(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        # D2: headers may remain for tracing, but nothing in the parse-target
+        # depends on them — the envelope must be self-sufficient. We assert
+        # both: headers still present AND the body alone carries correlation.
+        key = "ef" * 16
+        await adapter.publish_dispatch(_make_attempt(correlation_key=key), [])
+        recorded = nats_client.published[-1]
+        assert recorded.headers is not None
+        assert recorded.headers[CORRELATION_KEY_HEADER] == key
+        envelope = MessageEnvelope.model_validate_json(recorded.body)
+        assert envelope.correlation_id == key
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,9 @@ import json
 import logging
 from typing import Any, Protocol
 
+from nats_core.envelope import EventType, MessageEnvelope
+from nats_core.events import CommandPayload
+
 from forge.discovery.protocol import Clock, SystemClock
 from forge.dispatch.correlation import CorrelationRegistry
 from forge.dispatch.models import DispatchAttempt
@@ -111,6 +114,16 @@ SOURCE_AGENT_HEADER: str = "source_agent_id"
 
 #: Fixed source identifier stamped on every dispatch command.
 REQUESTING_AGENT_ID: str = "forge"
+
+#: Placeholder command verb carried by the :class:`CommandPayload` until the
+#: specialist-verb resolution (M2) is wired in S2. S1 is a **pure envelope
+#: change** — it makes forge publish a structurally valid nats-core
+#: :class:`MessageEnvelope` that the deployed specialist can parse, but it does
+#: NOT yet resolve the Mode-P stage to a real deployed verb (``greenfield`` for
+#: the PO product_docs stage, per contract decision D1). Until S2 replaces it,
+#: the wire carries this sentinel so ``CommandPayload.command`` satisfies its
+#: ``min_length=1`` constraint; it deliberately does not route to a handler.
+DISPATCH_COMMAND_PLACEHOLDER: str = "dispatch"
 
 __all__ = [
     "COMMAND_SUBJECT_TEMPLATE",
@@ -398,21 +411,43 @@ class NatsSpecialistDispatchAdapter:
     ) -> None:
         """Publish the dispatch command on ``agents.command.{matched_agent_id}``.
 
-        The published message carries:
+        Wire format (M1 + M5-command fix, DISPATCHFMT+ S1). The deployed
+        specialist parses every inbound message through
+        :class:`nats_core.envelope.MessageEnvelope` in
+        ``client.subscribe_with_reply`` **before** the router callback runs;
+        a message that is not a valid envelope is logged and silently
+        dropped (never routed, never replied). Forge therefore publishes a
+        canonical nats-core envelope:
 
         * Subject: :func:`command_subject_for`
           (``agents.command.{matched_agent_id}``).
-        * Headers:
+        * Body: a :class:`nats_core.envelope.MessageEnvelope` JSON document with
 
-          * ``correlation_key`` — taken from ``attempt.correlation_key``.
-          * ``requesting_agent_id`` — fixed ``"forge"``.
-          * ``dispatched_at`` — ISO 8601 UTC timestamp at publish time.
+          * ``source_id`` — fixed ``"forge"`` (:data:`REQUESTING_AGENT_ID`);
+            the specialist reads reply source identity from this field.
+          * ``event_type`` — :attr:`EventType.COMMAND` (member exists in the
+            deployed nats-core 0.4.0; the router's step-1 gate requires it).
+          * ``correlation_id`` — ``attempt.correlation_key``; the deployed
+            router demuxes replies by the body correlation value, so it must
+            live on the envelope, not only in headers.
+          * ``payload`` — a :class:`nats_core.events.CommandPayload`
+            (``command`` / ``args`` / ``correlation_id``) as a plain dict.
+            ``command`` is :data:`DISPATCH_COMMAND_PLACEHOLDER` until the
+            verb-resolution fix (M2) lands in S2; ``args["parameters"]``
+            carries the (already-scrubbed-by-caller) parameter list verbatim.
+            Sensitive parameters carry ``value=None`` so the on-wire form
+            mirrors the persisted-row form, satisfying
+            ``E.sensitive-parameter-hygiene`` end-to-end.
 
-        * Payload: a JSON envelope describing the dispatch attempt and
-          the (already-scrubbed-by-caller) parameter list. Sensitive
-          parameters carry ``value=None`` so the on-wire form mirrors
-          the persisted-row form, satisfying
-          ``E.sensitive-parameter-hygiene`` end-to-end.
+        * Headers: ``correlation_key`` / ``requesting_agent_id`` /
+          ``dispatched_at`` are retained for **tracing only** — nothing in
+          the deployed parse-target depends on them (contract decision D2).
+
+        The forge-local dispatch bookkeeping (``resolution_id``,
+        ``attempt_no``, ``retry_of``, ``matched_agent_id``) is **not** put on
+        the wire: the specialist ignores it, ``matched_agent_id`` is already
+        the subject, and the reply is re-correlated from forge's own registry.
+        This keeps the minimal canonical CommandPayload wire shape.
 
         PubAck on the audit stream (when JetStream emits one) is logged
         at DEBUG only — it is **not** routed through
@@ -426,24 +461,30 @@ class NatsSpecialistDispatchAdapter:
             REQUESTING_AGENT_HEADER: REQUESTING_AGENT_ID,
             DISPATCHED_AT_HEADER: self._clock.now().isoformat(),
         }
-        payload = {
-            "resolution_id": attempt.resolution_id,
-            "correlation_key": attempt.correlation_key,
-            "matched_agent_id": attempt.matched_agent_id,
-            "attempt_no": attempt.attempt_no,
-            "retry_of": attempt.retry_of,
-            "parameters": [
-                {
-                    "name": parameter.name,
-                    # Sensitive scrub mirrors persistence: the value is
-                    # dropped on the wire too, not just at rest.
-                    "value": None if parameter.sensitive else parameter.value,
-                    "sensitive": parameter.sensitive,
-                }
-                for parameter in parameters
-            ],
-        }
-        body = json.dumps(payload).encode("utf-8")
+        command_payload = CommandPayload(
+            # Placeholder verb — S2 (M2) resolves the real deployed verb.
+            command=DISPATCH_COMMAND_PLACEHOLDER,
+            args={
+                "parameters": [
+                    {
+                        "name": parameter.name,
+                        # Sensitive scrub mirrors persistence: the value is
+                        # dropped on the wire too, not just at rest.
+                        "value": None if parameter.sensitive else parameter.value,
+                        "sensitive": parameter.sensitive,
+                    }
+                    for parameter in parameters
+                ],
+            },
+            correlation_id=attempt.correlation_key,
+        )
+        envelope = MessageEnvelope(
+            source_id=REQUESTING_AGENT_ID,
+            event_type=EventType.COMMAND,
+            correlation_id=attempt.correlation_key,
+            payload=command_payload.model_dump(),
+        )
+        body = envelope.model_dump_json().encode("utf-8")
 
         ack = await self._nc.publish(subject, body, headers=headers)
 
