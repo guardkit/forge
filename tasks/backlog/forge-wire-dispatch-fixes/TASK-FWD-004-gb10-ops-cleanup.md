@@ -32,3 +32,15 @@ The operator must perform these on the GB10, then mark complete via
 - **Rotate JARVIS_NATS_PASSWORD** (leaked in chat 2026-07-04):
   nats-infrastructure/.env on GB10 + docker compose restart nats +
   ~/.config/guardkit/jarvis.env + restart jarvis-serve-nats.
+  - ✅ **DONE 2026-07-11 (Session A)** — rotated + verified (new pw accepted, old rejected,
+    fleet reconverged). Founding secrets-register entry:
+    ai-transition `docs/secrets-register/PAGE-jarvis-nats-password.md`.
+
+## Completion note — Session A (2026-07-11)
+
+All three items satisfied: unit-disable ✅ (`forge-autobuild-runner` is `disabled`); rotation ✅
+(above); **attended-override revert = no-op** — state has drifted to the desired post-revert
+state (forge tree clean → no uncommitted `autobuild_runner.py` coach-model deletion to
+`git checkout`; no `Environment=GUARDKIT_HARNESS=sdk` on `forge-langgraph-sidecar`). If P2
+local-inference validation later needs `coach-ft-v3` wired, that is a P2-time config, not a
+revert of an uncommitted deletion. FWD-004 done.

@@ -78,3 +78,24 @@ task complete via `/task-complete`.
 - Runbook only (this file). No src changes. Findings recorded in
   `docs/state/TASK-MP-010/` with a dated deploy record (the D659 audit lesson:
   runtime re-pins need committed artifacts).
+
+## Reconciliation — Session A operator validation (2026-07-11, authoritative)
+
+The `reconciled` frontmatter above records the WS3-S8 sweep moving this task to `completed`
+by **feature-rollup** (FEAT-3ED2 status) — but the operator ACs had **never run**. Session A
+(attended Opus on the GB10) executed the real validation:
+
+- **AC-1 ✅** — `forge-serve-planning` durable bound; a REAL Slack-originated `PlanningQueuedPayload`
+  (via J04) consumed → `planning_runs` row (`523adb76`); PAUSED at `product_docs` + approval
+  request published/rendered to the phone.
+- **AC-3 ✅** — identity-pinned phone approval (`decided_by=U03QR8WKT29`) resumed the run.
+- **AC-4/AC-5 (terminal) ✗ — filed deploy gap:** the in-process `WorktreeGitRunner` failed
+  (`repo_path is not a directory`) — forge-prod lacks git + the target-repo mount →
+  **TASK-FWD-PLAN-GITMOUNT**.
+- **PO content degraded** — planning `fleet_watcher` NoneType('operation') loop → specialist
+  discovery empty → `no_specialist_resolvable` → **TASK-FWD-PLAN-FLEETWATCHER**.
+- AC-2/AC-6/AC-7 not run (lower value with the terminal gapped; Rich's call).
+
+**Status truth:** core loop validated to the terminal; MP-010 stays **effectively open** pending
+the two filed gaps — "live planning" / J05 unblock is gated on them. Full evidence:
+`docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md`.
