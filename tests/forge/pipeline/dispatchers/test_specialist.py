@@ -31,10 +31,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from nats_core.manifest import AgentManifest, IntentCapability, ToolCapability
 
+from forge.discovery import DiscoveryCacheEntry, resolve
 from forge.dispatch.models import (
     AsyncPending,
     Degraded,
@@ -45,6 +48,8 @@ from forge.dispatch.models import (
 from forge.dispatch.persistence import DispatchParameter
 from forge.pipeline.dispatchers.specialist import (
     SPECIALIST_CAPABILITY_BY_STAGE,
+    SPECIALIST_INTENT_BY_STAGE,
+    SPECIALIST_STAGES,
     SpecialistDispatchSurface,
     StageDispatchOutcome,
     StageDispatchResult,
@@ -803,3 +808,206 @@ class TestProtocolConformance:
         self, writer: RecordingStageLogWriter
     ) -> None:
         assert isinstance(writer, StageLogWriter)
+
+
+# ---------------------------------------------------------------------------
+# TASK-FWD-PLAN-PODISCO — intent-pattern fallback resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_entry(manifest: AgentManifest) -> DiscoveryCacheEntry:
+    """A ready, zero-queue cache entry wrapping ``manifest``.
+
+    Hand-built so the resolver runs against an in-memory snapshot with no
+    live NATS broker (the whole point of ``resolve`` being a pure function
+    of the snapshot).
+    """
+    ts = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+    return DiscoveryCacheEntry(
+        manifest=manifest,
+        last_heartbeat_at=ts,
+        last_heartbeat_status="ready",
+        last_queue_depth=0,
+        last_active_tasks=0,
+        cached_at=ts,
+    )
+
+
+def _tool(name: str) -> ToolCapability:
+    return ToolCapability(
+        name=name,
+        description=f"{name} tool",
+        parameters={"type": "object", "properties": {}},
+        returns="dict",
+        risk_level="read_only",
+    )
+
+
+def _intent(pattern: str, confidence: float = 0.95) -> IntentCapability:
+    # Mirrors the live agents: signals present but NOT consulted by the
+    # resolver's matcher — matching is on ``pattern`` + ``confidence`` only.
+    return IntentCapability(
+        pattern=pattern,
+        signals=[pattern.split(".")[0], "specialist"],
+        confidence=confidence,
+        description=f"intent {pattern}",
+    )
+
+
+def _agent(
+    agent_id: str,
+    *,
+    tools: list[ToolCapability] | None = None,
+    intents: list[IntentCapability] | None = None,
+) -> AgentManifest:
+    return AgentManifest(
+        agent_id=agent_id,
+        name=agent_id.title(),
+        version="0.1.0",
+        template="specialist-agent",
+        trust_tier="specialist",
+        status="ready",
+        max_concurrent=1,
+        tools=tools or [],
+        intents=intents or [],
+        required_permissions=[],
+    )
+
+
+class TestSpecialistIntentFallbackResolution:
+    """TASK-FWD-PLAN-PODISCO: specialist stages resolve via the intent
+    fallback when no agent advertises the exact tool the dispatcher asks
+    for — using forge's own exact-tool → intent-fallback algorithm.
+
+    These tests feed :func:`resolve` the *exact same* ``tool_name`` and
+    ``intent_pattern`` pair that :func:`dispatch_specialist_stage` threads
+    through the dispatch surface, so they assert the wired-up behaviour end
+    to end without touching a broker.
+    """
+
+    def test_intent_map_covers_every_specialist_stage(self) -> None:
+        # Guardrail: the intent map must not drift from the capability map.
+        assert set(SPECIALIST_INTENT_BY_STAGE) == set(SPECIALIST_STAGES)
+
+    def test_product_owner_resolves_via_intent_when_only_product_intent(
+        self,
+    ) -> None:
+        # Live reality: the product-owner-agent advertises ``po_*`` tools
+        # plus a ``product.*`` intent — and NO ``product_owner_specialist``
+        # tool. Model exactly that: the intent is the only handle.
+        po_agent = _agent(
+            "product-owner-agent",
+            tools=[_tool("po_idea"), _tool("po_greenfield"), _tool("po_scope")],
+            intents=[_intent("product.*", confidence=0.95)],
+        )
+        snapshot = {po_agent.agent_id: _resolve_entry(po_agent)}
+
+        agent_id, resolution = resolve(
+            snapshot,
+            tool_name=SPECIALIST_CAPABILITY_BY_STAGE[StageClass.PRODUCT_OWNER],
+            intent_pattern=SPECIALIST_INTENT_BY_STAGE[StageClass.PRODUCT_OWNER],
+        )
+
+        assert agent_id == "product-owner-agent"
+        assert resolution.match_source == "intent_pattern"
+        assert resolution.matched_agent_id == "product-owner-agent"
+        assert resolution.chosen_confidence == pytest.approx(0.95)
+
+    def test_architect_resolves_via_intent_when_only_architecture_intent(
+        self,
+    ) -> None:
+        arch_agent = _agent(
+            "architect-agent",
+            tools=[_tool("architect_design"), _tool("architect_review")],
+            intents=[_intent("architecture.*", confidence=0.95)],
+        )
+        snapshot = {arch_agent.agent_id: _resolve_entry(arch_agent)}
+
+        agent_id, resolution = resolve(
+            snapshot,
+            tool_name=SPECIALIST_CAPABILITY_BY_STAGE[StageClass.ARCHITECT],
+            intent_pattern=SPECIALIST_INTENT_BY_STAGE[StageClass.ARCHITECT],
+        )
+
+        assert agent_id == "architect-agent"
+        assert resolution.match_source == "intent_pattern"
+
+    def test_product_intent_below_floor_stays_unresolved(self) -> None:
+        # Confidence floor is real: a ``product.*`` intent under 0.70 must
+        # NOT resolve — proves the match is gated on confidence, not just
+        # the pattern.
+        weak = _agent(
+            "weak-po",
+            intents=[_intent("product.*", confidence=0.5)],
+        )
+        snapshot = {weak.agent_id: _resolve_entry(weak)}
+
+        agent_id, resolution = resolve(
+            snapshot,
+            tool_name=SPECIALIST_CAPABILITY_BY_STAGE[StageClass.PRODUCT_OWNER],
+            intent_pattern=SPECIALIST_INTENT_BY_STAGE[StageClass.PRODUCT_OWNER],
+        )
+
+        assert agent_id is None
+        assert resolution.match_source == "unresolved"
+
+    def test_tool_exact_still_wins_over_intent(self) -> None:
+        # If an agent ever DOES advertise the exact capability tool, the
+        # exact-tool step must win — the intent fallback is only reached
+        # when the tool step misses.
+        exact = _agent(
+            "future-po",
+            tools=[_tool(SPECIALIST_CAPABILITY_BY_STAGE[StageClass.PRODUCT_OWNER])],
+            intents=[_intent("product.*", confidence=0.95)],
+        )
+        snapshot = {exact.agent_id: _resolve_entry(exact)}
+
+        agent_id, resolution = resolve(
+            snapshot,
+            tool_name=SPECIALIST_CAPABILITY_BY_STAGE[StageClass.PRODUCT_OWNER],
+            intent_pattern=SPECIALIST_INTENT_BY_STAGE[StageClass.PRODUCT_OWNER],
+        )
+
+        assert agent_id == "future-po"
+        assert resolution.match_source == "tool_exact"
+        assert resolution.chosen_confidence == 1.0
+
+
+class TestSpecialistIntentThreading:
+    """TASK-FWD-PLAN-PODISCO: ``dispatch_specialist_stage`` threads the
+    stage's mapped intent pattern onto the dispatch surface call (which is
+    the ``DispatchOrchestrator`` in production, forwarding it into
+    :func:`resolve`)."""
+
+    @pytest.mark.parametrize(
+        ("stage", "expected_intent"),
+        [
+            (StageClass.PRODUCT_OWNER, "product.*"),
+            (StageClass.ARCHITECT, "architecture.*"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_intent_pattern_threaded_to_surface(
+        self,
+        builder: ForwardContextBuilder,
+        surface: RecordingDispatchSurface,
+        writer: RecordingStageLogWriter,
+        stage: StageClass,
+        expected_intent: str,
+    ) -> None:
+        surface.outcome = _sync_result()
+
+        await dispatch_specialist_stage(
+            stage=stage,
+            build_id=_BUILD_ID,
+            correlation_id=_CORRELATION_ID,
+            forward_context_builder=builder,
+            dispatch_surface=surface,
+            stage_log_writer=writer,
+        )
+
+        # The exact tool name stays the first-choice capability; the intent
+        # is the fallback threaded alongside it.
+        assert surface.last_call["capability"] == SPECIALIST_CAPABILITY_BY_STAGE[stage]
+        assert surface.last_call["intent_pattern"] == expected_intent
+        assert surface.last_call["intent_pattern"] == SPECIALIST_INTENT_BY_STAGE[stage]

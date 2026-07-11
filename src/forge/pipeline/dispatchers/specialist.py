@@ -95,6 +95,7 @@ from forge.pipeline.stage_taxonomy import StageClass
 
 __all__ = [
     "SPECIALIST_CAPABILITY_BY_STAGE",
+    "SPECIALIST_INTENT_BY_STAGE",
     "SPECIALIST_STAGES",
     "SpecialistDispatchSurface",
     "StageDispatchOutcome",
@@ -114,6 +115,34 @@ logger = logging.getLogger(__name__)
 SPECIALIST_CAPABILITY_BY_STAGE: dict[StageClass, str] = {
     StageClass.PRODUCT_OWNER: "product_owner_specialist",
     StageClass.ARCHITECT: "architect_specialist",
+}
+
+
+#: Intent-pattern fallbacks per specialist stage (TASK-FWD-PLAN-PODISCO).
+#:
+#: No live specialist agent advertises a *tool* named after
+#: :data:`SPECIALIST_CAPABILITY_BY_STAGE`, so ``resolve()``'s exact-tool step
+#: always misses for these stages. The live ``product-owner-agent`` instead
+#: advertises tools ``po_idea`` / ``po_greenfield`` / ``po_scope`` / ... plus
+#: an ``IntentCapability(pattern="product.*", confidence=0.95)``; the
+#: ``architect-agent`` advertises ``architect_*`` tools plus an
+#: ``IntentCapability(pattern="architecture.*", confidence=0.95)``. Passing
+#: these patterns lets forge's *own* exact-tool → intent-fallback algorithm
+#: (``forge.discovery.resolve.resolve`` step 2) resolve the stage.
+#:
+#: The value here is matched by ``resolve``'s intent step:
+#: ``_filter_intent_candidates`` → ``_matching_intent`` →
+#: ``_pattern_matches(intent.pattern, requested_pattern)``. Because we pass the
+#: agent's *own* advertised pattern string, ``_pattern_matches`` returns True on
+#: its exact-equality branch (``manifest_pattern == requested_pattern``) — it is
+#: a *pattern* match, not a signal or substring match (``signals`` are never
+#: consulted by the matcher). The agents' 0.95 confidence clears the 0.70
+#: ``min_confidence`` floor. The exact tool name is still passed first
+#: (see :func:`dispatch_specialist_stage`), so if an agent ever advertises the
+#: exact tool, ``tool_exact`` still wins and this fallback is never used.
+SPECIALIST_INTENT_BY_STAGE: dict[StageClass, str] = {
+    StageClass.PRODUCT_OWNER: "product.*",
+    StageClass.ARCHITECT: "architecture.*",
 }
 
 
@@ -396,6 +425,12 @@ async def dispatch_specialist_stage(
         )
 
     capability = SPECIALIST_CAPABILITY_BY_STAGE[stage]
+    # Intent-pattern fallback (TASK-FWD-PLAN-PODISCO). The exact tool name
+    # above stays the first-choice; this intent is what the resolver falls
+    # back to when no agent advertises that tool — which is the live reality
+    # for both specialist stages. ``None`` for a stage without a mapped
+    # intent leaves resolution on the exact-tool path only.
+    intent_pattern = SPECIALIST_INTENT_BY_STAGE.get(stage)
 
     # Step 2 — build forward-propagated context. The builder owns the
     # approved-only and worktree-allowlist filtering (TASK-MAG7-006);
@@ -444,6 +479,7 @@ async def dispatch_specialist_stage(
         parameters=parameters,
         attempt_no=attempt_no,
         retry_of=retry_of,
+        intent_pattern=intent_pattern,
         build_id=build_id,
         stage_label=stage.value,
     )
