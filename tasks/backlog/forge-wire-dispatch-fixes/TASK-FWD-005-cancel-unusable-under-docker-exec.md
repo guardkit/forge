@@ -28,20 +28,47 @@ two independent ways:
    under `docker exec` (no utmp/loginuid; `-t` does not help), and there is no
    `--responder` flag to bypass it.
 
-Net: for a QUEUED build there is NO working in-container cancel. (For a PAUSED-at-gate
-build the `try_inject_paused_cancel` synthetic-reject path avoids `os.getlogin()` and
-works — the crash only hits the fallback.)
+3. **`SYNTHETIC_RESPONDER='rich'` vs the identity-pinned gate (the deepest one —
+   observed live 20:44:55Z).** For a PAUSED-at-gate build, `try_inject_paused_cancel`
+   avoids `os.getlogin()` but publishes the reject with the hardcoded constant
+   `SYNTHETIC_RESPONDER = "rich"` (`synthetic_response_injector.py:89`). A gate
+   deployed with `expected_approver` (forge-prod pins `U03QR8WKT29`) REJECTS it:
+   `approval_subscriber: unrecognised responder 'rich' (expected 'U03QR8WKT29') —
+   anomaly, NOT resuming`. The build stays PAUSED. **Worse, the CLI reports
+   success** ("synthetic reject injected") — a false-positive cancel: fire-and-forget
+   publish with no confirmation the daemon accepted it.
 
-## Workaround (validated, JNB-009)
+Net: against an identity-pinned gate there is NO working `forge cancel` at all —
+in-container OR host-side — for either QUEUED or PAUSED builds.
 
-Run cancel HOST-side against the bind-mounted live db (host `os.getlogin()` works):
+## Workaround (validated live on FEAT-3CC2, 2026-07-11 21:46 BST)
+
+Host-side, patch the responder to the pinned approver and drive the CLI's own
+injector (the Session-A synthetic identity-pinned response pattern):
 
 ```
-set -a; . ~/.config/forge/nats.env; set +a   # FORGE_NATS_URL for the synthetic-reject one-shot publish
-~/Projects/appmilla_github/forge/.venv/bin/forge cancel <FEAT-ID> \
-  --db /home/richardwoollcott/forge-prod-state/.forge/forge.db \
-  --reason "<why>"
+set -a; . ~/.config/forge/nats.env; set +a   # FORGE_NATS_URL for the one-shot publish
+cd ~/Projects/appmilla_github/forge && .venv/bin/python - <<'EOF'
+import asyncio, os, sqlite3
+import forge.adapters.nats.synthetic_response_injector as sri
+from forge.gating.identity import parse_request_id
+sri.SYNTHETIC_RESPONDER = "U03QR8WKT29"        # the pinned approver of record
+build_id, req_id, corr = ...                    # from the LIVE db: ~/forge-prod-state/.forge/forge.db
+_b, stage, attempt = parse_request_id(req_id)
+async def go():
+    import nats
+    nc = await nats.connect(servers=os.environ["FORGE_NATS_URL"])
+    try:
+        await sri.SyntheticResponseInjector(nats_client=nc).inject_cli_cancel(
+            build_id=build_id, stage_label=stage, attempt_count=attempt, correlation_id=corr)
+        await nc.flush()
+    finally: await nc.close()
+asyncio.run(go())
+EOF
 ```
+
+Result on FEAT-3CC2: gate decided CANCELLED, slot acked, nothing launched,
+`build-cancelled` terminal notification delivered (`Cancelled by: U03QR8WKT29`).
 
 ## Acceptance criteria
 
@@ -49,6 +76,11 @@ set -a; . ~/.config/forge/nats.env; set +a   # FORGE_NATS_URL for the synthetic-
   replace `os.getlogin()` with a fallback chain (e.g. `--responder` flag →
   `$FORGE_RESPONDER`/`$USER`/`getpass.getuser()` → `os.getlogin()` last), never an
   unhandled OSError.
+- The paused-path synthetic reject satisfies an identity-pinned gate: the responder
+  identity comes from config/flag (default = the gate's `expected_approver`), not the
+  hardcoded `SYNTHETIC_RESPONDER='rich'`; and the CLI must not report success on a
+  fire-and-forget publish the daemon then rejects (await the state transition or say
+  "injected, unconfirmed").
 - The wrong-db footgun is removed or fenced: either the container stops shipping a
   reachable stale `/var/forge/forge.db`, or `forge cancel` warns when the db it was
   given belongs to no running daemon (e.g. boot-log path mismatch), or `--db` gains
