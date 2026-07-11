@@ -101,3 +101,36 @@ items satisfied.
 *Written 2026-07-11 by the attended Opus Session A. Rotation + J04 fully green; MP-010 core loop
 validated with two forge gaps filed; JNB-009 live build-probes deferred (pytest matrix 122/122
 green). Cross-refs: nats-infrastructure `399c494`, ai-transition `d63942d` + exec-plan §8.*
+
+---
+
+## Follow-up addendum (2026-07-11) — the two gaps FIXED + deployed + terminal re-validated
+
+Per Rich's "proceed with the followups" (orchestrated-build playbook), the two filed gaps ran as
+a background Workflow (`wf_8e66c248-449`, 2 coach-gated stages, both passed) + a coordinator
+review/deploy/re-validation:
+
+- **Fix (reviewed + pushed):** the fleet_watcher crash was root-caused NOT to forge but to
+  **`nats_core.client.watch_fleet`** (the nats-py KV `_init_done` None sentinel) — guarded
+  `if entry is None: continue` (**nats-core `1dc6cef`** + regression test; forge `c2210db`
+  composed-watcher regression test). **git added to the forge runtime image** (forge `319a800`;
+  FEAT-FORGE-008 equivalence contract confirmed unaffected — it covers `pip install .[providers]`
+  + the buildx invocation, not the apt list). Tests re-verified (50 forge + the nats-core suite).
+- **Deploy (coordinator, GB10, Ack-0 gated + backups + rollback tag):** rebuilt
+  `forge:latest`=`0173e59a` (carries the fixed nats-core via `--build-context`), added the
+  **api_test rw mount** + a **git author identity** (`GIT_*` compose env — a 3rd sub-gap: the
+  container's `forge` user had no identity → `git commit` "Author identity unknown") to
+  `~/forge-prod/docker-compose.yml`, recreated forge-prod (rollback `forge:rollback-pre-gitmount-20260711`).
+- **Re-validation (synthetic inject + synthetic identity-pinned approve — no phone):**
+  - **TASK-FWD-PLAN-GITMOUNT ✅ FULLY VALIDATED** — run reached **`PLANNED_HANDOFF`**,
+    `handoff_branch=planning/{cid}` + `feature_spec_inputs/{cid}.md` committed in api_test
+    (`0ab1f62`), `error=None`. The exact prior failure (`repo_path is not a directory`) is gone.
+  - **TASK-FWD-PLAN-FLEETWATCHER — crash FIXED** (0 error loops, was ~1/s), watcher reads the
+    correct `agent-registry` KV; **but PO still degrades** → a DISTINCT capability-name mismatch
+    filed as **TASK-FWD-PLAN-PODISCO** (forge asks `tool_exact` for `product_owner_specialist`;
+    the PO agent advertises `po_*` tools + a `product.*` intent — no exact tool match).
+- **State:** planning reverted to `enabled:false` (Mode P produces degraded plan content until
+  PODISCO lands; the INFRA — durable, dispatch, pause, identity-pinned approval, git terminal —
+  all work). forge-prod left healthy on the new image; planning durable deleted; api_test test
+  branches removed. **J05 / live-planning: the terminal + crash gaps are cleared; PODISCO (plan
+  content) is the remaining Mode-P-quality gap.** Full ai-transition record: exec-plan §8.*

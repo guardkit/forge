@@ -45,7 +45,18 @@ manifesting on the live deploy.
   resolves `product_owner_specialist` (no `no_specialist_resolvable`), and the PO stage produces a
   real (non-degraded) product-owner document.
 
+## Resolution — CRASH FIXED (2026-07-11 Session-A follow-up), PO-resolution moved to TASK-FWD-PLAN-PODISCO
+
+The `'NoneType' … 'operation'` crash is **fixed + deployed**: root-caused to
+`nats_core.client.watch_fleet` (the nats-py KV `_init_done` None sentinel), guarded with
+`if entry is None: continue` (**nats-core `1dc6cef`** + regression test; forge `c2210db` composed
+regression test). Verified live on the rebuilt image: **0 fleet_watcher error loops** (was ~1/s);
+the watcher runs clean and reads the correct `agent-registry` KV. **BUT PO still degrades** — a
+DISTINCT capability-name mismatch (forge asks `tool_exact` for `product_owner_specialist`; the PO
+agent advertises `po_*` tools + a `product.*` intent) → filed as **TASK-FWD-PLAN-PODISCO**. This
+task's named crash is done; the "PO resolves" AC is carried by PODISCO.
+
 ## Notes
 - Pairs with TASK-FWD-PLAN-GITMOUNT — both gate Mode P production-readiness (degraded plan content
   vs failed terminal). Planning-only (does not affect build dispatch). Evidence:
-  `docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md` addendum 3.
+  `docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md` addendum 3 + follow-up.

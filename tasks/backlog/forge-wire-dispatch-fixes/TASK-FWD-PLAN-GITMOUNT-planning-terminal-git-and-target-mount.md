@@ -41,7 +41,21 @@ Contrast: autobuild BUILDS work because they delegate to the host `forge-langgra
   writes `planning/{cid}` + `feature_spec_inputs/{cid}.md` in the target repo, notification
   carries the exact `/feature-spec` command; kill-NATS-mid-pause recovery completes.
 
+## Resolution — FIXED + VALIDATED end-to-end (2026-07-11 Session-A follow-up)
+
+Chose option (a): `git` added to the forge runtime image (**forge `319a800`**), api_test
+bind-mounted rw into forge-prod (compose), and — a 3rd sub-gap the re-validation surfaced — a
+**git author identity** set for the `forge` user (`GIT_AUTHOR_*`/`GIT_COMMITTER_*` compose env;
+the container's `forge` user had none → `git commit` failed "Author identity unknown"). Image
+rebuilt (`build-image.sh` → `forge:latest` = `0173e59a`, carries the fixed nats-core via
+`--build-context`), forge-prod recreated (rollback `forge:rollback-pre-gitmount-20260711`).
+**Verified live end-to-end:** a synthetic planning run → dispatch → pause → synthetic approve →
+resume → **`state=PLANNED_HANDOFF`**, `handoff_branch=planning/{cid}` + `handoff_path=…/api_test/
+feature_spec_inputs/{cid}.md`, committed (`0ab1f62`), `error=None` — the exact "repo_path is not a
+directory" failure is gone. **Robustness follow-up:** the `WorktreeGitRunner` should set its own
+git identity (`git -c user.*`) so it never depends on ambient env.
+
 ## Notes
-- Gates the "live planning" half of Session A's unblock (J05 / live planning). Pairs with
-  TASK-FWD-PLAN-FLEETWATCHER (degraded PO content) — both must land before Mode P is
-  production-ready. Evidence: `docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md`.
+- The terminal now works regardless of PO content quality (a degraded run still reaches
+  PLANNED_HANDOFF). The remaining Mode-P-quality gap is TASK-FWD-PLAN-PODISCO (PO resolution).
+  Evidence: `docs/state/TASK-MP-010/deploy-verification-2026-07-11-session-a.md` (follow-up addendum).
