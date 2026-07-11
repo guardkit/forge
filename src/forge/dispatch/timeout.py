@@ -242,7 +242,17 @@ class TimeoutCoordinator:
             try:
                 async with asyncio.timeout(interim):
                     payload = await self._registry.wait_for_reply(binding)
-                return payload
+                if payload is not None:
+                    return payload
+                # ``None`` WITHOUT TimeoutError: the registry absorbed the
+                # leg's cancellation (CorrelationRegistry.wait_for_reply
+                # swallows CancelledError as its release-during-wait
+                # semantic) or had no future to wait on. ``None`` is never
+                # an authentic reply payload — treat it exactly like an
+                # expired interim leg, or the whole budget silently
+                # collapses to the interim (observed live 2026-07-11:
+                # dispatch.local_timeout at 60s on a healthy in-flight
+                # specialist run).
             except TimeoutError:
                 # asyncio.timeout raises TimeoutError (Python 3.11+; the
                 # older asyncio.TimeoutError is now an alias). No reply
@@ -270,7 +280,9 @@ class TimeoutCoordinator:
                 try:
                     async with asyncio.timeout(remainder):
                         payload = await self._registry.wait_for_reply(binding)
-                    return payload
+                    if payload is not None:
+                        return payload
+                    # Same ``None``-is-not-a-reply rule as the interim leg.
                 except TimeoutError:
                     pass
 

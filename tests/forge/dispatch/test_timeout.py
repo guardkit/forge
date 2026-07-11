@@ -603,3 +603,88 @@ class TestNoReplyDiagnostics:
             "hard cut-off" in r.getMessage() for r in caplog.records
         )
         assert registry.release_calls == ["klate"]
+
+
+# ---------------------------------------------------------------------------
+# Live regression 2026-07-11 (Mode-P DISPATCHFMT Sfinal): the production
+# CorrelationRegistry.wait_for_reply swallows CancelledError and returns
+# ``None`` (its release-during-wait semantic, correlation.py). When the
+# interim leg's ``asyncio.timeout`` cancelled that await, the swallow meant
+# no TimeoutError ever reached the coordinator — the interim leg returned
+# ``None`` as if it were the reply, silently collapsing the 900s budget to
+# the 60s interim (observed live: ``dispatch.local_timeout`` at exactly 60s
+# while the specialist's greenfield session was still healthily running).
+# ``None`` is never an authentic reply payload; the coordinator must treat
+# it as "no reply yet" on both legs.
+# ---------------------------------------------------------------------------
+
+
+class CancelSwallowingRegistry(FakeRegistry):
+    """Production-faithful fake: cancellation comes back as ``None``.
+
+    Mirrors ``CorrelationRegistry.wait_for_reply``'s
+    ``except asyncio.CancelledError: return None`` clause — the exact
+    behaviour the S5-era FakeRegistry (which lets CancelledError
+    propagate) could not exhibit.
+    """
+
+    async def wait_for_reply(self, binding: FakeBinding) -> Optional[dict]:
+        try:
+            return await asyncio.shield(binding._future)
+        except asyncio.CancelledError:
+            return None
+
+
+class TestCancelSwallowingRegistryBudget:
+    """The full budget must survive a registry that swallows cancellation."""
+
+    @pytest.mark.asyncio
+    async def test_reply_after_interim_is_returned_not_none(self) -> None:
+        # The live-bug shape: reply lands AFTER the interim, well before
+        # the cut-off. Pre-fix this returned None at the interim.
+        registry = CancelSwallowingRegistry()
+        binding = registry.bind(
+            FakeBinding(correlation_key="kswallow", matched_agent_id="po")
+        )
+        coord = TimeoutCoordinator(
+            registry,
+            FakeClock(),
+            default_timeout_seconds=0.30,
+            interim_warn_seconds=0.02,
+        )
+
+        async def deliver() -> None:
+            await asyncio.sleep(0.08)
+            if not binding._future.done():
+                binding._future.set_result({"ok": True})
+
+        deliver_task = asyncio.create_task(deliver())
+        result = await coord.wait_with_timeout(binding)
+        await deliver_task
+
+        assert result == {"ok": True}
+        assert registry.release_calls == ["kswallow"]
+
+    @pytest.mark.asyncio
+    async def test_no_reply_times_out_at_full_budget_not_interim(self) -> None:
+        # With no reply at all, None must arrive only at the FULL budget.
+        registry = CancelSwallowingRegistry()
+        binding = registry.bind(
+            FakeBinding(correlation_key="kswallow2", matched_agent_id="po")
+        )
+        coord = TimeoutCoordinator(
+            registry,
+            FakeClock(),
+            default_timeout_seconds=0.25,
+            interim_warn_seconds=0.02,
+        )
+
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        result = await coord.wait_with_timeout(binding)
+        elapsed = loop.time() - started
+
+        assert result is None
+        # Pre-fix the swallow collapsed this to ~interim (0.02s).
+        assert elapsed >= 0.20
+        assert registry.release_calls == ["kswallow2"]
