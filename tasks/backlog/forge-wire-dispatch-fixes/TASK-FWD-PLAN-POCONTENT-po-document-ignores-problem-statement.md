@@ -115,3 +115,18 @@ runs produced structurally-valid PO documents whose CONTENT ignored the request:
   greenfield-aware (currently inert on empty manifest).
 - Live re-validation of content quality rides the planning-activation run
   (jarvis env + planning.enabled:true), queued behind the JNB-009 claim.
+
+## Correction (2026-07-11 late — retarget REVERTED)
+
+The architect-agent retarget FAILED in the live session: the A/B replay was a raw
+completion, but the session's tool-bound langchain path + architect-agent's
+gemma4-thinking chat template produced unparseable output — `OutputParseError: No
+valid JSON found in Player output` on turn 1, then ~10-min client-canceled retries
+(run dfmt3, written off; it also exposed TASK-FWD-PLAN-M12). **Alias reverted to
+qwen36-workhorse** (2nd backup `config.yaml.bak-20260711-po-alias-retarget` +
+in-file comment), which completes the loop reliably (dfmt2 8m17s, dfmt4 18m30s —
+both parsed, checkpoint + handoff green; dfmt4 approved from Rich's REAL phone).
+Methodology lesson for the AC: any model A/B for this seam must replay the
+TOOL-BOUND session path, not a raw completion. Content quality remains the
+specialist-side fix list above (unchanged, queued behind FEAT-DF12); the dfmt4 doc
+was again off-topic with fabricated citations, consistent with the diagnosis.
