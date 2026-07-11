@@ -367,6 +367,16 @@ class TestHealthcheckDirective:
             r"apt-get[^\n]*install[^\n]*\bcurl\b", runtime_body
         ), "Runtime stage must apt-install curl for HEALTHCHECK"
 
+    def test_git_installed_in_runtime_stage(self, dockerfile_text: str) -> None:
+        # ``git`` is not in python:3.14-slim-bookworm by default; the Mode P
+        # planning PLANNED-HANDOFF terminal runs ``WorktreeGitRunner``
+        # in-process (``git worktree add``), so the runtime stage must
+        # apt-install git (TASK-FWD-PLAN-GITMOUNT option (a)).
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(
+            r"apt-get[^\n]*install[^\n]*\bgit\b", runtime_body
+        ), "Runtime stage must apt-install git for the Mode P planning handoff"
+
 
 class TestPortContract:
     """AC: ENV FORGE_HEALTHZ_PORT=8080 + EXPOSE 8080 (and only 8080)."""

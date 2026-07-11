@@ -118,9 +118,11 @@ RUN pip install .[providers]
 # Stage 2: runtime
 #
 # Minimal surface: copy the resolved venv from the builder stage, add
-# curl for the HEALTHCHECK probe, and run as the unprivileged
-# ``forge`` user. No package install beyond curl, no SSH, no debugger,
-# no secrets.
+# curl for the HEALTHCHECK probe and git for the Mode P planning
+# PLANNED-HANDOFF terminal (in-process ``WorktreeGitRunner`` shells out
+# to ``git worktree add``; TASK-FWD-PLAN-GITMOUNT), and run as the
+# unprivileged ``forge`` user. No package install beyond curl and git,
+# no SSH, no debugger, no secrets.
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS runtime
 
@@ -145,13 +147,15 @@ ENV FORGE_HEALTHZ_PORT=8080
 # backslash splitting the literal across lines.
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# curl is required by HEALTHCHECK and is NOT in the slim-bookworm
-# base. Install with ``--no-install-recommends`` to keep the layer
-# small and ``rm -rf /var/lib/apt/lists/*`` to drop the apt cache.
-# This is the only package added to the runtime stage; gcc and
-# build-essential live exclusively in the discarded builder stage.
+# curl is required by HEALTHCHECK and git by the Mode P planning
+# PLANNED-HANDOFF terminal (in-process ``WorktreeGitRunner``); neither
+# is in the slim-bookworm base. Install with ``--no-install-recommends``
+# to keep the layer small and ``rm -rf /var/lib/apt/lists/*`` to drop
+# the apt cache. These are the only packages added to the runtime
+# stage; gcc and build-essential live exclusively in the discarded
+# builder stage.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl \
+    && apt-get install --yes --no-install-recommends curl git \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
