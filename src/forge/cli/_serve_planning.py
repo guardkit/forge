@@ -561,6 +561,15 @@ async def compose_planning_consumer_and_dispatch(
         timeout_coordinator = TimeoutCoordinator(
             registry=_RegistryWaitAdapter(registry),
             clock=SystemClock(),
+            # Planning-only override of the ASSUM-003 900s dispatch ceiling
+            # (Mode B compositions keep the default). A REAL product-owner
+            # greenfield session measured ~50-70 min of agentic turns on the
+            # estate workhorse (Mode-P DISPATCHFMT Sfinal, 2026-07-11) —
+            # 900s degrades every healthy planning dispatch. 3600s matches
+            # the planning durable's ack_wait and the originator checkpoint
+            # wait; a longer stage is a specialist-latency problem, not a
+            # dispatch-budget one.
+            default_timeout_seconds=3600.0,
         )
         history_writer = SqliteHistoryWriter(pool)
         orchestrator = DispatchOrchestrator(
