@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,7 +41,11 @@ from typing import Any, Optional
 import pytest
 
 from forge.discovery.protocol import Clock
-from forge.dispatch.timeout import DEFAULT_TIMEOUT_SECONDS, TimeoutCoordinator
+from forge.dispatch.timeout import (
+    DEFAULT_TIMEOUT_SECONDS,
+    INTERIM_WARN_SECONDS,
+    TimeoutCoordinator,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +76,8 @@ class FakeClock:
 class FakeBinding:
     """Test double for ``CorrelationBinding``.
 
-    The coordinator only reads ``correlation_key``; the ``_future``
+    The coordinator reads ``correlation_key`` and ``matched_agent_id``
+    (the latter for the M8 no-reply diagnostics); the ``_future``
     attribute is plumbed by :class:`FakeRegistry.wait_for_reply` so
     tests can settle the reply at a deterministic point on the
     asyncio event loop.
@@ -105,11 +111,14 @@ class FakeRegistry:
         return binding
 
     async def wait_for_reply(self, binding: FakeBinding) -> Optional[dict]:
-        # Mirrors the production contract: await the per-binding Future.
-        # If the coordinator's hard cut-off fires, this coroutine is
-        # cancelled by asyncio.timeout, the CancelledError propagates
-        # out, and asyncio.timeout converts it to TimeoutError.
-        return await binding._future
+        # Mirrors the production contract (CorrelationRegistry): await the
+        # per-binding Future under ``asyncio.shield`` so a cancellation of
+        # THIS await (e.g. the coordinator's interim leg firing) does not
+        # cancel the underlying Future — a later re-await still surfaces
+        # the reply. If the coordinator's hard cut-off fires, the
+        # CancelledError propagates out and asyncio.timeout converts it to
+        # TimeoutError; ``release`` then cancels the Future for real.
+        return await asyncio.shield(binding._future)
 
     def release(self, binding: FakeBinding) -> None:
         # Idempotent: late replies on the same key are silently dropped.
@@ -465,3 +474,132 @@ class TestNoAsyncioSleepForTheTimeout:
         # though the task was cancelled mid-wait.
         assert registry.release_calls == ["kc"]
         assert "kc" not in registry.bindings
+
+
+# ---------------------------------------------------------------------------
+# M8: pointed no-reply diagnostics (OBSERVABILITY ONLY — no semantic change)
+# ---------------------------------------------------------------------------
+
+
+class TestNoReplyDiagnostics:
+    """M8: the interim warn + degrade log name the awaited seam.
+
+    A silent no-reply used to look identical to a slow-but-alive run
+    until the hard cut-off fired. These tests pin the *content* of the
+    two diagnostic log lines — subject / correlation_key / agent id /
+    elapsed — without changing any dispatch outcome.
+    """
+
+    def test_default_interim_warn_is_60_seconds(self) -> None:
+        assert INTERIM_WARN_SECONDS == 60.0
+        coord = TimeoutCoordinator(FakeRegistry(), FakeClock())
+        assert coord.interim_warn_seconds == 60.0
+
+    def test_constructor_rejects_non_positive_interim(self) -> None:
+        with pytest.raises(ValueError):
+            TimeoutCoordinator(
+                FakeRegistry(), FakeClock(), interim_warn_seconds=0.0,
+            )
+        with pytest.raises(ValueError):
+            TimeoutCoordinator(
+                FakeRegistry(), FakeClock(), interim_warn_seconds=-1.0,
+            )
+
+    @pytest.mark.asyncio
+    async def test_interim_warn_names_the_awaited_seam(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # interim (0.02) < hard cut-off (0.10): with no reply the
+        # coordinator emits the interim "still awaiting" warn naming the
+        # subject / correlation / agent / elapsed, then the degrade log.
+        registry = FakeRegistry()
+        binding = registry.bind(
+            FakeBinding(correlation_key="kwarn", matched_agent_id="po-agent"),
+        )
+        coord = TimeoutCoordinator(
+            registry, FakeClock(), interim_warn_seconds=0.02,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="forge.dispatch.timeout"):
+            result = await coord.wait_with_timeout(
+                binding, timeout_seconds=0.10,
+            )
+
+        assert result is None
+        interim_records = [
+            r for r in caplog.records if "still" in r.getMessage()
+        ]
+        assert len(interim_records) == 1
+        interim_msg = interim_records[0].getMessage()
+        assert interim_records[0].levelno == logging.WARNING
+        # The interim warn names the awaited reply subject, correlation
+        # key, agent id, and the elapsed interim.
+        assert "agents.result.po-agent" in interim_msg
+        assert "kwarn" in interim_msg
+        assert "po-agent" in interim_msg
+        assert "elapsed_seconds=0.020" in interim_msg
+        assert registry.release_calls == ["kwarn"]
+
+    @pytest.mark.asyncio
+    async def test_degrade_log_names_subject_and_correlation(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Short budget (no remainder leg): the single hard-cut-off degrade
+        # log must still NAME the subject + correlation it was awaiting.
+        registry = FakeRegistry()
+        binding = registry.bind(
+            FakeBinding(correlation_key="kcut", matched_agent_id="arch-agent"),
+        )
+        coord = TimeoutCoordinator(registry, FakeClock())
+
+        with caplog.at_level(logging.WARNING, logger="forge.dispatch.timeout"):
+            result = await coord.wait_with_timeout(
+                binding, timeout_seconds=0.02,
+            )
+
+        assert result is None
+        degrade_records = [
+            r for r in caplog.records if "hard cut-off" in r.getMessage()
+        ]
+        assert len(degrade_records) == 1
+        degrade_msg = degrade_records[0].getMessage()
+        assert degrade_records[0].levelno == logging.WARNING
+        assert "agents.result.arch-agent" in degrade_msg
+        assert "kcut" in degrade_msg
+        assert "arch-agent" in degrade_msg
+        # No interim leg fired (interim == whole budget here).
+        assert not any("still" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_reply_after_interim_is_still_accepted(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The interim warn does NOT shorten the cut-off: a reply that
+        # lands AFTER the interim but before the hard cut-off is still
+        # returned to the caller, and no degrade log is emitted.
+        registry = FakeRegistry()
+        binding = registry.bind(FakeBinding(correlation_key="klate"))
+        coord = TimeoutCoordinator(
+            registry, FakeClock(), interim_warn_seconds=0.02,
+        )
+
+        async def deliver() -> None:
+            # After the 0.02 interim, comfortably before the 0.30 cut-off.
+            await asyncio.sleep(0.08)
+            if not binding._future.done():
+                binding._future.set_result({"ok": True})
+
+        deliver_task = asyncio.create_task(deliver())
+        with caplog.at_level(logging.WARNING, logger="forge.dispatch.timeout"):
+            result = await coord.wait_with_timeout(
+                binding, timeout_seconds=0.30,
+            )
+        await deliver_task
+
+        assert result == {"ok": True}
+        # Interim warn fired (proving we crossed it) but NO degrade log.
+        assert any("still" in r.getMessage() for r in caplog.records)
+        assert not any(
+            "hard cut-off" in r.getMessage() for r in caplog.records
+        )
+        assert registry.release_calls == ["klate"]

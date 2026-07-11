@@ -74,18 +74,37 @@ logger = logging.getLogger(__name__)
 # Hard local cut-off for one dispatch attempt, in seconds. ASSUM-003.
 DEFAULT_TIMEOUT_SECONDS: float = 900.0
 
+# Interim "still waiting" diagnostic point, in seconds. Purely an
+# OBSERVABILITY seam (M8): a real PO/architect run takes minutes of LLM
+# time, so a silent dispatch used to look identical to a hung one until
+# the 900s cut-off fired. At this interim we emit a pointed warn naming
+# the awaited subject / correlation / agent so an on-call reader can tell
+# "slow but alive" from "nothing coming". This does NOT shorten the hard
+# cut-off — the wait continues to the full ``DEFAULT_TIMEOUT_SECONDS``.
+INTERIM_WARN_SECONDS: float = 60.0
+
+# Diagnostic mirror of the reply subject the registry is awaiting on:
+# nats-core ``Topics.Agents.RESULT`` == the adapter's
+# ``RESULT_SUBJECT_TEMPLATE`` (``agents.result.{agent_id}``, 3-token, D2).
+# Held here as a LOCAL format string — used only to compose human log
+# lines — so the pure dispatch domain stays free of transport imports
+# (the same layering discipline :mod:`forge.dispatch.correlation` keeps).
+_RESULT_SUBJECT_FMT: str = "agents.result.{agent_id}"
+
 
 @runtime_checkable
 class _BindingLike(Protocol):
     """Structural surface of a correlation binding the coordinator touches.
 
-    Only ``correlation_key`` is read by the coordinator (for the audit
-    log line on timeout). Both the production
+    The coordinator reads ``correlation_key`` and ``matched_agent_id``
+    for the pointed no-reply diagnostics (M8) — the awaited reply subject
+    is derived from the agent id. Both the production
     :class:`~forge.dispatch.correlation.CorrelationBinding` and any
     test double satisfy this protocol structurally.
     """
 
     correlation_key: str
+    matched_agent_id: str
 
 
 @runtime_checkable
@@ -126,20 +145,32 @@ class TimeoutCoordinator:
         registry: _RegistryLike,
         clock: Clock,
         default_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        interim_warn_seconds: float = INTERIM_WARN_SECONDS,
     ) -> None:
         if default_timeout_seconds <= 0:
             raise ValueError(
                 "default_timeout_seconds must be strictly positive, "
                 f"got {default_timeout_seconds!r}",
             )
+        if interim_warn_seconds <= 0:
+            raise ValueError(
+                "interim_warn_seconds must be strictly positive, "
+                f"got {interim_warn_seconds!r}",
+            )
         self._registry = registry
         self._clock = clock
         self._default_timeout_seconds = float(default_timeout_seconds)
+        self._interim_warn_seconds = float(interim_warn_seconds)
 
     @property
     def default_timeout_seconds(self) -> float:
         """Default hard cut-off in seconds (ASSUM-003 → 900.0)."""
         return self._default_timeout_seconds
+
+    @property
+    def interim_warn_seconds(self) -> float:
+        """Interim no-reply diagnostic point in seconds (M8 → 60.0)."""
+        return self._interim_warn_seconds
 
     async def wait_with_timeout(
         self,
@@ -188,24 +219,78 @@ class TimeoutCoordinator:
         # use the Clock as the timer source — asyncio.timeout owns that.
         started_at: datetime = self._clock.now()
 
+        # Awaited reply subject, derived from the agent id on the binding
+        # (M8 diagnostics only — see ``_RESULT_SUBJECT_FMT``).
+        awaited_subject: str = _RESULT_SUBJECT_FMT.format(
+            agent_id=binding.matched_agent_id,
+        )
+
+        # Split the single hard budget into an interim leg + a remainder
+        # leg PURELY so we can emit a pointed "still waiting" warn at the
+        # interim without shortening the cut-off: interim + remainder ==
+        # effective, and the reply is awaited continuously across both.
+        # No ``asyncio.sleep`` is used — each leg is bounded by its own
+        # ``asyncio.timeout`` so cancellation semantics are unchanged
+        # (AC-008). When the interim would meet or exceed the whole
+        # budget (short per-call timeouts), there is no interim leg and
+        # the behaviour is identical to a single ``asyncio.timeout``.
+        interim: float = min(self._interim_warn_seconds, effective)
+        remainder: float = effective - interim
+
         try:
+            # --- interim leg: wait up to the interim for a reply. ---
             try:
-                async with asyncio.timeout(effective):
+                async with asyncio.timeout(interim):
                     payload = await self._registry.wait_for_reply(binding)
                 return payload
             except TimeoutError:
-                # asyncio.timeout raises TimeoutError (Python 3.11+).
-                # Older asyncio.TimeoutError is now an alias of the
-                # builtin, so this single branch covers both.
-                logger.info(
-                    "wait_with_timeout: hard cut-off fired "
-                    "(correlation_key=%s, timeout_seconds=%.3f, "
+                # asyncio.timeout raises TimeoutError (Python 3.11+; the
+                # older asyncio.TimeoutError is now an alias). No reply
+                # arrived within the interim leg — fall through.
+                pass
+
+            # --- remainder leg: only when the interim is strictly less
+            # than the whole budget. Emit the pointed "still waiting"
+            # warn, then keep awaiting the SAME reply for the remainder
+            # so the 900s hard cut-off is preserved, not shortened. ---
+            if remainder > 0:
+                logger.warning(
+                    "wait_with_timeout: no reply after %.3fs — still "
+                    "awaiting (subject=%s, correlation_key=%s, agent_id=%s, "
+                    "elapsed_seconds=%.3f, hard_cutoff_seconds=%.3f, "
                     "started_at=%s)",
+                    interim,
+                    awaited_subject,
                     binding.correlation_key,
+                    binding.matched_agent_id,
+                    interim,
                     effective,
                     started_at.isoformat(),
                 )
-                return None
+                try:
+                    async with asyncio.timeout(remainder):
+                        payload = await self._registry.wait_for_reply(binding)
+                    return payload
+                except TimeoutError:
+                    pass
+
+            # --- hard cut-off fired with no reply (interim leg alone
+            # when there was no remainder, or interim + remainder). The
+            # degrade log NAMES the subject + correlation it was awaiting
+            # so the timeout is never a generic "nothing happened". ---
+            logger.warning(
+                "wait_with_timeout: hard cut-off fired — no reply "
+                "(subject=%s, correlation_key=%s, agent_id=%s, "
+                "timeout_seconds=%.3f, elapsed_seconds=%.3f, "
+                "started_at=%s)",
+                awaited_subject,
+                binding.correlation_key,
+                binding.matched_agent_id,
+                effective,
+                effective,
+                started_at.isoformat(),
+            )
+            return None
         finally:
             # Release on success AND on timeout AND on cancellation.
             # This is the unsubscribe-on-timeout invariant: the
@@ -215,4 +300,8 @@ class TimeoutCoordinator:
             self._registry.release(binding)
 
 
-__all__ = ["DEFAULT_TIMEOUT_SECONDS", "TimeoutCoordinator"]
+__all__ = [
+    "DEFAULT_TIMEOUT_SECONDS",
+    "INTERIM_WARN_SECONDS",
+    "TimeoutCoordinator",
+]
