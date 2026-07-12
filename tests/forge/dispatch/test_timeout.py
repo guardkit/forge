@@ -110,7 +110,9 @@ class FakeRegistry:
         self.bindings[binding.correlation_key] = binding
         return binding
 
-    async def wait_for_reply(self, binding: FakeBinding) -> Optional[dict]:
+    async def wait_for_reply(
+        self, binding: FakeBinding, timeout_seconds: Optional[float] = None
+    ) -> Optional[dict]:
         # Mirrors the production contract (CorrelationRegistry): await the
         # per-binding Future under ``asyncio.shield`` so a cancellation of
         # THIS await (e.g. the coordinator's interim leg firing) does not
@@ -118,6 +120,11 @@ class FakeRegistry:
         # the reply. If the coordinator's hard cut-off fires, the
         # CancelledError propagates out and asyncio.timeout converts it to
         # TimeoutError; ``release`` then cancels the Future for real.
+        #
+        # ``timeout_seconds`` is the M12 per-leg backstop budget. This
+        # in-memory double imposes the budget via the coordinator's outer
+        # ``asyncio.timeout`` instead, so it accepts and ignores the arg —
+        # the coordinator's leg still fires on time.
         return await asyncio.shield(binding._future)
 
     def release(self, binding: FakeBinding) -> None:
@@ -242,7 +249,9 @@ class TestReleaseInFinally:
         binding = registry.bind(FakeBinding(correlation_key="k3"))
         coord = TimeoutCoordinator(registry, FakeClock())
 
-        async def raise_first(_: Any) -> None:
+        async def raise_first(
+            _: Any, timeout_seconds: Optional[float] = None
+        ) -> None:
             raise RuntimeError("transport blew up")
 
         registry.wait_for_reply = raise_first  # type: ignore[assignment]
@@ -628,7 +637,12 @@ class CancelSwallowingRegistry(FakeRegistry):
     propagate) could not exhibit.
     """
 
-    async def wait_for_reply(self, binding: FakeBinding) -> Optional[dict]:
+    async def wait_for_reply(
+        self, binding: FakeBinding, timeout_seconds: Optional[float] = None
+    ) -> Optional[dict]:
+        # ``timeout_seconds`` (M12 backstop) accepted and ignored — this
+        # double proves the coordinator's outer ``asyncio.timeout`` still
+        # enforces the budget when a registry swallows cancellation.
         try:
             return await asyncio.shield(binding._future)
         except asyncio.CancelledError:
@@ -688,3 +702,157 @@ class TestCancelSwallowingRegistryBudget:
         # Pre-fix the swallow collapsed this to ~interim (0.02s).
         assert elapsed >= 0.20
         assert registry.release_calls == ["kswallow2"]
+
+
+# ---------------------------------------------------------------------------
+# Live regression 2026-07-11 (Mode-P dfmt3, TASK-FWD-PLAN-M12): the 3600s hard
+# cut-off NEVER fired. The interim warn (60s) fired, then the dispatch waited
+# forever. The live layering: the production ``_RegistryWaitAdapter`` pinned
+# the registry's inner wait open —
+# ``CorrelationRegistry.wait_for_reply(binding, timeout_seconds=1e9)`` =
+# ``asyncio.wait_for(asyncio.shield(future), 1e9)`` with an
+# ``except CancelledError: return None`` — so the registry had NO timer of its
+# own. The hard cut-off's delivery then depended ENTIRELY on the coordinator's
+# ``asyncio.timeout`` cancellation propagating through those absorbing layers
+# (asyncio.shield of the reply future + the cancel-swallow). When that
+# cancellation was lost, nothing terminated the leg and the dispatch wedged
+# (RUNNING run row + reply subscription leaked until restart).
+#
+# Fix: the coordinator hands the registry the SAME per-leg budget it wraps in
+# ``asyncio.timeout`` (M12). The registry's own ``asyncio.wait_for`` timer then
+# expires at that budget and returns None — an INDEPENDENT backstop the M11
+# None-is-not-a-reply rule already treats as an expired leg — so the hard
+# cut-off fires regardless of whether the outer cancellation is delivered.
+# ---------------------------------------------------------------------------
+
+
+class BackstopSpyRegistry:
+    """Records the per-leg budget the coordinator hands the registry.
+
+    ``wait_for_reply`` is the production ``CorrelationRegistry`` line
+    verbatim (``asyncio.wait_for(asyncio.shield(future), timeout_seconds)``
+    with the cancel-swallow), so it self-times on the handed budget. The
+    recorded budgets prove the coordinator supplies a finite, independent
+    backstop rather than pinning the inner wait open at ``1e9`` / relying
+    on a cancellation that the shield can absorb.
+    """
+
+    def __init__(self) -> None:
+        self.release_calls: list[str] = []
+        self.observed_budgets: list[Optional[float]] = []
+
+    def bind(self, binding: FakeBinding) -> FakeBinding:
+        binding._future = asyncio.get_event_loop().create_future()
+        return binding
+
+    async def wait_for_reply(
+        self, binding: FakeBinding, timeout_seconds: Optional[float] = None
+    ) -> Optional[dict]:
+        self.observed_budgets.append(timeout_seconds)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(binding._future), timeout=timeout_seconds
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+
+    def release(self, binding: FakeBinding) -> None:
+        self.release_calls.append(binding.correlation_key)
+        fut = binding._future
+        if fut is not None and not fut.done():
+            fut.cancel()
+
+
+class TestRemainderCutoffFiresThroughAbsorbedCancel:
+    """M12: the hard cut-off must not depend on a cancel propagating
+    through the registry's absorbing (shield + swallow) layers."""
+
+    @pytest.mark.asyncio
+    async def test_coordinator_hands_registry_a_finite_backstop_budget(
+        self,
+    ) -> None:
+        # The fix's mechanism: each leg hands the registry its own finite
+        # budget as an independent backstop. Pre-fix the coordinator called
+        # ``wait_for_reply(binding)`` with NO budget, so the observed values
+        # were ``[None, None]`` — the registry had nothing but the (lost)
+        # cancel to terminate on. This assertion fails on that baseline.
+        registry = BackstopSpyRegistry()
+        binding = registry.bind(
+            FakeBinding(correlation_key="kbackstop", matched_agent_id="po")
+        )
+        coord = TimeoutCoordinator(
+            registry,
+            FakeClock(),
+            default_timeout_seconds=0.25,
+            interim_warn_seconds=0.05,
+        )
+
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        # Bound the call: on the pre-fix code with a registry that has no
+        # timer of its own, a lost cancel wedges here forever.
+        async with asyncio.timeout(3.0):
+            result = await coord.wait_with_timeout(binding)
+        elapsed = loop.time() - started
+
+        assert result is None
+        # The hard cut-off fired at the FULL budget, not the interim.
+        assert 0.20 <= elapsed < 1.0
+        # Two legs (interim + remainder), each handed a finite backstop
+        # budget summing to the effective cut-off — never None, never 1e9.
+        assert registry.observed_budgets == [
+            pytest.approx(0.05),
+            pytest.approx(0.20),
+        ]
+        assert all(
+            b is not None and 0 < b < 1e6 for b in registry.observed_budgets
+        )
+        assert registry.release_calls == ["kbackstop"]
+
+    @pytest.mark.asyncio
+    async def test_real_registry_wait_terminates_at_budget_no_reply(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # End-to-end with the REAL CorrelationRegistry (the live layering):
+        # the coordinator drives ``CorrelationRegistry.wait_for_reply`` —
+        # whose ``asyncio.wait_for(asyncio.shield(future), timeout_seconds)``
+        # is exactly the absorbing shape that wedged live. With the handed
+        # backstop budget the registry's own timer terminates the wait at
+        # the cut-off; no reply ever arrives and the binding is released.
+        # (Pre-fix the coordinator omitted ``timeout_seconds`` and the real
+        # registry — which requires it — could not be driven this way.)
+        from forge.dispatch.correlation import CorrelationRegistry
+
+        class _FakeTransport:
+            async def subscribe(self, correlation_key: str, deliver: Any) -> Any:
+                return object()
+
+            async def unsubscribe(self, subscription: Any) -> None:
+                return None
+
+        registry = CorrelationRegistry(_FakeTransport())
+        key = registry.fresh_correlation_key()
+        binding = await registry.bind(key, "po")
+        coord = TimeoutCoordinator(
+            registry,
+            FakeClock(),
+            default_timeout_seconds=0.25,
+            interim_warn_seconds=0.05,
+        )
+
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        with caplog.at_level(logging.WARNING, logger="forge.dispatch.timeout"):
+            async with asyncio.timeout(3.0):
+                result = await coord.wait_with_timeout(binding)
+        elapsed = loop.time() - started
+
+        assert result is None
+        assert 0.20 <= elapsed < 1.0
+        # The named hard-cut-off degrade log fired (the cut-off was reached,
+        # not silently skipped as live).
+        assert any(
+            "hard cut-off" in r.getMessage() for r in caplog.records
+        )
+        # Unsubscribe-on-timeout invariant holds end to end.
+        assert key not in registry._bindings

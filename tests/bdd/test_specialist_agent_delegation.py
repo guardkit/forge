@@ -209,14 +209,18 @@ class _RegistryWaitAdapter:
 
     def __init__(self, registry: CorrelationRegistry) -> None:
         self._registry = registry
-        # Sentinel large timeout — the coordinator's asyncio.timeout
-        # owns the real cut-off, so this value should never fire.
-        self._inner_timeout: float = 1e9
+        # Fallback backstop used only if the coordinator ever omits the
+        # per-leg budget; the coordinator (M12) normally passes a finite
+        # ``timeout_seconds`` which we forward as the registry's own timer.
+        self._fallback_timeout: float = 3600.0
 
-    async def wait_for_reply(self, binding: Any) -> Any:
-        return await self._registry.wait_for_reply(
-            binding, self._inner_timeout
+    async def wait_for_reply(
+        self, binding: Any, timeout_seconds: float | None = None
+    ) -> Any:
+        budget = (
+            self._fallback_timeout if timeout_seconds is None else timeout_seconds
         )
+        return await self._registry.wait_for_reply(binding, budget)
 
     def release(self, binding: Any) -> None:
         self._registry.release(binding)

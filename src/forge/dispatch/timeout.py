@@ -113,14 +113,37 @@ class _RegistryLike(Protocol):
 
     The coordinator depends on exactly two methods:
 
-    * ``wait_for_reply(binding)`` — returns the payload dict when an
-      authentic reply arrives, or never returns if no reply ever
-      comes (the coordinator imposes the hard cut-off externally).
+    * ``wait_for_reply(binding, timeout_seconds)`` — returns the payload
+      dict when an authentic reply arrives, or ``None`` when the handed
+      ``timeout_seconds`` elapses first. ``timeout_seconds`` is the
+      per-leg **backstop budget**: the coordinator wraps the call in
+      :func:`asyncio.timeout` as the primary cut-off, but it ALSO hands
+      the registry the same budget so the registry's own timer can
+      terminate the wait even if that outer cancellation is absorbed
+      before it reaches the leg. This is the M12 fix — the production
+      :class:`~forge.dispatch.correlation.CorrelationRegistry` wraps
+      ``asyncio.wait_for(asyncio.shield(future), timeout_seconds)``,
+      whose ``asyncio.shield`` + ``except CancelledError: return None``
+      can swallow the coordinator's cancellation; when the coordinator
+      pinned that inner wait open (``timeout_seconds=1e9``) the hard
+      cut-off's delivery depended ENTIRELY on a cancel propagating
+      through those absorbing layers, and a lost cancel wedged the
+      dispatch forever (observed live 2026-07-11, dfmt3: the 3600s
+      cut-off never fired). Handing a finite budget gives the registry
+      an independent terminator — a ``None`` return the M11
+      None-is-not-a-reply rule already treats as an expired leg.
     * ``release(binding)`` — idempotently tears down the binding's
       subscription so late replies are silently dropped.
+
+    ``timeout_seconds`` is keyword-optional for structural compatibility
+    with lightweight in-memory doubles that impose the budget via the
+    coordinator's outer :func:`asyncio.timeout` alone; a double that
+    ignores it stays correct because the coordinator's leg still fires.
     """
 
-    async def wait_for_reply(self, binding: Any) -> Optional[dict]:
+    async def wait_for_reply(
+        self, binding: Any, timeout_seconds: Optional[float] = None
+    ) -> Optional[dict]:
         ...
 
     def release(self, binding: Any) -> None:
@@ -241,7 +264,17 @@ class TimeoutCoordinator:
             # --- interim leg: wait up to the interim for a reply. ---
             try:
                 async with asyncio.timeout(interim):
-                    payload = await self._registry.wait_for_reply(binding)
+                    # Hand the registry the SAME leg budget as an
+                    # independent backstop (M12): asyncio.timeout is the
+                    # primary cut-off, but if its cancellation is absorbed
+                    # by the registry's shield / cancel-swallow before it
+                    # reaches this leg, the registry's own timer still
+                    # expires at ``interim`` and returns None. Without it
+                    # the wait depends solely on a cancel propagating
+                    # through absorbing layers (the live wedge, dfmt3).
+                    payload = await self._registry.wait_for_reply(
+                        binding, timeout_seconds=interim
+                    )
                 if payload is not None:
                     return payload
                 # ``None`` WITHOUT TimeoutError: the registry absorbed the
@@ -279,7 +312,13 @@ class TimeoutCoordinator:
                 )
                 try:
                     async with asyncio.timeout(remainder):
-                        payload = await self._registry.wait_for_reply(binding)
+                        # Same backstop as the interim leg (M12): the
+                        # registry's own timer expires at ``remainder`` so
+                        # the hard cut-off fires even if the outer
+                        # asyncio.timeout cancellation is absorbed.
+                        payload = await self._registry.wait_for_reply(
+                            binding, timeout_seconds=remainder
+                        )
                     if payload is not None:
                         return payload
                     # Same ``None``-is-not-a-reply rule as the interim leg.

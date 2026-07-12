@@ -244,14 +244,39 @@ class _LateBoundReplyChannel:
 
 
 class _RegistryWaitAdapter:
-    """Adapt CorrelationRegistry to TimeoutCoordinator's narrower surface."""
+    """Adapt CorrelationRegistry to TimeoutCoordinator's narrower surface.
 
-    def __init__(self, registry: Any) -> None:
+    The coordinator owns the primary cut-off (``asyncio.timeout``) but
+    ALSO hands us the per-leg budget as an independent backstop (M12).
+    We pass it straight through to ``CorrelationRegistry.wait_for_reply``,
+    whose ``asyncio.wait_for(asyncio.shield(future), timeout_seconds)``
+    then has its OWN timer to terminate the wait — so the hard cut-off no
+    longer depends on the coordinator's cancellation surviving the
+    registry's ``asyncio.shield`` + ``except CancelledError: return None``
+    absorbing layers. Pinning the inner wait open at ``1e9`` (the prior
+    behaviour) wedged a dispatch forever when that cancellation was lost
+    (observed live 2026-07-11, dfmt3: the 3600s cut-off never fired).
+
+    ``timeout_seconds`` should always be supplied by the current
+    coordinator; if a caller omits it we fall back to the configured
+    ceiling rather than ``1e9`` so a finite backstop is never lost.
+    """
+
+    def __init__(self, registry: Any, backstop_seconds: float) -> None:
         self._registry = registry
+        # The finite fallback used only if a caller ever omits the per-leg
+        # budget — never ``1e9``, so a backstop is never lost.
+        self._backstop_seconds = float(backstop_seconds)
 
-    async def wait_for_reply(self, binding: Any) -> Any:
-        # The coordinator owns the outer timeout; pin the inner wait open.
-        return await self._registry.wait_for_reply(binding, timeout_seconds=1e9)
+    async def wait_for_reply(
+        self, binding: Any, timeout_seconds: float | None = None
+    ) -> Any:
+        budget = (
+            self._backstop_seconds if timeout_seconds is None else timeout_seconds
+        )
+        return await self._registry.wait_for_reply(
+            binding, timeout_seconds=budget
+        )
 
     def release(self, binding: Any) -> None:
         self._registry.release(binding)
@@ -558,18 +583,24 @@ async def compose_planning_consumer_and_dispatch(
         registry = CorrelationRegistry(transport=reply_channel)
         dispatch_adapter = NatsSpecialistDispatchAdapter(nats_client, registry)
         reply_channel.bind_transport(dispatch_adapter)
+        # Planning-only override of the ASSUM-003 900s dispatch ceiling
+        # (Mode B compositions keep the default). A REAL product-owner
+        # greenfield session measured ~50-70 min of agentic turns on the
+        # estate workhorse (Mode-P DISPATCHFMT Sfinal, 2026-07-11) —
+        # 900s degrades every healthy planning dispatch. 3600s matches
+        # the planning durable's ack_wait and the originator checkpoint
+        # wait; a longer stage is a specialist-latency problem, not a
+        # dispatch-budget one.
+        planning_dispatch_budget_seconds = 3600.0
         timeout_coordinator = TimeoutCoordinator(
-            registry=_RegistryWaitAdapter(registry),
+            # Hand the adapter the same ceiling as a finite fallback budget
+            # so the registry keeps an independent backstop timer even if a
+            # per-leg budget were ever omitted (M12 — never pin at 1e9).
+            registry=_RegistryWaitAdapter(
+                registry, backstop_seconds=planning_dispatch_budget_seconds
+            ),
             clock=SystemClock(),
-            # Planning-only override of the ASSUM-003 900s dispatch ceiling
-            # (Mode B compositions keep the default). A REAL product-owner
-            # greenfield session measured ~50-70 min of agentic turns on the
-            # estate workhorse (Mode-P DISPATCHFMT Sfinal, 2026-07-11) —
-            # 900s degrades every healthy planning dispatch. 3600s matches
-            # the planning durable's ack_wait and the originator checkpoint
-            # wait; a longer stage is a specialist-latency problem, not a
-            # dispatch-budget one.
-            default_timeout_seconds=3600.0,
+            default_timeout_seconds=planning_dispatch_budget_seconds,
         )
         history_writer = SqliteHistoryWriter(pool)
         orchestrator = DispatchOrchestrator(
