@@ -130,3 +130,27 @@ Methodology lesson for the AC: any model A/B for this seam must replay the
 TOOL-BOUND session path, not a raw completion. Content quality remains the
 specialist-side fix list above (unchanged, queued behind FEAT-DF12); the dfmt4 doc
 was again off-topic with fabricated citations, consistent with the diagnosis.
+
+## Deploy attempt (2026-07-12) — fixes MERGED; live deploy ROLLED BACK on an unrelated regression
+
+The six specialist-side fixes are BUILT, coach-verified, and MERGED (specialist-agent
+`2c70379..96d04dd`, pushed). A live deploy was attempted (image `51ef89dc`, both
+dual-role containers recreated; rollback tag `specialist-agent:rollback-pre-pocontent-20260712`).
+Validation run `dfmt5268a4666728` FAILED differently: the generation loop ran 5
+iterations with **coach score 0.00 every time** → `RuntimeError: … did not reach
+acceptance threshold (final_score=0.00, verdict=REVISE)`. The player WAS generating
+(large completions via the new client's /v1/responses path) — the SCORING leg is
+broken on the repo-HEAD image. NOTE: the rebuilt image ships 13 days of merged work
+(FEAT-96FC capture, FEAT-DF12 emitters, newer openai client 2.45/responses-API) beyond
+these six changes — the 0.00-coach break is NOT attributed yet.
+
+**State now: specialists ROLLED BACK to the known-good 13-day image** (the one that
+served dfmt4 + the factory-1 run green). So production behavior is unchanged: docs
+parse and hand off, with the known mild-drift/fabrication residual — the six fixes
+sit merged, awaiting a validated specialist deploy.
+
+**Next (a dedicated specialist-deploy lane, benched):** diagnose the coach-scoring
+0.00 on the new image (first suspects: the coach model call path under openai 2.45 /
+responses-API against llama-swap; the player-output parse feeding the coach; only then
+these six changes), with a hermetic session harness BEFORE any recreate. Evidence:
+session scratchpad `pocontent-deploy-fail-evidence.txt` + the dfmt5 logs.
