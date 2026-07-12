@@ -154,3 +154,38 @@ sit merged, awaiting a validated specialist deploy.
 responses-API against llama-swap; the player-output parse feeding the coach; only then
 these six changes), with a hermetic session harness BEFORE any recreate. Evidence:
 session scratchpad `pocontent-deploy-fail-evidence.txt` + the dfmt5 logs.
+
+---
+
+## Dated addendum — 2026-07-12 (Factory-2 S1): the hermetic diagnosis is DONE — coach-0.00 ROOT-CAUSED, prime suspect REFUTED
+
+The benched lane's hermetic-first step was executed by the Factory-2 pre-stage (run
+`wf_afe2213a-e0d`, independently re-verified). Full report + reproducible drivers beside this
+file: `factory-2-s1-hermetic-diagnosis-2026-07-12.md` (drivers also at `/tmp/f2-s1-out/`).
+
+**Three blockers at specialist-agent HEAD (`96d04dd`), in dependency order:**
+1. **Pre-LLM criteria-type crash** — `session.py:1981` assigns `load_criteria(...)` without
+   `.criteria` (legacy path `:1135` has it); `run_generation_loop:777` does `len(criteria)` →
+   `TypeError` in ~0.7s. One-line fix. This alone is why the headless tools were never driven.
+2. **Responses API forced** — the deepagents openai provider profile sets
+   `use_responses_api=True`; llama-swap/llama.cpp hangs on `POST /v1/responses` (~76s timeout)
+   while `/v1/chat/completions` answers in ~2s. App-side `ProviderProfile(use_responses_api=False)`.
+3. **THE coach-0.00 (root cause, load-bearing):** past 1+2, on real qwen36 output,
+   **gemma4-coach returns 5 of the 6 required criterion scores** → `validate_criterion_scores`
+   raises (`scoring.py:138`) → caught → `_EXTRACTION_FAILURE_SCORE=0.0`/REVISE every iteration
+   (`generation_loop.py:901-910`) → `ModeLoopNotAcceptedError(best_score=0.00)` — the exact
+   dfmt5268a4666728 bench shape. **Reproduced on openai 2.33.0 with the responses API bypassed —
+   the "openai 2.45 / responses-API" prime suspect is REFUTED for the scoring break.** The break
+   is coach-model criterion-count under-production, independent of client version and transport.
+
+**Encouraging counterpoint:** the player's iteration-0 output on the Factory-1 gold input was
+fully on-topic with ZERO fabricated citations — the six merged content fixes visibly work.
+Generation quality is there; coach score-conformance is the sole substantive blocker (candidate
+fixes: retry-on-miscount, prompt-force the 6th score, or accept-with-default — the lane's call).
+
+**Also relevant to this lane from the same day's live runs:** (a) the deployed image's revision
+loop ballooned a real PO session's context 92,359→128,802 tokens over an hour until M12's cutoff
+fired (run `0a645e36` — the runtime face of the multi-turn drift these fixes cap); (b) forge's
+soft_timeout does NOT propagate a cancel to the specialist (zombie session held the single-slot
+seat; scoped `docker restart` was the cleanup); (c) the specialist treats a seat 429 as fatal
+(no retry) — run `f9794a58` died in 3s on a transient slot collision.
