@@ -1,0 +1,37 @@
+{
+  "script": "scripts/restart_policy.py",
+  "purpose": "O-30 forge-prod restart-policy switch (Phase E2 / E2-S3)",
+  "mode": "apply",
+  "dry_run": false,
+  "timestamp": "2026-07-13T17:41:59.403792+00:00",
+  "container": "forge-restart-demo-e2s3",
+  "target_policy": "unless-stopped",
+  "docker_update_cmd": "docker update --restart unless-stopped forge-restart-demo-e2s3",
+  "restart_policy_before": {
+    "Name": "no",
+    "MaximumRetryCount": 0
+  },
+  "restart_policy_after": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+  },
+  "changed": true,
+  "preflight_checklist": [
+    {
+      "check": "no_restart_occurs",
+      "status": "ok",
+      "detail": "`docker update --restart` is a metadata-only change to 'forge-restart-demo-e2s3''s HostConfig.RestartPolicy \u2014 it does NOT stop, restart, or recreate the container; the running process is untouched and the new policy takes effect on the next daemon start / reboot."
+    },
+    {
+      "check": "ack_pending_zero_not_required",
+      "status": "ok",
+      "detail": "Ack-Pending-0 / worker-free drain is NOT needed for this operation: that gate guards a container *recreate* (a real restart that would drop an in-flight build); no restart occurs here, so no drain is required. (Contrast the forge-prod RECREATE at the B4 window, which does gate on Ack-Pending-0.)"
+    },
+    {
+      "check": "target_policy",
+      "status": "ok",
+      "detail": "target HostConfig.RestartPolicy.Name = 'unless-stopped' (auto-recovery on)."
+    }
+  ],
+  "operator_next_action": "none \u2014 the policy is live in the daemon immediately and persists across reboots; no container restart/recreate is needed or performed"
+}
