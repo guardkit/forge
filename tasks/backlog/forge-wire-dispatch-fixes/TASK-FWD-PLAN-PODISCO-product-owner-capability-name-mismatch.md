@@ -1,17 +1,47 @@
 ---
 id: TASK-FWD-PLAN-PODISCO
 title: "Mode P PO dispatch resolves nothing: forge asks for tool `product_owner_specialist`, PO agent advertises `po_*`"
-status: backlog
+status: reconciled
 created: 2026-07-11T12:00:00Z
+resolved: 2026-07-13T00:00:00Z
+resolution: "option (a) — intent fallback — LIVE IN CODE; reconciled + regression-pinned in Lane B / Phase E1 B2"
 priority: high
 task_type: design
 found_by: Session-A follow-up MP-010 terminal re-validation (2026-07-11)
 feature_ref: FEAT-SPL-002
-tags: [mode-p, planning, discovery, specialist-contract, found-2026-07-11]
+tags: [mode-p, planning, discovery, specialist-contract, found-2026-07-11, reconciled-2026-07-13]
 complexity: 3
 ---
 
 # Mode P product-owner dispatch never resolves (capability-name mismatch)
+
+## ✅ RECONCILED 2026-07-13 (Lane B / Phase E1 B2 — option (a), intent fallback, LIVE)
+
+Reconciled inside Lane B B2's acceptance (the binding "reconcile M-08/PODISCO — fix or
+evidence stale-and-struck, no silent carry" amendment). **Option (a) is IN CODE and now
+regression-pinned:** `src/forge/pipeline/dispatchers/specialist.py` maps
+`SPECIALIST_INTENT_BY_STAGE[PRODUCT_OWNER] = "product.*"` and
+`dispatch_specialist_stage` threads that string as `intent_pattern` into
+`forge.discovery.resolve.resolve` (step 2 — the exact-tool → intent-fallback algorithm).
+So although no agent advertises a *tool* named `product_owner_specialist`, forge resolves
+the live `product-owner-agent` via its advertised `IntentCapability(pattern="product.*",
+confidence=0.95)` — no `no_specialist_resolvable` degrade.
+
+**Evidence (this is not an assertion — a test proves it):**
+`tests/forge/discovery/test_podisco_reconciliation.py` reconstructs the exact live manifest
+shape recorded below (tools `po_idea`/`po_greenfield`/… + the `product.*` intent) and asserts
+`resolve(...)` returns `match_source="intent_pattern"` and matches the agent — while a
+companion test pins that WITHOUT the intent (`intent_pattern=None`) the old
+`unresolved` path still fires, so a future refactor that drops the intent thread fails loudly.
+Live corroboration already existed: the deployed PO reached on-topic `PLANNED_HANDOFF` twice
+after this landed (Factory-2 `2dfb4ef5`; Lane A `RESOLVED-DEPLOYED` note). B2 extended the same
+intent-fallback to the 007/008 target-terminal legs
+(`SPECIALIST_INTENT_BY_STAGE[FEATURE_SPEC]="product.*"`, `[FEATURE_PLAN]="architecture.*"`).
+
+_Original diagnosis retained below for the record._
+
+---
+
 
 ## Problem (verified live, 2026-07-11 — surfaced by fixing TASK-FWD-PLAN-FLEETWATCHER)
 

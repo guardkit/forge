@@ -37,6 +37,7 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
 from forge.adapters.git.models import GitOpResult
@@ -47,12 +48,14 @@ from forge.adapters.git.operations import (
     _failure_stderr,
     commit_all,
 )
+from forge.planning.handoff import PreCommitHook
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["WorktreeGitRunner"]
 
 _OPERATION = "prepare_branch_and_write"
+_TREE_OPERATION = "prepare_branch_and_write_tree"
 
 
 class WorktreeGitRunner:
@@ -229,6 +232,183 @@ class WorktreeGitRunner:
                 file_path,
             )
             return _exception_failure(_OPERATION, exc)
+
+    async def prepare_branch_and_write_tree(
+        self,
+        repo_path: str,
+        branch: str,
+        files: Mapping[str, str],
+        message: str,
+        *,
+        pre_commit: PreCommitHook | None = None,
+    ) -> GitOpResult:
+        """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
+
+        Additive sibling of :meth:`prepare_branch_and_write` — see the
+        :class:`forge.planning.handoff.GitRunner` protocol docstring for the
+        contract. Reuses the same worktree isolation, checkout-collision guard
+        (TASK-MP-013), idempotency probe (RT-08) and best-effort cleanup; adds
+        the multi-file write and the optional pre-commit oracle hook.
+        """
+        try:
+            repo = Path(repo_path)
+            if not repo.is_dir():
+                return GitOpResult(
+                    status="failed",
+                    operation=_TREE_OPERATION,
+                    stderr=f"repo_path is not a directory: {repo_path}",
+                    exit_code=-1,
+                )
+            if not files:
+                return GitOpResult(
+                    status="failed",
+                    operation=_TREE_OPERATION,
+                    stderr="no files supplied to prepare_branch_and_write_tree",
+                    exit_code=-1,
+                )
+
+            branch_exists = await self._branch_exists(repo, branch)
+
+            # RT-08 idempotency: every file already byte-identical on the
+            # branch AND no mutating hook required → success with the existing
+            # tip, zero mutations. A pre_commit hook may mutate files (the
+            # normalizer), so only short-circuit when there is no hook.
+            if branch_exists and pre_commit is None:
+                all_identical = True
+                for rel_path, content in files.items():
+                    existing = await self._show_file(repo, branch, rel_path)
+                    if existing is None or existing != content:
+                        all_identical = False
+                        break
+                if all_identical:
+                    sha = await self._rev_parse(repo, branch)
+                    logger.info(
+                        "%s: branch %s already carries identical %d file(s); "
+                        "idempotent success (sha=%s)",
+                        _TREE_OPERATION,
+                        branch,
+                        len(files),
+                        sha,
+                    )
+                    return GitOpResult(
+                        status="success",
+                        operation=_TREE_OPERATION,
+                        sha=sha,
+                        exit_code=0,
+                    )
+
+            if branch_exists:
+                blocker = await self._blocking_checkout(repo, branch)
+                if blocker is not None:
+                    logger.error(
+                        "handoff-branch-checked-out: refusing --force "
+                        "re-attach of branch %s; blocking worktree: %s",
+                        branch,
+                        blocker,
+                    )
+                    return GitOpResult(
+                        status="failed",
+                        operation=_TREE_OPERATION,
+                        stderr=(
+                            f"handoff-branch-checked-out: branch {branch} is "
+                            f"checked out at {blocker}; release or prune that "
+                            "checkout, then retry"
+                        ),
+                        exit_code=-1,
+                    )
+
+            self._worktrees_root.mkdir(parents=True, exist_ok=True)
+            worktree = self._worktrees_root / (
+                f"{branch.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
+            )
+
+            if branch_exists:
+                add_cmd = [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--force",
+                    str(worktree),
+                    branch,
+                ]
+            else:
+                add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
+
+            add_res = await self._execute(command=add_cmd, cwd=str(repo))
+            if add_res.exit_code != 0:
+                return GitOpResult(
+                    status="failed",
+                    operation=_TREE_OPERATION,
+                    stderr=_failure_stderr(add_res.stderr, add_res.stdout),
+                    exit_code=add_res.exit_code,
+                )
+
+            try:
+                worktree_resolved = worktree.resolve()
+                for rel_path, content in files.items():
+                    target = (worktree / rel_path).resolve()
+                    if not str(target).startswith(str(worktree_resolved) + os.sep):
+                        return GitOpResult(
+                            status="failed",
+                            operation=_TREE_OPERATION,
+                            stderr=f"file_path escapes the worktree: {rel_path}",
+                            exit_code=-1,
+                        )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+
+                # Pre-commit oracle (normalizer / feature validate). Runs
+                # against the materialised worktree; a red oracle aborts the
+                # commit with zero branch mutation.
+                if pre_commit is not None:
+                    hook_result = await pre_commit(worktree_resolved)
+                    if not hook_result.ok:
+                        return GitOpResult(
+                            status="failed",
+                            operation=_TREE_OPERATION,
+                            stderr=(
+                                "pre-commit oracle refused the commit: "
+                                f"{hook_result.detail}"
+                            ),
+                            exit_code=-1,
+                        )
+
+                commit_res = await commit_all(worktree, message, execute=self._execute)
+                if commit_res.status == "failed":
+                    stderr = commit_res.stderr or ""
+                    if "nothing to commit" in stderr:
+                        # Tree already matched on disk (e.g. an idempotent
+                        # re-run whose hook made no change) — RT-08 success.
+                        sha = await self._rev_parse(repo, branch)
+                        return GitOpResult(
+                            status="success",
+                            operation=_TREE_OPERATION,
+                            sha=sha,
+                            exit_code=0,
+                        )
+                    return GitOpResult(
+                        status="failed",
+                        operation=_TREE_OPERATION,
+                        stderr=commit_res.stderr,
+                        exit_code=commit_res.exit_code,
+                    )
+
+                return GitOpResult(
+                    status="success",
+                    operation=_TREE_OPERATION,
+                    sha=commit_res.sha,
+                    exit_code=0,
+                )
+            finally:
+                await self._cleanup_worktree(repo, worktree)
+        except Exception as exc:  # noqa: BLE001 — adapter boundary, ADR-ARCH-025
+            logger.exception(
+                "%s failed (branch=%s, files=%d)",
+                _TREE_OPERATION,
+                branch,
+                len(files),
+            )
+            return _exception_failure(_TREE_OPERATION, exc)
 
     async def _cleanup_worktree(self, repo: Path, worktree: Path) -> None:
         """Best-effort worktree removal anchored in the source repo."""

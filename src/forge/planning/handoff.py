@@ -44,6 +44,9 @@ References
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -58,15 +61,78 @@ __all__ = [
     "GitRunner",
     "NotificationPayload",
     "PlannedHandoffHandler",
+    "PreCommitHook",
+    "PreCommitResult",
     "TerminalRegistry",
+    "build_feature_spec_input_content",
     "build_notification_payload",
     "get_terminal_registry",
 ]
 
 
+def build_feature_spec_input_content(run_data: dict[str, Any]) -> str:
+    """Render the ``feature_spec_inputs/<id>.md`` markdown for a planning run.
+
+    Mirrors specialist-agent's ``feature_spec_inputs/<id>.md`` shape: a
+    minimal v1 with the product docs + originator + the raw request. This is
+    the deterministic input BOTH the flag-OFF PLANNED_HANDOFF terminal
+    (:meth:`PlannedHandoffHandler._build_file_content`) and the flag-ON
+    Lane B target terminal write to the branch and feed to the
+    ``po_feature_spec`` (007) leg — extracted to a module function so the two
+    paths can never drift (the 007 input must be byte-identical to what the
+    fallback handoff commits).
+
+    Deterministic in ``run_data`` — the same run always renders the same
+    bytes, which is what makes the target-terminal spec leg re-entrant.
+    """
+    correlation_id = run_data["correlation_id"]
+    originator = run_data.get("originating_user", "unknown")
+    request_text = run_data.get("request_text", "")
+    product_docs = run_data.get("product_docs", {})
+
+    content = f"""# Feature Spec Input: {correlation_id}
+
+**Originator**: {originator}
+
+**Request**: {request_text}
+
+## Product Documentation
+
+"""
+    if product_docs:
+        for key, value in product_docs.items():
+            content += f"**{key}**: {value}\n\n"
+    else:
+        content += "_No product documentation provided._\n"
+
+    return content
+
+
 # ---------------------------------------------------------------------------
 # GitRunner Protocol
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreCommitResult:
+    """Outcome of a target-terminal pre-commit hook (Lane B / Phase E1 B2).
+
+    A hook (the gherkin normalizer for the spec leg, ``guardkit feature
+    validate`` for the plan leg) runs against the materialised worktree
+    AFTER forge writes the artifacts but BEFORE the commit lands. ``ok=False``
+    aborts the commit and surfaces ``detail`` as the loud-failure reason —
+    a red oracle never reaches the branch.
+    """
+
+    ok: bool
+    detail: str = ""
+
+
+#: A pre-commit hook: given the materialised worktree path, run an oracle
+#: (normalizer / validate) against the on-disk artifacts and return whether
+#: the commit may proceed. May mutate files in place (the normalizer collapses
+#: wrapped gherkin steps), and those edits are included in the commit.
+PreCommitHook = Callable[[Path], Awaitable[PreCommitResult]]
 
 
 class GitRunner(Protocol):
@@ -95,6 +161,55 @@ class GitRunner(Protocol):
             Relative path within the repo (e.g., "feature_spec_inputs/cid.md").
         content:
             File content to write.
+
+        Returns
+        -------
+        GitOpResult:
+            status="success" with sha on success, status="failed" otherwise.
+        """
+        ...
+
+    async def prepare_branch_and_write_tree(
+        self,
+        repo_path: str,
+        branch: str,
+        files: Mapping[str, str],
+        message: str,
+        *,
+        pre_commit: PreCommitHook | None = None,
+    ) -> GitOpResult:
+        """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
+
+        The additive multi-file sibling of :meth:`prepare_branch_and_write`,
+        for the target-terminal spec/plan legs which write the three-file spec
+        contract and the plan tree under ``features/<slug>/``. Semantics:
+
+        - ``files`` maps repo-relative paths → content; all are written into an
+          isolated worktree of ``branch`` (created if absent, re-attached if a
+          prior leg already advanced it — the spec triple and the plan tree
+          land on the SAME ``planning/<cid>`` branch across the two legs).
+        - ``pre_commit`` (optional) runs against the worktree path after the
+          writes but before the commit; ``ok=False`` aborts the commit with
+          ZERO branch mutation and surfaces ``detail`` (the normalizer/validate
+          red path). The hook may rewrite files in place (normalizer collapse);
+          those edits are committed.
+        - Idempotent: if every file is already byte-identical on the branch and
+          the hook passes, returns success with the existing tip and no commit.
+        - Never raises (ADR-ARCH-025): failures become
+          ``GitOpResult(status="failed", ...)``.
+
+        Parameters
+        ----------
+        repo_path:
+            Absolute path to the target repository's working copy.
+        branch:
+            Branch name (e.g. ``"planning/<correlation-id>"``).
+        files:
+            Mapping of repo-relative path → file content.
+        message:
+            Commit message.
+        pre_commit:
+            Optional oracle hook (normalizer / ``feature validate``).
 
         Returns
         -------
@@ -341,27 +456,7 @@ class PlannedHandoffHandler:
         str:
             Markdown content for feature spec input file.
         """
-        correlation_id = run_data["correlation_id"]
-        originator = run_data.get("originating_user", "unknown")
-        request_text = run_data.get("request_text", "")
-        product_docs = run_data.get("product_docs", {})
-
-        content = f"""# Feature Spec Input: {correlation_id}
-
-**Originator**: {originator}
-
-**Request**: {request_text}
-
-## Product Documentation
-
-"""
-        if product_docs:
-            for key, value in product_docs.items():
-                content += f"**{key}**: {value}\n\n"
-        else:
-            content += "_No product documentation provided._\n"
-
-        return content
+        return build_feature_spec_input_content(run_data)
 
 
 # ---------------------------------------------------------------------------

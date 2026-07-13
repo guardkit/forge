@@ -287,15 +287,19 @@ class TestSurface:
 
 
 class TestStageRefusal:
-    """AC-002: refuses any stage outside ``{PRODUCT_OWNER, ARCHITECT}``."""
+    """AC-002: refuses any stage outside the specialist set.
+
+    Lane B / Phase E1 (B2) added FEATURE_SPEC / FEATURE_PLAN as target-terminal
+    specialist stages (the 007/008 legs), so they are NO LONGER refused here —
+    ``SYSTEM_ARCH`` / ``SYSTEM_DESIGN`` / ``AUTOBUILD`` / ``PULL_REQUEST_REVIEW``
+    remain non-specialist (subprocess / async-autobuild) and still raise.
+    """
 
     @pytest.mark.parametrize(
         "stage",
         [
             StageClass.SYSTEM_ARCH,
             StageClass.SYSTEM_DESIGN,
-            StageClass.FEATURE_SPEC,
-            StageClass.FEATURE_PLAN,
             StageClass.AUTOBUILD,
             StageClass.PULL_REQUEST_REVIEW,
         ],
@@ -1133,6 +1137,90 @@ class TestBuildSpecialistCommand:
         assert "AUTOBUILD".lower() in str(excinfo.value).lower() or (
             StageClass.AUTOBUILD.value in str(excinfo.value)
         )
+
+
+class TestTargetTerminalLegs:
+    """Lane B / Phase E1 (B2): the 007/008 target-terminal dispatch legs."""
+
+    def test_feature_spec_threads_supplied_spec_input(self) -> None:
+        command, args = build_specialist_command(
+            StageClass.FEATURE_SPEC,
+            request_text=None,
+            context_entries=[],
+            extra_command_args={"spec_input": "the committed handoff markdown"},
+        )
+        assert command == SPECIALIST_COMMAND_BY_STAGE[StageClass.FEATURE_SPEC]
+        # The forge-supplied required arg reaches the wire (007 reads it).
+        required = SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.FEATURE_SPEC]
+        assert all(args.get(name) for name in required)
+        assert args["spec_input"] == "the committed handoff markdown"
+
+    def test_feature_plan_threads_scope_target_and_minted_feature_id(self) -> None:
+        command, args = build_specialist_command(
+            StageClass.FEATURE_PLAN,
+            request_text=None,
+            context_entries=[],
+            extra_command_args={
+                "scope": "add GET /stats",
+                "target_repo": "guardkit/api_test",
+                "feature_id": "FEAT-BEEF",
+            },
+        )
+        assert command == SPECIALIST_COMMAND_BY_STAGE[StageClass.FEATURE_PLAN]
+        # RV-1: forge ALWAYS supplies scope + target descriptor + the minted id.
+        required = SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.FEATURE_PLAN]
+        assert all(args.get(name) for name in required)
+        assert args["feature_id"] == "FEAT-BEEF"
+        assert args["target_repo"] == "guardkit/api_test"
+
+    @pytest.mark.asyncio
+    async def test_feature_spec_dispatch_resolves_via_product_intent(
+        self,
+        builder: ForwardContextBuilder,
+        surface: RecordingDispatchSurface,
+        writer: RecordingStageLogWriter,
+    ) -> None:
+        # 007 rides the product-owner agent's advertised ``product.*`` intent —
+        # the exact tool name (po_feature_spec) never matches, so the resolver
+        # falls back to intent (the M-08 pattern extended to the spec leg).
+        surface.outcome = _sync_result()
+        await dispatch_specialist_stage(
+            stage=StageClass.FEATURE_SPEC,
+            build_id=_BUILD_ID,
+            correlation_id=_CORRELATION_ID,
+            forward_context_builder=builder,
+            dispatch_surface=surface,
+            stage_log_writer=writer,
+            extra_command_args={"spec_input": "handoff md"},
+        )
+        assert surface.last_call["capability"] == "po_feature_spec"
+        assert surface.last_call["intent_pattern"] == "product.*"
+        assert surface.last_call["command_args"]["spec_input"] == "handoff md"
+
+    @pytest.mark.asyncio
+    async def test_feature_plan_dispatch_resolves_via_architecture_intent(
+        self,
+        builder: ForwardContextBuilder,
+        surface: RecordingDispatchSurface,
+        writer: RecordingStageLogWriter,
+    ) -> None:
+        surface.outcome = _sync_result()
+        await dispatch_specialist_stage(
+            stage=StageClass.FEATURE_PLAN,
+            build_id=_BUILD_ID,
+            correlation_id=_CORRELATION_ID,
+            forward_context_builder=builder,
+            dispatch_surface=surface,
+            stage_log_writer=writer,
+            extra_command_args={
+                "scope": "add GET /stats",
+                "target_repo": "guardkit/api_test",
+                "feature_id": "FEAT-BEEF",
+            },
+        )
+        assert surface.last_call["capability"] == "architect_feature_plan"
+        assert surface.last_call["intent_pattern"] == "architecture.*"
+        assert surface.last_call["command_args"]["feature_id"] == "FEAT-BEEF"
 
 
 class TestDispatchThreadsCommand:

@@ -547,12 +547,22 @@ async def compose_planning_consumer_and_dispatch(
         from forge.pipeline.stage_taxonomy import StageClass
         from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
         from forge.planning.frontier import FrontierSecondOpinion
+        from forge.planning.target_terminal_tools import (
+            make_normalize_feature_spec,
+            make_validate_feature_plan,
+        )
 
         clock_fn = clock if clock is not None else lambda: datetime.now(timezone.utc)
 
         # -- durable store + gate adapters (TASK-MP-002/004A) ------------
+        # Lane B / Phase E1 (B1): the store selects its transition table from
+        # the target-terminal flag at construction. Flag OFF (default) = the
+        # shipped table; PLANNED_HANDOFF stays terminal.
         pool = connect_writer(db_path)
-        store = SqlitePlanningRunStore(pool)
+        store = SqlitePlanningRunStore(
+            pool,
+            target_terminal_enabled=config.planning.target_terminal.enabled,
+        )
         repository, state_machine = build_planning_gate_adapters(store, clock=clock_fn)
 
         # -- background task supervision ----------------------------------
@@ -700,6 +710,57 @@ async def compose_planning_consumer_and_dispatch(
                 request_text=request_text,
             )
 
+        # -- target terminal legs (Lane B / Phase E1 B2) ------------------
+        # The 007 (po_feature_spec) and 008 (architect_feature_plan) legs ride
+        # the SAME specialist dispatch surface + M12 planning budget as the PO
+        # leg above; forge supplies the leg inputs via extra_command_args
+        # (spec_input for 007; scope + target descriptor + minted feature_id for
+        # 008 — RV-1: the plan leg asserts the SUPPLIED id).
+        async def dispatch_feature_spec(
+            *,
+            plan_run_id: str,
+            correlation_id: str,
+            spec_input: str,
+        ) -> Any:
+            return await dispatch_specialist_stage(
+                stage=StageClass.FEATURE_SPEC,
+                build_id=plan_run_id,
+                correlation_id=correlation_id,
+                forward_context_builder=forward_context_builder,
+                dispatch_surface=orchestrator,
+                stage_log_writer=stage_log_writer,
+                feature_id=plan_run_id,
+                extra_command_args={"spec_input": spec_input},
+            )
+
+        async def dispatch_feature_plan(
+            *,
+            plan_run_id: str,
+            correlation_id: str,
+            scope: str,
+            target_repo: str,
+            feature_id: str,
+        ) -> Any:
+            return await dispatch_specialist_stage(
+                stage=StageClass.FEATURE_PLAN,
+                build_id=plan_run_id,
+                correlation_id=correlation_id,
+                forward_context_builder=forward_context_builder,
+                dispatch_surface=orchestrator,
+                stage_log_writer=stage_log_writer,
+                feature_id=plan_run_id,
+                extra_command_args={
+                    "scope": scope,
+                    "target_repo": target_repo,
+                    "feature_id": feature_id,
+                },
+            )
+
+        # The two deterministic oracles forge runs against the committed
+        # artifacts (bounded subprocesses; frozen guardkit `feature validate`).
+        normalize_feature_spec = make_normalize_feature_spec()
+        validate_feature_plan = make_validate_feature_plan()
+
         # -- approval side -------------------------------------------------
         approval_publisher = ApprovalPublisher(nats_client=nats_client)
         pause_publisher = _PlanningPausePublisher(
@@ -775,6 +836,12 @@ async def compose_planning_consumer_and_dispatch(
                 planning_config=config.planning,
                 clock=clock_fn,
                 publish_notification=publish_planning_notification,
+                # Lane B / Phase E1 (B2) — target-terminal legs (no-op unless
+                # planning.target_terminal.enabled is on).
+                dispatch_feature_spec=dispatch_feature_spec,
+                dispatch_feature_plan=dispatch_feature_plan,
+                normalize_feature_spec=normalize_feature_spec,
+                validate_feature_plan=validate_feature_plan,
             )
         )
 

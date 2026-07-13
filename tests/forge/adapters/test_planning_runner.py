@@ -202,3 +202,117 @@ class TestCheckoutCollisionGuard:
         assert second.status == "success"
         assert second.sha == first.sha
         assert _git(operator_wt, "status", "--porcelain") == ""
+
+
+class TestPrepareBranchAndWriteTree:
+    """Lane B / Phase E1 (B2): the multi-file + pre-commit-hook write."""
+
+    _FILES = {
+        "features/stats/stats.feature": "Feature: stats\n",
+        "features/stats/stats_assumptions.yaml": "assumptions: []\n",
+        "features/stats/stats_summary.md": "# summary\n",
+    }
+
+    @pytest.mark.asyncio
+    async def test_commits_a_multi_file_tree(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec"
+        )
+        assert result.status == "success"
+        for rel, content in self._FILES.items():
+            assert _git(repo, "show", f"{BRANCH}:{rel}") == content.rstrip("\n")
+
+    @pytest.mark.asyncio
+    async def test_second_leg_adds_to_the_same_branch(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec"
+        )
+        plan = {"features/stats/FEAT-BEEF.yaml": "id: FEAT-BEEF\n"}
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, plan, "planning: plan"
+        )
+        assert result.status == "success"
+        # Both the spec triple and the plan tree are on the branch.
+        assert _git(repo, "show", f"{BRANCH}:features/stats/stats.feature")
+        assert _git(repo, "show", f"{BRANCH}:features/stats/FEAT-BEEF.yaml")
+
+    @pytest.mark.asyncio
+    async def test_pre_commit_hook_can_mutate_before_commit(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        from forge.planning.handoff import PreCommitResult
+
+        async def _hook(worktree: Path) -> PreCommitResult:
+            # Rewrite the .feature in place (the normalizer's collapse behaviour).
+            (worktree / "features/stats/stats.feature").write_text(
+                "Feature: normalized\n", encoding="utf-8"
+            )
+            return PreCommitResult(ok=True)
+
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec", pre_commit=_hook
+        )
+        assert result.status == "success"
+        assert (
+            _git(repo, "show", f"{BRANCH}:features/stats/stats.feature")
+            == "Feature: normalized"
+        )
+
+    @pytest.mark.asyncio
+    async def test_red_pre_commit_hook_aborts_the_commit(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        from forge.planning.handoff import PreCommitResult
+
+        async def _hook(worktree: Path) -> PreCommitResult:
+            return PreCommitResult(ok=False, detail="unparseable")
+
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec", pre_commit=_hook
+        )
+        assert result.status == "failed"
+        assert "unparseable" in (result.stderr or "")
+        # Zero commit: the branch never advanced past HEAD (no such path).
+        show = subprocess.run(
+            ["git", "show", f"{BRANCH}:features/stats/stats.feature"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show.returncode != 0
+
+    @pytest.mark.asyncio
+    async def test_rejects_path_escaping_the_worktree(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, {"../escape.txt": "nope"}, "planning: bad"
+        )
+        assert result.status == "failed"
+        assert "escapes the worktree" in (result.stderr or "")
+
+    @pytest.mark.asyncio
+    async def test_empty_files_is_a_failure(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, {}, "planning: empty"
+        )
+        assert result.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_identical_tree_no_op(
+        self, repo: Path, runner: WorktreeGitRunner
+    ) -> None:
+        first = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec"
+        )
+        second = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec"
+        )
+        assert second.status == "success"
+        assert second.sha == first.sha

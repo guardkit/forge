@@ -229,6 +229,9 @@ class TestApprovalYamlRoundTrip:
                 "frontier_enabled": False,
                 "frontier_timeout_seconds": 30,
                 "model_resolution": {"model": None, "fallbacks": []},
+                # Lane B / Phase E1 (B1) target-terminal flag — default-OFF; the
+                # unfiltered round-trip dump always includes it.
+                "target_terminal": {"enabled": False},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages); the unfiltered
             # round-trip dump always includes it with default values.

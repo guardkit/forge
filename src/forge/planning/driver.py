@@ -39,14 +39,18 @@ References: TASK-MP-012, FEAT-SPL-002, DF-009, RT-04, RT-08, DDR-007.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from forge.gating.identity import parse_request_id
+from forge.lifecycle.identifiers import validate_feature_id
 from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
     PlanningEscalationContext,
@@ -59,7 +63,11 @@ from forge.planning.escalation import (
     EscalationPolicy,
     evaluate_escalation_phase,
 )
-from forge.planning.handoff import PlannedHandoffHandler
+from forge.planning.handoff import (
+    PlannedHandoffHandler,
+    PreCommitResult,
+    build_feature_spec_input_content,
+)
 from forge.planning.planner import (
     BoundaryViolation,
     DispatchProductOwner,
@@ -83,6 +91,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import PlanningConfig
     from forge.gating.wrappers import GateRepository, StateMachine
     from forge.planning.checkpoint import SecondOpinionProvider
+    from forge.planning.target_terminal_tools import (
+        NormalizeFeatureSpecFn,
+        ValidateFeaturePlanFn,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +112,23 @@ _TERMINAL_STATES = {
     PlanningState.CANCELLED,
     PlanningState.TIMED_OUT,
     PlanningState.PLANNED_HANDOFF,
+    # Target terminal (Lane B). Only reachable when the flag is on; adding it
+    # here is a byte-for-byte no-op with the flag off (unreachable state) and
+    # makes a re-drive of a completed BUILD_QUEUED run return immediately.
+    PlanningState.BUILD_QUEUED,
 }
+
+#: Durable stage labels for the target-terminal legs (Lane B / Phase E1 B2).
+#: A completed leg records ``status="approved"`` under these labels; their
+#: presence makes the legs idempotent on a re-drive (crash between the leg's
+#: artifact write and the state transition never re-dispatches the specialist).
+_FEATURE_SPEC_STAGE = "feature-spec"
+_FEATURE_PLAN_STAGE = "feature-plan"
+
+#: Filesystem-safe feature slug allowlist (mirrors the identifier boundary):
+#: a specialist-supplied slug is only trusted when it matches, else forge falls
+#: back to a deterministic ``feature-{cid}``.
+_SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 PublishNotificationFn = Callable[[str, str, str], Awaitable[None]]
 """``async (correlation_id, message, level) -> None`` — best-effort notify."""
@@ -116,6 +144,22 @@ DispatchProductOwnerFn = Callable[..., Awaitable[Any]]
 
 ``enrichment`` is the EnrichmentBatch-shaped revision delta on an
 assumption-dialogue re-invoke (``None`` on the first dispatch)."""
+
+DispatchFeatureSpecFn = Callable[..., Awaitable[Any]]
+"""``async (*, plan_run_id, correlation_id, spec_input) -> StageDispatchResult``.
+
+Lane B (B2): dispatch the ``po_feature_spec`` (007) leg with the committed
+feature-spec-input content; the result's ``role_output`` carries the three-file
+spec contract."""
+
+DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
+"""``async (*, plan_run_id, correlation_id, scope, target_repo, feature_id)
+-> StageDispatchResult``.
+
+Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge ALWAYS
+supplies the scope + target-repo descriptor + the forge-minted ``feature_id``
+(RV-1: the plan leg asserts the SUPPLIED id). The result's ``role_output``
+carries the plan tree."""
 
 
 def _extract_assumptions(result: Any) -> list[dict[str, Any]]:
@@ -150,6 +194,14 @@ class PlanningDriverDeps:
     planning_config: "PlanningConfig"
     clock: Callable[[], datetime]
     publish_notification: PublishNotificationFn | None = None
+    # Lane B / Phase E1 (B2) — the target-terminal spec/plan legs. All optional
+    # and default None: with the target-terminal flag OFF they are never
+    # consulted (byte-for-byte no-op). With the flag ON they are required; a
+    # missing collaborator fails the run LOUDLY (never a silent skip).
+    dispatch_feature_spec: DispatchFeatureSpecFn | None = None
+    dispatch_feature_plan: DispatchFeaturePlanFn | None = None
+    normalize_feature_spec: "NormalizeFeatureSpecFn | None" = None
+    validate_feature_plan: "ValidateFeaturePlanFn | None" = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +295,20 @@ class PlanningRunDriver:
                     return
                 continue  # re-read: now RUNNING, planner advances the chain
 
+            # Target-terminal chain (Lane B / Phase E1). These states are
+            # forge-machine states, not Mode-P-planner states — the driver
+            # advances them directly (the pure planner never sees them; its
+            # forbidden-stage guard only inspects the product_owner /
+            # checkpoint_cleared history rows, which use different labels).
+            if state is PlanningState.FEATURE_SPEC:
+                if not await self._feature_spec_leg(row, correlation_id):
+                    return
+                continue  # re-read: now FEATURE_PLAN
+            if state is PlanningState.FEATURE_PLAN:
+                if not await self._feature_plan_leg(row, correlation_id):
+                    return  # B2 endpoint: plan validated; build trigger is B3
+                continue
+
             # state is RUNNING — consult the pure planner over durable history
             history = self._load_history(correlation_id)
             decision = plan_next_step(history)
@@ -295,6 +361,13 @@ class PlanningRunDriver:
                 continue
 
             if isinstance(decision, ExecuteHandoff):
+                if self._target_terminal_enabled():
+                    # Flag ON: write the handoff file (the 007 input) and enter
+                    # the machine chain instead of terminating. PLANNED_HANDOFF
+                    # stays the reachable fallback (flag OFF), never removed.
+                    if not await self._enter_target_terminal(row, correlation_id):
+                        return
+                    continue  # re-read: now FEATURE_SPEC
                 await self._handoff(row, correlation_id)
                 return
 
@@ -795,6 +868,516 @@ class PlanningRunDriver:
             f"Planning run {correlation_id} handoff failed: {reason}",
             level="error",
         )
+
+    # ------------------------------------------------------------------ #
+    # Target terminal (Lane B / Phase E1 — the machine chain after
+    # PLANNED_HANDOFF). Gated on planning.target_terminal.enabled; every
+    # method below is unreachable with the flag off.
+    # ------------------------------------------------------------------ #
+
+    def _target_terminal_enabled(self) -> bool:
+        """True iff the ``planning.target_terminal.enabled`` flag is on."""
+        tt = getattr(self._deps.planning_config, "target_terminal", None)
+        return bool(getattr(tt, "enabled", False))
+
+    async def _enter_target_terminal(self, row: Any, correlation_id: str) -> bool:
+        """Write the handoff file (the 007 input) and transition RUNNING → FEATURE_SPEC.
+
+        The flag-ON analogue of :meth:`_handoff`'s branch write: it commits the
+        SAME ``feature_spec_inputs/{cid}.md`` the fallback terminal would (so
+        the 007 input is byte-identical to the fallback's handoff), but enters
+        the machine chain instead of terminating. Returns True on success
+        (drive() re-reads FEATURE_SPEC), False on a loud terminal failure.
+        """
+        deps = self._deps
+        resolved = await self._resolve_repo(row, correlation_id, stage_label="target-terminal-enter")
+        if resolved is None:
+            return False
+        target_repo, repo_path = resolved
+        branch = f"planning/{correlation_id}"
+        handoff_path = f"feature_spec_inputs/{correlation_id}.md"
+        content = build_feature_spec_input_content(self._run_data(row, correlation_id))
+
+        try:
+            result = await deps.git_runner.prepare_branch_and_write(
+                repo_path=repo_path,
+                branch=branch,
+                file_path=handoff_path,
+                content=content,
+            )
+        except Exception as exc:  # noqa: BLE001 — write boundary, never crash the run
+            return await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                f"handoff write raised {type(exc).__name__}: {exc}",
+            )
+        if result.status == "failed":
+            return await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                f"handoff write failed: {result.stderr}",
+            )
+
+        refused = deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.FEATURE_SPEC,
+            actor_identity="planning-driver",
+            stage_label="target-terminal-enter",
+            expected_from_state=PlanningState.RUNNING,
+            details_json=json.dumps(
+                {
+                    "target_repo": target_repo,
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "handoff_path": handoff_path,
+                }
+            ),
+        )
+        if isinstance(refused, TransitionRefused):
+            logger.warning(
+                "planning driver: RUNNING→FEATURE_SPEC refused for %s (current=%s)",
+                correlation_id,
+                refused.current_state,
+            )
+            return False
+        logger.info(
+            "planning driver: run %s entered the target terminal (branch=%s)",
+            correlation_id,
+            branch,
+        )
+        return True
+
+    async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
+        """FEATURE_SPEC leg: dispatch 007, write the triple, normalize, advance.
+
+        Returns True to keep driving (now FEATURE_PLAN), False on a loud
+        terminal failure. Idempotent: a durable ``feature-spec`` approved event
+        means the spec already landed (crash before the state advance) — the
+        leg just re-advances without re-dispatching the specialist.
+        """
+        deps = self._deps
+        if self._has_leg_event(correlation_id, _FEATURE_SPEC_STAGE):
+            return self._advance_after_spec(correlation_id)
+
+        if deps.dispatch_feature_spec is None or deps.normalize_feature_spec is None:
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "target terminal ON but the spec leg collaborators "
+                "(dispatch_feature_spec / normalize_feature_spec) are not wired",
+            )
+        resolved = await self._resolve_repo(row, correlation_id, stage_label=_FEATURE_SPEC_STAGE)
+        if resolved is None:
+            return False
+        target_repo, repo_path = resolved
+        branch = f"planning/{correlation_id}"
+        plan_run_id = f"plan-{correlation_id}"
+        spec_input = build_feature_spec_input_content(
+            self._run_data(row, correlation_id)
+        )
+
+        try:
+            result = await deps.dispatch_feature_spec(
+                plan_run_id=plan_run_id,
+                correlation_id=correlation_id,
+                spec_input=spec_input,
+            )
+        except Exception as exc:  # noqa: BLE001 — dispatch boundary
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"007 dispatch raised {type(exc).__name__}: {exc}",
+            )
+        ok, reason = self._dispatch_ok(result)
+        if not ok:
+            return await self._fail_leg(
+                correlation_id, _FEATURE_SPEC_STAGE, f"007 dispatch {reason}"
+            )
+
+        role_output = self._role_output_of(result)
+        slug = self._slug_of(role_output, correlation_id)
+        files = self._spec_triple_files(role_output, slug)
+        if not files:
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "007 returned no three-file spec contract (invalid artifacts)",
+            )
+
+        feature_rel = self._feature_file_rel(files)
+        normalize = deps.normalize_feature_spec
+
+        async def _pre_commit(worktree: Path) -> PreCommitResult:
+            if feature_rel is None:
+                return PreCommitResult(
+                    ok=False, detail="spec contract has no .feature file to normalize"
+                )
+            outcome = await normalize(worktree, feature_rel)
+            return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
+
+        try:
+            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+                repo_path=repo_path,
+                branch=branch,
+                files=files,
+                message=f"planning: feature spec for {correlation_id} (Lane B 007)",
+                pre_commit=_pre_commit,
+            )
+        except Exception as exc:  # noqa: BLE001 — write boundary
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"spec write raised {type(exc).__name__}: {exc}",
+            )
+        if gitres.status == "failed":
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"spec write / normalizer failed: {gitres.stderr}",
+            )
+
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_FEATURE_SPEC_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "slug": slug,
+                    "spec_files": sorted(files),
+                    "target_repo": target_repo,
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "sha": gitres.sha,
+                }
+            ),
+        )
+        logger.info(
+            "planning driver: run %s feature-spec committed (slug=%s, %d files)",
+            correlation_id,
+            slug,
+            len(files),
+        )
+        return self._advance_after_spec(correlation_id)
+
+    def _advance_after_spec(self, correlation_id: str) -> bool:
+        """Transition FEATURE_SPEC → FEATURE_PLAN (idempotent-resume safe)."""
+        refused = self._deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.FEATURE_PLAN,
+            actor_identity="planning-driver",
+            stage_label="feature-spec-complete",
+            expected_from_state=PlanningState.FEATURE_SPEC,
+        )
+        if isinstance(refused, TransitionRefused):
+            # A concurrent driver may already have advanced it — treat
+            # FEATURE_PLAN (or a later target-terminal state) as success.
+            current = self._deps.store.get_run(correlation_id)
+            if current and PlanningState(current["state"]) in {
+                PlanningState.FEATURE_PLAN,
+                PlanningState.BUILD_QUEUED,
+            }:
+                return True
+            logger.warning(
+                "planning driver: FEATURE_SPEC→FEATURE_PLAN refused for %s (current=%s)",
+                correlation_id,
+                refused.current_state,
+            )
+            return False
+        return True
+
+    async def _feature_plan_leg(self, row: Any, correlation_id: str) -> bool:
+        """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write + validate.
+
+        Returns False in ALL cases — B2's endpoint is a validated plan tree
+        parked at FEATURE_PLAN (the build trigger + BUILD_QUEUED transition is
+        B3). A durable ``feature-plan`` approved event short-circuits a re-drive
+        (no re-dispatch). ``self._fail_leg`` moves the run to FAILED on any
+        loud failure; success records the leg event and stops driving.
+        """
+        deps = self._deps
+        if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
+            logger.info(
+                "planning driver: run %s feature-plan already complete "
+                "(B2 endpoint — awaiting the B3 build trigger)",
+                correlation_id,
+            )
+            return False
+
+        if deps.dispatch_feature_plan is None or deps.validate_feature_plan is None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "target terminal ON but the plan leg collaborators "
+                "(dispatch_feature_plan / validate_feature_plan) are not wired",
+            )
+            return False
+        resolved = await self._resolve_repo(row, correlation_id, stage_label=_FEATURE_PLAN_STAGE)
+        if resolved is None:
+            return False
+        target_repo, repo_path = resolved
+        branch = f"planning/{correlation_id}"
+        plan_run_id = f"plan-{correlation_id}"
+        spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
+        slug = str(spec_details.get("slug") or self._slug_of({}, correlation_id))
+        feature_id = self._mint_feature_id(correlation_id)
+        scope = str(row["request_text"] or "")
+
+        try:
+            result = await deps.dispatch_feature_plan(
+                plan_run_id=plan_run_id,
+                correlation_id=correlation_id,
+                scope=scope,
+                target_repo=target_repo,
+                feature_id=feature_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — dispatch boundary
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                f"008 dispatch raised {type(exc).__name__}: {exc}",
+            )
+            return False
+        ok, reason = self._dispatch_ok(result)
+        if not ok:
+            await self._fail_leg(
+                correlation_id, _FEATURE_PLAN_STAGE, f"008 dispatch {reason}"
+            )
+            return False
+
+        role_output = self._role_output_of(result)
+        # RV-1: assert the SUPPLIED feature id, not filename self-consistency.
+        declared = role_output.get("feature_id")
+        if declared is not None and str(declared) != feature_id:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                f"feature id mismatch (RV-1): forge supplied {feature_id}, "
+                f"the plan declares {declared}",
+            )
+            return False
+
+        files = self._plan_tree_files(role_output)
+        if not files:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "008 returned no plan tree (invalid artifacts)",
+            )
+            return False
+
+        validate = deps.validate_feature_plan
+
+        async def _pre_commit(worktree: Path) -> PreCommitResult:
+            outcome = await validate(worktree, feature_id)
+            return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
+
+        try:
+            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+                repo_path=repo_path,
+                branch=branch,
+                files=files,
+                message=(
+                    f"planning: feature plan {feature_id} for {correlation_id} "
+                    "(Lane B 008)"
+                ),
+                pre_commit=_pre_commit,
+            )
+        except Exception as exc:  # noqa: BLE001 — write boundary
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                f"plan write raised {type(exc).__name__}: {exc}",
+            )
+            return False
+        if gitres.status == "failed":
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                f"plan write / feature validate failed: {gitres.stderr}",
+            )
+            return False
+
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_FEATURE_PLAN_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "feature_id": feature_id,
+                    "slug": slug,
+                    "plan_files": sorted(files),
+                    "target_repo": target_repo,
+                    "branch": branch,
+                    "sha": gitres.sha,
+                }
+            ),
+        )
+        await self._notify(
+            correlation_id,
+            f"Planning run {correlation_id}: machine spec + plan complete and "
+            f"validated (feature {feature_id}, branch {branch}). Awaiting the "
+            "build trigger.",
+            level="info",
+        )
+        logger.info(
+            "planning driver: run %s feature-plan validated (feature_id=%s); "
+            "B2 endpoint reached (parked at FEATURE_PLAN for the B3 build trigger)",
+            correlation_id,
+            feature_id,
+        )
+        return False
+
+    # -- target-terminal helpers ---------------------------------------- #
+
+    def _run_data(self, row: Any, correlation_id: str) -> dict[str, Any]:
+        """Assemble the run_data dict the handoff-content builder consumes."""
+        po_output = self._latest_po_output(correlation_id)
+        return {
+            "correlation_id": correlation_id,
+            "state": row["state"],
+            "request_text": row["request_text"],
+            "originating_user": row["originating_user"],
+            "target_repo": row["target_repo"],
+            "product_docs": po_output.get("docs_summary") or {},
+        }
+
+    async def _resolve_repo(
+        self, row: Any, correlation_id: str, *, stage_label: str
+    ) -> tuple[str, str] | None:
+        """Resolve ``(target_repo, repo_path)`` or fail the run loudly."""
+        cfg = self._deps.planning_config
+        target_repo = row["target_repo"] or cfg.default_target_repo
+        if target_repo is None:
+            await self._fail_leg(
+                correlation_id, stage_label, "no target repository configured"
+            )
+            return None
+        repo_path = cfg.target_repo_paths.get(target_repo)
+        if repo_path is None:
+            await self._fail_leg(
+                correlation_id,
+                stage_label,
+                f"target repo {target_repo} not in target_repo_paths",
+            )
+            return None
+        return target_repo, repo_path
+
+    async def _fail_leg(
+        self, correlation_id: str, stage_label: str, reason: str
+    ) -> bool:
+        """Move the run to FAILED, notify, and return False (loud terminal)."""
+        self._fail(correlation_id, stage_label=stage_label, reason=reason)
+        await self._notify(
+            correlation_id,
+            f"Planning run {correlation_id} failed at {stage_label}: {reason}",
+            level="error",
+        )
+        return False
+
+    def _mint_feature_id(self, correlation_id: str) -> str:
+        """Mint a deterministic ``FEAT-XXXX`` id for the plan (rule 6).
+
+        Deterministic in ``correlation_id`` so a re-drive mints the SAME id,
+        and validated through the identifier security boundary before it is
+        threaded to the architect (008) and asserted on the returned plan.
+        """
+        digest = hashlib.sha1(correlation_id.encode("utf-8")).hexdigest()[:4].upper()
+        return validate_feature_id(f"FEAT-{digest}")
+
+    @staticmethod
+    def _dispatch_ok(result: Any) -> tuple[bool, str]:
+        """Map a StageDispatchResult onto ``(ok, reason)`` (M10 outcome shape)."""
+        outcome = getattr(result, "outcome", None)
+        value = str(getattr(outcome, "value", outcome or "error")).lower()
+        if value in ("completed", "degraded"):
+            return True, value
+        reason = getattr(result, "reason", None) or "no reason supplied"
+        return False, f"{value}: {reason}"
+
+    @staticmethod
+    def _role_output_of(result: Any) -> dict[str, Any]:
+        """Project the specialist's ``role_output`` document as a dict (M10)."""
+        ro = getattr(result, "role_output", None)
+        return dict(ro) if isinstance(ro, Mapping) else {}
+
+    @staticmethod
+    def _slug_of(role_output: Mapping[str, Any], correlation_id: str) -> str:
+        """Feature slug from the 007 result, or a deterministic fallback.
+
+        The specialist MAY name the feature (``role_output['slug']``); forge
+        sanitises it to a filesystem-safe token and otherwise falls back to a
+        deterministic ``feature-{cid}`` (WS1's semantic-slug emitter is §9
+        follow-on, not a B stage).
+        """
+        candidate = str(role_output.get("slug") or "").strip()
+        if candidate and _SLUG_RE.fullmatch(candidate):
+            return candidate
+        return f"feature-{correlation_id}"
+
+    @staticmethod
+    def _spec_triple_files(
+        role_output: Mapping[str, Any], slug: str
+    ) -> dict[str, str] | None:
+        """Project the three-file spec contract from the 007 role_output.
+
+        Prefers an explicit ``files`` mapping (specialist-authored repo-relative
+        paths); otherwise builds the canonical ``features/<slug>/`` triple from
+        the ``feature`` / ``assumptions`` / ``summary`` fields. ``None`` when
+        neither shape yields files (the invalid-artifacts failure path).
+        """
+        files = role_output.get("files")
+        if isinstance(files, Mapping) and files:
+            return {str(k): str(v) for k, v in files.items()}
+        feature = role_output.get("feature")
+        assumptions = role_output.get("assumptions")
+        summary = role_output.get("summary")
+        if feature and assumptions and summary:
+            base = f"features/{slug}"
+            return {
+                f"{base}/{slug}.feature": str(feature),
+                f"{base}/{slug}_assumptions.yaml": str(assumptions),
+                f"{base}/{slug}_summary.md": str(summary),
+            }
+        return None
+
+    @staticmethod
+    def _plan_tree_files(role_output: Mapping[str, Any]) -> dict[str, str] | None:
+        """Project the plan tree (feature/task YAML) from the 008 role_output."""
+        files = role_output.get("files")
+        if isinstance(files, Mapping) and files:
+            return {str(k): str(v) for k, v in files.items()}
+        return None
+
+    @staticmethod
+    def _feature_file_rel(files: Mapping[str, str]) -> str | None:
+        """The repo-relative ``.feature`` path in a spec triple (or None)."""
+        for rel in files:
+            if rel.endswith(".feature"):
+                return rel
+        return None
+
+    def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
+        """True iff a durable ``approved`` event exists for ``stage_label``."""
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] == stage_label and event["status"] == "approved":
+                return True
+        return False
+
+    def _leg_event_details(
+        self, correlation_id: str, stage_label: str
+    ) -> dict[str, Any]:
+        """Parsed details of the latest ``approved`` event for ``stage_label``."""
+        latest: dict[str, Any] = {}
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] == stage_label and event["status"] == "approved":
+                if event["details_json"]:
+                    try:
+                        latest = json.loads(event["details_json"]) or {}
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        return latest
 
     # ------------------------------------------------------------------ #
     # Helpers

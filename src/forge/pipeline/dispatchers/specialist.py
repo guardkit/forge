@@ -118,6 +118,15 @@ logger = logging.getLogger(__name__)
 SPECIALIST_CAPABILITY_BY_STAGE: dict[StageClass, str] = {
     StageClass.PRODUCT_OWNER: "product_owner_specialist",
     StageClass.ARCHITECT: "architect_specialist",
+    # Lane B / Phase E1 (B2) — the target-terminal spec/plan legs. These are
+    # NOT dispatched in Mode A/B/C (there FEATURE_SPEC/FEATURE_PLAN are
+    # subprocess stages, see supervisor._SUBPROCESS_STAGES); they are only
+    # reached by the Mode P planning driver's target terminal, which calls
+    # dispatch_specialist_stage directly. Same agents as PO/architect, spec
+    # and plan modes: FEAT-SPL-007 (po_feature_spec) / FEAT-SPL-008
+    # (architect_feature_plan) per sovereign-planning-loop-scope §4/§5.
+    StageClass.FEATURE_SPEC: "po_feature_spec",
+    StageClass.FEATURE_PLAN: "architect_feature_plan",
 }
 
 
@@ -146,6 +155,13 @@ SPECIALIST_CAPABILITY_BY_STAGE: dict[StageClass, str] = {
 SPECIALIST_INTENT_BY_STAGE: dict[StageClass, str] = {
     StageClass.PRODUCT_OWNER: "product.*",
     StageClass.ARCHITECT: "architecture.*",
+    # Lane B (B2): 007 rides the product-owner agent's ``product.*`` intent,
+    # 008 the architect agent's ``architecture.*`` intent — the same
+    # advertised patterns as the PO/architect stages, so the exact-tool ->
+    # intent-fallback resolver reaches the live agents (the M-08/PODISCO
+    # resolution, extended to the spec/plan tools).
+    StageClass.FEATURE_SPEC: "product.*",
+    StageClass.FEATURE_PLAN: "architecture.*",
 }
 
 
@@ -175,6 +191,12 @@ SPECIALIST_STAGES: frozenset[StageClass] = frozenset(
 SPECIALIST_COMMAND_BY_STAGE: dict[StageClass, str] = {
     StageClass.PRODUCT_OWNER: "greenfield",
     StageClass.ARCHITECT: "greenfield",
+    # Lane B (B2): the deployed verbs for the 007/008 tools. The exact verb
+    # strings BIND at Lane A / B4 (FEAT-SPL-007/008 land the specialist-side
+    # handlers); until then B2 is hermetic (stubbed replies) so the wire verb
+    # is exercised only against the test bus. Named for the tool they invoke.
+    StageClass.FEATURE_SPEC: "feature_spec",
+    StageClass.FEATURE_PLAN: "feature_plan",
 }
 
 
@@ -186,6 +208,14 @@ SPECIALIST_COMMAND_BY_STAGE: dict[StageClass, str] = {
 SPECIALIST_REQUIRED_ARGS_BY_STAGE: dict[StageClass, tuple[str, ...]] = {
     StageClass.PRODUCT_OWNER: ("problem_statement",),
     StageClass.ARCHITECT: ("docs_path", "scope"),
+    # Lane B (B2): the required inputs forge ALWAYS supplies for the
+    # target-terminal legs (threaded via ``extra_command_args``, never sourced
+    # from request_text/forward-context). 007 reads the committed
+    # feature_spec_inputs content (``spec_input``); 008 reads the scope + the
+    # target-repo descriptor + the forge-minted FEAT id (RV-1: forge mints and
+    # threads ``feature_id``; the plan leg asserts the SUPPLIED id).
+    StageClass.FEATURE_SPEC: ("spec_input",),
+    StageClass.FEATURE_PLAN: ("scope", "target_repo", "feature_id"),
 }
 
 
@@ -215,6 +245,7 @@ def build_specialist_command(
     *,
     request_text: str | None,
     context_entries: Sequence[ContextEntry],
+    extra_command_args: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Resolve the deployed verb + argument dict for one specialist stage.
 
@@ -291,6 +322,17 @@ def build_specialist_command(
         arg_name = entry.flag.lstrip("-")
         if arg_name in required and entry.value.strip():
             args.setdefault(arg_name, entry.value)
+
+    # Lane B (B2): forge-supplied inputs for the target-terminal legs
+    # (``spec_input`` for 007; ``scope`` / ``target_repo`` / ``feature_id`` for
+    # 008). These are sourced by the caller (the planning driver's spec/plan
+    # legs), not from request_text/forward-context — the fixed division of
+    # labour where FORGE owns the artifacts and mints/threads the FEAT id.
+    # ``setdefault`` keeps any value already sourced above authoritative.
+    if extra_command_args:
+        for arg_name, value in extra_command_args.items():
+            if str(value).strip():
+                args.setdefault(arg_name, value)
 
     return command, args
 
@@ -500,6 +542,7 @@ async def dispatch_specialist_stage(
     attempt_no: int = 1,
     retry_of: str | None = None,
     request_text: str | None = None,
+    extra_command_args: Mapping[str, Any] | None = None,
 ) -> StageDispatchResult:
     """Dispatch one specialist stage (PRODUCT_OWNER or ARCHITECT).
 
@@ -553,6 +596,13 @@ async def dispatch_specialist_stage(
             composition reads it from the ``planning_runs`` row. ``None`` for
             callers with no raw request (a warning is logged if a required
             deployed argument is left unsourced).
+        extra_command_args: Lane B (B2) forge-supplied wire args for the
+            target-terminal stages (:attr:`StageClass.FEATURE_SPEC` /
+            :attr:`StageClass.FEATURE_PLAN`) — ``spec_input`` for 007 and
+            ``scope`` / ``target_repo`` / ``feature_id`` for 008. Merged into
+            ``command_args`` via :func:`build_specialist_command`;
+            request-sourced values stay authoritative. ``None`` for the
+            PRODUCT_OWNER / ARCHITECT stages (byte-unchanged behaviour).
 
     Returns:
         A :class:`StageDispatchResult`. The supervisor consumes the
@@ -611,6 +661,7 @@ async def dispatch_specialist_stage(
         stage,
         request_text=request_text,
         context_entries=context_entries,
+        extra_command_args=extra_command_args,
     )
     missing_args = [
         name
