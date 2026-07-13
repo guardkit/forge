@@ -243,9 +243,10 @@ class TestBootLogEmitsAppliedCount:
             "Expected an INFO log line containing 'SQLite migration' "
             f"after fresh-DB bind; got: {[r.getMessage() for r in caplog.records]!r}"
         )
-        # Three bundled migrations (schema.sql + schema_v2.sql + schema_v3.sql,
-        # the latter added by FEAT-SPL-002 Mode P) → applied=3.
-        assert "applied 3" in applied_lines[0], applied_lines[0]
+        # Four bundled migrations (schema.sql + schema_v2.sql + schema_v3.sql,
+        # the latter added by FEAT-SPL-002 Mode P; schema_v4.sql added by the
+        # Lane B / Phase E1 target-terminal CHECK widening) → applied=4.
+        assert "applied 4" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

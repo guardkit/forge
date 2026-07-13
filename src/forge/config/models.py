@@ -516,6 +516,36 @@ class PlanningModelResolution(BaseModel):
     )
 
 
+class TargetTerminalConfig(BaseModel):
+    """Configuration for the Lane B / Phase E1 forge target terminal.
+
+    The target terminal is the machine chain that runs *after*
+    PLANNED_HANDOFF — it automates the Factory-2 coordinator sequence
+    (handoff → spec leg → plan leg → build queue) so the planning run no
+    longer terminates at PLANNED_HANDOFF but chains
+    FEATURE_SPEC → FEATURE_PLAN → BUILD_QUEUED.
+
+    Defaults are chosen for safe opt-in: ``enabled=False`` means the extra
+    transitions are unreachable and PLANNED_HANDOFF keeps its current
+    terminal behaviour. Flag OFF is a byte-for-byte no-op — the planning
+    state machine is byte-identical to the shipped table (proven by the
+    state-table regression test). Flag ON only ADDS transitions; it never
+    removes PLANNED_HANDOFF as a reachable fallback terminal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the Lane B target terminal. False = the "
+            "planning chain terminates at PLANNED_HANDOFF exactly as it does "
+            "today (byte-for-byte no-op). True = the chain continues into "
+            "FEATURE_SPEC -> FEATURE_PLAN -> BUILD_QUEUED."
+        ),
+    )
+
+
 class PlanningConfig(BaseModel):
     """Configuration for Mode P planning approval-routing (FEAT-SPL-002).
 
@@ -611,6 +641,14 @@ class PlanningConfig(BaseModel):
         description=(
             "Planning model resolution configuration. See DF-004 audit for "
             "fallback restrictions."
+        ),
+    )
+    target_terminal: TargetTerminalConfig = Field(
+        default_factory=TargetTerminalConfig,
+        description=(
+            "Lane B / Phase E1 forge target-terminal configuration. Defaults "
+            "to disabled (enabled=False) — the planning chain terminates at "
+            "PLANNED_HANDOFF exactly as today (byte-for-byte no-op)."
         ),
     )
 

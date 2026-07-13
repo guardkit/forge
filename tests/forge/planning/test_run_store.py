@@ -369,3 +369,139 @@ def test_cas_race_only_one_transition_wins(
     # Final state should be RUNNING
     row = store._get_run(correlation_id)
     assert row["state"] == PlanningState.RUNNING.value
+
+
+# ---------------------------------------------------------------------------
+# Lane B / Phase E1 — target-terminal transition enforcement in the store.
+# The store selects its transition table from the target_terminal_enabled flag
+# at construction. Flag OFF = shipped behaviour; flag ON = the additive chain.
+# ---------------------------------------------------------------------------
+
+
+def _queue_and_run(store: SqlitePlanningRunStore, cid: str) -> None:
+    """Drive a fresh run to RUNNING (the common precondition)."""
+    assert (
+        store.record_queued(
+            correlation_id=cid,
+            originating_user="alice",
+            expected_approver="bob",
+            request_text="feature",
+            triggered_by="cli",
+        )
+        is None
+    )
+    assert (
+        store.transition(cid, PlanningState.RUNNING, actor_identity="worker") is None
+    )
+
+
+def test_flag_off_store_refuses_running_to_feature_spec(
+    db_connection: sqlite3.Connection,
+) -> None:
+    """With the flag off, RUNNING -> FEATURE_SPEC is refused (shipped behaviour)."""
+    store = SqlitePlanningRunStore(db_connection, target_terminal_enabled=False)
+    _queue_and_run(store, "off-1")
+
+    refused = store.transition(
+        "off-1", PlanningState.FEATURE_SPEC, actor_identity="worker"
+    )
+    assert isinstance(refused, TransitionRefused)
+    assert refused.current_state == PlanningState.RUNNING.value
+    assert refused.requested_state == PlanningState.FEATURE_SPEC.value
+
+
+def test_default_store_is_flag_off(db_connection: sqlite3.Connection) -> None:
+    """The store defaults to the flag-OFF table (byte-no-op posture)."""
+    store = SqlitePlanningRunStore(db_connection)  # no flag passed
+    _queue_and_run(store, "def-1")
+    refused = store.transition(
+        "def-1", PlanningState.FEATURE_SPEC, actor_identity="worker"
+    )
+    assert isinstance(refused, TransitionRefused)
+
+
+def test_flag_on_store_drives_full_target_terminal_chain(
+    db_connection: sqlite3.Connection,
+) -> None:
+    """Flag ON: RUNNING -> FEATURE_SPEC -> FEATURE_PLAN -> BUILD_QUEUED."""
+    store = SqlitePlanningRunStore(db_connection, target_terminal_enabled=True)
+    _queue_and_run(store, "on-1")
+
+    assert (
+        store.transition("on-1", PlanningState.FEATURE_SPEC, actor_identity="w")
+        is None
+    )
+    assert (
+        store.transition("on-1", PlanningState.FEATURE_PLAN, actor_identity="w")
+        is None
+    )
+    assert (
+        store.transition("on-1", PlanningState.BUILD_QUEUED, actor_identity="w")
+        is None
+    )
+
+    row = store.get_run("on-1")
+    assert row is not None
+    assert row["state"] == PlanningState.BUILD_QUEUED.value
+
+
+def test_build_queued_stamps_completed_at_and_is_terminal(
+    db_connection: sqlite3.Connection,
+) -> None:
+    """BUILD_QUEUED is terminal: completed_at is set and no further move is allowed."""
+    store = SqlitePlanningRunStore(db_connection, target_terminal_enabled=True)
+    _queue_and_run(store, "on-2")
+    store.transition("on-2", PlanningState.FEATURE_SPEC, actor_identity="w")
+    store.transition("on-2", PlanningState.FEATURE_PLAN, actor_identity="w")
+    store.transition("on-2", PlanningState.BUILD_QUEUED, actor_identity="w")
+
+    row = store.get_run("on-2")
+    assert row is not None
+    assert row["completed_at"] is not None
+
+    # Terminal — a follow-on transition is refused.
+    refused = store.transition(
+        "on-2", PlanningState.FEATURE_SPEC, actor_identity="w"
+    )
+    assert isinstance(refused, TransitionRefused)
+
+
+def test_flag_on_store_still_allows_planned_handoff_fallback(
+    db_connection: sqlite3.Connection,
+) -> None:
+    """Flag ON never removes PLANNED_HANDOFF as a reachable terminal (§2.12)."""
+    store = SqlitePlanningRunStore(db_connection, target_terminal_enabled=True)
+    _queue_and_run(store, "on-3")
+
+    assert (
+        store.transition(
+            "on-3", PlanningState.PLANNED_HANDOFF, actor_identity="w"
+        )
+        is None
+    )
+    row = store.get_run("on-3")
+    assert row is not None
+    assert row["state"] == PlanningState.PLANNED_HANDOFF.value
+    assert row["completed_at"] is not None
+
+
+def test_duplicate_run_reports_build_queued_as_terminal(
+    db_connection: sqlite3.Connection,
+) -> None:
+    """A run resting at BUILD_QUEUED is reported terminal by the duplicate sentinel."""
+    store = SqlitePlanningRunStore(db_connection, target_terminal_enabled=True)
+    _queue_and_run(store, "on-4")
+    store.transition("on-4", PlanningState.FEATURE_SPEC, actor_identity="w")
+    store.transition("on-4", PlanningState.FEATURE_PLAN, actor_identity="w")
+    store.transition("on-4", PlanningState.BUILD_QUEUED, actor_identity="w")
+
+    dup = store.record_queued(
+        correlation_id="on-4",
+        originating_user="alice",
+        expected_approver="bob",
+        request_text="feature",
+        triggered_by="cli",
+    )
+    assert isinstance(dup, DuplicateRun)
+    assert dup.existing_state == PlanningState.BUILD_QUEUED.value
+    assert dup.is_terminal is True

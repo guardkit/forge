@@ -39,7 +39,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from forge.planning.states import PlanningState, PLANNING_TRANSITIONS
+from forge.planning.states import PlanningState, planning_transitions_for
+
+
+# Terminal states that set ``completed_at`` and count as terminal for the
+# duplicate-run sentinel. BUILD_QUEUED is the target-terminal (Lane B); it is
+# only ever reached when the target-terminal flag is on, so its presence here
+# is a byte-for-byte no-op for flag-off runs (they never reach it).
+_TERMINAL_STATES: frozenset[PlanningState] = frozenset(
+    {
+        PlanningState.FAILED,
+        PlanningState.CANCELLED,
+        PlanningState.TIMED_OUT,
+        PlanningState.PLANNED_HANDOFF,
+        PlanningState.BUILD_QUEUED,
+    }
+)
+_TERMINAL_STATE_VALUES: frozenset[str] = frozenset(
+    state.value for state in _TERMINAL_STATES
+)
 
 
 @dataclass(frozen=True)
@@ -69,15 +87,28 @@ class SqlitePlanningRunStore:
     create its own store instance with its own connection.
     """
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        target_terminal_enabled: bool = False,
+    ) -> None:
         """Initialize store with a SQLite connection.
 
         Parameters
         ----------
         connection:
-            A writable ``sqlite3.Connection`` with schema v3+ applied.
+            A writable ``sqlite3.Connection`` with schema v4+ applied.
+        target_terminal_enabled:
+            When ``False`` (default), the store enforces the shipped flag-OFF
+            transition table — behaviour is byte-for-byte unchanged and the
+            FEATURE_SPEC / FEATURE_PLAN / BUILD_QUEUED chain is unreachable.
+            When ``True`` (Lane B / Phase E1), the store enforces the additive
+            target-terminal table. The driver threads the
+            ``planning.target_terminal.enabled`` config flag through here.
         """
         self._connection = connection
+        self._transitions = planning_transitions_for(target_terminal_enabled)
         # Enable dict-like row access
         self._connection.row_factory = sqlite3.Row
 
@@ -126,12 +157,7 @@ class SqlitePlanningRunStore:
         existing = self._get_run(correlation_id)
         if existing is not None:
             existing_state = existing["state"]
-            is_terminal = existing_state in {
-                PlanningState.FAILED.value,
-                PlanningState.CANCELLED.value,
-                PlanningState.TIMED_OUT.value,
-                PlanningState.PLANNED_HANDOFF.value,
-            }
+            is_terminal = existing_state in _TERMINAL_STATE_VALUES
             return DuplicateRun(
                 existing_state=existing_state,
                 is_terminal=is_terminal,
@@ -178,12 +204,7 @@ class SqlitePlanningRunStore:
             existing = self._get_run(correlation_id)
             if existing is not None:
                 existing_state = existing["state"]
-                is_terminal = existing_state in {
-                    PlanningState.FAILED.value,
-                    PlanningState.CANCELLED.value,
-                    PlanningState.TIMED_OUT.value,
-                    PlanningState.PLANNED_HANDOFF.value,
-                }
+                is_terminal = existing_state in _TERMINAL_STATE_VALUES
                 return DuplicateRun(
                     existing_state=existing_state,
                     is_terminal=is_terminal,
@@ -207,11 +228,14 @@ class SqlitePlanningRunStore:
     ) -> TransitionRefused | None:
         """Execute a state transition via CAS (compare-and-swap).
 
-        Validates that the transition is allowed by :const:`PLANNING_TRANSITIONS`,
-        updates the planning_runs row, and records a planning_run_events entry.
+        Validates that the transition is allowed by the store's active
+        transition table (flag-OFF or the target-terminal table, selected at
+        construction), updates the planning_runs row, and records a
+        planning_run_events entry.
 
-        Terminal states (FAILED, CANCELLED, TIMED_OUT, PLANNED_HANDOFF) set
-        ``completed_at`` to the current timestamp.
+        Terminal states (FAILED, CANCELLED, TIMED_OUT, PLANNED_HANDOFF, and
+        BUILD_QUEUED when the target terminal is enabled) set ``completed_at``
+        to the current timestamp.
 
         Parameters
         ----------
@@ -262,7 +286,7 @@ class SqlitePlanningRunStore:
             )
 
         # Check if transition is allowed
-        allowed_next_states = PLANNING_TRANSITIONS.get(current_state, set())
+        allowed_next_states = self._transitions.get(current_state, set())
         if to_state not in allowed_next_states:
             return TransitionRefused(
                 current_state=current_state.value,
@@ -280,13 +304,7 @@ class SqlitePlanningRunStore:
             update_values.append(now)
 
         # Set completed_at on terminal transitions
-        terminal_states = {
-            PlanningState.FAILED,
-            PlanningState.CANCELLED,
-            PlanningState.TIMED_OUT,
-            PlanningState.PLANNED_HANDOFF,
-        }
-        if to_state in terminal_states:
+        if to_state in _TERMINAL_STATES:
             update_fields.append("completed_at = ?")
             update_values.append(now)
 

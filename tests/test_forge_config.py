@@ -247,6 +247,7 @@ class TestYamlRoundTrip:
                 "frontier_enabled": False,
                 "frontier_timeout_seconds": 30,
                 "model_resolution": {"model": None, "fallbacks": []},
+                "target_terminal": {"enabled": False},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages) — like
             # ``planning`` above, the unfiltered round-trip dump always includes
@@ -328,3 +329,44 @@ class TestMissingAllowlistMessage:
             err["type"] == "missing" and err["loc"] == ("permissions", "filesystem")
             for err in errors
         )
+
+
+# ---------------------------------------------------------------------------
+# Lane B / Phase E1 — planning.target_terminal flag (default-OFF, additive).
+# ---------------------------------------------------------------------------
+
+
+class TestTargetTerminalConfig:
+    """The Lane B target-terminal flag defaults off and is byte-no-op safe."""
+
+    def test_planning_config_has_target_terminal(self) -> None:
+        from forge.config.models import PlanningConfig
+
+        assert "target_terminal" in PlanningConfig.model_fields
+
+    def test_target_terminal_defaults_disabled(self) -> None:
+        from forge.config.models import PlanningConfig
+
+        cfg = PlanningConfig()
+        assert cfg.target_terminal.enabled is False
+
+    def test_target_terminal_defaults_disabled_from_root(self) -> None:
+        cfg = ForgeConfig.model_validate(
+            {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
+        )
+        assert cfg.planning.target_terminal.enabled is False
+
+    def test_target_terminal_can_be_enabled(self) -> None:
+        cfg = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                "planning": {"target_terminal": {"enabled": True}},
+            }
+        )
+        assert cfg.planning.target_terminal.enabled is True
+
+    def test_target_terminal_rejects_unknown_keys(self) -> None:
+        from forge.config.models import TargetTerminalConfig
+
+        with pytest.raises(ValidationError):
+            TargetTerminalConfig.model_validate({"enabled": False, "bogus": 1})
