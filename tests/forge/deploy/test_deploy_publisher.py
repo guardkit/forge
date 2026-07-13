@@ -23,6 +23,7 @@ from nats_core.events import (
     DeployCompletePayload,
     DeployFailedPayload,
     DeployQueuedPayload,
+    DeployRevertedPayload,
     LiveGateResultPayload,
     QAVerdictPayload,
 )
@@ -63,6 +64,7 @@ class TestPublisherSurface:
             "publish_deploy_started",
             "publish_deploy_complete",
             "publish_deploy_failed",
+            "publish_deploy_reverted",
             "publish_qa_verdict",
             "publish_live_gate_result",
         ],
@@ -126,6 +128,24 @@ class TestPublishContract:
         assert subject == f"deploy.failed.{CID}"
         assert envelope["payload"]["failed_step"] == "health_check"
         assert envelope["payload"]["status"] == "failed"
+
+    def test_deploy_reverted_subject_and_event_type(
+        self, publisher: DeployPublisher, nats_client: AsyncMock
+    ) -> None:
+        payload = DeployRevertedPayload(
+            correlation_id=CID,
+            env_id="e",
+            deploy_run_id="run-1",
+            reverted_to_image_ref="app:rollback-20260713",
+            failing_verdict="fail",
+            reverted_at=NOW,
+        )
+        asyncio.run(publisher.publish_deploy_reverted(payload))
+        subject, envelope = _decode(nats_client.publish.call_args)
+        assert subject == f"deploy.reverted.{CID}"
+        assert envelope["event_type"] == EventType.DEPLOY_REVERTED.value
+        assert envelope["payload"]["reverted_to_image_ref"] == "app:rollback-20260713"
+        assert envelope["payload"]["status"] == "reverted"
 
     def test_qa_verdict_subject(
         self, publisher: DeployPublisher, nats_client: AsyncMock

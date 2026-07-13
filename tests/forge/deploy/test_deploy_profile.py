@@ -158,3 +158,28 @@ class TestLoadErrors:
         p.write_text("- a\n- b\n", encoding="utf-8")
         with pytest.raises(DeployProfileError, match="mapping"):
             load_deploy_profile(p)
+
+
+class TestRollbackImageRef:
+    """O-32 — the profile carries the kept :rollback-* image ref."""
+
+    def test_rollback_ref_parsed_and_exposed(self) -> None:
+        p = parse_deploy_profile(
+            {
+                "env_id": "e",
+                "compose": {"file": "dc.yml"},
+                "rollback_image_ref": "app:rollback-20260713",
+            }
+        )
+        assert p.rollback_image_ref == "app:rollback-20260713"
+        assert p.rollback_ref == "app:rollback-20260713"
+
+    def test_rollback_ref_absent_is_none(self) -> None:
+        p = parse_deploy_profile({"env_id": "e", "compose": {"file": "dc.yml"}})
+        assert p.rollback_ref is None
+
+    def test_empty_rollback_ref_rejected(self) -> None:
+        with pytest.raises(DeployProfileError, match="rollback_image_ref"):
+            parse_deploy_profile(
+                {"env_id": "e", "compose": {"file": "dc.yml"}, "rollback_image_ref": "  "}
+            )

@@ -145,6 +145,12 @@ class DeployProfile:
         health_checks: Post-deploy health checks.
         broker_contract_ref: Ref to the F6 broker-contract section (pre-flight).
         reservation: The environment-reservation lease request, or None.
+        rollback_image_ref: The kept ``:rollback-*`` image tag re-deployed on a
+            FAILED post-deploy live-gate (O-32). Names only the image ref (e.g.
+            ``study-tutor:rollback-20260713``); the profile's deploy script
+            consumes it (env/compose IMAGE var) to bring the prior build back up.
+            When absent, a revert is a LOUD terminal failure — never a silent
+            keep-serving of the failed build.
         cwd: Working directory for subprocess steps (repo-relative or absolute).
         source_ref: Path the profile was loaded from (for deploy_profile_ref).
     """
@@ -159,6 +165,7 @@ class DeployProfile:
     health_checks: tuple[HealthCheck, ...] = ()
     broker_contract_ref: str | None = None
     reservation: Reservation | None = None
+    rollback_image_ref: str | None = None
     cwd: str | None = None
     source_ref: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -172,6 +179,17 @@ class DeployProfile:
     def reservation_resource(self) -> str | None:
         """The reservation resource name (for the B7 payload), or None."""
         return self.reservation.resource if self.reservation else None
+
+    @property
+    def rollback_ref(self) -> str | None:
+        """The rollback image ref to re-deploy on a gate fail (O-32), or None.
+
+        Carries the explicit ``rollback_image_ref`` when the profile sets one.
+        A property (not just the field) so a future derivation rule (e.g. a
+        ``<image>:rollback-*`` convention keyed on ``env_id``) has one seam to
+        land in without touching the runner.
+        """
+        return self.rollback_image_ref
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +399,15 @@ def parse_deploy_profile(
         for i, entry in enumerate(data.get("secret_injection") or [])
     )
 
+    rollback_image_ref = data.get("rollback_image_ref")
+    if rollback_image_ref is not None and (
+        not isinstance(rollback_image_ref, str) or not rollback_image_ref.strip()
+    ):
+        raise DeployProfileError(
+            "rollback_image_ref must be a non-empty string when present "
+            "(the kept :rollback-* image tag re-deployed on a gate fail)"
+        )
+
     known_keys = {
         "env_id",
         "compose",
@@ -392,6 +419,7 @@ def parse_deploy_profile(
         "health_checks",
         "broker_contract_ref",
         "reservation",
+        "rollback_image_ref",
         "cwd",
     }
     extra = {k: v for k, v in data.items() if k not in known_keys}
@@ -407,6 +435,9 @@ def parse_deploy_profile(
         health_checks=_parse_health_checks(data.get("health_checks")),
         broker_contract_ref=data.get("broker_contract_ref"),
         reservation=_parse_reservation(data.get("reservation")),
+        rollback_image_ref=rollback_image_ref.strip()
+        if isinstance(rollback_image_ref, str)
+        else None,
         cwd=data.get("cwd"),
         source_ref=source_ref,
         extra=extra,

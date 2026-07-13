@@ -1,17 +1,17 @@
 """Outbound deploy-domain lifecycle publisher (WS2-B8).
 
-Owns the six publish methods for the deploy stage's lifecycle events, one per
+Owns the seven publish methods for the deploy stage's lifecycle events, one per
 subject in the ``deploy.*.{correlation_id}`` family (``Topics.Deploy``,
-nats-core 0.7.0 / B7). Mirrors :class:`forge.adapters.nats.runbook_publisher.RunbookPublisher`
-exactly — thin, fire-and-forget, PubAck is informational only (LES1 parity),
-transport failures raise :class:`PublishFailure`, every envelope carries
-``source_id="forge"``.
+nats-core 0.7.1 / B7 + the O-32 revert receipt). Mirrors
+:class:`forge.adapters.nats.runbook_publisher.RunbookPublisher` exactly — thin,
+fire-and-forget, PubAck is informational only (LES1 parity), transport failures
+raise :class:`PublishFailure`, every envelope carries ``source_id="forge"``.
 
-The payloads (``DeployQueued/Started/Complete/Failed``, ``QAVerdictPayload``,
-``LiveGateResultPayload``) are consumed from nats-core 0.7.0 **verbatim** — no
-B7 schema edits (WS2-B8 guardrail). These are NOTIFICATIONS: forge's
-authoritative live-gate input stays the seam stdout envelope; the bus payloads
-never trigger forge.
+The payloads (``DeployQueued/Started/Complete/Failed/Reverted``,
+``QAVerdictPayload``, ``LiveGateResultPayload``) are consumed from nats-core
+0.7.1 **verbatim** — no schema edits here (WS2-B8 guardrail). These are
+NOTIFICATIONS: forge's authoritative live-gate input stays the seam stdout
+envelope; the bus payloads never trigger forge.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from nats_core.events import (
     DeployCompletePayload,
     DeployFailedPayload,
     DeployQueuedPayload,
+    DeployRevertedPayload,
     DeployStartedPayload,
     LiveGateResultPayload,
     QAVerdictPayload,
@@ -75,6 +76,10 @@ class DeployPublisher:
         "publish_deploy_failed": (
             Topics.Deploy.DEPLOY_FAILED,
             EventType.DEPLOY_FAILED,
+        ),
+        "publish_deploy_reverted": (
+            Topics.Deploy.DEPLOY_REVERTED,
+            EventType.DEPLOY_REVERTED,
         ),
         "publish_qa_verdict": (Topics.Deploy.QA_VERDICT, EventType.QA_VERDICT),
         "publish_live_gate_result": (
@@ -170,6 +175,14 @@ class DeployPublisher:
         await self._publish_envelope(
             subject_template=Topics.Deploy.DEPLOY_FAILED,
             event_type=EventType.DEPLOY_FAILED,
+            payload=payload,
+        )
+
+    async def publish_deploy_reverted(self, payload: DeployRevertedPayload) -> None:
+        """Publish ``deploy.reverted.{correlation_id}`` (O-32 revert-on-gate-fail)."""
+        await self._publish_envelope(
+            subject_template=Topics.Deploy.DEPLOY_REVERTED,
+            event_type=EventType.DEPLOY_REVERTED,
             payload=payload,
         )
 

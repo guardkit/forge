@@ -19,6 +19,7 @@ from nats_core.events import (
     DeployCompletePayload,
     DeployFailedPayload,
     DeployQueuedPayload,
+    DeployRevertedPayload,
     DeployStartedPayload,
     LiveGateResultPayload,
     QAVerdictPayload,
@@ -26,7 +27,11 @@ from nats_core.events import (
 
 from forge.config.models import DeployStageConfig
 from forge.deploy.deploy_record import render_deploy_record  # noqa: F401 (import smoke)
-from forge.deploy.live_gate import DryRunBrokerInspector, DryRunLiveGateInvoker
+from forge.deploy.live_gate import (
+    DryRunBrokerInspector,
+    DryRunLiveGateInvoker,
+    LiveGateInvocation,
+)
 from forge.deploy.profile import load_deploy_profile, parse_deploy_profile
 from forge.deploy.reservation import InProcessReservationLease
 from forge.deploy.stage import DeployStageRunner
@@ -79,11 +84,33 @@ class RecordingDeployPublisher:
     async def publish_deploy_failed(self, p: DeployFailedPayload) -> None:
         self.events.append(("DeployFailed", p))
 
+    async def publish_deploy_reverted(self, p: DeployRevertedPayload) -> None:
+        self.events.append(("DeployReverted", p))
+
     async def publish_qa_verdict(self, p: QAVerdictPayload) -> None:
         self.events.append(("QAVerdict", p))
 
     async def publish_live_gate_result(self, p: LiveGateResultPayload) -> None:
         self.events.append(("LiveGateResult", p))
+
+
+class _FixedVerdictLiveGateInvoker:
+    """A live-gate invoker that returns a fixed (non-pass) verdict — for O-32."""
+
+    def __init__(self, verdict: str = "fail") -> None:
+        self._verdict = verdict
+
+    def invoke(
+        self, *, feature: str, target: str, gates: tuple[str, ...] = ()
+    ) -> LiveGateInvocation:
+        return LiveGateInvocation(
+            verdict=self._verdict,
+            run_id=f"run-{feature}",
+            gate_ids=tuple(gates),
+            evidence_index_ref="ev/idx.json",
+            dry_run=False,
+            detail={},
+        )
 
 
 def _runner(
@@ -96,13 +123,14 @@ def _runner(
     reservation: InProcessReservationLease | None = None,
     presence_resolver=None,
     config: DeployStageConfig | None = None,
+    live_gate_invoker: Any = None,
 ) -> DeployStageRunner:
     return DeployStageRunner(
         repository=repository,
         runbook_publisher=runbook_publisher,
         deploy_publisher=deploy_publisher,
         reservation=reservation or InProcessReservationLease(),
-        live_gate_invoker=DryRunLiveGateInvoker(),
+        live_gate_invoker=live_gate_invoker or DryRunLiveGateInvoker(),
         broker_inspector=DryRunBrokerInspector(),
         config=config or DeployStageConfig(),
         deploy_record_root=str(tmp_path / "state"),
@@ -110,6 +138,16 @@ def _runner(
         clock=lambda: FIXED,
         presence_resolver=presence_resolver,
     )
+
+
+def _profile_with_rollback(rollback_image_ref: str | None) -> Any:
+    raw: dict[str, Any] = {
+        "env_id": "study-tutor-prod",
+        "compose": {"file": "docker-compose.yml", "script": "deploy.sh"},
+    }
+    if rollback_image_ref is not None:
+        raw["rollback_image_ref"] = rollback_image_ref
+    return parse_deploy_profile(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -351,3 +389,131 @@ class TestEscalationMapping:
         assert result.detail.get("reason") == "awaiting_approval"
         # An approval pause is NOT a DeployFailed.
         assert "DeployFailed" not in result.events
+
+
+# ---------------------------------------------------------------------------
+# O-32 — revert-on-gate-fail (the endpoint's word "verified", enforced)
+# ---------------------------------------------------------------------------
+
+
+class TestRevertOnGateFail:
+    @pytest.mark.asyncio
+    async def test_verdict_fail_reverts_to_rollback_and_publishes_reverted(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        # A live-gate verdict != "pass" + a profile carrying a rollback ref:
+        # the runner re-deploys the kept :rollback-* tag and publishes
+        # DeployReverted; the stage outcome is the FAILED+reverted truth, not
+        # the old outcome="complete" regardless of verdict.
+        deploy_pub = RecordingDeployPublisher()
+        profile = _profile_with_rollback("study-tutor:rollback-20260713")
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            deploy_pub,
+            tmp_path,
+            live_gate_invoker=_FixedVerdictLiveGateInvoker("fail"),
+        )
+        result = await runner.run_deploy(
+            profile,
+            correlation_id="corr-rev",
+            deploy_run_id="deployrun-rev",
+            feature="FEAT-9A21",
+            feat_id="FEAT-9A21",
+        )
+
+        assert result.outcome == "reverted"
+        assert result.verdict == "fail"
+        # The revert receipt fired AFTER the failing live-gate result.
+        names = [n for n, _ in deploy_pub.events]
+        assert names == [
+            "DeployQueued",
+            "DeployStarted",
+            "DeployComplete",
+            "QAVerdict",
+            "LiveGateResult",
+            "DeployReverted",
+        ]
+        assert result.events == tuple(names)
+        # NO honest-green complete: the deploy did not stay serving.
+        reverted = [p for n, p in deploy_pub.events if n == "DeployReverted"][0]
+        assert isinstance(reverted, DeployRevertedPayload)
+        assert reverted.reverted_to_image_ref == "study-tutor:rollback-20260713"
+        assert reverted.failing_verdict == "fail"
+        assert reverted.failing_verdict_ref == "ev/idx.json"
+        assert reverted.env_id == "study-tutor-prod"
+        # A revert runbook actually ran through the SAME executor + seam.
+        revert_rb = repository.load_runbook(
+            "revert-deployrun-rev", correlation_id="corr-rev"
+        )
+        assert revert_rb is not None
+        step = revert_rb.steps[0]
+        assert step.step_type == "deploy_compose"
+        assert step.result is not None
+        # Dry-run records the rollback image ref it would bring up (the intent).
+        assert (
+            step.result.payload["would_deploy_compose"]["rollback_image_ref"]
+            == "study-tutor:rollback-20260713"
+        )
+        # An honest F7 record with the reverted status.
+        body = Path(result.deploy_record_ref).read_text(encoding="utf-8")
+        assert "**status**: reverted" in body
+
+    @pytest.mark.asyncio
+    async def test_verdict_pass_does_not_revert(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        # The happy path stays untouched: a passing gate never reverts and never
+        # builds a revert runbook.
+        deploy_pub = RecordingDeployPublisher()
+        profile = _profile_with_rollback("study-tutor:rollback-20260713")
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            deploy_pub,
+            tmp_path,
+            live_gate_invoker=_FixedVerdictLiveGateInvoker("pass"),
+        )
+        result = await runner.run_deploy(
+            profile, correlation_id="corr-ok", deploy_run_id="deployrun-ok"
+        )
+        assert result.outcome == "complete"
+        assert result.verdict == "pass"
+        assert "DeployReverted" not in result.events
+        assert (
+            repository.load_runbook(
+                "revert-deployrun-ok", correlation_id="corr-ok"
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_fail_with_no_rollback_ref_is_loud_terminal_failure(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        # A gate fail but the profile carries NO rollback ref: LOUD terminal
+        # failure naming the missing ref — never a silent keep-serving. No
+        # DeployReverted (nothing was reverted); DeployFailed with failed_step
+        # "revert".
+        deploy_pub = RecordingDeployPublisher()
+        profile = _profile_with_rollback(None)
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            deploy_pub,
+            tmp_path,
+            live_gate_invoker=_FixedVerdictLiveGateInvoker("fail"),
+        )
+        result = await runner.run_deploy(
+            profile, correlation_id="corr-norr", deploy_run_id="deployrun-norr"
+        )
+        assert result.outcome == "failed"
+        assert result.failed_step == "revert"
+        assert result.verdict == "fail"
+        assert "DeployReverted" not in result.events
+        assert "DeployFailed" in result.events
+        failed = [p for n, p in deploy_pub.events if n == "DeployFailed"][0]
+        assert failed.failed_step == "revert"
+        assert failed.recoverable is False
+        assert "rollback_image_ref" in failed.failure_reason
+        assert result.detail.get("reason") == "missing_rollback_ref"

@@ -11,7 +11,15 @@ scope-§4 event flow for one feature, end to end:
       → DeployComplete   [or DeployFailed + record addendum on step failure]
       → LIVE_GATE runbook (run_live_gate → guardkit qa live-gate via the seam)
       → QAVerdict + LiveGateResult
+      → [O-32] on verdict != "pass": REVERT runbook (re-deploy the kept
+        :rollback-* tag via the same seam) → DeployReverted; outcome="reverted"
     reservation.release   (always, in finally)
+
+O-32 (the endpoint's word "verified", enforced): a FAILED post-deploy live-gate
+means the current build is NOT verified, so the runner rolls back — it does not
+return ``outcome="complete"`` regardless of the verdict. If the profile carries
+no rollback image ref, the revert is a LOUD terminal failure (``outcome="failed"``,
+``failed_step="revert"``) — never a silent keep-serving of the failed build.
 
 Config-gated: the DeployStageRunner is only *constructed and driven* when
 ``deploy.enabled`` is true (default False — inert in production until V1). The
@@ -37,6 +45,7 @@ from nats_core.events import (
     DeployCompletePayload,
     DeployFailedPayload,
     DeployQueuedPayload,
+    DeployRevertedPayload,
     DeployStartedPayload,
     LiveGateResultPayload,
     QAVerdictPayload,
@@ -60,6 +69,7 @@ from forge.deploy.reservation import (
 from forge.deploy.runbook_builder import (
     build_deploy_runbook,
     build_live_gate_runbook,
+    build_revert_runbook,
 )
 from forge.deploy.steps import SecretPresenceResolver, register_deploy_handlers
 from forge.executor.executor import RunbookExecutor, RunResult
@@ -81,8 +91,11 @@ class DeployStageResult:
     """The outcome of one deploy-stage run.
 
     Attributes:
-        outcome: "complete" (deploy + optional gate ran), "failed" (a deploy
-            step failed), or "escalated" (an irreversible-edge approval pause).
+        outcome: "complete" (deploy + optional gate PASSED), "reverted" (the
+            live-gate verdict != pass and the deploy was rolled back to the kept
+            :rollback-* image — O-32), "failed" (a deploy or revert step failed,
+            including a gate-fail with no rollback ref to revert to), or
+            "escalated" (an irreversible-edge approval pause).
         deploy_run_id: The raw forge run id for this DEPLOY execution.
         deploy_record_ref: Path of the written F7 record (None if not written).
         verdict: The live-gate verdict (None if the gate did not run).
@@ -309,14 +322,41 @@ class DeployStageRunner:
             # --- LIVE_GATE (optional) --------------------------------------
             verdict: str | None = None
             live_gate_runbook_id: str | None = None
+            failing_verdict_ref: str | None = None
             if self._config.run_live_gate:
-                verdict, live_gate_runbook_id = await self._run_live_gate(
+                (
+                    verdict,
+                    live_gate_runbook_id,
+                    failing_verdict_ref,
+                ) = await self._run_live_gate(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
                     feature=feature or (feat_id or profile.env_id),
                     feat_id=feat_id,
                     task_id=task_id,
+                    events=events,
+                )
+
+            # --- [O-32] revert-on-gate-fail --------------------------------
+            # A live-gate verdict that is not "pass" means the current build is
+            # NOT verified. The endpoint's word "verified" is enforced, not
+            # decorative: roll back to the kept :rollback-* image rather than
+            # keep serving the failed build. (instrument_fail/environment_fail
+            # are also != "pass" — an un-run gate is not a verified deploy.)
+            if verdict is not None and verdict != "pass":
+                return await self._run_revert(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    profile_ref=profile_ref,
+                    deployer=deployer,
+                    failing_verdict=verdict,
+                    failing_verdict_ref=failing_verdict_ref,
+                    deploy_runbook_id=deploy_runbook.runbook_id,
+                    live_gate_runbook_id=live_gate_runbook_id,
                     events=events,
                 )
 
@@ -413,8 +453,13 @@ class DeployStageRunner:
         feat_id: str | None,
         task_id: str | None,
         events: list[str],
-    ) -> tuple[str | None, str | None]:
-        """Run the LIVE_GATE runbook and publish QAVerdict + LiveGateResult."""
+    ) -> tuple[str | None, str | None, str | None]:
+        """Run the LIVE_GATE runbook and publish QAVerdict + LiveGateResult.
+
+        Returns ``(verdict, live_gate_runbook_id, failing_verdict_ref)`` — the
+        evidence ref (F5 index, falling back to the run id) lets the O-32 revert
+        receipt cite the failing gate.
+        """
         gate_runbook = build_live_gate_runbook(
             profile,
             runbook_id=f"live-gate-{deploy_run_id}",
@@ -438,7 +483,7 @@ class DeployStageRunner:
                 "live-gate step did not produce a verdict (run=%s)",
                 run_result.status,
             )
-            return None, gate_runbook.runbook_id
+            return None, gate_runbook.runbook_id, None
 
         verdict = str(payload.get("verdict", "environment_fail"))
         assertions = tuple(
@@ -481,7 +526,197 @@ class DeployStageRunner:
             ),
         )
         events.append("LiveGateResult")
-        return verdict, gate_runbook.runbook_id
+        failing_verdict_ref = common["evidence_index_ref"] or common["run_id"]
+        return verdict, gate_runbook.runbook_id, failing_verdict_ref
+
+    async def _run_revert(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feat_id: str | None,
+        task_id: str | None,
+        profile_ref: str | None,
+        deployer: str,
+        failing_verdict: str,
+        failing_verdict_ref: str | None,
+        deploy_runbook_id: str,
+        live_gate_runbook_id: str | None,
+        events: list[str],
+    ) -> DeployStageResult:
+        """[O-32] Roll back a build whose live-gate verdict was not "pass".
+
+        Re-deploys the kept ``:rollback-*`` image through the SAME deploy seam and
+        publishes DeployReverted (``outcome="reverted"``). Two loud terminal
+        failures guard against a silent keep-serving of the unverified build:
+        a profile with no rollback ref, and a revert re-deploy that itself fails
+        — both return ``outcome="failed"`` with ``failed_step="revert"`` and a
+        DeployFailed naming the cause.
+        """
+        rollback_ref = profile.rollback_ref
+        when = self._clock()
+
+        # No rollback ref → cannot revert. LOUD terminal failure naming the
+        # missing ref; never silently keep serving the failed build.
+        if not rollback_ref:
+            reason = (
+                f"live-gate verdict {failing_verdict!r} != 'pass' but the deploy "
+                f"profile for {profile.env_id!r} carries NO rollback image ref "
+                "(rollback_image_ref); cannot revert — refusing to keep serving "
+                "the unverified build"
+            )
+            logger.error("O-32 revert impossible: %s", reason)
+            await self._safe_publish(
+                self._deploy_publisher.publish_deploy_failed,
+                DeployFailedPayload(
+                    correlation_id=correlation_id,
+                    env_id=profile.env_id,
+                    deploy_run_id=deploy_run_id,
+                    failed_step="revert",
+                    failure_reason=reason,
+                    recoverable=False,
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    deploy_record_ref=None,
+                    deploy_profile_ref=profile_ref,
+                    runbook_ref=live_gate_runbook_id,
+                    hosts=profile.host_names or None,
+                    reservation_resource=profile.reservation_resource,
+                    failed_at=when,
+                ),
+            )
+            events.append("DeployFailed")
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                verdict=failing_verdict,
+                failed_step="revert",
+                events=tuple(events),
+                deploy_runbook_id=deploy_runbook_id,
+                live_gate_runbook_id=live_gate_runbook_id,
+                dry_run=self._dry_run,
+                detail={
+                    "reason": "missing_rollback_ref",
+                    "failing_verdict": failing_verdict,
+                },
+            )
+
+        # Re-deploy the kept rollback image through the same deploy seam.
+        revert_runbook = build_revert_runbook(
+            profile,
+            runbook_id=f"revert-{deploy_run_id}",
+            target=profile.env_id,
+            rollback_image_ref=rollback_ref,
+            now=self._clock(),
+        )
+        run_result = await self._run_runbook(revert_runbook, correlation_id)
+        executed = self._repo.load_runbook(
+            revert_runbook.runbook_id, correlation_id=correlation_id
+        )
+
+        # The revert re-deploy itself failed → the loudest failure (the target is
+        # now in an unknown serving state). DeployFailed, outcome="failed".
+        if run_result.status != "complete":
+            reason = (
+                f"O-32 revert of {profile.env_id!r} to {rollback_ref!r} FAILED "
+                f"(revert runbook status={run_result.status!r}); the target may be "
+                "serving an unverified build — manual intervention required"
+            )
+            logger.error(reason)
+            record_ref: str | None = None
+            try:
+                record_ref = self._write_record(
+                    profile,
+                    executed=executed,
+                    deploy_run_id=deploy_run_id,
+                    deployer=deployer,
+                    profile_ref=profile_ref,
+                    task_id=task_id,
+                    status="revert_failed",
+                    when=when,
+                )
+            except Exception as exc:  # noqa: BLE001 — record is best-effort
+                logger.info("no F7 record for failed revert: %s", exc)
+            await self._safe_publish(
+                self._deploy_publisher.publish_deploy_failed,
+                DeployFailedPayload(
+                    correlation_id=correlation_id,
+                    env_id=profile.env_id,
+                    deploy_run_id=deploy_run_id,
+                    failed_step="revert",
+                    failure_reason=reason,
+                    recoverable=False,
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    deploy_record_ref=record_ref,
+                    deploy_profile_ref=profile_ref,
+                    runbook_ref=revert_runbook.runbook_id,
+                    hosts=profile.host_names or None,
+                    reservation_resource=profile.reservation_resource,
+                    failed_at=when,
+                ),
+            )
+            events.append("DeployFailed")
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                deploy_record_ref=record_ref,
+                verdict=failing_verdict,
+                failed_step="revert",
+                events=tuple(events),
+                deploy_runbook_id=deploy_runbook_id,
+                live_gate_runbook_id=live_gate_runbook_id,
+                dry_run=self._dry_run,
+                detail={
+                    "reason": "revert_failed",
+                    "rollback_image_ref": rollback_ref,
+                },
+            )
+
+        # Revert succeeded → honest F7 record + DeployReverted receipt.
+        reverted_at = self._clock()
+        record_ref = self._write_record(
+            profile,
+            executed=executed,
+            deploy_run_id=deploy_run_id,
+            deployer=deployer,
+            profile_ref=profile_ref,
+            task_id=task_id,
+            status="reverted",
+            when=reverted_at,
+        )
+        await self._safe_publish(
+            self._deploy_publisher.publish_deploy_reverted,
+            DeployRevertedPayload(
+                correlation_id=correlation_id,
+                env_id=profile.env_id,
+                deploy_run_id=deploy_run_id,
+                reverted_to_image_ref=rollback_ref,
+                failing_verdict=failing_verdict,
+                feat_id=feat_id,
+                task_id=task_id,
+                failing_verdict_ref=failing_verdict_ref,
+                deploy_record_ref=record_ref,
+                deploy_profile_ref=profile_ref,
+                revert_runbook_ref=revert_runbook.runbook_id,
+                hosts=profile.host_names or None,
+                reservation_resource=profile.reservation_resource,
+                reverted_at=reverted_at,
+            ),
+        )
+        events.append("DeployReverted")
+        return DeployStageResult(
+            outcome="reverted",
+            deploy_run_id=deploy_run_id,
+            deploy_record_ref=record_ref,
+            verdict=failing_verdict,
+            events=tuple(events),
+            deploy_runbook_id=deploy_runbook_id,
+            live_gate_runbook_id=live_gate_runbook_id,
+            dry_run=self._dry_run,
+            detail={"reverted_to": rollback_ref},
+        )
 
     async def _on_deploy_not_complete(
         self,

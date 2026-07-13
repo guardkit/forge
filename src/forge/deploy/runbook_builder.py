@@ -33,6 +33,7 @@ from forge.persistence.repositories.runbook_models import Runbook, Step, StepSta
 __all__ = [
     "build_deploy_runbook",
     "build_live_gate_runbook",
+    "build_revert_runbook",
     "deploy_runbook_step_types",
 ]
 
@@ -190,6 +191,54 @@ def build_deploy_runbook(
         runbook_id=runbook_id,
         target=target,
         steps=tuple(steps),
+        current_step_index=0,
+        status=StepStatus.pending,
+        created_at=now,
+    )
+
+
+def build_revert_runbook(
+    profile: DeployProfile,
+    *,
+    runbook_id: str,
+    target: str,
+    rollback_image_ref: str,
+    now: datetime,
+) -> Runbook:
+    """Render the REVERT runbook (O-32) — re-deploy the kept ``:rollback-*`` tag.
+
+    A FAILED post-deploy live-gate means the current build is NOT verified, so
+    the runner rolls back by re-deploying the prior image through the SAME deploy
+    seam. The revert is a single focused ``deploy_compose`` step (the prior
+    build's compose invocation carrying the rollback image ref) — deliberately
+    NOT the full DEPLOY pre-flight (broker_preflight/inject_secrets/seed/warm):
+    a rollback re-serves a known-good image, it does not re-provision. The
+    ``rollback_image_ref`` rides in the step params so a dry-run records the
+    intent (the hermetic gate) and the profile's deploy script consumes it (env /
+    compose IMAGE var) on a live revert.
+
+    Args:
+        profile: The parsed deploy profile (its compose invocation is reused).
+        runbook_id: Unique id for this runbook (typically ``revert-<deploy_run_id>``).
+        target: The runbook target (typically the profile ``env_id``).
+        rollback_image_ref: The kept ``:rollback-*`` image tag to bring back up.
+        now: Creation timestamp (injected clock).
+    """
+    compose_params: dict[str, Any] = {
+        "cwd": profile.cwd,
+        "compose_file": profile.compose.file,
+        "compose_profile": profile.compose.profile,
+        "rollback_image_ref": rollback_image_ref,
+        "revert": True,
+    }
+    if profile.compose.script is not None:
+        compose_params["script"] = profile.compose.script
+    if profile.compose.env_file is not None:
+        compose_params["env_file"] = profile.compose.env_file
+    return Runbook(
+        runbook_id=runbook_id,
+        target=target,
+        steps=(_step("deploy_compose", compose_params, 0),),
         current_step_index=0,
         status=StepStatus.pending,
         created_at=now,
