@@ -142,6 +142,20 @@ SOURCE_AGENT_HEADER: str = "source_agent_id"
 #: Fixed source identifier stamped on every dispatch command.
 REQUESTING_AGENT_ID: str = "forge"
 
+#: Deployed verb the specialist routes a **cooperative cancel** on (O-01).
+#: Published on the SAME command subject as a dispatch
+#: (``agents.command.{agent_id}``) so a timed-out session can be told to
+#: abort and release its single ``-np 1`` seat before forge moves the run to
+#: terminal FAILED — killing the zombie-holds-the-seat class (run 0a645e36).
+#: It is a plain :class:`nats_core.events.CommandPayload` verb value (exactly
+#: like ``greenfield``); the ONE nats-core envelope + ``Topics.Agents.COMMAND``
+#: subject are reused, nothing new is put on the wire. The specialist-side
+#: handler that maps this verb + ``correlation_id`` onto the running session
+#: is the FWD-005 / specialist-repo follow-on (O-02); forge's obligation here
+#: is only to EMIT the cancel — an unknown verb is answered fire-and-forget
+#: with "Command not supported" and is harmless.
+CANCEL_COMMAND: str = "cancel"
+
 #: Default command verb used **only** when a caller does not resolve one — the
 #: production path (:func:`forge.pipeline.dispatchers.specialist.dispatch_specialist_stage`
 #: → :meth:`DispatchOrchestrator.dispatch`) ALWAYS passes the stage-resolved
@@ -155,6 +169,7 @@ REQUESTING_AGENT_ID: str = "forge"
 DISPATCH_COMMAND_PLACEHOLDER: str = "dispatch"
 
 __all__ = [
+    "CANCEL_COMMAND",
     "COMMAND_SUBJECT_TEMPLATE",
     "CORRELATION_KEY_HEADER",
     "DISPATCHED_AT_HEADER",
@@ -231,6 +246,15 @@ class DispatchCommandPublisher(Protocol):
         routes on (``greenfield`` for both specialist stages, per D1);
         ``command_args`` is the deployed-handler argument dict (e.g.
         ``{"problem_statement": ...}`` for the PO greenfield handler).
+        """
+        ...
+
+    async def publish_cancel(self, attempt: DispatchAttempt) -> None:
+        """Publish a cooperative cancel for a timed-out dispatch (O-01).
+
+        Fire-and-forget on ``agents.command.{attempt.matched_agent_id}`` so a
+        soft-timed-out specialist session aborts and releases its single seat
+        before forge moves the run to terminal FAILED.
         """
         ...
 
@@ -611,6 +635,80 @@ class NatsSpecialistDispatchAdapter:
                 "dispatch publish ok subject=%s correlation_key=%s",
                 subject,
                 attempt.correlation_key,
+            )
+
+    async def publish_cancel(self, attempt: DispatchAttempt) -> None:
+        """Publish a cooperative cancel on ``agents.command.{matched_agent_id}`` (O-01).
+
+        When a planning/dispatch session soft-times out, forge has stopped
+        waiting for the reply (the correlation binding is already released by
+        the :class:`~forge.dispatch.timeout.TimeoutCoordinator`) but the
+        specialist is still running the request, holding the single ``-np 1``
+        seat — the zombie-holds-the-seat class (run ``0a645e36``). This method
+        tells the specialist to abort that session and free the seat.
+
+        Wire shape (the ONE nats-core envelope — reuses the dispatch shapes,
+        invents nothing):
+
+        * Subject: :func:`command_subject_for`
+          (``agents.command.{matched_agent_id}`` — nats-core
+          ``Topics.Agents.COMMAND``), the SAME subject a dispatch rides.
+        * Body: a :class:`nats_core.envelope.MessageEnvelope` with
+          ``event_type=EventType.COMMAND`` (the router's step-1 gate) wrapping
+          a :class:`nats_core.events.CommandPayload` whose ``command`` is
+          :data:`CANCEL_COMMAND` and whose ``args`` + ``correlation_id`` carry
+          the timed-out ``attempt.correlation_key`` so the specialist can map
+          the cancel onto the running session.
+        * Headers: the same tracing triple as a dispatch — nothing depends on
+          them (D2).
+
+        Fire-and-forget (no ``reply_to``): forge does not wait on a cancel-ack
+        (that would re-introduce an unbounded wait, rule 5); the seat-release
+        is the specialist's cooperative response. PubAck, if any, is logged at
+        DEBUG only (C.pubAck-not-success). Publish failures are NOT swallowed
+        here — the pure-domain caller
+        (:meth:`forge.dispatch.orchestrator.DispatchOrchestrator.dispatch`)
+        owns the "cancel failed → still fail the run loudly, never hang"
+        policy so the timeout outcome is never masked.
+        """
+        subject = self.command_subject_for(attempt.matched_agent_id)
+        headers = {
+            CORRELATION_KEY_HEADER: attempt.correlation_key,
+            REQUESTING_AGENT_HEADER: REQUESTING_AGENT_ID,
+            DISPATCHED_AT_HEADER: self._clock.now().isoformat(),
+        }
+        command_payload = CommandPayload(
+            command=CANCEL_COMMAND,
+            args={"correlation_id": attempt.correlation_key},
+            correlation_id=attempt.correlation_key,
+        )
+        envelope = MessageEnvelope(
+            source_id=REQUESTING_AGENT_ID,
+            event_type=EventType.COMMAND,
+            correlation_id=attempt.correlation_key,
+            payload=command_payload.model_dump(),
+        )
+        body = envelope.model_dump_json().encode("utf-8")
+
+        ack = await self._nc.publish(subject, body, headers=headers)
+
+        # The receipt: name the subject + correlation + agent so a soft-timeout
+        # cancel is never a silent side-effect (route-and-notify, rule 4).
+        logger.info(
+            "dispatch.cancel_published subject=%s correlation_key=%s agent=%s "
+            "command=%s (soft_timeout — releasing the specialist seat)",
+            subject,
+            attempt.correlation_key,
+            attempt.matched_agent_id,
+            CANCEL_COMMAND,
+        )
+        if ack is not None:
+            logger.debug(
+                "dispatch cancel publish ack subject=%s correlation_key=%s "
+                "ack=%r (informational only)",
+                subject,
+                attempt.correlation_key,
+                ack,
             )
 
     # ------------------------------------------------------------------

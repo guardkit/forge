@@ -192,6 +192,16 @@ class _FakeDispatchPublisher:
             scheduled["payload"],
         )
 
+    async def publish_cancel(self, attempt: DispatchAttempt) -> None:
+        # This fake replies synchronously on publish, so the orchestrator's
+        # soft-timeout cancel branch (O-01) is never reached here. Recorded
+        # for completeness so the fake remains a full DispatchCommandPublisher.
+        from tests.bdd.conftest import _RecordedPublish
+
+        self._recorder.published.append(
+            _RecordedPublish("dispatch.cancel", {"attempt": attempt})
+        )
+
 
 class _RegistryWaitAdapter:
     """Adapter satisfying :class:`TimeoutCoordinator._RegistryLike`.

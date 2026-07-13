@@ -41,6 +41,7 @@ contract can assert on the wire-equivalent header.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
@@ -171,6 +172,16 @@ class FakePublisher:
         # Set by the seam test fixture so the publisher can verify the
         # write-before-send invariant at recording time.
         self._db_writer: Optional[SqliteHistoryWriter] = None
+        # O-01 cooperative-cancel recording. Each entry is the DispatchAttempt
+        # handed to ``publish_cancel`` (soft-timeout path). ``cancel_raises``,
+        # when set, is raised from ``publish_cancel`` so the failure-path test
+        # can prove the timeout still fails loudly and never hangs.
+        self.cancelled: list[DispatchAttempt] = []
+        self.cancel_raises: Optional[BaseException] = None
+        # Optional external ordering log so a test can prove the cancel is
+        # published BEFORE dispatch() returns its DispatchError (the strict
+        # precondition for the driver's terminal FAILED).
+        self.order_log: Optional[list[str]] = None
 
     def attach_db_writer(self, writer: SqliteHistoryWriter) -> None:
         """Hook the writer in so the seam test can prove "row exists"."""
@@ -217,6 +228,13 @@ class FakePublisher:
         )
         if self.on_publish is not None:
             self.on_publish(attempt, parameters)
+
+    async def publish_cancel(self, attempt: DispatchAttempt) -> None:
+        if self.order_log is not None:
+            self.order_log.append("cancel")
+        if self.cancel_raises is not None:
+            raise self.cancel_raises
+        self.cancelled.append(attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +713,167 @@ class TestLocalTimeoutPath:
         assert outcome.error_explanation == "local_timeout"
         # Persistence still occurred — write-before-send is satisfied
         # even when the wait times out.
+        assert len(db_writer.read_resolutions()) == 1
+
+
+# ---------------------------------------------------------------------------
+# O-01 — soft-timeout cooperative cancel (kill the zombie-holds-the-seat class)
+# ---------------------------------------------------------------------------
+
+
+class TestSoftTimeoutCancel:
+    """O-01 — on the hard cut-off, forge publishes exactly one cancel on the
+    command subject for the timed-out agent, BEFORE the run reaches terminal
+    FAILED, and the seat/slot bookkeeping is released — plus the cancel-publish
+    failure path still fails the run loudly and never hangs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_publishes_exactly_one_cancel_for_the_right_agent(
+        self,
+    ) -> None:
+        # (a) — a stubbed timed-out session publishes exactly one cancel on the
+        # right topic (agents.command.{matched_agent_id}) with the right shape.
+        publisher = FakePublisher()
+        orchestrator, cache, _r, transport, publisher, _db = (
+            await _build_orchestrator(
+                publisher=publisher, default_timeout_seconds=0.05
+            )
+        )
+        await _populate_cache(cache, agent_id="specialist-a", tool_name="review")
+
+        # No reply is ever emitted — the hard cut-off fires.
+        outcome = await orchestrator.dispatch(
+            capability="review", parameters=[]
+        )
+
+        assert isinstance(outcome, DispatchError)
+        assert outcome.error_explanation == "local_timeout"
+        # Exactly ONE cancel, targeting the resolved specialist. The transport
+        # (NatsSpecialistDispatchAdapter) turns the attempt into the
+        # agents.command.{agent} envelope; here we assert the domain contract:
+        # one cancel, carrying the timed-out agent + correlation.
+        assert len(publisher.cancelled) == 1
+        cancel_attempt = publisher.cancelled[0]
+        assert cancel_attempt.matched_agent_id == "specialist-a"
+        assert re.fullmatch(r"[0-9a-f]{32}", cancel_attempt.correlation_key)
+
+    @pytest.mark.asyncio
+    async def test_no_cancel_on_the_happy_reply_path(self) -> None:
+        # A session that replies in time has already released its seat — no
+        # cancel must be published (a cancel there would abort a finished run).
+        publisher = FakePublisher()
+        orchestrator, cache, _r, transport, publisher, _db = (
+            await _build_orchestrator(publisher=publisher)
+        )
+        await _populate_cache(cache)
+
+        dispatch_task = asyncio.create_task(
+            orchestrator.dispatch(capability="review", parameters=[])
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if transport.subscribed_keys:
+                break
+        key = transport.subscribed_keys[-1]
+        transport.emit_reply(
+            key,
+            source_agent_id="specialist-a",
+            payload={"agent_id": "specialist-a"},
+        )
+        outcome = await dispatch_task
+
+        assert isinstance(outcome, SyncResult)
+        assert publisher.cancelled == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_is_published_before_the_failed_signal(self) -> None:
+        # (b) — the cancel is published BEFORE the terminal FAILED transition.
+        # The orchestrator never transitions FAILED itself; the driver reaches
+        # FAILED only AFTER this dispatch() returns its DispatchError. So
+        # proving the cancel is recorded *before* dispatch() returns the
+        # DispatchError proves it is strictly before FAILED.
+        order_log: list[str] = []
+        publisher = FakePublisher()
+        publisher.order_log = order_log
+        orchestrator, cache, _r, _t, publisher, _db = await _build_orchestrator(
+            publisher=publisher, default_timeout_seconds=0.05
+        )
+        await _populate_cache(cache)
+
+        outcome = await orchestrator.dispatch(
+            capability="review", parameters=[]
+        )
+        order_log.append("dispatch_returned_error")
+
+        assert isinstance(outcome, DispatchError)
+        assert outcome.error_explanation == "local_timeout"
+        # Cancel recorded strictly before dispatch() surfaced the error that
+        # the driver later turns into the FAILED transition.
+        assert order_log == ["cancel", "dispatch_returned_error"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_releases_the_seat_slot_bookkeeping(self) -> None:
+        # (c) — the seat/slot bookkeeping shows released: the correlation
+        # binding's reply subscription is torn down (registry.release →
+        # transport.unsubscribe) AND the cancel command that frees the
+        # specialist-side seat was emitted, both on the timeout path.
+        publisher = FakePublisher()
+        orchestrator, cache, registry, transport, publisher, _db = (
+            await _build_orchestrator(
+                publisher=publisher, default_timeout_seconds=0.05
+            )
+        )
+        await _populate_cache(cache)
+
+        outcome = await orchestrator.dispatch(
+            capability="review", parameters=[]
+        )
+
+        assert isinstance(outcome, DispatchError)
+        assert len(publisher.cancelled) == 1
+        key = publisher.cancelled[0].correlation_key
+        # Forge-side seat released — proven two ways:
+        #  * the binding is dropped from the registry synchronously in
+        #    release(), so a late reply on this key now finds no binding;
+        assert key not in registry._bindings
+        #  * and the transport unsubscribe (scheduled as a background task by
+        #    release()) tears the shared reply subscription down. Drain the
+        #    loop so that scheduled task runs, then assert it fired.
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if key in transport.unsubscribed_keys:
+                break
+        assert key in transport.unsubscribed_keys
+
+    @pytest.mark.asyncio
+    async def test_cancel_publish_failure_still_fails_loudly_and_never_hangs(
+        self,
+    ) -> None:
+        # Failure path — the cancel publish itself blows up. The run must still
+        # reach the loud terminal error (local_timeout), never hang, never
+        # raise the transport error past the orchestrator boundary.
+        publisher = FakePublisher()
+        publisher.cancel_raises = RuntimeError("nats publish failed")
+        orchestrator, cache, _r, _t, publisher, db_writer = (
+            await _build_orchestrator(
+                publisher=publisher, default_timeout_seconds=0.05
+            )
+        )
+        await _populate_cache(cache)
+
+        # Bound the whole call so a hypothetical hang fails the test fast
+        # rather than stalling the suite.
+        outcome = await asyncio.wait_for(
+            orchestrator.dispatch(capability="review", parameters=[]),
+            timeout=5.0,
+        )
+
+        assert isinstance(outcome, DispatchError)
+        assert outcome.error_explanation == "local_timeout"
+        # The cancel attempt was made (and raised) — not silently skipped.
+        assert publisher.cancelled == []  # raised before recording
+        # Write-before-send still held even though the cancel failed.
         assert len(db_writer.read_resolutions()) == 1
 
 

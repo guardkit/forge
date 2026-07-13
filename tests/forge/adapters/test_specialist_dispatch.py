@@ -43,6 +43,7 @@ from nats_core.events import CommandPayload, ResultPayload
 
 from forge.adapters.nats import specialist_dispatch as sd_module
 from forge.adapters.nats.specialist_dispatch import (
+    CANCEL_COMMAND,
     COMMAND_SUBJECT_TEMPLATE,
     CORRELATION_KEY_HEADER,
     DISPATCH_COMMAND_PLACEHOLDER,
@@ -335,7 +336,12 @@ class TestPublicSurface:
     def test_adapter_exposes_three_lifecycle_methods(
         self, adapter: NatsSpecialistDispatchAdapter
     ) -> None:
-        for name in ("subscribe_reply", "unsubscribe_reply", "publish_dispatch"):
+        for name in (
+            "subscribe_reply",
+            "unsubscribe_reply",
+            "publish_dispatch",
+            "publish_cancel",
+        ):
             method = getattr(adapter, name, None)
             assert method is not None, f"missing method: {name}"
             assert asyncio.iscoroutinefunction(method), (
@@ -734,6 +740,82 @@ class TestDispatchDeployedVerb:
         # cmd_payload.correlation_id first, envelope.correlation_id second).
         assert command.correlation_id == key
         assert envelope.correlation_id == key
+
+
+# ---------------------------------------------------------------------------
+# O-01: publish_cancel — the soft-timeout cooperative cancel wire shape
+# ---------------------------------------------------------------------------
+
+
+class TestPublishCancel:
+    """O-01 — ``publish_cancel`` emits the ONE nats-core command envelope on
+    ``agents.command.{agent_id}`` so a timed-out session releases its seat.
+
+    The wire body is the SAME envelope shape a dispatch rides (reuses
+    ``MessageEnvelope`` + ``CommandPayload`` + ``Topics.Agents.COMMAND``);
+    only the verb differs (:data:`CANCEL_COMMAND`).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancel_uses_the_agent_command_subject(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        await adapter.publish_cancel(_make_attempt(matched_agent_id="po-agent"))
+        recorded = nats_client.published[-1]
+        assert recorded.subject == "agents.command.po-agent"
+        assert recorded.subject == COMMAND_SUBJECT_TEMPLATE.format(
+            agent_id="po-agent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_body_is_a_valid_command_envelope(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        key = "cd" * 16
+        await adapter.publish_cancel(_make_attempt(correlation_key=key))
+        envelope = MessageEnvelope.model_validate_json(
+            nats_client.published[-1].body
+        )
+        # The router's step-1 gate requires event_type == COMMAND to route.
+        assert envelope.event_type is EventType.COMMAND
+        assert envelope.source_id == REQUESTING_AGENT_ID == "forge"
+        assert envelope.correlation_id == key
+
+        command = CommandPayload.model_validate(envelope.payload)
+        # The cancel verb + the timed-out correlation the specialist maps onto
+        # the running session (specialist-side handler is the O-02 follow-on).
+        assert command.command == CANCEL_COMMAND == "cancel"
+        assert command.correlation_id == key
+        assert command.args == {"correlation_id": key}
+
+    @pytest.mark.asyncio
+    async def test_cancel_carries_the_tracing_headers(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        key = "ef" * 16
+        await adapter.publish_cancel(_make_attempt(correlation_key=key))
+        headers = nats_client.published[-1].headers or {}
+        assert headers[CORRELATION_KEY_HEADER] == key
+        assert headers[REQUESTING_AGENT_HEADER] == REQUESTING_AGENT_ID
+
+    @pytest.mark.asyncio
+    async def test_cancel_publish_error_propagates_to_the_caller(
+        self,
+        adapter: NatsSpecialistDispatchAdapter,
+        nats_client: FakeNATSClient,
+    ) -> None:
+        # The adapter does NOT swallow a publish failure — the pure-domain
+        # orchestrator owns the "cancel failed → still fail loudly" policy, so
+        # the transport error must surface to it rather than be hidden here.
+        nats_client.publish_raises = RuntimeError("broker down")
+        with pytest.raises(RuntimeError, match="broker down"):
+            await adapter.publish_cancel(_make_attempt())
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1329,7 @@ class TestModuleExports:
             "DISPATCHED_AT_HEADER",
             "SOURCE_AGENT_HEADER",
             "REQUESTING_AGENT_ID",
+            "CANCEL_COMMAND",
         ):
             assert name in sd_module.__all__, (
                 f"{name!r} missing from __all__"

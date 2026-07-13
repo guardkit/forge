@@ -105,6 +105,18 @@ class DispatchCommandPublisher(Protocol):
         """
         ...
 
+    async def publish_cancel(self, attempt: DispatchAttempt) -> None:
+        """Publish a cooperative cancel for a soft-timed-out dispatch (O-01).
+
+        Called by :meth:`DispatchOrchestrator.dispatch` on the hard cut-off
+        branch, BEFORE the run reaches terminal FAILED, so the specialist
+        aborts and releases its single seat instead of becoming a zombie. The
+        transport owns the wire shape (the ONE nats-core envelope on
+        ``agents.command.{agent_id}``); the orchestrator owns the "cancel
+        failed → still fail loudly, never hang" policy.
+        """
+        ...
+
 
 class DispatchOrchestrator:
     """Sequence one dispatch attempt: resolve → persist → bind → publish → wait → parse.
@@ -294,6 +306,33 @@ class DispatchOrchestrator:
                 resolution.resolution_id,
                 correlation_key,
             )
+            # O-01: the hard cut-off fired but the specialist is still running
+            # this request, holding its single seat (the zombie class, run
+            # 0a645e36). Publish a cooperative cancel on the command subject so
+            # the specialist aborts and releases the seat — and do it HERE, at
+            # the single timeout choke point, so it is strictly BEFORE the
+            # terminal FAILED transition (which the driver only reaches after
+            # this DispatchError propagates up through the SOFT_TIMEOUT
+            # translation). The binding's reply subscription is already torn
+            # down by the TimeoutCoordinator (registry.release in its finally),
+            # so the forge-side seat/slot bookkeeping is released; this cancel
+            # releases the specialist-side seat. Failure to publish the cancel
+            # must NOT mask the timeout or hang the run (rule 4 — loud terminal
+            # state): swallow-and-log, then still return the local_timeout
+            # error so the run fails loudly.
+            try:
+                await self._publisher.publish_cancel(attempt)
+            except Exception:  # noqa: BLE001 — cancel is best-effort; never mask the timeout
+                logger.warning(
+                    "dispatch.cancel_publish_failed resolution_id=%s "
+                    "correlation_key=%s agent=%s — the specialist seat may stay "
+                    "held until its own advisory timeout; failing the run "
+                    "loudly regardless",
+                    resolution.resolution_id,
+                    correlation_key,
+                    matched_id,
+                    exc_info=True,
+                )
             return DispatchError(
                 resolution_id=resolution.resolution_id,
                 attempt_no=attempt_no,
