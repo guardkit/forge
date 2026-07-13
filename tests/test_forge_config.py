@@ -273,6 +273,16 @@ class TestYamlRoundTrip:
                 "min_refuters": 2,
                 "record_dir": "qa",
             },
+            # ``resource_preflight`` was added by E2-S4 (O-27/O-29 run-entry
+            # memory/disk headroom preflight) — like ``deploy`` above, the
+            # unfiltered round-trip dump always includes it, so this test
+            # declares it with default values.
+            "resource_preflight": {
+                "enabled": True,
+                "min_available_memory_gb": 8.0,
+                "min_available_disk_gb": 20.0,
+                "working_path": None,
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],
