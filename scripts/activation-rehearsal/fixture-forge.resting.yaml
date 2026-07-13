@@ -1,0 +1,15 @@
+# Fixture forge config (RESTING state) for the G-09 activation-bundle rehearsal.
+# Sanitised representative of ~/forge-state/forge.yaml — planning OFF.
+# NOT a live config; contains no secrets (the approver is a public Slack member id).
+permissions:
+  filesystem:
+    allowlist:
+      - /srv/forge
+planning:
+  enabled: false
+  target_terminal:
+    enabled: false
+  originator_wait_seconds: 3600
+  escalated_wait_seconds: 14400
+  target_repo_paths:
+    guardkit/api_test: /srv/repos/api_test

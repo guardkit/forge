@@ -1,0 +1,65 @@
+{
+  "script": "scripts/activate_planning.py",
+  "purpose": "Lane B / Phase E1 (G-09) activation bundle \u2014 live planning switch",
+  "mode": "rollback",
+  "dry_run": false,
+  "timestamp": "2026-07-13T16:17:43.894739+00:00",
+  "config_path": "scripts/activation-rehearsal/work-forge.yaml",
+  "before": {
+    "planning.enabled": true,
+    "planning.target_terminal.enabled": true,
+    "planning.escalation_approver": "U03QR8WKT29",
+    "planning.default_target_repo": "guardkit/api_test",
+    "planning.originator_wait_seconds": 3600,
+    "planning.escalated_wait_seconds": 14400,
+    "planning.target_repo_paths": {
+      "guardkit/api_test": "/srv/repos/api_test"
+    },
+    "approval.expected_approver": "U03QR8WKT29"
+  },
+  "after": {
+    "planning.enabled": false,
+    "planning.target_terminal.enabled": false,
+    "planning.escalation_approver": "U03QR8WKT29",
+    "planning.default_target_repo": "guardkit/api_test",
+    "planning.originator_wait_seconds": 3600,
+    "planning.escalated_wait_seconds": 14400,
+    "planning.target_repo_paths": {
+      "guardkit/api_test": "/srv/repos/api_test"
+    },
+    "approval.expected_approver": "U03QR8WKT29"
+  },
+  "changed": true,
+  "changed_keys": [
+    "planning.enabled",
+    "planning.target_terminal.enabled"
+  ],
+  "preflight_checklist": [
+    {
+      "check": "target_repo_path_mapped",
+      "status": "ok",
+      "detail": "planning.target_repo_paths['guardkit/api_test'] = '/srv/repos/api_test' (the target terminal cannot resolve the repo without a local path \u2014 pass --target-repo-path to set it)"
+    },
+    {
+      "check": "member_id_approver_present",
+      "status": "ok",
+      "detail": "pinned approver member-id = 'U03QR8WKT29' (apply will set it)"
+    },
+    {
+      "check": "broker_notification_acl",
+      "status": "confirm",
+      "detail": "nats-infra: `forge` may publish jarvis.notification.slack + the planning subjects (granted live in MP-010 follow-up addendum 2)"
+    },
+    {
+      "check": "slack_app_scopes_and_invite",
+      "status": "confirm",
+      "detail": "Slack app has message.channels/message.groups + bot is /invite'd to the planning channel; originator id matches the approver (J04)"
+    },
+    {
+      "check": "fleet_watcher_nats_url",
+      "status": "confirm",
+      "detail": "forge-prod env threads nats_url so the fleet watcher populates specialist discovery (else every PO dispatch degrades)"
+    }
+  ],
+  "operator_next_action": "recreate forge-prod to return to the resting state"
+}
