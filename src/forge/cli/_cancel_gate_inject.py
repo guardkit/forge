@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 __all__ = ["try_inject_paused_cancel"]
 
 
-def try_inject_paused_cancel(runtime: Any, *, build_id: str, reason: str) -> bool:
+def try_inject_paused_cancel(
+    runtime: Any, *, build_id: str, reason: str, responder: str | None = None
+) -> bool:
     """Inject a synthetic reject for a gate-paused build; return True on success.
 
     Reads the persisted ``pending_approval_request_id`` (the durable home of the
@@ -34,6 +36,12 @@ def try_inject_paused_cancel(runtime: Any, *, build_id: str, reason: str) -> boo
     (caller falls back to ``handle_cancel``) when the row carries no pending
     request id or the id is a legacy / unparseable value — there is nothing for
     the daemon's live frame to correlate a synthetic reject against.
+
+    ``responder`` (O-02 / TASK-FWD-005 break #3) is the identity stamped onto the
+    synthetic reject's ``decided_by``. It MUST match the gate's
+    ``expected_approver`` or the daemon's identity-pinned approval subscriber
+    refuses the reject as an anomaly and the build stays PAUSED. ``None`` falls
+    back to the injector's legacy default for callers that do not resolve one.
     """
     from forge.gating.identity import parse_request_id
 
@@ -58,13 +66,16 @@ def try_inject_paused_cancel(runtime: Any, *, build_id: str, reason: str) -> boo
         stage_label=stage_label,
         attempt_count=attempt_count,
         correlation_id=row.correlation_id,
+        responder=responder,
     )
     logger.info(
         "forge cancel: build %s paused at the approval gate; injected a "
-        "synthetic reject (%r) onto its approval response subject — the "
-        "daemon's live frame owns the CANCELLED transition + build-cancelled",
+        "synthetic reject (%r, responder=%r) onto its approval response "
+        "subject — the daemon's live frame owns the CANCELLED transition + "
+        "build-cancelled",
         build_id,
         reason,
+        responder,
     )
     return True
 
@@ -75,6 +86,7 @@ def _inject_synthetic_reject(
     stage_label: str,
     attempt_count: int,
     correlation_id: str | None,
+    responder: str | None = None,
 ) -> None:
     """One-shot connect → inject synthetic reject → flush → close.
 
@@ -82,6 +94,8 @@ def _inject_synthetic_reject(
     bridge. The synthetic reject keys on the persisted ``request_id`` (via
     ``attempt_count``), so the daemon subscriber's dedup + correlation guards
     treat it as a first-response reject for the outstanding request.
+    ``responder`` is forwarded to the injector as the reject's ``decided_by``
+    identity (O-02 / TASK-FWD-005 break #3).
     """
     import asyncio
 
@@ -102,6 +116,7 @@ def _inject_synthetic_reject(
                 stage_label=stage_label,
                 attempt_count=attempt_count,
                 correlation_id=correlation_id,
+                responder=responder,
             )
             await client.flush()
         finally:

@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from forge.cli import _cancel_run as cancel_run_module
 from forge.cli import cancel as cancel_module
 from forge.cli import main as cli_main
 from forge.cli import runtime as cli_runtime
@@ -164,7 +165,10 @@ def _patch_runtime(
         cli_steering_handler=handler,  # type: ignore[arg-type]
     )
     monkeypatch.setattr(cli_runtime, "build_cli_runtime", lambda *_a, **_kw: fake)
-    monkeypatch.setattr(cancel_module, "build_cli_runtime", lambda *_a, **_kw: fake)
+    # ``forge cancel`` orchestration lives in ``_cancel_run`` (O-02 extraction
+    # keeps the wrapper thin, AC-007); ``forge skip`` still builds the runtime
+    # in-module.
+    monkeypatch.setattr(cancel_run_module, "build_cli_runtime", lambda *_a, **_kw: fake)
     monkeypatch.setattr(skip_module, "build_cli_runtime", lambda *_a, **_kw: fake)
 
 
@@ -296,14 +300,16 @@ class TestSkipNonPausedRefused:
 
 
 # ---------------------------------------------------------------------------
-# AC-006 — both pass responder=os.getlogin() to the handler
+# AC-006 — both record the resolved responder on the handler (O-02: the
+# responder now resolves via --responder / $FORGE_RESPONDER / OS user, never a
+# tty-dependent os.getlogin()).
 # ---------------------------------------------------------------------------
 
 
 class TestResponderPassedToHandler:
     """AC-006 — Group E "cancelling operator recorded distinctly"."""
 
-    def test_cancel_passes_os_getlogin_responder_to_handler(
+    def test_cancel_passes_responder_flag_to_handler(
         self, monkeypatch: pytest.MonkeyPatch, db_path: Path
     ) -> None:
         persistence = FakePersistence(
@@ -316,14 +322,18 @@ class TestResponderPassedToHandler:
         )
         handler = FakeHandler(snapshot_reader=FakeSnapshotReader())
         _patch_runtime(monkeypatch, persistence, handler)
-        # Stub os.getlogin so the assertion is deterministic across CI hosts.
-        import os
-
-        monkeypatch.setattr(os, "getlogin", lambda: "alice")
         runner = CliRunner()
         result = runner.invoke(
             cancel_module.cancel_cmd,
-            ["FEAT-A1B2", "--reason", "CI cleanup", "--db", str(db_path)],
+            [
+                "FEAT-A1B2",
+                "--reason",
+                "CI cleanup",
+                "--responder",
+                "alice",
+                "--db",
+                str(db_path),
+            ],
         )
         assert result.exit_code == 0, result.output + result.stderr
         assert handler.cancel_calls == [
@@ -334,7 +344,36 @@ class TestResponderPassedToHandler:
             }
         ]
 
-    def test_skip_passes_os_getlogin_responder_to_handler(
+    def test_cancel_resolves_responder_from_env_without_a_tty(
+        self, monkeypatch: pytest.MonkeyPatch, db_path: Path
+    ) -> None:
+        """O-02: no flag, os.getlogin() raising → resolves from env, no crash."""
+        persistence = FakePersistence(
+            builds={
+                "FEAT-A1B2": Build(
+                    build_id="build-FEAT-A1B2-001",
+                    status=BuildState.RUNNING,
+                )
+            }
+        )
+        handler = FakeHandler(snapshot_reader=FakeSnapshotReader())
+        _patch_runtime(monkeypatch, persistence, handler)
+        import os
+
+        def _no_tty() -> str:
+            raise OSError(6, "No such device or address")
+
+        monkeypatch.setattr(os, "getlogin", _no_tty)
+        monkeypatch.setenv("FORGE_RESPONDER", "U03QR8WKT29")
+        runner = CliRunner()
+        result = runner.invoke(
+            cancel_module.cancel_cmd,
+            ["FEAT-A1B2", "--db", str(db_path)],
+        )
+        assert result.exit_code == 0, result.output + result.stderr
+        assert handler.cancel_calls[0]["responder"] == "U03QR8WKT29"
+
+    def test_skip_passes_responder_flag_to_handler(
         self, monkeypatch: pytest.MonkeyPatch, db_path: Path
     ) -> None:
         build = Build(
@@ -354,13 +393,18 @@ class TestResponderPassedToHandler:
         )
         handler = FakeHandler(snapshot_reader=snapshot_reader)
         _patch_runtime(monkeypatch, persistence, handler)
-        import os
-
-        monkeypatch.setattr(os, "getlogin", lambda: "bob")
         runner = CliRunner()
         result = runner.invoke(
             skip_module.skip_cmd,
-            ["FEAT-A1B2", "--reason", "approved by hand", "--db", str(db_path)],
+            [
+                "FEAT-A1B2",
+                "--reason",
+                "approved by hand",
+                "--responder",
+                "bob",
+                "--db",
+                str(db_path),
+            ],
         )
         assert result.exit_code == 0, result.output + result.stderr
         assert len(handler.skip_calls) == 1

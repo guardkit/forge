@@ -22,9 +22,12 @@ passes the parsed :class:`ForgeConfig` to subcommands via
 :attr:`click.Context.obj`. ``forge queue`` (the principal consumer)
 reads its ``repo_allowlist`` and queue defaults from that object;
 ``forge history`` keys off the same value to pull
-``queue.default_history_limit``. The cancel/skip wrappers do not need a
-config and therefore never read ``ctx.obj`` — running ``forge cancel``
-without ``--config`` and without a ``./forge.yaml`` continues to work.
+``queue.default_history_limit``. ``forge cancel`` reads ``ctx.obj``
+*best-effort* (O-02) for the gate's pinned ``approval.expected_approver``
+default, but never requires it — running ``forge cancel`` without
+``--config`` and without a ``./forge.yaml`` continues to work (the pinned
+approver resolves to ``None`` and the responder falls back to the env / OS
+user chain); ``forge skip`` needs no config.
 """
 
 from __future__ import annotations

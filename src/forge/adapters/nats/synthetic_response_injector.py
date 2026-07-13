@@ -184,13 +184,14 @@ class SyntheticResponseInjector:
         stage_label: str,
         attempt_count: int,
         correlation_id: str | None = None,
+        responder: str | None = None,
     ) -> None:
         """Publish a synthetic ``decision="reject"`` response for ``forge cancel``.
 
         Per ASSUM-005 (high) and ``API §7``: a CLI cancel maps to a
         rejection so the state machine transitions the build to
         ``CANCELLED``. The persisted ``GateDecision`` response record
-        carries ``responder="rich"`` (``decided_by``) AND
+        carries the resolved ``responder`` (``decided_by``) AND
         ``reason="cli cancel"`` (``notes``) so the CLI origin is
         distinguishable from a real Rich rejection.
 
@@ -212,6 +213,12 @@ class SyntheticResponseInjector:
                 ``BuildQueuedPayload``. Threaded onto the
                 :class:`MessageEnvelope` for trace stitching; ``None``
                 when no correlation is available.
+            responder: Identity stamped onto the reject's ``decided_by``
+                (O-02 / TASK-FWD-005 break #3). MUST equal the gate's
+                ``expected_approver`` or the identity-pinned approval
+                subscriber refuses the reject and the build stays PAUSED.
+                ``None`` keeps the legacy :data:`SYNTHETIC_RESPONDER`
+                default for callers that do not resolve an identity.
 
         Raises:
             ValueError: If ``build_id`` or ``stage_label`` is empty, or
@@ -226,6 +233,7 @@ class SyntheticResponseInjector:
             decision="reject",
             reason=REASON_CLI_CANCEL,
             correlation_id=correlation_id,
+            responder=responder,
         )
 
     async def inject_cli_skip(
@@ -235,6 +243,7 @@ class SyntheticResponseInjector:
         stage_label: str,
         attempt_count: int,
         correlation_id: str | None = None,
+        responder: str | None = None,
     ) -> None:
         """Publish a synthetic ``decision="override"`` response for ``forge skip``.
 
@@ -253,6 +262,9 @@ class SyntheticResponseInjector:
                 the paused stage; see :meth:`inject_cli_cancel` for why
                 this MUST be the persisted value rather than re-derived.
             correlation_id: Optional pipeline-level correlation id.
+            responder: Identity stamped onto ``decided_by`` (see
+                :meth:`inject_cli_cancel`). ``None`` keeps the legacy
+                :data:`SYNTHETIC_RESPONDER` default.
 
         Raises:
             ValueError: If ``build_id`` or ``stage_label`` is empty, or
@@ -266,6 +278,7 @@ class SyntheticResponseInjector:
             decision="override",
             reason=REASON_CLI_SKIP,
             correlation_id=correlation_id,
+            responder=responder,
         )
 
     # ------------------------------------------------------------------
@@ -281,16 +294,19 @@ class SyntheticResponseInjector:
         decision: str,
         reason: str,
         correlation_id: str | None,
+        responder: str | None = None,
     ) -> None:
         """Construct and publish the synthetic :class:`ApprovalResponsePayload`.
 
         Single shared code path for cancel and skip — the only
-        differences between the two are the ``decision`` Literal and the
-        ``reason`` sentinel. Centralising the envelope wrapping here
-        guarantees the two CLI steering paths emit envelopes that are
-        byte-for-byte structurally identical apart from those two
-        fields.
+        differences between the two are the ``decision`` Literal, the
+        ``reason`` sentinel, and the ``responder`` identity. Centralising
+        the envelope wrapping here guarantees the two CLI steering paths
+        emit envelopes that are byte-for-byte structurally identical apart
+        from those fields. ``responder`` defaults to
+        :data:`SYNTHETIC_RESPONDER` when the caller passes ``None``.
         """
+        decided_by = responder if responder and responder.strip() else SYNTHETIC_RESPONDER
         # request_id must be **deterministic** over (build_id,
         # stage_label, attempt_count) so it matches the value the
         # publisher emitted on first send. derive_request_id is pure;
@@ -309,7 +325,7 @@ class SyntheticResponseInjector:
         payload = ApprovalResponsePayload(
             request_id=request_id,
             decision=decision,  # type: ignore[arg-type]  # validated by Pydantic Literal
-            decided_by=SYNTHETIC_RESPONDER,
+            decided_by=decided_by,
             notes=reason,
         )
 

@@ -30,7 +30,8 @@ import pytest
 from click.testing import CliRunner
 from pytest_bdd import given, scenario, then, when
 
-from forge.cli import cancel as cancel_module
+from forge.cli import _cancel_run as cancel_run_module
+from forge.cli import cancel as cancel_module  # noqa: F401 — kept for symmetry
 from forge.cli import runtime as cli_runtime
 from forge.cli import skip as skip_module
 from forge.lifecycle.persistence import Build
@@ -67,6 +68,13 @@ class _FakePersistence:
         for build in self.builds.values():
             if build.build_id == identifier:
                 return build
+        return None
+
+    def get_build_row(self, build_id: str) -> None:
+        # These scenarios model a PAUSED build with no persisted pending
+        # approval request id, so ``try_inject_paused_cancel`` returns False
+        # and the wrapper falls back to ``handle_cancel`` (the path the
+        # Gherkin then-steps assert). Returning ``None`` is the falsy row.
         return None
 
 
@@ -185,16 +193,19 @@ def psm011_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, A
     monkeypatch.setattr(
         cli_runtime, "build_cli_runtime", lambda *_a, **_kw: fake_runtime
     )
+    # ``forge cancel`` builds its runtime in ``_cancel_run`` (O-02 extraction);
+    # ``forge skip`` still builds it in-module.
     monkeypatch.setattr(
-        cancel_module, "build_cli_runtime", lambda *_a, **_kw: fake_runtime
+        cancel_run_module, "build_cli_runtime", lambda *_a, **_kw: fake_runtime
     )
     monkeypatch.setattr(
         skip_module, "build_cli_runtime", lambda *_a, **_kw: fake_runtime
     )
 
-    import os
-
-    monkeypatch.setattr(os, "getlogin", lambda: "alice")
+    # O-02: the responder resolves via $FORGE_RESPONDER (the operator identity
+    # the Gherkin records "on my behalf") rather than a tty-dependent
+    # os.getlogin(). Setting it here keeps the assertion deterministic.
+    monkeypatch.setenv("FORGE_RESPONDER", "alice")
 
     return {
         "db_path": db_path,
