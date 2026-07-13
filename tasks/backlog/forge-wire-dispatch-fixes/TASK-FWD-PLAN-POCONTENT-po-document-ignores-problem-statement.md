@@ -189,3 +189,74 @@ fired (run `0a645e36` — the runtime face of the multi-turn drift these fixes c
 soft_timeout does NOT propagate a cancel to the specialist (zombie session held the single-slot
 seat; scoped `docker restart` was the cleanup); (c) the specialist treats a seat 429 as fatal
 (no retry) — run `f9794a58` died in 3s on a transient slot collision.
+
+---
+
+## RESOLVED-DEPLOYED — 2026-07-13 (Lane A specialist-deploy, three-lanes handoff §3)
+
+**All three S1 blockers fixed, deployed, and live-validated; the six content fixes are LIVE.**
+specialist-agent `96d04dd..99cff1f` (5 commits, pushed 0/0); deployed image `8ace8ad927cf`
+(both dual-role containers recreated 2026-07-13 ~01:30; rollback tag
+`specialist-agent:rollback-pre-pocontent-20260712` KEPT).
+
+- **Blocker 1** (session.py criteria crash): `.criteria` unwrap at the registered-mode load
+  (`48423dd`, mirror of the legacy path).
+- **Blocker 2** (responses-API hang): app-side `ProviderProfile(use_responses_api=False)` on the
+  shared model-build path — every openai: seat call rides `/v1/chat/completions` (`48423dd`).
+- **Blocker 3** (coach-0.00) — ROOT CAUSE DEEPER THAN S1: registered modes ship their own
+  `criteria_file` but NO coach prompt override, so gemma4-coach answers the ROLE-DEFAULT
+  greenfield rubric (different criterion set, zero overlap → 5-of-6 count mismatch → 0.0/REVISE
+  forever) and fires foreign detection penalties. Fix (`04779f3`, per handoff §2.8): criteria-set-
+  generic conformance layer — ONE bounded tool-bound re-ask naming the missing criteria with
+  weights+descriptions · accept-with-default per-criterion 0.0 (loud WARNING) · detection-pattern
+  allowlist (mode's own patterns; None=legacy off) · schema-constrained decoding built first-class
+  but OFF pending a mode coach prompt (activating a bare name-forcing schema against the
+  mismatched rubric would un-ground scores and suppress the healing re-ask — recorded choice).
+- **+ Truncation lever** (`5cd0dec`, the task's diagnosed cheap lever, registered modes ONLY):
+  `enable_thinking=false` (wire-probed honored) + 16384 completion budget — fixed the 008
+  plan-tree truncation (IMPLEMENTATION-GUIDE block never reached at 8192 with think-stream).
+  Greenfield/live path + coach byte-identical (coach-verified).
+- **+ 429 bounded retry** (`14e8db6`): the f9794a58 3s-death class — 3 attempts, jittered
+  backoff, non-429 semantics unchanged; generation-loop seat calls (single-shot session calls
+  left unwrapped, named residue).
+- **+ Greenfield source_documents pre-validation normalizer** (`99cff1f`) — found by THIS lane's
+  first live validation (run 67d02467-lanea, loud parse failure): the exemplar-filename strip
+  removed the format guidance, so greenfield stochastically emits missing/string-typed
+  source_documents; ProductRoadmap requires them per epic. Normalizer empties all
+  source_documents pre-validation in greenfield ONLY (the scrub's own semantics), value-free
+  WARNING; non-greenfield strictness intact.
+
+**Hermetic gate (gold trace) DISCHARGED on final HEAD:** 007 ACCEPTED on the Factory-1 gold
+input (0.785, iter 1, 241s, ZERO fabricated citations) → normalizer PASS → 008 ACCEPTED (0.97,
+iter 1, full machine-made plan tree) → revision round via `validate_feedback` (its first live
+exercise) closed the one oracle miss → accepted 1.0, oracle 16/16, `guardkit feature validate
+FEAT-UPTIME-001` ✓ exit 0. Hermetic-vs-image harness PASSED pre-recreate (greenfield in-image:
+'Git Weekly Report CLI', zero fabrications).
+
+**Live validation GREEN (run `b6cda1ea-lanea`, 2026-07-13 00:37→00:49):** inject → 10-min PO
+session → **on-topic doc (git×11/commit×32/slack×16), ZERO fabricated citations, project_name
+"Git Weekly Slack Reporter CLI"** → checkpoint pause → identity-pinned approve → PLANNED_HANDOFF
+(api_test `498dfff`, evidence archived, test branch cleaned). Both new layers fired live:
+normalizer `dropped 2 top-level, 4 epic entries` + scrub `16 fabricated source_documents…
+scrubbed`. **The 2026-07-11 acceptance criteria are met.**
+
+**AC (section logging):** value-free per-iteration prompt-SECTION logging SHIPPED
+(`04779f3`) and captured on real runs (2-section greenfield trace; 19/34-section registered-mode
+traces — the statement stays present every iteration; drift driver = the revision-payload
+sections, not statement loss). NOTE: lines are INFO-level; the deployed container logs at
+WARNING — bump the container log level when a production section trace is wanted.
+
+**Explicitly NOT decided here (per handoff):** the model question (PO fine-tune vs
+prompt-hardened workhorse; M9 alias stays INTERIM) — resolves at G3 post-07-16.
+**Residues (named):** forge-side soft_timeout cancel-propagation (out of this lane's venue —
+forge lane work) · single-shot session 429s unwrapped · gemma4-coach greenfield evals can
+reasoning-marathon 30-60 min (pre-existing seat behavior, ctx-bounded, M12-capped in production;
+observed 3/4 harness runs 2026-07-12 night) · deployed-container INFO visibility (above) ·
+mode coach prompts (`coach_feature_spec.md` etc.) = the durable fix that also unlocks
+schema-constrained coach decoding · 29 pre-existing red tests on the repo (stale-import +
+config/criteria classes, checkout-proven pre-existing).
+**Infra receipt (same night, Rich's call):** llama-swap `all` set now co-residents
+qwen36-workhorse + gemma4-coach (qwen-graphiti → on-demand `graphiti` set; backup
+`config.yaml.bak-20260712-pre-gc-coresident`) — the player↔coach set-thrash is gone from the
+factory hot path. The s2s voice service's responses-API calls (unserved by llama.cpp) remain a
+proxy-wedge source when active — flagged to Rich.
