@@ -343,8 +343,11 @@ class DeployStageRunner:
             # NOT verified. The endpoint's word "verified" is enforced, not
             # decorative: roll back to the kept :rollback-* image rather than
             # keep serving the failed build. (instrument_fail/environment_fail
-            # are also != "pass" — an un-run gate is not a verified deploy.)
-            if verdict is not None and verdict != "pass":
+            # are also != "pass".) A gate that produced NO verdict at all
+            # (verdict=None: unconfigured/raising invoker) is an un-run gate,
+            # and an un-run gate is not a verified deploy — it reverts as
+            # "instrument_fail" rather than silently keeping the build serving.
+            if self._config.run_live_gate and verdict != "pass":
                 return await self._run_revert(
                     profile,
                     correlation_id=correlation_id,
@@ -353,7 +356,7 @@ class DeployStageRunner:
                     task_id=task_id,
                     profile_ref=profile_ref,
                     deployer=deployer,
-                    failing_verdict=verdict,
+                    failing_verdict=verdict if verdict is not None else "instrument_fail",
                     failing_verdict_ref=failing_verdict_ref,
                     deploy_runbook_id=deploy_runbook.runbook_id,
                     live_gate_runbook_id=live_gate_runbook_id,

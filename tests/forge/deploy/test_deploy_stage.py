@@ -94,6 +94,15 @@ class RecordingDeployPublisher:
         self.events.append(("LiveGateResult", p))
 
 
+class _RaisingLiveGateInvoker:
+    """A live-gate invoker that raises — the gate produces NO verdict (O-32)."""
+
+    def invoke(
+        self, *, feature: str, target: str, gates: tuple[str, ...] = ()
+    ) -> LiveGateInvocation:
+        raise RuntimeError("live-gate instrument down")
+
+
 class _FixedVerdictLiveGateInvoker:
     """A live-gate invoker that returns a fixed (non-pass) verdict — for O-32."""
 
@@ -485,6 +494,46 @@ class TestRevertOnGateFail:
                 "revert-deployrun-ok", correlation_id="corr-ok"
             )
             is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_verdict_gate_reverts_as_instrument_fail(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        # [O-32, the verdict=None hole — closed] A live-gate that produces NO
+        # verdict at all (raising/unconfigured invoker) is an un-run gate, and
+        # an un-run gate is not a verified deploy: the runner reverts as
+        # "instrument_fail" instead of silently returning outcome="complete"
+        # with the unverified build left serving.
+        deploy_pub = RecordingDeployPublisher()
+        profile = _profile_with_rollback("study-tutor:rollback-20260713")
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            deploy_pub,
+            tmp_path,
+            live_gate_invoker=_RaisingLiveGateInvoker(),
+        )
+        result = await runner.run_deploy(
+            profile, correlation_id="corr-nv", deploy_run_id="deployrun-nv"
+        )
+
+        assert result.outcome == "reverted"
+        assert result.verdict == "instrument_fail"
+        names = [n for n, _ in deploy_pub.events]
+        # An instrument problem is not a SUT verdict — no QAVerdict published —
+        # but the revert receipt still fires.
+        assert "QAVerdict" not in names
+        assert "DeployReverted" in names
+        reverted = [p for n, p in deploy_pub.events if n == "DeployReverted"][0]
+        assert reverted.failing_verdict == "instrument_fail"
+        assert reverted.reverted_to_image_ref == "study-tutor:rollback-20260713"
+        # The revert runbook genuinely ran through the same seam.
+        assert (
+            repository.load_runbook(
+                "revert-deployrun-nv", correlation_id="corr-nv"
+            )
+            is not None
         )
 
     @pytest.mark.asyncio
