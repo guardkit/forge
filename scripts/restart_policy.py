@@ -29,23 +29,31 @@ demonstrating this pass targets a *throwaway scratch container* via ``--containe
 the live application is left for the coordinator. The default ``--container`` is
 ``forge-prod`` because that is who the coordinator ultimately runs it against.
 
-**Idempotent.** Re-running ``apply`` when the policy is already ``unless-stopped``
-(or ``--rollback`` when already ``no``) changes nothing and still emits a receipt;
-``changed`` is False.
+**Explicit-apply guard (E2-S3 fix).** A mutation NEVER happens by default. A bare
+run is a **preview**: it inspects and prints the would-be change and runs NO
+``docker update``. Changing the live container requires the explicit ``--apply``
+flag — so a stray ``python scripts/restart_policy.py`` cannot touch ``forge-prod``.
+``--apply`` and ``--dry-run`` are mutually exclusive (asking to both apply and
+preview is a usage error).
+
+**Idempotent.** Re-running ``--apply`` when the policy is already ``unless-stopped``
+(or ``--rollback --apply`` when already ``no``) changes nothing and still emits a
+receipt; ``changed`` is False.
 
 Usage
 -----
-    # Preflight only (read-only inspect; runs no `docker update`):
-    python scripts/restart_policy.py --dry-run
-
-    # Give forge-prod the restart policy (the coordinator's live step):
+    # Preview (DEFAULT — read-only inspect; runs no `docker update`):
     python scripts/restart_policy.py
+    python scripts/restart_policy.py --dry-run          # explicit, same effect
 
-    # Take it back off (docker's default `no`):
-    python scripts/restart_policy.py --rollback
+    # Give forge-prod the restart policy (the coordinator's live step — needs --apply):
+    python scripts/restart_policy.py --apply
+
+    # Take it back off (docker's default `no`) — also a mutation, so also --apply:
+    python scripts/restart_policy.py --rollback --apply
 
     # Hermetic rehearsal / demonstration against a scratch container:
-    python scripts/restart_policy.py --container forge-prod-restart-demo --dry-run
+    python scripts/restart_policy.py --container forge-prod-restart-demo --apply
 """
 
 from __future__ import annotations
@@ -223,9 +231,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"restore docker's default restart policy ({ROLLBACK_POLICY!r})",
     )
     p.add_argument(
+        "--apply",
+        action="store_true",
+        help="ACTUALLY run `docker update` (mutating). Without it, this is a "
+        "preview only — no live container is touched. Mutually exclusive with "
+        "--dry-run.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="inspect + print the change and receipt; run NO `docker update`",
+        help="force preview: inspect + print the change and receipt; run NO "
+        "`docker update` (this is also the default when --apply is omitted)",
     )
     p.add_argument(
         "--receipt-dir",
@@ -243,6 +259,19 @@ def _default_receipt_dir() -> Path:
 
 def run(argv: list[str]) -> int:
     args = _parse_args(argv)
+
+    # Explicit-apply guard (E2-S3): a mutation happens ONLY on --apply. Without it,
+    # the run is inert (a preview) regardless of mode, so a stray invocation cannot
+    # touch the live container. Asking to both --apply and --dry-run is a conflict.
+    if args.apply and args.dry_run:
+        print(
+            "ERROR: --apply and --dry-run are mutually exclusive "
+            "(--apply mutates; --dry-run/omitting --apply previews).",
+            file=sys.stderr,
+        )
+        return 2
+    dry_run = not args.apply  # inert unless the operator explicitly opts in
+
     mode = "rollback" if args.rollback else "apply"
     target_policy = ROLLBACK_POLICY if args.rollback else APPLY_POLICY
     container: str = args.container
@@ -258,7 +287,7 @@ def run(argv: list[str]) -> int:
 
     already = (before.get("Name") or "no") == target_policy
 
-    print(f"=== restart_policy.py [{mode}{' · DRY RUN' if args.dry_run else ''}] ===")
+    print(f"=== restart_policy.py [{mode}{' · DRY RUN' if dry_run else ''}] ===")
     print(f"container: {container}")
     print(f"restart policy (before): {before.get('Name')!r}")
     print(f"target policy: {target_policy!r}")
@@ -269,10 +298,15 @@ def run(argv: list[str]) -> int:
 
     after: dict[str, Any] | None
     changed: bool
-    if args.dry_run:
+    if dry_run:
         after = before if already else {"Name": target_policy, "MaximumRetryCount": 0}
         changed = not already
         print(f"would change: {changed} ({'nothing' if not changed else target_policy})")
+        if not args.apply:
+            print(
+                "PREVIEW ONLY — no `docker update` executed. Re-run with --apply to "
+                f"actually change {container!r}."
+            )
     else:
         if already:
             after = before
@@ -296,7 +330,7 @@ def run(argv: list[str]) -> int:
 
     receipt = build_receipt(
         mode=mode,
-        dry_run=args.dry_run,
+        dry_run=dry_run,
         container=container,
         target_policy=target_policy,
         before=before,

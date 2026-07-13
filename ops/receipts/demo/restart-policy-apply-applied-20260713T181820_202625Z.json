@@ -3,10 +3,10 @@
   "purpose": "O-30 forge-prod restart-policy switch (Phase E2 / E2-S3)",
   "mode": "apply",
   "dry_run": false,
-  "timestamp": "2026-07-13T17:41:59.403792+00:00",
-  "container": "forge-restart-demo-e2s3",
+  "timestamp": "2026-07-13T18:18:20.202545+00:00",
+  "container": "forge-restart-demo-e2s3fix",
   "target_policy": "unless-stopped",
-  "docker_update_cmd": "docker update --restart unless-stopped forge-restart-demo-e2s3",
+  "docker_update_cmd": "docker update --restart unless-stopped forge-restart-demo-e2s3fix",
   "restart_policy_before": {
     "Name": "no",
     "MaximumRetryCount": 0
@@ -20,7 +20,7 @@
     {
       "check": "no_restart_occurs",
       "status": "ok",
-      "detail": "`docker update --restart` is a metadata-only change to 'forge-restart-demo-e2s3''s HostConfig.RestartPolicy \u2014 it does NOT stop, restart, or recreate the container; the running process is untouched and the new policy takes effect on the next daemon start / reboot."
+      "detail": "`docker update --restart` is a metadata-only change to 'forge-restart-demo-e2s3fix''s HostConfig.RestartPolicy \u2014 it does NOT stop, restart, or recreate the container; the running process is untouched and the new policy takes effect on the next daemon start / reboot."
     },
     {
       "check": "ack_pending_zero_not_required",

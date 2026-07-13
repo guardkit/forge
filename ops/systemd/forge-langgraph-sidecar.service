@@ -1,57 +1,85 @@
 # forge-langgraph-sidecar.service — supervised forge autobuild-runner sidecar (O-30, Phase E2-S3)
 #
-# WHAT: the autobuild-runner sidecar is a bare `nohup .venv/bin/langgraph dev …`
-#   on :8124 (RUNBOOK-FEAT-JARVIS-INTERNAL-001 Prerequisite A) with NO supervisor.
-#   forge-prod REFUSES to boot without FORGE_AUTOBUILD_RUNNER_URL pointing at this
-#   sidecar (TASK-FORGE-FRR-F010J fail-fast guard), so if the sidecar dies or is
-#   lost on reboot, the whole build back-half is down. This unit supervises it with
-#   an auto-restart policy — the third un-supervised `langgraph dev` O-30 names.
+# WHAT: the autobuild-runner sidecar (`langgraph dev` on :8124, the autobuild_runner
+#   graph from forge.langgraph.json). forge-prod REFUSES to boot without
+#   FORGE_AUTOBUILD_RUNNER_URL pointing at this sidecar (TASK-FORGE-FRR-F010J
+#   fail-fast guard), so if the sidecar is lost the whole build back-half is down.
 #
-# SCOPE: a systemd **USER** unit (the sidecar binds the forge developer venv and
-#   the forge-local .env). Install/enable is a coordinator step (see
-#   ops/systemd/README.md); this file is AUTHORED + `systemd-analyze verify`-clean,
-#   NOT installed.
+# STATE (re-verified 2026-07-13, E2-S3 fix pass): on the live box this sidecar is
+#   ALREADY supervised — a unit of this name is installed at
+#   ~/.config/systemd/user/forge-langgraph-sidecar.service (dated 2026-07-04),
+#   enabled AND active, carrying the load-bearing Environment= lines below
+#   (guardkit resolver path, SDK-harness pin, config path, default repo, enriched
+#   PATH). O-30's "sidecar un-supervised" premise is therefore already CLOSED on
+#   this box; what was actually missing is that the unit lived ONLY in
+#   ~/.config/systemd/user (not in version control), so a box rebuild / fresh
+#   clone would silently lose it — and the enriched PATH + guardkit/harness env
+#   with it. THIS FILE version-controls the running unit so it is reproducible.
+#   It is a faithful capture of the installed unit (same Environment=, same
+#   127.0.0.1 host binding, same Type=simple + direct-venv ExecStart) so that
+#   installing it is a no-op against what is already running — NOT a competing
+#   redesign. (A stale sibling `forge-autobuild-runner.service`, 2026-05-12, is
+#   installed-but-disabled — the superseded earlier attempt; leave it alone.)
 #
-# PREREQUISITE (RUNBOOK-FEAT-JARVIS-INTERNAL-001 Prerequisite B): the forge venv
-#   must carry langgraph-cli + the provider extras, i.e. `.venv/bin/langgraph`
-#   must exist and `init_chat_model` must import langchain-openai. Bring those in
-#   with `uv sync --extra providers` (or the pip line in the runbook) BEFORE enable.
+# LOAD-BEARING ENV (do not drop — .env does NOT carry these; verified E2-S3):
+#   FORGE_GUARDKIT_PATH  — the guardkit resolver (not on systemd's minimal PATH)
+#   GUARDKIT_HARNESS=sdk — pins the SDK (Claude API) harness (2026-07-04 attended)
+#   FORGE_CONFIG_PATH / FORGE_DEFAULT_REPO — autobuild_runner launch inputs
+#   PATH=%h/.agentecflow/bin:… — rich enough for the spawned guardkit subprocess
+#   Dropping any of these makes the autobuild build-half launch without its
+#   guardkit resolver / SDK pin and break — the reason a blind `cp` overwrite of
+#   the running unit is unsafe. See ops/systemd/README.md §b for the install rule.
 #
-# BOOT ORDER (see ops/systemd/README.md §Boot order): the sidecar must be UP
-#   before forge-prod (forge serve fail-fasts on a dead FORGE_AUTOBUILD_RUNNER_URL).
-#   A user unit cannot hard-order against the system-scoped forge-prod container;
-#   Restart=on-failure closes the race (forge-prod, itself restart: unless-stopped
-#   after E2-S3(a), retries until the sidecar answers on :8124).
+# SCOPE: a systemd **USER** unit (binds the forge developer venv + repo-local .env,
+#   both user-scoped — no root). Install/reconcile is a coordinator step, NOT done
+#   by this pass; this file is AUTHORED + `systemd-analyze verify`-clean.
+#
+# BOOT ORDER (see ops/systemd/README.md §Boot order): the sidecar must be UP before
+#   forge-prod (forge serve fail-fasts on a dead FORGE_AUTOBUILD_RUNNER_URL). A user
+#   unit cannot hard-order against the system-scoped forge-prod container;
+#   Restart=on-failure closes the race (forge-prod, itself unless-stopped after
+#   E2-S3(a), retries until the sidecar answers on :8124).
 
 [Unit]
-Description=forge autobuild-runner sidecar (langgraph dev — autobuild_runner graph on :8124)
+Description=forge langgraph-runner sidecar (autobuild_runner subagent host)
 Documentation=file:///home/richardwoollcott/Projects/appmilla_github/forge/ops/systemd/README.md
 Documentation=file:///home/richardwoollcott/Projects/appmilla_github/ai-transition/docs/factory-gap-analysis-2026-07-13.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=simple
+# autobuild_runner reads these — forge-prod does not yet plumb repo
+# through to the launch payload (tracked: TASK-ABW-002).
+Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
+Environment=FORGE_DEFAULT_REPO=appmilla/api_test
+# guardkit is not on systemd's minimal PATH — point the resolver at it
+# explicitly, and give the spawned guardkit subprocess a PATH rich enough
+# for its own tool calls (git, claude CLI, etc.).
+Environment=FORGE_GUARDKIT_PATH=%h/.agentecflow/bin/guardkit
+# 2026-07-04 attended run: force the SDK harness (Claude API) — the langgraph
+# default (guardkit TASK-HMIG-011 cutover) stays deferred until local-inference
+# P2 validation. Revert by deleting this line + restarting this unit.
+Environment=GUARDKIT_HARNESS=sdk
+Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Projects/appmilla_github/forge
-# forge.langgraph.json registers ONLY autobuild_runner — the default langgraph.json
-# also registers `orchestrator`, which fails to import (Prerequisite A). langgraph
-# loads the file named in that config ("env": ".env"); sourced here too (optional).
-EnvironmentFile=-%h/Projects/appmilla_github/forge/.env
-# Canonical launch (RUNBOOK Prerequisite A), minus `nohup … &` (systemd owns the
-# process lifecycle now): foreground, single graph, blocking backend, no reload.
-# Invoked through `uv run` (matching the jarvis front door) so it binds the pinned
-# forge venv; the runbook's bare `.venv/bin/langgraph` is the same binary. `uv run`
-# also keeps the unit `systemd-analyze verify`-clean before Prerequisite B installs
-# langgraph-cli into the venv (uv is the exec; langgraph is resolved at run time).
-ExecStart=%h/.local/bin/uv run langgraph dev \
-    --config forge.langgraph.json \
-    --port 8124 --host 0.0.0.0 \
-    --no-browser --allow-blocking --no-reload
-# The O-30 requirement: auto-recover the crashed sidecar. on-failure so a clean
-# operator `systemctl --user stop` stays stopped.
+# forge.langgraph.json registers ONLY autobuild_runner (the default langgraph.json
+# also registers `orchestrator`, which fails to import). Host bound to 127.0.0.1
+# deliberately: the box is on the host network, so 0.0.0.0 would expose the dev
+# server on every interface — keep it loopback-only.
+ExecStart=%h/Projects/appmilla_github/forge/.venv/bin/langgraph dev \
+  --config forge.langgraph.json \
+  --port 8124 \
+  --host 127.0.0.1 \
+  --no-browser \
+  --no-reload \
+  --allow-blocking
 Restart=on-failure
 RestartSec=5
-TimeoutStartSec=120
+TimeoutStopSec=15
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

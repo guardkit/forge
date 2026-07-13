@@ -81,7 +81,7 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
 
 
 def test_apply_sets_unless_stopped_and_receipts(fake: FakeDocker, tmp_path: Path) -> None:
-    rc = mod.run(["--receipt-dir", str(tmp_path)])
+    rc = mod.run(["--apply", "--receipt-dir", str(tmp_path)])
     assert rc == 0
     # The policy flipped on the (fake) container.
     assert fake.policies["forge-prod"] == "unless-stopped"
@@ -97,11 +97,48 @@ def test_apply_sets_unless_stopped_and_receipts(fake: FakeDocker, tmp_path: Path
 
 def test_apply_is_idempotent(fake: FakeDocker, tmp_path: Path) -> None:
     fake.policies["forge-prod"] = "unless-stopped"  # already on
-    rc = mod.run(["--receipt-dir", str(tmp_path)])
+    rc = mod.run(["--apply", "--receipt-dir", str(tmp_path)])
     assert rc == 0
     assert fake.update_calls == []  # no docker update issued
     receipt = json.loads(next(tmp_path.glob("*.json")).read_text())
     assert receipt["changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# explicit-apply guard (E2-S3): mutation NEVER happens by default
+# ---------------------------------------------------------------------------
+
+
+def test_default_is_inert_no_apply_flag(fake: FakeDocker, tmp_path: Path) -> None:
+    """A bare run (no --apply) must NOT touch the live container."""
+    rc = mod.run(["--receipt-dir", str(tmp_path)])
+    assert rc == 0
+    assert fake.update_calls == []  # NOTHING mutated
+    assert fake.policies["forge-prod"] == "no"  # unchanged
+    receipt = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert receipt["dry_run"] is True  # inert-by-default marks the receipt as preview
+    # Still shows the would-be end state, like --dry-run.
+    assert receipt["restart_policy_after"]["Name"] == "unless-stopped"
+    assert receipt["changed"] is True
+
+
+def test_rollback_without_apply_is_inert(fake: FakeDocker, tmp_path: Path) -> None:
+    """--rollback is a mutation too — it must also require --apply."""
+    fake.policies["forge-prod"] = "unless-stopped"
+    rc = mod.run(["--rollback", "--receipt-dir", str(tmp_path)])
+    assert rc == 0
+    assert fake.update_calls == []  # nothing mutated
+    assert fake.policies["forge-prod"] == "unless-stopped"  # NOT rolled back
+    receipt = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert receipt["mode"] == "rollback"
+    assert receipt["dry_run"] is True
+
+
+def test_apply_and_dry_run_conflict_is_rejected(fake: FakeDocker, tmp_path: Path) -> None:
+    rc = mod.run(["--apply", "--dry-run", "--receipt-dir", str(tmp_path)])
+    assert rc == 2
+    assert fake.update_calls == []  # rejected before any docker touch
+    assert list(tmp_path.glob("*.json")) == []  # no receipt on a usage error
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +148,7 @@ def test_apply_is_idempotent(fake: FakeDocker, tmp_path: Path) -> None:
 
 def test_rollback_restores_no(fake: FakeDocker, tmp_path: Path) -> None:
     fake.policies["forge-prod"] = "unless-stopped"
-    rc = mod.run(["--rollback", "--receipt-dir", str(tmp_path)])
+    rc = mod.run(["--rollback", "--apply", "--receipt-dir", str(tmp_path)])
     assert rc == 0
     assert fake.policies["forge-prod"] == "no"
     receipt = json.loads(next(tmp_path.glob("restart-policy-rollback-applied-*.json")).read_text())
@@ -120,9 +157,9 @@ def test_rollback_restores_no(fake: FakeDocker, tmp_path: Path) -> None:
 
 
 def test_apply_then_rollback_round_trips(fake: FakeDocker, tmp_path: Path) -> None:
-    mod.run(["--receipt-dir", str(tmp_path / "on")])
+    mod.run(["--apply", "--receipt-dir", str(tmp_path / "on")])
     assert fake.policies["forge-prod"] == "unless-stopped"
-    mod.run(["--rollback", "--receipt-dir", str(tmp_path / "off")])
+    mod.run(["--rollback", "--apply", "--receipt-dir", str(tmp_path / "off")])
     assert fake.policies["forge-prod"] == "no"
 
 
@@ -157,7 +194,7 @@ def test_update_failure_surfaces_rc3(monkeypatch: pytest.MonkeyPatch, tmp_path: 
             return super().__call__(args)
 
     monkeypatch.setattr(mod, "_run_docker", Flaky({"forge-prod": "no"}))
-    rc = mod.run(["--receipt-dir", str(tmp_path)])
+    rc = mod.run(["--apply", "--receipt-dir", str(tmp_path)])
     assert rc == 3
 
 
