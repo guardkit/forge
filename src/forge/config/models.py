@@ -791,6 +791,70 @@ class ReviewGateConfig(BaseModel):
     )
 
 
+#: Conservative default floors for the pre-run resource preflight (O-27/O-29).
+#: The co-resident 4-model seat stack sits at ~14 GB steady-state headroom, so an
+#: 8 GB memory floor refuses only a genuinely starved box; the 20 GB disk floor
+#: clears the 10 GB JetStream store plus rollback-image churn.
+DEFAULT_PREFLIGHT_MEMORY_FLOOR_GB = 8.0
+DEFAULT_PREFLIGHT_DISK_FLOOR_GB = 20.0
+
+
+class ResourcePreflightConfig(BaseModel):
+    """Pre-run memory/disk headroom preflight (O-27 / O-29 — E2-S4).
+
+    A run must fail CLEANLY *before* it starts when the box is already under its
+    memory or disk floor — never mid-run with a kernel OOM-kill (O-27) or an
+    ENOSPC-wedged JetStream/worktree write (O-29). The run-entry path consults
+    :func:`forge.preflight.run_resource_preflight`; on a breach the run is
+    refused into a loud FAILED terminal with a route-and-notify to the
+    originator (never a mid-run kill).
+
+    Unlike the other stage switches this defaults **enabled=True**: the check
+    only ever refuses BEFORE work starts, so leaving it on is safe (it can never
+    kill a run in flight). An *unreadable* resource (non-Linux dev host, etc.)
+    is treated as UNCHECKED, never a fabricated breach — the preflight fails open
+    per-resource.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for the pre-run resource preflight. True (default) = "
+            "refuse a run BEFORE it starts if memory/disk is below floor; a "
+            "breach is a loud FAILED terminal + originator notification, never a "
+            "mid-run kill. False = the check is skipped entirely (no readings)."
+        ),
+    )
+    min_available_memory_gb: float = Field(
+        default=DEFAULT_PREFLIGHT_MEMORY_FLOOR_GB,
+        gt=0,
+        description=(
+            "Minimum available system memory (GiB, from /proc/meminfo "
+            "MemAvailable) required to START a run. Below this the run is "
+            "refused before any seat-holding dispatch."
+        ),
+    )
+    min_available_disk_gb: float = Field(
+        default=DEFAULT_PREFLIGHT_DISK_FLOOR_GB,
+        gt=0,
+        description=(
+            "Minimum free space (GiB) on the working filesystem required to "
+            "START a run. Below this the run is refused before any deploy / "
+            "worktree / JetStream write can hit ENOSPC."
+        ),
+    )
+    working_path: str | None = Field(
+        default=None,
+        description=(
+            "Filesystem whose free space is checked. None = the forge process "
+            "working directory (where worktrees, deploy compose and the "
+            "JetStream store live on the single GB10 box)."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -836,6 +900,14 @@ class ForgeConfig(BaseModel):
             "until reviewer-seat SLMs land in WS4 (Q2 = attended-v1)."
         ),
     )
+    resource_preflight: ResourcePreflightConfig = Field(
+        default_factory=ResourcePreflightConfig,
+        description=(
+            "O-27/O-29 pre-run memory/disk headroom preflight. Defaults to "
+            "enabled=True — it only ever refuses a run BEFORE it starts, so it "
+            "is safe on by default (never a mid-run kill)."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -854,6 +926,8 @@ __all__ = [
     "DEFAULT_CACHE_TTL_SECONDS",
     "DEFAULT_HEARTBEAT_INTERVAL_SECONDS",
     "DEFAULT_INTENT_MIN_CONFIDENCE",
+    "DEFAULT_PREFLIGHT_DISK_FLOOR_GB",
+    "DEFAULT_PREFLIGHT_MEMORY_FLOOR_GB",
     "DEFAULT_PROGRESS_INTERVAL_SECONDS",
     "DEFAULT_STALE_HEARTBEAT_SECONDS",
     "DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS",
@@ -870,6 +944,7 @@ __all__ = [
     "PlanningConfig",
     "PlanningModelResolution",
     "QueueConfig",
+    "ResourcePreflightConfig",
     "ReviewGateConfig",
 ]
 

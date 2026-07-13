@@ -90,6 +90,7 @@ from forge.planning.states import PlanningState
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import PlanningConfig
     from forge.gating.wrappers import GateRepository, StateMachine
+    from forge.preflight import ResourcePreflightResult
     from forge.planning.checkpoint import SecondOpinionProvider
     from forge.planning.target_terminal_tools import (
         NormalizeFeatureSpecFn,
@@ -136,6 +137,13 @@ _SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 PublishNotificationFn = Callable[[str, str, str], Awaitable[None]]
 """``async (correlation_id, message, level) -> None`` — best-effort notify."""
+
+ResourcePreflightFn = Callable[[], "ResourcePreflightResult"]
+"""``() -> ResourcePreflightResult`` — a zero-arg pre-run resource check.
+
+Bound (e.g. ``functools.partial(run_resource_preflight, config.resource_preflight)``)
+so the driver stays ignorant of ``/proc`` and ``shutil``. Consulted once at the
+QUEUED→RUNNING run-start boundary (O-27/O-29); ``None`` = no preflight wired."""
 
 SubscriberFactory = Callable[[str | None, "asyncio.Event | None"], Any]
 """``(expected_approver, armed_event) -> subscriber`` — the returned object
@@ -226,6 +234,12 @@ class PlanningDriverDeps:
     planning_config: "PlanningConfig"
     clock: Callable[[], datetime]
     publish_notification: PublishNotificationFn | None = None
+    # O-27/O-29 (E2-S4) — pre-run resource-headroom preflight. Optional / default
+    # None: unwired = no preflight (byte-for-byte no-op). Wired, it is consulted
+    # exactly ONCE at the fresh QUEUED→RUNNING run-start boundary; a breach fails
+    # the run LOUDLY before any seat-holding dispatch (never a mid-run kill, and
+    # never re-run on a crash re-drive of an already-RUNNING run).
+    resource_preflight: ResourcePreflightFn | None = None
     # Lane B / Phase E1 (B2) — the target-terminal spec/plan legs. All optional
     # and default None: with the target-terminal flag OFF they are never
     # consulted (byte-for-byte no-op). With the flag ON they are required; a
@@ -310,6 +324,27 @@ class PlanningRunDriver:
                     refused.current_state,
                 )
                 return
+
+            # O-27/O-29 — resource-headroom preflight at the fresh run-start
+            # boundary. We are now RUNNING (FAILED is a legal edge) and nothing
+            # has dispatched yet, so a starved box refuses CLEANLY here rather
+            # than risk a mid-run kernel OOM-kill / ENOSPC. Only on this fresh
+            # QUEUED→RUNNING path: a crash re-drive of an already-RUNNING run
+            # never re-preflights (we never kill work in flight).
+            if deps.resource_preflight is not None:
+                preflight = deps.resource_preflight()
+                if not preflight.ok:
+                    logger.error(
+                        "planning driver: %s refused at run start — %s",
+                        correlation_id,
+                        preflight.summary,
+                    )
+                    await self._fail_leg(
+                        correlation_id,
+                        stage_label="resource-preflight",
+                        reason=preflight.summary,
+                    )
+                    return
 
         needs_republish = republish_pending
         checkpoint_failures = 0

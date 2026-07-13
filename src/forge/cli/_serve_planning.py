@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -59,6 +60,7 @@ from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.notifications import build_planning_notification_envelope
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
+from forge.preflight import run_resource_preflight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import ForgeConfig, PlanningConfig
@@ -935,6 +937,13 @@ async def compose_planning_consumer_and_dispatch(
                 planning_config=config.planning,
                 clock=clock_fn,
                 publish_notification=publish_planning_notification,
+                # O-27/O-29 (E2-S4) — pre-run memory/disk headroom preflight,
+                # bound to a zero-arg callable so the driver stays ignorant of
+                # /proc + shutil. Defaults enabled=True (refuses only BEFORE a
+                # run starts, never a mid-run kill).
+                resource_preflight=partial(
+                    run_resource_preflight, config.resource_preflight
+                ),
                 # Lane B / Phase E1 (B2) — target-terminal legs (no-op unless
                 # planning.target_terminal.enabled is on).
                 dispatch_feature_spec=dispatch_feature_spec,
