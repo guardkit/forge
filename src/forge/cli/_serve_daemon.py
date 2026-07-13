@@ -218,6 +218,13 @@ async def _default_dispatch(msg: _MsgLike) -> None:
 nats_connect: NatsConnectFn = _default_nats_connect
 dispatch_payload: DispatchFn = _default_dispatch
 
+#: The composed WS2-B8 deploy-stage runner (Lane C1a), or ``None`` when
+#: ``deploy.enabled`` is False (the default). Stashed at serve boot by
+#: ``bind_production_dispatch_chain`` so the post-review deploy trigger (Lane
+#: C4) can reach it. ``None`` = the deploy stage is inert (DEPLOY / LIVE_GATE
+#: never dispatch) — the byte-for-byte no-op flag-off state.
+deploy_stage_runner: Any | None = None
+
 
 # ---------------------------------------------------------------------------
 # Subscription wiring

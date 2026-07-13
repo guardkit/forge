@@ -497,6 +497,31 @@ def bind_production_dispatch_chain(
                     exc,
                 )
 
+        # Lane C1a — wire the WS2-B8 deploy-stage runner into serve boot,
+        # gated on config.deploy.enabled (the flag's first production reader).
+        # Flag OFF (default) = byte-for-byte no-op: nothing is composed and
+        # _serve_daemon.deploy_stage_runner stays None (DEPLOY / LIVE_GATE
+        # inert). Flag ON composes the runner from the shared client + forge
+        # DB and stashes it for the post-review deploy trigger (Lane C4).
+        # DDR-007 boot protection: a composition failure never bricks daemon
+        # boot — the deploy stage stays inert and the ERROR log is the probe.
+        try:
+            from forge.cli._serve_deploy import compose_deploy_stage_runner
+
+            _serve_daemon.deploy_stage_runner = compose_deploy_stage_runner(
+                forge_config=forge_config,
+                nats_client=client,
+                db_path=db_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            _serve_daemon.deploy_stage_runner = None
+            logger.error(
+                "forge-serve: deploy-stage composition FAILED (%s) — the "
+                "deploy stage stays INERT (DEPLOY / LIVE_GATE will not "
+                "dispatch) until fixed",
+                exc,
+            )
+
         deps = build_pipeline_consumer_deps(
             client,
             forge_config,

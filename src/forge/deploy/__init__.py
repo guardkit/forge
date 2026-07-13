@@ -14,6 +14,11 @@ reasoning loop (they are filtered out of the Mode A/B/C permitted set —
 ``forge.pipeline.stage_taxonomy.POST_REVIEW_STAGES``).
 """
 
+from forge.deploy.composition import (
+    build_deploy_stage_runner,
+    dispatch_deploy_stage,
+    resolve_reservation_lease,
+)
 from forge.deploy.deploy_record import (
     DeployAddendum,
     DeployClaim,
@@ -53,4 +58,7 @@ __all__ = [
     "UnconfiguredReservationLease",
     "DeployStageRunner",
     "DeployStageResult",
+    "build_deploy_stage_runner",
+    "dispatch_deploy_stage",
+    "resolve_reservation_lease",
 ]
