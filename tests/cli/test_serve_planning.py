@@ -830,3 +830,100 @@ class TestDuplicateIntakeNoDoubleDispatch:
         assert len(publisher.envelopes) == 1, (
             "exactly one approval request on the wire (request_id dedup holds)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Lane B / Phase E1 (B3) — the production build-trigger closure publishes a
+# Mode B build-queued envelope onto forge's OWN intake (the pre-dispatch
+# approval gate then pauses it for the human tap).
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTriggerWiring:
+    """The composed dispatch_build_trigger queues Mode B on the real wire."""
+
+    @pytest.mark.asyncio
+    async def test_build_trigger_publishes_mode_b_build_queued(
+        self, tmp_db: Path
+    ) -> None:
+        import json
+
+        broker = InMemoryNats()
+        config = _make_planning_config(target_terminal={"enabled": True})
+
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
+        )
+        assert result is not None and result.driver is not None
+        try:
+            trigger = result.driver._deps.dispatch_build_trigger
+            assert trigger is not None, "B3 build trigger must be wired flag-ON"
+
+            outcome = await trigger(
+                plan_run_id="plan-corr-b3",
+                correlation_id="corr-b3",
+                feature_id="FEAT-B3AA",
+                target_repo="guardkit/api_test",
+                branch="planning/corr-b3",
+                plan_files=[
+                    "tasks/TASK-STAT-001.md",
+                    "features/stats/FEAT-B3AA.yaml",
+                ],
+                originating_user="U0RIGINATOR",
+            )
+
+            assert outcome.queued is True
+
+            # A single Mode B build-queued envelope landed on forge's OWN intake.
+            subject = "pipeline.build-queued.FEAT-B3AA"
+            assert subject in broker.published
+            bodies = broker.published[subject]
+            assert len(bodies) == 1
+            env = json.loads(bodies[0].decode("utf-8"))
+            payload = env["payload"]
+            assert payload["mode"] == "mode-b"
+            assert payload["feature_id"] == "FEAT-B3AA"
+            assert payload["repo"] == "guardkit/api_test"
+            assert payload["branch"] == "planning/corr-b3"
+            # The feature-level YAML (named after the minted id) was selected.
+            assert payload["feature_yaml_path"] == "features/stats/FEAT-B3AA.yaml"
+            # Forge-internal machine dispatch (constrained wire literals).
+            assert payload["triggered_by"] == "forge-internal"
+            assert payload["correlation_id"] == "corr-b3"
+        finally:
+            for task in list(result.background_tasks or []):
+                task.cancel()
+            await asyncio.gather(
+                *(result.background_tasks or []), return_exceptions=True
+            )
+
+    @pytest.mark.asyncio
+    async def test_build_trigger_no_yaml_returns_not_queued(
+        self, tmp_db: Path
+    ) -> None:
+        broker = InMemoryNats()
+        config = _make_planning_config(target_terminal={"enabled": True})
+
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
+        )
+        assert result is not None and result.driver is not None
+        try:
+            trigger = result.driver._deps.dispatch_build_trigger
+            outcome = await trigger(
+                plan_run_id="plan-corr-b3n",
+                correlation_id="corr-b3n",
+                feature_id="FEAT-B3NN",
+                target_repo="guardkit/api_test",
+                branch="planning/corr-b3n",
+                plan_files=["tasks/TASK-1.md"],  # no YAML
+                originating_user="U0RIGINATOR",
+            )
+            assert outcome.queued is False
+            assert "pipeline.build-queued.FEAT-B3NN" not in broker.published
+        finally:
+            for task in list(result.background_tasks or []):
+                task.cancel()
+            await asyncio.gather(
+                *(result.background_tasks or []), return_exceptions=True
+            )

@@ -447,6 +447,29 @@ class _DisabledFrontierClient:
         )
 
 
+def _select_feature_yaml(plan_files: list[str], feature_id: str) -> str | None:
+    """Pick the feature-level YAML from a committed plan tree (B3).
+
+    The 008 plan tree carries feature/task/wave YAML; the Mode B build intake
+    needs the feature YAML path (repo-relative, resolved against the branch
+    checkout). Prefer the YAML named after the forge-minted ``feature_id``
+    (``.../{feature_id}.yaml``), then any YAML under a ``features/`` directory,
+    then the first YAML. ``None`` when the tree carries no YAML at all (a loud
+    build-trigger failure — the plan tree is malformed). The WS1 emitter (§9)
+    will make this deterministic; until then this is the best-effort selector.
+    """
+    yamls = [f for f in plan_files if f.endswith((".yaml", ".yml"))]
+    if not yamls:
+        return None
+    for rel in yamls:
+        if Path(rel).stem == feature_id:
+            return rel
+    for rel in yamls:
+        if rel.startswith("features/") or "/features/" in rel:
+            return rel
+    return yamls[0]
+
+
 def _latest_po_output(store: SqlitePlanningRunStore, correlation_id: str) -> dict:
     """Most recent recorded PO output for a run (empty when none)."""
     latest: dict[str, Any] = {}
@@ -756,6 +779,82 @@ async def compose_planning_consumer_and_dispatch(
                 },
             )
 
+        # -- the build trigger (Lane B / Phase E1 B3) ---------------------
+        # On validate green forge queues the feature onto its OWN Mode B build
+        # intake (``pipeline.build-queued.{feature_id}``) — the canonical
+        # MODE_B dispatcher (reaching ``dispatch_autobuild_async`` via the build
+        # daemon, NOT the local guardkit CLI). The daemon's pre-dispatch
+        # approval gate (``maybe_gate_build``) then pauses the build for the
+        # human tap, and jarvis renders the build-paused lifecycle event on the
+        # existing build-notification surface. Fire-and-forget publish: no
+        # specialist round-trip, so no new unbounded wait (rule 5).
+        from forge.planning.driver import BuildTriggerResult
+
+        async def dispatch_build_trigger(
+            *,
+            plan_run_id: str,
+            correlation_id: str,
+            feature_id: str,
+            target_repo: str,
+            branch: str,
+            plan_files: list[str],
+            originating_user: str | None,
+        ) -> BuildTriggerResult:
+            from nats_core.envelope import EventType, MessageEnvelope
+            from nats_core.events import BuildQueuedPayload
+
+            from forge.lifecycle.modes import BuildMode
+
+            feature_yaml = _select_feature_yaml(plan_files, feature_id)
+            if feature_yaml is None:
+                logger.error(
+                    "planning target terminal: no feature YAML in the committed "
+                    "plan tree for %s (files=%s) — cannot queue the Mode B build",
+                    correlation_id,
+                    plan_files,
+                )
+                return BuildTriggerResult(
+                    queued=False,
+                    reason="no feature YAML in the committed plan tree",
+                )
+            now = clock_fn()
+            # ``triggered_by`` / ``originating_adapter`` are constrained wire
+            # literals — the target-terminal build trigger is a forge-internal
+            # machine dispatch (no user-facing adapter), so it uses
+            # ``forge-internal`` and omits the adapter.
+            payload = BuildQueuedPayload(
+                feature_id=feature_id,
+                repo=target_repo,
+                branch=branch,
+                feature_yaml_path=feature_yaml,
+                triggered_by="forge-internal",
+                originating_user=originating_user,
+                correlation_id=correlation_id,
+                requested_at=now,
+                queued_at=now,
+                mode=BuildMode.MODE_B.value,
+            )
+            envelope = MessageEnvelope(
+                source_id="forge",
+                event_type=EventType.BUILD_QUEUED,
+                correlation_id=correlation_id,
+                payload=payload.model_dump(mode="json"),
+            )
+            subject = f"pipeline.build-queued.{feature_id}"
+            await nats_client.publish(
+                subject, envelope.model_dump_json().encode("utf-8")
+            )
+            logger.info(
+                "planning target terminal: queued Mode B build for %s "
+                "(feature %s, branch %s) on %s — the pre-dispatch approval gate "
+                "will pause it for the human tap",
+                correlation_id,
+                feature_id,
+                branch,
+                subject,
+            )
+            return BuildTriggerResult(queued=True, build_id=None)
+
         # The two deterministic oracles forge runs against the committed
         # artifacts (bounded subprocesses; frozen guardkit `feature validate`).
         normalize_feature_spec = make_normalize_feature_spec()
@@ -842,6 +941,8 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_feature_plan=dispatch_feature_plan,
                 normalize_feature_spec=normalize_feature_spec,
                 validate_feature_plan=validate_feature_plan,
+                # Lane B / Phase E1 (B3) — the Mode B build trigger.
+                dispatch_build_trigger=dispatch_build_trigger,
             )
         )
 

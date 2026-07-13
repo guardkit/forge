@@ -98,7 +98,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PlanningDriverDeps", "PlanningRunDriver"]
+__all__ = ["BuildTriggerResult", "PlanningDriverDeps", "PlanningRunDriver"]
 
 #: Stage label used for the product docs checkpoint (pinned by checkpoint.py).
 _PRODUCT_DOCS_STAGE = "product_docs"
@@ -124,6 +124,10 @@ _TERMINAL_STATES = {
 #: artifact write and the state transition never re-dispatches the specialist).
 _FEATURE_SPEC_STAGE = "feature-spec"
 _FEATURE_PLAN_STAGE = "feature-plan"
+#: Durable stage label for the B3 build trigger. Its presence makes the trigger
+#: idempotent on a re-drive (crash between the build-queued publish and the
+#: BUILD_QUEUED transition never re-queues the build).
+_BUILD_QUEUED_STAGE = "build-queued"
 
 #: Filesystem-safe feature slug allowlist (mirrors the identifier boundary):
 #: a specialist-supplied slug is only trusted when it matches, else forge falls
@@ -160,6 +164,34 @@ Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge ALWAYS
 supplies the scope + target-repo descriptor + the forge-minted ``feature_id``
 (RV-1: the plan leg asserts the SUPPLIED id). The result's ``role_output``
 carries the plan tree."""
+
+
+@dataclass(frozen=True)
+class BuildTriggerResult:
+    """Outcome of the B3 build trigger (Lane B / Phase E1 B3).
+
+    ``queued`` True means the feature was accepted onto forge's OWN Mode B
+    build intake (``pipeline.build-queued.{feature_id}``) — the canonical
+    dispatcher whose pre-dispatch approval gate then pauses the build for the
+    human tap. ``build_id`` is the build identifier when the trigger seam
+    surfaces one (``None`` for the fire-and-forget publish seam). ``reason``
+    carries the loud-failure detail when ``queued`` is False.
+    """
+
+    queued: bool
+    build_id: str | None = None
+    reason: str | None = None
+
+
+DispatchBuildTriggerFn = Callable[..., Awaitable["BuildTriggerResult"]]
+"""``async (*, plan_run_id, correlation_id, feature_id, target_repo, branch,
+plan_files, originating_user) -> BuildTriggerResult``.
+
+Lane B (B3): queue the validated feature onto forge's OWN Mode B build
+dispatcher (``dispatch_autobuild_async`` reached via the build-queued intake,
+NOT the local guardkit CLI) so the pre-dispatch approval gate pauses it for the
+human tap. This is a fire-and-forget publish — it does NOT wait on a specialist
+round-trip, so it introduces no new unbounded wait (rule 5)."""
 
 
 def _extract_assumptions(result: Any) -> list[dict[str, Any]]:
@@ -202,6 +234,10 @@ class PlanningDriverDeps:
     dispatch_feature_plan: DispatchFeaturePlanFn | None = None
     normalize_feature_spec: "NormalizeFeatureSpecFn | None" = None
     validate_feature_plan: "ValidateFeaturePlanFn | None" = None
+    # Lane B / Phase E1 (B3) — the build trigger. Optional / default None: with
+    # the target-terminal flag OFF it is never consulted; with the flag ON it is
+    # required and a missing collaborator fails the run LOUDLY (never silent).
+    dispatch_build_trigger: DispatchBuildTriggerFn | None = None
 
 
 @dataclass(frozen=True)
@@ -305,9 +341,14 @@ class PlanningRunDriver:
                     return
                 continue  # re-read: now FEATURE_PLAN
             if state is PlanningState.FEATURE_PLAN:
+                # B2: dispatch 008 + write + validate the plan tree (idempotent
+                # on a re-drive). B3: on validate green, queue the feature onto
+                # forge's own Mode B dispatcher and advance to BUILD_QUEUED.
                 if not await self._feature_plan_leg(row, correlation_id):
-                    return  # B2 endpoint: plan validated; build trigger is B3
-                continue
+                    return
+                if not await self._build_trigger_leg(row, correlation_id):
+                    return
+                continue  # re-read: now BUILD_QUEUED (terminal) — loop returns
 
             # state is RUNNING — consult the pure planner over durable history
             history = self._load_history(correlation_id)
@@ -1089,20 +1130,20 @@ class PlanningRunDriver:
     async def _feature_plan_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write + validate.
 
-        Returns False in ALL cases — B2's endpoint is a validated plan tree
-        parked at FEATURE_PLAN (the build trigger + BUILD_QUEUED transition is
-        B3). A durable ``feature-plan`` approved event short-circuits a re-drive
-        (no re-dispatch). ``self._fail_leg`` moves the run to FAILED on any
-        loud failure; success records the leg event and stops driving.
+        Returns True once the plan tree is validated + committed (the caller
+        proceeds to the B3 build trigger), False on a loud terminal failure. A
+        durable ``feature-plan`` approved event short-circuits a re-drive
+        (no re-dispatch — returns True so the build trigger still runs, which is
+        what makes a crash between the plan commit and BUILD_QUEUED recover).
         """
         deps = self._deps
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
             logger.info(
                 "planning driver: run %s feature-plan already complete "
-                "(B2 endpoint — awaiting the B3 build trigger)",
+                "(idempotent re-drive — proceeding to the B3 build trigger)",
                 correlation_id,
             )
-            return False
+            return True
 
         if deps.dispatch_feature_plan is None or deps.validate_feature_plan is None:
             await self._fail_leg(
@@ -1217,17 +1258,140 @@ class PlanningRunDriver:
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id}: machine spec + plan complete and "
-            f"validated (feature {feature_id}, branch {branch}). Awaiting the "
-            "build trigger.",
+            f"validated (feature {feature_id}, branch {branch}); queueing the "
+            "build.",
             level="info",
         )
         logger.info(
             "planning driver: run %s feature-plan validated (feature_id=%s); "
-            "B2 endpoint reached (parked at FEATURE_PLAN for the B3 build trigger)",
+            "proceeding to the B3 build trigger",
             correlation_id,
             feature_id,
         )
-        return False
+        return True
+
+    async def _build_trigger_leg(self, row: Any, correlation_id: str) -> bool:
+        """B3 build trigger: queue the validated feature, advance to BUILD_QUEUED.
+
+        On validate green (a durable ``feature-plan`` event exists) this queues
+        the feature onto forge's OWN Mode B build dispatcher via the injected
+        ``dispatch_build_trigger`` collaborator — the canonical MODE_B path
+        (NOT the local guardkit CLI) whose pre-dispatch approval gate then
+        pauses the build for the human tap and whose build-paused lifecycle
+        event jarvis renders (the existing build-notification surface).
+
+        The trigger is a fire-and-forget publish (no specialist round-trip), so
+        it introduces no new unbounded wait (rule 5). Idempotent: a durable
+        ``build-queued`` event means the feature was already queued (crash
+        before the BUILD_QUEUED transition) — the leg just re-attempts the
+        transition without re-publishing. Returns True on success (drive()
+        re-reads BUILD_QUEUED, the target terminal), False on a loud failure.
+        """
+        deps = self._deps
+        if self._has_leg_event(correlation_id, _BUILD_QUEUED_STAGE):
+            return self._advance_to_build_queued(correlation_id)
+
+        if deps.dispatch_build_trigger is None:
+            return await self._fail_leg(
+                correlation_id,
+                _BUILD_QUEUED_STAGE,
+                "target terminal ON but the build trigger collaborator "
+                "(dispatch_build_trigger) is not wired",
+            )
+
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        feature_id = str(plan_details.get("feature_id") or "")
+        if not feature_id:
+            return await self._fail_leg(
+                correlation_id,
+                _BUILD_QUEUED_STAGE,
+                "no feature id recorded on the feature-plan leg — cannot queue "
+                "the build",
+            )
+        target_repo = str(plan_details.get("target_repo") or "")
+        branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
+        plan_files = plan_details.get("plan_files") or []
+        plan_run_id = f"plan-{correlation_id}"
+
+        try:
+            result = await deps.dispatch_build_trigger(
+                plan_run_id=plan_run_id,
+                correlation_id=correlation_id,
+                feature_id=feature_id,
+                target_repo=target_repo,
+                branch=branch,
+                plan_files=list(plan_files),
+                originating_user=row["originating_user"],
+            )
+        except Exception as exc:  # noqa: BLE001 — trigger boundary, never crash
+            return await self._fail_leg(
+                correlation_id,
+                _BUILD_QUEUED_STAGE,
+                f"build trigger raised {type(exc).__name__}: {exc}",
+            )
+
+        queued = bool(getattr(result, "queued", False))
+        if not queued:
+            reason = str(getattr(result, "reason", None) or "no reason supplied")
+            return await self._fail_leg(
+                correlation_id,
+                _BUILD_QUEUED_STAGE,
+                f"build trigger did not queue the feature: {reason}",
+            )
+
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_BUILD_QUEUED_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "feature_id": feature_id,
+                    "build_id": getattr(result, "build_id", None),
+                    "target_repo": target_repo,
+                    "branch": branch,
+                }
+            ),
+        )
+        if not self._advance_to_build_queued(correlation_id):
+            return False
+        await self._notify(
+            correlation_id,
+            f"Planning run {correlation_id}: feature {feature_id} queued for "
+            f"build on forge's Mode B pipeline (branch {branch}); paused at the "
+            "build approval gate for the human tap.",
+            level="info",
+        )
+        logger.info(
+            "planning driver: run %s reached BUILD_QUEUED (feature_id=%s, "
+            "branch=%s) — the target terminal is complete",
+            correlation_id,
+            feature_id,
+            branch,
+        )
+        return True
+
+    def _advance_to_build_queued(self, correlation_id: str) -> bool:
+        """Transition FEATURE_PLAN → BUILD_QUEUED (idempotent-resume safe)."""
+        refused = self._deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.BUILD_QUEUED,
+            actor_identity="planning-driver",
+            stage_label=_BUILD_QUEUED_STAGE,
+            expected_from_state=PlanningState.FEATURE_PLAN,
+        )
+        if isinstance(refused, TransitionRefused):
+            current = self._deps.store.get_run(correlation_id)
+            if current and PlanningState(current["state"]) is PlanningState.BUILD_QUEUED:
+                return True
+            logger.warning(
+                "planning driver: FEATURE_PLAN→BUILD_QUEUED refused for %s "
+                "(current=%s)",
+                correlation_id,
+                refused.current_state,
+            )
+            return False
+        return True
 
     # -- target-terminal helpers ---------------------------------------- #
 

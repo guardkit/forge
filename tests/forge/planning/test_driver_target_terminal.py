@@ -27,6 +27,7 @@ Covered:
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,9 +41,13 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import PlanningConfig, TargetTerminalConfig
 from forge.gating.identity import derive_request_id
 from forge.lifecycle import migrations
-from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
+from forge.planning.driver import (
+    BuildTriggerResult,
+    PlanningDriverDeps,
+    PlanningRunDriver,
+)
 from forge.planning.gate_adapters import build_planning_gate_adapters
-from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
 from forge.planning.target_terminal_tools import ToolOutcome
 from nats_core.events import ApprovalResponsePayload
@@ -244,6 +249,9 @@ def _make_driver(
     normalize: Any | None = None,
     validate: Any | None = None,
     wire_legs: bool = True,
+    build_trigger_result: Any | None = None,
+    build_trigger_fn: Any | None = None,
+    wire_build_trigger: bool = True,
 ) -> _Harness:
     from datetime import UTC, datetime
 
@@ -253,7 +261,14 @@ def _make_driver(
     repository, state_machine = build_planning_gate_adapters(store, clock=clock)
     publisher = FakePublisher()
     notifications: list[tuple[str, str, str]] = []
-    counters = {"po": 0, "spec": 0, "plan": 0, "normalize": 0, "validate": 0}
+    counters = {
+        "po": 0,
+        "spec": 0,
+        "plan": 0,
+        "normalize": 0,
+        "validate": 0,
+        "build_trigger": 0,
+    }
 
     def subscriber_factory(expected_approver: Any, armed: Any) -> ScriptedSubscriber:
         return ScriptedSubscriber([_approve()], armed)
@@ -289,6 +304,37 @@ def _make_driver(
         counters["validate"] += 1
         return validate if validate is not None else ToolOutcome(ok=True)
 
+    build_triggers: list[dict[str, Any]] = []
+
+    async def _dispatch_build_trigger(
+        *,
+        plan_run_id: str,
+        correlation_id: str,
+        feature_id: str,
+        target_repo: str,
+        branch: str,
+        plan_files: list[str],
+        originating_user: str | None,
+    ) -> BuildTriggerResult:
+        counters["build_trigger"] += 1
+        # Record the "queue onto the Mode B bus" call — the observable
+        # pre-gate step the real gate pause hangs off (B3 test-bus fixture).
+        build_triggers.append(
+            {
+                "feature_id": feature_id,
+                "target_repo": target_repo,
+                "branch": branch,
+                "plan_files": list(plan_files),
+                "originating_user": originating_user,
+            }
+        )
+        assert feature_id.startswith("FEAT-")
+        assert target_repo == TARGET_REPO
+        assert branch == f"planning/{CID}"
+        if build_trigger_result is not None:
+            return build_trigger_result
+        return BuildTriggerResult(queued=True, build_id="build-1")
+
     async def publish_notification(cid: str, message: str, level: str) -> None:
         notifications.append((cid, message, level))
 
@@ -314,10 +360,20 @@ def _make_driver(
         dispatch_feature_plan=(plan_dispatch or _dispatch_plan) if wire_legs else None,
         normalize_feature_spec=_normalize if wire_legs else None,
         validate_feature_plan=_validate if wire_legs else None,
+        dispatch_build_trigger=(
+            (build_trigger_fn or _dispatch_build_trigger)
+            if wire_build_trigger
+            else None
+        ),
     )
     return _Harness(
         PlanningRunDriver(deps),
-        {"notifications": notifications, "counters": counters, "git": deps.git_runner},
+        {
+            "notifications": notifications,
+            "counters": counters,
+            "git": deps.git_runner,
+            "build_triggers": build_triggers,
+        },
     )
 
 
@@ -356,6 +412,7 @@ async def test_flag_off_terminates_at_planned_handoff_and_never_calls_legs(
     assert h.ctx["counters"]["plan"] == 0
     assert h.ctx["counters"]["normalize"] == 0
     assert h.ctx["counters"]["validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -392,8 +449,8 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
     await h.driver.drive(CID)
 
     run = store.get_run(CID)
-    # B2 endpoint: plan validated, parked at FEATURE_PLAN (build trigger = B3).
-    assert run["state"] == PlanningState.FEATURE_PLAN.value
+    # B3 endpoint: plan validated, build queued, run reaches the target terminal.
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
 
     branch = f"planning/{CID}"
 
@@ -412,16 +469,26 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
     feature_id = h.ctx["counters"]["last_feature_id"]
     assert f"id: {feature_id}" in _show(f"features/stats-endpoint/{feature_id}.yaml")
 
-    # Both oracles ran; each leg dispatched exactly once.
+    # Both oracles ran; each leg dispatched exactly once; the build was queued.
     assert h.ctx["counters"] ["spec"] == 1
     assert h.ctx["counters"]["plan"] == 1
     assert h.ctx["counters"]["normalize"] == 1
     assert h.ctx["counters"]["validate"] == 1
+    assert h.ctx["counters"]["build_trigger"] == 1
+
+    # The build trigger was called with the minted feature id + the committed
+    # branch — the queue-onto-Mode-B step the pre-dispatch gate hangs off.
+    assert len(h.ctx["build_triggers"]) == 1
+    trig = h.ctx["build_triggers"][0]
+    assert trig["feature_id"] == feature_id
+    assert trig["branch"] == branch
+    assert any(f.endswith(".yaml") for f in trig["plan_files"])
 
     # Durable leg events landed.
     labels = {e["stage_label"] for e in store.list_events(CID)}
     assert "feature-spec" in labels
     assert "feature-plan" in labels
+    assert "build-queued" in labels
 
 
 @pytest.mark.asyncio
@@ -435,11 +502,12 @@ async def test_round_trip_is_idempotent_on_redrive(
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
 
     await h.driver.drive(CID)
-    await h.driver.drive(CID)  # re-drive: must not re-dispatch the specialist
+    await h.driver.drive(CID)  # re-drive: must not re-dispatch or re-queue
 
     assert h.ctx["counters"]["spec"] == 1
     assert h.ctx["counters"]["plan"] == 1
-    assert store.get_run(CID)["state"] == PlanningState.FEATURE_PLAN.value
+    assert h.ctx["counters"]["build_trigger"] == 1  # build queued exactly once
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
 
 
 # ---------------------------------------------------------------------------
@@ -563,3 +631,117 @@ async def test_unwired_legs_fail_loudly(store: SqlitePlanningRunStore) -> None:
     h = _make_driver(store, wire_legs=False)
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
     assert any(level == "error" for _, _, level in h.ctx["notifications"])
+
+
+# ---------------------------------------------------------------------------
+# B3 — the build trigger (queue onto Mode B → BUILD_QUEUED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_trigger_not_queued_fails_loudly(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """A trigger that refuses to queue (e.g. repo not allowlisted) fails loud."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        build_trigger_result=BuildTriggerResult(
+            queued=False, reason="repo not allowlisted"
+        ),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+    # Spec + plan still ran (the trigger is the last leg) but no BUILD_QUEUED.
+    assert h.ctx["counters"]["plan"] == 1
+    assert h.ctx["counters"]["build_trigger"] == 1
+    # No durable APPROVED build-queued marker landed (the failure transition
+    # records a build-queued-labelled row, but not the idempotency sentinel).
+    assert not any(
+        e["stage_label"] == "build-queued" and e["status"] == "approved"
+        for e in store.list_events(CID)
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_trigger_raises_fails_loudly(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """A trigger that raises (e.g. bus publish error) never crashes the run."""
+
+    async def _boom(**_: Any) -> BuildTriggerResult:
+        raise RuntimeError("bus unreachable")
+
+    _queue(store)
+    h = _make_driver(store, build_trigger_fn=_boom)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+
+
+@pytest.mark.asyncio
+async def test_unwired_build_trigger_fails_loudly(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Flag ON but the build-trigger collaborator missing = loud FAILED."""
+    _queue(store)
+    h = _make_driver(store, wire_build_trigger=False)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+    # The plan leg completed; only the build trigger was unwired.
+    assert h.ctx["counters"]["plan"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_trigger_idempotent_after_queue_recorded(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Crash AFTER the build was queued but BEFORE the BUILD_QUEUED transition.
+
+    A re-drive must advance to BUILD_QUEUED from the durable ``build-queued``
+    leg event WITHOUT re-queuing the build (no second Mode B publish).
+    """
+    _queue(store)
+    # Walk the run to FEATURE_PLAN via the flag-ON transition table.
+    for to in (
+        PlanningState.RUNNING,
+        PlanningState.FEATURE_SPEC,
+        PlanningState.FEATURE_PLAN,
+    ):
+        refused = store.transition(
+            correlation_id=CID,
+            to_state=to,
+            actor_identity="seed",
+            stage_label="seed",
+        )
+        assert not isinstance(refused, TransitionRefused)
+    # Seed the durable leg events the trigger leg reads, incl. the already-queued
+    # marker (the crash window: event recorded, state not yet advanced).
+    store._record_event(
+        correlation_id=CID,
+        stage_label="feature-plan",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps(
+            {
+                "feature_id": "FEAT-AAAA",
+                "target_repo": TARGET_REPO,
+                "branch": f"planning/{CID}",
+                "plan_files": ["features/x/FEAT-AAAA.yaml"],
+            }
+        ),
+    )
+    store._record_event(
+        correlation_id=CID,
+        stage_label="build-queued",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps({"feature_id": "FEAT-AAAA", "build_id": "build-1"}),
+    )
+
+    h = _make_driver(store)
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # Neither the specialist legs nor the build trigger were re-invoked.
+    assert h.ctx["counters"]["build_trigger"] == 0
+    assert h.ctx["counters"]["plan"] == 0
