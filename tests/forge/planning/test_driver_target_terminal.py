@@ -636,12 +636,15 @@ async def test_full_round_trip_on_the_DEPLOYED_native_reply_shape(
 
 
 @pytest.mark.asyncio
-async def test_native_spec_validation_failure_fails_loudly(
-    store: SqlitePlanningRunStore, tmp_path: Path
+async def test_native_spec_validation_flag_is_advisory_and_proceeds(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """VALIDATION HONESTY: a 007 native reply whose validation.json reports a
-    decidable-gate failure (accepted:false) fails the leg loudly — it does not
-    proceed to commit + plan."""
+    """VALIDATION CHANNEL (C5): a 007 reply whose validation.json reports
+    accepted:false is ADVISORY self-check data, not an oracle — the leg logs
+    the errors loudly (WARNING, verbatim) and proceeds to the REAL oracles
+    (normalizer + guardkit validate). The gold hermetic run itself shipped
+    accepted:false on a minor count note while the coach scored 0.985; the
+    C5 bounded revision re-invoke is the named follow-on consumer."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
@@ -652,9 +655,16 @@ async def test_native_spec_validation_failure_fails_loudly(
         repo_path=str(repo),
         spec_result=_spec_result_native(accepted=False),
     )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["plan"] == 0  # never reached the plan leg
-    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+    with caplog.at_level("WARNING"):
+        await h.driver.drive(CID)
+    # The run proceeds through the real oracles to BUILD_QUEUED.
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["plan"] == 1  # the plan leg WAS reached
+    # The self-reported error was surfaced loudly and verbatim.
+    assert any(
+        "validation.json self-check" in r.message and "ADVISORY" in r.message
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

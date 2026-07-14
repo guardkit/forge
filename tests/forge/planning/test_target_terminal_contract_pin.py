@@ -290,12 +290,13 @@ def test_spec_triple_duplicate_suffix_is_none() -> None:
     assert PlanningRunDriver._spec_triple_files(native, slug) is None
 
 
-# ---- VALIDATION HONESTY: validation.json errors -> loud fail signal --------
+# ---- VALIDATION CHANNEL (ADVISORY): errors surfaced verbatim, oracles decide
 
 
-def test_real_validation_json_with_errors_is_a_loud_failure() -> None:
-    """The REAL B4 gold set carried accepted=false — the leg must NOT proceed
-    silently; the honesty check names the decidable-gate error."""
+def test_real_validation_json_with_errors_is_surfaced_verbatim() -> None:
+    """The REAL B4 gold set carried accepted=false — the extractor surfaces the
+    self-check errors verbatim so the leg can WARN loudly (advisory posture:
+    the normalizer/validate oracles decide; C5 revision re-invoke = follow-on)."""
     native = _load_real_native_map()  # the REAL (accepted:false) channel
     failures = PlanningRunDriver._validation_failures(native)
     assert failures  # non-empty => the leg fails loudly
@@ -310,7 +311,7 @@ def test_absent_validation_channel_proceeds() -> None:
     assert PlanningRunDriver._validation_failures({"x.feature": "Feature: x\n"}) == []
 
 
-def test_unparseable_validation_json_is_a_loud_failure() -> None:
+def test_unparseable_validation_json_is_surfaced() -> None:
     failures = PlanningRunDriver._validation_failures(
         {"validation.json": "{not json"}
     )
@@ -351,7 +352,7 @@ def test_plan_tree_native_carries_a_feature_yaml_for_build_trigger() -> None:
     assert any(f.endswith(".yaml") and "features/" in f for f in files)
 
 
-def test_plan_validation_errors_are_a_loud_failure() -> None:
+def test_plan_validation_errors_are_surfaced_verbatim() -> None:
     poisoned = dict(_PLAN_NATIVE_MAP)
     poisoned["validation.json"] = json.dumps(
         {"accepted": False, "errors": ["ungated waves without an activation notice"]}
@@ -362,3 +363,52 @@ def test_plan_validation_errors_are_a_loud_failure() -> None:
 
 def test_plan_tree_empty_map_is_none() -> None:
     assert PlanningRunDriver._plan_tree_files({"validation.json": "{}"}) is None
+
+
+# ---- WIRE TRUTH: the reply as the specialist's OWN wrap chain produces it --
+# fixtures/b4_hermetic_007_r2/wire_reply.json is GENERATED (not hand-shaped) by
+# specialist-agent's SessionResult.model_dump() + wrap_role_output() over the
+# real gold artifacts — the artifact map nests at role_output.artifacts (the
+# B4 run 5392685a miss: reconstructed fixtures pinned a plausible-but-wrong
+# shape; wire-true fixtures are the standing rule now).
+
+
+def _load_wire_reply() -> dict:
+    return json.loads((_FIXTURE_DIR / "wire_reply.json").read_text(encoding="utf-8"))
+
+
+def test_wire_true_reply_descends_to_the_artifact_map() -> None:
+    wire = _load_wire_reply()
+    projected = PlanningRunDriver._role_output_of(SimpleNamespace(role_output=wire))
+    assert "uptime-endpoint.feature" in projected
+    # Neither envelope scalars nor SessionResult scalars leak through.
+    assert "role_id" not in projected and "run_id" not in projected
+
+
+def test_wire_true_session_result_dump_descends_to_the_artifact_map() -> None:
+    """The single-unwrap case: the reply parser handed the SessionResult dump."""
+    wire = _load_wire_reply()
+    projected = PlanningRunDriver._role_output_of(
+        SimpleNamespace(role_output=wire["role_output"])
+    )
+    assert "uptime-endpoint.feature" in projected
+    assert "run_id" not in projected
+
+
+def test_wire_true_spec_triple_projects_end_to_end() -> None:
+    wire = _load_wire_reply()
+    ro = PlanningRunDriver._role_output_of(SimpleNamespace(role_output=wire))
+    slug = PlanningRunDriver._slug_of(ro, "cid-wire")
+    files = PlanningRunDriver._spec_triple_files(ro, slug)
+    assert files is not None and set(files) == {
+        "features/uptime-endpoint/uptime-endpoint.feature",
+        "features/uptime-endpoint/uptime-endpoint_assumptions.yaml",
+        "features/uptime-endpoint/uptime-endpoint_summary.md",
+    }
+
+
+def test_wire_true_validation_channel_extracts_the_real_error() -> None:
+    wire = _load_wire_reply()
+    ro = PlanningRunDriver._role_output_of(SimpleNamespace(role_output=wire))
+    failures = PlanningRunDriver._validation_failures(ro)
+    assert any("@negative" in f for f in failures)
