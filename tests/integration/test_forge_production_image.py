@@ -80,6 +80,7 @@ RUNBOOK_PATH: Path = (
 # (e.g. by collapsing whitespace) — the literal-grep is the contract.
 CANONICAL_INVOCATION: str = (
     "docker buildx build --build-context nats-core=../nats-core "
+    "--build-context guardkit=../guardkit "
     "-t forge:production-validation -f Dockerfile ."
 )
 

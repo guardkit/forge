@@ -39,6 +39,7 @@ BUILD_SCRIPT_PATH = REPO_ROOT / "scripts" / "build-image.sh"
 # (forge/). ``../nats-core`` resolves to the sibling working tree.
 CONTRACT_A_INVOCATION = (
     "docker buildx build --build-context nats-core=../nats-core "
+    "--build-context guardkit=../guardkit "
     "-t forge:production-validation -f Dockerfile ."
 )
 

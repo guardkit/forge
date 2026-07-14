@@ -923,7 +923,11 @@ async def compose_planning_consumer_and_dispatch(
 
         # The two deterministic oracles forge runs against the committed
         # artifacts (bounded subprocesses; frozen guardkit `feature validate`).
-        normalize_feature_spec = make_normalize_feature_spec()
+        # ``command_prefix=None`` requests dual-candidate module resolution so the
+        # normalizer works whether guardkit is wheel-installed
+        # (``guardkit._installer_core.*``) or a source checkout
+        # (``installer.core.*``) — the B4 run 4b3b0893 in-container gap.
+        normalize_feature_spec = make_normalize_feature_spec(command_prefix=None)
         validate_feature_plan = make_validate_feature_plan()
 
         # -- approval side -------------------------------------------------

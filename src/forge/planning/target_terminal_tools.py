@@ -32,6 +32,7 @@ sovereign-planning-loop-scope §4 (guardkit ``feature validate`` = the oracle).
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -43,25 +44,110 @@ from forge.adapters.guardkit.run import run as guardkit_run
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "NORMALIZER_MODULE_CANDIDATES",
     "NormalizeFeatureSpecFn",
+    "NormalizerModuleUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
+    "resolve_normalizer_command",
 ]
 
 #: Default per-oracle wall-clock budget. Bounded (M12) — a stuck oracle fails
 #: the leg loudly rather than hanging the planning run forever.
 _DEFAULT_ORACLE_TIMEOUT_SECONDS: int = 600
 
-#: Default normalizer invocation. ``feature_spec_normalize`` is a guardkit
-#: module (``python -m …``), not a ``guardkit`` subcommand; the interpreter and
-#: module path are a config knob so Lane A / B4 can bind the deployed form.
-_DEFAULT_NORMALIZER_COMMAND: tuple[str, ...] = (
-    "python",
-    "-m",
+#: The interpreter used to launch the ``python -m …`` normalizer. Inside the
+#: forge image this resolves (via PATH) to the same ``/opt/venv`` interpreter the
+#: forge daemon itself runs under, so an in-process :func:`importlib.util.find_spec`
+#: probe is an accurate predictor of what ``python -m`` will be able to import.
+_DEFAULT_PYTHON_EXECUTABLE: str = "python"
+
+#: The two module paths ``feature_spec_normalize`` is importable at, in
+#: resolution priority order. This mirrors the specialist's dual-candidate
+#: template-loader: the guardkit distribution exposes the normalizer at DIFFERENT
+#: paths depending on how it was installed, and forge must be robust to BOTH.
+#:
+#: * ``guardkit._installer_core.commands.lib.feature_spec_normalize`` — a plain
+#:   ``pip install`` (DF-011 wheel). Hatch ``force-include`` maps the authoring
+#:   source ``installer/core`` under the guardkit namespace as
+#:   ``guardkit/_installer_core`` (never a top-level ``installer`` distribution,
+#:   which would collide with PyPI ``pypa/installer``). This is the form the
+#:   forge production image installs, so it is tried FIRST.
+#: * ``installer.core.commands.lib.feature_spec_normalize`` — a source / editable
+#:   checkout, where the repo root carries an importable top-level ``installer``
+#:   package. This is the dev-host form.
+#:
+#: LIVE INCIDENT (B4 run 4b3b0893, round 5): the forge image shipped no guardkit,
+#: so the hard-coded ``installer.core.…`` invocation failed in-container with
+#: ``ModuleNotFoundError: No module named 'installer'`` AFTER the reply had already
+#: been projected and the branch written. The image now installs guardkit and the
+#: default production wiring resolves whichever of these two paths is importable.
+NORMALIZER_MODULE_CANDIDATES: tuple[str, ...] = (
+    "guardkit._installer_core.commands.lib.feature_spec_normalize",
     "installer.core.commands.lib.feature_spec_normalize",
 )
+
+#: Default normalizer invocation for the DEV / source-checkout form. Production
+#: wiring passes ``command_prefix=None`` to request dual-candidate resolution via
+#: :func:`resolve_normalizer_command` instead (robust to a wheel install too).
+#: ``feature_spec_normalize`` is a guardkit *module* (``python -m …``), not a
+#: ``guardkit`` subcommand.
+_DEFAULT_NORMALIZER_COMMAND: tuple[str, ...] = (
+    _DEFAULT_PYTHON_EXECUTABLE,
+    "-m",
+    NORMALIZER_MODULE_CANDIDATES[1],
+)
+
+
+class NormalizerModuleUnresolved(RuntimeError):
+    """Neither normalizer module candidate is importable in this interpreter.
+
+    Raised by :func:`resolve_normalizer_command` when the guardkit distribution
+    is absent from the image entirely (the B4 run 4b3b0893 failure mode). The
+    message names BOTH candidates and the fix, mirroring the loud-error grammar
+    the loaders use elsewhere.
+    """
+
+
+def resolve_normalizer_command(
+    *,
+    python_executable: str = _DEFAULT_PYTHON_EXECUTABLE,
+    module_candidates: Sequence[str] = NORMALIZER_MODULE_CANDIDATES,
+    find_spec: Callable[[str], object | None] = importlib.util.find_spec,
+) -> tuple[str, ...]:
+    """Resolve the ``python -m <module>`` prefix for the normalizer subprocess.
+
+    Probes :data:`NORMALIZER_MODULE_CANDIDATES` in priority order using an
+    in-process :func:`importlib.util.find_spec` and returns
+    ``(python, "-m", <first importable candidate>)``. Because the forge daemon
+    and the ``python -m`` subprocess share the same ``/opt/venv`` interpreter,
+    an importable spec here is an accurate predictor that ``python -m`` will
+    resolve the module in-container.
+
+    Raises :class:`NormalizerModuleUnresolved` — naming BOTH candidates — when
+    neither resolves (a guardkit-less image; the seam that shipped the live B4
+    failure).
+    """
+    for candidate in module_candidates:
+        try:
+            spec = find_spec(candidate)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            # ``find_spec`` raises rather than returns None when a *parent*
+            # package is missing (e.g. no top-level ``installer`` at all).
+            # Treat that exactly like "not importable" and try the next.
+            spec = None
+        if spec is not None:
+            return (python_executable, "-m", candidate)
+    raise NormalizerModuleUnresolved(
+        "target-terminal normalizer module could not be resolved: none of the "
+        f"candidates import in this interpreter — {list(module_candidates)}. "
+        "The forge image must install guardkit (pip install the DF-011 wheel, "
+        "which exposes guardkit._installer_core.*) or provide a source checkout "
+        "with an importable top-level installer package. See scripts/build-image.sh "
+        "and scripts/verify-forge-oracles.sh."
+    )
 
 
 @dataclass(frozen=True)
@@ -120,22 +206,47 @@ async def _default_normalizer_subprocess(
 
 def make_normalize_feature_spec(
     *,
-    command_prefix: Sequence[str] = _DEFAULT_NORMALIZER_COMMAND,
+    command_prefix: Sequence[str] | None = _DEFAULT_NORMALIZER_COMMAND,
     timeout_seconds: int = _DEFAULT_ORACLE_TIMEOUT_SECONDS,
     subprocess_seam: Callable[..., Awaitable[tuple[str, str, int, bool]]]
     | None = None,
+    python_executable: str = _DEFAULT_PYTHON_EXECUTABLE,
 ) -> NormalizeFeatureSpecFn:
     """Build the production normalizer oracle (spec-leg pre-commit hook).
 
     The returned callable rewrites the ``.feature`` file in place (collapsing
     any wrapped gherkin steps) and validates it parses — exit 0 means the
     committed spec is parseable by the downstream ``/feature-plan`` linker.
+
+    ``command_prefix`` controls how the ``python -m …`` module path is chosen:
+
+    * an explicit sequence — used verbatim (the dev default + the injection
+      point unit tests drive through the stub seam);
+    * ``None`` — **dual-candidate resolution** via
+      :func:`resolve_normalizer_command`, robust to BOTH the wheel/pip layout
+      (``guardkit._installer_core.*``) and the source-checkout layout
+      (``installer.core.*``). This is what production wiring passes. Resolution
+      is lazy (first invocation) and cached; if neither candidate resolves the
+      oracle returns a loud red :class:`ToolOutcome` naming both — contained per
+      the oracle-boundary doctrine, never a crashed run.
     """
     seam = subprocess_seam or _default_normalizer_subprocess
+    resolved_prefix: list[str] | None = (
+        list(command_prefix) if command_prefix is not None else None
+    )
 
     async def _normalize(worktree_path: Path, feature_rel_path: str) -> ToolOutcome:
+        nonlocal resolved_prefix
         target = (worktree_path / feature_rel_path).resolve()
-        command = [*command_prefix, str(target)]
+        if resolved_prefix is None:
+            try:
+                resolved_prefix = list(
+                    resolve_normalizer_command(python_executable=python_executable)
+                )
+            except NormalizerModuleUnresolved as exc:
+                logger.error("normalize_feature_spec: %s", exc)
+                return ToolOutcome(ok=False, detail=str(exc))
+        command = [*resolved_prefix, str(target)]
         started = time.monotonic()
         try:
             stdout, stderr, exit_code, timed_out = await seam(

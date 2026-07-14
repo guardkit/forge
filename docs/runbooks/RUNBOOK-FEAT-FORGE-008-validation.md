@@ -776,17 +776,20 @@ Build the forge production container, run `forge serve` inside it, publish one r
 
 ```bash
 ssh promaxgb10-41b1
-# Run from inside forge/ so that the BuildKit named context
-# `--build-context nats-core=../nats-core` resolves to the sibling
-# `nats-core` working tree (one level up from forge/, alongside it).
-# This is the canonical invocation — no host-side mutation. Fixed in
-# TASK-FORGE-FRR-003 after the GB10 first-real-run revealed the
-# previous "cd to forge's parent" form pointed `../nats-core` at the
-# wrong directory.
+# Run from inside forge/ so that the BuildKit named contexts
+# `--build-context nats-core=../nats-core` and
+# `--build-context guardkit=../guardkit` resolve to the sibling
+# `nats-core` / `guardkit` working trees (one level up from forge/,
+# alongside it). This is the canonical invocation — no host-side
+# mutation. Fixed in TASK-FORGE-FRR-003 after the GB10 first-real-run
+# revealed the previous "cd to forge's parent" form pointed
+# `../nats-core` at the wrong directory. The `guardkit` context was
+# added after B4 run 4b3b0893 caught the target-terminal oracles
+# (normalizer + `guardkit feature validate`) missing from the image.
 cd ~/Projects/appmilla_github/forge
 
 # Build the production image (Contract A — canonical BuildKit invocation)
-docker buildx build --build-context nats-core=../nats-core -t forge:production-validation -f Dockerfile .
+docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit -t forge:production-validation -f Dockerfile .
 
 # Run forge serve inside it, with NATS pointing at the GB10 host
 docker run -d --name forge-cmdw \

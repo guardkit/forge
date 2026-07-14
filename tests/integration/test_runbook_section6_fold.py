@@ -29,6 +29,7 @@ RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "RUNBOOK-FEAT-FORGE-008-validation.m
 
 CANONICAL_BUILDKIT = (
     "docker buildx build --build-context nats-core=../nats-core "
+    "--build-context guardkit=../guardkit "
     "-t forge:production-validation -f Dockerfile ."
 )
 PRE_FOLD_BUILD = "docker build -t forge:production-validation -f Dockerfile ."

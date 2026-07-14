@@ -115,6 +115,56 @@ COPY src ./src
 RUN pip install .[providers]
 
 # ---------------------------------------------------------------------------
+# guardkit oracle payload + CLI — forge-side mirror of the specialist's
+# template-payload fix (specialist-agent 2708d0a).
+#
+# LIVE INCIDENT (B4 run 4b3b0893, round 5): the target-terminal pre-commit
+# oracles are guardkit code this image never installed. The normalizer leg
+# (``python -m installer.core.commands.lib.feature_spec_normalize``) died
+# in-container with ``ModuleNotFoundError: No module named 'installer'`` AFTER
+# the reply had been projected and the branch written; the ``guardkit feature
+# validate`` plan-leg oracle would have hit the same wall a step later (its
+# ``/usr/local/bin/guardkit`` binary did not exist either).
+#
+# FIX: install guardkit from the BuildKit named context ``guardkit`` (supplied
+# by scripts/build-image.sh via ``--build-context guardkit=../guardkit``), the
+# same mechanism nats-core already uses. This image is python:3.14 and
+# guardkit-py declares requires-python>=3.12, so a REAL pip install resolves —
+# unlike the specialist's python:3.11 image, which had to vendor the
+# distribution as data. The pip install yields BOTH seams at once:
+#   * seam 1 — the DF-011 wheel exposes the normalizer at
+#     ``guardkit._installer_core.commands.lib.feature_spec_normalize`` (hatch
+#     force-include of ``installer/core`` under the guardkit namespace); the
+#     forge normalizer resolver (target_terminal_tools.resolve_normalizer_command)
+#     prefers this path in-container.
+#   * seam 2 — the ``guardkit-py`` console-script entry point, symlinked to
+#     ``/usr/local/bin/guardkit`` in the runtime stage below so the frozen
+#     ``forge.adapters.guardkit.run`` boundary (``_GUARDKIT_BINARY``) resolves.
+#
+# NOT ONE guardkit byte is authored or altered (DF-019); we only install and
+# invoke. The sibling ../guardkit source is required at build time — the build
+# script verifies it, stages it, and records the installed commit sha as a
+# receipt line. Only ``/opt/venv`` crosses to the runtime stage.
+COPY --from=guardkit /pyproject.toml /tmp/guardkit/pyproject.toml
+COPY --from=guardkit /README.md /tmp/guardkit/README.md
+COPY --from=guardkit /LICENSE /tmp/guardkit/LICENSE
+COPY --from=guardkit /guardkit /tmp/guardkit/guardkit
+COPY --from=guardkit /installer/core /tmp/guardkit/installer/core
+
+# R3-style layout gate (mirrors the nats-core gate): refuse to proceed if the
+# COPYed guardkit tree is missing the ``guardkit`` package dir, so a stale or
+# empty sibling checkout fails fast with a named diagnostic instead of a
+# confusing pip resolution error several layers down.
+RUN test -d /tmp/guardkit/guardkit || (echo "guardkit layout invalid" >&2; exit 1)
+
+# Real pip install of the guardkit-py distribution (python floor >=3.12 is
+# satisfied). Builds the DF-011 wheel from the staged tree — packages=["guardkit"]
+# plus the ``installer/core`` -> ``guardkit/_installer_core`` force-include — and
+# installs the ``guardkit-py`` console script into /opt/venv/bin.
+RUN pip install /tmp/guardkit \
+    && python -c "import guardkit, guardkit._installer_core; print('guardkit installed at', guardkit.__file__)"
+
+# ---------------------------------------------------------------------------
 # Stage 2: runtime
 #
 # Minimal surface: copy the resolved venv from the builder stage, add
@@ -163,6 +213,15 @@ RUN apt-get update \
 # so the unprivileged ``forge`` user can read but not modify the
 # installed distributions — matches a hardened production posture.
 COPY --from=builder /opt/venv /opt/venv
+
+# seam 2: the frozen ``forge.adapters.guardkit.run`` boundary shells the
+# guardkit binary at the absolute path ``/usr/local/bin/guardkit``
+# (``_GUARDKIT_BINARY``). The guardkit-py distribution installs its console
+# script as ``guardkit-py`` (pyproject [project.scripts]); symlink the canonical
+# name so the ``guardkit feature validate`` plan-leg oracle resolves without
+# touching the frozen adapter. The venv crossed from the builder above, so the
+# target exists at this point.
+RUN ln -s /opt/venv/bin/guardkit-py /usr/local/bin/guardkit
 
 # Create the unprivileged runtime user *before* WORKDIR/COPY-into-home
 # so any files copied later inherit the correct ownership when --chown
