@@ -1,0 +1,11 @@
+{
+  "accepted": false,
+  "errors": [
+    "summary category count for @negative is 4 but the .feature has 5"
+  ],
+  "gates_run": [
+    "gherkin_backstop",
+    "manifest_schema",
+    "summary_consistency"
+  ]
+}

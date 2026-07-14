@@ -1,0 +1,47 @@
+feature: Uptime Endpoint
+generated: '2026-07-09T14:32:00Z'
+stack: python
+review_required: true
+assumptions:
+- id: ASSUM-001
+  scenario: The uptime endpoint returns a valid response with service name, start
+    time, and uptime
+  assumption: The service name is taken from the configured app name in the api_test
+    service
+  confidence: low
+  basis: Input states 'the configured app name' but does not specify where this configuration
+    is stored or how it is accessed
+  human_response: deferred
+- id: ASSUM-002
+  scenario: The uptime endpoint returns a valid response with service name, start
+    time, and uptime
+  assumption: Process start time is captured at application boot and stored in memory
+  confidence: low
+  basis: Input states 'process start time, UTC ISO-8601' but does not specify the
+    mechanism for capturing or storing it
+  human_response: deferred
+- id: ASSUM-003
+  scenario: The uptime endpoint returns a valid response with service name, start
+    time, and uptime
+  assumption: Uptime is calculated as the difference between current time and process
+    start time in seconds
+  confidence: low
+  basis: Input states 'uptime_seconds (float)' but does not specify the calculation
+    method or precision
+  human_response: deferred
+- id: ASSUM-004
+  scenario: The uptime endpoint operates without database access
+  assumption: The endpoint must not import or reference any database models, sessions,
+    or query functions
+  confidence: low
+  basis: Input states 'no database access' but does not specify whether this is a
+    hard architectural constraint or a soft guideline
+  human_response: deferred
+- id: ASSUM-005
+  scenario: Rapid successive requests to the uptime endpoint all succeed
+  assumption: The endpoint should handle at least 100 concurrent requests without
+    degradation
+  confidence: low
+  basis: Input states 'existing test suite must stay green' but does not specify concurrency
+    expectations for the new endpoint
+  human_response: deferred

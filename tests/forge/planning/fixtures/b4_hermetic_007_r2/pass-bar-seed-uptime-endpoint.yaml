@@ -1,0 +1,16 @@
+format_version: '2.0'
+feature_slug: uptime-endpoint
+auth_surface_bearing: true
+auth_surface_basis: 'auth signals detected: auth token ''identity'' in feature text
+  (deferred — requires human confirmation per SPL-007 CONTRACT §A.2)'
+preconditions:
+- suite_green_vs_ledger
+- analyze_clean
+- build_artifact
+criteria:
+- id: uptime-endpoint-AC-001
+  text: The uptime endpoint returns a valid response with service name, start time,
+    and uptime
+  class: machine
+  evidence_kind: screenshot
+  runbook_ref: null

@@ -135,6 +135,33 @@ _BUILD_QUEUED_STAGE = "build-queued"
 #: back to a deterministic ``feature-{cid}``.
 _SLUG_RE = re.compile(r"[A-Za-z0-9_-]+")
 
+#: The three suffix conventions the 007 (po_feature_spec) native artifact map
+#: keys carry — the contract of record (specialist-agent product_owner/modes/
+#: feature_spec.py ``_ARTIFACT_SUFFIXES``). forge projects the committed triple
+#: from these; anything else in the map (a ``pass-bar-seed-*.yaml``,
+#: ``validation.json``) is a tolerated extra, never part of the committed triple.
+_SPEC_FEATURE_SUFFIX = ".feature"
+_SPEC_ASSUMPTIONS_SUFFIX = "_assumptions.yaml"
+_SPEC_SUMMARY_SUFFIX = "_summary.md"
+
+#: Keys that appear in a specialist artifact map (or a wrap_role_output envelope)
+#: that are NOT committable target-repo files: the out-of-band validation-as-data
+#: channels (``validation.json`` / ``seed_errors.json``) plus any envelope
+#: scalars. ``_plan_tree_files`` excludes these so only real repo paths commit.
+_NON_ARTIFACT_KEYS = frozenset(
+    {
+        "validation.json",
+        "seed_errors.json",
+        "feature_id",
+        "slug",
+        "role_id",
+        "coach_score",
+        "criterion_breakdown",
+        "detection_findings",
+        "role_output",
+    }
+)
+
 PublishNotificationFn = Callable[[str, str, str], Awaitable[None]]
 """``async (correlation_id, message, level) -> None`` — best-effort notify."""
 
@@ -1085,6 +1112,21 @@ class PlanningRunDriver:
                 "007 returned no three-file spec contract (invalid artifacts)",
             )
 
+        # VALIDATION HONESTY (C5): the 007 native map ships a validation.json
+        # data channel alongside the artifacts. A decidable-gate FAILURE must
+        # NOT proceed silently — fail the leg loudly naming the errors.
+        # TODO(FEAT-DFEM C5): replace this loud fail with the NAMED bounded
+        # revision_of re-invoke — thread these errors + the prior artifact set
+        # back into 007 for a budgeted correction pass instead of failing the run.
+        spec_val_errors = self._validation_failures(role_output)
+        if spec_val_errors:
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "007 decidable-gate validation reported failures — the spec was "
+                "NOT accepted: " + "; ".join(spec_val_errors),
+            )
+
         feature_rel = self._feature_file_rel(files)
         normalize = deps.normalize_feature_spec
 
@@ -1267,6 +1309,22 @@ class PlanningRunDriver:
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
                 "008 returned no plan tree (invalid artifacts)",
+            )
+            return False
+
+        # VALIDATION HONESTY (C5): the 008 native map ships a validation.json
+        # data channel alongside the artifacts. A decidable-gate FAILURE must
+        # NOT proceed silently — fail the leg loudly naming the errors.
+        # TODO(FEAT-DFEM C5): replace this loud fail with the NAMED bounded
+        # revision_of re-invoke — thread these errors + the prior artifact set
+        # back into 008 for a budgeted correction pass instead of failing the run.
+        plan_val_errors = self._validation_failures(role_output)
+        if plan_val_errors:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "008 decidable-gate validation reported failures — the plan was "
+                "NOT accepted: " + "; ".join(plan_val_errors),
             )
             return False
 
@@ -1525,23 +1583,107 @@ class PlanningRunDriver:
 
     @staticmethod
     def _role_output_of(result: Any) -> dict[str, Any]:
-        """Project the specialist's ``role_output`` document as a dict (M10)."""
+        """Project the specialist's ``role_output`` document as a dict (M10).
+
+        The deployed reply nests the role's NATIVE artifact map one level down:
+        the specialist wraps every reply via ``wrap_role_output`` (specialist-
+        agent adapters/result_wrapper.py) into
+        ``{role_id, coach_score, criterion_breakdown, detection_findings,
+        role_output: <native map>}``, and forge's reply parser
+        (``_extract_role_output``) already unwraps that envelope so the driver
+        receives the NATIVE map directly at ``result.role_output``.
+
+        This projection is belt-and-braces against BOTH nesting levels: if the
+        value handed through is itself a ``wrap_role_output`` envelope (a doubly
+        wrapped payload — the ``role_output`` key still carries a Mapping), it
+        descends one level so the caller always gets the bare native artifact
+        map. A native map never carries a ``role_output`` key (its keys are
+        artifact filenames / repo paths), so the descent is unambiguous.
+        """
         ro = getattr(result, "role_output", None)
-        return dict(ro) if isinstance(ro, Mapping) else {}
+        if not isinstance(ro, Mapping):
+            return {}
+        inner = ro.get("role_output")
+        if isinstance(inner, Mapping):
+            return dict(inner)
+        return dict(ro)
+
+    @staticmethod
+    def _sanitise_slug(raw: str) -> str | None:
+        """Sanitise a raw token to a filesystem-safe slug, or ``None``.
+
+        Collapses any run of disallowed characters to a single hyphen and trims
+        leading/trailing hyphens; returns ``None`` when nothing usable remains.
+        """
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip()).strip("-")
+        return cleaned if cleaned and _SLUG_RE.fullmatch(cleaned) else None
 
     @staticmethod
     def _slug_of(role_output: Mapping[str, Any], correlation_id: str) -> str:
         """Feature slug from the 007 result, or a deterministic fallback.
 
-        The specialist MAY name the feature (``role_output['slug']``); forge
-        sanitises it to a filesystem-safe token and otherwise falls back to a
-        deterministic ``feature-{cid}`` (WS1's semantic-slug emitter is §9
-        follow-on, not a B stage).
+        Resolution order: an explicit ``role_output['slug']`` (sanitised); else
+        the stem of the ``*.feature`` key in the native suffix-keyed artifact map
+        (the DEPLOYED 007 shape — the filename carries the slug, e.g.
+        ``uptime-endpoint.feature`` → ``uptime-endpoint``); else a deterministic
+        ``feature-{cid}`` (WS1's semantic-slug emitter is §9 follow-on).
         """
         candidate = str(role_output.get("slug") or "").strip()
         if candidate and _SLUG_RE.fullmatch(candidate):
             return candidate
+        for name in role_output:
+            key = str(name)
+            if key.endswith(_SPEC_FEATURE_SUFFIX):
+                slug = PlanningRunDriver._sanitise_slug(
+                    key[: -len(_SPEC_FEATURE_SUFFIX)]
+                )
+                if slug:
+                    return slug
+                break
         return f"feature-{correlation_id}"
+
+    @staticmethod
+    def _project_native_spec_triple(
+        role_output: Mapping[str, Any], slug: str
+    ) -> dict[str, str] | None:
+        """Project the committed triple from the 007 NATIVE suffix-keyed map.
+
+        The deployed 007 ``role_output`` is an artifact map keyed by BARE
+        filename with the three contract suffixes (``.feature`` /
+        ``_assumptions.yaml`` / ``_summary.md``) PLUS extras (a
+        ``pass-bar-seed-*.yaml`` and the ``validation.json`` data channel).
+        Requires EXACTLY one file per suffix; extras are tolerated but never
+        committed. The committed paths are the canonical ``features/<slug>/``
+        triple (``slug`` already resolved via ``_slug_of``). ``None`` when the
+        map does not carry exactly one of each suffix.
+        """
+        by_suffix: dict[str, list[str]] = {
+            _SPEC_FEATURE_SUFFIX: [],
+            _SPEC_ASSUMPTIONS_SUFFIX: [],
+            _SPEC_SUMMARY_SUFFIX: [],
+        }
+        # Longest suffix first so ``_assumptions.yaml`` never loses to a broader
+        # match; the three are mutually exclusive but order-independence is cheap.
+        for name, content in role_output.items():
+            key = str(name)
+            for suffix in (
+                _SPEC_ASSUMPTIONS_SUFFIX,
+                _SPEC_SUMMARY_SUFFIX,
+                _SPEC_FEATURE_SUFFIX,
+            ):
+                if key.endswith(suffix):
+                    by_suffix[suffix].append(str(content))
+                    break
+        if any(len(matches) != 1 for matches in by_suffix.values()):
+            return None
+        base = f"features/{slug}"
+        return {
+            f"{base}/{slug}{_SPEC_FEATURE_SUFFIX}": by_suffix[_SPEC_FEATURE_SUFFIX][0],
+            f"{base}/{slug}{_SPEC_ASSUMPTIONS_SUFFIX}": by_suffix[
+                _SPEC_ASSUMPTIONS_SUFFIX
+            ][0],
+            f"{base}/{slug}{_SPEC_SUMMARY_SUFFIX}": by_suffix[_SPEC_SUMMARY_SUFFIX][0],
+        }
 
     @staticmethod
     def _spec_triple_files(
@@ -1549,14 +1691,21 @@ class PlanningRunDriver:
     ) -> dict[str, str] | None:
         """Project the three-file spec contract from the 007 role_output.
 
-        Prefers an explicit ``files`` mapping (specialist-authored repo-relative
-        paths); otherwise builds the canonical ``features/<slug>/`` triple from
-        the ``feature`` / ``assumptions`` / ``summary`` fields. ``None`` when
-        neither shape yields files (the invalid-artifacts failure path).
+        Shape resolution (belt-and-braces):
+          1. An explicit ``files`` mapping (specialist-authored repo-relative
+             paths — the legacy/alternate shape), committed verbatim.
+          2. The DEPLOYED native suffix-keyed artifact map (one ``*.feature`` /
+             ``*_assumptions.yaml`` / ``*_summary.md`` plus tolerated extras),
+             projected onto the canonical ``features/<slug>/`` triple.
+          3. Field-based ``feature`` / ``assumptions`` / ``summary`` fallback.
+        ``None`` when no shape yields a triple (the invalid-artifacts fail path).
         """
         files = role_output.get("files")
         if isinstance(files, Mapping) and files:
             return {str(k): str(v) for k, v in files.items()}
+        native = PlanningRunDriver._project_native_spec_triple(role_output, slug)
+        if native is not None:
+            return native
         feature = role_output.get("feature")
         assumptions = role_output.get("assumptions")
         summary = role_output.get("summary")
@@ -1571,11 +1720,68 @@ class PlanningRunDriver:
 
     @staticmethod
     def _plan_tree_files(role_output: Mapping[str, Any]) -> dict[str, str] | None:
-        """Project the plan tree (feature/task YAML) from the 008 role_output."""
+        """Project the plan tree (feature/task/qa files) from the 008 role_output.
+
+        Prefers an explicit ``files`` mapping; otherwise projects the DEPLOYED
+        native 008 artifact map, whose keys are ALREADY repo-relative paths
+        (``.guardkit/features/<id>.yaml``, ``tasks/backlog/**``, ``qa/*``) — the
+        contract of record (specialist-agent architect/modes/feature_plan.py).
+        The out-of-band validation channel and any envelope scalars
+        (``_NON_ARTIFACT_KEYS``) are excluded so only real repo files commit.
+        ``None`` when neither shape yields any committable file.
+        """
         files = role_output.get("files")
         if isinstance(files, Mapping) and files:
             return {str(k): str(v) for k, v in files.items()}
-        return None
+        tree = {
+            str(k): str(v)
+            for k, v in role_output.items()
+            if isinstance(v, str) and str(k) not in _NON_ARTIFACT_KEYS
+        }
+        return tree or None
+
+    @staticmethod
+    def _validation_failures(role_output: Mapping[str, Any]) -> list[str]:
+        """Return the specialist's decidable-gate failures (C5), or ``[]``.
+
+        The 007/008 modes ship the artifacts PLUS a machine-readable
+        ``validation.json`` (a JSON STRING in the native map) carrying
+        ``{accepted, errors, gates_run}`` — the validation-as-data channel: a
+        decidable gate FAILURE returns the artifacts AND the error list so the
+        leg holds both. VALIDATION HONESTY: a reply that reports gate failures
+        (``accepted: false`` / a non-empty ``errors`` list) must NOT proceed
+        silently — the caller fails the leg loudly naming these errors. A clean
+        (``accepted: true``) or absent channel returns ``[]`` (proceed).
+        """
+        raw = role_output.get("validation.json")
+        data: Any = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return [
+                    "the specialist's validation.json is present but not "
+                    "parseable JSON"
+                ]
+        elif isinstance(raw, Mapping):
+            data = raw
+        else:
+            alt = role_output.get("validation")
+            if isinstance(alt, Mapping):
+                data = alt
+        if not isinstance(data, Mapping):
+            return []
+        accepted = data.get("accepted")
+        errors = data.get("errors")
+        error_list = [str(e) for e in errors] if isinstance(errors, list) else []
+        if accepted is True:
+            return []
+        if accepted is False or error_list:
+            return error_list or [
+                "the specialist reported the artifact set as not accepted "
+                "(no error detail supplied)"
+            ]
+        return []
 
     @staticmethod
     def _feature_file_rel(files: Mapping[str, str]) -> str | None:

@@ -226,6 +226,49 @@ def _plan_result(feature_id: str, files: dict[str, str] | None = None) -> Any:
     )
 
 
+def _spec_result_native(slug: str = "stats-endpoint", accepted: bool = True) -> Any:
+    """The DEPLOYED 007 reply shape: ``role_output`` is the NATIVE artifact map
+    keyed by BARE FILENAME with the three contract suffixes PLUS extras (a
+    pass-bar-seed-*.yaml and the validation.json data channel) — NOT the invented
+    'files' mapping. This is what the reply parser hands the driver post-unwrap.
+    """
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        role_output={
+            f"{slug}.feature": "Feature: stats\n  Scenario: ok\n    Given a\n",
+            f"{slug}_assumptions.yaml": "assumptions: []\n",
+            f"{slug}_summary.md": "# summary\n",
+            f"pass-bar-seed-{slug}.yaml": "format_version: '2.0'\n",
+            "validation.json": json.dumps(
+                {"accepted": accepted, "errors": [] if accepted else ["bad"],
+                 "gates_run": ["gherkin_backstop"]}
+            ),
+        },
+        reason=None,
+    )
+
+
+def _plan_result_native(feature_id: str, slug: str = "stats-endpoint",
+                        accepted: bool = True) -> Any:
+    """The DEPLOYED 008 reply shape: ``role_output`` is the NATIVE artifact map
+    whose keys are ALREADY repo-relative paths (.guardkit/features/<id>.yaml,
+    tasks/backlog/**, qa/*) PLUS the validation.json channel."""
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        role_output={
+            f".guardkit/features/{feature_id}.yaml": f"id: {feature_id}\ntasks: []\n",
+            f"tasks/backlog/{slug}/IMPLEMENTATION-GUIDE.md": "# guide\n",
+            f"tasks/backlog/{slug}/TASK-STAT-001.md": "# task\n",
+            "qa/pass-bar-TASK-STAT-001.yaml": "task_id: TASK-STAT-001\n",
+            "validation.json": json.dumps(
+                {"accepted": accepted, "errors": [] if accepted else ["bad"],
+                 "gates_run": ["feature_validate"]}
+            ),
+        },
+        reason=None,
+    )
+
+
 def _error_result(outcome: str = "error", reason: str = "boom") -> Any:
     return SimpleNamespace(
         outcome=SimpleNamespace(value=outcome), role_output={}, reason=reason
@@ -258,6 +301,7 @@ def _make_driver(
     repo_path: str = "/srv/repos/api_test",
     spec_result: Any | None = None,
     plan_result: Any | None = None,
+    plan_result_factory: Any | None = None,
     spec_dispatch: Any | None = None,
     plan_dispatch: Any | None = None,
     normalize: Any | None = None,
@@ -331,6 +375,8 @@ def _make_driver(
         counters["last_spec_assumptions"] = spec_assumptions
         if plan_result is not None:
             return plan_result
+        if plan_result_factory is not None:
+            return plan_result_factory(feature_id)
         return _plan_result(feature_id)
 
     async def _normalize(worktree: Path, feature_rel: str) -> ToolOutcome:
@@ -528,6 +574,87 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
     assert "feature-spec" in labels
     assert "feature-plan" in labels
     assert "build-queued" in labels
+
+
+@pytest.mark.asyncio
+async def test_full_round_trip_on_the_DEPLOYED_native_reply_shape(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The B4 regression proof: drive the whole sequence with the DEPLOYED
+    reply shape (007 suffix-keyed artifact map + 008 repo-relative paths, each
+    with its validation.json channel) — NOT the invented 'files' mapping. The
+    live run f6781ad4 COMPLETED coach=0.91 yet forge failed it "no three-file
+    spec contract" on exactly this shape; this test pins the fix end-to-end.
+    """
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result=None,  # built per-drive from the minted feature id
+        plan_result_factory=_plan_result_native,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+
+    branch = f"planning/{CID}"
+
+    def _show(path: str) -> str:
+        return subprocess.run(
+            ["git", "show", f"{branch}:{path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    # 007: the triple committed under features/<slug>/ (slug from the .feature
+    # stem); the pass-bar seed + validation.json are NEVER on the branch.
+    assert "Feature: stats" in _show(
+        "features/stats-endpoint/stats-endpoint.feature"
+    )
+    assert _show("features/stats-endpoint/pass-bar-seed-stats-endpoint.yaml") == ""
+    # 008: the native repo-relative plan tree committed verbatim; the feature
+    # YAML lives at .guardkit/features/<id>.yaml (the real 008 layout).
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    assert f"id: {feature_id}" in _show(f".guardkit/features/{feature_id}.yaml")
+    assert "# task" in _show("tasks/backlog/stats-endpoint/TASK-STAT-001.md")
+    assert _show("validation.json") == ""  # the data channel never commits
+
+    # The build trigger got the native feature YAML path.
+    trig = h.ctx["build_triggers"][0]
+    assert any(
+        f == f".guardkit/features/{feature_id}.yaml" for f in trig["plan_files"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_spec_validation_failure_fails_loudly(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """VALIDATION HONESTY: a 007 native reply whose validation.json reports a
+    decidable-gate failure (accepted:false) fails the leg loudly — it does not
+    proceed to commit + plan."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(accepted=False),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["plan"] == 0  # never reached the plan leg
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
 
 
 @pytest.mark.asyncio
