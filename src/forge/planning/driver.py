@@ -1845,13 +1845,48 @@ class PlanningRunDriver:
         ``TARGET_REPO_DESCRIPTOR_SCHEMA``): required = ``repo`` + ``test_roots``;
         optional = ``default_branch`` / ``sibling_repos`` / ``stack``. forge NEVER
         invents an undefined field: ``repo`` is the configured target repo name;
-        ``test_roots`` are the ``tests/`` or ``test/`` directories that actually
-        exist at the checkout root (EMPTY ⇒ the plan may emit no smoke gate,
-        ASSUM-010). ``sibling_repos`` is omitted — forge does not cheaply know
-        siblings.
+        ``sibling_repos`` is omitted — forge does not cheaply know siblings.
+
+        ``test_roots`` is the EXACT ``tests/<name>`` set the downstream
+        ``guardkit feature validate`` pre-commit oracle enforces, discovered by
+        REUSING guardkit's OWN ``discover_test_roots``
+        (:func:`forge.planning.target_terminal_tools.discover_target_test_roots`)
+        — never a shallow re-guess. For api_test this is
+        ``["tests/health", "tests/users"]`` (EMPTY ⇒ the plan may emit no smoke
+        gate, ASSUM-010). B4 run 36629c5a round 10: the old shallow
+        checkout-root discovery returned ``["tests"]``, so 008 invented
+        ``tests/smoke`` — a prefix of ``tests`` that the in-session containment
+        gate passed but the real validate rejected (repo has ``tests/health``,
+        ``tests/users``, no ``tests/smoke``). Handing the exact roots makes
+        prefix-containment == membership so the invention is caught in-session.
         """
-        root = Path(repo_path)
-        test_roots = [name for name in ("tests", "test") if (root / name).is_dir()]
+        # Local import: keep the guardkit-boundary reuse out of the module
+        # import graph (target_terminal_tools imports the guardkit run seam).
+        from forge.planning.target_terminal_tools import (
+            TargetTestRootsUnresolved,
+            discover_target_test_roots,
+        )
+
+        try:
+            test_roots = discover_target_test_roots(repo_path)
+        except TargetTestRootsUnresolved as exc:
+            # Degraded path: guardkit absent from the interpreter. Production
+            # images always ship guardkit (the Dockerfile asserts the import),
+            # so this only fires in a guardkit-less env where the real
+            # ``feature validate`` oracle cannot run either. Fall back to the
+            # historical shallow checkout-root discovery so the descriptor is
+            # still built and the run reaches the oracle (the last line of
+            # defense) rather than crashing — log LOUDLY.
+            logger.warning(
+                "target_repo_descriptor: guardkit test-root discovery "
+                "unavailable (%s); falling back to shallow checkout-root "
+                "discovery — 008 will NOT receive the exact tests/<name> set",
+                exc,
+            )
+            root = Path(repo_path)
+            test_roots = [
+                name for name in ("tests", "test") if (root / name).is_dir()
+            ]
         return {"repo": target_repo, "test_roots": test_roots}
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:

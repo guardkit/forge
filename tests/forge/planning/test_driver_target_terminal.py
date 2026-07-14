@@ -306,6 +306,7 @@ def _make_driver(
     plan_dispatch: Any | None = None,
     normalize: Any | None = None,
     validate: Any | None = None,
+    validate_fn: Any | None = None,
     wire_legs: bool = True,
     build_trigger_result: Any | None = None,
     build_trigger_fn: Any | None = None,
@@ -387,6 +388,10 @@ def _make_driver(
 
     async def _validate(worktree: Path, feature_id: str) -> ToolOutcome:
         counters["validate"] += 1
+        # A dynamic oracle (e.g. the real guardkit smoke-gate path check that
+        # inspects the worktree) takes precedence over a static ToolOutcome.
+        if validate_fn is not None:
+            return await validate_fn(worktree, feature_id)
         return validate if validate is not None else ToolOutcome(ok=True)
 
     build_triggers: list[dict[str, Any]] = []
@@ -673,12 +678,18 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
 ) -> None:
     """The 008 leg gets the committed spec CONTENTS + an honestly-built descriptor.
 
-    ``test_roots`` is discovered from the target checkout (a real ``tests/`` dir);
-    ``spec_feature``/``spec_summary`` are the contents read back off the branch.
+    ``test_roots`` is the EXACT ``tests/<name>`` set discovered from the target
+    checkout by REUSING guardkit's own ``discover_test_roots`` (the same
+    function the pre-commit ``feature validate`` oracle reports as its
+    "Available test roots") — api_test-shaped: ``tests/health`` + ``tests/users``
+    (no ``tests/smoke``). ``spec_feature``/``spec_summary`` are the contents read
+    back off the branch.
     """
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    (repo / "tests").mkdir()  # a real test root at the checkout root
+    # api_test-shaped test tree: real per-suite roots, NOT a bare ``tests/``.
+    (repo / "tests" / "health").mkdir(parents=True)
+    (repo / "tests" / "users").mkdir(parents=True)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
 
     _queue(store)
@@ -687,13 +698,204 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # The descriptor forge built for 008 carries the discovered test root and
-    # only schema-defined fields (repo + test_roots) — no invented keys.
+    # The descriptor forge built for 008 carries the EXACT discovered roots and
+    # only schema-defined fields (repo + test_roots) — no invented keys, and
+    # crucially NOT the shallow ``["tests"]`` that let 008 invent ``tests/smoke``.
     descriptor = h.ctx["counters"]["last_descriptor"]
-    assert descriptor == {"repo": TARGET_REPO, "test_roots": ["tests"]}
+    assert descriptor == {
+        "repo": TARGET_REPO,
+        "test_roots": ["tests/health", "tests/users"],
+    }
     # The optional assumptions content was threaded (the default spec triple
     # carries an _assumptions.yaml).
     assert h.ctx["counters"]["last_spec_assumptions"] == "assumptions: []\n"
+
+
+# ---------------------------------------------------------------------------
+# REPLAY PROOF (B4 run 36629c5a, round 10) — the fixed descriptor threads the
+# EXACT roots, and the pre-commit validate (the REAL guardkit smoke-gate path
+# check, byte-faithful to `guardkit feature validate`) is STILL the last line of
+# defense: an invented ``tests/smoke`` fails loudly; a real ``tests/health``
+# passes to BUILD_QUEUED.
+# ---------------------------------------------------------------------------
+
+
+def _init_api_test_shaped_repo(path: Path) -> None:
+    """A scratch git repo shaped like api_test: real per-suite test roots
+    (``tests/health`` + ``tests/users``) committed on the base, NO
+    ``tests/smoke`` — so both the main checkout (descriptor discovery) and the
+    planning worktree (validate) carry the exact round-10 shape."""
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, env=env)
+    (path / "README.md").write_text("scratch\n")
+    for suite in ("health", "users"):
+        d = path / "tests" / suite
+        d.mkdir(parents=True)
+        (d / "__init__.py").write_text("")  # git tracks the dir via a real file
+    subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
+
+
+async def _guardkit_smoke_gate_validate(
+    worktree: Path, feature_id: str
+) -> ToolOutcome:
+    """A validate oracle built from guardkit's OWN smoke-gate path primitives.
+
+    Byte-faithful to guardkit's ``feature validate`` smoke-gate check
+    (``guardkit/orchestrator/feature_loader.py:1131-1142``
+    ``_validate_smoke_gate_paths_for_validate``): it reuses the SAME three
+    functions — ``parse_positional_paths`` + a filesystem existence check +
+    ``discover_test_roots`` + ``format_smoke_gate_path_error`` — the real
+    validate binary composes. Used in-process here because the full guardkit
+    ``FeatureLoader`` pulls heavy deps (frontmatter) absent from the forge venv,
+    which is exactly why production shells the guardkit BINARY via
+    ``forge.adapters.guardkit.run``; the identical binary run against the
+    preserved round-10 worktree is the separate live-repro check.
+    """
+    import yaml
+    from guardkit.lib.pytest_argv import (
+        format_smoke_gate_path_error,
+        parse_positional_paths,
+    )
+    from installer.core.commands.lib.smoke_gates_nudge import discover_test_roots
+
+    feature_file = worktree / ".guardkit" / "features" / f"{feature_id}.yaml"
+    data = yaml.safe_load(feature_file.read_text(encoding="utf-8"))
+    smoke_gates = (data or {}).get("smoke_gates")
+    if not smoke_gates or not smoke_gates.get("command"):
+        return ToolOutcome(ok=True)
+    paths = parse_positional_paths(smoke_gates["command"])
+    missing = [p for p in paths if not (worktree / p).exists()]
+    if not missing:
+        return ToolOutcome(ok=True)
+    roots = discover_test_roots(worktree)
+    return ToolOutcome(
+        ok=False,
+        detail=format_smoke_gate_path_error(missing, worktree, roots),
+    )
+
+
+def _plan_result_native_smoke(smoke_path: str, slug: str = "stats-endpoint"):
+    """008 native reply whose feature YAML declares a smoke gate at ``smoke_path``
+    (e.g. ``tests/smoke`` — invented — or ``tests/health`` — real)."""
+
+    def _factory(feature_id: str) -> Any:
+        feature_yaml = (
+            f"id: {feature_id}\n"
+            "tasks: []\n"
+            "smoke_gates:\n"
+            "  after_wave: 1\n"
+            "  command: |\n"
+            f"    pytest {smoke_path} -x\n"
+            "  expected_exit: 0\n"
+        )
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={
+                f".guardkit/features/{feature_id}.yaml": feature_yaml,
+                f"tasks/backlog/{slug}/TASK-STAT-001.md": "# task\n",
+                "validation.json": json.dumps(
+                    {"accepted": True, "errors": [],
+                     "gates_run": ["feature_validate"]}
+                ),
+            },
+            reason=None,
+        )
+
+    return _factory
+
+
+@pytest.mark.asyncio
+async def test_replay_invented_tests_smoke_fails_the_real_validate(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(a)+(b): the fixed descriptor carries the exact roots, and an 008 reply
+    whose feature YAML references the invented ``tests/smoke`` is REFUSED loudly
+    by the pre-commit validate (the round-10 live failure, still caught) — the
+    plan is NOT committed and the run never reaches BUILD_QUEUED."""
+    repo = tmp_path / "api_test"
+    _init_api_test_shaped_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        plan_result_factory=_plan_result_native_smoke("tests/smoke"),
+        validate_fn=_guardkit_smoke_gate_validate,
+    )
+
+    await h.driver.drive(CID)
+
+    # (a) the descriptor forge threaded to 008 carried the EXACT roots.
+    assert h.ctx["counters"]["last_descriptor"] == {
+        "repo": TARGET_REPO,
+        "test_roots": ["tests/health", "tests/users"],
+    }
+    # (b) the pre-commit validate refused the invented path — loudly, verbatim.
+    run = store.get_run(CID)
+    assert run["state"] != PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["validate"] == 1
+    assert h.ctx["counters"]["build_trigger"] == 0
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "tests/smoke" in reasons
+    assert "Available test roots: tests/health, tests/users" in reasons
+    # The plan tree was NOT committed to the branch.
+    branch = f"planning/{CID}"
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    show = subprocess.run(
+        ["git", "show", f"{branch}:.guardkit/features/{feature_id}.yaml"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show.returncode != 0  # the path does not exist on the branch
+
+
+@pytest.mark.asyncio
+async def test_replay_real_tests_health_passes_to_build_queued(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(c): the same round-trip with a smoke gate referencing the REAL
+    ``tests/health`` root passes the pre-commit validate and drives to
+    BUILD_QUEUED — the good path is unblocked."""
+    repo = tmp_path / "api_test"
+    _init_api_test_shaped_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        plan_result_factory=_plan_result_native_smoke("tests/health"),
+        validate_fn=_guardkit_smoke_gate_validate,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["validate"] == 1
+    assert h.ctx["counters"]["build_trigger"] == 1
+    # The plan tree (with the valid smoke gate) IS committed on the branch.
+    branch = f"planning/{CID}"
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    show = subprocess.run(
+        ["git", "show", f"{branch}:.guardkit/features/{feature_id}.yaml"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show.returncode == 0
+    assert "pytest tests/health" in show.stdout
 
 
 @pytest.mark.asyncio

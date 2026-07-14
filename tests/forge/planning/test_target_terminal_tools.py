@@ -17,12 +17,19 @@ import pytest
 from forge.planning import target_terminal_tools as ttt
 from forge.planning.target_terminal_tools import (
     NORMALIZER_MODULE_CANDIDATES,
+    TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
     NormalizerModuleUnresolved,
+    TargetTestRootsUnresolved,
     ToolOutcome,
+    discover_target_test_roots,
     make_normalize_feature_spec,
     make_validate_feature_plan,
     resolve_normalizer_command,
 )
+
+# The real api_test sibling checkout (Rich's estate); present on the dev host,
+# absent in a clean CI image — the REAL-repo assertion skips when it is missing.
+_REAL_API_TEST = Path(__file__).resolve().parents[4] / "api_test"
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +257,118 @@ async def test_normalize_none_prefix_red_when_unresolved(
     assert not outcome.ok
     assert "both absent" in outcome.detail
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Descriptor test-root discovery — REUSE of guardkit's discover_test_roots
+# (B4 run 36629c5a, round 10). These pin that forge asks GUARDKIT for the roots
+# (dual-candidate import), never re-guesses them, so the 008 descriptor carries
+# the EXACT ``tests/<name>`` set the pre-commit ``feature validate`` oracle
+# enforces (tests/health, tests/users for api_test — never a shallow "tests").
+# ---------------------------------------------------------------------------
+
+
+def _fake_import_for(modules: dict[str, Any]):
+    """A fake ``importlib.import_module`` that only "imports" the given names.
+
+    Names outside the mapping raise ``ModuleNotFoundError`` — the parent-missing
+    shape real ``import_module`` produces when e.g. no top-level ``installer``
+    package exists (a wheel install with no source checkout).
+    """
+
+    def _fake(name: str):
+        if name in modules:
+            return modules[name]
+        raise ModuleNotFoundError(f"No module named {name!r}")
+
+    return _fake
+
+
+def test_discovery_candidates_mirror_the_wheel_then_source_shape() -> None:
+    wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
+    assert wheel == "guardkit._installer_core.commands.lib.smoke_gates_nudge"
+    assert source == "installer.core.commands.lib.smoke_gates_nudge"
+
+
+def test_discovery_prefers_the_wheel_candidate() -> None:
+    wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
+    wheel_mod = SimpleNamespace(
+        discover_test_roots=lambda root: ["tests/from_wheel"]
+    )
+    source_mod = SimpleNamespace(
+        discover_test_roots=lambda root: ["tests/from_source"]
+    )
+    roots = discover_target_test_roots(
+        "/repo",
+        import_module=_fake_import_for({wheel: wheel_mod, source: source_mod}),
+    )
+    # Both importable -> the wheel/pip path wins (production container form).
+    assert roots == ["tests/from_wheel"]
+
+
+def test_discovery_falls_back_to_the_source_candidate() -> None:
+    _wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
+    source_mod = SimpleNamespace(
+        discover_test_roots=lambda root: ["tests/from_source"]
+    )
+    # Only the source-checkout path importable (dev-host / editable form).
+    roots = discover_target_test_roots(
+        "/repo", import_module=_fake_import_for({source: source_mod})
+    )
+    assert roots == ["tests/from_source"]
+
+
+def test_discovery_raises_naming_both_when_neither_resolves() -> None:
+    with pytest.raises(TargetTestRootsUnresolved) as excinfo:
+        discover_target_test_roots(
+            "/repo", import_module=_fake_import_for({})
+        )
+    message = str(excinfo.value)
+    for candidate in TEST_ROOT_DISCOVERY_MODULE_CANDIDATES:
+        assert candidate in message
+    assert "guardkit" in message
+
+
+def test_discovery_passes_the_repo_path_through_to_guardkit() -> None:
+    wheel, _source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
+    seen: list[Path] = []
+
+    def _discover(root: Path) -> list[str]:
+        seen.append(root)
+        return ["tests/x"]
+
+    discover_target_test_roots(
+        "/srv/repos/api_test",
+        import_module=_fake_import_for(
+            {wheel: SimpleNamespace(discover_test_roots=_discover)}
+        ),
+    )
+    # guardkit is handed a Path built from the repo_path string.
+    assert seen == [Path("/srv/repos/api_test")]
+
+
+def test_discovery_against_an_api_test_shaped_fixture(tmp_path: Path) -> None:
+    """The real guardkit function (via the conftest source-checkout path) over an
+    api_test-shaped tree returns the EXACT per-suite roots — not a bare 'tests'."""
+    (tmp_path / "tests" / "health").mkdir(parents=True)
+    (tmp_path / "tests" / "users").mkdir(parents=True)
+    (tmp_path / "tests" / "__pycache__").mkdir()  # skipped by guardkit
+    roots = discover_target_test_roots(tmp_path)
+    assert roots == ["tests/health", "tests/users"]
+
+
+def test_discovery_empty_when_no_tests_tree(tmp_path: Path) -> None:
+    # ASSUM-010: no tests/ tree -> empty roots (the plan may emit no smoke gate).
+    assert discover_target_test_roots(tmp_path) == []
+
+
+@pytest.mark.skipif(
+    not (_REAL_API_TEST / "tests").is_dir(),
+    reason="real api_test sibling checkout not present",
+)
+def test_discovery_against_the_REAL_api_test_checkout() -> None:
+    """Against Rich's REAL api_test checkout, the descriptor roots are exactly
+    the set guardkit's ``feature validate`` reports (tests/health, tests/users) —
+    the byte-identical roots from the round-10 live validate error."""
+    roots = discover_target_test_roots(_REAL_API_TEST)
+    assert roots == ["tests/health", "tests/users"]

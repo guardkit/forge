@@ -78,15 +78,20 @@ def test_feature_plan_wire_args_are_exactly_the_required_four() -> None:
         feature_id="FEAT-BEEF",
         spec_feature="Feature: x\n",
         spec_summary="# summary\n",
-        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": ["tests"]},
+        target_repo_descriptor={
+            "repo": "guardkit/api_test",
+            "test_roots": ["tests/health", "tests/users"],
+        },
     )
     # Exactly the four required names — no invented fields, no legacy
     # scope/target_repo, and spec_assumptions absent when not supplied.
     assert set(args) == _FEATURE_PLAN_REQUIRED
     assert args["feature_id"] == "FEAT-BEEF"
+    # test_roots is the EXACT guardkit-discovered per-suite set (api_test shape),
+    # not a shallow ["tests"] — the B4 run 36629c5a round-10 descriptor fix.
     assert args["target_repo_descriptor"] == {
         "repo": "guardkit/api_test",
-        "test_roots": ["tests"],
+        "test_roots": ["tests/health", "tests/users"],
     }
 
 
@@ -119,7 +124,10 @@ def test_feature_plan_descriptor_carries_only_schema_fields() -> None:
         feature_id="FEAT-BEEF",
         spec_feature="Feature: x\n",
         spec_summary="# summary\n",
-        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": ["tests"]},
+        target_repo_descriptor={
+            "repo": "guardkit/api_test",
+            "test_roots": ["tests/health", "tests/users"],
+        },
     )
     descriptor = args["target_repo_descriptor"]
     # The two required descriptor keys are present, and every key is defined by

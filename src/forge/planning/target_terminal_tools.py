@@ -32,12 +32,14 @@ sovereign-planning-loop-scope §4 (guardkit ``feature validate`` = the oracle).
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from forge.adapters.guardkit.run import run as guardkit_run
 
@@ -45,10 +47,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "NORMALIZER_MODULE_CANDIDATES",
+    "TEST_ROOT_DISCOVERY_MODULE_CANDIDATES",
     "NormalizeFeatureSpecFn",
     "NormalizerModuleUnresolved",
+    "TargetTestRootsUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
+    "discover_target_test_roots",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
     "resolve_normalizer_command",
@@ -148,6 +153,102 @@ def resolve_normalizer_command(
         "with an importable top-level installer package. See scripts/build-image.sh "
         "and scripts/verify-forge-oracles.sh."
     )
+
+
+# ---------------------------------------------------------------------------
+# Descriptor test-root discovery — REUSE guardkit's OWN function (B4 run
+# 36629c5a, round 10)
+#
+# The 008 ``target_repo_descriptor.test_roots`` must be the EXACT set the
+# downstream ``guardkit feature validate`` pre-commit oracle enforces, never a
+# shallow re-guess. guardkit builds both the smoke-gate ``available_roots`` and
+# the "Available test roots: …" validate error from a single function —
+# ``installer/core/commands/lib/smoke_gates_nudge.py:42`` ``discover_test_roots``
+# (called at ``guardkit/orchestrator/feature_loader.py:931`` and :1139). We
+# import and call THAT function so forge tells 008 the truth the oracle holds it
+# to.
+#
+# LIVE INCIDENT this fixes: forge's old shallow builder discovered checkout-root
+# ``tests/`` dirs only -> ``['tests']``; the 008 model then invented
+# ``tests/smoke`` (a PREFIX of ``tests``), which the specialist's in-session
+# ``smoke_gate_containment`` gate PASSED (keyed on ``descriptor.test_roots``,
+# ``path.startswith(root + '/')`` — feature_plan_oracle.py:915) — but the real
+# ``feature validate`` knows the repo's roots are ``tests/health, tests/users``
+# (no ``tests/smoke``) and refused the plan at the pre-commit oracle. Handing the
+# EXACT roots makes prefix-containment == membership for these shapes, so the
+# in-session gate catches the invention where the revision loop can correct it.
+# ---------------------------------------------------------------------------
+
+#: The two module paths guardkit's ``discover_test_roots`` is importable at, in
+#: resolution priority order — the SAME dual-candidate shape as
+#: :data:`NORMALIZER_MODULE_CANDIDATES`:
+#:
+#: * ``guardkit._installer_core.commands.lib.smoke_gates_nudge`` — the wheel/pip
+#:   form (DF-011 wheel, hatch ``force-include`` of ``installer/core`` under the
+#:   guardkit namespace). This is what the forge production image installs, so it
+#:   is tried FIRST.
+#: * ``installer.core.commands.lib.smoke_gates_nudge`` — the source/editable
+#:   checkout form (a repo root carrying an importable top-level ``installer``
+#:   package). The dev-host form.
+TEST_ROOT_DISCOVERY_MODULE_CANDIDATES: tuple[str, ...] = (
+    "guardkit._installer_core.commands.lib.smoke_gates_nudge",
+    "installer.core.commands.lib.smoke_gates_nudge",
+)
+
+
+class TargetTestRootsUnresolved(RuntimeError):
+    """guardkit's ``discover_test_roots`` is not importable in this interpreter.
+
+    Raised by :func:`discover_target_test_roots` when the guardkit distribution
+    is absent from the image entirely (the same failure mode
+    :class:`NormalizerModuleUnresolved` names for the normalizer). The message
+    names BOTH candidates and the build fix; the descriptor builder catches it
+    and degrades to a shallow discovery so a guardkit-less env — where the real
+    ``feature validate`` oracle cannot run either — still builds a descriptor
+    rather than crashing the drive.
+    """
+
+
+def discover_target_test_roots(
+    repo_path: Path | str,
+    *,
+    module_candidates: Sequence[str] = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
+    import_module: Callable[[str], Any] = importlib.import_module,
+) -> list[str]:
+    """Return the target checkout's ``tests/<name>`` roots via guardkit's OWN discovery.
+
+    Imports guardkit's ``discover_test_roots`` — dual-candidate, wheel form
+    (``guardkit._installer_core.*``) first, source-checkout form
+    (``installer.core.*``) second — and calls it in-process against
+    ``repo_path``. The result is the byte-identical ``tests/<name>`` set
+    ``guardkit feature validate`` reports as its "Available test roots"
+    (``installer/core/commands/lib/smoke_gates_nudge.py:42``), so the 008
+    descriptor carries exactly what the pre-commit oracle will enforce.
+
+    Raises :class:`TargetTestRootsUnresolved` — naming BOTH candidates — when
+    neither module imports (a guardkit-less interpreter).
+    """
+    last_exc: Exception | None = None
+    for candidate in module_candidates:
+        try:
+            module = import_module(candidate)
+        except (ImportError, ModuleNotFoundError, ValueError) as exc:
+            # ``import_module`` raises rather than returns None when a parent
+            # package is missing (e.g. no top-level ``installer`` at all).
+            # Treat that as "not importable" and try the next candidate.
+            last_exc = exc
+            continue
+        # guardkit's discover_test_roots(repo_root) -> sorted list[str] of
+        # ``tests/<name>`` paths; [] when there is no tests/ tree.
+        return list(module.discover_test_roots(Path(repo_path)))
+    raise TargetTestRootsUnresolved(
+        "target-terminal test-root discovery could not import guardkit's "
+        "discover_test_roots: none of the candidates import in this "
+        f"interpreter — {list(module_candidates)}. The forge image must "
+        "install guardkit (pip install the DF-011 wheel, which exposes "
+        "guardkit._installer_core.*) or provide a source checkout with an "
+        "importable top-level installer package. See scripts/build-image.sh."
+    ) from last_exc
 
 
 @dataclass(frozen=True)

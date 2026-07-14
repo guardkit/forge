@@ -1163,7 +1163,10 @@ class TestTargetTerminalLegs:
         # feature_plan.py required_args=("feature_id","spec_feature",
         # "spec_summary","target_repo_descriptor"). RV-1: forge mints + threads
         # the SUPPLIED feature_id. The descriptor is a structured object.
-        descriptor = {"repo": "guardkit/api_test", "test_roots": ["tests"]}
+        descriptor = {
+            "repo": "guardkit/api_test",
+            "test_roots": ["tests/health", "tests/users"],
+        }
         command, args = build_specialist_command(
             StageClass.FEATURE_PLAN,
             request_text=None,
@@ -1233,7 +1236,7 @@ class TestTargetTerminalLegs:
                 "spec_summary": "# summary\n",
                 "target_repo_descriptor": {
                     "repo": "guardkit/api_test",
-                    "test_roots": ["tests"],
+                    "test_roots": ["tests/health", "tests/users"],
                 },
             },
         )
@@ -1242,7 +1245,7 @@ class TestTargetTerminalLegs:
         assert surface.last_call["command_args"]["feature_id"] == "FEAT-BEEF"
         assert surface.last_call["command_args"]["target_repo_descriptor"] == {
             "repo": "guardkit/api_test",
-            "test_roots": ["tests"],
+            "test_roots": ["tests/health", "tests/users"],
         }
 
 
