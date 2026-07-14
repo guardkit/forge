@@ -218,6 +218,20 @@ class GitRunner(Protocol):
         """
         ...
 
+    async def read_file_from_branch(
+        self, *, repo_path: str, branch: str, file_path: str
+    ) -> str | None:
+        """Return the content of ``file_path`` on ``branch`` (None if absent).
+
+        Lane B (008 leg): the plan leg reads the committed spec triple back off
+        the ``planning/<cid>`` branch so it can thread the ``.feature`` /
+        ``_summary.md`` / ``_assumptions.yaml`` CONTENTS (not paths) into
+        ``architect_feature_plan`` — correct on an idempotent re-drive where the
+        spec contents are no longer in memory. Never raises (ADR-ARCH-025); a
+        missing file or a read failure returns ``None``.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Notification Payload

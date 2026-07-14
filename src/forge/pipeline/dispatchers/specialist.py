@@ -210,12 +210,27 @@ SPECIALIST_REQUIRED_ARGS_BY_STAGE: dict[StageClass, tuple[str, ...]] = {
     StageClass.ARCHITECT: ("docs_path", "scope"),
     # Lane B (B2): the required inputs forge ALWAYS supplies for the
     # target-terminal legs (threaded via ``extra_command_args``, never sourced
-    # from request_text/forward-context). 007 reads the committed
-    # feature_spec_inputs content (``spec_input``); 008 reads the scope + the
-    # target-repo descriptor + the forge-minted FEAT id (RV-1: forge mints and
-    # threads ``feature_id``; the plan leg asserts the SUPPLIED id).
-    StageClass.FEATURE_SPEC: ("spec_input",),
-    StageClass.FEATURE_PLAN: ("scope", "target_repo", "feature_id"),
+    # from request_text/forward-context). These MUST match the specialist mode
+    # registrations byte-for-byte — the CONTRACT OF RECORD is:
+    #   007  specialist-agent/src/specialist_agent/roles/product_owner/modes/
+    #        feature_spec.py → required_args=("from_input",)  [the approved
+    #        feature_spec_inputs/<id>.md CONTENT]
+    #   008  specialist-agent/src/specialist_agent/roles/architect/modes/
+    #        feature_plan.py → required_args=("feature_id","spec_feature",
+    #        "spec_summary","target_repo_descriptor")  [RV-1: forge mints and
+    #        threads the SUPPLIED ``feature_id``; ``spec_feature``/``spec_summary``
+    #        are the 007 .feature/_summary.md CONTENTS; ``target_repo_descriptor``
+    #        is the structured {repo, test_roots, ...} object].
+    # (Live run 8c4e156f failed here: forge sent ``spec_input`` where 007
+    # requires ``from_input``, and ``scope``/``target_repo`` where 008 requires
+    # the spec triple contents + descriptor. The contract-pin test guards drift.)
+    StageClass.FEATURE_SPEC: ("from_input",),
+    StageClass.FEATURE_PLAN: (
+        "feature_id",
+        "spec_feature",
+        "spec_summary",
+        "target_repo_descriptor",
+    ),
 }
 
 
@@ -324,11 +339,15 @@ def build_specialist_command(
             args.setdefault(arg_name, entry.value)
 
     # Lane B (B2): forge-supplied inputs for the target-terminal legs
-    # (``spec_input`` for 007; ``scope`` / ``target_repo`` / ``feature_id`` for
-    # 008). These are sourced by the caller (the planning driver's spec/plan
-    # legs), not from request_text/forward-context — the fixed division of
-    # labour where FORGE owns the artifacts and mints/threads the FEAT id.
-    # ``setdefault`` keeps any value already sourced above authoritative.
+    # (``from_input`` for 007; ``feature_id`` / ``spec_feature`` / ``spec_summary``
+    # / ``target_repo_descriptor`` [+ optional ``spec_assumptions``] for 008 —
+    # the specialist contract of record, see SPECIALIST_REQUIRED_ARGS_BY_STAGE).
+    # These are sourced by the caller (the planning driver's spec/plan legs),
+    # not from request_text/forward-context — the fixed division of labour where
+    # FORGE owns the artifacts and mints/threads the FEAT id. Non-str values
+    # (e.g. the ``target_repo_descriptor`` object) pass through unchanged; the
+    # ``str(value).strip()`` guard only skips blank scalars. ``setdefault`` keeps
+    # any value already sourced above authoritative.
     if extra_command_args:
         for arg_name, value in extra_command_args.items():
             if str(value).strip():
@@ -598,11 +617,14 @@ async def dispatch_specialist_stage(
             deployed argument is left unsourced).
         extra_command_args: Lane B (B2) forge-supplied wire args for the
             target-terminal stages (:attr:`StageClass.FEATURE_SPEC` /
-            :attr:`StageClass.FEATURE_PLAN`) — ``spec_input`` for 007 and
-            ``scope`` / ``target_repo`` / ``feature_id`` for 008. Merged into
-            ``command_args`` via :func:`build_specialist_command`;
-            request-sourced values stay authoritative. ``None`` for the
-            PRODUCT_OWNER / ARCHITECT stages (byte-unchanged behaviour).
+            :attr:`StageClass.FEATURE_PLAN`) — ``from_input`` for 007 and
+            ``feature_id`` / ``spec_feature`` / ``spec_summary`` /
+            ``target_repo_descriptor`` (+ optional ``spec_assumptions``) for 008,
+            per SPECIALIST_REQUIRED_ARGS_BY_STAGE (the specialist contract of
+            record). Merged into ``command_args`` via
+            :func:`build_specialist_command`; request-sourced values stay
+            authoritative. ``None`` for the PRODUCT_OWNER / ARCHITECT stages
+            (byte-unchanged behaviour).
 
     Returns:
         A :class:`StageDispatchResult`. The supervisor consumes the

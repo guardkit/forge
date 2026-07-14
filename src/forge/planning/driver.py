@@ -165,13 +165,18 @@ feature-spec-input content; the result's ``role_output`` carries the three-file
 spec contract."""
 
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
-"""``async (*, plan_run_id, correlation_id, scope, target_repo, feature_id)
+"""``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
+spec_summary, target_repo_descriptor, spec_assumptions=None)
 -> StageDispatchResult``.
 
-Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge ALWAYS
-supplies the scope + target-repo descriptor + the forge-minted ``feature_id``
-(RV-1: the plan leg asserts the SUPPLIED id). The result's ``role_output``
-carries the plan tree."""
+Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge supplies
+the SUPPLIED minted ``feature_id`` (RV-1: the plan leg asserts it), the 007 spec
+triple CONTENTS (``spec_feature`` = the committed .feature, ``spec_summary`` =
+the committed _summary.md, optional ``spec_assumptions`` = the committed
+_assumptions.yaml), and the structured ``target_repo_descriptor`` — the exact
+argument shape ``architect_feature_plan`` requires (specialist-agent
+roles/architect/modes/feature_plan.py). The result's ``role_output`` carries the
+plan tree."""
 
 
 @dataclass(frozen=True)
@@ -1197,15 +1202,38 @@ class PlanningRunDriver:
         spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         slug = str(spec_details.get("slug") or self._slug_of({}, correlation_id))
         feature_id = self._mint_feature_id(correlation_id)
-        scope = str(row["request_text"] or "")
+
+        # The 008 contract needs the CONTENTS of the committed spec triple, not
+        # paths. Read them back off the planning branch (they are no longer in
+        # memory after the spec leg returned — and on an idempotent re-drive the
+        # spec leg never ran this drive at all). The .feature is the committed,
+        # normalizer-collapsed content of record.
+        spec_files = spec_details.get("spec_files") or []
+        spec_feature, spec_summary, spec_assumptions = await self._read_spec_triple(
+            repo_path, branch, spec_files
+        )
+        if not spec_feature or not spec_summary:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "could not read the committed spec triple contents "
+                f"(.feature / _summary.md) off branch {branch} "
+                f"(spec_files={sorted(spec_files)})",
+            )
+            return False
+        target_repo_descriptor = self._build_target_repo_descriptor(
+            target_repo, repo_path
+        )
 
         try:
             result = await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
-                scope=scope,
-                target_repo=target_repo,
                 feature_id=feature_id,
+                spec_feature=spec_feature,
+                spec_summary=spec_summary,
+                target_repo_descriptor=target_repo_descriptor,
+                spec_assumptions=spec_assumptions,
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -1556,6 +1584,54 @@ class PlanningRunDriver:
             if rel.endswith(".feature"):
                 return rel
         return None
+
+    async def _read_spec_triple(
+        self, repo_path: str, branch: str, spec_files: Any
+    ) -> tuple[str | None, str | None, str | None]:
+        """Read the committed spec triple CONTENTS back off the planning branch.
+
+        Returns ``(spec_feature, spec_summary, spec_assumptions)`` classified by
+        suffix (``.feature`` / ``_summary.md`` / ``_assumptions.yaml``); any role
+        whose file is absent or unreadable comes back ``None``. Threading the
+        CONTENTS (not paths) is the 008 contract — and reading them off the
+        branch (rather than carrying them in memory) is what makes the plan leg
+        correct on an idempotent re-drive.
+        """
+        feature = summary = assumptions = None
+        for rel in spec_files:
+            rel = str(rel)
+            if rel.endswith(".feature"):
+                feature = await self._deps.git_runner.read_file_from_branch(
+                    repo_path=repo_path, branch=branch, file_path=rel
+                )
+            elif rel.endswith("_summary.md"):
+                summary = await self._deps.git_runner.read_file_from_branch(
+                    repo_path=repo_path, branch=branch, file_path=rel
+                )
+            elif rel.endswith("_assumptions.yaml"):
+                assumptions = await self._deps.git_runner.read_file_from_branch(
+                    repo_path=repo_path, branch=branch, file_path=rel
+                )
+        return feature, summary, assumptions
+
+    @staticmethod
+    def _build_target_repo_descriptor(
+        target_repo: str, repo_path: str
+    ) -> dict[str, Any]:
+        """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
+
+        Schema of record (specialist-agent roles/architect/modes/feature_plan.py
+        ``TARGET_REPO_DESCRIPTOR_SCHEMA``): required = ``repo`` + ``test_roots``;
+        optional = ``default_branch`` / ``sibling_repos`` / ``stack``. forge NEVER
+        invents an undefined field: ``repo`` is the configured target repo name;
+        ``test_roots`` are the ``tests/`` or ``test/`` directories that actually
+        exist at the checkout root (EMPTY ⇒ the plan may emit no smoke gate,
+        ASSUM-010). ``sibling_repos`` is omitted — forge does not cheaply know
+        siblings.
+        """
+        root = Path(repo_path)
+        test_roots = [name for name in ("tests", "test") if (root / name).is_dir()]
+        return {"repo": target_repo, "test_roots": test_roots}
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
         """True iff a durable ``approved`` event exists for ``stage_label``."""

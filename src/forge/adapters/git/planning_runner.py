@@ -410,6 +410,32 @@ class WorktreeGitRunner:
             )
             return _exception_failure(_TREE_OPERATION, exc)
 
+    async def read_file_from_branch(
+        self, *, repo_path: str, branch: str, file_path: str
+    ) -> str | None:
+        """Return the content of ``file_path`` on ``branch`` (None if absent).
+
+        Lane B (008 leg): the plan leg reads the committed spec triple back off
+        the planning branch to thread the ``.feature`` / ``_summary.md`` /
+        ``_assumptions.yaml`` CONTENTS into ``architect_feature_plan`` (the
+        contract needs contents, not paths), correctly surviving an idempotent
+        re-drive where the spec contents are no longer in memory. Reuses the
+        ``git show <branch>:<path>`` probe; never raises (adapter boundary,
+        ADR-ARCH-025).
+        """
+        try:
+            repo = Path(repo_path)
+            if not repo.is_dir():
+                return None
+            return await self._show_file(repo, branch, file_path)
+        except Exception:  # noqa: BLE001 — adapter boundary, ADR-ARCH-025
+            logger.exception(
+                "read_file_from_branch failed (branch=%s, file=%s)",
+                branch,
+                file_path,
+            )
+            return None
+
     async def _cleanup_worktree(self, repo: Path, worktree: Path) -> None:
         """Best-effort worktree removal anchored in the source repo."""
         try:

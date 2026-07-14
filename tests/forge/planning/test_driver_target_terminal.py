@@ -103,6 +103,10 @@ class RecordingGitRunner:
         self.single_calls: list[dict[str, Any]] = []
         self.tree_calls: list[dict[str, Any]] = []
         self.tree_fail = tree_fail
+        # (branch, file_path) -> content, so the plan leg's read-back of the
+        # committed spec triple works against the fake exactly as the real
+        # WorktreeGitRunner reads it off the branch.
+        self._branch_files: dict[str, dict[str, str]] = {}
 
     async def prepare_branch_and_write(
         self, repo_path: str, branch: str, file_path: str, content: str
@@ -110,12 +114,18 @@ class RecordingGitRunner:
         self.single_calls.append(
             {"branch": branch, "file_path": file_path, "content": content}
         )
+        self._branch_files.setdefault(branch, {})[file_path] = content
         return GitOpResult(
             status="success",
             operation="prepare_branch_and_write",
             sha="handoff-sha",
             exit_code=0,
         )
+
+    async def read_file_from_branch(
+        self, *, repo_path: str, branch: str, file_path: str
+    ) -> str | None:
+        return self._branch_files.get(branch, {}).get(file_path)
 
     async def prepare_branch_and_write_tree(
         self,
@@ -160,6 +170,10 @@ class RecordingGitRunner:
                 stderr="simulated tree write failure",
                 exit_code=1,
             )
+        # Commit succeeded — the files are now readable off the branch.
+        self._branch_files.setdefault(branch, {}).update(
+            {str(k): str(v) for k, v in files.items()}
+        )
         return GitOpResult(
             status="success",
             operation="prepare_branch_and_write_tree",
@@ -283,13 +297,38 @@ def _make_driver(
         return spec_result if spec_result is not None else _spec_result()
 
     async def _dispatch_plan(
-        *, plan_run_id: str, correlation_id: str, scope: str, target_repo: str, feature_id: str
+        *,
+        plan_run_id: str,
+        correlation_id: str,
+        feature_id: str,
+        spec_feature: str,
+        spec_summary: str,
+        target_repo_descriptor: dict[str, Any],
+        spec_assumptions: str | None = None,
     ) -> Any:
         counters["plan"] += 1
-        # Forge ALWAYS supplies scope + target descriptor + minted id.
-        assert target_repo == TARGET_REPO
-        assert feature_id.startswith("FEAT-")
+        # Reject-on-missing, exactly like the real specialist command router:
+        # the 008 contract of record (specialist-agent architect/modes/
+        # feature_plan.py) requires feature_id + the spec triple CONTENTS +
+        # the structured descriptor. A blank/missing required arg is a contract
+        # violation the stub must NOT silently accept.
+        assert feature_id.startswith("FEAT-"), "RV-1: the SUPPLIED minted id"
+        assert spec_feature and spec_feature.strip(), "spec_feature content required"
+        assert spec_summary and spec_summary.strip(), "spec_summary content required"
+        assert isinstance(target_repo_descriptor, dict)
+        assert target_repo_descriptor.get("repo") == TARGET_REPO
+        assert isinstance(target_repo_descriptor.get("test_roots"), list)
+        # forge never invents undefined schema fields.
+        assert set(target_repo_descriptor) <= {
+            "repo",
+            "default_branch",
+            "test_roots",
+            "sibling_repos",
+            "stack",
+        }
         counters["last_feature_id"] = feature_id
+        counters["last_descriptor"] = target_repo_descriptor
+        counters["last_spec_assumptions"] = spec_assumptions
         if plan_result is not None:
             return plan_result
         return _plan_result(feature_id)
@@ -489,6 +528,35 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
     assert "feature-spec" in labels
     assert "feature-plan" in labels
     assert "build-queued" in labels
+
+
+@pytest.mark.asyncio
+async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The 008 leg gets the committed spec CONTENTS + an honestly-built descriptor.
+
+    ``test_roots`` is discovered from the target checkout (a real ``tests/`` dir);
+    ``spec_feature``/``spec_summary`` are the contents read back off the branch.
+    """
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    (repo / "tests").mkdir()  # a real test root at the checkout root
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # The descriptor forge built for 008 carries the discovered test root and
+    # only schema-defined fields (repo + test_roots) — no invented keys.
+    descriptor = h.ctx["counters"]["last_descriptor"]
+    assert descriptor == {"repo": TARGET_REPO, "test_roots": ["tests"]}
+    # The optional assumptions content was threaded (the default spec triple
+    # carries an _assumptions.yaml).
+    assert h.ctx["counters"]["last_spec_assumptions"] == "assumptions: []\n"
 
 
 @pytest.mark.asyncio

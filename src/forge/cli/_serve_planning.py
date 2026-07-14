@@ -114,6 +114,60 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 
 
 # ---------------------------------------------------------------------------
+# Target-terminal wire-arg builders (Lane B / Phase E1 B2)
+#
+# CONTRACT OF RECORD — the specialist mode registration files, whose
+# ``required_args`` these builders MUST reproduce exactly (a drift here is a
+# live-run failure, not a test failure: run 8c4e156f rejected at the
+# feature-spec leg because forge sent ``spec_input`` where 007 requires
+# ``from_input``):
+#   007  specialist-agent/src/specialist_agent/roles/product_owner/modes/
+#        feature_spec.py → required_args=("from_input",)
+#        (``from_input`` = the approved feature_spec_inputs/<id>.md CONTENT;
+#         optional: context, stack, revision_of, validate_feedback)
+#   008  specialist-agent/src/specialist_agent/roles/architect/modes/
+#        feature_plan.py → required_args=("feature_id","spec_feature",
+#        "spec_summary","target_repo_descriptor")
+#        (``feature_id`` = the SUPPLIED minted id reproduced verbatim (RV-1);
+#         ``spec_feature``/``spec_summary`` = the 007 .feature/_summary.md
+#         CONTENTS; ``target_repo_descriptor`` = the {repo, test_roots, ...}
+#         object (TARGET_REPO_DESCRIPTOR_SCHEMA); optional: ``spec_assumptions``
+#         = the 007 _assumptions.yaml content, revision_of, validate_feedback)
+# The contract-pin test (tests/forge/planning/test_target_terminal_contract_pin)
+# asserts the literal arg-name sets these emit against those files.
+# ---------------------------------------------------------------------------
+
+
+def build_feature_spec_command_args(*, from_input: str) -> dict[str, Any]:
+    """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above."""
+    return {"from_input": from_input}
+
+
+def build_feature_plan_command_args(
+    *,
+    feature_id: str,
+    spec_feature: str,
+    spec_summary: str,
+    target_repo_descriptor: dict[str, Any],
+    spec_assumptions: str | None = None,
+) -> dict[str, Any]:
+    """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
+
+    Only the four required keys plus ``spec_assumptions`` when non-blank —
+    never a field the schema does not define.
+    """
+    args: dict[str, Any] = {
+        "feature_id": feature_id,
+        "spec_feature": spec_feature,
+        "spec_summary": spec_summary,
+        "target_repo_descriptor": dict(target_repo_descriptor),
+    }
+    if spec_assumptions is not None and str(spec_assumptions).strip():
+        args["spec_assumptions"] = spec_assumptions
+    return args
+
+
+# ---------------------------------------------------------------------------
 # Per-run drive spawner (per-cid mutual exclusion)
 # ---------------------------------------------------------------------------
 
@@ -738,9 +792,13 @@ async def compose_planning_consumer_and_dispatch(
         # -- target terminal legs (Lane B / Phase E1 B2) ------------------
         # The 007 (po_feature_spec) and 008 (architect_feature_plan) legs ride
         # the SAME specialist dispatch surface + M12 planning budget as the PO
-        # leg above; forge supplies the leg inputs via extra_command_args
-        # (spec_input for 007; scope + target descriptor + minted feature_id for
-        # 008 — RV-1: the plan leg asserts the SUPPLIED id).
+        # leg above; forge supplies the leg inputs via extra_command_args built
+        # by the pinned wire-arg builders (the specialist contract of record):
+        # ``from_input`` for 007; ``feature_id`` + the 007 spec triple CONTENTS
+        # (``spec_feature``/``spec_summary``[/``spec_assumptions``]) + the
+        # structured ``target_repo_descriptor`` for 008 (RV-1: the plan leg
+        # asserts the SUPPLIED id; the driver reads the committed spec contents
+        # back off the branch and builds the descriptor from the target repo).
         async def dispatch_feature_spec(
             *,
             plan_run_id: str,
@@ -755,16 +813,20 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_surface=orchestrator,
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
-                extra_command_args={"spec_input": spec_input},
+                extra_command_args=build_feature_spec_command_args(
+                    from_input=spec_input
+                ),
             )
 
         async def dispatch_feature_plan(
             *,
             plan_run_id: str,
             correlation_id: str,
-            scope: str,
-            target_repo: str,
             feature_id: str,
+            spec_feature: str,
+            spec_summary: str,
+            target_repo_descriptor: dict[str, Any],
+            spec_assumptions: str | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -774,11 +836,13 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_surface=orchestrator,
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
-                extra_command_args={
-                    "scope": scope,
-                    "target_repo": target_repo,
-                    "feature_id": feature_id,
-                },
+                extra_command_args=build_feature_plan_command_args(
+                    feature_id=feature_id,
+                    spec_feature=spec_feature,
+                    spec_summary=spec_summary,
+                    target_repo_descriptor=target_repo_descriptor,
+                    spec_assumptions=spec_assumptions,
+                ),
             )
 
         # -- the build trigger (Lane B / Phase E1 B3) ---------------------
