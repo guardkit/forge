@@ -1021,6 +1021,16 @@ DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 3600
 #: works.
 DEFAULT_FORGE_REPO_BASE: str = "~/Projects/appmilla_github"
 
+#: Environment override for the base directory that holds per-build ISOLATED
+#: git worktrees (DEFECT #19, B4 round-17). Each branch-aware autobuild
+#: materialises ``<base>/<build_id>`` as a worktree of ``payload["branch"]``
+#: so the SHARED checkout is never mutated by a build.
+FORGE_AUTOBUILD_WORKTREE_BASE_ENV: str = "FORGE_AUTOBUILD_WORKTREE_BASE"
+
+#: Default per-build worktree base when
+#: :data:`FORGE_AUTOBUILD_WORKTREE_BASE_ENV` is unset.
+DEFAULT_AUTOBUILD_WORKTREE_BASE: str = "/tmp/forge-autobuild-worktrees"
+
 #: Regex matching one ``[guardkit-checkpoint] Turn N complete (tests: ...)``
 #: line in guardkit's verbose stdout. The runner counts these to drive the
 #: stage_complete fallback (TASK-ABW-001 §Scope item 3).
@@ -1256,6 +1266,133 @@ def _resolve_autobuild_timeout_seconds() -> float:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# Branch-aware isolated worktrees (DEFECT #19, B4 round-17)
+# ---------------------------------------------------------------------------
+#
+# Before this fix the runner ran ``guardkit autobuild`` with cwd = the SHARED
+# repo checkout AS-IS, ignoring the ``branch`` the dispatch was scoped to. The
+# machine-made feature artifacts live on the planning branch; the shared
+# checkout may be on a different lane's branch entirely — so a build targeted
+# the WRONG TREE (or refused on a missing feature YAML). The runner now
+# materialises an isolated git worktree of ``payload["branch"]`` and runs the
+# subprocess there, never touching the shared checkout. Worktree creation reads
+# the LOCAL ref only: no fetch / pull / checkout is ever issued against the
+# shared tree (a missing branch is a loud failure, not a fetch trigger).
+
+
+class WorktreeMaterialisationError(RuntimeError):
+    """Raised when a branch-isolated worktree cannot be created (DEFECT #19)."""
+
+
+async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
+    """Run ``git <args>`` in ``cwd``; return ``(returncode, combined output)``.
+
+    Uses :func:`asyncio.create_subprocess_exec` — the same subprocess seam the
+    guardkit invocation uses — so tests that stub the guardkit call can
+    dispatch on ``argv[0]`` and let real git run against a throwaway repo. Only
+    LOCAL git verbs are ever passed here (``rev-parse``, ``worktree``); no
+    network verb (``fetch``/``pull``) is issued, honouring the DEFECT #19
+    "read the local ref only" rule.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out_bytes, _ = await proc.communicate()
+    code = proc.returncode if proc.returncode is not None else -1
+    return code, out_bytes.decode("utf-8", errors="replace").strip()
+
+
+async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
+    """Return ``True`` iff ``branch`` resolves as a LOCAL ref in ``repo_path``.
+
+    Uses ``git rev-parse --verify --quiet refs/heads/<branch>`` so only a
+    local branch ref counts — a remote-tracking ref alone is NOT enough. No
+    fetch is performed; a branch that exists only on the remote reads as
+    missing here, which the caller turns into a loud failure (DEFECT #19).
+    """
+    code, _ = await _run_git(
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_path,
+    )
+    return code == 0
+
+
+def _worktree_base_dir() -> Path:
+    """Resolve the per-build worktree base dir (env-overridable)."""
+    raw = (
+        os.environ.get(FORGE_AUTOBUILD_WORKTREE_BASE_ENV, "").strip()
+        or DEFAULT_AUTOBUILD_WORKTREE_BASE
+    )
+    return Path(raw).expanduser()
+
+
+async def _materialise_worktree(
+    repo_path: Path, branch: str, build_id: str
+) -> Path:
+    """``git worktree add <base>/<build_id> <branch>`` reading the LOCAL ref.
+
+    Returns the resolved worktree path on success. Raises
+    :class:`WorktreeMaterialisationError` (carrying git's output) on failure —
+    on that failure git has created nothing, so there is no worktree litter to
+    clean up. Never fetches; the branch is assumed already verified present via
+    :func:`_local_branch_exists`.
+    """
+    base = _worktree_base_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    worktree_path = (base / build_id).resolve()
+    code, output = await _run_git(
+        ["worktree", "add", str(worktree_path), branch],
+        cwd=repo_path,
+    )
+    if code != 0:
+        raise WorktreeMaterialisationError(
+            f"git worktree add {worktree_path} for branch {branch!r} failed "
+            f"(exit={code}): {output}"
+        )
+    return worktree_path
+
+
+async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
+    """Best-effort worktree removal — called ONLY on the success path.
+
+    On failure the worktree is deliberately KEPT (see DEFECT #19: loud
+    failures carry their own forensics), so this helper is never invoked
+    there. A cleanup failure on the success path is logged at WARNING and
+    swallowed — a leftover worktree does not regress a build that already
+    succeeded.
+    """
+    code, output = await _run_git(
+        ["worktree", "remove", "--force", str(worktree_path)],
+        cwd=repo_path,
+    )
+    if code != 0:
+        logger.warning(
+            "autobuild_runner: worktree cleanup failed for %s (exit=%s): %s "
+            "— leaving it on disk; not fatal to the succeeded build",
+            worktree_path,
+            code,
+            output,
+        )
+
+
+def _with_worktree_forensics(reason: str, worktree_path: Path | None) -> str:
+    """Append the kept-worktree forensics pointer to a failure ``reason``.
+
+    DEFECT #19: a failed branch-aware build KEEPS its worktree and NAMES it in
+    the failure event so an operator can inspect the exact tree the build ran
+    against. When no worktree was created (legacy path or pre-worktree
+    failure) the reason is returned unchanged.
+    """
+    if worktree_path is not None:
+        return f"{reason} (worktree KEPT for forensics: {worktree_path})"
+    return reason
+
+
 def _build_failed_snapshot(
     payload: Mapping[str, Any], *, reason: str
 ) -> dict[str, Any]:
@@ -1351,6 +1488,55 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         )
 
+    # DEFECT #19 — branch-aware ISOLATED worktree resolution. When the launch
+    # payload carries a ``branch``, materialise a git worktree of that branch
+    # from the resolved (shared) checkout and run guardkit there so the shared
+    # tree is never mutated. When ``branch`` is absent (legacy CLI launches,
+    # the F2-proven path), preserve today's behaviour: run in the shared
+    # checkout AS-IS. Either way we log which mode was taken.
+    branch_raw = payload.get("branch")
+    worktree_path: Path | None = None
+    if isinstance(branch_raw, str) and branch_raw.strip():
+        branch = branch_raw.strip()
+        build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
+        if not await _local_branch_exists(repo_path, branch):
+            return _snapshot_update(
+                _build_failed_snapshot(
+                    payload,
+                    reason=(
+                        f"branch {branch!r} does not exist locally in "
+                        f"{repo_path} — refusing to fetch (DEFECT #19: the "
+                        "runner reads the local ref only and never touches the "
+                        "shared checkout)"
+                    ),
+                )
+            )
+        try:
+            worktree_path = await _materialise_worktree(repo_path, branch, build_id)
+        except WorktreeMaterialisationError as exc:
+            # worktree add failed → git created nothing → no litter to clean.
+            return _snapshot_update(
+                _build_failed_snapshot(payload, reason=str(exc))
+            )
+        run_cwd = worktree_path
+        logger.info(
+            "autobuild_runner: DEFECT#19 isolated-worktree mode feature_id=%s "
+            "branch=%s worktree=%s (shared checkout %s left untouched)",
+            feature_id,
+            branch,
+            worktree_path,
+            repo_path,
+        )
+    else:
+        run_cwd = repo_path
+        logger.info(
+            "autobuild_runner: legacy shared-checkout mode feature_id=%s cwd=%s "
+            "(no 'branch' in launch payload — F2-proven CLI path preserved, "
+            "byte-compatible)",
+            feature_id,
+            repo_path,
+        )
+
     timeout_seconds = _resolve_autobuild_timeout_seconds()
     argv: list[str] = [
         str(guardkit_path),
@@ -1364,23 +1550,28 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s timeout=%ss",
         feature_id,
-        repo_path,
+        run_cwd,
         timeout_seconds,
     )
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            cwd=str(repo_path),
+            cwd=str(run_cwd),
             env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
     except (OSError, FileNotFoundError) as exc:
+        # Spawn failed AFTER a worktree may have been created — keep it for
+        # forensics and name it in the failure event (DEFECT #19).
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
-                reason=f"failed to spawn guardkit subprocess: {exc!r}",
+                reason=_with_worktree_forensics(
+                    f"failed to spawn guardkit subprocess: {exc!r}",
+                    worktree_path,
+                ),
             )
         )
 
@@ -1430,17 +1621,30 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     exit_code = proc.returncode if proc.returncode is not None else -1
 
     if timed_out or exit_code != 0:
+        # A non-zero exit also covers guardkit's own refusal on a missing
+        # feature YAML in the (worktree) tree — we delegate that detection to
+        # guardkit rather than reimplementing its feature-file discovery, and
+        # surface it here as a loud failure that KEEPS the worktree so the
+        # exact tree is inspectable (DEFECT #19).
         reason = (
             f"guardkit autobuild timed out after {timeout_seconds}s"
             if timed_out
             else f"guardkit autobuild exit={exit_code}"
         )
-        return _snapshot_update(_build_failed_snapshot(payload, reason=reason))
+        return _snapshot_update(
+            _build_failed_snapshot(
+                payload,
+                reason=_with_worktree_forensics(reason, worktree_path),
+            )
+        )
 
-    # Success — return a running_wave snapshot with tasks_completed=1 so
-    # the bridge translator's stage_complete delta can fire (and so the
-    # state-channel visibly carries a stage_complete-shaped snapshot for
-    # the integration test's mid-stream assertion).
+    # Success — clean up the isolated worktree (DEFECT #19: remove on SUCCESS,
+    # keep on failure) then return a running_wave snapshot with
+    # tasks_completed=1 so the bridge translator's stage_complete delta can
+    # fire (and so the state-channel visibly carries a stage_complete-shaped
+    # snapshot for the integration test's mid-stream assertion).
+    if worktree_path is not None:
+        await _remove_worktree(repo_path, worktree_path)
     tasks_completed = max(stage_complete_count, 1)
     snapshot = _build_snapshot(
         payload,
@@ -1497,6 +1701,52 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
         tasks_failed=tasks_failed,
     )
     return _snapshot_update(snapshot)
+
+
+def _node_finalize(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Structural loud-no-op guard (DEFECT #18b, B4 round-17).
+
+    Every path through the graph funnels here before ``END``. A runner run
+    that reaches its end WITHOUT a terminal lifecycle (``completed`` /
+    ``cancelled`` / ``failed``) written to the ``async_tasks`` channel is the
+    exact silent no-op the July-3 sidecar exhibited: the run ended
+    ``status='success'`` having emitted zero lifecycle, and the forge-side
+    observer had to infer the failure from a truncated stream. This node makes
+    that structurally impossible: if the channel is not terminal for this run's
+    ``feature_id``, it forces a loud ``failed`` snapshot with a named error
+    rather than letting the graph end clean. The check is centralised here (not
+    scattered per node) so it holds regardless of payload shape or any future
+    node body.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+    async_tasks = state.get("async_tasks") or {}
+    snapshot = (
+        async_tasks.get(feature_id) if isinstance(async_tasks, Mapping) else None
+    )
+    lifecycle = snapshot.get("lifecycle") if isinstance(snapshot, Mapping) else None
+    if lifecycle in TERMINAL_LIFECYCLES:
+        # Terminal state reached the honest way — nothing to force.
+        return {}
+    logger.error(
+        "autobuild_runner: graph reached finalize WITHOUT a terminal lifecycle "
+        "(feature_id=%s observed=%r) — forcing a loud failure (DEFECT #18b "
+        "silent-no-op guard). A runner run must never end 'success' without "
+        "emitting completed/cancelled/failed.",
+        feature_id,
+        lifecycle,
+    )
+    return _snapshot_update(
+        _build_failed_snapshot(
+            payload,
+            reason=(
+                "autobuild_runner ended without reaching a terminal lifecycle "
+                f"(observed lifecycle={lifecycle!r}); forced failure by the "
+                "DEFECT #18b silent-no-op guard so the run fails LOUD instead "
+                "of ending 'success' silently"
+            ),
+        )
+    )
 
 
 def _route_after_running_wave(state: AutobuildRunnerState) -> str:
@@ -1562,6 +1812,10 @@ def _build_runner_graph() -> Any:
         sg.add_node("running_wave", _node_running_wave)
         sg.add_node("completed", _node_completed)
         sg.add_node("failed", _node_failed)
+        # DEFECT #18b: the terminal loud-no-op guard. Every terminal node
+        # funnels through it before END so the graph is structurally incapable
+        # of ending without a terminal lifecycle on the channel.
+        sg.add_node("finalize", _node_finalize)
         sg.add_edge(START, "starting")
         sg.add_edge("starting", "planning_waves")
         sg.add_edge("planning_waves", "running_wave")
@@ -1574,8 +1828,9 @@ def _build_runner_graph() -> Any:
             _route_after_running_wave,
             {"completed": "completed", "failed": "failed"},
         )
-        sg.add_edge("completed", END)
-        sg.add_edge("failed", END)
+        sg.add_edge("completed", "finalize")
+        sg.add_edge("failed", "finalize")
+        sg.add_edge("finalize", END)
         return sg.compile()
     except Exception as exc:  # noqa: BLE001 - construction-time safety net
         logger.warning(
@@ -1604,6 +1859,48 @@ def _build_placeholder_graph() -> Any:
     return sg.compile()
 
 
+def _resolve_runner_code_version() -> str:
+    """Best-effort code-version string for the boot-time staleness stamp (#18a).
+
+    Prefers the git rev of the running tree — that is precisely what
+    distinguishes a code-stale sidecar (serving an old checkout, as in the B4
+    round-17 failure) from a fresh one. The langgraph-api ``/version`` endpoint
+    (see :mod:`forge.lifecycle_bridge.version_check`) only reports the SDK
+    package version, which is unchanged whether forge's graph code is fresh or
+    months old — so it cannot see this. Falls back to the installed ``forge``
+    package version, then ``"unknown"``. Never raises: the stamp must not block
+    module import at sidecar boot.
+    """
+    module_dir = Path(__file__).resolve().parent
+    try:
+        import subprocess  # local import — runs once at module import
+
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-C", str(module_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        rev = result.stdout.strip()
+        if rev:
+            return f"git-{rev}"
+    except Exception:  # noqa: BLE001 — never block import on the stamp
+        pass
+    try:
+        from importlib.metadata import version
+
+        return f"pkg-{version('forge')}"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+#: Import-time code-version stamp (DEFECT #18a). Logged at module import so a
+#: code-stale sidecar is visible in the journal — grep for "code version
+#: stamp" after any deploy to confirm the sidecar is serving the intended rev.
+RUNNER_CODE_VERSION: str = _resolve_runner_code_version()
+
+
 #: Module-level compiled graph addressed by ``langgraph.json`` as
 #: ``./src/forge/subagents/autobuild_runner.py:graph``. Built once at
 #: import time; the LangGraph dev server resolves the ``autobuild_runner``
@@ -1611,13 +1908,26 @@ def _build_placeholder_graph() -> Any:
 graph = _build_runner_graph()
 
 
+# DEFECT #18a — boot-visible code-version stamp. A ``--no-reload`` sidecar
+# only picks up new code on restart; this line is how an operator confirms the
+# running process is serving current code (a stale sidecar prints an old rev).
+logger.info(
+    "autobuild_runner: import-time code version stamp rev=%s "
+    "(DEFECT #18a boot-visible staleness signal)",
+    RUNNER_CODE_VERSION,
+)
+
+
 __all__ = [
     "AUTOBUILD_RUNNER_NAME",
     "DEFAULT_AUTOBUILD_TIMEOUT_SECONDS",
+    "DEFAULT_AUTOBUILD_WORKTREE_BASE",
     "DEFAULT_FORGE_REPO_BASE",
     "FORGE_AUTOBUILD_TIMEOUT_ENV",
+    "FORGE_AUTOBUILD_WORKTREE_BASE_ENV",
     "FORGE_GUARDKIT_PATH_ENV",
     "FORGE_REPO_BASE_ENV",
+    "RUNNER_CODE_VERSION",
     "AutobuildLifecycle",
     "AutobuildRunnerState",
     "AutobuildState",
@@ -1628,8 +1938,12 @@ __all__ = [
     "SubagentEmitter",
     "TERMINAL_LIFECYCLES",
     "WorktreeConfinementError",
+    "WorktreeMaterialisationError",
     "_async_tasks_reducer",
+    "_local_branch_exists",
+    "_materialise_worktree",
     "_node_failed",
+    "_node_finalize",
     "_node_running_wave",
     "_resolve_guardkit_path",
     "_resolve_repo_path",

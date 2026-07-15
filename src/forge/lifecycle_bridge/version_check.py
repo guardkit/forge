@@ -157,6 +157,28 @@ def _default_fetch(url: str, timeout_seconds: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Scope note (DEFECT #18a, B4 round-17): why this check cannot catch a
+# CODE-stale sidecar
+# ---------------------------------------------------------------------------
+#
+# This diagnostic catches *package*-version skew: the sidecar's ``/version``
+# endpoint reports the ``langgraph-api`` SDK version, which we compare against
+# LANGGRAPH_API_SUPPORTED_RANGE. It CANNOT catch a sidecar that is running a
+# stale checkout of *forge's own* graph code (the B4 round-17 failure mode: a
+# ``--no-reload`` sidecar served July-3 ``autobuild_runner.py`` for days while
+# the package version was unchanged). The reason it cannot be cheaply extended
+# to catch that: ``/version`` is a langgraph-api-owned endpoint that reports
+# only the SDK package version — it has no knowledge of the forge git rev of
+# the graph modules the SDK imports, and those bytes are identical-versioned
+# whether fresh or months old. Surfacing forge's code rev here would require
+# the sidecar to expose a *new* forge-owned endpoint (or embed the rev in graph
+# metadata) and this checker to learn to read it — not a cheap extension, and
+# it would couple the boot-time bridge check to a graph-internal detail.
+# The chosen signal instead lives at the source: ``autobuild_runner`` logs an
+# import-time code-version stamp (``RUNNER_CODE_VERSION``) to the journal, so a
+# code-stale sidecar is visible by grepping ``journalctl`` for that line after a
+# deploy. See ``forge.subagents.autobuild_runner._resolve_runner_code_version``.
+# ---------------------------------------------------------------------------
 # Public entry point.
 # ---------------------------------------------------------------------------
 

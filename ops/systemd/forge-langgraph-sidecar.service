@@ -30,6 +30,22 @@
 #   guardkit resolver / SDK pin and break — the reason a blind `cp` overwrite of
 #   the running unit is unsafe. See ops/systemd/README.md §b for the install rule.
 #
+# VENV INSTALL RECIPE (DEFECT #18a, B4 round-17): the `langgraph` binary in the
+#   ExecStart below ships in `langgraph-cli[inmem]`, now declared as the
+#   `sidecar` extra in pyproject.toml. Install/repair the sidecar venv with
+#     uv pip install -e ".[sidecar]"      (or: uv sync --extra sidecar)
+#   so the CLI is a first-class pinned requirement. Before round-17 this dep
+#   lived ONLY as an ad-hoc `uv pip install` in the venv; a later `uv sync`
+#   pruned it and the running `langgraph dev` process survived on deleted
+#   inodes while serving stale code — invisible until the next restart.
+#
+# CODE FRESHNESS (DEFECT #18a): the runner logs an import-time code-version
+#   stamp — grep the journal for `code version stamp rev=` after any deploy
+#   (`journalctl --user -u forge-langgraph-sidecar | grep 'code version stamp'`)
+#   to confirm the sidecar is serving the intended git rev. `langgraph dev`
+#   runs with --no-reload, so a restart is the ONLY way new code is picked up;
+#   the stamp is how a code-stale sidecar becomes visible.
+#
 # SCOPE: a systemd **USER** unit (binds the forge developer venv + repo-local .env,
 #   both user-scoped — no root). Install/reconcile is a coordinator step, NOT done
 #   by this pass; this file is AUTHORED + `systemd-analyze verify`-clean.

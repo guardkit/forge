@@ -64,6 +64,22 @@ providers = [
     "langchain-openai>=1.2,<2",
     "langchain-google-genai>=4.2,<5",
 ]
+# TASK-ABW-B4R17 (DEFECT #18a) — the langgraph-runner sidecar
+# (ops/systemd/forge-langgraph-sidecar.service) is launched via
+# ``langgraph dev`` from the ``langgraph-cli`` package with its ``[inmem]``
+# extra (the in-memory dev server the autobuild_runner graph is hosted on).
+# That dependency was NEVER declared here: it survived only as an ad-hoc
+# ``uv pip install`` in the sidecar venv, so a later ``uv sync`` pruned it
+# and the running process limped on deleted inodes until its next restart
+# (B4 round-17 silent-launch defect). Declaring it as a NAMED extra makes
+# ``uv sync`` treat it as a first-class requirement that cannot be pruned.
+# INSTALL RECIPE (coordinator, at deploy — see the sidecar .service file's
+# LOAD-BEARING header): install the sidecar venv with
+# ``uv pip install -e ".[sidecar]"`` (or ``uv sync --extra sidecar``) so the
+# ``langgraph`` CLI the unit's ExecStart depends on is present and pinned.
+sidecar = [
+    "langgraph-cli[inmem]>=0.4,<0.5",
+]
 # TASK-FIX-F0E7 (per TASK-REV-F0E4 §5.2): mirrored from [dependency-groups].dev
 # below. PEP 735's [dependency-groups] is read by `uv sync --group dev`,
 # NOT by `uv pip install -e ".[dev]"`. The GuardKit portfolio-pinning
