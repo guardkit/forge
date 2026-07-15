@@ -253,7 +253,12 @@ def _build_resume_launcher(
     """
 
     async def launch(
-        *, build_id: str, feature_id: str, correlation_id: str | None
+        *,
+        build_id: str,
+        feature_id: str,
+        correlation_id: str | None,
+        branch: str | None = None,
+        repo: str | None = None,
     ) -> Any:
         if async_task_starter is None:
             raise RuntimeError(
@@ -262,6 +267,11 @@ def _build_resume_launcher(
                 "TASK-FW10-008 (Supervisor + AsyncSubAgentMiddleware); tests "
                 "should pass a fake starter via the kwarg."
             )
+        # DEFECT #19 activation (B4 round-17): forward ``branch``/``repo`` from
+        # the accepted BuildQueuedPayload (the live approve path passes them;
+        # the boot-rearm resume path restores the row from SQLite and has no
+        # payload in scope, so they default to None and the launch stays
+        # byte-compatible with the pre-fix shape).
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -271,6 +281,8 @@ def _build_resume_launcher(
             stage_log_recorder=stage_log_recorder,
             state_channel=state_channel,
             lifecycle_emitter=lifecycle_emitter,
+            branch=branch,
+            repo=repo,
         )
 
     return launch
@@ -553,6 +565,8 @@ def _build_dispatch_build(
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
+                branch=payload.branch,
+                repo=payload.repo,
             )
             return
 
@@ -596,6 +610,8 @@ def _build_dispatch_build(
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
+                branch=payload.branch,
+                repo=payload.repo,
             )
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never

@@ -332,6 +332,8 @@ async def dispatch_autobuild_async(
     stage_log_recorder: StageLogRecorder,
     state_channel: AutobuildStateInitialiser,
     lifecycle_emitter: "PipelineLifecycleEmitter | None" = None,
+    branch: str | None = None,
+    repo: str | None = None,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -409,6 +411,18 @@ async def dispatch_autobuild_async(
             compatibility with the wave-2 dispatcher tests; production
             callers (TASK-FW10-008) MUST pass an emitter so the
             five-collaborator wiring contract is honoured.
+        branch: The base branch the build is scoped to, forwarded verbatim
+            from the consumed :class:`BuildQueuedPayload.branch`. When set it
+            is threaded into the launch payload as ``payload["branch"]`` so the
+            autobuild_runner's DEFECT #19 branch-aware isolated-worktree path
+            engages. ``None`` (legacy CLI / boot-rearm launch, no payload in
+            scope) keeps the launch bytes byte-compatible with the pre-fix
+            shape — the key is omitted entirely.
+        repo: The ``org/repo`` the build targets, forwarded verbatim from
+            :class:`BuildQueuedPayload.repo`. Threaded into the launch payload
+            as ``payload["repo"]`` when set (same one-hop provenance as
+            ``branch``); omitted when ``None`` so the runner's existing
+            FORGE_DEFAULT_REPO fallback still governs the legacy path.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -502,6 +516,21 @@ async def dispatch_autobuild_async(
         "context_entries": serialised_context,
         "lifecycle_emitter": lifecycle_emitter,
     }
+    # DEFECT #19 activation (B4 round-17): thread ``branch`` (and ``repo`` when
+    # equally available) from the ALREADY-VALIDATED BuildQueuedPayload the
+    # consumer's dispatch closure accepted into the launch payload. Without
+    # these the round-17 launch bytes carried only
+    # {build_id, context_entries, correlation_id, feature_id}, so the runner's
+    # branch-aware isolated-worktree path never engaged (payload["branch"]
+    # absent → legacy shared-checkout mode). We add each key ONLY when a value
+    # was threaded so the legacy CLI / boot-rearm launch (no branch/repo) stays
+    # byte-compatible with the pre-fix payload the F2 path proved. Values are
+    # forwarded verbatim (no reformatting) — same one-hop provenance as
+    # build_id/feature_id/correlation_id.
+    if branch:
+        launch_payload["branch"] = branch
+    if repo:
+        launch_payload["repo"] = repo
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

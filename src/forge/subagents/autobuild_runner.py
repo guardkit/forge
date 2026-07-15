@@ -1772,6 +1772,16 @@ def _route_after_running_wave(state: AutobuildRunnerState) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Captured at module scope by :func:`_build_runner_graph`'s except branch when
+#: the real StateGraph fails to construct at import (the DEFECT #18a
+#: dependency-drift scenario). The placeholder graph's node reads it so every
+#: gate-approved run served by a sidecar that could NOT build its real graph
+#: emits a LOUD ``failed`` lifecycle naming this original error — instead of a
+#: no-op graph silently 'succeeding'. ``None`` means the real graph built
+#: cleanly and the placeholder is never served.
+_RUNNER_GRAPH_CONSTRUCTION_ERROR: Exception | None = None
+
+
 def _build_runner_graph() -> Any:
     """Compile the autobuild_runner graph for ``langgraph.json``.
 
@@ -1833,29 +1843,68 @@ def _build_runner_graph() -> Any:
         sg.add_edge("finalize", END)
         return sg.compile()
     except Exception as exc:  # noqa: BLE001 - construction-time safety net
-        logger.warning(
+        # Capture the original construction error at module scope so the
+        # placeholder graph's node can NAME it on every run (DEFECT #18a).
+        global _RUNNER_GRAPH_CONSTRUCTION_ERROR
+        _RUNNER_GRAPH_CONSTRUCTION_ERROR = exc
+        logger.error(
             "autobuild_runner: StateGraph construction raised %s — "
-            "exporting placeholder graph so langgraph.json still "
-            "parses; investigate before relying on the subagent",
+            "exporting a LOUD-FAILING placeholder graph so every "
+            "gate-approved build served by this sidecar fails 'failed' "
+            "(never silent 'success'); investigate the construction error "
+            "before relying on the subagent",
             exc,
         )
         return _build_placeholder_graph()
 
 
-def _build_placeholder_graph() -> Any:
-    """Return a trivial compiled :class:`StateGraph`.
+def _node_graph_construction_failed(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Emit a LOUD ``failed`` snapshot naming the import-time construction error.
 
-    Used only when the production graph cannot be constructed. The
-    graph compiles, addresses, and invokes (returning state unchanged)
-    so ``langgraph.json`` parse and LangGraph dev-server import paths
-    still work; production behaviour is delegated to the real graph.
+    The single node of :func:`_build_placeholder_graph`. When the real runner
+    graph could not be constructed at import (DEFECT #18a dependency drift), the
+    sidecar STILL boots and serves this placeholder — but instead of the old
+    silent no-op (which let every gate-approved build end ``status='success'``
+    having emitted zero lifecycle), this node writes a terminal ``failed``
+    snapshot to the ``async_tasks`` channel whose reason NAMES the captured
+    :data:`_RUNNER_GRAPH_CONSTRUCTION_ERROR`. The bridge translator publishes
+    that reason on ``pipeline.build-failed.<feature_id>`` so the failure is
+    visible on the wire, not inferred from a truncated stream.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    exc = _RUNNER_GRAPH_CONSTRUCTION_ERROR
+    reason = f"autobuild_runner graph failed to construct at import: {exc!r}"
+    logger.error(
+        "autobuild_runner: serving the placeholder graph — forcing a loud "
+        "failed lifecycle for feature_id=%s because the real graph failed to "
+        "construct at import (%r)",
+        payload.get("feature_id"),
+        exc,
+    )
+    return _snapshot_update(_build_failed_snapshot(payload, reason=reason))
+
+
+def _build_placeholder_graph() -> Any:
+    """Return a LOUD-FAILING compiled :class:`StateGraph`.
+
+    Served only when the production graph cannot be constructed at import
+    (:func:`_build_runner_graph`'s except branch, DEFECT #18a). It is a valid,
+    servable graph — the sidecar must still boot so it can REPORT the failure —
+    but its single node (:func:`_node_graph_construction_failed`) emits a
+    terminal ``failed`` lifecycle naming the original construction error rather
+    than the old silent no-op that let a broken sidecar 'succeed' every build.
+
+    It uses the same :class:`AutobuildRunnerState` schema (``messages`` +
+    ``async_tasks``) as the real graph so the ``AsyncSubAgentMiddleware`` launch
+    contract holds and the bridge translator's ``_extract_state`` finds the
+    ``failed`` snapshot on the ``async_tasks`` channel.
     """
     from langgraph.graph import END, START, StateGraph
 
-    sg: StateGraph[dict[str, Any]] = StateGraph(dict)
-    sg.add_node("noop", lambda state: state)
-    sg.add_edge(START, "noop")
-    sg.add_edge("noop", END)
+    sg: StateGraph[AutobuildRunnerState] = StateGraph(AutobuildRunnerState)
+    sg.add_node("graph_construction_failed", _node_graph_construction_failed)
+    sg.add_edge(START, "graph_construction_failed")
+    sg.add_edge("graph_construction_failed", END)
     return sg.compile()
 
 

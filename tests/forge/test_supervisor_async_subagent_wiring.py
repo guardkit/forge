@@ -223,24 +223,32 @@ class TestDispatchAutobuildSignature:
 
     def test_signature_has_exactly_five_collaborator_kwargs(self) -> None:
         sig = inspect.signature(dispatch_autobuild_async)
-        # Identify keyword-only collaborator parameters (everything after
-        # the positional build/feature/correlation triple).
+        # Keyword-only parameters after the positional build/feature/correlation
+        # triple. The five COLLABORATORS lead; ``branch``/``repo`` are additive
+        # DATA kwargs (B4 round-17 DEFECT #19 wire-up) forwarded verbatim from
+        # the BuildQueuedPayload — not collaborators, so AC-005's five-
+        # collaborator contract is unchanged.
         kw_only = [
             name
             for name, p in sig.parameters.items()
             if p.kind is inspect.Parameter.KEYWORD_ONLY
         ]
-        expected = [
+        collaborators = [
             "forward_context_builder",
             "async_task_starter",
             "stage_log_recorder",
             "state_channel",
             "lifecycle_emitter",
         ]
-        assert kw_only == expected, (
-            f"dispatch_autobuild_async must expose exactly the five "
-            f"collaborator parameters {expected!r}; got {kw_only!r}"
+        additive_data_kwargs = ["branch", "repo"]
+        assert kw_only == collaborators + additive_data_kwargs, (
+            f"dispatch_autobuild_async must expose exactly the five collaborator "
+            f"parameters {collaborators!r} followed only by the additive data "
+            f"kwargs {additive_data_kwargs!r}; got {kw_only!r}"
         )
+        # The additive kwargs are pure data (default None), never collaborators.
+        for name in additive_data_kwargs:
+            assert sig.parameters[name].default is None
 
     def test_lifecycle_emitter_defaults_to_none(self) -> None:
         sig = inspect.signature(dispatch_autobuild_async)
