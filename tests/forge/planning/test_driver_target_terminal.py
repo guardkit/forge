@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 from forge.adapters.git.models import GitOpResult
 from forge.adapters.git.planning_runner import WorktreeGitRunner
@@ -56,6 +57,24 @@ CID = "tt-run-0001"
 PLAN_RUN_ID = f"plan-{CID}"
 ORIGINATOR = "U0RIGINATOR"
 TARGET_REPO = "guardkit/api_test"
+
+#: A valid AUTHLESS feature-grain pass-bar seed (guardkit `/feature-spec`
+#: `pass-bar-seed-*.yaml` shape). The default 007 fakes ship it so the machine
+#: chain reaches BUILD_QUEUED — the B4 round-19 contract requires a seed to
+#: register the per-task bars the B2 precondition demands.
+_AUTHLESS_SEED_YAML = (
+    "format_version: '2.0'\n"
+    "feature_slug: stats-endpoint\n"
+    "auth_surface_bearing: false\n"
+    "preconditions:\n"
+    "- suite_green_vs_ledger\n"
+    "criteria:\n"
+    "- id: stats-AC-001\n"
+    "  text: A GET request to /stats returns the statistics\n"
+    "  class: machine\n"
+    "  evidence_kind: json\n"
+    "  runbook_ref: null\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +217,9 @@ def _spec_result(files: dict[str, str] | None = None, slug: str = "stats-endpoin
         outcome=SimpleNamespace(value="completed"),
         role_output={
             "slug": slug,
+            # The feature-grain seed rides alongside the triple (a tolerated
+            # extra); forge captures it at the spec commit and specialises it.
+            f"pass-bar-seed-{slug}.yaml": _AUTHLESS_SEED_YAML,
             "files": files
             if files is not None
             else {
@@ -218,7 +240,9 @@ def _plan_result(feature_id: str, files: dict[str, str] | None = None) -> Any:
             "files": files
             if files is not None
             else {
-                f"features/stats-endpoint/{feature_id}.yaml": f"id: {feature_id}\n",
+                f"features/stats-endpoint/{feature_id}.yaml": (
+                    f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
+                ),
                 "tasks/TASK-STAT-001.md": "# task\n",
             },
         },
@@ -238,7 +262,7 @@ def _spec_result_native(slug: str = "stats-endpoint", accepted: bool = True) -> 
             f"{slug}.feature": "Feature: stats\n  Scenario: ok\n    Given a\n",
             f"{slug}_assumptions.yaml": "assumptions: []\n",
             f"{slug}_summary.md": "# summary\n",
-            f"pass-bar-seed-{slug}.yaml": "format_version: '2.0'\n",
+            f"pass-bar-seed-{slug}.yaml": _AUTHLESS_SEED_YAML,
             "validation.json": json.dumps(
                 {"accepted": accepted, "errors": [] if accepted else ["bad"],
                  "gates_run": ["gherkin_backstop"]}
@@ -256,10 +280,13 @@ def _plan_result_native(feature_id: str, slug: str = "stats-endpoint",
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
         role_output={
-            f".guardkit/features/{feature_id}.yaml": f"id: {feature_id}\ntasks: []\n",
+            # The real 008 map lists tasks in the feature YAML but emits NO
+            # per-task qa/pass-bar-*.yaml (the round-19 gap forge now fills).
+            f".guardkit/features/{feature_id}.yaml": (
+                f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
+            ),
             f"tasks/backlog/{slug}/IMPLEMENTATION-GUIDE.md": "# guide\n",
             f"tasks/backlog/{slug}/TASK-STAT-001.md": "# task\n",
-            "qa/pass-bar-TASK-STAT-001.yaml": "task_id: TASK-STAT-001\n",
             "validation.json": json.dumps(
                 {"accepted": accepted, "errors": [] if accepted else ["bad"],
                  "gates_run": ["feature_validate"]}
@@ -307,6 +334,8 @@ def _make_driver(
     normalize: Any | None = None,
     validate: Any | None = None,
     validate_fn: Any | None = None,
+    pass_bar_validate: Any | None = None,
+    pass_bar_validate_fn: Any | None = None,
     wire_legs: bool = True,
     build_trigger_result: Any | None = None,
     build_trigger_fn: Any | None = None,
@@ -326,8 +355,10 @@ def _make_driver(
         "plan": 0,
         "normalize": 0,
         "validate": 0,
+        "pass_bar_validate": 0,
         "build_trigger": 0,
     }
+    validated_bars: list[str] = []
 
     def subscriber_factory(expected_approver: Any, armed: Any) -> ScriptedSubscriber:
         return ScriptedSubscriber([_approve()], armed)
@@ -394,6 +425,14 @@ def _make_driver(
             return await validate_fn(worktree, feature_id)
         return validate if validate is not None else ToolOutcome(ok=True)
 
+    async def _validate_pass_bar(worktree: Path, bar_rel: str) -> ToolOutcome:
+        counters["pass_bar_validate"] += 1
+        validated_bars.append(bar_rel)
+        # A dynamic oracle (the schema-faithful pass-bar check) takes precedence.
+        if pass_bar_validate_fn is not None:
+            return await pass_bar_validate_fn(worktree, bar_rel)
+        return pass_bar_validate if pass_bar_validate is not None else ToolOutcome(ok=True)
+
     build_triggers: list[dict[str, Any]] = []
 
     async def _dispatch_build_trigger(
@@ -450,6 +489,7 @@ def _make_driver(
         dispatch_feature_plan=(plan_dispatch or _dispatch_plan) if wire_legs else None,
         normalize_feature_spec=_normalize if wire_legs else None,
         validate_feature_plan=_validate if wire_legs else None,
+        validate_pass_bar=_validate_pass_bar if wire_legs else None,
         dispatch_build_trigger=(
             (build_trigger_fn or _dispatch_build_trigger)
             if wire_build_trigger
@@ -463,6 +503,7 @@ def _make_driver(
             "counters": counters,
             "git": deps.git_runner,
             "build_triggers": build_triggers,
+            "validated_bars": validated_bars,
         },
     )
 
@@ -1137,6 +1178,15 @@ async def test_build_trigger_idempotent_after_queue_recorded(
             }
         ),
     )
+    # The pass bars were already registered in this crash window (they land
+    # BEFORE the build-queued marker), so seed that leg event too.
+    store._record_event(
+        correlation_id=CID,
+        stage_label="qa-pass-bars",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps({"feature_id": "FEAT-AAAA", "bar_files": []}),
+    )
     store._record_event(
         correlation_id=CID,
         stage_label="build-queued",
@@ -1152,3 +1202,340 @@ async def test_build_trigger_idempotent_after_queue_recorded(
     # Neither the specialist legs nor the build trigger were re-invoked.
     assert h.ctx["counters"]["build_trigger"] == 0
     assert h.ctx["counters"]["plan"] == 0
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B4 round-19 (Rich-ratified) — register per-task QA pass bars from the 007
+# seed at plan-commit. Wire-true replay: the LITERAL round-19 seed bytes (the
+# committed fixture below), driven through the plan-commit step on a throwaway
+# repo. The live launch (run 75978066) reached the first real machine build and
+# guardkit refused in 12s: qa_precondition_blocked — no qa/pass-bar-<TASK-ID>
+# registered before implementation. Forge now mints them from the seed.
+# ---------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+#: The LITERAL round-19 live seed bytes (specialist output, host-visible mount).
+#: It is auth_surface_bearing: true — the attended-registration path.
+_ROUND19_SEED_AUTH = (_FIXTURES / "pass-bar-seed-version-endpoint.yaml").read_text(
+    encoding="utf-8"
+)
+#: The SAME seed with the flag flipped false — the machine-registration path.
+_ROUND19_SEED_AUTHLESS = _ROUND19_SEED_AUTH.replace(
+    "auth_surface_bearing: true", "auth_surface_bearing: false"
+)
+
+_ALLOWED_PRECONDITIONS = {"suite_green_vs_ledger", "analyze_clean", "build_artifact"}
+_ALLOWED_CRITERION_KEYS = {"id", "text", "class", "evidence_kind", "runbook_ref"}
+_ALLOWED_EVIDENCE = {"screenshot", "json", "log", "operator_signoff"}
+_ALLOWED_BAR_KEYS = {
+    "format_version",
+    "task_id",
+    "registered_at",
+    "auth_surface_bearing",
+    "preconditions",
+    "criteria",
+    "negative_paths",
+    "checkpoint_list_ref",
+}
+
+
+def _assert_pass_bar_schema(bar: dict[str, Any]) -> None:
+    """Schema-faithful in-test check mirroring guardkit's PassBar (F1 v2.0).
+
+    guardkit is not importable in the forge venv (production shells the vendored
+    BINARY), so this replicates the load-bearing constraints of
+    ``guardkit/qa/formats/pass_bar.py`` so "guardkit qa validate pass-bar is
+    green" is a real assertion, not a stubbed one: extra="forbid" at the root,
+    the registered_at {sha>=4, date YYYY-MM-DD} shape, the precondition/evidence
+    enums, and the conditional negative-path minimum set.
+    """
+    import re as _re
+
+    assert set(bar) <= _ALLOWED_BAR_KEYS, f"unknown root keys: {set(bar) - _ALLOWED_BAR_KEYS}"
+    assert int(str(bar["format_version"]).split(".", 1)[0]) in {1, 2}
+    assert isinstance(bar["task_id"], str) and bar["task_id"]
+    reg = bar["registered_at"]
+    assert set(reg) <= {"sha", "date"}
+    assert isinstance(reg["sha"], str) and len(reg["sha"]) >= 4
+    assert _re.fullmatch(r"\d{4}-\d{2}-\d{2}", reg["date"])
+    assert isinstance(bar["auth_surface_bearing"], bool)
+    assert bar["preconditions"] and set(bar["preconditions"]) <= _ALLOWED_PRECONDITIONS
+    assert bar["criteria"], "criteria must be non-empty"
+    for crit in bar["criteria"]:
+        assert set(crit) <= _ALLOWED_CRITERION_KEYS
+        assert crit["id"] and crit["text"]
+        assert crit["class"] in {"machine", "operator"}
+        assert crit["evidence_kind"] in _ALLOWED_EVIDENCE
+        if crit["class"] == "operator":
+            assert crit.get("runbook_ref")
+    assert bar["negative_paths"], "negative_paths must be non-empty"
+    if bar["auth_surface_bearing"]:
+        required = {
+            "dependency_down_degradation",
+            "wrong_credential",
+            "anonymous_deep_link",
+            "post_logout_401",
+            "unauthorized_403_ui",
+        }
+    else:
+        required = {"dependency_down_degradation"}
+    assert required <= set(bar["negative_paths"])
+
+
+async def _schema_pass_bar_oracle(worktree: Path, bar_rel: str) -> ToolOutcome:
+    """A pass-bar validate oracle that runs the schema-faithful check against the
+    on-disk minted bar (stands in for the vendored guardkit binary in-test)."""
+    import yaml as _yaml
+
+    try:
+        data = _yaml.safe_load((worktree / bar_rel).read_text(encoding="utf-8"))
+        _assert_pass_bar_schema(data)
+    except AssertionError as exc:
+        return ToolOutcome(ok=False, detail=f"{bar_rel}: schema invalid — {exc}")
+    return ToolOutcome(ok=True)
+
+
+def _spec_result_with_seed(seed_yaml: str | None, slug: str = "version-endpoint") -> Any:
+    """The DEPLOYED 007 native reply for ``slug`` carrying ``seed_yaml`` as its
+    pass-bar seed (or NO seed when ``seed_yaml`` is None — the older-specialist
+    shape)."""
+    result = _spec_result_native(slug=slug)
+    seed_key = f"pass-bar-seed-{slug}.yaml"
+    if seed_yaml is None:
+        result.role_output.pop(seed_key, None)
+    else:
+        result.role_output[seed_key] = seed_yaml
+    return result
+
+
+def _plan_result_native_versions(feature_id: str) -> Any:
+    """The round-19 feature YAML: three version-endpoint tasks, NO qa bars (the
+    008 map never emits them — the gap forge fills)."""
+    feature_yaml = (
+        f"id: {feature_id}\n"
+        "tasks:\n"
+        "- id: TASK-VER-001\n"
+        "- id: TASK-VER-002\n"
+        "- id: TASK-VER-003\n"
+    )
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        role_output={
+            f".guardkit/features/{feature_id}.yaml": feature_yaml,
+            "tasks/backlog/version-endpoint/TASK-VER-001-create-version-endpoint.md": (
+                "# task\n"
+            ),
+            "validation.json": json.dumps(
+                {"accepted": True, "errors": [], "gates_run": ["feature_validate"]}
+            ),
+        },
+        reason=None,
+    )
+
+
+def _leg_sha(store: SqlitePlanningRunStore, stage_label: str) -> str | None:
+    for e in store.list_events(CID):
+        if e["stage_label"] == stage_label and e["status"] == "approved":
+            return (json.loads(e["details_json"]) or {}).get("sha")
+    return None
+
+
+@pytest.mark.asyncio
+async def test_round19_auth_flagged_seed_refuses_machine_registration(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(a) The LITERAL round-19 seed is auth_surface_bearing: true — forge
+    REFUSES machine registration LOUDLY (SPL-007 §A.2 + the seed's basis
+    verbatim); no bars minted, no BUILD_QUEUED, nothing beyond the plan."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    assert run["state"] != PlanningState.BUILD_QUEUED.value
+    # Not a single bar was validated or minted, and the build was never queued.
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    # The refusal names the clause and the seed's OWN basis verbatim.
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "SPL-007 §A.2" in reasons
+    assert "attended registration" in reasons
+    assert "requires human confirmation per SPL-007 CONTRACT §A.2" in reasons
+    # No qa/pass-bar file landed on the branch.
+    branch = f"planning/{CID}"
+    show = subprocess.run(
+        ["git", "show", f"{branch}:qa/pass-bar-TASK-VER-001.yaml"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show.returncode != 0
+    # The idempotency sentinel was NOT recorded (the leg refused, not completed).
+    assert not any(
+        e["stage_label"] == "qa-pass-bars" and e["status"] == "approved"
+        for e in store.list_events(CID)
+    )
+
+
+@pytest.mark.asyncio
+async def test_round19_authless_seed_mints_three_validated_bars(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(b) The same seed with the flag false → one bar per validated-plan task
+    (TASK-VER-001/002/003), each guardkit-qa-validate green, registered_at.sha ==
+    the PLAN commit sha, committed as ONE commit BEFORE the build trigger."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,  # the schema-faithful oracle
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+
+    # One bar per task, each run through guardkit's own qa validate (green).
+    assert h.ctx["counters"]["pass_bar_validate"] == 3
+    assert set(h.ctx["validated_bars"]) == {
+        "qa/pass-bar-TASK-VER-001.yaml",
+        "qa/pass-bar-TASK-VER-002.yaml",
+        "qa/pass-bar-TASK-VER-003.yaml",
+    }
+
+    branch = f"planning/{CID}"
+
+    def _show(path: str) -> str:
+        return subprocess.run(
+            ["git", "show", f"{branch}:{path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    plan_sha = _leg_sha(store, "feature-plan")
+    assert plan_sha
+    for task_id in ("TASK-VER-001", "TASK-VER-002", "TASK-VER-003"):
+        raw = _show(f"qa/pass-bar-{task_id}.yaml")
+        assert raw, f"{task_id} bar not on the branch"
+        bar = yaml.safe_load(raw)
+        # Mirrors the F2 registered shape exactly, and guardkit-schema-valid.
+        _assert_pass_bar_schema(bar)
+        assert bar["task_id"] == task_id
+        assert bar["auth_surface_bearing"] is False
+        # registered_at.sha is the PLAN commit sha (not the bars commit sha).
+        assert bar["registered_at"]["sha"] == plan_sha
+        # The seed's preconditions + criteria were carried verbatim.
+        assert bar["preconditions"] == [
+            "suite_green_vs_ledger",
+            "analyze_clean",
+            "build_artifact",
+        ]
+        assert [c["id"] for c in bar["criteria"]] == [
+            "version-endpoint-AC-001",
+            "version-endpoint-AC-002",
+        ]
+        # The seed's own auth basis is NOT leaked into the authless bar.
+        assert "auth_surface_basis" not in bar
+        assert "feature_slug" not in bar
+
+    # The bars landed as ONE commit BEFORE BUILD_QUEUED: the qa-pass-bars leg
+    # event precedes the build-queued event in the durable log, and the build
+    # trigger ran exactly once afterward.
+    labels = [
+        e["stage_label"]
+        for e in store.list_events(CID)
+        if e["status"] == "approved"
+        and e["stage_label"] in {"feature-plan", "qa-pass-bars", "build-queued"}
+    ]
+    assert labels == ["feature-plan", "qa-pass-bars", "build-queued"]
+    assert h.ctx["counters"]["build_trigger"] == 1
+    # The registered sha recorded on the leg event is the plan sha.
+    assert _leg_event_sha_field(store, "qa-pass-bars", "registered_at_sha") == plan_sha
+
+
+def _leg_event_sha_field(
+    store: SqlitePlanningRunStore, stage_label: str, field: str
+) -> str | None:
+    for e in store.list_events(CID):
+        if e["stage_label"] == stage_label and e["status"] == "approved":
+            return (json.loads(e["details_json"]) or {}).get(field)
+    return None
+
+
+@pytest.mark.asyncio
+async def test_round19_no_seed_fails_loudly_before_the_build(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(c) An older specialist that ships NO seed → loud, named failure at the
+    cheaper plan-commit layer (never a silent skip — the B2 gate would refuse the
+    build anyway); no bars, no BUILD_QUEUED."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(None),  # no pass-bar-seed-*.yaml
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "no pass-bar seed" in reasons
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+
+
+@pytest.mark.asyncio
+async def test_unwired_pass_bar_validate_fails_loudly(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Flag ON but the pass-bar validate collaborator missing = loud FAILED
+    (never a silent skip of the guardkit check)."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+    )
+    # Unwire ONLY the pass-bar oracle (the plan legs stay wired).
+    h.driver._deps.validate_pass_bar = None
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    assert run["state"] != PlanningState.BUILD_QUEUED.value
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "validate_pass_bar" in reasons

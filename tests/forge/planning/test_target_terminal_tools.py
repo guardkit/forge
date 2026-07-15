@@ -24,6 +24,7 @@ from forge.planning.target_terminal_tools import (
     discover_target_test_roots,
     make_normalize_feature_spec,
     make_validate_feature_plan,
+    make_validate_pass_bar,
     resolve_normalizer_command,
 )
 
@@ -140,6 +141,48 @@ async def test_validate_never_crashes_on_raise(tmp_path: Path) -> None:
 
     validate = make_validate_feature_plan(run_fn=_boom)
     outcome = await validate(tmp_path, "FEAT-BEEF")
+    assert not outcome.ok
+    assert "RuntimeError" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# qa validate pass-bar (B4 round-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_pass_bar_ok_on_success_exit_zero(tmp_path: Path) -> None:
+    run_fn, captured = _fake_run("success", 0)
+    validate = make_validate_pass_bar(run_fn=run_fn)
+    outcome = await validate(tmp_path, "qa/pass-bar-TASK-VER-001.yaml")
+    assert outcome.ok
+    # Rides the frozen seam as ``guardkit qa validate pass-bar <path>``.
+    assert captured["subcommand"] == "qa"
+    assert captured["args"] == [
+        "validate",
+        "pass-bar",
+        "qa/pass-bar-TASK-VER-001.yaml",
+    ]
+    assert captured["repo_path"] == tmp_path
+    assert captured["with_nats_streaming"] is False
+
+
+@pytest.mark.asyncio
+async def test_validate_pass_bar_red_on_schema_error(tmp_path: Path) -> None:
+    run_fn, _ = _fake_run("failed", 1, stderr="VALIDATION FAILED: missing task_id")
+    validate = make_validate_pass_bar(run_fn=run_fn)
+    outcome = await validate(tmp_path, "qa/pass-bar-X.yaml")
+    assert not outcome.ok
+    assert "missing task_id" in outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_validate_pass_bar_never_crashes_on_raise(tmp_path: Path) -> None:
+    async def _boom(**kwargs):
+        raise RuntimeError("guardkit blew up")
+
+    validate = make_validate_pass_bar(run_fn=_boom)
+    outcome = await validate(tmp_path, "qa/pass-bar-X.yaml")
     assert not outcome.ok
     assert "RuntimeError" in outcome.detail
 

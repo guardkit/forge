@@ -666,6 +666,7 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.target_terminal_tools import (
             make_normalize_feature_spec,
             make_validate_feature_plan,
+            make_validate_pass_bar,
         )
 
         clock_fn = clock if clock is not None else lambda: datetime.now(timezone.utc)
@@ -974,6 +975,9 @@ async def compose_planning_consumer_and_dispatch(
         # (``installer.core.*``) — the B4 run 4b3b0893 in-container gap.
         normalize_feature_spec = make_normalize_feature_spec(command_prefix=None)
         validate_feature_plan = make_validate_feature_plan()
+        # B4 round-19: the per-task pass bars forge mints from the 007 seed are
+        # validated by guardkit's OWN ``qa validate pass-bar`` before they land.
+        validate_pass_bar = make_validate_pass_bar()
 
         # -- approval side -------------------------------------------------
         approval_publisher = ApprovalPublisher(nats_client=nats_client)
@@ -1063,6 +1067,7 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_feature_plan=dispatch_feature_plan,
                 normalize_feature_spec=normalize_feature_spec,
                 validate_feature_plan=validate_feature_plan,
+                validate_pass_bar=validate_pass_bar,
                 # Lane B / Phase E1 (B3) — the Mode B build trigger.
                 dispatch_build_trigger=dispatch_build_trigger,
             )

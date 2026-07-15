@@ -49,6 +49,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
+import yaml
+
 from forge.gating.identity import parse_request_id
 from forge.lifecycle.identifiers import validate_feature_id
 from forge.pipeline.stage_taxonomy import StageClass
@@ -95,6 +97,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.planning.target_terminal_tools import (
         NormalizeFeatureSpecFn,
         ValidateFeaturePlanFn,
+        ValidatePassBarFn,
     )
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,34 @@ _FEATURE_PLAN_STAGE = "feature-plan"
 #: idempotent on a re-drive (crash between the build-queued publish and the
 #: BUILD_QUEUED transition never re-queues the build).
 _BUILD_QUEUED_STAGE = "build-queued"
+#: Durable stage label for the per-task QA pass-bar registration leg (B4 round-19,
+#: Rich-ratified). Its presence makes the leg idempotent on a re-drive: a crash
+#: between the bars commit and the BUILD_QUEUED transition never re-mints them.
+_QA_PASS_BARS_STAGE = "qa-pass-bars"
+
+#: The 007 native artifact-map key convention for the feature-grain quality-bar
+#: SEED (specialist-agent product_owner/modes/feature_spec.py; guardkit
+#: ``/feature-spec`` §"Quality-bar seed emission"): ``pass-bar-seed-*.yaml``. It
+#: is a tolerated extra in the spec map — NEVER a committed spec-triple file —
+#: that forge CAPTURES at the spec commit and specialises into per-task bars at
+#: plan-commit (the guardkit ``/feature-plan`` "consumes this seed" contract,
+#: done forge-side because the machine 008 leg does not emit the per-task bars).
+_PASS_BAR_SEED_PREFIX = "pass-bar-seed-"
+_PASS_BAR_SEED_SUFFIX = ".yaml"
+
+#: The negative path mandatory for EVERY pass bar, auth-surface-bearing or not
+#: (guardkit PB-14 / :data:`guardkit.qa.formats.pass_bar.UNIVERSAL_NEGATIVE_PATHS`).
+#: An authless per-task bar (``auth_surface_bearing: false`` by construction on
+#: this path) needs exactly this one to satisfy guardkit's own schema — the seed
+#: itself carries no ``negative_paths``, so forge supplies the universal minimum.
+_UNIVERSAL_NEGATIVE_PATH = "dependency_down_degradation"
+
+#: The pass-bar schema version forge mints (guardkit
+#: ``PassBar.CURRENT_FORMAT_VERSION``). Carried from the seed when present.
+_PASS_BAR_FORMAT_VERSION = "2.0"
+
+#: The contract reference an auth-surface-bearing seed refusal names verbatim.
+_SPL_007_AUTH_CLAUSE = "SPL-007 §A.2"
 
 #: Filesystem-safe feature slug allowlist (mirrors the identifier boundary):
 #: a specialist-supplied slug is only trusted when it matches, else forge falls
@@ -280,6 +311,12 @@ class PlanningDriverDeps:
     dispatch_feature_plan: DispatchFeaturePlanFn | None = None
     normalize_feature_spec: "NormalizeFeatureSpecFn | None" = None
     validate_feature_plan: "ValidateFeaturePlanFn | None" = None
+    # Lane B / Phase E1 (B4 round-19, Rich-ratified) — the guardkit ``qa validate
+    # pass-bar`` oracle. Optional / default None: with the flag OFF it is never
+    # consulted. With the flag ON the per-task QA pass-bar registration leg
+    # requires it; a missing collaborator fails the run LOUDLY (never a silent
+    # skip — the same posture as the other target-terminal oracles).
+    validate_pass_bar: "ValidatePassBarFn | None" = None
     # Lane B / Phase E1 (B3) — the build trigger. Optional / default None: with
     # the target-terminal flag OFF it is never consulted; with the flag ON it is
     # required and a missing collaborator fails the run LOUDLY (never silent).
@@ -409,9 +446,15 @@ class PlanningRunDriver:
                 continue  # re-read: now FEATURE_PLAN
             if state is PlanningState.FEATURE_PLAN:
                 # B2: dispatch 008 + write + validate the plan tree (idempotent
-                # on a re-drive). B3: on validate green, queue the feature onto
-                # forge's own Mode B dispatcher and advance to BUILD_QUEUED.
+                # on a re-drive). Then (B4 round-19): fan the captured 007 seed
+                # out into per-task ``qa/pass-bar-<TASK-ID>.yaml`` bars and commit
+                # them BEFORE the build trigger — the WS2 B2 precondition demands
+                # the bars be registered before implementation. B3: on validate
+                # green, queue the feature onto forge's own Mode B dispatcher and
+                # advance to BUILD_QUEUED.
                 if not await self._feature_plan_leg(row, correlation_id):
+                    return
+                if not await self._register_pass_bars_leg(row, correlation_id):
                     return
                 if not await self._build_trigger_leg(row, correlation_id):
                     return
@@ -1164,6 +1207,13 @@ class PlanningRunDriver:
                 f"spec write / normalizer failed: {gitres.stderr}",
             )
 
+        # CAPTURE the 007 feature-grain pass-bar SEED (a tolerated extra in the
+        # native map, NEVER a committed spec-triple file) and persist it on the
+        # durable feature-spec event so it survives to plan-commit — where it is
+        # specialised into per-task bars (B4 round-19). ``None`` when this reply
+        # shipped no seed (an older specialist); the plan-commit leg fails loudly
+        # on that rather than silently skipping the bars the B2 gate demands.
+        pass_bar_seed = self._capture_pass_bar_seed(role_output)
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_SPEC_STAGE,
@@ -1177,14 +1227,17 @@ class PlanningRunDriver:
                     "repo_path": repo_path,
                     "branch": branch,
                     "sha": gitres.sha,
+                    "pass_bar_seed": pass_bar_seed,
                 }
             ),
         )
         logger.info(
-            "planning driver: run %s feature-spec committed (slug=%s, %d files)",
+            "planning driver: run %s feature-spec committed (slug=%s, %d files, "
+            "pass-bar seed %s)",
             correlation_id,
             slug,
             len(files),
+            "captured" if pass_bar_seed is not None else "ABSENT",
         )
         return self._advance_after_spec(correlation_id)
 
@@ -1519,6 +1572,226 @@ class PlanningRunDriver:
             return False
         return True
 
+    async def _register_pass_bars_leg(self, row: Any, correlation_id: str) -> bool:
+        """Register per-task QA pass bars from the 007 seed (B4 round-19).
+
+        Runs at plan-commit — AFTER ``validate_feature_plan`` passed and the plan
+        tree committed, BEFORE the B3 build trigger — because the WS2 B2
+        precondition demands a ``qa/pass-bar-<TASK-ID>.yaml`` registered for
+        every task BEFORE implementation, and the machine plan leg (008) does not
+        emit them. Forge fans the captured feature-grain seed out per task,
+        mirroring the Factory-2 registered shape, and commits the bars as ONE
+        commit so tap-2's artifacts include them.
+
+        Auth gate (Rich's §5 call): a seed flagged ``auth_surface_bearing`` is
+        REFUSED loudly here — pass bars for an auth surface need ATTENDED
+        registration per SPL-007 §A.2 — and the run fails without a build queued.
+
+        Idempotent: a durable ``qa-pass-bars`` event short-circuits a re-drive
+        (a crash between the bars commit and BUILD_QUEUED never re-mints them).
+        Returns True to keep driving (the caller proceeds to the B3 trigger),
+        False on a loud terminal failure.
+        """
+        deps = self._deps
+        if self._has_leg_event(correlation_id, _QA_PASS_BARS_STAGE):
+            logger.info(
+                "planning driver: run %s pass bars already registered "
+                "(idempotent re-drive — proceeding to the B3 build trigger)",
+                correlation_id,
+            )
+            return True
+
+        if deps.validate_pass_bar is None:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                "target terminal ON but the pass-bar validate collaborator "
+                "(validate_pass_bar) is not wired",
+            )
+
+        # The seed was captured at the spec commit and persisted on the durable
+        # feature-spec event (it survives an idempotent re-drive where the spec
+        # leg never ran this drive).
+        spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
+        raw_seed = spec_details.get("pass_bar_seed")
+        if not raw_seed:
+            # (c) no seed shipped (older specialist). Fail LOUDLY at this cheaper
+            # layer — the WS2 B2 precondition would refuse the build anyway.
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                "the 007 reply shipped no pass-bar seed (pass-bar-seed-*.yaml); "
+                "cannot register the per-task QA pass bars the B2 precondition "
+                "demands — the specialist must emit the feature-grain seed",
+            )
+
+        try:
+            seed = yaml.safe_load(raw_seed)
+        except yaml.YAMLError as exc:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                f"the captured pass-bar seed is not parseable YAML: {exc}",
+            )
+        if not isinstance(seed, Mapping):
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                "the captured pass-bar seed is not a YAML mapping",
+            )
+
+        # AUTH GATE (SPL-007 §A.2, Rich-ratified): an auth-surface-bearing seed is
+        # REFUSED machine registration — pass bars need attended registration.
+        # Refuse LOUDLY, naming the clause + the seed's own basis verbatim;
+        # nothing beyond the already-committed plan lands, and no BUILD_QUEUED.
+        if bool(seed.get("auth_surface_bearing")):
+            basis = str(seed.get("auth_surface_basis") or "no basis supplied")
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                f"pass-bar seed is auth_surface_bearing — pass bars need "
+                f"attended registration per {_SPL_007_AUTH_CLAUSE}; refusing "
+                f"machine registration. Seed auth_surface_basis: {basis}",
+            )
+
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        feature_id = str(plan_details.get("feature_id") or "")
+        plan_sha = str(plan_details.get("sha") or "")
+        branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
+        plan_files = [str(f) for f in (plan_details.get("plan_files") or [])]
+        if not feature_id or not plan_sha:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                "no feature id / plan commit sha recorded on the feature-plan "
+                "leg — cannot register per-task pass bars",
+            )
+        resolved = await self._resolve_repo(
+            row, correlation_id, stage_label=_QA_PASS_BARS_STAGE
+        )
+        if resolved is None:
+            return False
+        _target_repo, repo_path = resolved
+
+        # The per-task bar ids ARE the validated plan's task ids — the SAME
+        # source ``guardkit feature validate`` reads: the committed feature YAML.
+        task_ids = await self._read_plan_task_ids(
+            repo_path, branch, feature_id, plan_files
+        )
+        if task_ids is None:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                f"could not read the validated plan's feature YAML for "
+                f"{feature_id} off branch {branch} to enumerate task ids "
+                f"(plan_files={sorted(plan_files)})",
+            )
+
+        run_date = deps.clock().date().isoformat()
+        if not task_ids:
+            # A validated plan with zero tasks: no per-task bars to register.
+            # Record the leg complete (idempotent) and advance — B2 is vacuous.
+            logger.info(
+                "planning driver: run %s plan lists no tasks; no per-task pass "
+                "bars to register",
+                correlation_id,
+            )
+            deps.store._record_event(
+                correlation_id=correlation_id,
+                stage_label=_QA_PASS_BARS_STAGE,
+                status="approved",
+                actor_identity="planning-driver",
+                details_json=json.dumps(
+                    {
+                        "feature_id": feature_id,
+                        "bar_files": [],
+                        "registered_at_sha": plan_sha,
+                        "branch": branch,
+                    }
+                ),
+            )
+            return True
+
+        # Fan the seed out — one bar per task, registered_at.sha = the PLAN
+        # commit sha, date = the run date from the driver's clock,
+        # auth_surface_bearing false by construction on this (refused-if-true) path.
+        bars: dict[str, str] = {
+            f"qa/pass-bar-{task_id}.yaml": self._mint_pass_bar_yaml(
+                task_id=task_id, seed=seed, sha=plan_sha, date=run_date
+            )
+            for task_id in task_ids
+        }
+
+        validate = deps.validate_pass_bar
+
+        async def _pre_commit(worktree: Path) -> PreCommitResult:
+            # Run guardkit's OWN ``qa validate pass-bar`` on every minted bar so a
+            # malformed forge-minted bar fails the leg before it lands (never a
+            # bar the B2 gate would later reject).
+            for rel in sorted(bars):
+                outcome = await validate(worktree, rel)
+                if not outcome.ok:
+                    return PreCommitResult(
+                        ok=False, detail=f"{rel}: {outcome.detail}"
+                    )
+            return PreCommitResult(ok=True)
+
+        try:
+            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+                repo_path=repo_path,
+                branch=branch,
+                files=bars,
+                message=(
+                    f"planning: register {len(bars)} per-task QA pass bar(s) for "
+                    f"{correlation_id} ({feature_id}, Lane B seed fan-out)"
+                ),
+                pre_commit=_pre_commit,
+            )
+        except Exception as exc:  # noqa: BLE001 — write boundary
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                f"pass-bar write raised {type(exc).__name__}: {exc}",
+            )
+        if gitres.status == "failed":
+            return await self._fail_leg(
+                correlation_id,
+                _QA_PASS_BARS_STAGE,
+                f"pass-bar write / qa validate failed: {gitres.stderr}",
+            )
+
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_QA_PASS_BARS_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "feature_id": feature_id,
+                    "bar_files": sorted(bars),
+                    "registered_at_sha": plan_sha,
+                    "sha": gitres.sha,
+                    "branch": branch,
+                }
+            ),
+        )
+        await self._notify(
+            correlation_id,
+            f"Planning run {correlation_id}: registered {len(bars)} per-task QA "
+            f"pass bar(s) for {feature_id} on branch {branch} (from the 007 "
+            "seed) before queueing the build.",
+            level="info",
+        )
+        logger.info(
+            "planning driver: run %s registered %d per-task pass bar(s) "
+            "(feature_id=%s, plan_sha=%s)",
+            correlation_id,
+            len(bars),
+            feature_id,
+            plan_sha,
+        )
+        return True
+
     # -- target-terminal helpers ---------------------------------------- #
 
     def _run_data(self, row: Any, correlation_id: str) -> dict[str, Any]:
@@ -1834,6 +2107,108 @@ class PlanningRunDriver:
                     repo_path=repo_path, branch=branch, file_path=rel
                 )
         return feature, summary, assumptions
+
+    @staticmethod
+    def _capture_pass_bar_seed(role_output: Mapping[str, Any]) -> str | None:
+        """The 007 feature-grain pass-bar seed content, or ``None`` (B4 round-19).
+
+        Finds the ``pass-bar-seed-*.yaml`` extra in the 007 native artifact map
+        (a tolerated extra, never a committed spec-triple file) and returns its
+        raw content verbatim so the plan-commit leg can specialise it into
+        per-task bars. ``None`` when the reply shipped no seed (an older
+        specialist — the plan-commit leg then fails loudly rather than silently
+        skipping the bars the B2 precondition demands).
+        """
+        for name, content in role_output.items():
+            key = str(name)
+            if key.startswith(_PASS_BAR_SEED_PREFIX) and key.endswith(
+                _PASS_BAR_SEED_SUFFIX
+            ):
+                return str(content)
+        return None
+
+    async def _read_plan_task_ids(
+        self, repo_path: str, branch: str, feature_id: str, plan_files: Any
+    ) -> list[str] | None:
+        """Enumerate the validated plan's task ids from its committed feature YAML.
+
+        The feature YAML (``.guardkit/features/<feature_id>.yaml``) is the SAME
+        source ``guardkit feature validate`` reads; forge reads it back off the
+        planning branch (not from memory, so this is correct on an idempotent
+        re-drive) and returns ``[task.id for task in tasks]`` in plan order.
+        Returns ``None`` when the feature YAML cannot be located among the
+        committed plan files, read, or parsed — a loud-fail signal for the caller.
+        """
+        # Locate the feature YAML among the committed plan files: the entry whose
+        # path ends with ``<feature_id>.yaml``, preferring the canonical
+        # ``.guardkit/features/`` location when several match.
+        candidates = [
+            str(f) for f in plan_files if str(f).endswith(f"{feature_id}.yaml")
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: (".guardkit/features/" not in p, p))
+        feature_rel = candidates[0]
+
+        raw = await self._deps.git_runner.read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=feature_rel
+        )
+        if not raw:
+            return None
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            return None
+        if not isinstance(data, Mapping):
+            return None
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list):
+            # A feature YAML with no ``tasks`` key (or a null/absent list) has no
+            # tasks to register bars for — an empty enumeration, not a read error.
+            return []
+        task_ids: list[str] = []
+        for task in tasks:
+            if isinstance(task, Mapping):
+                tid = task.get("id")
+                if tid:
+                    task_ids.append(str(tid))
+        return task_ids
+
+    @staticmethod
+    def _mint_pass_bar_yaml(
+        *, task_id: str, seed: Mapping[str, Any], sha: str, date: str
+    ) -> str:
+        """Mint one ``qa/pass-bar-<TASK-ID>.yaml`` from the seed (F2 shape).
+
+        Mirrors the Factory-2 registered bar shape EXACTLY (format_version 2.0,
+        task_id, registered_at{sha,date}, auth_surface_bearing, preconditions,
+        criteria, negative_paths) so guardkit's own ``qa validate pass-bar``
+        accepts it. ``registered_at.sha`` is the PLAN commit sha; the seed's
+        ``preconditions``/``criteria`` are carried verbatim; ``auth_surface_bearing``
+        is false by construction (an auth-bearing seed never reaches this path);
+        ``negative_paths`` supplies the universal minimum the seed omits.
+        """
+        negative_paths = sorted(
+            {str(p) for p in (seed.get("negative_paths") or [])}
+            | {_UNIVERSAL_NEGATIVE_PATH}
+        )
+        bar: dict[str, Any] = {
+            "format_version": str(
+                seed.get("format_version") or _PASS_BAR_FORMAT_VERSION
+            ),
+            "task_id": task_id,
+            "registered_at": {"sha": sha, "date": date},
+            "auth_surface_bearing": False,
+            "preconditions": list(seed.get("preconditions") or []),
+            "criteria": [
+                dict(c) if isinstance(c, Mapping) else c
+                for c in (seed.get("criteria") or [])
+            ],
+            "negative_paths": negative_paths,
+        }
+        return yaml.safe_dump(
+            bar, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
 
     @staticmethod
     def _build_target_repo_descriptor(

@@ -53,9 +53,11 @@ __all__ = [
     "TargetTestRootsUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
+    "ValidatePassBarFn",
     "discover_target_test_roots",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
+    "make_validate_pass_bar",
     "resolve_normalizer_command",
 ]
 
@@ -272,6 +274,12 @@ NormalizeFeatureSpecFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 #: ``guardkit feature validate <feature_id>`` against the worktree.
 ValidateFeaturePlanFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 
+#: ``async (worktree_path, bar_rel_path) -> ToolOutcome`` — run
+#: ``guardkit qa validate pass-bar <bar_rel_path>`` against the worktree. The
+#: forge-minted per-task QA pass bar (registered from the 007 seed at
+#: plan-commit) must pass guardkit's OWN F1 schema before it is committed.
+ValidatePassBarFn = Callable[[Path, str], Awaitable[ToolOutcome]]
+
 
 async def _default_normalizer_subprocess(
     *, command: Sequence[str], cwd: str, timeout: int
@@ -426,6 +434,64 @@ def make_validate_feature_plan(
             detail=(
                 f"guardkit feature validate {status} (exit {exit_code}) for "
                 f"{feature_id}: {(stderr or tail).strip()[:500]}"
+            ),
+        )
+
+    return _validate
+
+
+def make_validate_pass_bar(
+    *,
+    read_allowlist: Sequence[Path] | None = None,
+    timeout_seconds: int = _DEFAULT_ORACLE_TIMEOUT_SECONDS,
+    run_fn: Callable[..., Awaitable[object]] = guardkit_run,
+) -> ValidatePassBarFn:
+    """Build the production ``guardkit qa validate pass-bar`` oracle (plan leg).
+
+    Rides the SAME frozen :func:`forge.adapters.guardkit.run.run` seam
+    ``make_validate_feature_plan`` uses (the vendored guardkit BINARY the image
+    carries — the defect-#7 dual-candidate resolution lives inside that binary,
+    not here). ``ok`` iff ``guardkit qa validate pass-bar <path>`` exits 0 (the
+    F1 schema — :mod:`guardkit.qa.formats.pass_bar` — accepts the instance).
+
+    The forge-minted per-task bars (fanned out from the 007 seed at plan-commit)
+    are validated by guardkit's OWN checker BEFORE they land on the branch, so a
+    malformed forge-minted bar fails the leg loudly rather than reaching the B2
+    precondition gate with a bar guardkit would later reject.
+    """
+
+    async def _validate(worktree_path: Path, bar_rel_path: str) -> ToolOutcome:
+        allowlist = list(read_allowlist or [worktree_path])
+        try:
+            result = await guardkit_run_shim(
+                run_fn,
+                subcommand="qa",
+                args=["validate", "pass-bar", bar_rel_path],
+                repo_path=worktree_path,
+                read_allowlist=allowlist,
+                timeout_seconds=timeout_seconds,
+                with_nats_streaming=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — oracle boundary
+            logger.exception("validate_pass_bar invocation raised")
+            return ToolOutcome(
+                ok=False,
+                detail=f"qa validate pass-bar raised {type(exc).__name__}: {exc}",
+            )
+        status = getattr(result, "status", "failed")
+        exit_code = getattr(result, "exit_code", -1)
+        if status == "success" and exit_code == 0:
+            logger.info("validate_pass_bar: %s valid", bar_rel_path)
+            return ToolOutcome(ok=True, detail="")
+        stderr = getattr(result, "stderr", None) or ""
+        tail = getattr(result, "stdout_tail", "") or ""
+        return ToolOutcome(
+            ok=False,
+            detail=(
+                f"guardkit qa validate pass-bar {status} (exit {exit_code}) for "
+                f"{bar_rel_path}: {(stderr or tail).strip()[:500]}"
             ),
         )
 
