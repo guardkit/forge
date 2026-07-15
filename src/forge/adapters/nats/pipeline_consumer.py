@@ -450,14 +450,34 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         return
 
     # --- 2. Originator allowlist -----------------------------------------
+    # The effective originator identity is the ``originating_adapter`` when a
+    # human adapter is present (the CLI / jarvis path), else the
+    # ``triggered_by`` layer (a forge-internal MACHINE dispatch — the Lane B
+    # planning target-terminal, which is contract-legal with
+    # triggered_by="forge-internal" and no adapter, per nats-core's own
+    # BuildQueuedPayload validator). Membership is still governed by
+    # ``forge_config.pipeline.approved_originators`` (config-overridable) —
+    # the bus is credentialed, so this is a policy filter, not cryptography.
+    #
+    # Adapter-takes-precedence (the stricter reading): when an adapter IS
+    # present it alone is checked, so an unapproved adapter is rejected even
+    # if ``triggered_by`` happens to name an approved layer. jarvis semantics
+    # are unchanged — the payload validator forces an adapter whenever
+    # triggered_by=='jarvis', so a jarvis build never falls through to the
+    # triggered_by branch here.
     approved = deps.forge_config.pipeline.approved_originators
-    originator = payload.originating_adapter
-    if originator is None or originator not in approved:
+    originator = (
+        payload.originating_adapter
+        if payload.originating_adapter is not None
+        else payload.triggered_by
+    )
+    if originator not in approved:
         logger.warning(
-            "pipeline_consumer: originating_adapter=%r not in approved list "
-            "for feature_id=%s; rejecting",
-            payload.originating_adapter,
+            "pipeline_consumer: originator not in approved list for "
+            "feature_id=%s (originating_adapter=%r triggered_by=%r); rejecting",
             payload.feature_id,
+            payload.originating_adapter,
+            payload.triggered_by,
         )
         await msg.ack()
         await _safe_publish_failure(

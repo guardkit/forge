@@ -849,7 +849,10 @@ class TestBuildTriggerWiring:
         import json
 
         broker = InMemoryNats()
-        config = _make_planning_config(target_terminal={"enabled": True})
+        config = _make_planning_config(
+            target_terminal={"enabled": True},
+            target_repo_paths={"guardkit/api_test": "/srv/checkouts/api_test"},
+        )
 
         result = await compose_planning_consumer_and_dispatch(
             db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
@@ -885,8 +888,14 @@ class TestBuildTriggerWiring:
             assert payload["feature_id"] == "FEAT-B3AA"
             assert payload["repo"] == "guardkit/api_test"
             assert payload["branch"] == "planning/corr-b3"
-            # The feature-level YAML (named after the minted id) was selected.
-            assert payload["feature_yaml_path"] == "features/stats/FEAT-B3AA.yaml"
+            # The feature-level YAML (named after the minted id) was selected
+            # and resolved to an ABSOLUTE path against the configured checkout
+            # for guardkit/api_test (B4 round-14 second-fault fix) so the Mode
+            # B intake's path allowlist validates it meaningfully.
+            assert (
+                payload["feature_yaml_path"]
+                == "/srv/checkouts/api_test/features/stats/FEAT-B3AA.yaml"
+            )
             # Forge-internal machine dispatch (constrained wire literals).
             assert payload["triggered_by"] == "forge-internal"
             assert payload["correlation_id"] == "corr-b3"

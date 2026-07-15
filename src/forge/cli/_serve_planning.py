@@ -526,6 +526,43 @@ def _select_feature_yaml(plan_files: list[str], feature_id: str) -> str | None:
     return yamls[0]
 
 
+def _resolve_feature_yaml_path(
+    feature_yaml: str, target_repo: str, target_repo_paths: dict[str, str]
+) -> str:
+    """Resolve the repo-relative plan YAML to an ABSOLUTE ``feature_yaml_path``.
+
+    B4 round-14 second-fault fix. The Mode B build intake's path allowlist
+    (:func:`forge.adapters.nats.pipeline_consumer._path_inside_allowlist`)
+    calls :meth:`pathlib.Path.resolve` on the candidate; a repo-relative
+    value would resolve against the daemon process CWD — semantically wrong
+    and pass/fail by accident.
+
+    The dispatch side does NOT consume ``feature_yaml_path`` to locate the
+    spec — the autobuild executor
+    (:func:`forge.subagents.autobuild_runner._resolve_repo_path`) derives the
+    checkout from ``payload.repo`` (``<FORGE_REPO_BASE>/<basename>``) and runs
+    ``guardkit autobuild feature <feature_id>`` there. So the ONLY meaningful
+    consumer of ``feature_yaml_path`` is the allowlist gate, and the
+    live-proven CLI trigger (``forge queue``) sends an operator-supplied
+    ABSOLUTE path. We mirror that: join the repo-relative plan path onto the
+    configured local checkout root for ``target_repo``
+    (``planning.target_repo_paths`` — the map that already declares each
+    repo's absolute working copy for handoff-to-local-build), so the gate
+    validates the feature YAML lives inside an authorised checkout.
+
+    When the repo is unmapped or the path is already absolute the value is
+    returned unchanged — an unmapped repo then fails the allowlist gate
+    loudly (the correct outcome), never resolving against the daemon CWD by
+    accident.
+    """
+    if Path(feature_yaml).is_absolute():
+        return feature_yaml
+    checkout = target_repo_paths.get(target_repo)
+    if not checkout:
+        return feature_yaml
+    return str(Path(checkout) / feature_yaml)
+
+
 def _latest_po_output(store: SqlitePlanningRunStore, correlation_id: str) -> dict:
     """Most recent recorded PO output for a run (empty when none)."""
     latest: dict[str, Any] = {}
@@ -884,6 +921,14 @@ async def compose_planning_consumer_and_dispatch(
                     reason="no feature YAML in the committed plan tree",
                 )
             now = clock_fn()
+            # B4 round-14: emit an ABSOLUTE feature_yaml_path (resolved
+            # against the configured local checkout for ``target_repo``) so
+            # the Mode B intake's path allowlist validates it meaningfully —
+            # a repo-relative value resolves against the daemon CWD by
+            # accident. See :func:`_resolve_feature_yaml_path`.
+            feature_yaml_path = _resolve_feature_yaml_path(
+                feature_yaml, target_repo, config.planning.target_repo_paths
+            )
             # ``triggered_by`` / ``originating_adapter`` are constrained wire
             # literals — the target-terminal build trigger is a forge-internal
             # machine dispatch (no user-facing adapter), so it uses
@@ -892,7 +937,7 @@ async def compose_planning_consumer_and_dispatch(
                 feature_id=feature_id,
                 repo=target_repo,
                 branch=branch,
-                feature_yaml_path=feature_yaml,
+                feature_yaml_path=feature_yaml_path,
                 triggered_by="forge-internal",
                 originating_user=originating_user,
                 correlation_id=correlation_id,

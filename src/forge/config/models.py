@@ -62,6 +62,15 @@ DEFAULT_BUILD_QUEUE_SUBJECT = "pipeline.build-queued.>"
 
 #: Default originator allowlist accepted by ``pipeline_consumer``. Anything
 #: not in this list is rejected before the pipeline state machine sees it.
+#:
+#: The six human adapters plus ``forge-internal``: the last is the
+#: ``triggered_by`` layer the Lane B planning target-terminal uses for a
+#: machine-made build dispatch (no user-facing adapter). It is the effective
+#: originator identity when ``originating_adapter is None`` (see
+#: ``pipeline_consumer.handle_message`` gate 2). Deliberately NOT widened to
+#: ``cli`` (the CLI already carries ``cli-wrapper``) or ``notification-adapter``
+#: (nothing live uses it) — the list widens by exactly the one literal the
+#: B4 round-14 machine-dispatch defect needs.
 DEFAULT_APPROVED_ORIGINATORS: tuple[str, ...] = (
     "terminal",
     "voice-reachy",
@@ -69,6 +78,7 @@ DEFAULT_APPROVED_ORIGINATORS: tuple[str, ...] = (
     "slack",
     "dashboard",
     "cli-wrapper",
+    "forge-internal",
 )
 
 #: ASSUM-001 (CGCP / FEAT-FORGE-004) — initial wait time published on an
