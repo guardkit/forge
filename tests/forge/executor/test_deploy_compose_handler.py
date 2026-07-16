@@ -18,6 +18,24 @@ from forge.executor.shell_steps import deploy_compose
 from forge.persistence.repositories.runbook_models import Step, StepStatus
 
 
+def _env_probe_script(tmp_path: Path) -> Path:
+    """Stub deploy script that prints the O-32 revert-contract env vars.
+
+    Prints ``<unset>`` markers (bash ``${VAR-<unset>}``) so absence is
+    observable, distinguishing "not set" from "set to empty".
+    """
+    script = tmp_path / "deploy.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "ENV_FILE=${ENV_FILE-<unset>}"\n'
+        'echo "REVERT=${REVERT-<unset>}"\n'
+        'echo "ROLLBACK_IMAGE_REF=${ROLLBACK_IMAGE_REF-<unset>}"\n'
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
 class TestDeployComposeHandler:
     """Test suite for deploy_compose handler (AC-001 through AC-006)."""
 
@@ -296,6 +314,189 @@ exit 0
         # Should fail with timeout exit code (124)
         assert outcome.status == StepStatus.failed
         assert outcome.result["exit_code"] == 124
+
+    def test_normal_params_thread_no_revert_env(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """O-32: a normal deploy step exposes neither REVERT nor ROLLBACK_IMAGE_REF."""
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert "REVERT=<unset>" in outcome.result["captured_output"]
+        assert "ROLLBACK_IMAGE_REF=<unset>" in outcome.result["captured_output"]
+
+    def test_revert_params_thread_env_vars_to_script(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """O-32 fix: revert step params reach the script as REVERT/ROLLBACK_IMAGE_REF.
+
+        This is the C4-prep defect: build_revert_runbook renders revert=True +
+        rollback_image_ref in step.params, but the handler dropped them — a
+        revert would have re-run the deploy script in NORMAL mode, re-deploying
+        the broken build it was supposed to roll back.
+        """
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+                "revert": True,
+                "rollback_image_ref": "api-test:rollback-20260713",
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert "REVERT=1" in outcome.result["captured_output"]
+        assert (
+            "ROLLBACK_IMAGE_REF=api-test:rollback-20260713"
+            in outcome.result["captured_output"]
+        )
+
+    def test_revert_false_threads_no_revert_env(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """O-32: revert=False is not truthy — REVERT must not be set."""
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+                "revert": False,
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert "REVERT=<unset>" in outcome.result["captured_output"]
+        assert "ROLLBACK_IMAGE_REF=<unset>" in outcome.result["captured_output"]
+
+    def test_rollback_ref_without_revert_still_threaded(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """O-32: rollback_image_ref passes through independently of revert.
+
+        The runbook always pairs them, but the passthrough must not invent
+        coupling.
+        """
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+                "rollback_image_ref": "api-test:rollback-20260713",
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert "REVERT=<unset>" in outcome.result["captured_output"]
+        assert (
+            "ROLLBACK_IMAGE_REF=api-test:rollback-20260713"
+            in outcome.result["captured_output"]
+        )
+
+    @pytest.mark.parametrize("bad_ref", [123, "", None, {"tag": "x"}])
+    def test_non_string_or_empty_rollback_ref_is_omitted(
+        self, tmp_path: Path, monkeypatch, bad_ref
+    ) -> None:
+        """O-32: a non-string/empty rollback ref is never silently stringified.
+
+        It is omitted; the vetted script's own revert-without-ref refusal
+        fails loud.
+        """
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": None,
+                "revert": True,
+                "rollback_image_ref": bad_ref,
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        assert "REVERT=1" in outcome.result["captured_output"]
+        assert "ROLLBACK_IMAGE_REF=<unset>" in outcome.result["captured_output"]
+
+    def test_revert_env_coexists_with_env_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """O-32: revert env vars merge AFTER (and alongside) ENV_FILE."""
+        monkeypatch.delenv("REVERT", raising=False)
+        monkeypatch.delenv("ROLLBACK_IMAGE_REF", raising=False)
+        env_file = tmp_path / ".env"
+        env_file.write_text("SECRET=value\n")
+        script = _env_probe_script(tmp_path)
+
+        step = Step(
+            step_type="deploy_compose",
+            params={
+                "cwd": str(tmp_path),
+                "script": str(script),
+                "env_file": str(env_file),
+                "revert": True,
+                "rollback_image_ref": "api-test:rollback-20260713",
+            },
+            status=StepStatus.pending,
+            sequence_index=0,
+        )
+
+        outcome = deploy_compose(step)
+
+        assert outcome.status == StepStatus.passed
+        out = outcome.result["captured_output"]
+        assert f"ENV_FILE={env_file}" in out
+        assert "REVERT=1" in out
+        assert "ROLLBACK_IMAGE_REF=api-test:rollback-20260713" in out
 
     def test_output_cap_override_honored(self, tmp_path: Path) -> None:
         """Verify custom output_cap param is passed through to _run_script_step."""

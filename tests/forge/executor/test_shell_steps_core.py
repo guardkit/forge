@@ -52,6 +52,51 @@ class TestScriptExecution:
         assert exit_code == 0
         assert str(env_file) in output
 
+    def test_extra_env_merged_into_subprocess_environment(self, tmp_path, monkeypatch):
+        """extra_env entries are exposed to the script alongside ENV_FILE (O-32).
+
+        The merge happens AFTER the ENV_FILE line, so extra_env wins on a key
+        collision — pinned here by overriding ENV_FILE itself.
+        """
+        from forge.executor.shell_steps import _run_script_step
+
+        monkeypatch.delenv("REVERT", raising=False)
+        env_file = tmp_path / "test.env"
+        env_file.write_text("SECRET_KEY=super_secret\n")
+
+        script = tmp_path / "check_env.sh"
+        script.write_text(
+            '#!/usr/bin/env bash\necho "ENV_FILE=$ENV_FILE"\necho "REVERT=${REVERT-<unset>}"\n'
+        )
+        script.chmod(0o755)
+
+        exit_code, output = _run_script_step(
+            cwd=str(tmp_path),
+            script=str(script),
+            env_file=str(env_file),
+            extra_env={"REVERT": "1", "ENV_FILE": "/overridden/by/extra_env"},
+        )
+
+        assert exit_code == 0
+        assert "REVERT=1" in output
+        assert "ENV_FILE=/overridden/by/extra_env" in output
+
+    def test_extra_env_none_leaves_environment_untouched(self, tmp_path, monkeypatch):
+        """extra_env=None (the default) adds nothing — never-raises posture unchanged."""
+        from forge.executor.shell_steps import _run_script_step
+
+        monkeypatch.delenv("REVERT", raising=False)
+        script = tmp_path / "check_env.sh"
+        script.write_text('#!/usr/bin/env bash\necho "REVERT=${REVERT-<unset>}"\n')
+        script.chmod(0o755)
+
+        exit_code, output = _run_script_step(
+            cwd=str(tmp_path), script=str(script), env_file=None, extra_env=None
+        )
+
+        assert exit_code == 0
+        assert "REVERT=<unset>" in output
+
     def test_no_output_returns_clean_exit(self, tmp_path):
         """A script producing no output returns (0, "") for the clean-exit path.
 

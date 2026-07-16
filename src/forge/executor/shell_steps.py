@@ -47,6 +47,7 @@ def _run_script_step(
     env_file: str | None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     output_cap: int = DEFAULT_OUTPUT_CAP_BYTES,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
 
@@ -70,6 +71,10 @@ def _run_script_step(
             environment variable. No existence check is performed (ASSUM-013).
         timeout: Maximum execution time in seconds. Defaults to 600 (10 min).
         output_cap: Maximum output size in bytes. Defaults to 1 MiB.
+        extra_env: Optional additional environment variables merged into the
+            subprocess environment AFTER ENV_FILE (so entries here win on a
+            key collision). Handlers use this to thread step-level signals
+            (e.g. the O-32 revert contract) to the vetted script.
 
     Returns:
         A tuple of (exit_code, output):
@@ -85,6 +90,8 @@ def _run_script_step(
     env = os.environ.copy()
     if env_file is not None:
         env["ENV_FILE"] = env_file
+    if extra_env:
+        env.update(extra_env)
 
     # Resolve a bare script name (no directory component) relative to cwd.
     # subprocess resolves an executable containing a path separator relative
@@ -160,6 +167,21 @@ def deploy_compose(step: Step) -> StepOutcome:
     from step.params, delegates to the shared core (_run_script_step), and maps
     the exit status to a verdict: 0 → passed, non-zero → failed.
 
+    Vetted-script revert contract (O-32, C4-prep): revert runbooks
+    (:func:`forge.deploy.runbook_builder.build_revert_runbook`) carry
+    ``revert: True`` and ``rollback_image_ref: <tag>`` in step.params. This
+    handler threads them to the script as environment variables, following the
+    unprefixed ENV_FILE naming precedent:
+
+    - ``REVERT=1`` — set only when ``params["revert"]`` is truthy.
+    - ``ROLLBACK_IMAGE_REF=<tag>`` — set only when ``params["rollback_image_ref"]``
+      is a non-empty string. A non-string or empty value is never silently
+      stringified — it is omitted, and the vetted script's own
+      revert-without-ref refusal fails loud.
+
+    Without this threading a revert step would re-run the deploy script in
+    NORMAL mode, re-deploying the very build it was meant to roll back.
+
     Args:
         step: The Step instance containing params and metadata.
 
@@ -179,6 +201,15 @@ def deploy_compose(step: Step) -> StepOutcome:
     timeout = step.params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
     output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
 
+    # O-32 revert contract: thread the revert signal to the vetted script.
+    revert = bool(step.params.get("revert"))
+    rollback_image_ref = step.params.get("rollback_image_ref")
+    extra_env: dict[str, str] = {}
+    if revert:
+        extra_env["REVERT"] = "1"
+    if isinstance(rollback_image_ref, str) and rollback_image_ref:
+        extra_env["ROLLBACK_IMAGE_REF"] = rollback_image_ref
+
     # Delegate to shared core
     exit_code, captured_output = _run_script_step(
         cwd=cwd,
@@ -186,6 +217,7 @@ def deploy_compose(step: Step) -> StepOutcome:
         env_file=env_file,
         timeout=timeout,
         output_cap=output_cap,
+        extra_env=extra_env or None,
     )
 
     # Map exit status to verdict

@@ -464,6 +464,15 @@ class TestRevertOnGateFail:
             step.result.payload["would_deploy_compose"]["rollback_image_ref"]
             == "study-tutor:rollback-20260713"
         )
+        # [O-32 revert-signal drop, C4-prep] The revert runbook's step params
+        # reach the executor payload intact — would_deploy_compose is
+        # dict(step.params) as seen by the handler at execution time, so BOTH
+        # revert signals are present for the live handler to thread as
+        # REVERT/ROLLBACK_IMAGE_REF env vars (forge.executor.shell_steps).
+        assert step.result.payload["would_deploy_compose"]["revert"] is True
+        # And the persisted step params carry the same signals verbatim.
+        assert step.params["revert"] is True
+        assert step.params["rollback_image_ref"] == "study-tutor:rollback-20260713"
         # An honest F7 record with the reverted status.
         body = Path(result.deploy_record_ref).read_text(encoding="utf-8")
         assert "**status**: reverted" in body
