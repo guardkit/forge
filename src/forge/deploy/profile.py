@@ -38,6 +38,11 @@ import yaml
 #: VALUE — refused (secrets are register REFS ONLY, WS2-B8 guardrail).
 _REF_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+#: An environment-variable NAME for the optional ``live_gate.env`` map: strict
+#: UPPER_SNAKE_CASE (leading letter, then upper/digits/underscore). Values are
+#: non-secret strings only (base URLs and the like); secrets stay register REFS.
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
 __all__ = [
     "DeployProfile",
     "DeployHost",
@@ -46,6 +51,7 @@ __all__ = [
     "ModelRequirement",
     "HealthCheck",
     "Reservation",
+    "DeployLiveGate",
     "DeployProfileError",
     "load_deploy_profile",
 ]
@@ -124,6 +130,35 @@ class Reservation:
 
 
 @dataclass(frozen=True, slots=True)
+class DeployLiveGate:
+    """The per-target live-gate driver spec (the F16 real backend, C4-prep).
+
+    Names the target repo's own live-gate driver — the honest per-target
+    command that injects a minimal F16 perishable-prereq provider into the
+    UNMODIFIED guardkit ``LiveGateRunner`` (see
+    :class:`forge.deploy.live_gate.RepoDriverLiveGateInvoker` for the full F16
+    story). Absent from a profile ⇒ the deploy stage's live-gate seam stays
+    ``Unconfigured`` and loud-fails (deny by default — a fake pass is worse than
+    none).
+
+    Attributes:
+        driver: The driver argv (min 1 element), e.g.
+            ``["python3", "qa/gates/local_live_gate.py"]`` — resolved relative
+            to the target repo (the subprocess ``cwd``).
+        gates: Optional explicit gate-id subset; empty ⇒ all registered gates.
+        timeout_seconds: Hard wall on the driver subprocess (default 600).
+        env: Optional NON-SECRET env overlay for the driver (UPPER_SNAKE names,
+            string values — base URLs and the like). Secrets stay register REFS
+            (``secret_injection``), never inlined here.
+    """
+
+    driver: tuple[str, ...]
+    gates: tuple[str, ...] = ()
+    timeout_seconds: int = 600
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class DeployProfile:
     """A parsed, validated deploy profile — the DEPLOY stage's input.
 
@@ -152,6 +187,9 @@ class DeployProfile:
             When absent, a revert is a LOUD terminal failure — never a silent
             keep-serving of the failed build.
         cwd: Working directory for subprocess steps (repo-relative or absolute).
+        live_gate: The per-target live-gate driver spec (the F16 real backend),
+            or None. Absent ⇒ the live-gate seam stays ``Unconfigured`` (deny by
+            default — the stage loud-fails rather than synthesize a verdict).
         source_ref: Path the profile was loaded from (for deploy_profile_ref).
     """
 
@@ -167,6 +205,7 @@ class DeployProfile:
     reservation: Reservation | None = None
     rollback_image_ref: str | None = None
     cwd: str | None = None
+    live_gate: DeployLiveGate | None = None
     source_ref: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -371,6 +410,76 @@ def _parse_reservation(raw: Any) -> Reservation | None:
     return Reservation(resource=resource, quiet_window=m.get("quiet_window"))
 
 
+def _parse_live_gate(raw: Any) -> DeployLiveGate | None:
+    if raw is None:
+        return None
+    m = _require_mapping(raw, "live_gate")
+
+    driver = m.get("driver")
+    if not isinstance(driver, list) or not driver:
+        raise DeployProfileError(
+            "live_gate.driver is required and must be a non-empty argv list "
+            "(e.g. ['python3', 'qa/gates/local_live_gate.py'])"
+        )
+    argv: list[str] = []
+    for i, part in enumerate(driver):
+        if not isinstance(part, str) or not part.strip():
+            raise DeployProfileError(
+                f"live_gate.driver[{i}] must be a non-empty string"
+            )
+        argv.append(part)
+
+    gates_raw = m.get("gates")
+    gates: tuple[str, ...] = ()
+    if gates_raw is not None:
+        if not isinstance(gates_raw, list):
+            raise DeployProfileError(
+                "live_gate.gates must be a list of gate-id strings when present"
+            )
+        gate_ids: list[str] = []
+        for i, g in enumerate(gates_raw):
+            if not isinstance(g, str) or not g.strip():
+                raise DeployProfileError(
+                    f"live_gate.gates[{i}] must be a non-empty gate-id string"
+                )
+            gate_ids.append(g)
+        gates = tuple(gate_ids)
+
+    timeout_seconds = m.get("timeout_seconds", 600)
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        raise DeployProfileError(
+            "live_gate.timeout_seconds must be a positive integer when present"
+        )
+
+    env_raw = m.get("env")
+    env: dict[str, str] = {}
+    if env_raw is not None:
+        env_map = _require_mapping(env_raw, "live_gate.env")
+        for name, value in env_map.items():
+            if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+                raise DeployProfileError(
+                    f"live_gate.env key {name!r} must be UPPER_SNAKE_CASE "
+                    "(a non-secret env-var NAME, e.g. API_TEST_BASE_URL)"
+                )
+            if not isinstance(value, str):
+                raise DeployProfileError(
+                    f"live_gate.env[{name!r}] must be a string value "
+                    "(non-secret, e.g. a base URL; secrets stay register REFS)"
+                )
+            env[name] = value
+
+    return DeployLiveGate(
+        driver=tuple(argv),
+        gates=gates,
+        timeout_seconds=timeout_seconds,
+        env=env,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
@@ -421,6 +530,7 @@ def parse_deploy_profile(
         "reservation",
         "rollback_image_ref",
         "cwd",
+        "live_gate",
     }
     extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -439,6 +549,7 @@ def parse_deploy_profile(
         if isinstance(rollback_image_ref, str)
         else None,
         cwd=data.get("cwd"),
+        live_gate=_parse_live_gate(data.get("live_gate")),
         source_ref=source_ref,
         extra=extra,
     )

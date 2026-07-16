@@ -27,6 +27,7 @@ loop, so the seam stays untouched and the sync handler contract is preserved.
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,7 @@ __all__ = [
     "UnconfiguredLiveGateInvoker",
     "DryRunLiveGateInvoker",
     "GuardkitSeamLiveGateInvoker",
+    "RepoDriverLiveGateInvoker",
     "BrokerDiff",
     "BrokerInspector",
     "UnconfiguredBrokerInspector",
@@ -267,6 +269,209 @@ class GuardkitSeamLiveGateInvoker:
             # instrument problem, not a SUT fail.
             return "instrument_fail"
         return "fail"
+
+
+# ---------------------------------------------------------------------------
+# Real per-target live-gate backend (runs a TARGET REPO's own driver)
+# ---------------------------------------------------------------------------
+
+
+#: The DRIVER's own four-for-four exit-code map (mirrors api_test
+#: ``qa/gates/local_live_gate.py::_VERDICT_EXIT``): 0=pass, 1=fail,
+#: 3=instrument_fail, 4=environment_fail. Used as the fallback verdict when the
+#: driver's stdout is NOT a parseable results envelope. Any other exit code maps
+#: to ``fail`` (a non-zero the driver did not classify).
+_DRIVER_EXIT_VERDICT: dict[int, str] = {
+    0: "pass",
+    1: "fail",
+    3: "instrument_fail",
+    4: "environment_fail",
+}
+
+#: Bound on the stdout/stderr tail recorded in ``LiveGateInvocation.detail`` so a
+#: chatty driver never bloats a deploy record.
+_STDIO_TAIL_CAP = 2000
+
+
+def _bounded_tail(text: str | None, cap: int = _STDIO_TAIL_CAP) -> str:
+    """The last ``cap`` characters of ``text`` (empty string for None/empty)."""
+    if not text:
+        return ""
+    return text[-cap:]
+
+
+class RepoDriverLiveGateInvoker:
+    """The REAL per-target live-gate backend: runs a target repo's own driver.
+
+    F16 story (why the guardkit-CLI backend is not usable as the per-target real
+    backend today): guardkit's live-gate pre-flight ALWAYS consults an F16
+    perishable-prereq checklist provider, but the ``guardkit qa live-gate`` CLI
+    wires NONE — so :class:`GuardkitSeamLiveGateInvoker` (which shells that CLI
+    through the frozen seam) short-circuits to ``environment_fail`` (exit 4) on
+    EVERY repo BEFORE any registered gate script runs, no matter how healthy the
+    deployment is. That is a guardkit-side v1 gap, not a target-repo authoring
+    gap. Until guardkit gains an F16-provider CLI hook, each target repo instead
+    carries its own honest driver (e.g. api_test ``qa/gates/local_live_gate.py``)
+    that injects a minimal F16 health-probe provider into the SAME UNMODIFIED
+    guardkit ``LiveGateRunner``, executes the registered gates against the live
+    deployment, prints the genuine results-envelope JSON on stdout, and exits by
+    the four-for-four verdict map above. This backend runs that driver as a
+    subprocess and projects its envelope onto a :class:`LiveGateInvocation`.
+
+    The frozen seam (``forge.adapters.guardkit.run``) hardcodes the guardkit
+    binary, so it cannot run a repo driver — hence a distinct subprocess path
+    here. **This backend retires when guardkit gains an F16-provider CLI hook**
+    (or a real WS5 F16 source): the target drivers fold back into
+    ``guardkit qa live-gate`` and :class:`GuardkitSeamLiveGateInvoker`.
+
+    Mirrors the seam posture: :meth:`invoke` NEVER raises — a timeout is an
+    ``environment_fail``, a spawn failure an ``instrument_fail``, and an
+    unparseable stdout falls back to the driver's own exit-code map. None of
+    those indict the system under test (DF-017).
+
+    Args:
+        repo_path: Absolute path to the target repo (the subprocess ``cwd``).
+        driver_argv: The per-target driver command, e.g.
+            ``["python3", "qa/gates/local_live_gate.py"]``.
+        timeout_seconds: Hard wall on the driver subprocess (default 600).
+        extra_env: Non-secret env overlaid on ``os.environ`` for the driver
+            (e.g. a base URL); an empty map by default.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_path: Path,
+        driver_argv: list[str],
+        timeout_seconds: int = 600,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
+        self._repo_path = Path(repo_path)
+        self._driver_argv = list(driver_argv)
+        self._timeout_seconds = timeout_seconds
+        self._extra_env = dict(extra_env or {})
+
+    def invoke(
+        self, *, feature: str, target: str, gates: tuple[str, ...] = ()
+    ) -> LiveGateInvocation:
+        # Imported inside the method to keep this module's import surface small
+        # (the seam-boundary precedent above).
+        import json
+        import subprocess
+
+        argv = [*self._driver_argv, "--feature", feature, "--target", target]
+        if gates:
+            argv += ["--gates", ",".join(gates)]
+        env = os.environ | self._extra_env
+        run_id_fallback = f"{feature}-{target}"
+        gate_ids = tuple(gates)
+
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(self._repo_path),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A driver that never returns is an ENVIRONMENT problem — never a SUT
+            # fail (it never indicts the feature).
+            return LiveGateInvocation(
+                verdict="environment_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "exit_code": None,
+                    "error": f"driver timed out after {self._timeout_seconds}s",
+                    "stdout_tail": _bounded_tail(
+                        exc.stdout if isinstance(exc.stdout, str) else None
+                    ),
+                    "stderr_tail": _bounded_tail(
+                        exc.stderr if isinstance(exc.stderr, str) else None
+                    ),
+                },
+            )
+        except OSError as exc:
+            # Spawn failure — missing interpreter / script / not executable. An
+            # INSTRUMENT problem (the gate could not be run), never a SUT fail.
+            return LiveGateInvocation(
+                verdict="instrument_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "exit_code": None,
+                    "error": f"could not spawn driver: {exc}",
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
+            return LiveGateInvocation(
+                verdict="instrument_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "exit_code": None,
+                    "error": f"driver invocation error: {exc}",
+                },
+            )
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        detail: dict[str, Any] = {
+            "argv": argv,
+            "exit_code": proc.returncode,
+            "stdout_tail": _bounded_tail(stdout),
+            "stderr_tail": _bounded_tail(stderr),
+        }
+
+        envelope: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(stdout)
+            if isinstance(parsed, dict):
+                envelope = parsed
+        except (json.JSONDecodeError, ValueError):
+            envelope = None
+
+        if envelope is not None:
+            verdict = envelope.get("verdict")
+            if verdict in _VALID_VERDICTS:
+                gate_ids_env = tuple(
+                    str(g.get("gate_id"))
+                    for g in (envelope.get("gates") or [])
+                    if isinstance(g, dict) and g.get("gate_id")
+                )
+                return LiveGateInvocation(
+                    verdict=str(verdict),
+                    run_id=str(envelope.get("run_id") or run_id_fallback),
+                    gate_ids=gate_ids_env or gate_ids,
+                    evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
+                    dispositions_ref=envelope.get("dispositions_ref"),
+                    attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
+                    dry_run=False,
+                    detail={**detail, "source": "results_envelope"},
+                )
+            # A JSON body with a missing/unknown verdict is NOT a valid envelope;
+            # fall through to the exit-code map rather than raise on a bad verdict.
+            detail["envelope_verdict"] = verdict
+
+        verdict = _DRIVER_EXIT_VERDICT.get(proc.returncode, "fail")
+        return LiveGateInvocation(
+            verdict=verdict,
+            run_id=run_id_fallback,
+            gate_ids=gate_ids,
+            dry_run=False,
+            detail={**detail, "source": "exit_code_map"},
+        )
 
 
 # ---------------------------------------------------------------------------

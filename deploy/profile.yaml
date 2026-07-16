@@ -41,6 +41,23 @@ health_checks:
 # cwd for the wrapped scripts (relative to the fleet-memory checkout root).
 cwd: deploy/nas
 
+# Optional per-target live-gate driver (the F16 REAL backend, C4-prep). Absent
+# here on purpose: fleet-memory is a headless Postgres container with no live
+# walk, so its live-gate seam stays Unconfigured and loud-fails by default (a
+# fake pass is worse than none). A target WITH a live walk (e.g. api_test) names
+# its own honest driver — the one that injects a minimal F16 perishable-prereq
+# provider into the UNMODIFIED guardkit LiveGateRunner, because `guardkit qa
+# live-gate` wires no F16 provider in v1 and would short-circuit to
+# environment_fail before any gate runs. Example (commented — do not enable for
+# fleet-memory):
+#
+# live_gate:
+#   driver: ["python3", "qa/gates/local_live_gate.py"]
+#   gates: [health]            # optional subset; omit ⇒ all registered gates
+#   timeout_seconds: 600       # optional; hard wall on the driver subprocess
+#   env:                       # optional NON-SECRET overlay (UPPER_SNAKE names)
+#     API_TEST_BASE_URL: "http://localhost:8901"
+
 # fleet-memory is a Postgres container: no realm import, no llama-swap models,
 # no GPU reservation, no broker contract. A minimal profile is valid — the
 # richer sections (realm_import / models_required / reservation /

@@ -37,6 +37,7 @@ from pathlib import Path
 import click
 
 from forge.cli import cancel as _cancel
+from forge.cli import deploy as _deploy
 from forge.cli import history as _history
 from forge.cli import queue as _queue
 from forge.cli import review_gate as _review_gate
@@ -98,6 +99,7 @@ main.add_command(_history.history_cmd)
 main.add_command(_cancel.cancel_cmd)
 main.add_command(_skip.skip_cmd)
 main.add_command(_serve.serve_cmd)
+main.add_command(_deploy.deploy_cmd)
 main.add_command(_runbook.runbook_cmd)
 main.add_command(_review_gate.review_gate_cmd)
 

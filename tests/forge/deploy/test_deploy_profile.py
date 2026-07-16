@@ -183,3 +183,81 @@ class TestRollbackImageRef:
             parse_deploy_profile(
                 {"env_id": "e", "compose": {"file": "dc.yml"}, "rollback_image_ref": "  "}
             )
+
+
+class TestLiveGateSection:
+    """The optional per-target live_gate driver spec (the F16 real backend)."""
+
+    def _base(self) -> dict:
+        return {"env_id": "e", "compose": {"file": "dc.yml"}}
+
+    def test_absent_is_none(self) -> None:
+        p = parse_deploy_profile(self._base())
+        assert p.live_gate is None
+
+    def test_exemplar_has_no_live_gate(self) -> None:
+        # The committed fleet-memory exemplar deliberately ships no live_gate
+        # (headless Postgres, no live walk) — the seam stays Unconfigured.
+        p = load_deploy_profile(FLEET_MEMORY)
+        assert p.live_gate is None
+
+    def test_minimal_live_gate_parses(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": ["python3", "qa/gates/local_live_gate.py"]}
+        p = parse_deploy_profile(raw)
+        assert p.live_gate is not None
+        assert p.live_gate.driver == ("python3", "qa/gates/local_live_gate.py")
+        assert p.live_gate.gates == ()
+        assert p.live_gate.timeout_seconds == 600
+        assert p.live_gate.env == {}
+
+    def test_full_live_gate_parses(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {
+            "driver": ["python3", "qa/gates/local_live_gate.py"],
+            "gates": ["health", "api"],
+            "timeout_seconds": 120,
+            "env": {"API_TEST_BASE_URL": "http://localhost:8901"},
+        }
+        p = parse_deploy_profile(raw)
+        lg = p.live_gate
+        assert lg is not None
+        assert lg.gates == ("health", "api")
+        assert lg.timeout_seconds == 120
+        assert lg.env == {"API_TEST_BASE_URL": "http://localhost:8901"}
+
+    def test_empty_driver_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": []}
+        with pytest.raises(DeployProfileError, match="live_gate.driver"):
+            parse_deploy_profile(raw)
+
+    def test_missing_driver_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"gates": ["health"]}
+        with pytest.raises(DeployProfileError, match="live_gate.driver"):
+            parse_deploy_profile(raw)
+
+    def test_non_string_driver_element_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": ["python3", 3]}
+        with pytest.raises(DeployProfileError, match=r"live_gate.driver\[1\]"):
+            parse_deploy_profile(raw)
+
+    def test_non_positive_timeout_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": ["x"], "timeout_seconds": 0}
+        with pytest.raises(DeployProfileError, match="timeout_seconds"):
+            parse_deploy_profile(raw)
+
+    def test_lowercase_env_name_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": ["x"], "env": {"base_url": "http://x"}}
+        with pytest.raises(DeployProfileError, match="UPPER_SNAKE"):
+            parse_deploy_profile(raw)
+
+    def test_non_string_env_value_rejected(self) -> None:
+        raw = self._base()
+        raw["live_gate"] = {"driver": ["x"], "env": {"PORT": 8080}}
+        with pytest.raises(DeployProfileError, match="string value"):
+            parse_deploy_profile(raw)
