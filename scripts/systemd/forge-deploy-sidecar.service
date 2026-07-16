@@ -1,0 +1,74 @@
+# forge-deploy-sidecar.service — the deploy execution surface (S1, C4 residue #24)
+#
+# WHAT: the loopback-only HTTP service that runs the deploy stage's vetted,
+#   profile-named scripts (deploy_compose / health_check drivers) on the
+#   docker-capable HOST. The forge container deliberately has NO docker access
+#   (C4 catch #24 — docker socket in a container ≈ host root); this sidecar is
+#   how the in-container daemon dispatches a deploy WITHOUT a docker socket. It
+#   adds ZERO new privilege: Rich's user, on Rich's box, running only scripts
+#   the target repo's own deploy/profile.yaml already names (deny by default).
+#   Design of record:
+#     docs/factory-deploy-execution-surface-design-2026-07-16.md §1
+#
+# CONTRACT (loopback-only, :8125):
+#     GET  /healthz -> {"status":"healthy","rev":"git-<sha>"}
+#     POST /run  {repo, script, env, timeout_seconds} -> {exit_code, output_tail}
+#   The forge side opts in per config: deploy.execution_surface=sidecar (+
+#   deploy.sidecar_url). Default 'local' does not touch this unit at all.
+#
+# SCOPE: a systemd **USER** unit (binds the forge developer venv + repo-local
+#   .env, both user-scoped — no root). Host bound to 127.0.0.1 IN CODE
+#   (forge.deploy_sidecar.service.HOST); this unit does not, and must not, widen
+#   that. This file is AUTHORED only — the attended install/enable + drill is the
+#   coordinator's step (NOT done by this pass).
+#
+# INSTALL (coordinator, attended — one-liners):
+#     mkdir -p ~/.config/systemd/user
+#     cp scripts/systemd/forge-deploy-sidecar.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now forge-deploy-sidecar.service
+#   Verify boot + code freshness (the sidecar runs --no-reload equivalent; a
+#   restart is the only way it picks up new code):
+#     systemctl --user status forge-deploy-sidecar.service
+#     journalctl --user -u forge-deploy-sidecar | grep 'code version stamp'
+#     curl -s http://127.0.0.1:8125/healthz
+#
+# CODE FRESHNESS: the service logs an import-time `code version stamp rev=` line
+#   at boot (forge.deploy_sidecar.service.SIDECAR_CODE_VERSION) so a code-stale
+#   sidecar is visible in the journal — the same DEFECT #18a discipline the
+#   langgraph-runner sidecar uses.
+#
+# NOTE (repo idiom): the langgraph-runner unit lives in ops/systemd/. This unit
+#   is authored under scripts/systemd/ per the S1 build spec; the coordinator may
+#   relocate/symlink it alongside ops/systemd/ at install time if preferred —
+#   the install one-liners above are path-agnostic once copied.
+
+[Unit]
+Description=forge deploy sidecar (loopback deploy/health-check script runner, C4 #24)
+Documentation=file:///home/richardwoollcott/Projects/appmilla_github/ai-transition/docs/factory-deploy-execution-surface-design-2026-07-16.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The sidecar validates `repo` keys against planning.target_repo_paths in this
+# config (the same map forge uses); it re-reads each target's deploy/profile.yaml
+# itself per request.
+Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
+# Optional non-default port for a drill (defaults to 8125 in code):
+# Environment=FORGE_DEPLOY_SIDECAR_PORT=8125
+# Rich enough PATH for the spawned vetted scripts (git, docker compose, etc.).
+Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/Projects/appmilla_github/forge
+# Loopback binding is enforced in code (HOST=127.0.0.1); -m runs the package
+# entry point (forge.deploy_sidecar.__main__).
+ExecStart=%h/Projects/appmilla_github/forge/.venv/bin/python -m forge.deploy_sidecar
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

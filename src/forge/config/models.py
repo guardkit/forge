@@ -730,6 +730,27 @@ class DeployStageConfig(BaseModel):
             "(the MP-012 addenda pattern)."
         ),
     )
+    execution_surface: Literal["local", "sidecar"] = Field(
+        default="local",
+        description=(
+            "Where the deploy stage's docker-touching scripts (deploy_compose, "
+            "health_check) physically run. 'local' (default) = today's in-process "
+            "subprocess via forge.executor.shell_steps — a byte-identical no-op "
+            "for the attended host CLI. 'sidecar' routes those scripts over "
+            "loopback HTTP to the forge-deploy-sidecar (S1, C4 residue #24), which "
+            "is what lets the in-container daemon dispatch deploys without a docker "
+            "socket. All other subprocess steps (seed/warm/import/smoke) stay "
+            "in-process regardless of this switch."
+        ),
+    )
+    sidecar_url: str = Field(
+        default="http://127.0.0.1:8125",
+        description=(
+            "Base URL of the forge-deploy-sidecar, used only when "
+            "execution_surface='sidecar'. Loopback-only by default (the sidecar "
+            "binds 127.0.0.1); a remote value is a deliberate, reviewed choice."
+        ),
+    )
 
 
 class ReviewGateConfig(BaseModel):

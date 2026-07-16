@@ -43,6 +43,7 @@ from forge.executor.registry import StepOutcome, StepTypeRegistry
 from forge.executor.shell_steps import (
     DEFAULT_OUTPUT_CAP_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
+    ScriptRunner,
     _run_script_step,
 )
 from forge.persistence.repositories.runbook_models import Step, StepStatus
@@ -90,13 +91,16 @@ def _run_scripts(
     default_cwd: str | None,
     default_env_file: str | None,
     dry_run: bool,
+    runner: ScriptRunner = _run_script_step,
 ) -> StepOutcome:
     """Run a list of ``{script, cwd?, env_file?}`` entries as subprocess steps.
 
     Shared core for the subprocess-shaped deploy steps. In dry-run, records the
-    scripts it would run and passes. Live, runs each via the FMDR
-    ``_run_script_step`` core (credential-scrubbed, never raises); the first
-    non-zero exit fails the step.
+    scripts it would run and passes. Live, runs each via ``runner`` (default =
+    the FMDR ``_run_script_step`` core, credential-scrubbed, never raises); the
+    first non-zero exit fails the step. The ``runner`` seam lets the
+    docker-touching ``health_check`` step route through the deploy sidecar (S1)
+    while the DB/model-touching steps stay on the in-process default.
     """
     if dry_run:
         return StepOutcome(
@@ -118,7 +122,7 @@ def _run_scripts(
                     "ran": ran,
                 },
             )
-        exit_code, output = _run_script_step(
+        exit_code, output = runner(
             cwd=cwd,
             script=script,
             env_file=env_file,
@@ -138,12 +142,19 @@ def _run_scripts(
 # ---------------------------------------------------------------------------
 
 
-def make_deploy_compose_handler(*, dry_run: bool):
+def make_deploy_compose_handler(
+    *, dry_run: bool, script_runner: ScriptRunner | None = None
+):
     """Dry-run-aware wrapper over the shipped FMDR ``deploy_compose`` handler.
 
     Live, it delegates VERBATIM to :func:`forge.executor.shell_steps.deploy_compose`
     (the shipped step — no logic duplicated, the FMDR executor is extended not
     replaced). Dry-run records the params it would run and passes.
+
+    When ``script_runner`` is supplied (deploy.execution_surface='sidecar'), it
+    is threaded into the shipped handler as its execution seam, so the O-32
+    revert-env threading is preserved and NOT duplicated. ``script_runner=None``
+    (the local default) is byte-identical to before the seam existed.
     """
 
     def deploy_compose_step(step: Step) -> StepOutcome:
@@ -154,7 +165,9 @@ def make_deploy_compose_handler(*, dry_run: bool):
             )
         from forge.executor.shell_steps import deploy_compose as _fmdr_deploy_compose
 
-        return _fmdr_deploy_compose(step)
+        if script_runner is None:
+            return _fmdr_deploy_compose(step)
+        return _fmdr_deploy_compose(step, runner=script_runner)
 
     return deploy_compose_step
 
@@ -390,13 +403,20 @@ def make_warm_models_handler(*, dry_run: bool):
 # ---------------------------------------------------------------------------
 
 
-def make_health_check_handler(*, dry_run: bool):
+def make_health_check_handler(
+    *, dry_run: bool, script_runner: ScriptRunner | None = None
+):
     """Build the ``health_check`` handler.
 
     Params: ``{checks: [{cmd (script), expected?, cwd?}], cwd?}``. Each check is
     a vetted script whose exit code is the health verdict (0 = healthy). Dry-run
     records the checks it would run.
+
+    ``script_runner`` (deploy.execution_surface='sidecar') routes the health
+    scripts through the deploy sidecar; ``None`` (the local default) keeps the
+    in-process subprocess core — byte-identical to before the seam existed.
     """
+    runner = script_runner or _run_script_step
 
     def health_check(step: Step) -> StepOutcome:
         checks = step.params.get("checks", [])
@@ -419,6 +439,7 @@ def make_health_check_handler(*, dry_run: bool):
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
+            runner=runner,
         )
 
     return health_check
@@ -547,6 +568,7 @@ def register_deploy_handlers(
     live_gate_invoker: LiveGateInvoker,
     broker_inspector: BrokerInspector,
     presence_resolver: SecretPresenceResolver | None = None,
+    script_runner: ScriptRunner | None = None,
 ) -> None:
     """Register all seven deploy step-type handlers into ``registry``.
 
@@ -555,8 +577,17 @@ def register_deploy_handlers(
     flag close over the handlers, so a dry-run, a test (fake seams), and a live
     run share one registry and one executor. Registers the two reused FMDR
     shell steps (dry-run-guarded) plus the seven new deploy step types.
+
+    ``script_runner`` (deploy.execution_surface='sidecar') routes ONLY the
+    docker-touching steps — ``deploy_compose`` and ``health_check`` — through the
+    deploy sidecar (S1). The DB/model/secret-touching steps (seed/warm/import/
+    smoke) always run in-process. ``script_runner=None`` (the local default) is a
+    byte-identical no-op: every step keeps the in-process subprocess core.
     """
-    registry.register("deploy_compose", make_deploy_compose_handler(dry_run=dry_run))
+    registry.register(
+        "deploy_compose",
+        make_deploy_compose_handler(dry_run=dry_run, script_runner=script_runner),
+    )
     registry.register("run_smoke_tests", make_run_smoke_tests_handler(dry_run=dry_run))
     registry.register("import_realm", make_import_realm_handler(dry_run=dry_run))
     registry.register(
@@ -567,7 +598,10 @@ def register_deploy_handlers(
     )
     registry.register("seed_fixtures", make_seed_fixtures_handler(dry_run=dry_run))
     registry.register("warm_models", make_warm_models_handler(dry_run=dry_run))
-    registry.register("health_check", make_health_check_handler(dry_run=dry_run))
+    registry.register(
+        "health_check",
+        make_health_check_handler(dry_run=dry_run, script_runner=script_runner),
+    )
     registry.register(
         "broker_preflight",
         make_broker_preflight_handler(broker_inspector=broker_inspector),

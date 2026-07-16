@@ -71,9 +71,11 @@ from forge.deploy.runbook_builder import (
     build_live_gate_runbook,
     build_revert_runbook,
 )
+from forge.deploy.sidecar_runner import SidecarScriptRunner
 from forge.deploy.steps import SecretPresenceResolver, register_deploy_handlers
 from forge.executor.executor import RunbookExecutor, RunResult
 from forge.executor.registry import StepTypeRegistry
+from forge.executor.shell_steps import ScriptRunner
 from forge.persistence.repositories.runbook import RunbookRepository
 from forge.persistence.repositories.runbook_models import Runbook
 
@@ -151,6 +153,7 @@ class DeployStageRunner:
         dry_run: bool = False,
         clock: Callable[[], datetime] = _utcnow,
         presence_resolver: SecretPresenceResolver | None = None,
+        target_repo: str | None = None,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -163,6 +166,32 @@ class DeployStageRunner:
         self._dry_run = dry_run
         self._clock = clock
         self._presence_resolver = presence_resolver
+        self._target_repo = target_repo
+
+    def _resolve_script_runner(self) -> ScriptRunner | None:
+        """The docker-touching-step execution seam for this stage.
+
+        ``None`` (deploy.execution_surface='local', the default) keeps every
+        step on the in-process subprocess core — byte-identical to before the
+        seam existed. 'sidecar' builds a :class:`SidecarScriptRunner` bound to
+        the target repo, so ``deploy_compose``/``health_check`` execute on the
+        docker-capable host without a docker socket in the container (S1).
+        """
+        if self._config.execution_surface != "sidecar":
+            return None
+        if not self._target_repo:
+            # Deny by default: a sidecar surface with no target repo cannot name
+            # the repo the sidecar must resolve. Fail loud rather than silently
+            # fall back to the (docker-less) local surface.
+            raise ValueError(
+                "deploy.execution_surface='sidecar' requires a target_repo "
+                "(the org/name key the sidecar resolves via "
+                "planning.target_repo_paths); none was threaded into the "
+                "DeployStageRunner"
+            )
+        return SidecarScriptRunner(
+            base_url=self._config.sidecar_url, repo=self._target_repo
+        )
 
     def _build_registry(self) -> StepTypeRegistry:
         registry = StepTypeRegistry()
@@ -172,6 +201,7 @@ class DeployStageRunner:
             live_gate_invoker=self._live_gate_invoker,
             broker_inspector=self._broker_inspector,
             presence_resolver=self._presence_resolver,
+            script_runner=self._resolve_script_runner(),
         )
         return registry
 

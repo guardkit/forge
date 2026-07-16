@@ -138,6 +138,7 @@ async def _adispatch(
     correlation_id: str,
     deploy_run_id: str,
     deployer: str | None,
+    target_repo: str,
 ) -> Any | None:
     """Open backends, dispatch the deploy stage, then tear the backends down."""
     (
@@ -158,6 +159,7 @@ async def _adispatch(
             live_gate_invoker=invoker,
             deploy_record_root=str(repo_path / config.deploy.deploy_record_dir),
             dry_run=dry_run,
+            target_repo=target_repo,
             feature=feature_id,
             feat_id=feature_id,
             task_id=task_id,
@@ -236,6 +238,7 @@ def execute_deploy(
             correlation_id=correlation_id,
             deploy_run_id=deploy_run_id,
             deployer=deployer,
+            target_repo=repo,
         )
     )
 

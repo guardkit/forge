@@ -13,10 +13,17 @@ from __future__ import annotations
 
 import os
 import subprocess
+from typing import Callable
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
+
+#: A callable with the :func:`_run_script_step` keyword signature. The deploy
+#: stage injects a sidecar-backed implementation here (S1) to route
+#: docker-touching scripts over loopback HTTP without a second executor; the
+#: default is the in-process subprocess core.
+ScriptRunner = Callable[..., tuple[int, str]]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -160,12 +167,19 @@ def _run_script_step(
     return (exit_code, output)
 
 
-def deploy_compose(step: Step) -> StepOutcome:
+def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> StepOutcome:
     """Execute a deploy_compose step (TASK-SSH-003).
 
     Extracts cwd, script, env_file (and optional timeout/output_cap overrides)
-    from step.params, delegates to the shared core (_run_script_step), and maps
-    the exit status to a verdict: 0 → passed, non-zero → failed.
+    from step.params, delegates to the shared core (``runner``, defaulting to
+    :func:`_run_script_step`), and maps the exit status to a verdict:
+    0 → passed, non-zero → failed.
+
+    The ``runner`` seam (default = the in-process subprocess core) lets the
+    deploy stage route this step's execution through the forge-deploy-sidecar
+    when ``deploy.execution_surface == "sidecar"`` (S1, C4 residue #24) WITHOUT
+    duplicating the O-32 revert-env threading below. The default keeps the local
+    path byte-identical to before the seam existed.
 
     Vetted-script revert contract (O-32, C4-prep): revert runbooks
     (:func:`forge.deploy.runbook_builder.build_revert_runbook`) carry
@@ -210,8 +224,8 @@ def deploy_compose(step: Step) -> StepOutcome:
     if isinstance(rollback_image_ref, str) and rollback_image_ref:
         extra_env["ROLLBACK_IMAGE_REF"] = rollback_image_ref
 
-    # Delegate to shared core
-    exit_code, captured_output = _run_script_step(
+    # Delegate to the runner (default = in-process subprocess core)
+    exit_code, captured_output = runner(
         cwd=cwd,
         script=script,
         env_file=env_file,
@@ -305,6 +319,7 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 __all__ = [
     "_run_script_step",
+    "ScriptRunner",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_OUTPUT_CAP_BYTES",
     "deploy_compose",
