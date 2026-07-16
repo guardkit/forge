@@ -411,3 +411,37 @@ class TestServeBootComposition:
                 nats_client=AsyncMock(),
                 db_path=None,
             )
+
+    def test_flag_on_migrates_a_fresh_db(self, tmp_path) -> None:
+        """A never-migrated DB gains the deploy-domain schema at composition.
+
+        C4 live-caught (2026-07-16): the production DB predates the runbook
+        tables and NOTHING on the production paths applied the boot-idempotent
+        DDL -- the first live dispatch died on ``no such table: runbooks``.
+        Composition must guarantee the schema, and a second composition over
+        the migrated DB must be a no-op (CREATE TABLE IF NOT EXISTS).
+        """
+        import sqlite3
+
+        from forge.cli._serve_deploy import compose_deploy_stage_runner
+
+        db_path = tmp_path / "fresh-forge.db"
+        assert not db_path.exists()  # truly never-migrated
+
+        forge_config = SimpleNamespace(deploy=DeployStageConfig(enabled=True))
+        for _ in range(2):  # second pass proves idempotence
+            runner = compose_deploy_stage_runner(
+                forge_config=forge_config,
+                nats_client=AsyncMock(),
+                db_path=db_path,
+            )
+            assert isinstance(runner, DeployStageRunner)
+
+        with sqlite3.connect(db_path) as cx:
+            tables = {
+                row[0]
+                for row in cx.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        assert {"runbooks", "runbook_steps"} <= tables

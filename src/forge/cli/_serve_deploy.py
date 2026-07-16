@@ -80,6 +80,7 @@ def compose_deploy_stage_runner(
         resolve_reservation_lease,
     )
     from forge.adapters.sqlite.connect import connect_writer
+    from forge.persistence.migrations import runbook as runbook_migration
     from forge.persistence.repositories.runbook import RunbookRepository
 
     if db_path is None:
@@ -88,7 +89,13 @@ def compose_deploy_stage_runner(
             "composition — the deploy-stage runner cannot persist its runbooks"
         )
 
-    repository = RunbookRepository(connection=connect_writer(db_path))
+    connection = connect_writer(db_path)
+    # The deploy-domain DDL is boot-idempotent (CREATE TABLE IF NOT EXISTS) and
+    # a production DB may predate it — apply here so BOTH production
+    # construction sites (serve boot + the deploy CLI) guarantee the schema
+    # (C4 live-caught: `no such table: runbooks` on the first live dispatch).
+    runbook_migration.apply(connection)
+    repository = RunbookRepository(connection=connection)
     runbook_publisher = RunbookPublisher(nats_client=nats_client)
     deploy_publisher = DeployPublisher(nats_client=nats_client)
     lease = resolve_reservation_lease(

@@ -103,11 +103,17 @@ async def _aopen_backends(
     from forge.adapters.nats.deploy_publisher import DeployPublisher
     from forge.adapters.nats.runbook_publisher import RunbookPublisher
     from forge.adapters.sqlite.connect import connect_writer
+    from forge.persistence.migrations import runbook as runbook_migration
     from forge.persistence.repositories.runbook import RunbookRepository
 
     servers = os.environ.get("FORGE_NATS_URL", "nats://127.0.0.1:4222")
     client = await nats.connect(servers=servers)
-    repository = RunbookRepository(connection=connect_writer(_resolve_db_path()))
+    connection = connect_writer(_resolve_db_path())
+    # The deploy-domain DDL is boot-idempotent and the production DB predates
+    # it — nothing on the production paths applied it (C4 live-caught: the
+    # first dispatch died on `no such table: runbooks`).
+    runbook_migration.apply(connection)
+    repository = RunbookRepository(connection=connection)
     runbook_publisher = RunbookPublisher(nats_client=client)
     deploy_publisher = DeployPublisher(nats_client=client)
 
