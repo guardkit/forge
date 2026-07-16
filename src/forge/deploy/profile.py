@@ -52,6 +52,7 @@ __all__ = [
     "HealthCheck",
     "Reservation",
     "DeployLiveGate",
+    "DeployCandidate",
     "DeployProfileError",
     "load_deploy_profile",
 ]
@@ -159,6 +160,33 @@ class DeployLiveGate:
 
 
 @dataclass(frozen=True, slots=True)
+class DeployCandidate:
+    """The optional candidate-then-promote overlay (S2F, execution-surface design).
+
+    When a profile carries a ``candidate`` section, the DEPLOY stage stands the
+    build up first under a SEPARATE compose project (``<live project>-cand``),
+    gates it, and only re-tags-and-promotes it to the live name on a PASS — the
+    live name is never touched by a candidate that fails its gate. Absent ⇒
+    ``None`` ⇒ byte-identical to today's direct-live flow.
+
+    Attributes:
+        env: NON-SECRET env overlay (UPPER_SNAKE names, string values — e.g.
+            ``CANDIDATE_PORT=8902``, ``API_TEST_BASE_URL=http://localhost:8902``)
+            threaded, alongside ``CANDIDATE=1``, to the candidate-leg
+            ``deploy_compose`` step, to the candidate-leg ``health_check``
+            scripts, and to the candidate-leg live-gate driver env — so those
+            three all address the candidate instance, not the live one. Secrets
+            stay register REFS (``secret_injection``), never inlined here. Same
+            validation idiom as :class:`DeployLiveGate.env`.
+        keep: When True, leave the candidate project up after a successful
+            promote (for manual poking); when False (the default), tear it down.
+    """
+
+    env: dict[str, str] = field(default_factory=dict)
+    keep: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class DeployProfile:
     """A parsed, validated deploy profile — the DEPLOY stage's input.
 
@@ -190,6 +218,10 @@ class DeployProfile:
         live_gate: The per-target live-gate driver spec (the F16 real backend),
             or None. Absent ⇒ the live-gate seam stays ``Unconfigured`` (deny by
             default — the stage loud-fails rather than synthesize a verdict).
+        candidate: The optional candidate-then-promote overlay, or None. Absent
+            ⇒ byte-identical to the direct-live flow (deploy → gate → O-32
+            revert). Present ⇒ the stage stands the build up under a ``-cand``
+            project, gates it, and promotes only on a PASS (S2F).
         source_ref: Path the profile was loaded from (for deploy_profile_ref).
     """
 
@@ -206,6 +238,7 @@ class DeployProfile:
     rollback_image_ref: str | None = None
     cwd: str | None = None
     live_gate: DeployLiveGate | None = None
+    candidate: DeployCandidate | None = None
     source_ref: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -480,6 +513,38 @@ def _parse_live_gate(raw: Any) -> DeployLiveGate | None:
     )
 
 
+def _parse_candidate(raw: Any) -> DeployCandidate | None:
+    if raw is None:
+        return None
+    m = _require_mapping(raw, "candidate")
+
+    env_raw = m.get("env")
+    env: dict[str, str] = {}
+    if env_raw is not None:
+        env_map = _require_mapping(env_raw, "candidate.env")
+        for name, value in env_map.items():
+            if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+                raise DeployProfileError(
+                    f"candidate.env key {name!r} must be UPPER_SNAKE_CASE "
+                    "(a non-secret env-var NAME, e.g. CANDIDATE_PORT)"
+                )
+            if not isinstance(value, str):
+                raise DeployProfileError(
+                    f"candidate.env[{name!r}] must be a string value "
+                    "(non-secret, e.g. a port/base URL; secrets stay register REFS)"
+                )
+            env[name] = value
+
+    keep = m.get("keep", False)
+    if not isinstance(keep, bool):
+        raise DeployProfileError(
+            "candidate.keep must be a boolean when present "
+            "(True keeps the candidate project up after promote; default False)"
+        )
+
+    return DeployCandidate(env=env, keep=keep)
+
+
 # ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
@@ -531,6 +596,7 @@ def parse_deploy_profile(
         "rollback_image_ref",
         "cwd",
         "live_gate",
+        "candidate",
     }
     extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -550,6 +616,7 @@ def parse_deploy_profile(
         else None,
         cwd=data.get("cwd"),
         live_gate=_parse_live_gate(data.get("live_gate")),
+        candidate=_parse_candidate(data.get("candidate")),
         source_ref=source_ref,
         extra=extra,
     )

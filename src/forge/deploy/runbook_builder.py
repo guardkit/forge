@@ -34,6 +34,7 @@ __all__ = [
     "build_deploy_runbook",
     "build_live_gate_runbook",
     "build_revert_runbook",
+    "build_candidate_teardown_runbook",
     "deploy_runbook_step_types",
 ]
 
@@ -76,6 +77,8 @@ def build_deploy_runbook(
     runbook_id: str,
     target: str,
     now: datetime,
+    compose_extra_env: dict[str, str] | None = None,
+    check_extra_env: dict[str, str] | None = None,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -85,6 +88,16 @@ def build_deploy_runbook(
         target: The runbook target (typically the profile ``env_id``).
         now: Creation timestamp (injected — the executor forbids argless
             ``datetime.now`` in some call sites; the caller supplies the clock).
+        compose_extra_env: Candidate-then-promote sequencing (S2F) — a
+            non-secret env overlay injected into the ``deploy_compose`` step's
+            params (threaded verbatim to the vetted script by
+            :func:`forge.executor.shell_steps.deploy_compose`). Carries the mode
+            flag + addressing overlay: ``{CANDIDATE:"1", **candidate.env}`` for
+            the candidate leg, ``{PROMOTE:"1"}`` for the promote leg. ``None``
+            (the direct-live flow) ⇒ no ``extra_env`` key ⇒ byte-identical.
+        check_extra_env: Same, for the ``health_check`` step — the candidate.env
+            overlay so the candidate-leg checks hit the ``-cand`` port. ``None``
+            (direct-live + promote leg's "no overlay" health check) ⇒ unchanged.
 
     Returns:
         A :class:`Runbook` of typed, ordered, ``pending`` steps.
@@ -168,23 +181,22 @@ def build_deploy_runbook(
         compose_params["script"] = profile.compose.script
     if profile.compose.env_file is not None:
         compose_params["env_file"] = profile.compose.env_file
+    if compose_extra_env:
+        compose_params["extra_env"] = dict(compose_extra_env)
     steps.append(_step("deploy_compose", compose_params, idx))
     idx += 1
 
     if profile.health_checks:
-        steps.append(
-            _step(
-                "health_check",
-                {
-                    "cwd": cwd,
-                    "checks": [
-                        {"cmd": h.cmd, "expected": h.expected}
-                        for h in profile.health_checks
-                    ],
-                },
-                idx,
-            )
-        )
+        check_params: dict[str, Any] = {
+            "cwd": cwd,
+            "checks": [
+                {"cmd": h.cmd, "expected": h.expected}
+                for h in profile.health_checks
+            ],
+        }
+        if check_extra_env:
+            check_params["extra_env"] = dict(check_extra_env)
+        steps.append(_step("health_check", check_params, idx))
         idx += 1
 
     return Runbook(
@@ -230,6 +242,52 @@ def build_revert_runbook(
         "compose_profile": profile.compose.profile,
         "rollback_image_ref": rollback_image_ref,
         "revert": True,
+    }
+    if profile.compose.script is not None:
+        compose_params["script"] = profile.compose.script
+    if profile.compose.env_file is not None:
+        compose_params["env_file"] = profile.compose.env_file
+    return Runbook(
+        runbook_id=runbook_id,
+        target=target,
+        steps=(_step("deploy_compose", compose_params, 0),),
+        current_step_index=0,
+        status=StepStatus.pending,
+        created_at=now,
+    )
+
+
+def build_candidate_teardown_runbook(
+    profile: DeployProfile,
+    *,
+    runbook_id: str,
+    target: str,
+    extra_env: dict[str, str],
+    now: datetime,
+) -> Runbook:
+    """Render the candidate-teardown runbook (S2F) — a single ``deploy_compose``.
+
+    Tears the candidate compose project (``<live project>-cand``) down. Fired
+    on a candidate-gate FAIL (before any promote — the LIVE name is never
+    touched) and, when ``candidate.keep`` is false, after a successful promote.
+    The teardown signal + candidate addressing ride in the step's ``extra_env``
+    ({CANDIDATE_DOWN:"1", **candidate.env}) so the vetted script brings DOWN the
+    ``-cand`` project (``down -v``) rather than re-deploying it. Deliberately a
+    single focused step — no pre-flight, no health check.
+
+    Args:
+        profile: The parsed deploy profile (its compose invocation is reused).
+        runbook_id: Unique id (typically ``teardown-cand-<deploy_run_id>``).
+        target: The runbook target (typically the profile ``env_id``).
+        extra_env: The teardown env overlay ({CANDIDATE_DOWN:"1", ...}).
+        now: Creation timestamp (injected clock).
+    """
+    compose_params: dict[str, Any] = {
+        "cwd": profile.cwd,
+        "compose_file": profile.compose.file,
+        "compose_profile": profile.compose.profile,
+        "candidate_down": True,
+        "extra_env": dict(extra_env),
     }
     if profile.compose.script is not None:
         compose_params["script"] = profile.compose.script

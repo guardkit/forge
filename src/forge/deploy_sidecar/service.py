@@ -197,17 +197,22 @@ def allowed_env_keys(profile: DeployProfile) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
 
     Base allowlist UNION ``live_gate.env`` keys UNION ``candidate.env`` keys.
-    ``candidate`` is not yet a first-class profile field (S2, not built), so it
-    is read defensively from ``profile.extra`` — present-and-well-shaped only.
+    ``candidate`` is a first-class profile field (S2F): its ``env`` keys are read
+    from ``profile.candidate``. A defensive fallback to ``profile.extra`` is kept
+    for a profile parsed by an older loader that still parked ``candidate`` in
+    ``extra`` (present-and-well-shaped only).
     """
     keys: set[str] = set(ENV_ALLOWLIST_BASE)
     if profile.live_gate is not None:
         keys.update(profile.live_gate.env.keys())
-    candidate = profile.extra.get("candidate")
-    if isinstance(candidate, dict):
-        cand_env = candidate.get("env")
-        if isinstance(cand_env, dict):
-            keys.update(str(k) for k in cand_env)
+    if profile.candidate is not None:
+        keys.update(profile.candidate.env.keys())
+    else:
+        candidate = profile.extra.get("candidate")
+        if isinstance(candidate, dict):
+            cand_env = candidate.get("env")
+            if isinstance(cand_env, dict):
+                keys.update(str(k) for k in cand_env)
     return keys
 
 

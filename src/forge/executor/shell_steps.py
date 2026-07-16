@@ -215,10 +215,22 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
     timeout = step.params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
     output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
 
+    # Step-level env overlay (candidate-then-promote sequencing, S2F): a
+    # ``extra_env`` param dict is threaded verbatim to the vetted script. It
+    # carries the candidate/promote mode flags + the candidate.env addressing
+    # overlay ({CANDIDATE:"1", CANDIDATE_PORT:...} / {PROMOTE:"1"} /
+    # {CANDIDATE_DOWN:"1", ...}). Absent (every legacy/normal-mode step) ⇒ no
+    # entries added ⇒ byte-identical to before the seam existed.
+    extra_env: dict[str, str] = {}
+    params_extra_env = step.params.get("extra_env")
+    if isinstance(params_extra_env, dict):
+        for k, v in params_extra_env.items():
+            if isinstance(k, str) and isinstance(v, str):
+                extra_env[k] = v
+
     # O-32 revert contract: thread the revert signal to the vetted script.
     revert = bool(step.params.get("revert"))
     rollback_image_ref = step.params.get("rollback_image_ref")
-    extra_env: dict[str, str] = {}
     if revert:
         extra_env["REVERT"] = "1"
     if isinstance(rollback_image_ref, str) and rollback_image_ref:

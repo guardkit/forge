@@ -351,6 +351,24 @@ class RepoDriverLiveGateInvoker:
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
 
+    def with_extra_env(self, overlay: dict[str, str]) -> "RepoDriverLiveGateInvoker":
+        """Return a copy whose driver env is this invoker's env plus ``overlay``.
+
+        Candidate-then-promote sequencing (S2F): the candidate-leg live gate must
+        address the ``-cand`` instance, so the candidate.env overlay (e.g.
+        ``API_TEST_BASE_URL=http://localhost:8902``) is merged ON TOP of the
+        profile's live_gate.env (overlay wins on a key clash) for that leg ONLY —
+        the promote-leg live gate keeps the base env untouched. A copy (not a
+        mutation) so the shared injected invoker is never altered.
+        """
+        merged = {**self._extra_env, **overlay}
+        return RepoDriverLiveGateInvoker(
+            repo_path=self._repo_path,
+            driver_argv=self._driver_argv,
+            timeout_seconds=self._timeout_seconds,
+            extra_env=merged,
+        )
+
     def invoke(
         self, *, feature: str, target: str, gates: tuple[str, ...] = ()
     ) -> LiveGateInvocation:

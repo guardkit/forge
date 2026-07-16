@@ -67,6 +67,7 @@ from forge.deploy.reservation import (
     ReservationLease,
 )
 from forge.deploy.runbook_builder import (
+    build_candidate_teardown_runbook,
     build_deploy_runbook,
     build_live_gate_runbook,
     build_revert_runbook,
@@ -193,12 +194,14 @@ class DeployStageRunner:
             base_url=self._config.sidecar_url, repo=self._target_repo
         )
 
-    def _build_registry(self) -> StepTypeRegistry:
+    def _build_registry(
+        self, *, live_gate_invoker: LiveGateInvoker | None = None
+    ) -> StepTypeRegistry:
         registry = StepTypeRegistry()
         register_deploy_handlers(
             registry,
             dry_run=self._dry_run,
-            live_gate_invoker=self._live_gate_invoker,
+            live_gate_invoker=live_gate_invoker or self._live_gate_invoker,
             broker_inspector=self._broker_inspector,
             presence_resolver=self._presence_resolver,
             script_runner=self._resolve_script_runner(),
@@ -276,11 +279,39 @@ class DeployStageRunner:
             )
             events.append("DeployQueued")
 
+            # --- [candidate leg] optional candidate-then-promote gate ------
+            # When the profile carries a candidate section, stand the build up
+            # under a separate ``-cand`` project and gate it FIRST. A candidate
+            # that fails its gate is torn down and the run ends here — the LIVE
+            # name is never touched, no DeployStarted, no revert. Only a PASS
+            # falls through to the live (promote) leg below. Absent candidate
+            # section ⇒ this is skipped ⇒ byte-identical to the direct-live flow.
+            promote_extra_env: dict[str, str] | None = None
+            if profile.candidate is not None:
+                candidate_terminal = await self._run_candidate_leg(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
+                    feature=feature or (feat_id or profile.env_id),
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    profile_ref=profile_ref,
+                    events=events,
+                )
+                if candidate_terminal is not None:
+                    return candidate_terminal
+                # Candidate PASSED — the live leg re-tags-and-promotes the
+                # candidate-built image (PROMOTE=1, no overlay: promote must NOT
+                # rebuild — it re-tags + brings the live project up --no-build,
+                # snapshotting the previous live image as the rollback tag).
+                promote_extra_env = {"PROMOTE": "1"}
+
             deploy_runbook = build_deploy_runbook(
                 profile,
                 runbook_id=f"deploy-{deploy_run_id}",
                 target=profile.env_id,
                 now=self._clock(),
+                compose_extra_env=promote_extra_env,
             )
             await self._safe_publish(
                 self._deploy_publisher.publish_deploy_started,
@@ -349,6 +380,19 @@ class DeployStageRunner:
             )
             events.append("DeployComplete")
 
+            # --- [candidate leg] post-promote teardown ---------------------
+            # The promote succeeded (the candidate image is now the live image),
+            # so the ``-cand`` project is redundant. Tear it down unless the
+            # profile asked to keep it up for manual poking. Best-effort: a
+            # leftover candidate is not a live-deploy failure, so a teardown
+            # hiccup is logged, never fails the (already-live) deploy.
+            if profile.candidate is not None and not profile.candidate.keep:
+                await self._teardown_candidate(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
+                )
+
             # --- LIVE_GATE (optional) --------------------------------------
             verdict: str | None = None
             live_gate_runbook_id: str | None = None
@@ -411,11 +455,25 @@ class DeployStageRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _run_runbook(self, runbook: Runbook, correlation_id: str) -> RunResult:
-        """Persist a runbook and run it through the shipped FMDR executor."""
+    async def _run_runbook(
+        self,
+        runbook: Runbook,
+        correlation_id: str,
+        *,
+        live_gate_invoker: LiveGateInvoker | None = None,
+    ) -> RunResult:
+        """Persist a runbook and run it through the shipped FMDR executor.
+
+        ``live_gate_invoker`` overrides the injected invoker for this run only
+        (the candidate-leg live gate threads a candidate.env-overlaid invoker so
+        its driver addresses the ``-cand`` instance). ``None`` = the injected
+        invoker unchanged.
+        """
         self._repo.create_runbook(runbook, correlation_id=correlation_id)
         executor = RunbookExecutor(
-            self._repo, self._build_registry(), self._runbook_publisher
+            self._repo,
+            self._build_registry(live_gate_invoker=live_gate_invoker),
+            self._runbook_publisher,
         )
         return await executor.run(runbook.runbook_id, correlation_id=correlation_id)
 
@@ -486,21 +544,48 @@ class DeployStageRunner:
         feat_id: str | None,
         task_id: str | None,
         events: list[str],
+        runbook_id: str | None = None,
+        driver_env_overlay: dict[str, str] | None = None,
+        publish_domain_events: bool = True,
     ) -> tuple[str | None, str | None, str | None]:
         """Run the LIVE_GATE runbook and publish QAVerdict + LiveGateResult.
 
         Returns ``(verdict, live_gate_runbook_id, failing_verdict_ref)`` — the
         evidence ref (F5 index, falling back to the run id) lets the O-32 revert
         receipt cite the failing gate.
+
+        Candidate-then-promote sequencing (S2F): the candidate-leg call passes a
+        ``-cand``-suffixed ``runbook_id``, a ``driver_env_overlay`` (candidate.env,
+        merged into the driver env so the gate hits the candidate instance), and
+        ``publish_domain_events=False`` — the candidate gate is an INTERNAL gate,
+        so it emits the FMDR runbook step/receipt events (an honest audit trail)
+        but NOT the deploy-domain QAVerdict/LiveGateResult, which stay reserved
+        for the ONE live deploy. The promote/direct-live leg keeps the defaults.
         """
         gate_runbook = build_live_gate_runbook(
             profile,
-            runbook_id=f"live-gate-{deploy_run_id}",
+            runbook_id=runbook_id or f"live-gate-{deploy_run_id}",
             target=profile.env_id,
             feature=feature,
             now=self._clock(),
         )
-        run_result = await self._run_runbook(gate_runbook, correlation_id)
+        invoker_override: LiveGateInvoker | None = None
+        if driver_env_overlay:
+            with_overlay = getattr(self._live_gate_invoker, "with_extra_env", None)
+            if callable(with_overlay):
+                invoker_override = with_overlay(driver_env_overlay)
+            else:
+                # The injected invoker cannot carry an env overlay (a dry-run /
+                # fixed-verdict test seam). The overlay is best-effort only here;
+                # the candidate.env already reaches deploy_compose + health_check
+                # (which is what physically addresses the -cand instance).
+                logger.debug(
+                    "live-gate invoker has no with_extra_env; candidate driver "
+                    "overlay not applied"
+                )
+        run_result = await self._run_runbook(
+            gate_runbook, correlation_id, live_gate_invoker=invoker_override
+        )
         executed = self._repo.load_runbook(
             gate_runbook.runbook_id, correlation_id=correlation_id
         )
@@ -537,30 +622,221 @@ class DeployStageRunner:
             "app_url": payload.get("app_url"),
             "leak_sweep_findings": payload.get("leak_sweep_findings"),
         }
-        await self._safe_publish(
-            self._deploy_publisher.publish_qa_verdict,
-            QAVerdictPayload(
-                **common,
-                assertions=list(assertions),
-                dispositions_ref=payload.get("dispositions_ref"),
-                attempts_ledger_ref=payload.get("attempts_ledger_ref"),
-                decided_at=decided_at,
-            ),
-        )
-        events.append("QAVerdict")
-        await self._safe_publish(
-            self._deploy_publisher.publish_live_gate_result,
-            LiveGateResultPayload(
-                **common,
-                assertions=list(assertions),
-                screenshot_refs=list(payload.get("screenshot_refs", [])),
-                trace_refs=list(payload.get("trace_refs", [])),
-                finished_at=decided_at,
-            ),
-        )
-        events.append("LiveGateResult")
+        if publish_domain_events:
+            await self._safe_publish(
+                self._deploy_publisher.publish_qa_verdict,
+                QAVerdictPayload(
+                    **common,
+                    assertions=list(assertions),
+                    dispositions_ref=payload.get("dispositions_ref"),
+                    attempts_ledger_ref=payload.get("attempts_ledger_ref"),
+                    decided_at=decided_at,
+                ),
+            )
+            events.append("QAVerdict")
+            await self._safe_publish(
+                self._deploy_publisher.publish_live_gate_result,
+                LiveGateResultPayload(
+                    **common,
+                    assertions=list(assertions),
+                    screenshot_refs=list(payload.get("screenshot_refs", [])),
+                    trace_refs=list(payload.get("trace_refs", [])),
+                    finished_at=decided_at,
+                ),
+            )
+            events.append("LiveGateResult")
         failing_verdict_ref = common["evidence_index_ref"] or common["run_id"]
         return verdict, gate_runbook.runbook_id, failing_verdict_ref
+
+    async def _run_candidate_leg(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feature: str,
+        feat_id: str | None,
+        task_id: str | None,
+        profile_ref: str | None,
+        events: list[str],
+    ) -> DeployStageResult | None:
+        """Stand the candidate up under ``-cand``, gate it, promote-or-teardown.
+
+        Returns ``None`` when the candidate PASSED (the caller proceeds to the
+        promote leg). Returns a terminal ``DeployStageResult`` (outcome="failed",
+        detail reason ``candidate_failed`` / ``candidate_deploy_failed``) when the
+        candidate deploy or gate failed — in which case the candidate has been
+        torn down and the LIVE name was NEVER touched (no DeployStarted, no
+        revert). Emits the FMDR runbook step/receipt events for its runbooks; the
+        deploy-domain QAVerdict/LiveGateResult stay reserved for the live leg.
+        """
+        assert profile.candidate is not None  # caller-guarded
+        cand_env = dict(profile.candidate.env)
+        compose_extra = {"CANDIDATE": "1", **cand_env}
+
+        # --- candidate deploy (separate -cand project) ---
+        cand_runbook = build_deploy_runbook(
+            profile,
+            runbook_id=f"deploy-cand-{deploy_run_id}",
+            target=profile.env_id,
+            now=self._clock(),
+            compose_extra_env=compose_extra,
+            check_extra_env=cand_env,
+        )
+        run_result = await self._run_runbook(cand_runbook, correlation_id)
+        executed = self._repo.load_runbook(
+            cand_runbook.runbook_id, correlation_id=correlation_id
+        )
+        if run_result.status != "complete":
+            failed_step = "candidate_deploy"
+            if executed is not None and run_result.stopped_at_index is not None:
+                idx = run_result.stopped_at_index
+                if 0 <= idx < len(executed.steps):
+                    failed_step = executed.steps[idx].step_type
+            await self._teardown_candidate(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+            )
+            return await self._candidate_failed_result(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feat_id=feat_id,
+                task_id=task_id,
+                profile_ref=profile_ref,
+                failed_step=failed_step,
+                reason="candidate_deploy_failed",
+                failing_verdict=None,
+                events=events,
+            )
+
+        # --- candidate live gate (candidate.env overlay, no domain events) ---
+        if self._config.run_live_gate:
+            verdict, _, _ = await self._run_live_gate(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feature=feature,
+                feat_id=feat_id,
+                task_id=task_id,
+                events=events,
+                runbook_id=f"live-gate-cand-{deploy_run_id}",
+                driver_env_overlay=cand_env,
+                publish_domain_events=False,
+            )
+            if verdict != "pass":
+                await self._teardown_candidate(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
+                )
+                return await self._candidate_failed_result(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    profile_ref=profile_ref,
+                    failed_step="candidate_gate",
+                    reason="candidate_failed",
+                    failing_verdict=verdict if verdict is not None else "instrument_fail",
+                    events=events,
+                )
+
+        return None  # candidate passed → caller promotes
+
+    async def _teardown_candidate(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+    ) -> None:
+        """Tear the ``-cand`` compose project down (best-effort, never raises)."""
+        assert profile.candidate is not None
+        teardown_env = {"CANDIDATE_DOWN": "1", **dict(profile.candidate.env)}
+        teardown_runbook = build_candidate_teardown_runbook(
+            profile,
+            runbook_id=f"teardown-cand-{deploy_run_id}",
+            target=profile.env_id,
+            extra_env=teardown_env,
+            now=self._clock(),
+        )
+        try:
+            run_result = await self._run_runbook(teardown_runbook, correlation_id)
+            if run_result.status != "complete":
+                logger.warning(
+                    "candidate teardown for %s did not complete (status=%s); "
+                    "the -cand project may still be up (manual cleanup)",
+                    profile.env_id,
+                    run_result.status,
+                )
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning("candidate teardown raised (continuing): %s", exc)
+
+    async def _candidate_failed_result(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feat_id: str | None,
+        task_id: str | None,
+        profile_ref: str | None,
+        failed_step: str,
+        reason: str,
+        failing_verdict: str | None,
+        events: list[str],
+    ) -> DeployStageResult:
+        """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
+
+        A loud, honest failure that names the candidate as the cause and records
+        that the live name was untouched — recoverable (retry the deploy), never
+        a revert (there is nothing live to roll back to).
+        """
+        when = self._clock()
+        detail_verdict = (
+            f" (candidate live-gate verdict {failing_verdict!r} != 'pass')"
+            if failing_verdict is not None
+            else ""
+        )
+        failure_reason = (
+            f"candidate leg failed at {failed_step!r}{detail_verdict}; the "
+            f"candidate ('{profile.env_id}-cand') was torn down and the LIVE "
+            f"name '{profile.env_id}' was never touched (no promote, no revert)"
+        )
+        logger.error("candidate-then-promote gate refused promote: %s", failure_reason)
+        await self._safe_publish(
+            self._deploy_publisher.publish_deploy_failed,
+            DeployFailedPayload(
+                correlation_id=correlation_id,
+                env_id=profile.env_id,
+                deploy_run_id=deploy_run_id,
+                failed_step=failed_step,
+                failure_reason=failure_reason,
+                recoverable=True,
+                feat_id=feat_id,
+                task_id=task_id,
+                deploy_record_ref=None,
+                deploy_profile_ref=profile_ref,
+                runbook_ref=f"deploy-cand-{deploy_run_id}",
+                hosts=profile.host_names or None,
+                reservation_resource=profile.reservation_resource,
+                failed_at=when,
+            ),
+        )
+        events.append("DeployFailed")
+        return DeployStageResult(
+            outcome="failed",
+            deploy_run_id=deploy_run_id,
+            verdict=failing_verdict,
+            failed_step=failed_step,
+            events=tuple(events),
+            deploy_runbook_id=f"deploy-cand-{deploy_run_id}",
+            dry_run=self._dry_run,
+            detail={"reason": reason, "failing_verdict": failing_verdict},
+        )
 
     async def _run_revert(
         self,

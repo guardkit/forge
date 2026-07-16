@@ -92,6 +92,7 @@ def _run_scripts(
     default_env_file: str | None,
     dry_run: bool,
     runner: ScriptRunner = _run_script_step,
+    extra_env: dict[str, str] | None = None,
 ) -> StepOutcome:
     """Run a list of ``{script, cwd?, env_file?}`` entries as subprocess steps.
 
@@ -101,6 +102,12 @@ def _run_scripts(
     first non-zero exit fails the step. The ``runner`` seam lets the
     docker-touching ``health_check`` step route through the deploy sidecar (S1)
     while the DB/model-touching steps stay on the in-process default.
+
+    ``extra_env`` (candidate-then-promote sequencing, S2F): a non-secret env
+    overlay threaded to EVERY script's subprocess (e.g. the candidate.env
+    overlay pointing the candidate-leg health checks at the ``-cand`` port).
+    ``None`` (every legacy call) ⇒ ``extra_env=None`` to the runner ⇒
+    byte-identical to before the overlay existed.
     """
     if dry_run:
         return StepOutcome(
@@ -128,6 +135,7 @@ def _run_scripts(
             env_file=env_file,
             timeout=entry.get("timeout", DEFAULT_TIMEOUT_SECONDS),
             output_cap=entry.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES),
+            extra_env=extra_env,
         )
         ran.append(
             {"script": script, "exit_code": exit_code, "captured_output": output}
@@ -415,6 +423,11 @@ def make_health_check_handler(
     ``script_runner`` (deploy.execution_surface='sidecar') routes the health
     scripts through the deploy sidecar; ``None`` (the local default) keeps the
     in-process subprocess core — byte-identical to before the seam existed.
+
+    A ``extra_env`` step param (candidate-then-promote sequencing, S2F) is a
+    non-secret env overlay threaded to every health-check subprocess — the
+    candidate.env addressing overlay so the candidate-leg checks hit the
+    ``-cand`` port. Absent ⇒ ``None`` ⇒ byte-identical.
     """
     runner = script_runner or _run_script_step
 
@@ -434,12 +447,23 @@ def make_health_check_handler(
             for c in checks
             if isinstance(c, dict) and c.get("cmd")
         ]
+        params_extra_env = step.params.get("extra_env")
+        extra_env = (
+            {
+                k: v
+                for k, v in params_extra_env.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+            if isinstance(params_extra_env, dict)
+            else None
+        )
         return _run_scripts(
             scripts,
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
             runner=runner,
+            extra_env=extra_env,
         )
 
     return health_check
