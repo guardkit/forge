@@ -462,7 +462,11 @@ def test_discovery_empty_when_no_tests_tree(tmp_path: Path) -> None:
 )
 def test_discovery_against_the_REAL_api_test_checkout() -> None:
     """Against Rich's REAL api_test checkout, the descriptor roots are exactly
-    the set guardkit's ``feature validate`` reports (tests/health, tests/users) —
-    the byte-identical roots from the round-10 live validate error."""
+    the set guardkit's ``feature validate`` reports — the round-10 byte-identical
+    roots (tests/health, tests/users) plus tests/version since the FEAT-B70F
+    merge (``e0ad48a``, the B4 first live pass) landed the /version endpoint's
+    tests (dated truth-update 2026-07-16). A live-fixture test: when the real
+    checkout legitimately grows a root, update this list with a dated note —
+    never loosen it to a pattern."""
     roots = discover_target_test_roots(_REAL_API_TEST)
-    assert roots == ["tests/health", "tests/users"]
+    assert roots == ["tests/health", "tests/users", "tests/version"]
