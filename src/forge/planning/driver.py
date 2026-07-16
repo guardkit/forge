@@ -97,6 +97,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.planning.target_terminal_tools import (
         NormalizeFeatureSpecFn,
         ValidateFeaturePlanFn,
+        ValidateGateRegistryFn,
         ValidatePassBarFn,
     )
 
@@ -136,6 +137,51 @@ _BUILD_QUEUED_STAGE = "build-queued"
 #: Rich-ratified). Its presence makes the leg idempotent on a re-drive: a crash
 #: between the bars commit and the BUILD_QUEUED transition never re-mints them.
 _QA_PASS_BARS_STAGE = "qa-pass-bars"
+#: Durable stage label for the per-feature live-gate REGISTRATION leg (F2 —
+#: sibling of the pass-bar leg). Its presence makes the leg idempotent on a
+#: re-drive: a crash between the gate commit and the BUILD_QUEUED transition
+#: never re-fills the gate. An HONEST skip (non-endpoint feature, or a repo that
+#: has not adopted the qa/gates/ surface) ALSO records this label (a skipped
+#: detail), so a re-drive of a legitimately-skipped run is a clean no-op too.
+_QA_FEATURE_GATE_STAGE = "qa-feature-gate"
+
+#: The target repo's OWN feature-behaviour gate TEMPLATE + gate registry, read
+#: off the planning branch (never fabricated forge-side). Their ABSENCE is an
+#: honest skip (the repo has not adopted the F4 gate surface), never a failure.
+_FEATURE_GATE_TEMPLATE_REL = "qa/gates/feature_behaviour_gate.py"
+_GATE_REGISTRY_REL = "qa/gates/registry.yaml"
+
+#: The two placeholder literals the forge fill substitutes in the target repo's
+#: OWN template SPEC block (guardkit api_test ``feature_behaviour_gate.py``). Each
+#: must appear EXACTLY once; a count mismatch is a loud fill failure (the repo's
+#: template drifted from the shape forge fills — never a silent wrong gate). The
+#: ``/REPLACE_ME`` guard line elsewhere in the template is a DIFFERENT literal and
+#: is deliberately left intact so an unedited copy still fails honestly at runtime.
+_GATE_TEMPLATE_GATE_ID_LITERAL = '"gate_id": "feature-behaviour",'
+_GATE_TEMPLATE_REQUEST_LITERAL = (
+    '"request": {"method": "GET", "path": "/REPLACE_ME"},'
+)
+
+#: F2 endpoint-derivation grammar (deterministic, conservative — the design law).
+#: Parse ONLY machine-class criterion text: a capital ``A``, an uppercase HTTP
+#: verb, ``request to``, then an explicit ``/``-rooted path. Case-sensitive (no
+#: IGNORECASE) so mid-sentence prose ("you can get request info") and mixed-case
+#: never match; the leading ``\bA `` anchors the SPL criterion phrasing. Only a
+#: GET yields a v1 gate (expect_status 200); any other verb, a missing path, or a
+#: non-match yields None → an honest skip (never a guessed success status).
+_FEATURE_GATE_ENDPOINT_RE = re.compile(
+    r"\bA (?P<method>GET|POST|PUT|PATCH|DELETE) request to "
+    r"(?P<path>/[A-Za-z0-9_/{}-]*)\b"
+)
+
+
+class _FeatureGateFillError(Exception):
+    """A derivable feature gate could not be filled / its registry appended.
+
+    Raised by the F2 fill helpers on template drift or an unparseable/empty
+    registry — the caller maps it to a LOUD ``_fail_leg`` (SKIP-vs-FAIL law (c):
+    template present + derivable but the fill fails is a failure, never a skip).
+    """
 
 #: The 007 native artifact-map key convention for the feature-grain quality-bar
 #: SEED (specialist-agent product_owner/modes/feature_spec.py; guardkit
@@ -317,6 +363,13 @@ class PlanningDriverDeps:
     # requires it; a missing collaborator fails the run LOUDLY (never a silent
     # skip — the same posture as the other target-terminal oracles).
     validate_pass_bar: "ValidatePassBarFn | None" = None
+    # Lane B / Phase E1 (F2 — the per-feature live-gate REGISTRATION leg, sibling
+    # of the pass-bar leg) — the guardkit ``qa validate gate-registry`` oracle.
+    # Optional / default None: with the flag OFF it is never consulted. With the
+    # flag ON the per-feature gate-registration leg requires it; a missing
+    # collaborator fails the run LOUDLY (never a silent skip — the same posture
+    # as the other target-terminal oracles).
+    validate_gate_registry: "ValidateGateRegistryFn | None" = None
     # Lane B / Phase E1 (B3) — the build trigger. Optional / default None: with
     # the target-terminal flag OFF it is never consulted; with the flag ON it is
     # required and a missing collaborator fails the run LOUDLY (never silent).
@@ -455,6 +508,8 @@ class PlanningRunDriver:
                 if not await self._feature_plan_leg(row, correlation_id):
                     return
                 if not await self._register_pass_bars_leg(row, correlation_id):
+                    return
+                if not await self._register_feature_gate_leg(row, correlation_id):
                     return
                 if not await self._build_trigger_leg(row, correlation_id):
                     return
@@ -1791,6 +1846,417 @@ class PlanningRunDriver:
             plan_sha,
         )
         return True
+
+    async def _register_feature_gate_leg(
+        self, row: Any, correlation_id: str
+    ) -> bool:
+        """Register a per-feature live GATE from the 007 seed at plan-commit (F2).
+
+        The exact sibling of :meth:`_register_pass_bars_leg`. The pass-bar leg
+        registers the pass BARS the B2 precondition demands; this leg closes the
+        matching gap on the OTHER side — at plan-commit the machine flow
+        registered bars but no live GATE, so the post-deploy live-gate only
+        proved "the deployment passes health+stats", never "the NEW endpoint
+        passes a REGISTERED gate". Forge derives the endpoint from the seed's
+        machine criteria, fills the target repo's OWN feature-behaviour gate
+        TEMPLATE, appends a mirrored GateEntry to its OWN gate registry, and
+        commits both as ONE commit AFTER the bars commit and BEFORE the build
+        trigger.
+
+        SKIP-vs-FAIL law (BINDING):
+          (a) no machine criterion yields a GET ``{method,path}`` → honest
+              ``skipped`` leg event ("no derivable endpoint — no gate
+              registered") and CONTINUE to the build (non-endpoint features are
+              legitimate);
+          (b) the target repo carries no ``qa/gates/feature_behaviour_gate.py``
+              template or no ``qa/gates/registry.yaml`` on the branch → the same
+              honest skip (the repo has not adopted the F4 gate surface);
+          (c) template + derivable but the fill / validate / commit fails → LOUD
+              :meth:`_fail_leg` (same posture as the bars leg);
+          (d) the auth-flagged seed case never reaches this leg — the bars leg
+              refuses it first — so no auth handling is re-implemented here.
+
+        Idempotent: a durable ``qa-feature-gate`` event (approved, whether a real
+        registration OR an honest skip) short-circuits a re-drive. Returns True
+        to keep driving (skip AND success both proceed to the B3 trigger), False
+        on a loud terminal failure.
+        """
+        deps = self._deps
+        if self._has_leg_event(correlation_id, _QA_FEATURE_GATE_STAGE):
+            logger.info(
+                "planning driver: run %s feature gate already resolved "
+                "(idempotent re-drive — proceeding to the B3 build trigger)",
+                correlation_id,
+            )
+            return True
+
+        if deps.validate_gate_registry is None:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_FEATURE_GATE_STAGE,
+                "target terminal ON but the gate-registry validate collaborator "
+                "(validate_gate_registry) is not wired",
+            )
+
+        # The seed the bars leg consumed (persisted on the durable feature-spec
+        # event). By construction it is authless here — the bars leg refuses an
+        # auth-flagged seed BEFORE this leg runs (driver.py auth gate), so we
+        # never re-implement that refusal. A missing/unparseable seed can only
+        # reach here if the bars leg already failed (it guards the same seed), so
+        # treat it defensively as an honest skip: nothing derivable, no gate.
+        spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
+        raw_seed = spec_details.get("pass_bar_seed")
+        seed: Any = None
+        if raw_seed:
+            try:
+                seed = yaml.safe_load(raw_seed)
+            except yaml.YAMLError:
+                seed = None
+        criteria = (
+            seed.get("criteria") if isinstance(seed, Mapping) else None
+        ) or []
+
+        endpoint = self._derive_feature_gate_endpoint(criteria)
+        if endpoint is None:
+            return self._skip_feature_gate(
+                correlation_id,
+                "no derivable endpoint — no gate registered",
+            )
+
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        feature_id = str(plan_details.get("feature_id") or "")
+        plan_sha = str(plan_details.get("sha") or "")
+        branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
+        if not feature_id or not plan_sha:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_FEATURE_GATE_STAGE,
+                "no feature id / plan commit sha recorded on the feature-plan "
+                "leg — cannot register the per-feature live gate",
+            )
+
+        # The first minted pass bar is the gate's ``pass_bar_ref`` (the gate and
+        # its bar share the feature's first task). No bars ⇒ nothing to reference
+        # ⇒ honest skip (a validated plan with zero tasks registers no gate).
+        bars_details = self._leg_event_details(correlation_id, _QA_PASS_BARS_STAGE)
+        bar_files = sorted(str(f) for f in (bars_details.get("bar_files") or []))
+        if not bar_files:
+            return self._skip_feature_gate(
+                correlation_id,
+                "the plan registered no pass bars — no gate pass_bar_ref to "
+                "anchor; no gate registered",
+            )
+        pass_bar_ref = bar_files[0]
+
+        resolved = await self._resolve_repo(
+            row, correlation_id, stage_label=_QA_FEATURE_GATE_STAGE
+        )
+        if resolved is None:
+            return False
+        _target_repo, repo_path = resolved
+
+        # (b) The repo's OWN gate surface must exist on the branch — never
+        # fabricated forge-side. Absent ⇒ the repo has not adopted the F4 gate
+        # surface ⇒ honest skip.
+        template = await deps.git_runner.read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=_FEATURE_GATE_TEMPLATE_REL
+        )
+        if not template:
+            return self._skip_feature_gate(
+                correlation_id,
+                f"the target repo carries no {_FEATURE_GATE_TEMPLATE_REL} "
+                "template on the branch — the F4 gate surface is not adopted; "
+                "no gate registered",
+            )
+        registry_raw = await deps.git_runner.read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=_GATE_REGISTRY_REL
+        )
+        if not registry_raw:
+            return self._skip_feature_gate(
+                correlation_id,
+                f"the target repo carries no {_GATE_REGISTRY_REL} on the branch "
+                "— the F4 gate surface is not adopted; no gate registered",
+            )
+
+        # Derive the slug + snake filename deterministically from the seed.
+        raw_slug = str(seed.get("feature_slug") or "").strip()
+        slug = self._sanitise_slug(raw_slug) or feature_id.lower()
+        slug_snake = re.sub(r"[^a-z0-9]+", "_", slug.lower()).strip("_")
+        if not slug_snake:
+            return await self._fail_leg(
+                correlation_id,
+                _QA_FEATURE_GATE_STAGE,
+                f"could not derive a gate filename from feature_slug={raw_slug!r} "
+                f"/ feature_id={feature_id}",
+            )
+        gate_rel = f"qa/gates/{slug_snake}_gate.py"
+
+        # (c) Fill the template + append the registry entry. A drift in the
+        # template's fillable literals, or a malformed registry, is a LOUD fail.
+        try:
+            filled_gate = self._fill_feature_gate(template, slug, endpoint)
+            new_registry = self._append_gate_registry_entry(
+                registry_raw,
+                gate_id=slug,
+                gate_path=gate_rel,
+                pass_bar_ref=pass_bar_ref,
+            )
+        except _FeatureGateFillError as exc:
+            return await self._fail_leg(
+                correlation_id, _QA_FEATURE_GATE_STAGE, str(exc)
+            )
+
+        validate = deps.validate_gate_registry
+
+        async def _pre_commit(worktree: Path) -> PreCommitResult:
+            # Run guardkit's OWN ``qa validate gate-registry`` on the appended
+            # registry so a malformed forge-appended entry fails the leg BEFORE
+            # it lands (never an entry the post-deploy live-gate would reject).
+            outcome = await validate(worktree, _GATE_REGISTRY_REL)
+            return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
+
+        files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
+        try:
+            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+                repo_path=repo_path,
+                branch=branch,
+                files=files,
+                message=(
+                    f"planning: register the per-feature live gate for "
+                    f"{correlation_id} ({feature_id}, GET {endpoint['path']} — "
+                    "F2 seed derivation)"
+                ),
+                pre_commit=_pre_commit,
+            )
+        except Exception as exc:  # noqa: BLE001 — write boundary
+            return await self._fail_leg(
+                correlation_id,
+                _QA_FEATURE_GATE_STAGE,
+                f"feature-gate write raised {type(exc).__name__}: {exc}",
+            )
+        if gitres.status == "failed":
+            return await self._fail_leg(
+                correlation_id,
+                _QA_FEATURE_GATE_STAGE,
+                f"feature-gate write / qa validate gate-registry failed: "
+                f"{gitres.stderr}",
+            )
+
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_QA_FEATURE_GATE_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "feature_id": feature_id,
+                    "gate_file": gate_rel,
+                    "registry_file": _GATE_REGISTRY_REL,
+                    "gate_id": slug,
+                    "endpoint": endpoint,
+                    "pass_bar_ref": pass_bar_ref,
+                    "registered_at_sha": plan_sha,
+                    "sha": gitres.sha,
+                    "branch": branch,
+                }
+            ),
+        )
+        await self._notify(
+            correlation_id,
+            f"Planning run {correlation_id}: registered a live gate for "
+            f"{feature_id} (GET {endpoint['path']} → {gate_rel}) on branch "
+            f"{branch} before queueing the build.",
+            level="info",
+        )
+        logger.info(
+            "planning driver: run %s registered feature gate %s (endpoint=GET "
+            "%s, feature_id=%s, plan_sha=%s)",
+            correlation_id,
+            gate_rel,
+            endpoint["path"],
+            feature_id,
+            plan_sha,
+        )
+        return True
+
+    def _skip_feature_gate(self, correlation_id: str, reason: str) -> bool:
+        """Record an HONEST skipped ``qa-feature-gate`` leg event and CONTINUE.
+
+        A non-endpoint feature (or a repo that has not adopted the qa/gates/
+        surface) is a legitimate no-gate outcome, not a failure: record the
+        durable label (so a re-drive is a clean no-op) with a ``skipped`` detail
+        and return True so the caller proceeds to the B3 build trigger. Zero
+        target-repo writes.
+        """
+        logger.info(
+            "planning driver: run %s feature gate skipped — %s",
+            correlation_id,
+            reason,
+        )
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_QA_FEATURE_GATE_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps({"skipped": True, "reason": reason}),
+        )
+        return True
+
+    def _derive_feature_gate_endpoint(
+        self, criteria: Any
+    ) -> dict[str, str] | None:
+        """First machine criterion that yields a v1 (GET) gate endpoint, or None.
+
+        Iterates the seed's criteria in order; for each ``class: machine``
+        criterion applies :meth:`_derive_get_endpoint` to its text and returns
+        the first match. Non-machine criteria, non-GET verbs, missing paths and
+        prose all yield nothing — an honest skip rather than a guessed gate.
+        """
+        if not isinstance(criteria, list):
+            return None
+        for crit in criteria:
+            if not isinstance(crit, Mapping):
+                continue
+            if str(crit.get("class")) != "machine":
+                continue
+            endpoint = self._derive_get_endpoint(str(crit.get("text") or ""))
+            if endpoint is not None:
+                return endpoint
+        return None
+
+    @staticmethod
+    def _derive_get_endpoint(text: str) -> dict[str, str] | None:
+        """Conservative v1 endpoint derivation from one criterion's free text.
+
+        Returns ``{"method": "GET", "path": "/…"}`` ONLY when the strict grammar
+        matches AND the verb is GET (the sole verb whose happy-path status forge
+        knows: 200). Any other verb, a missing path, wrong case, or mid-sentence
+        prose returns None (skip — forge never guesses a success status).
+        """
+        match = _FEATURE_GATE_ENDPOINT_RE.search(text)
+        if match is None or match.group("method") != "GET":
+            return None
+        return {"method": "GET", "path": match.group("path")}
+
+    @staticmethod
+    def _fill_feature_gate(
+        template: str, gate_id: str, endpoint: Mapping[str, str]
+    ) -> str:
+        """Fill the target repo's OWN feature-behaviour gate template (F2).
+
+        Substitutes ONLY the two fillable SPEC literals (gate_id + the request
+        method/path), leaving the rest of the template — including the
+        ``/REPLACE_ME`` runtime guard elsewhere — byte-untouched. v1 derives NO
+        json_assertions from free text (the filled gate asserts status + valid
+        JSON body + the template's own header defaults). Each literal must appear
+        EXACTLY once; a mismatch means the repo's template drifted from the shape
+        forge fills — raise so the caller fails the leg loudly (never a silently
+        wrong gate).
+        """
+        if template.count(_GATE_TEMPLATE_GATE_ID_LITERAL) != 1:
+            raise _FeatureGateFillError(
+                "the target repo's feature-behaviour gate template does not "
+                f"carry the fillable gate_id literal exactly once "
+                f"({_GATE_TEMPLATE_GATE_ID_LITERAL!r}) — template drift; "
+                "refusing to fill a wrong gate"
+            )
+        if template.count(_GATE_TEMPLATE_REQUEST_LITERAL) != 1:
+            raise _FeatureGateFillError(
+                "the target repo's feature-behaviour gate template does not "
+                f"carry the fillable request literal exactly once "
+                f"({_GATE_TEMPLATE_REQUEST_LITERAL!r}) — template drift; "
+                "refusing to fill a wrong gate"
+            )
+        method = endpoint["method"]
+        path = endpoint["path"]
+        filled = template.replace(
+            _GATE_TEMPLATE_GATE_ID_LITERAL, f'"gate_id": "{gate_id}",'
+        )
+        filled = filled.replace(
+            _GATE_TEMPLATE_REQUEST_LITERAL,
+            f'"request": {{"method": "{method}", "path": "{path}"}},',
+        )
+        return filled
+
+    @staticmethod
+    def _append_gate_registry_entry(
+        registry_raw: str,
+        *,
+        gate_id: str,
+        gate_path: str,
+        pass_bar_ref: str,
+    ) -> str:
+        """Append one mirrored GateEntry to the repo's OWN gate registry (F2).
+
+        Reads the existing registry, MIRRORS a sibling entry's ``target
+        {base_url_env, environment_id}``, ``preconditions``, ``preflight`` and
+        ``evidence_dir_pattern`` (never hardcoding ``API_TEST_*``), points the new
+        entry at ``gate_path`` with the first minted bar as ``pass_bar_ref``, and
+        TEXTUALLY appends the rendered block so the existing entries + header
+        comments stay byte-untouched. Raises when the registry is unparseable or
+        carries no sibling entry to mirror (a loud-fail signal).
+        """
+        try:
+            data = yaml.safe_load(registry_raw)
+        except yaml.YAMLError as exc:
+            raise _FeatureGateFillError(
+                f"the target repo's {_GATE_REGISTRY_REL} is not parseable "
+                f"YAML: {exc}"
+            ) from exc
+        gates = data.get("gates") if isinstance(data, Mapping) else None
+        if not isinstance(gates, list) or not gates:
+            raise _FeatureGateFillError(
+                f"the target repo's {_GATE_REGISTRY_REL} carries no gate entry "
+                "to mirror — cannot copy the sibling's base_url_env / "
+                "preconditions / preflight / evidence_dir_pattern"
+            )
+        sibling = next((g for g in gates if isinstance(g, Mapping)), None)
+        if sibling is None:
+            raise _FeatureGateFillError(
+                f"the target repo's {_GATE_REGISTRY_REL} gates list carries no "
+                "mapping entry to mirror"
+            )
+        sib_target = sibling.get("target") if isinstance(sibling, Mapping) else {}
+        base_url_env = (
+            str(sib_target.get("base_url_env"))
+            if isinstance(sib_target, Mapping) and sib_target.get("base_url_env")
+            else None
+        )
+        if not base_url_env:
+            raise _FeatureGateFillError(
+                f"the sibling gate entry in {_GATE_REGISTRY_REL} carries no "
+                "target.base_url_env to mirror"
+            )
+        environment_id = (
+            str(sib_target.get("environment_id"))
+            if isinstance(sib_target, Mapping) and sib_target.get("environment_id")
+            else "local"
+        )
+        entry: dict[str, Any] = {
+            "id": gate_id,
+            "path": gate_path,
+            "target": {
+                "base_url_env": base_url_env,
+                "environment_id": environment_id,
+            },
+            "preconditions": list(sibling.get("preconditions") or []),
+            "preflight": list(sibling.get("preflight") or []),
+            "pass_bar_ref": pass_bar_ref,
+            "evidence_dir_pattern": str(
+                sibling.get("evidence_dir_pattern")
+                or "qa/gates/evidence/{run_id}"
+            ),
+        }
+        block = yaml.safe_dump(
+            [entry], sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+        # Indent the top-level list block by two spaces so it nests under the
+        # existing ``gates:`` key, and append after the last existing entry.
+        indented = "".join(
+            ("  " + line if line.strip() else line)
+            for line in block.splitlines(keepends=True)
+        )
+        return registry_raw.rstrip("\n") + "\n" + indented
 
     # -- target-terminal helpers ---------------------------------------- #
 

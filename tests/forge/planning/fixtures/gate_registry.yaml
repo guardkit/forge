@@ -1,0 +1,52 @@
+# F4 · gate registry (guardkit qa kind: gate-registry)
+# The durable, named gate scripts this repo carries. The live-gate runner
+# executes ONLY registered gates. Each script honours the F4 contract: exit 0 =
+# pass; a non-zero exit enumerates its failures as a JSON results envelope on
+# stdout (assertion id, observed/expected, evidence_ref).
+#
+# base_url comes from the env-var NAMED here (base_url_env), never a hard-coded
+# URL (LPA-02). Default when unset: http://localhost:8901 (the compose front
+# door — see docker-compose.yml, app service host port 8901).
+#
+# The FEATURE-BEHAVIOUR gate TEMPLATE (qa/gates/feature_behaviour_gate.py) is
+# intentionally NOT registered here: it is a template S3 copies + fills in
+# (endpoint + assertions) and registers as its own entry (e.g. a `stats` gate
+# pointing at qa/gates/stats_gate.py with pass-bar-STATS.yaml).
+format_version: "1.0"
+gates:
+  - id: health
+    path: qa/gates/health_gate.py
+    target:
+      base_url_env: API_TEST_BASE_URL
+      environment_id: local
+    preconditions:
+      - suite_vs_ledger
+    preflight:
+      - tool_imports
+      - base_url_reachable
+    pass_bar_ref: qa/pass-bar-HEALTH.yaml
+    evidence_dir_pattern: qa/gates/evidence/{run_id}
+  - id: stats
+    path: qa/gates/stats_gate.py
+    target:
+      base_url_env: API_TEST_BASE_URL
+      environment_id: local
+    preconditions:
+      - suite_vs_ledger
+    preflight:
+      - tool_imports
+      - base_url_reachable
+    pass_bar_ref: qa/pass-bar-TASK-STAT-001.yaml
+    evidence_dir_pattern: qa/gates/evidence/{run_id}
+  - id: version
+    path: qa/gates/version_gate.py
+    target:
+      base_url_env: API_TEST_BASE_URL
+      environment_id: local
+    preconditions:
+      - suite_vs_ledger
+    preflight:
+      - tool_imports
+      - base_url_reachable
+    pass_bar_ref: qa/pass-bar-TASK-B70F-001.yaml
+    evidence_dir_pattern: qa/gates/evidence/{run_id}

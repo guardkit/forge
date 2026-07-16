@@ -666,6 +666,7 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.target_terminal_tools import (
             make_normalize_feature_spec,
             make_validate_feature_plan,
+            make_validate_gate_registry,
             make_validate_pass_bar,
         )
 
@@ -978,6 +979,10 @@ async def compose_planning_consumer_and_dispatch(
         # B4 round-19: the per-task pass bars forge mints from the 007 seed are
         # validated by guardkit's OWN ``qa validate pass-bar`` before they land.
         validate_pass_bar = make_validate_pass_bar()
+        # F2: the per-feature live gate forge fills + its appended registry entry
+        # are validated by guardkit's OWN ``qa validate gate-registry`` before
+        # they land.
+        validate_gate_registry = make_validate_gate_registry()
 
         # -- approval side -------------------------------------------------
         approval_publisher = ApprovalPublisher(nats_client=nats_client)
@@ -1068,6 +1073,10 @@ async def compose_planning_consumer_and_dispatch(
                 normalize_feature_spec=normalize_feature_spec,
                 validate_feature_plan=validate_feature_plan,
                 validate_pass_bar=validate_pass_bar,
+                # Lane B / Phase E1 (F2) — the per-feature live-gate registration
+                # leg (sibling of the pass-bar leg; no-op unless the endpoint is
+                # derivable AND the repo carries the qa/gates/ surface).
+                validate_gate_registry=validate_gate_registry,
                 # Lane B / Phase E1 (B3) — the Mode B build trigger.
                 dispatch_build_trigger=dispatch_build_trigger,
             )

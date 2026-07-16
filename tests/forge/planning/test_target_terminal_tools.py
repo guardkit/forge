@@ -24,6 +24,7 @@ from forge.planning.target_terminal_tools import (
     discover_target_test_roots,
     make_normalize_feature_spec,
     make_validate_feature_plan,
+    make_validate_gate_registry,
     make_validate_pass_bar,
     resolve_normalizer_command,
 )
@@ -183,6 +184,56 @@ async def test_validate_pass_bar_never_crashes_on_raise(tmp_path: Path) -> None:
 
     validate = make_validate_pass_bar(run_fn=_boom)
     outcome = await validate(tmp_path, "qa/pass-bar-X.yaml")
+    assert not outcome.ok
+    assert "RuntimeError" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# qa validate gate-registry (F2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_gate_registry_ok_on_success_exit_zero(tmp_path: Path) -> None:
+    run_fn, captured = _fake_run("success", 0)
+    validate = make_validate_gate_registry(run_fn=run_fn)
+    outcome = await validate(tmp_path, "qa/gates/registry.yaml")
+    assert outcome.ok
+    # Rides the frozen seam as ``guardkit qa validate gate-registry <path>``.
+    assert captured["subcommand"] == "qa"
+    assert captured["args"] == [
+        "validate",
+        "gate-registry",
+        "qa/gates/registry.yaml",
+    ]
+    assert captured["repo_path"] == tmp_path
+    assert captured["with_nats_streaming"] is False
+
+
+@pytest.mark.asyncio
+async def test_validate_gate_registry_red_on_schema_error(tmp_path: Path) -> None:
+    run_fn, _ = _fake_run("failed", 1, stderr="VALIDATION FAILED: unknown gate id")
+    validate = make_validate_gate_registry(run_fn=run_fn)
+    outcome = await validate(tmp_path, "qa/gates/registry.yaml")
+    assert not outcome.ok
+    assert "unknown gate id" in outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_validate_gate_registry_red_on_timeout_status(tmp_path: Path) -> None:
+    run_fn, _ = _fake_run("timeout", -1)
+    validate = make_validate_gate_registry(run_fn=run_fn)
+    outcome = await validate(tmp_path, "qa/gates/registry.yaml")
+    assert not outcome.ok
+
+
+@pytest.mark.asyncio
+async def test_validate_gate_registry_never_crashes_on_raise(tmp_path: Path) -> None:
+    async def _boom(**kwargs):
+        raise RuntimeError("guardkit blew up")
+
+    validate = make_validate_gate_registry(run_fn=_boom)
+    outcome = await validate(tmp_path, "qa/gates/registry.yaml")
     assert not outcome.ok
     assert "RuntimeError" in outcome.detail
 

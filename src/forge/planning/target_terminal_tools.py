@@ -53,10 +53,12 @@ __all__ = [
     "TargetTestRootsUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
+    "ValidateGateRegistryFn",
     "ValidatePassBarFn",
     "discover_target_test_roots",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
+    "make_validate_gate_registry",
     "make_validate_pass_bar",
     "resolve_normalizer_command",
 ]
@@ -280,6 +282,13 @@ ValidateFeaturePlanFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 #: plan-commit) must pass guardkit's OWN F1 schema before it is committed.
 ValidatePassBarFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 
+#: ``async (worktree_path, registry_rel_path) -> ToolOutcome`` — run
+#: ``guardkit qa validate gate-registry <registry_rel_path>`` against the
+#: worktree. The forge-appended per-feature GateEntry (registered from the 007
+#: seed's derivable GET endpoint at plan-commit) must pass guardkit's OWN
+#: gate-registry schema before the filled gate + registry edit are committed.
+ValidateGateRegistryFn = Callable[[Path, str], Awaitable[ToolOutcome]]
+
 
 async def _default_normalizer_subprocess(
     *, command: Sequence[str], cwd: str, timeout: int
@@ -492,6 +501,67 @@ def make_validate_pass_bar(
             detail=(
                 f"guardkit qa validate pass-bar {status} (exit {exit_code}) for "
                 f"{bar_rel_path}: {(stderr or tail).strip()[:500]}"
+            ),
+        )
+
+    return _validate
+
+
+def make_validate_gate_registry(
+    *,
+    read_allowlist: Sequence[Path] | None = None,
+    timeout_seconds: int = _DEFAULT_ORACLE_TIMEOUT_SECONDS,
+    run_fn: Callable[..., Awaitable[object]] = guardkit_run,
+) -> ValidateGateRegistryFn:
+    """Build the production ``guardkit qa validate gate-registry`` oracle (F2).
+
+    Sibling of :func:`make_validate_pass_bar`: rides the SAME frozen
+    :func:`forge.adapters.guardkit.run.run` seam, ``ok`` iff
+    ``guardkit qa validate gate-registry <path>`` exits 0 (guardkit's OWN
+    gate-registry schema accepts the instance).
+
+    The forge-appended per-feature GateEntry (mirrored from the target repo's own
+    existing registry entries, pointing at the filled feature-behaviour gate) is
+    validated by guardkit's own checker BEFORE the gate script + registry edit
+    land on the branch, so a malformed forge-appended entry fails the leg loudly
+    rather than reaching the post-deploy live-gate with an entry guardkit would
+    later reject.
+    """
+
+    async def _validate(worktree_path: Path, registry_rel_path: str) -> ToolOutcome:
+        allowlist = list(read_allowlist or [worktree_path])
+        try:
+            result = await guardkit_run_shim(
+                run_fn,
+                subcommand="qa",
+                args=["validate", "gate-registry", registry_rel_path],
+                repo_path=worktree_path,
+                read_allowlist=allowlist,
+                timeout_seconds=timeout_seconds,
+                with_nats_streaming=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — oracle boundary
+            logger.exception("validate_gate_registry invocation raised")
+            return ToolOutcome(
+                ok=False,
+                detail=(
+                    f"qa validate gate-registry raised {type(exc).__name__}: {exc}"
+                ),
+            )
+        status = getattr(result, "status", "failed")
+        exit_code = getattr(result, "exit_code", -1)
+        if status == "success" and exit_code == 0:
+            logger.info("validate_gate_registry: %s valid", registry_rel_path)
+            return ToolOutcome(ok=True, detail="")
+        stderr = getattr(result, "stderr", None) or ""
+        tail = getattr(result, "stdout_tail", "") or ""
+        return ToolOutcome(
+            ok=False,
+            detail=(
+                f"guardkit qa validate gate-registry {status} (exit {exit_code}) "
+                f"for {registry_rel_path}: {(stderr or tail).strip()[:500]}"
             ),
         )
 

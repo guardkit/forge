@@ -336,6 +336,8 @@ def _make_driver(
     validate_fn: Any | None = None,
     pass_bar_validate: Any | None = None,
     pass_bar_validate_fn: Any | None = None,
+    gate_registry_validate: Any | None = None,
+    gate_registry_validate_fn: Any | None = None,
     wire_legs: bool = True,
     build_trigger_result: Any | None = None,
     build_trigger_fn: Any | None = None,
@@ -356,9 +358,11 @@ def _make_driver(
         "normalize": 0,
         "validate": 0,
         "pass_bar_validate": 0,
+        "gate_registry_validate": 0,
         "build_trigger": 0,
     }
     validated_bars: list[str] = []
+    validated_registries: list[str] = []
 
     def subscriber_factory(expected_approver: Any, armed: Any) -> ScriptedSubscriber:
         return ScriptedSubscriber([_approve()], armed)
@@ -433,6 +437,19 @@ def _make_driver(
             return await pass_bar_validate_fn(worktree, bar_rel)
         return pass_bar_validate if pass_bar_validate is not None else ToolOutcome(ok=True)
 
+    async def _validate_gate_registry(worktree: Path, registry_rel: str) -> ToolOutcome:
+        counters["gate_registry_validate"] += 1
+        validated_registries.append(registry_rel)
+        # A dynamic oracle (the schema-faithful gate-registry check) takes
+        # precedence over a static ToolOutcome.
+        if gate_registry_validate_fn is not None:
+            return await gate_registry_validate_fn(worktree, registry_rel)
+        return (
+            gate_registry_validate
+            if gate_registry_validate is not None
+            else ToolOutcome(ok=True)
+        )
+
     build_triggers: list[dict[str, Any]] = []
 
     async def _dispatch_build_trigger(
@@ -490,6 +507,7 @@ def _make_driver(
         normalize_feature_spec=_normalize if wire_legs else None,
         validate_feature_plan=_validate if wire_legs else None,
         validate_pass_bar=_validate_pass_bar if wire_legs else None,
+        validate_gate_registry=_validate_gate_registry if wire_legs else None,
         dispatch_build_trigger=(
             (build_trigger_fn or _dispatch_build_trigger)
             if wire_build_trigger
@@ -504,6 +522,7 @@ def _make_driver(
             "git": deps.git_runner,
             "build_triggers": build_triggers,
             "validated_bars": validated_bars,
+            "validated_registries": validated_registries,
         },
     )
 
@@ -1539,3 +1558,510 @@ async def test_unwired_pass_bar_validate_fails_loudly(
     assert run["state"] != PlanningState.BUILD_QUEUED.value
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
     assert "validate_pass_bar" in reasons
+
+
+# ---------------------------------------------------------------------------
+# F2 — the per-feature live-gate REGISTRATION leg (sibling of the pass-bar leg).
+# At plan-commit the machine flow registered pass BARS but no live GATE; this
+# leg derives the endpoint from the seed's machine criteria, fills the target
+# repo's OWN feature-behaviour gate TEMPLATE, appends a mirrored GateEntry to its
+# OWN gate registry, and commits both as ONE commit AFTER the bars commit and
+# BEFORE the build trigger. Wire-true: the scratch repo carries BYTE-COPIES of
+# the LIVE api_test qa/gates/ surface (hash-locked below).
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib  # noqa: E402
+
+#: Byte-copies of the LIVE api_test F4 gate surface
+#: (``/home/richardwoollcott/Projects/appmilla_github/api_test/qa/gates/``).
+#: The hashes lock the fixture bytes so a drift from the wire-true surface is
+#: caught here rather than silently changing what the leg fills against.
+_FEATURE_GATE_TEMPLATE_FIXTURE = _FIXTURES / "feature_behaviour_gate.py"
+_GATE_REGISTRY_FIXTURE = _FIXTURES / "gate_registry.yaml"
+_FEATURE_GATE_TEMPLATE_SHA256 = (
+    "f6a985e5c1d8d0a4ae185f3ffcf5cfaa0b0f74af397339884aa07f112603dfed"
+)
+_GATE_REGISTRY_SHA256 = (
+    "4f397ea62304433a9897fd8aba04502de42481a9c98b01b008d1683dbdcd19c4"
+)
+
+
+def test_gate_surface_fixtures_are_byte_copies_of_the_api_test_surface() -> None:
+    """The committed fixtures are the WIRE-TRUE api_test gate surface bytes."""
+    tmpl = _FEATURE_GATE_TEMPLATE_FIXTURE.read_bytes()
+    reg = _GATE_REGISTRY_FIXTURE.read_bytes()
+    assert _hashlib.sha256(tmpl).hexdigest() == _FEATURE_GATE_TEMPLATE_SHA256
+    assert _hashlib.sha256(reg).hexdigest() == _GATE_REGISTRY_SHA256
+
+
+def _git_env() -> dict[str, str]:
+    return {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+
+def _seed_gate_surface(
+    repo: Path, *, template: bool = True, registry: bool = True
+) -> None:
+    """Commit BYTE-COPIES of the api_test qa/gates/ surface onto the scratch
+    repo's default branch, so the planning branch (forked from it) carries them
+    and the leg reads them off the branch exactly as production does."""
+    gates = repo / "qa" / "gates"
+    gates.mkdir(parents=True, exist_ok=True)
+    if template:
+        (gates / "feature_behaviour_gate.py").write_bytes(
+            _FEATURE_GATE_TEMPLATE_FIXTURE.read_bytes()
+        )
+    if registry:
+        (gates / "registry.yaml").write_bytes(
+            _GATE_REGISTRY_FIXTURE.read_bytes()
+        )
+    env = _git_env()
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-qm", "seed the F4 gate surface"],
+        cwd=repo,
+        check=True,
+        env=env,
+    )
+
+
+async def _schema_gate_registry_oracle(
+    worktree: Path, registry_rel: str
+) -> ToolOutcome:
+    """A gate-registry validate oracle running a schema-faithful check against
+    the on-disk appended registry (stands in for the vendored guardkit binary):
+    every entry carries id/path/target.base_url_env/pass_bar_ref."""
+    import yaml as _yaml
+
+    try:
+        data = _yaml.safe_load((worktree / registry_rel).read_text(encoding="utf-8"))
+        assert isinstance(data, dict) and isinstance(data.get("gates"), list)
+        assert data["gates"], "gates must be non-empty"
+        for gate in data["gates"]:
+            assert gate.get("id") and gate.get("path")
+            assert gate.get("target", {}).get("base_url_env")
+            assert gate.get("pass_bar_ref")
+    except AssertionError as exc:
+        return ToolOutcome(ok=False, detail=f"gate-registry schema invalid — {exc}")
+    return ToolOutcome(ok=True)
+
+
+#: An AUTHLESS seed whose ONLY machine criterion yields NO endpoint (a legitimate
+#: non-endpoint feature) — the honest-skip path.
+_UNDERIVABLE_SEED_AUTHLESS = (
+    "format_version: '2.0'\n"
+    "feature_slug: nightly-report\n"
+    "auth_surface_bearing: false\n"
+    "preconditions:\n"
+    "- suite_green_vs_ledger\n"
+    "criteria:\n"
+    "- id: nightly-AC-001\n"
+    "  text: The nightly report job runs to completion each midnight\n"
+    "  class: machine\n"
+    "  evidence_kind: log\n"
+    "  runbook_ref: null\n"
+)
+
+
+def _show_on_branch(repo: Path, path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "show", f"planning/{CID}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_f2_derivable_seed_registers_gate_as_one_commit_before_build(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(1) A derivable GET seed + the adopted gate surface → the filled gate +
+    the appended registry land as ONE commit AFTER the bars commit and BEFORE
+    build-queued; the durable label order is
+    [feature-plan, qa-pass-bars, qa-feature-gate, build-queued]."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+
+    # guardkit's own gate-registry validate ran exactly once, on the registry.
+    assert h.ctx["counters"]["gate_registry_validate"] == 1
+    assert h.ctx["validated_registries"] == ["qa/gates/registry.yaml"]
+
+    # The filled gate landed on the branch: gate_id + request substituted, the
+    # runtime /REPLACE_ME guard left intact, valid Python.
+    gate = _show_on_branch(repo, "qa/gates/version_endpoint_gate.py")
+    assert gate.returncode == 0, gate.stderr
+    assert '"gate_id": "version-endpoint",' in gate.stdout
+    assert '"request": {"method": "GET", "path": "/version"},' in gate.stdout
+    assert 'if spec["request"]["path"] == "/REPLACE_ME":' in gate.stdout
+    compile(gate.stdout, "version_endpoint_gate.py", "exec")
+
+    # The registry gained a MIRRORED entry (base_url_env copied, never hardcoded)
+    # pointing at the gate with the FIRST minted bar as its pass_bar_ref.
+    reg = _show_on_branch(repo, "qa/gates/registry.yaml")
+    assert reg.returncode == 0
+    reg_data = yaml.safe_load(reg.stdout)
+    new = [g for g in reg_data["gates"] if g["id"] == "version-endpoint"]
+    assert len(new) == 1
+    entry = new[0]
+    assert entry["path"] == "qa/gates/version_endpoint_gate.py"
+    assert entry["target"]["base_url_env"] == "API_TEST_BASE_URL"
+    assert entry["target"]["environment_id"] == "local"
+    assert entry["pass_bar_ref"] == "qa/pass-bar-TASK-VER-001.yaml"
+    assert entry["preconditions"] == ["suite_vs_ledger"]
+    assert entry["preflight"] == ["tool_imports", "base_url_reachable"]
+    assert entry["evidence_dir_pattern"] == "qa/gates/evidence/{run_id}"
+    # The pre-existing entries + header comments survive byte-untouched.
+    assert reg.stdout.startswith("# F4 · gate registry")
+    assert {"health", "stats", "version"} <= {g["id"] for g in reg_data["gates"]}
+
+    # ONE commit: the gate script AND the registry edit are in the SAME commit,
+    # recorded on the qa-feature-gate leg event, distinct from the bars commit.
+    gate_sha = _leg_event_sha_field(store, "qa-feature-gate", "sha")
+    bars_sha = _leg_sha(store, "qa-pass-bars")
+    assert gate_sha and bars_sha and gate_sha != bars_sha
+    names = subprocess.run(
+        ["git", "show", "--name-only", "--format=", gate_sha],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert sorted(names) == [
+        "qa/gates/registry.yaml",
+        "qa/gates/version_endpoint_gate.py",
+    ]
+
+    # Durable order: the gate leg sits between the bars and the build queue.
+    labels = [
+        e["stage_label"]
+        for e in store.list_events(CID)
+        if e["status"] == "approved"
+        and e["stage_label"]
+        in {"feature-plan", "qa-pass-bars", "qa-feature-gate", "build-queued"}
+    ]
+    assert labels == [
+        "feature-plan",
+        "qa-pass-bars",
+        "qa-feature-gate",
+        "build-queued",
+    ]
+    assert h.ctx["counters"]["build_trigger"] == 1
+    # registered_at_sha on the leg event is the PLAN commit sha.
+    assert (
+        _leg_event_sha_field(store, "qa-feature-gate", "registered_at_sha")
+        == _leg_sha(store, "feature-plan")
+    )
+
+
+@pytest.mark.asyncio
+async def test_f2_underivable_seed_honest_skip_build_still_queues(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(2) A non-endpoint (underivable) seed → an HONEST skip event, the build
+    STILL queues, and ZERO target-repo gate writes (even though the surface is
+    adopted — the skip is about the criteria, not the surface)."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+    # The gate-registry validator was never called; nothing was gated.
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 1
+    # No new gate script landed; the registry is byte-unchanged (no new entry).
+    assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
+    reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
+    assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
+    # The leg recorded an HONEST skip (idempotency label present, skipped detail).
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert "no derivable endpoint" in ev.get("reason", "")
+
+
+@pytest.mark.asyncio
+async def test_f2_missing_template_honest_skip(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(3) The repo carries a registry but NO feature-behaviour template on the
+    branch → honest skip (the F4 gate surface is not fully adopted); the build
+    still queues, zero gate writes."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo, template=False, registry=True)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode != 0
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert "no qa/gates/feature_behaviour_gate.py" in ev.get("reason", "")
+
+
+@pytest.mark.asyncio
+async def test_f2_validator_red_fails_loudly_zero_branch_mutation(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(4) Derivable + surface adopted but guardkit qa validate gate-registry is
+    RED → loud FAILED, no gate/registry mutation on the branch, no build."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+        gate_registry_validate=ToolOutcome(
+            ok=False, detail="gate-registry schema: unknown precondition"
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["build_trigger"] == 0
+    # The pre-commit oracle aborted the commit: zero branch mutation.
+    assert _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode != 0
+    reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
+    assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
+    # No approved qa-feature-gate sentinel (the leg failed, not completed/skipped).
+    assert not any(
+        e["stage_label"] == "qa-feature-gate" and e["status"] == "approved"
+        for e in store.list_events(CID)
+    )
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "gate-registry" in reasons
+    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+
+
+@pytest.mark.asyncio
+async def test_f2_unwired_gate_registry_validate_fails_loudly(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(5) Flag ON but the gate-registry validate collaborator missing = loud
+    FAILED (never a silent skip of the guardkit check)."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+    )
+    # Unwire ONLY the gate-registry oracle (the other legs stay wired).
+    h.driver._deps.validate_gate_registry = None
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    assert run["state"] != PlanningState.BUILD_QUEUED.value
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "validate_gate_registry" in reasons
+
+
+@pytest.mark.asyncio
+async def test_f2_idempotent_redrive_no_ops_the_gate_leg(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(6) A crash-window re-drive with the qa-feature-gate sentinel already
+    present no-ops the leg: no re-fill, no re-validate, and the run reaches
+    BUILD_QUEUED without re-minting anything."""
+    _queue(store)
+    for to in (
+        PlanningState.RUNNING,
+        PlanningState.FEATURE_SPEC,
+        PlanningState.FEATURE_PLAN,
+    ):
+        refused = store.transition(
+            correlation_id=CID,
+            to_state=to,
+            actor_identity="seed",
+            stage_label="seed",
+        )
+        assert not isinstance(refused, TransitionRefused)
+    # Seed every leg event up to and including the gate registration (the crash
+    # window: gate committed + build-queued marker recorded, state not advanced).
+    store._record_event(
+        correlation_id=CID,
+        stage_label="feature-plan",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps(
+            {
+                "feature_id": "FEAT-AAAA",
+                "target_repo": TARGET_REPO,
+                "branch": f"planning/{CID}",
+                "plan_files": ["features/x/FEAT-AAAA.yaml"],
+                "sha": "plan-sha",
+            }
+        ),
+    )
+    store._record_event(
+        correlation_id=CID,
+        stage_label="qa-pass-bars",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps(
+            {"feature_id": "FEAT-AAAA", "bar_files": ["qa/pass-bar-TASK-X-001.yaml"]}
+        ),
+    )
+    store._record_event(
+        correlation_id=CID,
+        stage_label="qa-feature-gate",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps(
+            {"feature_id": "FEAT-AAAA", "gate_file": "qa/gates/x_gate.py"}
+        ),
+    )
+    store._record_event(
+        correlation_id=CID,
+        stage_label="build-queued",
+        status="approved",
+        actor_identity="seed",
+        details_json=json.dumps({"feature_id": "FEAT-AAAA", "build_id": "build-1"}),
+    )
+
+    h = _make_driver(store)
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # The gate leg no-opped: no fill, no validate, no build re-trigger.
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    assert h.ctx["counters"]["plan"] == 0
+
+
+def _leg_event_details_of(
+    store: SqlitePlanningRunStore, stage_label: str
+) -> dict[str, Any]:
+    for e in store.list_events(CID):
+        if e["stage_label"] == stage_label and e["status"] == "approved":
+            return json.loads(e["details_json"]) or {}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# F2 derivation grammar — the deterministic, conservative endpoint parser.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # Positive: the exact SPL criterion phrasing → GET + path.
+        (
+            "A GET request to /version returns the version metadata",
+            {"method": "GET", "path": "/version"},
+        ),
+        ("A GET request to /stats", {"method": "GET", "path": "/stats"}),
+        (
+            "A GET request to /users/{id}/profile succeeds",
+            {"method": "GET", "path": "/users/{id}/profile"},
+        ),
+    ],
+)
+def test_derive_get_endpoint_positive(text: str, expected: dict[str, str]) -> None:
+    assert PlanningRunDriver._derive_get_endpoint(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "A GET request to the version endpoint",  # no /-rooted path
+        "A GET request to",  # no path at all
+        "a get request to /version",  # lower-case verb + article
+        "A POST request to /version",  # non-GET verb → skip (don't guess status)
+        "A PUT request to /version",
+        "A DELETE request to /version",
+        "You can get request info at /version",  # prose 'get request' mid-sentence
+        "The /version response contains exactly three fields",  # no verb phrase
+        "GET /version",  # missing the 'A … request to' frame
+        "",  # empty
+    ],
+)
+def test_derive_get_endpoint_adversarial_negatives(text: str) -> None:
+    assert PlanningRunDriver._derive_get_endpoint(text) is None
+
+
+def test_derive_feature_gate_endpoint_first_machine_get_wins() -> None:
+    """The leg-level derivation ignores non-machine criteria and non-GET verbs,
+    returning the FIRST machine criterion that yields a GET endpoint."""
+    criteria = [
+        {"text": "A GET request to /skip", "class": "operator"},  # not machine
+        {"text": "A POST request to /users", "class": "machine"},  # non-GET → skip
+        {"text": "A GET request to /version", "class": "machine"},  # first GET win
+        {"text": "A GET request to /later", "class": "machine"},
+    ]
+    d = PlanningRunDriver(SimpleNamespace())  # type: ignore[arg-type]
+    assert d._derive_feature_gate_endpoint(criteria) == {
+        "method": "GET",
+        "path": "/version",
+    }
+
+
+def test_derive_feature_gate_endpoint_none_when_no_machine_get() -> None:
+    d = PlanningRunDriver(SimpleNamespace())  # type: ignore[arg-type]
+    assert d._derive_feature_gate_endpoint([]) is None
+    assert (
+        d._derive_feature_gate_endpoint(
+            [{"text": "A GET request to /x", "class": "operator"}]
+        )
+        is None
+    )
+    assert d._derive_feature_gate_endpoint("not-a-list") is None
