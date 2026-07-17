@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "NORMALIZER_MODULE_CANDIDATES",
     "TEST_ROOT_DISCOVERY_MODULE_CANDIDATES",
+    "DclAuthorFn",
+    "DclAuthorOutcome",
     "NormalizeFeatureSpecFn",
     "NormalizerModuleUnresolved",
     "TargetTestRootsUnresolved",
@@ -56,6 +58,7 @@ __all__ = [
     "ValidateGateRegistryFn",
     "ValidatePassBarFn",
     "discover_target_test_roots",
+    "make_dcl_author",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
     "make_validate_gate_registry",
@@ -288,6 +291,52 @@ ValidatePassBarFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 #: seed's derivable GET endpoint at plan-commit) must pass guardkit's OWN
 #: gate-registry schema before the filled gate + registry edit are committed.
 ValidateGateRegistryFn = Callable[[Path, str], Awaitable[ToolOutcome]]
+
+
+@dataclass(frozen=True)
+class DclAuthorOutcome:
+    """Result of one ``guardkit dcl author`` invocation (W1-S2).
+
+    Richer than :class:`ToolOutcome` because the plan-commit leg needs more than
+    a pass/fail bit: it reads the ``--json`` envelope
+    (``{authored, attempts, zero_shot_clean, repaired_clean, artifact, receipt,
+    failure_reason}``) to record the durable ``dcl-author`` event, and it maps
+    the guardkit exit CLASS onto the leg's three outcomes:
+
+    * ``exit_class == "authored"`` (exit 0) — the seat authored the artifact +
+      receipt into the worktree under the §10 protocol; the leg reads and
+      commits them.
+    * ``exit_class == "authoring-failed"`` (exit 1) — a LOUD authoring failure
+      (dirty second attempt / refusal / empty final content); no artifact
+      written. The leg records ``authored:false`` and CONTINUES (never a blocked
+      plan).
+    * ``exit_class == "instrument-error"`` (exit 2) — node/checker missing,
+      config invalid, inputs missing, seat unreachable. Same loud-continue.
+    * ``exit_class == "timeout"`` — the seat exceeded the (generous) budget.
+    * ``exit_class == "invocation-error"`` — the seam itself raised; contained
+      here, never crashes the run.
+
+    ``authored`` is True ONLY on the exit-0 path with the envelope's own
+    ``authored`` flag set. ``envelope`` is the parsed ``--json`` dict (empty when
+    absent/unparseable). ``detail`` is the loud-failure reason surfaced to the
+    warning notification.
+    """
+
+    authored: bool
+    exit_class: str
+    exit_code: int
+    envelope: dict[str, Any]
+    detail: str = ""
+
+
+#: ``async (*, worktree_path, slug, task_id, request_rel, criteria_rel)
+#: -> DclAuthorOutcome`` — run ``guardkit dcl author`` under the §10 protocol
+#: against the materialised worktree. The seat authors ``features/<slug>/
+#: <slug>.dcl`` + ``qa/dcl/authoring-<slug>.yaml`` into the worktree; the leg
+#: reads and commits them. Injected + default-None on the driver deps so the
+#: gherkin track never touches it (SINGLE-SLOT LAW: tests inject a spy; the real
+#: closure is the ONLY thing that would call the seat).
+DclAuthorFn = Callable[..., Awaitable[DclAuthorOutcome]]
 
 
 async def _default_normalizer_subprocess(
@@ -566,6 +615,173 @@ def make_validate_gate_registry(
         )
 
     return _validate
+
+
+#: The §10 authoring seat can take ~15 min worst case (two calls x ~900s: the
+#: zero-shot author + one bounded compile→repair pass). The forge-side budget is
+#: generous enough to bound BOTH without ever cutting a live seat off mid-repair.
+_DEFAULT_DCL_AUTHOR_TIMEOUT_SECONDS: int = 1900
+
+
+def _extract_json_envelope(text: str) -> dict[str, Any]:
+    """Best-effort parse of the ``guardkit dcl author --json`` envelope.
+
+    ``dcl author --json`` prints a single machine envelope on stdout; the frozen
+    run seam hands us the (≤4 KB) ``stdout_tail`` verbatim. Try the whole tail as
+    JSON first, then fall back to the LAST balanced ``{...}`` object in the tail
+    (robust to a preamble line). Returns ``{}`` on any failure — the envelope is
+    advisory metadata for the receipt, never a gate.
+    """
+    import json
+
+    tail = (text or "").strip()
+    if not tail:
+        return {}
+    try:
+        parsed = json.loads(tail)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Fall back to the last balanced top-level object in the tail.
+    depth = 0
+    end = -1
+    for idx in range(len(tail) - 1, -1, -1):
+        ch = tail[idx]
+        if ch == "}":
+            if depth == 0:
+                end = idx
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0 and end != -1:
+                candidate = tail[idx : end + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    return parsed if isinstance(parsed, dict) else {}
+                except (json.JSONDecodeError, ValueError):
+                    end = -1
+    return {}
+
+
+def make_dcl_author(
+    *,
+    read_allowlist: Sequence[Path] | None = None,
+    timeout_seconds: int = _DEFAULT_DCL_AUTHOR_TIMEOUT_SECONDS,
+    run_fn: Callable[..., Awaitable[object]] = guardkit_run,
+) -> DclAuthorFn:
+    """Build the production ``guardkit dcl author`` oracle (W1-S2, the §10 seat).
+
+    The DCL sibling of :func:`make_validate_pass_bar` / the gate-registry oracle,
+    but its outcome is richer (:class:`DclAuthorOutcome`) because the plan-commit
+    leg both COMMITS the seat's output and RECORDS the ``--json`` envelope.
+
+    Rides the SAME frozen :func:`forge.adapters.guardkit.run.run` seam the other
+    oracles use (untouched guardkit bytes; ``with_nats_streaming=False``). The
+    generous ``timeout_seconds`` (default 1900s) bounds BOTH the zero-shot author
+    call and the one bounded compile→repair pass (§10) at ~900s each without
+    cutting the live seat off mid-repair.
+
+    Exit-class mapping (the CLI contract): exit 0 → ``authored``; exit 1 →
+    ``authoring-failed`` (LOUD, no artifact); exit 2 → ``instrument-error``;
+    timeout → ``timeout``; the seam itself raising → ``invocation-error``. Every
+    non-zero class is contained here (never crashes the run) — the leg turns it
+    into a warning + a ``authored:false`` durable event + a CONTINUED plan.
+    """
+
+    async def _author(
+        *,
+        worktree_path: Path,
+        slug: str,
+        task_id: str,
+        request_rel: str,
+        criteria_rel: str,
+    ) -> DclAuthorOutcome:
+        allowlist = list(read_allowlist or [worktree_path])
+        args = [
+            "author",
+            "--feature",
+            slug,
+            "--task",
+            task_id,
+            "--repo",
+            str(worktree_path),
+            "--request",
+            request_rel,
+            "--criteria",
+            criteria_rel,
+            "--json",
+        ]
+        try:
+            result = await guardkit_run_shim(
+                run_fn,
+                subcommand="dcl",
+                args=args,
+                repo_path=worktree_path,
+                read_allowlist=allowlist,
+                timeout_seconds=timeout_seconds,
+                with_nats_streaming=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — oracle boundary, never crash
+            logger.exception("dcl author invocation raised")
+            return DclAuthorOutcome(
+                authored=False,
+                exit_class="invocation-error",
+                exit_code=-1,
+                envelope={},
+                detail=f"dcl author raised {type(exc).__name__}: {exc}",
+            )
+
+        status = getattr(result, "status", "failed")
+        exit_code = int(getattr(result, "exit_code", -1))
+        tail = getattr(result, "stdout_tail", "") or ""
+        stderr = getattr(result, "stderr", None) or ""
+        envelope = _extract_json_envelope(tail)
+
+        if status == "timeout":
+            return DclAuthorOutcome(
+                authored=False,
+                exit_class="timeout",
+                exit_code=exit_code,
+                envelope=envelope,
+                detail=f"dcl author timed out after {timeout_seconds}s ({slug})",
+            )
+        if exit_code == 0 and status == "success":
+            authored = bool(envelope.get("authored", True))
+            logger.info(
+                "dcl author: %s authored (attempts=%s, zero_shot_clean=%s)",
+                slug,
+                envelope.get("attempts"),
+                envelope.get("zero_shot_clean"),
+            )
+            return DclAuthorOutcome(
+                authored=authored,
+                exit_class="authored" if authored else "authoring-failed",
+                exit_code=exit_code,
+                envelope=envelope,
+                detail="" if authored else "exit 0 but envelope authored=false",
+            )
+        # Non-zero exits: 1 = loud authoring failure, 2 = instrument/usage error.
+        reason = str(
+            envelope.get("failure_reason") or (stderr or tail).strip()[:500]
+        )
+        exit_class = {1: "authoring-failed", 2: "instrument-error"}.get(
+            exit_code, "authoring-failed"
+        )
+        return DclAuthorOutcome(
+            authored=False,
+            exit_class=exit_class,
+            exit_code=exit_code,
+            envelope=envelope,
+            detail=(
+                f"guardkit dcl author exit {exit_code} for {slug}: {reason}"
+                if reason
+                else f"guardkit dcl author exit {exit_code} for {slug}"
+            ),
+        )
+
+    return _author
 
 
 async def guardkit_run_shim(run_fn: Callable[..., Awaitable[object]], **kwargs: object):
