@@ -33,6 +33,7 @@ copy for the attended ``/feature-spec`` follow-up.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -66,6 +67,15 @@ class WorktreeGitRunner:
             created. Defaults to ``<tempdir>/forge-planning-worktrees``.
         execute: Injectable subprocess primitive (tests inject a fake;
             production uses the shared list-token, no-shell default).
+        op_timeout_s: Per-git-operation timeout (seconds). Every git
+            subprocess this runner drives is bounded by this value so a
+            wedged git invocation surfaces as a loud, retryable failure
+            instead of hanging the planning driver forever (diagnosed
+            live 2026-07-18). Defaults to 180s.
+        hook_timeout_s: Ceiling for the optional pre-commit oracle hook.
+            An overrun aborts the commit with a failed result (never a
+            silent hang) after best-effort worktree cleanup. Defaults to
+            900s.
     """
 
     def __init__(
@@ -73,11 +83,35 @@ class WorktreeGitRunner:
         *,
         worktrees_root: Path | None = None,
         execute: ExecuteCallable = _default_execute,
+        op_timeout_s: float = 180.0,
+        hook_timeout_s: float = 900.0,
     ) -> None:
         self._worktrees_root = worktrees_root or (
             Path(tempfile.gettempdir()) / "forge-planning-worktrees"
         )
         self._execute = execute
+        self._op_timeout_s = op_timeout_s
+        self._hook_timeout_s = hook_timeout_s
+
+    async def _execute_timed(
+        self,
+        *,
+        command: object,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ):
+        """``self._execute`` with this runner's per-op timeout injected.
+
+        Every git call in this runner routes through here so no single
+        subprocess can wedge unbounded (2026-07-18 hang). The ``timeout``
+        keyword is accepted for signature compatibility with
+        :data:`~forge.adapters.git.operations.ExecuteCallable` (so this
+        method can itself be passed as the ``execute`` of ``commit_all``)
+        but is always overridden with ``self._op_timeout_s``.
+        """
+        return await self._execute(
+            command=command, cwd=cwd, timeout=self._op_timeout_s
+        )
 
     async def prepare_branch_and_write(
         self,
@@ -166,7 +200,7 @@ class WorktreeGitRunner:
             else:
                 add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
 
-            add_res = await self._execute(command=add_cmd, cwd=str(repo))
+            add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:
                 return GitOpResult(
                     status="failed",
@@ -191,7 +225,7 @@ class WorktreeGitRunner:
                 target.write_text(content, encoding="utf-8")
 
                 message = f"planning: add {file_path} (Mode P planned handoff)"
-                commit_res = await commit_all(worktree, message, execute=self._execute)
+                commit_res = await commit_all(worktree, message, execute=self._execute_timed)
                 if commit_res.status == "failed":
                     stderr = commit_res.stderr or ""
                     if "nothing to commit" in stderr:
@@ -250,6 +284,12 @@ class WorktreeGitRunner:
         (TASK-MP-013), idempotency probe (RT-08) and best-effort cleanup; adds
         the multi-file write and the optional pre-commit oracle hook.
         """
+        logger.info(
+            "prepare_branch_and_write_tree: begin branch=%s files=%d repo=%s",
+            branch,
+            len(files),
+            repo_path,
+        )
         try:
             repo = Path(repo_path)
             if not repo.is_dir():
@@ -334,7 +374,7 @@ class WorktreeGitRunner:
             else:
                 add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
 
-            add_res = await self._execute(command=add_cmd, cwd=str(repo))
+            add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:
                 return GitOpResult(
                     status="failed",
@@ -342,6 +382,7 @@ class WorktreeGitRunner:
                     stderr=_failure_stderr(add_res.stderr, add_res.stdout),
                     exit_code=add_res.exit_code,
                 )
+            logger.info("worktree ready at %s", worktree)
 
             try:
                 worktree_resolved = worktree.resolve()
@@ -359,9 +400,34 @@ class WorktreeGitRunner:
 
                 # Pre-commit oracle (normalizer / feature validate). Runs
                 # against the materialised worktree; a red oracle aborts the
-                # commit with zero branch mutation.
+                # commit with zero branch mutation. Bounded by
+                # ``hook_timeout_s`` so a wedged hook fails loud rather than
+                # hanging the driver forever — the never-raises contract holds
+                # (the finally-block cleanup still runs on the timeout path).
                 if pre_commit is not None:
-                    hook_result = await pre_commit(worktree_resolved)
+                    try:
+                        hook_result = await asyncio.wait_for(
+                            pre_commit(worktree_resolved),
+                            timeout=self._hook_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "%s: pre-commit hook timed out after %ss "
+                            "(branch=%s, worktree=%s)",
+                            _TREE_OPERATION,
+                            self._hook_timeout_s,
+                            branch,
+                            worktree,
+                        )
+                        return GitOpResult(
+                            status="failed",
+                            operation=_TREE_OPERATION,
+                            stderr=(
+                                "pre-commit hook timed out after "
+                                f"{self._hook_timeout_s}s"
+                            ),
+                            exit_code=-1,
+                        )
                     if not hook_result.ok:
                         return GitOpResult(
                             status="failed",
@@ -373,7 +439,7 @@ class WorktreeGitRunner:
                             exit_code=-1,
                         )
 
-                commit_res = await commit_all(worktree, message, execute=self._execute)
+                commit_res = await commit_all(worktree, message, execute=self._execute_timed)
                 if commit_res.status == "failed":
                     stderr = commit_res.stderr or ""
                     if "nothing to commit" in stderr:
@@ -439,7 +505,7 @@ class WorktreeGitRunner:
     async def _cleanup_worktree(self, repo: Path, worktree: Path) -> None:
         """Best-effort worktree removal anchored in the source repo."""
         try:
-            res = await self._execute(
+            res = await self._execute_timed(
                 command=["git", "worktree", "remove", str(worktree), "--force"],
                 cwd=str(repo),
             )
@@ -460,7 +526,7 @@ class WorktreeGitRunner:
     # -- probes ---------------------------------------------------------- #
 
     async def _branch_exists(self, repo: Path, branch: str) -> bool:
-        res = await self._execute(
+        res = await self._execute_timed(
             command=[
                 "git",
                 "rev-parse",
@@ -483,7 +549,7 @@ class WorktreeGitRunner:
         fails, returns a descriptive marker so the caller refuses the
         ``--force`` re-attach rather than mutating an unverifiable branch.
         """
-        res = await self._execute(
+        res = await self._execute_timed(
             command=["git", "worktree", "list", "--porcelain"],
             cwd=str(repo),
         )
@@ -514,7 +580,7 @@ class WorktreeGitRunner:
         return None
 
     async def _show_file(self, repo: Path, branch: str, file_path: str) -> str | None:
-        res = await self._execute(
+        res = await self._execute_timed(
             command=["git", "show", f"{branch}:{file_path}"],
             cwd=str(repo),
         )
@@ -523,7 +589,7 @@ class WorktreeGitRunner:
         return res.stdout
 
     async def _rev_parse(self, repo: Path, branch: str) -> str | None:
-        res = await self._execute(
+        res = await self._execute_timed(
             command=["git", "rev-parse", f"refs/heads/{branch}"],
             cwd=str(repo),
         )

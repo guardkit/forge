@@ -55,6 +55,9 @@ from forge.adapters.git.models import GitOpResult
 
 logger = logging.getLogger(__name__)
 
+_KILL_GRACE_SECONDS: float = 5.0
+"""SIGTERM → SIGKILL grace window when a subprocess overruns its timeout."""
+
 
 # --------------------------------------------------------------------------- #
 # Subprocess primitive — injectable for tests, default for production.
@@ -106,6 +109,14 @@ async def _default_execute(
     permissions are enforced framework-side. The default here mirrors
     that contract (list tokens, no shell) so unit tests and seam tests
     behave identically to production.
+
+    **Timeout discipline (mirrors ``forge.adapters.guardkit.run``).** When
+    ``timeout`` is not ``None`` and the child overruns it, the child is
+    SIGTERM'd, given ``_KILL_GRACE_SECONDS`` to exit, then SIGKILL'd and
+    reaped — never left running. The overrun is surfaced as a *normal*
+    :class:`ExecuteResult` with ``exit_code=-1`` and a ``stderr`` noting
+    the timeout and the command, so the caller sees a loud, retryable
+    failure rather than an unbounded silent hang.
     """
     proc = await asyncio.create_subprocess_exec(
         *command,
@@ -116,7 +127,29 @@ async def _default_execute(
     if timeout is None:
         stdout_b, stderr_b = await proc.communicate()
     else:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Never leak a running child: SIGTERM, grace window, then SIGKILL,
+            # and always reap via communicate() so no zombie/pipe lingers.
+            proc.terminate()
+            try:
+                await asyncio.wait_for(
+                    proc.communicate(), timeout=_KILL_GRACE_SECONDS
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+            return ExecuteResult(
+                exit_code=-1,
+                stdout="",
+                stderr=(
+                    f"git-runner timeout: command timed out after {timeout}s "
+                    f"and the child was terminated: {list(command)!r}"
+                ),
+            )
     return ExecuteResult(
         exit_code=proc.returncode if proc.returncode is not None else -1,
         stdout=stdout_b.decode("utf-8", errors="replace"),

@@ -8,11 +8,14 @@ never-raise adapter boundary (ADR-ARCH-025).
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+from forge.adapters.git.operations import ExecuteResult
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 
 CID = "runner-test-001"
@@ -316,3 +319,105 @@ class TestPrepareBranchAndWriteTree:
         )
         assert second.status == "success"
         assert second.sha == first.sha
+
+
+class TestTimeoutRobustness:
+    """The 2026-07-18 silent-hang fix: a wedged git op or pre-commit hook
+    must surface as a loud, quick, non-raising ``status="failed"`` — never
+    an unbounded silent wait."""
+
+    _FILES = {"features/stats/stats.feature": "Feature: stats\n"}
+
+    @pytest.mark.asyncio
+    async def test_wedged_git_op_returns_failed_quickly_without_raising(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A subprocess primitive whose git call never completes on its own:
+        the runner's per-op timeout ends it and maps it to a failed result."""
+
+        async def _never_completes(
+            *,
+            command: object,
+            cwd: str | None = None,
+            timeout: float | None = None,
+        ) -> ExecuteResult:
+            # Honour the timeout contract the real _default_execute enforces:
+            # the operation never finishes on its own; only the timeout ends it.
+            try:
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return ExecuteResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=(
+                        f"git-runner timeout: command timed out after "
+                        f"{timeout}s: {command!r}"
+                    ),
+                )
+            raise AssertionError("timeout was expected to fire")
+
+        runner = WorktreeGitRunner(
+            worktrees_root=tmp_path / "worktrees",
+            execute=_never_completes,
+            op_timeout_s=0.1,
+        )
+
+        started = time.monotonic()
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec"
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.status == "failed"
+        assert "timeout" in (result.stderr or "").lower()
+        assert elapsed < 3.0  # ended by the tiny op timeout, not hung
+
+    @pytest.mark.asyncio
+    async def test_wedged_pre_commit_hook_fails_loud_and_leaves_branch_unmutated(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A pre-commit hook that never returns: bounded by hook_timeout_s,
+        the worktree is cleaned up and the branch carries no handoff commit."""
+        worktrees_root = tmp_path / "worktrees"
+        runner = WorktreeGitRunner(
+            worktrees_root=worktrees_root,
+            hook_timeout_s=0.2,
+        )
+
+        base_head = _git(repo, "rev-parse", "HEAD")
+
+        async def _hangs_forever(worktree: Path):
+            await asyncio.Event().wait()  # never returns
+
+        started = time.monotonic()
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo),
+            BRANCH,
+            self._FILES,
+            "planning: spec",
+            pre_commit=_hangs_forever,
+        )
+        elapsed = time.monotonic() - started
+
+        # Loud, quick failure — never raises, never hangs.
+        assert result.status == "failed"
+        assert "timed out" in (result.stderr or "")
+        assert elapsed < 3.0
+
+        # Worktree cleaned up (best-effort path ran on the timeout branch).
+        leftovers = (
+            list(worktrees_root.iterdir()) if worktrees_root.exists() else []
+        )
+        assert leftovers == [], f"worktree not cleaned up: {leftovers}"
+
+        # Branch un-mutated: no handoff commit landed. The file is absent on
+        # the branch and the tip still points at the base HEAD.
+        show = subprocess.run(
+            ["git", "show", f"{BRANCH}:features/stats/stats.feature"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show.returncode != 0, "no file should have been committed"
+        if BRANCH in _git(repo, "branch", "--list", BRANCH):
+            assert _git(repo, "rev-parse", f"refs/heads/{BRANCH}") == base_head

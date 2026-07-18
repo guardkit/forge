@@ -25,8 +25,11 @@ worktree-add / commit / cleanup-failure-doesn't-block contract.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -432,6 +435,58 @@ class TestAdapterContract:
         # backtick-quoted reference in the module docstring).
         assert "shell=True," not in source
         assert "shell=True)" not in source
+
+
+# --------------------------------------------------------------------------- #
+# Timeout discipline — real subprocess, terminate/kill, never leak a child.
+# --------------------------------------------------------------------------- #
+
+
+class TestDefaultExecuteTimeout:
+    """The 2026-07-18 hang fix: a bounded ``_default_execute`` that reaps
+    the child on overrun instead of awaiting ``communicate()`` forever."""
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_still_runs_to_completion(self) -> None:
+        # Regression guard: the unbounded path (timeout=None) is unchanged.
+        result = await _default_execute(command=["true"])
+        assert result.exit_code == 0
+
+    @pytest.mark.skipif(
+        shutil.which("sleep") is None, reason="sleep binary not available"
+    )
+    @pytest.mark.asyncio
+    async def test_real_subprocess_timeout_kills_child_and_returns_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Capture the spawned child's pid so we can prove it is dead
+        # (reaped) once _default_execute returns — no leaked process.
+        pids: list[int] = []
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def _spy(*args: object, **kwargs: object):
+            proc = await real_spawn(*args, **kwargs)  # type: ignore[arg-type]
+            pids.append(proc.pid)
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spy)
+
+        started = time.monotonic()
+        result = await _default_execute(command=["sleep", "300"], timeout=0.5)
+        elapsed = time.monotonic() - started
+
+        # Loud, retryable failure — not a silent hang.
+        assert result.exit_code == -1
+        assert "timeout" in result.stderr.lower()
+        assert "sleep" in result.stderr  # command echoed for diagnosis
+        # SIGTERM on `sleep` is immediate, so we return far inside the
+        # 0.5s + 5s grace envelope.
+        assert elapsed < 6.0
+
+        # The child is dead and reaped: signalling it raises ProcessLookupError.
+        assert pids, "spy did not capture a child pid"
+        with pytest.raises(ProcessLookupError):
+            os.kill(pids[0], 0)
 
 
 # --------------------------------------------------------------------------- #
