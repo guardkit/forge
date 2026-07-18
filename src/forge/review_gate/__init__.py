@@ -36,6 +36,11 @@ from forge.review_gate.models import (
     raw_finding_from_dict,
     raw_findings_from_input,
 )
+from forge.review_gate.merge_boundary import (
+    MergeBoundaryReviewResult,
+    dispatch_merge_review_gate,
+    load_review_input,
+)
 from forge.review_gate.record import (
     GuardkitValidatorUnavailable,
     ValidationResult,
@@ -85,4 +90,8 @@ __all__ = [
     "MergeReviewGateRunner",
     "MergeReviewResult",
     "build_review_packet",
+    # merge-boundary invoke point (H-A Stage 2)
+    "MergeBoundaryReviewResult",
+    "dispatch_merge_review_gate",
+    "load_review_input",
 ]
