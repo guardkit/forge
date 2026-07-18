@@ -160,6 +160,7 @@ async def _adispatch(
             deploy_record_root=str(repo_path / config.deploy.deploy_record_dir),
             dry_run=dry_run,
             target_repo=target_repo,
+            target_repo_root=str(repo_path),
             feature=feature_id,
             feat_id=feature_id,
             task_id=task_id,

@@ -119,6 +119,7 @@ def build_deploy_stage_runner(
     dry_run: bool = False,
     clock: Callable[[], datetime] = _utcnow,
     target_repo: str | None = None,
+    target_repo_root: str | None = None,
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -170,6 +171,7 @@ def build_deploy_stage_runner(
         clock=clock,
         presence_resolver=presence_resolver,
         target_repo=target_repo,
+        target_repo_root=target_repo_root,
     )
 
 
@@ -190,6 +192,7 @@ async def dispatch_deploy_stage(
     dry_run: bool = False,
     clock: Callable[[], datetime] = _utcnow,
     target_repo: str | None = None,
+    target_repo_root: str | None = None,
     feature: str | None = None,
     feat_id: str | None = None,
     task_id: str | None = None,
@@ -223,6 +226,7 @@ async def dispatch_deploy_stage(
         dry_run=dry_run,
         clock=clock,
         target_repo=target_repo,
+        target_repo_root=target_repo_root,
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.

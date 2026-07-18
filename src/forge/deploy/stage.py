@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from nats_core.events import (
@@ -54,6 +55,7 @@ from nats_core.events import (
 from forge.adapters.nats.deploy_publisher import DeployPublisher
 from forge.adapters.nats.runbook_publisher import RunbookPublisher
 from forge.config.models import DeployStageConfig
+from forge.deploy.demotion_event import write_demotion_event
 from forge.deploy.deploy_record import (
     DeployClaim,
     DeployRecord,
@@ -138,6 +140,9 @@ class DeployStageRunner:
         dry_run: When True, deploy steps record intent instead of acting.
         clock: Injected ``() -> datetime`` (UTC).
         presence_resolver: Secret-ref presence check (never returns values).
+        target_repo_root: The target repo's filesystem root. When set, the [MG-5]
+            live-gate-failure demotion edge writes its DF-021 demotion event under
+            ``<root>/qa/`` (beside the gates) for the trust ledger; None ⇒ no-op.
     """
 
     def __init__(
@@ -155,6 +160,7 @@ class DeployStageRunner:
         clock: Callable[[], datetime] = _utcnow,
         presence_resolver: SecretPresenceResolver | None = None,
         target_repo: str | None = None,
+        target_repo_root: str | None = None,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -168,6 +174,11 @@ class DeployStageRunner:
         self._clock = clock
         self._presence_resolver = presence_resolver
         self._target_repo = target_repo
+        # [MG-5] The target repo's filesystem root — the demotion-event emission
+        # writes under ``<root>/qa/`` (beside the live-gate gates), where the
+        # DF-021 trust ledger reads it. None (older callers/tests) → the emission
+        # is a no-op, since it cannot name the qa/ tree.
+        self._target_repo_root = target_repo_root
 
     def _resolve_script_runner(self) -> ScriptRunner | None:
         """The docker-touching-step execution seam for this stage.
@@ -422,6 +433,20 @@ class DeployStageRunner:
             # and an un-run gate is not a verified deploy — it reverts as
             # "instrument_fail" rather than silently keeping the build serving.
             if self._config.run_live_gate and verdict != "pass":
+                # [MG-5] Demotion edge (H-A Stage 3): a post-merge live-gate that
+                # did not pass demotes the lane back to attended. Emit the
+                # file-based demotion event into the target repo's qa/ tree BEFORE
+                # the revert — it rides the existing O-32 path unconditionally and
+                # never alters it (a demotion event with no ledger present is inert
+                # data). The revert behaviour below is byte-for-byte untouched.
+                self._emit_demotion_event(
+                    profile,
+                    feature=feature or (feat_id or profile.env_id),
+                    feat_id=feat_id,
+                    failing_verdict=verdict if verdict is not None else "instrument_fail",
+                    failing_verdict_ref=failing_verdict_ref,
+                    deploy_run_id=deploy_run_id,
+                )
                 return await self._run_revert(
                     profile,
                     correlation_id=correlation_id,
@@ -837,6 +862,56 @@ class DeployStageRunner:
             dry_run=self._dry_run,
             detail={"reason": reason, "failing_verdict": failing_verdict},
         )
+
+    def _emit_demotion_event(
+        self,
+        profile: DeployProfile,
+        *,
+        feature: str,
+        feat_id: str | None,
+        failing_verdict: str,
+        failing_verdict_ref: str | None,
+        deploy_run_id: str,
+    ) -> None:
+        """[MG-5] Write the DF-021 live-gate demotion event (Stage 3).
+
+        Rides the O-32 verdict-fail branch unconditionally: whenever the deploy
+        stage reverts an unverified build, the auto-merged lane must be demoted,
+        so this drops a file-based demotion event into the target repo's ``qa/``
+        tree for the trust ledger to read. Best-effort and side-only — it never
+        alters the revert and never raises past its boundary (a demotion-event
+        write failure must not turn a clean revert into a crash). When no target
+        repo root was threaded (older callers / unit fixtures) it is a no-op: the
+        emission cannot name the qa/ tree, and an un-emitted event is inert.
+        """
+        if not self._target_repo_root:
+            logger.debug(
+                "MG-5: no target_repo_root threaded; demotion event not emitted "
+                "(run=%s)",
+                deploy_run_id,
+            )
+            return
+        lane = self._target_repo or profile.env_id
+        try:
+            path = write_demotion_event(
+                Path(self._target_repo_root) / "qa",
+                feature_id=feat_id or feature,
+                lane=lane,
+                verdict=failing_verdict,
+                timestamp=self._clock().isoformat(),
+                receipt_ref=failing_verdict_ref,
+                run_id=deploy_run_id,
+            )
+            logger.info(
+                "MG-5: wrote live-gate demotion event for lane %r (%s)", lane, path
+            )
+        except Exception as exc:  # noqa: BLE001 — demotion emission is best-effort
+            logger.warning(
+                "MG-5: failed to write demotion event for lane %r (run=%s): %s",
+                lane,
+                deploy_run_id,
+                exc,
+            )
 
     async def _run_revert(
         self,
