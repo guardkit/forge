@@ -205,9 +205,16 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # stage; gcc and build-essential live exclusively in the discarded
 # builder stage.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl git \
+    && apt-get install --yes --no-install-recommends curl git nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# guardkit's vendored DCL checker (qa/dcl/bin/dcl_check.mjs, WASM) needs a
+# node runtime — the ``guardkit dcl author``/oracle legs shell it in-container
+# (first live-caught 2026-07-18, run s3dcl-6e6bdabea57c: exit-2 instrument
+# error, node absent). Bookworm ships node 18, whose Go wasm_exec requires
+# the webcrypto global behind a flag (global by default only from node 19).
+ENV NODE_OPTIONS=--experimental-global-webcrypto
 
 # Bring the resolved venv across from the builder stage. Owned by root
 # so the unprivileged ``forge`` user can read but not modify the
