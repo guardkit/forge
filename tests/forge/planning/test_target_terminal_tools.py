@@ -21,6 +21,10 @@ from forge.planning.target_terminal_tools import (
     DclAuthorOutcome,
     DividerRepairResult,
     comment_box_drawing_dividers,
+    FrontmatterIdRepair,
+    FrontmatterRepairResult,
+    repair_frontmatter_feature_id,
+    repair_plan_task_frontmatter,
     NormalizerModuleUnresolved,
     TargetTestRootsUnresolved,
     ToolOutcome,
@@ -867,3 +871,253 @@ def test_discovery_against_the_REAL_api_test_checkout() -> None:
     never loosen it to a pattern."""
     roots = discover_target_test_roots(_REAL_API_TEST)
     assert roots == ["tests/health", "tests/users", "tests/version"]
+
+
+# ---------------------------------------------------------------------------
+# P-8 — task-doc frontmatter feature_id truncation repair
+# ---------------------------------------------------------------------------
+
+
+def _task_doc(feature_id: str, task_id: str = "TASK-A001") -> str:
+    """A minimal task doc with a YAML frontmatter block carrying ``feature_id``."""
+    return (
+        "---\n"
+        f"id: {task_id}\n"
+        'title: "A task"\n'
+        "status: backlog\n"
+        f"feature_id: {feature_id}\n"
+        "wave: 1\n"
+        "---\n"
+        "\n"
+        "# A task\n"
+        "\n"
+        "Body prose that mentions the feature id in passing.\n"
+    )
+
+
+# --- pure repair function --------------------------------------------------
+
+
+def test_p8_repair_fires_on_strict_prefix_truncation() -> None:
+    # run-7 grain: id-minus-one-char is a strict prefix -> repaired.
+    doc = _task_doc("FEAT-07F")  # canonical FEAT-07F3
+    new_text, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
+    assert before == "FEAT-07F"
+    assert "feature_id: FEAT-07F3\n" in new_text
+    # ONLY the feature_id field changed — every other byte survives.
+    assert new_text == doc.replace("feature_id: FEAT-07F\n", "feature_id: FEAT-07F3\n")
+
+
+def test_p8_repair_preserves_quoting_style() -> None:
+    doc = _task_doc('"FEAT-048"')  # canonical FEAT-0482, quoted
+    new_text, before = repair_frontmatter_feature_id(doc, "FEAT-0482")
+    assert before == "FEAT-048"
+    assert 'feature_id: "FEAT-0482"\n' in new_text
+
+
+def test_p8_repair_negative_non_prefix_is_untouched() -> None:
+    # A NON-prefix mismatch must NOT be touched (conservative by law).
+    doc = _task_doc("FEAT-9999")  # canonical FEAT-07F3
+    new_text, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
+    assert before is None
+    assert new_text == doc  # byte-identical
+
+
+def test_p8_repair_clean_doc_byte_untouched() -> None:
+    doc = _task_doc("FEAT-07F3")  # already canonical
+    new_text, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
+    assert before is None
+    assert new_text == doc
+
+
+def test_p8_repair_empty_value_untouched() -> None:
+    doc = _task_doc("")  # empty frontmatter value
+    new_text, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
+    assert before is None
+    assert new_text == doc
+
+
+def test_p8_repair_no_frontmatter_untouched() -> None:
+    body = "# A task\n\nNo frontmatter here, feature_id: FEAT-07F in prose.\n"
+    new_text, before = repair_frontmatter_feature_id(body, "FEAT-07F3")
+    assert before is None
+    assert new_text == body
+
+
+def test_p8_repair_is_idempotent() -> None:
+    doc = _task_doc("FEAT-07F")
+    once, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
+    assert before == "FEAT-07F"
+    twice, before2 = repair_frontmatter_feature_id(once, "FEAT-07F3")
+    assert before2 is None
+    assert twice == once
+
+
+# --- tree-level scan (repair_plan_task_frontmatter) ------------------------
+
+
+def _write_task_tree(root: Path, docs: dict[str, str]) -> None:
+    for rel, content in docs.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+
+def test_p8_tree_run7_shape_all_five_docs_repaired(tmp_path: Path) -> None:
+    docs = {
+        f"tasks/backlog/TASK-A00{i}.md": _task_doc("FEAT-07F", f"TASK-A00{i}")
+        for i in range(1, 6)
+    }
+    _write_task_tree(tmp_path, docs)
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert isinstance(result, FrontmatterRepairResult)
+    assert result.fired
+    assert len(result.repairs) == 5
+    assert {r.rel_path for r in result.repairs} == set(docs)
+    assert all(r.before == "FEAT-07F" and r.after == "FEAT-07F3" for r in result.repairs)
+    # Every doc on disk now carries the canonical id.
+    for rel in docs:
+        assert "feature_id: FEAT-07F3\n" in (tmp_path / rel).read_text(encoding="utf-8")
+    # LOUD receipt names the count and every doc.
+    receipt = result.receipt("FEAT-07F3")
+    assert "rewrote 5" in receipt
+    assert "FEAT-07F -> FEAT-07F3" in receipt
+
+
+def test_p8_tree_run4_shape_only_drifted_doc_repaired(tmp_path: Path) -> None:
+    docs = {
+        "tasks/backlog/TASK-A001.md": _task_doc("FEAT-0482", "TASK-A001"),  # clean
+        "tasks/backlog/TASK-A002.md": _task_doc("FEAT-048", "TASK-A002"),   # drifted
+        "tasks/backlog/TASK-A003.md": _task_doc("FEAT-0482", "TASK-A003"),  # clean
+    }
+    _write_task_tree(tmp_path, docs)
+    clean_before = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-0482")
+    assert result.fired
+    assert len(result.repairs) == 1
+    assert result.repairs[0].rel_path == "tasks/backlog/TASK-A002.md"
+    # The clean docs are byte-untouched.
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == clean_before
+
+
+def test_p8_tree_negative_non_prefix_untouched(tmp_path: Path) -> None:
+    docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
+    _write_task_tree(tmp_path, docs)
+    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert not result.fired
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+
+
+def test_p8_tree_clean_docs_do_not_fire(tmp_path: Path) -> None:
+    docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-07F3", "TASK-A001")}
+    _write_task_tree(tmp_path, docs)
+    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert not result.fired
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+
+
+def test_p8_tree_idempotent(tmp_path: Path) -> None:
+    docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-07F", "TASK-A001")}
+    _write_task_tree(tmp_path, docs)
+    first = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert first.fired
+    after_first = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    second = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert not second.fired
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == after_first
+
+
+def test_p8_tree_no_tasks_dir_is_noop(tmp_path: Path) -> None:
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    assert not result.fired
+
+
+# --- wired _validate end-to-end (fake oracle checks per-doc parity) --------
+
+
+def _parity_validate_seam(canonical: str):
+    """A fake guardkit ``feature validate`` that exits 0 iff EVERY task doc's
+    frontmatter feature_id equals ``canonical`` — the accept/refuse the real
+    oracle encodes for per-doc parity, with no shell-out. Returns the offending
+    doc's line on stdout_tail when it refuses (so P-5 can be exercised too)."""
+    calls: list[dict[str, Any]] = []
+
+    async def _run(**kwargs):
+        calls.append(dict(kwargs))
+        repo = Path(kwargs["repo_path"])
+        tasks = repo / "tasks"
+        bad: list[str] = []
+        if tasks.is_dir():
+            for doc in sorted(tasks.rglob("*.md")):
+                text = doc.read_text(encoding="utf-8")
+                # Parity check: the frontmatter must carry the canonical id line.
+                if f"feature_id: {canonical}\n" not in text:
+                    bad.append(str(doc.relative_to(repo)))
+        if bad:
+            return SimpleNamespace(
+                status="failed",
+                exit_code=1,
+                stderr="",
+                stdout_tail="FRONTMATTER PARITY FAILED: " + ", ".join(bad),
+            )
+        return SimpleNamespace(status="success", exit_code=0, stderr="", stdout_tail="")
+
+    return _run, calls
+
+
+@pytest.mark.asyncio
+async def test_p8_wired_run7_all_repaired_validate_proceeds(tmp_path: Path) -> None:
+    docs = {
+        f"tasks/backlog/TASK-A00{i}.md": _task_doc("FEAT-07F", f"TASK-A00{i}")
+        for i in range(1, 6)
+    }
+    _write_task_tree(tmp_path, docs)
+    run_fn, _calls = _parity_validate_seam("FEAT-07F3")
+    validate = make_validate_feature_plan(run_fn=run_fn)
+    outcome = await validate(tmp_path, "FEAT-07F3")
+    assert outcome.ok  # repaired tree passes the parity oracle
+    # LOUD receipt surfaced on the outcome.
+    assert "P-8 frontmatter repair" in outcome.detail
+    assert "rewrote 5" in outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_p8_wired_run4_one_repaired_validate_proceeds(tmp_path: Path) -> None:
+    docs = {
+        "tasks/backlog/TASK-A001.md": _task_doc("FEAT-0482", "TASK-A001"),
+        "tasks/backlog/TASK-A002.md": _task_doc("FEAT-048", "TASK-A002"),
+    }
+    _write_task_tree(tmp_path, docs)
+    run_fn, _calls = _parity_validate_seam("FEAT-0482")
+    validate = make_validate_feature_plan(run_fn=run_fn)
+    outcome = await validate(tmp_path, "FEAT-0482")
+    assert outcome.ok
+    assert "rewrote 1" in outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_p8_wired_negative_non_prefix_still_refuses(tmp_path: Path) -> None:
+    docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
+    _write_task_tree(tmp_path, docs)
+    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    run_fn, _calls = _parity_validate_seam("FEAT-07F3")
+    validate = make_validate_feature_plan(run_fn=run_fn)
+    outcome = await validate(tmp_path, "FEAT-07F3")
+    assert not outcome.ok  # refuse path unchanged — repair never touched it
+    assert "FRONTMATTER PARITY FAILED" in outcome.detail
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_p8_wired_clean_docs_no_receipt(tmp_path: Path) -> None:
+    docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-07F3", "TASK-A001")}
+    _write_task_tree(tmp_path, docs)
+    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    run_fn, _calls = _parity_validate_seam("FEAT-07F3")
+    validate = make_validate_feature_plan(run_fn=run_fn)
+    outcome = await validate(tmp_path, "FEAT-07F3")
+    assert outcome.ok
+    assert outcome.detail == ""  # repair did not fire -> no receipt
+    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original

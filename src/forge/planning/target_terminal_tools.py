@@ -60,6 +60,10 @@ __all__ = [
     "ValidatePassBarFn",
     "DividerRepairResult",
     "comment_box_drawing_dividers",
+    "FrontmatterIdRepair",
+    "FrontmatterRepairResult",
+    "repair_frontmatter_feature_id",
+    "repair_plan_task_frontmatter",
     "discover_target_test_roots",
     "make_dcl_author",
     "make_normalize_feature_spec",
@@ -588,6 +592,194 @@ def _repair_box_drawing_dividers(target: Path, feature_rel_path: str) -> str | N
     return note
 
 
+# ---------------------------------------------------------------------------
+# Task-doc frontmatter feature_id repair (P-8 — defect-#14/#15 deterministic-
+# repair pattern; sibling of the P-7 divider repair above).
+#
+# LIVE INCIDENT this fixes: the HB-4 pilot's 008 feature-plan legs
+# DETERMINISTICALLY truncated the LAST character of the feature id when writing
+# the ``feature_id`` field of a task doc's YAML frontmatter — run 4 wrote
+# ``feature_id: FEAT-048`` for FEAT-0482 (1 of N docs); run 7 wrote
+# ``feature_id: FEAT-07F`` for FEAT-07F3 (ALL 5 docs). The in-session oracle
+# does NOT check per-doc frontmatter parity, so the drift survives to the
+# pre-commit ``guardkit feature validate`` oracle, which exits 1 and kills the
+# run with NO bounded revision loop. Frontmatter is the last unrepaired
+# truncation site (tree/path truncation already has the defect-#14/#15 repairs).
+#
+# THE REPAIR — conservative by law. For every task doc the plan wrote, parse the
+# ``feature_id`` in its FIRST YAML frontmatter block; ONLY when that value V is a
+# non-empty STRICT PREFIX of the canonical feature id
+# (``canonical.startswith(V) and V != canonical``) — i.e. a truncation — is the
+# one value rewritten in place to the canonical id (quoting style preserved). A
+# NON-prefix mismatch (e.g. ``FEAT-9999`` under FEAT-07F3), an already-correct
+# id, an empty value, a doc with no frontmatter / no feature_id, and every other
+# frontmatter field are all left byte-for-byte untouched so the oracle refuses
+# exactly as today. Idempotent by construction: once V == canonical the strict-
+# prefix guard no longer fires.
+# ---------------------------------------------------------------------------
+
+#: A ``---`` YAML frontmatter delimiter line (leading/trailing blanks tolerated).
+_FRONTMATTER_DELIM_RE = re.compile(r"^[ \t]*---[ \t]*$")
+
+#: A top-level ``feature_id:`` frontmatter line — captures the key+colon prefix
+#: (preserved verbatim) and the raw value token that follows.
+_FEATURE_ID_LINE_RE = re.compile(r"^(?P<prefix>[ \t]*feature_id[ \t]*:[ \t]*)(?P<value>.*)$")
+
+
+@dataclass
+class FrontmatterIdRepair:
+    """One repaired task doc's before -> after frontmatter feature_id.
+
+    ``rel_path`` is the worktree-relative doc path; ``before`` is the truncated
+    id found in the frontmatter; ``after`` is the canonical id it was rewritten
+    to.
+    """
+
+    rel_path: str
+    before: str
+    after: str
+
+
+@dataclass
+class FrontmatterRepairResult:
+    """Outcome of :func:`repair_plan_task_frontmatter` over a plan tree.
+
+    ``repairs`` is the per-doc before->after record (empty when the repair did
+    not fire — in which case every scanned doc is byte-untouched on disk).
+    """
+
+    repairs: list[FrontmatterIdRepair]
+
+    @property
+    def fired(self) -> bool:
+        return bool(self.repairs)
+
+    def receipt(self, canonical_feature_id: str) -> str:
+        """A LOUD one-line receipt naming every repaired doc + before->after."""
+        detail = "; ".join(
+            f"{r.rel_path}: {r.before} -> {r.after}" for r in self.repairs
+        )
+        return (
+            f"P-8 frontmatter repair: rewrote {len(self.repairs)} truncated "
+            f"task-doc feature_id(s) to canonical {canonical_feature_id} [{detail}]"
+        )
+
+
+def _unquote_yaml_scalar(value: str) -> str:
+    """Strip a single pair of matching surrounding YAML quotes, if present."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _requote_yaml_scalar(original_token: str, replacement: str) -> str:
+    """Re-emit ``replacement`` with the SAME quoting style as ``original_token``.
+
+    The feature-id truncation only ever shortens a plain scalar, so this
+    preserves a ``"…"`` / ``'…'`` wrapper when the original carried one and emits
+    a bare scalar otherwise (a feature id needs no quoting).
+    """
+    if (
+        len(original_token) >= 2
+        and original_token[0] == original_token[-1]
+        and original_token[0] in "\"'"
+    ):
+        quote = original_token[0]
+        return f"{quote}{replacement}{quote}"
+    return replacement
+
+
+def repair_frontmatter_feature_id(
+    text: str, canonical_feature_id: str
+) -> tuple[str, str | None]:
+    """Repair a strict-prefix-truncated ``feature_id`` in one task doc (P-8).
+
+    Pure and deterministic. If ``text`` opens with a ``---`` YAML frontmatter
+    block whose ``feature_id`` value V is a NON-EMPTY STRICT PREFIX of
+    ``canonical_feature_id`` (``canonical.startswith(V) and V != canonical``),
+    that single value is rewritten to the canonical id in place (quoting style
+    preserved) and ``(new_text, V)`` is returned. Every other case — no
+    frontmatter, no ``feature_id``, an already-correct id, an empty value, or a
+    NON-prefix mismatch — returns ``(text, None)`` byte-for-byte unchanged. Only
+    the ``feature_id`` field in the FIRST frontmatter block is ever touched.
+    """
+    if not canonical_feature_id:
+        return text, None
+    lines = text.splitlines(keepends=True)
+    if not lines or _FRONTMATTER_DELIM_RE.match(lines[0].rstrip("\r\n")) is None:
+        return text, None
+    close_idx: int | None = None
+    for i in range(1, len(lines)):
+        if _FRONTMATTER_DELIM_RE.match(lines[i].rstrip("\r\n")) is not None:
+            close_idx = i
+            break
+    if close_idx is None:
+        return text, None
+    for i in range(1, close_idx):
+        match = _FEATURE_ID_LINE_RE.match(lines[i].rstrip("\r\n"))
+        if match is None:
+            continue
+        raw_token = match.group("value").strip()
+        before = _unquote_yaml_scalar(raw_token)
+        # First (and only) feature_id line decides the outcome for this doc.
+        if not before or before == canonical_feature_id:
+            return text, None
+        if not canonical_feature_id.startswith(before):
+            # NON-prefix mismatch — DO NOT touch; let the oracle refuse as today.
+            return text, None
+        newline_suffix = lines[i][len(lines[i].rstrip("\r\n")):]
+        lines[i] = (
+            match.group("prefix")
+            + _requote_yaml_scalar(raw_token, canonical_feature_id)
+            + newline_suffix
+        )
+        return "".join(lines), before
+    return text, None
+
+
+def repair_plan_task_frontmatter(
+    worktree_path: Path, canonical_feature_id: str
+) -> FrontmatterRepairResult:
+    """Repair strict-prefix-truncated frontmatter feature_ids across a plan tree.
+
+    Scans every ``*.md`` task doc under ``worktree_path/tasks`` (the plan tree's
+    task files — ``tasks/backlog/**`` per the 008 contract) and applies
+    :func:`repair_frontmatter_feature_id` in place. A doc is rewritten ONLY when
+    its frontmatter feature_id is a strict-prefix truncation of
+    ``canonical_feature_id``; a clean doc is left byte-untouched. Idempotent.
+
+    Contained per the oracle-boundary doctrine: a missing ``tasks`` tree, or an
+    unreadable / undecodable / unwritable doc, is a silent no-op left for the
+    downstream oracle to report — this never crashes the planning leg.
+    """
+    repairs: list[FrontmatterIdRepair] = []
+    tasks_root = worktree_path / "tasks"
+    if not tasks_root.is_dir():
+        return FrontmatterRepairResult(repairs=repairs)
+    for doc in sorted(tasks_root.rglob("*.md")):
+        try:
+            original = doc.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new_text, before = repair_frontmatter_feature_id(original, canonical_feature_id)
+        if before is None:
+            continue
+        try:
+            doc.write_text(new_text, encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            rel = str(doc.relative_to(worktree_path))
+        except ValueError:  # pragma: no cover — doc is under worktree by construction
+            rel = str(doc)
+        repairs.append(
+            FrontmatterIdRepair(
+                rel_path=rel, before=before, after=canonical_feature_id
+            )
+        )
+    return FrontmatterRepairResult(repairs=repairs)
+
+
 def make_validate_feature_plan(
     *,
     read_allowlist: Sequence[Path] | None = None,
@@ -603,6 +795,20 @@ def make_validate_feature_plan(
 
     async def _validate(worktree_path: Path, feature_id: str) -> ToolOutcome:
         allowlist = list(read_allowlist or [worktree_path])
+        # P-8 pre-oracle repair: rewrite any strict-prefix-truncated task-doc
+        # frontmatter feature_id to the canonical id BEFORE the guardkit validate
+        # oracle sees the tree, so a deterministic last-character truncation gets
+        # a parity-clean tree instead of dying with no revision loop. Conservative
+        # (only strict-prefix truncations of feature_id), information-preserving,
+        # LOUD (logs + receipts the per-doc before->after when it fires), and
+        # contained (a missing/unreadable doc is a no-op). If the tree STILL fails
+        # to validate afterwards (e.g. a NON-prefix mismatch was left untouched),
+        # the refuse path below is byte-for-byte unchanged.
+        repair = repair_plan_task_frontmatter(worktree_path, feature_id)
+        repair_note: str | None = None
+        if repair.fired:
+            repair_note = repair.receipt(feature_id)
+            logger.warning("validate_feature_plan: %s", repair_note)
         try:
             result = await guardkit_run_shim(
                 run_fn,
@@ -624,7 +830,7 @@ def make_validate_feature_plan(
         exit_code = getattr(result, "exit_code", -1)
         if status == "success" and exit_code == 0:
             logger.info("validate_feature_plan: %s valid", feature_id)
-            return ToolOutcome(ok=True, detail="")
+            return ToolOutcome(ok=True, detail=repair_note or "")
         stderr = getattr(result, "stderr", None) or ""
         tail = getattr(result, "stdout_tail", "") or ""
         return ToolOutcome(
