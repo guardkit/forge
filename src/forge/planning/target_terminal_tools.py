@@ -77,6 +77,12 @@ __all__ = [
 #: the leg loudly rather than hanging the planning run forever.
 _DEFAULT_ORACLE_TIMEOUT_SECONDS: int = 600
 
+#: P-5 observability cap for the persisted validate-refusal error. The oracle's
+#: REAL refusing lines land at the END of its stdout (the ``--json`` report),
+#: behind an INFO/WARNING stderr preamble, so we keep the TAIL and mark a
+#: ``[truncated head]`` when the combined stream exceeds this bound.
+_VALIDATE_ERROR_CAP_BYTES: int = 8192
+
 #: The interpreter used to launch the ``python -m …`` normalizer. Inside the
 #: forge image this resolves (via PATH) to the same ``/opt/venv`` interpreter the
 #: forge daemon itself runs under, so an in-process :func:`importlib.util.find_spec`
@@ -780,6 +786,36 @@ def repair_plan_task_frontmatter(
     return FrontmatterRepairResult(repairs=repairs)
 
 
+def _combine_validate_error_streams(
+    *, stdout_tail: str, stderr: str, cap_bytes: int = _VALIDATE_ERROR_CAP_BYTES
+) -> str:
+    """Combine the validate subprocess's stderr + stdout tail for the persisted
+    error (P-5 observability rider).
+
+    The prior ``(stderr or tail)`` picked ONE stream and then clipped it to 500
+    chars — on a real refusal the INFO/WARNING stderr preamble won, so the actual
+    refusing ``--json`` lines (on stdout) were lost and diagnosis needed manual
+    log archaeology. This captures BOTH, ordered stderr-then-stdout so the
+    refusing stdout lines sit at the TAIL, then keeps at most ``cap_bytes`` bytes
+    from the END (prefixing ``[truncated head]`` when clipped) so the errors that
+    live at the tail always survive. Pure and side-effect-free; changes only what
+    is persisted, never the accept/refuse decision.
+    """
+    parts: list[str] = []
+    if stderr.strip():
+        parts.append("stderr:\n" + stderr.strip())
+    if stdout_tail.strip():
+        parts.append("stdout:\n" + stdout_tail.strip())
+    combined = "\n".join(parts).strip()
+    if not combined:
+        return ""
+    encoded = combined.encode("utf-8")
+    if len(encoded) <= cap_bytes:
+        return combined
+    tail = encoded[-cap_bytes:].decode("utf-8", errors="ignore")
+    return "[truncated head]\n" + tail
+
+
 def make_validate_feature_plan(
     *,
     read_allowlist: Sequence[Path] | None = None,
@@ -833,11 +869,16 @@ def make_validate_feature_plan(
             return ToolOutcome(ok=True, detail=repair_note or "")
         stderr = getattr(result, "stderr", None) or ""
         tail = getattr(result, "stdout_tail", "") or ""
+        # P-5: persist the FULL stdout+stderr (tail-kept, 8KB cap) so the oracle's
+        # real refusing lines reach ``planning_runs.error`` instead of just the
+        # INFO/WARNING preamble. Observability only — the refuse decision is
+        # unchanged.
+        streams = _combine_validate_error_streams(stdout_tail=tail, stderr=stderr)
         return ToolOutcome(
             ok=False,
             detail=(
                 f"guardkit feature validate {status} (exit {exit_code}) for "
-                f"{feature_id}: {(stderr or tail).strip()[:500]}"
+                f"{feature_id}: {streams}"
             ),
         )
 

@@ -1121,3 +1121,38 @@ async def test_p8_wired_clean_docs_no_receipt(tmp_path: Path) -> None:
     assert outcome.ok
     assert outcome.detail == ""  # repair did not fire -> no receipt
     assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+
+
+# ---------------------------------------------------------------------------
+# P-5 — persist the FULL validate stdout+stderr (observability rider)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p5_refusing_stdout_line_survives_stderr_preamble(tmp_path: Path) -> None:
+    # The real incident: an INFO/WARNING stderr preamble drowned the actual
+    # refusing ``--json`` lines on stdout, which were then lost. Both must now
+    # reach the persisted error.
+    stderr = "INFO boot\nWARNING deprecated flag\n" + ("noise\n" * 40)
+    tail = 'DISTINCTIVE: {"errors": ["feature_id parity: FEAT-07F != FEAT-07F3"]}'
+    run_fn, _ = _fake_run("failed", 1, stderr=stderr, tail=tail)
+    validate = make_validate_feature_plan(run_fn=run_fn)
+    outcome = await validate(tmp_path, "FEAT-07F3")
+    assert not outcome.ok
+    assert "DISTINCTIVE" in outcome.detail
+    assert "feature_id parity" in outcome.detail
+    assert "WARNING deprecated flag" in outcome.detail  # stderr preserved too
+
+
+def test_p5_combine_keeps_tail_and_marks_truncated_head() -> None:
+    stderr = "S" * 20
+    # A large stdout whose refusing line is at the very END.
+    tail = ("X" * 20000) + "\nTHE-REFUSING-LINE"
+    combined = ttt._combine_validate_error_streams(stdout_tail=tail, stderr=stderr)
+    assert combined.startswith("[truncated head]\n")
+    assert "THE-REFUSING-LINE" in combined  # tail survived
+    assert len(combined.encode("utf-8")) <= 8192 + len("[truncated head]\n") + 1
+
+
+def test_p5_combine_no_streams_is_empty() -> None:
+    assert ttt._combine_validate_error_streams(stdout_tail="", stderr="") == ""
