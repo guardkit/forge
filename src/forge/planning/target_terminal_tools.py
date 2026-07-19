@@ -35,6 +35,7 @@ import asyncio
 import importlib
 import importlib.util
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -57,6 +58,8 @@ __all__ = [
     "ValidateFeaturePlanFn",
     "ValidateGateRegistryFn",
     "ValidatePassBarFn",
+    "DividerRepairResult",
+    "comment_box_drawing_dividers",
     "discover_target_test_roots",
     "make_dcl_author",
     "make_normalize_feature_spec",
@@ -371,6 +374,100 @@ async def _default_normalizer_subprocess(
     )
 
 
+# ---------------------------------------------------------------------------
+# Box-drawing "divider" repair (P-7 — defect-#14/#15 deterministic-repair
+# pattern).
+#
+# LIVE INCIDENT this fixes: the HB-4 pilot's 007 feature-spec legs twice emitted
+# decorative divider lines at top level between scenarios inside the generated
+# ``.feature`` file, e.g.::
+#
+#     ━━ GROUP A: Key Examples (3 scenarios) ━━
+#     ━━ GROUP B: Boundary Conditions (4 scenarios) ━━
+#
+# gherkin-official rightly refuses these (a top-level line that is neither a
+# keyword, comment, tag, nor docstring content), the pre-commit normalizer exits
+# 1, and the whole run dies with NO revision loop.
+#
+# THE REPAIR — conservative by law. ONLY a line whose first non-whitespace
+# character is a Unicode box-drawing character (block U+2500–U+257F: ━ ─ ═ │ …)
+# and that sits OUTSIDE any gherkin docstring block is rewritten by prefixing
+# ``# `` (turning it into a legal comment — information-preserving, never
+# deleted). Every other malformed line (a step that lost its keyword, prose that
+# is not a divider, …) is left exactly as-is for the parser to refuse, exactly as
+# today. Docstring interiors are legal free text and are left byte-untouched
+# (a divider *inside* a docstring is content, not a top-level line): the scan
+# tracks docstring context the same way guardkit's own ``feature_spec_normalize``
+# collapse pass does, so a box-drawing line inside ``"""``/``'''``/```` ``` ```` is
+# never touched. This is the simplest provably-safe rule for requirement (d).
+# ---------------------------------------------------------------------------
+
+#: A "divider" line: first non-whitespace char is in the box-drawing block.
+_BOX_DRAWING_DIVIDER_RE = re.compile(r"^\s*[─-╿]")
+
+#: Gherkin docstring delimiters (``"""`` / ``'''`` / triple-backtick). Mirrors
+#: guardkit ``feature_spec_normalize`` (which tracks ``"""``/``'''``); the
+#: triple-backtick form is included for completeness.
+_DOCSTRING_DELIMITER_RE = re.compile(r"^\s*(\"\"\"|'''|```)")
+
+
+@dataclass
+class DividerRepairResult:
+    """Outcome of :func:`comment_box_drawing_dividers`.
+
+    ``text`` is the (possibly) rewritten feature text; ``commented_lines`` is the
+    1-based line numbers of the divider lines that were commented out (empty when
+    the repair did not fire — in which case ``text`` is the input byte-for-byte).
+    """
+
+    text: str
+    commented_lines: list[int]
+
+    @property
+    def fired(self) -> bool:
+        return bool(self.commented_lines)
+
+
+def comment_box_drawing_dividers(text: str) -> DividerRepairResult:
+    """Comment out top-level box-drawing divider lines (P-7 repair).
+
+    Pure and deterministic. Scans ``text`` line by line, tracking gherkin
+    docstring context, and prefixes ``# `` to every line that (a) is OUTSIDE a
+    docstring and (b) has a box-drawing character (U+2500–U+257F) as its first
+    non-whitespace character. All other bytes — including divider-looking lines
+    *inside* a docstring, and any non-box-drawing malformed line — are preserved
+    exactly. Idempotent: a line already commented no longer starts with a
+    box-drawing char, so a second pass is a no-op.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    commented: list[int] = []
+    in_docstring = False
+    open_delim: str | None = None
+    for idx, line in enumerate(lines, start=1):
+        delim_match = _DOCSTRING_DELIMITER_RE.match(line)
+        if in_docstring:
+            # Inside a docstring: NEVER touch content. Only a matching closing
+            # delimiter flips us back out.
+            if delim_match and delim_match.group(1) == open_delim:
+                in_docstring = False
+                open_delim = None
+            out.append(line)
+            continue
+        if delim_match:
+            # Opening a docstring — the delimiter line itself is not a divider.
+            in_docstring = True
+            open_delim = delim_match.group(1)
+            out.append(line)
+            continue
+        if _BOX_DRAWING_DIVIDER_RE.match(line):
+            out.append("# " + line)
+            commented.append(idx)
+            continue
+        out.append(line)
+    return DividerRepairResult(text="".join(out), commented_lines=commented)
+
+
 def make_normalize_feature_spec(
     *,
     command_prefix: Sequence[str] | None = _DEFAULT_NORMALIZER_COMMAND,
@@ -405,6 +502,15 @@ def make_normalize_feature_spec(
     async def _normalize(worktree_path: Path, feature_rel_path: str) -> ToolOutcome:
         nonlocal resolved_prefix
         target = (worktree_path / feature_rel_path).resolve()
+        # P-7 pre-parse repair: comment out any top-level box-drawing divider
+        # lines BEFORE the gherkin parse, so the run gets a parseable spec instead
+        # of dying with no revision loop. Conservative (only that char class),
+        # information-preserving (comments, never deletes), and LOUD (logs the
+        # count + line numbers when it fires). Contained per the oracle-boundary
+        # doctrine — a missing/unreadable file is left for the parse to report,
+        # never crashes the leg. If the file STILL fails to parse afterwards, the
+        # exit/refuse path below is unchanged.
+        repair_note = _repair_box_drawing_dividers(target, feature_rel_path)
         if resolved_prefix is None:
             try:
                 resolved_prefix = list(
@@ -443,9 +549,43 @@ def make_normalize_feature_spec(
         logger.info(
             "normalize_feature_spec: %s parseable (%.2fs)", feature_rel_path, duration
         )
-        return ToolOutcome(ok=True, detail="")
+        return ToolOutcome(ok=True, detail=repair_note or "")
 
     return _normalize
+
+
+def _repair_box_drawing_dividers(target: Path, feature_rel_path: str) -> str | None:
+    """Apply the P-7 divider repair to ``target`` in place, if it fires.
+
+    Reads the feature file, runs :func:`comment_box_drawing_dividers`, and only
+    rewrites the file when at least one divider was commented (a clean file is
+    left byte-untouched). Returns a LOUD one-line receipt (naming the count and
+    the commented 1-based line numbers) when the repair fired, else ``None``.
+
+    Contained per the oracle-boundary doctrine: a missing/unreadable/undecodable
+    file is a no-op (returns ``None``) and is left for the downstream parse to
+    report — this never crashes the planning leg.
+    """
+    try:
+        original = target.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, OSError,
+            UnicodeDecodeError):
+        return None
+    result = comment_box_drawing_dividers(original)
+    if not result.fired:
+        return None
+    try:
+        target.write_text(result.text, encoding="utf-8")
+    except OSError:
+        # Could not persist the repair — leave the original bytes for the parse
+        # to refuse, exactly as before the repair existed.
+        return None
+    note = (
+        f"P-7 divider repair: commented {len(result.commented_lines)} top-level "
+        f"box-drawing line(s) at {result.commented_lines} in {feature_rel_path}"
+    )
+    logger.warning("normalize_feature_spec: %s", note)
+    return note
 
 
 def make_validate_feature_plan(

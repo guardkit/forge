@@ -19,6 +19,8 @@ from forge.planning.target_terminal_tools import (
     NORMALIZER_MODULE_CANDIDATES,
     TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
     DclAuthorOutcome,
+    DividerRepairResult,
+    comment_box_drawing_dividers,
     NormalizerModuleUnresolved,
     TargetTestRootsUnresolved,
     ToolOutcome,
@@ -89,6 +91,236 @@ async def test_normalize_never_crashes_on_raise(tmp_path: Path) -> None:
     outcome = await normalize(tmp_path, "features/x/x.feature")
     assert not outcome.ok
     assert "RuntimeError" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# P-7 box-drawing divider repair (defect-#14/#15 deterministic-repair pattern)
+#
+# The HB-4 pilot's 007 legs twice emitted decorative box-drawing divider lines
+# at top level between scenarios; gherkin-official refuses them and the run died
+# with no revision loop. The repair comments those lines out (conservative,
+# information-preserving, LOUD) BEFORE the parse. The four fixtures below pin the
+# ratified class exactly — (a) fires+GREEN, (b) refuses (conservative law),
+# (c) byte-untouched, (d) docstring-safe.
+# ---------------------------------------------------------------------------
+
+# (a) run-6 shape: valid gherkin + 3 box-drawing divider lines at top level
+#     (dividers at 1-based lines 3, 11, 17).
+_FIXTURE_RUN6 = (
+    "Feature: Invoice grouping\n"
+    "\n"
+    "  ━━ GROUP A: Key Examples (3 scenarios) ━━\n"
+    "\n"
+    "  Scenario: first\n"
+    "    Given a thing\n"
+    "    When I act\n"
+    "    Then it works\n"
+    "\n"
+    "\n"
+    "  ━━ GROUP B: Boundary Conditions (4 scenarios) ━━\n"
+    "\n"
+    "  Scenario: second\n"
+    "    Given another\n"
+    "    Then ok\n"
+    "\n"
+    "  ══ GROUP C ══\n"
+    "  Scenario: third\n"
+    "    Given x\n"
+    "    Then y\n"
+)
+
+# (b) a bare NON-box-drawing text line in the same between-scenarios slot — the
+#     parser refuses it and the conservative law says the repair must NOT fire.
+_FIXTURE_BARE_NONBOX = (
+    "Feature: F\n"
+    "\n"
+    "  Scenario: first\n"
+    "    Given a\n"
+    "    Then b\n"
+    "\n"
+    "  GROUP B plain prose that lost its keyword\n"
+    "\n"
+    "  Scenario: second\n"
+    "    Given c\n"
+    "    Then d\n"
+)
+
+# (c) a clean, already-parseable spec — the repair must not fire, byte-untouched.
+_FIXTURE_CLEAN = (
+    "Feature: F\n"
+    "  Scenario: s\n"
+    "    Given a\n"
+    "    Then b\n"
+)
+
+# (d) a box-drawing line INSIDE a docstring block — legal content, not a
+#     top-level divider; must be left byte-untouched.
+_FIXTURE_DOCSTRING = (
+    "Feature: F\n"
+    "  Scenario: s\n"
+    "    Given a payload\n"
+    '      """\n'
+    "      ━━ this is content, not a divider ━━\n"
+    "      normal text\n"
+    '      """\n'
+    "    Then b\n"
+)
+
+
+def _gherkin_parses(text: str) -> bool:
+    """True iff gherkin-official parses ``text`` (the downstream oracle's rule)."""
+    parser_mod = pytest.importorskip("gherkin.parser")
+    scanner_mod = pytest.importorskip("gherkin.token_scanner")
+    try:
+        parser_mod.Parser().parse(scanner_mod.TokenScanner(text))
+        return True
+    except Exception:  # noqa: BLE001 — any parse error == refuse
+        return False
+
+
+def _gherkin_parse_seam():
+    """A fake normalizer subprocess that runs the REAL gherkin parse in-process.
+
+    Reads the target ``.feature`` file (as rewritten by the pre-parse repair) and
+    returns exit 0 iff gherkin-official accepts it — exactly the accept/refuse the
+    production ``python -m …feature_spec_normalize`` subprocess encodes, but with
+    no shell-out. This exercises the full wired ``_normalize`` path end-to-end.
+    """
+    pytest.importorskip("gherkin.parser")
+    calls: list[dict[str, Any]] = []
+
+    async def _seam(*, command, cwd, timeout):
+        target = Path(command[-1])
+        text = target.read_text(encoding="utf-8")
+        calls.append({"text": text})
+        return ("", "", 0, False) if _gherkin_parses(text) else ("", "refuse", 1, False)
+
+    return _seam, calls
+
+
+# --- pure repair function --------------------------------------------------
+
+
+def test_repair_a_run6_fires_and_names_three_lines() -> None:
+    result = comment_box_drawing_dividers(_FIXTURE_RUN6)
+    assert isinstance(result, DividerRepairResult)
+    assert result.fired
+    # N=3, and the exact 1-based line numbers of the divider lines.
+    assert result.commented_lines == [3, 11, 17]
+    # The divider lines are now legal comments; the file parses GREEN.
+    assert not _gherkin_parses(_FIXTURE_RUN6)  # raw refused
+    assert _gherkin_parses(result.text)  # repaired accepted
+    # Information-preserving: the original divider text survives inside a comment.
+    assert "# " in result.text
+    assert "GROUP A: Key Examples" in result.text
+    assert "GROUP C" in result.text
+
+
+def test_repair_b_bare_nonbox_line_does_not_fire_still_refuses() -> None:
+    result = comment_box_drawing_dividers(_FIXTURE_BARE_NONBOX)
+    # Conservative by law: only the box-drawing class triggers the repair.
+    assert not result.fired
+    assert result.commented_lines == []
+    assert result.text == _FIXTURE_BARE_NONBOX  # byte-identical
+    # And it still refuses exactly as today.
+    assert not _gherkin_parses(_FIXTURE_BARE_NONBOX)
+
+
+def test_repair_c_clean_spec_is_byte_untouched() -> None:
+    result = comment_box_drawing_dividers(_FIXTURE_CLEAN)
+    assert not result.fired
+    assert result.commented_lines == []
+    assert result.text == _FIXTURE_CLEAN
+    assert _gherkin_parses(_FIXTURE_CLEAN)
+
+
+def test_repair_d_divider_inside_docstring_is_not_touched() -> None:
+    result = comment_box_drawing_dividers(_FIXTURE_DOCSTRING)
+    # Docstring content is legal free text — the scan must respect docstring
+    # context and leave the interior byte-untouched.
+    assert not result.fired
+    assert result.text == _FIXTURE_DOCSTRING
+    assert _gherkin_parses(_FIXTURE_DOCSTRING)
+
+
+def test_repair_is_idempotent() -> None:
+    once = comment_box_drawing_dividers(_FIXTURE_RUN6)
+    twice = comment_box_drawing_dividers(once.text)
+    assert not twice.fired
+    assert twice.text == once.text
+
+
+# --- wired _normalize end-to-end (real gherkin parse via the seam) ---------
+
+
+def _write_feature(tmp_path: Path, text: str) -> str:
+    rel = "features/x/x.feature"
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return rel
+
+
+@pytest.mark.asyncio
+async def test_normalize_a_repairs_in_place_then_parses_green(tmp_path: Path) -> None:
+    rel = _write_feature(tmp_path, _FIXTURE_RUN6)
+    seam, _calls = _gherkin_parse_seam()
+    normalize = make_normalize_feature_spec(subprocess_seam=seam)
+    outcome = await normalize(tmp_path, rel)
+    assert outcome.ok  # repaired file parsed GREEN
+    # LOUD receipt: count + line numbers surfaced on the outcome.
+    assert "P-7 divider repair" in outcome.detail
+    assert "commented 3" in outcome.detail
+    assert "[3, 11, 17]" in outcome.detail
+    # The file on disk was rewritten with the dividers commented out.
+    on_disk = (tmp_path / rel).read_text(encoding="utf-8")
+    assert on_disk != _FIXTURE_RUN6
+    assert _gherkin_parses(on_disk)
+
+
+@pytest.mark.asyncio
+async def test_normalize_b_bare_nonbox_still_refuses(tmp_path: Path) -> None:
+    rel = _write_feature(tmp_path, _FIXTURE_BARE_NONBOX)
+    seam, _calls = _gherkin_parse_seam()
+    normalize = make_normalize_feature_spec(subprocess_seam=seam)
+    outcome = await normalize(tmp_path, rel)
+    assert not outcome.ok  # refuse path unchanged
+    assert "exit 1" in outcome.detail
+    # File untouched (repair never fired).
+    assert (tmp_path / rel).read_text(encoding="utf-8") == _FIXTURE_BARE_NONBOX
+
+
+@pytest.mark.asyncio
+async def test_normalize_c_clean_spec_untouched_no_receipt(tmp_path: Path) -> None:
+    rel = _write_feature(tmp_path, _FIXTURE_CLEAN)
+    seam, _calls = _gherkin_parse_seam()
+    normalize = make_normalize_feature_spec(subprocess_seam=seam)
+    outcome = await normalize(tmp_path, rel)
+    assert outcome.ok
+    assert outcome.detail == ""  # repair did not fire → no receipt
+    assert (tmp_path / rel).read_text(encoding="utf-8") == _FIXTURE_CLEAN
+
+
+@pytest.mark.asyncio
+async def test_normalize_d_docstring_divider_untouched(tmp_path: Path) -> None:
+    rel = _write_feature(tmp_path, _FIXTURE_DOCSTRING)
+    seam, _calls = _gherkin_parse_seam()
+    normalize = make_normalize_feature_spec(subprocess_seam=seam)
+    outcome = await normalize(tmp_path, rel)
+    assert outcome.ok
+    assert outcome.detail == ""  # repair did not fire
+    assert (tmp_path / rel).read_text(encoding="utf-8") == _FIXTURE_DOCSTRING
+
+
+@pytest.mark.asyncio
+async def test_normalize_missing_file_is_noop_repair(tmp_path: Path) -> None:
+    # No file on disk (the existing stub-seam tests' shape): the repair is a
+    # silent no-op and the leg proceeds to the seam exactly as before.
+    seam, _calls = _fake_normalizer(exit_code=0)
+    normalize = make_normalize_feature_spec(subprocess_seam=seam)
+    outcome = await normalize(tmp_path, "features/x/x.feature")
+    assert outcome.ok
+    assert outcome.detail == ""
 
 
 # ---------------------------------------------------------------------------
