@@ -1,0 +1,13 @@
+
+# QAV shadow mode (2026-07-25, design: ai-transition docs/qav-shadow-mode-design-2026-07-25.md).
+# Log-only second opinion beside every coach verdict — never blocks, absent-not-fail,
+# default OFF when this block is missing. Reversible one-line kill: enabled: false or
+# delete the block. Zero verdict impact by construction (never-raise wrappers; the
+# receipt qav_shadow_turn_N.json lands beside coach_turn_N.json).
+autobuild:
+  coach:
+    qav_shadow:
+      enabled: true
+      endpoint: http://localhost:9000/v1/chat/completions
+      model: qav-shadow
+      timeout_seconds: 60
