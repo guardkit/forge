@@ -73,10 +73,48 @@ updated: 2026-07-09T00:00:00Z
 > caps travel + resolve but do not yet pause a live build. §3 coach-score floor
 > unchanged.
 >
-> **§3 coach-score floor (no change, as scoped):** `last_coach_score` stays
-> `None` (ADR-ARCH-033); the `min_coach_score` branch is inert and
-> activates automatically when the runner feeds a real score. No
-> `budget_guard` change needed.
+> **§3 coach-score floor (SUPERSEDED — see the 2026-07-26 closure below).**
+> ~~`last_coach_score` stays `None` (ADR-ARCH-033); the `min_coach_score`
+> branch is inert and activates automatically when the runner feeds a real
+> score. No `budget_guard` change needed.~~
+>
+> **✅ §3 COACH-SCORE FLOOR WIRE DONE 2026-07-26 (AC-05) — DI seam + fixture
+> reader; production reader deferred to the Mode-C-production lane.**
+> The supervisor no longer hardcodes `last_coach_score=None`. Shipped
+> (`src/forge/pipeline/supervisor.py`, no `budget_guard.py` change):
+> - New DI field `budget_coach_score_reader: (build_id) -> float | None`
+>   (default `None`), mirroring `budget_started_at_reader`. Default `None`
+>   → `last_coach_score=None` → floor inert → byte-identical to the pre-reader
+>   path (AC-03 preserved).
+> - New helper `_budget_last_coach_score(build_id)`: returns the reader's value
+>   when wired; a reader failure degrades to `None` with a loud `logger.error`
+>   (mirrors the `build_mode_reader` safe-default shape) so enforcement never
+>   crashes and the OTHER caps still enforce.
+> - `_enforce_mode_c_budget` metrics assembly now feeds
+>   `last_coach_score=self._budget_last_coach_score(build_id)`; the evaluator's
+>   `min_coach_score` branch activates automatically on a non-None score.
+> - Tests (`TestModeCBudgetEnforcement`, +4 → 9 total): below-floor → PAUSED
+>   `budget_guard_breach`/`min_coach_score`; at-floor → dispatches; reader
+>   None/unwired → dispatch (floor inert); reader raises → loud-log + None +
+>   the review-cycle cap still fires.
+>
+> **HONEST FINDING — the production reader is NOT wired this session, by
+> design.** Investigation of the UBS1C population (`autobuild_runner.py`
+> ~1900-2032): the decision-derived `last_coach_score` (1.0 success / 0.0
+> feedback) lands on the in-memory `AutobuildRunnerState` snapshot and flows
+> outward only through the lifecycle emitter / nats payloads
+> (`translation.py` `StageCompletePayload.coach_score`, `autobuild_runner.py`
+> L620) — the streaming path. The Mode C **Supervisor** runs a *different*
+> execution path (ADR-ARCH-033 two-path split) and has no store it can query
+> **by build_id** for that specific streaming value. (The forge SQLite
+> `stage_log.coach_score` column *is* queryable via `read_stages(build_id)`,
+> but it carries the **gating/specialist** coach scores, not the UBS1C
+> streaming aggregate.) Per the task's scope, this session therefore ships the
+> **DI seam + a documented fixture reader in tests** only. **The production
+> reader lands with the Mode-C-production lane** (the same lane that wires
+> `serve.py build_supervisor`, explicitly out of this task's scope) — that lane
+> chooses and injects the real `budget_coach_score_reader` alongside the live
+> Mode C planner.
 
 # TASK-UBS-002-integration — connect the budget guard to the live build loop
 
@@ -145,8 +183,11 @@ needed — just feed a real score into `BuildBudgetMetrics`.
   ModeCCyclePlanner behaviour is byte-for-byte unchanged.
 - [ ] AC-04: `forge queue --profile unattended` delivers the profile to the
   daemon (via §2), verified by the daemon resolving the unattended caps.
-- [ ] AC-05: With a real `last_coach_score` present, a score below the floor
-  pauses; at/above the floor proceeds.
+- [x] AC-05 (2026-07-26): With a real `last_coach_score` present (supplied by
+  the `budget_coach_score_reader` DI seam), a score below the floor pauses;
+  at/above proceeds. Proven via the fixture reader in `TestModeCBudgetEnforcement`;
+  the production reader lands with the Mode-C-production lane (see the §3 banner
+  note — the streaming score is not Supervisor-queryable by build_id).
 
 ## Out of scope
 - The QA-Verifier fine-tune and the coach-score *parser* itself (guardkit /
