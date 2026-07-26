@@ -407,3 +407,217 @@ def test_code_version_stamp_is_present() -> None:
     assert ar.RUNNER_CODE_VERSION.startswith(("git-", "pkg-")) or (
         ar.RUNNER_CODE_VERSION == "unknown"
     )
+
+
+# ---------------------------------------------------------------------------
+# F2 — worktree add uses --detach (branch REF not claimed)
+# ---------------------------------------------------------------------------
+
+
+def _branch_exists(repo: Path, branch: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{branch}"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _write_guardkit_feature(
+    repo: Path, feature_id: str, task_ids: list[str]
+) -> None:
+    """Write a minimal ``.guardkit/features/<feature_id>.yaml`` with a task list."""
+    features_dir = repo / ".guardkit" / "features"
+    features_dir.mkdir(parents=True, exist_ok=True)
+    tasks = "\n".join(f"- id: {t}\n  name: {t}" for t in task_ids)
+    (features_dir / f"{feature_id}.yaml").write_text(
+        f"id: {feature_id}\ntasks:\n{tasks}\n"
+    )
+
+
+def test_materialise_uses_detach_and_does_not_claim_branch(
+    throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2: ``git worktree add --detach`` — the branch commit, ref UNCLAIMED."""
+    monkeypatch.setenv(
+        ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt")
+    )
+    calls: list[list[str]] = []
+    real = ar._run_git
+
+    async def _rec(args: list[str], *, cwd: Path):
+        calls.append(list(args))
+        return await real(args, cwd=cwd)
+
+    monkeypatch.setattr(ar, "_run_git", _rec)
+    wt = asyncio.run(
+        ar._materialise_worktree(throwaway_repo, PLANNING_BRANCH, "build-DETACH")
+    )
+
+    add = next(c for c in calls if c[:2] == ["worktree", "add"])
+    assert add == ["worktree", "add", "--detach", str(wt), PLANNING_BRANCH], (
+        f"worktree add must be --detach; got {add!r}"
+    )
+    # The worktree checked out the branch's COMMIT at a DETACHED HEAD — the
+    # branch ref is not claimed by any worktree.
+    porcelain = _git(throwaway_repo, "worktree", "list", "--porcelain")
+    assert f"branch refs/heads/{PLANNING_BRANCH}" not in porcelain
+    assert _git(wt, "rev-parse", "HEAD") == _git(
+        throwaway_repo, "rev-parse", PLANNING_BRANCH
+    )
+    assert _git(wt, "branch", "--show-current") == ""
+
+
+# ---------------------------------------------------------------------------
+# F3 — preflight residue sweep
+# ---------------------------------------------------------------------------
+
+
+def test_prune_preflight_runs_before_materialise(
+    throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3: ``git worktree prune`` is issued BEFORE the worktree add."""
+    monkeypatch.setenv(
+        ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt")
+    )
+    _write_guardkit_feature(throwaway_repo, ROUND17_FEATURE_ID, ["TASK-X-1"])
+
+    seq: list[list[str]] = []
+    real = ar._run_git
+
+    async def _rec(args: list[str], *, cwd: Path):
+        seq.append(list(args))
+        return await real(args, cwd=cwd)
+
+    monkeypatch.setattr(ar, "_run_git", _rec)
+
+    description = _launch(
+        '{"build_id": "%s", "feature_id": "%s", "correlation_id": "%s", '
+        '"branch": "%s"}'
+        % (ROUND17_BUILD_ID, ROUND17_FEATURE_ID, ROUND17_CORR, PLANNING_BRANCH)
+    )
+    recorded: dict[str, Any] = {}
+    _invoke(description, throwaway_repo, exit_code=0, recorded=recorded)
+
+    prune_idx = next(
+        i for i, c in enumerate(seq) if c[:2] == ["worktree", "prune"]
+    )
+    add_idx = next(
+        i for i, c in enumerate(seq) if c[:2] == ["worktree", "add"]
+    )
+    assert prune_idx < add_idx, "prune must precede worktree add"
+
+
+def test_sweep_detaches_stale_inner_worktree_then_deletes_branch(
+    throwaway_repo: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F3(c): stale same-task branch checked out in an on-disk prior inner
+    worktree → detached FIRST (forensics preserved), THEN branch deleted."""
+    _write_guardkit_feature(throwaway_repo, "FEAT-SWEEP", ["TASK-X-1"])
+    inner = tmp_path / "stale_inner"
+    _git(
+        throwaway_repo, "worktree", "add", "-b", "autobuild/TASK-X-1",
+        str(inner), "main",
+    )
+    # A kept forensic file (the F11 read-only-forensics law protects it).
+    (inner / "forensic.txt").write_text("evidence")
+    head_before = _git(inner, "rev-parse", "HEAD")
+
+    with caplog.at_level(
+        logging.INFO, logger="forge.subagents.autobuild_runner"
+    ):
+        asyncio.run(ar._sweep_build_refs(throwaway_repo, "FEAT-SWEEP"))
+
+    # Branch deleted; the inner worktree KEPT on disk, detached at same commit,
+    # forensic file preserved.
+    assert not _branch_exists(throwaway_repo, "autobuild/TASK-X-1")
+    assert inner.exists()
+    assert (inner / "forensic.txt").read_text() == "evidence"
+    assert _git(inner, "rev-parse", "HEAD") == head_before
+    assert _git(inner, "branch", "--show-current") == ""
+
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "detached stale inner worktree" in joined
+    assert "deleted stale branch autobuild/TASK-X-1" in joined
+
+
+def test_sweep_leaves_other_feature_branches_untouched(
+    throwaway_repo: Path,
+) -> None:
+    """F3(d): a branch owned by ANOTHER feature is never swept."""
+    _write_guardkit_feature(throwaway_repo, "FEAT-MINE", ["TASK-X-1"])
+    _git(throwaway_repo, "branch", "autobuild/TASK-X-1", "main")
+    _git(throwaway_repo, "branch", "autobuild/TASK-OTHER-1", "main")
+
+    asyncio.run(ar._sweep_build_refs(throwaway_repo, "FEAT-MINE"))
+
+    assert not _branch_exists(throwaway_repo, "autobuild/TASK-X-1"), (
+        "this feature's stale branch must be swept"
+    )
+    assert _branch_exists(throwaway_repo, "autobuild/TASK-OTHER-1"), (
+        "another feature's branch must be left alone"
+    )
+
+
+def test_sweep_yaml_missing_falls_back_to_prune_only(
+    throwaway_repo: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F3(e): no feature yaml → loud warning + prune-only (no branch sweep)."""
+    # No .guardkit/features/<id>.yaml written at all.
+    _git(throwaway_repo, "branch", "autobuild/TASK-X-1", "main")
+
+    with caplog.at_level(
+        logging.WARNING, logger="forge.subagents.autobuild_runner"
+    ):
+        asyncio.run(ar._sweep_build_refs(throwaway_repo, "FEAT-NOFILE"))
+
+    # prune-only: the stale branch is NOT deleted because task ids are unknown.
+    assert _branch_exists(throwaway_repo, "autobuild/TASK-X-1")
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "falling back to prune-only" in joined
+
+
+def test_sweep_malformed_yaml_falls_back_to_prune_only(
+    throwaway_repo: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F3(e): unparseable feature yaml → loud warning + prune-only."""
+    features_dir = throwaway_repo / ".guardkit" / "features"
+    features_dir.mkdir(parents=True, exist_ok=True)
+    (features_dir / "FEAT-BAD.yaml").write_text("tasks: [unterminated\n")
+    _git(throwaway_repo, "branch", "autobuild/TASK-X-1", "main")
+
+    with caplog.at_level(
+        logging.WARNING, logger="forge.subagents.autobuild_runner"
+    ):
+        asyncio.run(ar._sweep_build_refs(throwaway_repo, "FEAT-BAD"))
+
+    assert _branch_exists(throwaway_repo, "autobuild/TASK-X-1")
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "falling back to prune-only" in joined
+
+
+def test_sweep_never_crashes_on_unexpected_error(
+    throwaway_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F3: any unexpected sweep failure is logged loud, never raised."""
+
+    async def _boom(args: list[str], *, cwd: Path):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(ar, "_run_git", _boom)
+    with caplog.at_level(
+        logging.WARNING, logger="forge.subagents.autobuild_runner"
+    ):
+        # Must not raise.
+        asyncio.run(ar._sweep_build_refs(throwaway_repo, "FEAT-ANY"))
+
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "preflight sweep failed unexpectedly" in joined

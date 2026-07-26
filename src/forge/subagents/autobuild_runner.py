@@ -1442,6 +1442,194 @@ async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
     return code == 0
 
 
+def _feature_task_ids(repo_path: Path, feature_id: str) -> list[str] | None:
+    """Return the task ids declared in ``.guardkit/features/<feature_id>.yaml``.
+
+    guardkit turns each task id into an ``autobuild/<task_id>`` branch + a
+    ``.guardkit/worktrees/<task_id>`` inner worktree
+    (``WorktreeManager._build_branch_name``), so these are the ONLY refs this
+    build's F3 preflight sweep is allowed to touch — a concurrent build of
+    ANOTHER feature owns its own task ids and must be left alone.
+
+    Reads the SAME file :func:`_node_planning_waves` consults, NOT the payload's
+    ``feature_yaml_path`` — that field is the plan-tree yaml the allowlist gate
+    validates; dispatch never uses it to locate the spec (see
+    ``forge.cli._serve_planning._resolve_feature_yaml_path``), and it may point
+    at a plan branch not checked out here. The ``.guardkit/features`` yaml is
+    the authoritative task graph guardkit itself consumes.
+
+    Returns ``None`` (never raises) when the file is missing or unparseable so
+    the caller can fall back to prune-only per the loud-warn-never-crash
+    convention (FEAT-UBS1C).
+    """
+    feature_yaml_path = (
+        repo_path / ".guardkit" / "features" / f"{feature_id}.yaml"
+    )
+    try:
+        if not feature_yaml_path.exists():
+            return None
+        with open(feature_yaml_path, "r") as f:
+            feature_data = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError):
+        return None
+    if not isinstance(feature_data, dict):
+        return None
+    tasks = feature_data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    task_ids: list[str] = []
+    for task in tasks:
+        if isinstance(task, dict):
+            tid = task.get("id")
+            if isinstance(tid, str) and tid.strip():
+                task_ids.append(tid.strip())
+    return task_ids
+
+
+async def _list_registered_worktrees(
+    repo_path: Path,
+) -> list[tuple[Path, str | None]]:
+    """Parse ``git worktree list --porcelain`` → ``[(path, branch_or_None)]``.
+
+    ``branch`` is the short branch a worktree has checked out
+    (``refs/heads/<name>`` → ``<name>``), or ``None`` for a detached HEAD.
+    Returns ``[]`` on any git failure so the sweep degrades gracefully rather
+    than crashing.
+    """
+    code, output = await _run_git(
+        ["worktree", "list", "--porcelain"], cwd=repo_path
+    )
+    if code != 0:
+        return []
+    entries: list[tuple[Path, str | None]] = []
+    current_path: Path | None = None
+    current_branch: str | None = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            if current_path is not None:
+                entries.append((current_path, current_branch))
+            current_path = Path(line[len("worktree ") :])
+            current_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch ") :].strip()
+            if ref.startswith("refs/heads/"):
+                current_branch = ref[len("refs/heads/") :]
+            else:
+                current_branch = ref
+    if current_path is not None:
+        entries.append((current_path, current_branch))
+    return entries
+
+
+async def _sweep_build_refs(repo_path: Path, feature_id: str) -> None:
+    """Preflight sweep of THIS build's residue before worktree add (F3).
+
+    Failed/prior autobuild attempts leave guardkit's inner
+    ``.guardkit/worktrees/<task_id>`` registrations + ``autobuild/<task_id>``
+    branches in the shared repo; they outlive the outer worktree's removal and
+    poison the next run. This clears ONLY this feature's residue, loudly and
+    itemised:
+
+    1. ``git worktree prune`` — drops registrations whose dirs are gone.
+    2. For each of this feature's task ids ``T`` with a live ``autobuild/<T>``
+       branch: if that branch is still checked out in an on-disk (stale, prior
+       build) worktree, ``git -C <that-worktree> checkout --detach`` FIRST — the
+       F11 read-only-forensics law: preserve the kept files at their commit,
+       never destroy them — then ``git branch -D autobuild/<T>``.
+
+    NEVER touches branches/worktrees of OTHER features (concurrent builds are
+    legal). When the feature yaml cannot be read for task ids, logs a loud
+    warning and falls back to prune-only. Never raises: a sweep failure must
+    not crash the build (the FEAT-UBS1C loud-warn-never-crash convention).
+    """
+    try:
+        code, output = await _run_git(["worktree", "prune"], cwd=repo_path)
+        if code == 0:
+            logger.info(
+                "autobuild_runner: F3 preflight sweep — `git worktree prune` "
+                "done in %s%s",
+                repo_path,
+                f" ({output})" if output else "",
+            )
+        else:
+            logger.warning(
+                "autobuild_runner: F3 preflight sweep — `git worktree prune` "
+                "exit=%s in %s: %s (continuing)",
+                code,
+                repo_path,
+                output,
+            )
+
+        task_ids = _feature_task_ids(repo_path, feature_id)
+        if task_ids is None:
+            logger.warning(
+                "autobuild_runner: F3 preflight sweep — could not read task ids "
+                "from .guardkit/features/%s.yaml in %s; falling back to "
+                "prune-only (no branch sweep). OTHER-feature refs are untouched "
+                "either way.",
+                feature_id,
+                repo_path,
+            )
+            return
+
+        registered = await _list_registered_worktrees(repo_path)
+        branch_to_worktree = {
+            branch: path
+            for path, branch in registered
+            if branch is not None
+        }
+        for task_id in task_ids:
+            branch = f"autobuild/{task_id}"
+            if not await _local_branch_exists(repo_path, branch):
+                continue
+            holder = branch_to_worktree.get(branch)
+            if holder is not None and holder.exists():
+                code, output = await _run_git(
+                    ["-C", str(holder), "checkout", "--detach"],
+                    cwd=repo_path,
+                )
+                if code == 0:
+                    logger.info(
+                        "autobuild_runner: F3 sweep — detached stale inner "
+                        "worktree %s off %s (forensic files preserved at "
+                        "commit)",
+                        holder,
+                        branch,
+                    )
+                else:
+                    logger.warning(
+                        "autobuild_runner: F3 sweep — could not detach %s off "
+                        "%s (exit=%s): %s; skipping branch delete to avoid data "
+                        "loss",
+                        holder,
+                        branch,
+                        code,
+                        output,
+                    )
+                    continue
+            code, output = await _run_git(["branch", "-D", branch], cwd=repo_path)
+            if code == 0:
+                logger.info(
+                    "autobuild_runner: F3 sweep — deleted stale branch %s",
+                    branch,
+                )
+            else:
+                logger.warning(
+                    "autobuild_runner: F3 sweep — `git branch -D %s` exit=%s: "
+                    "%s (continuing)",
+                    branch,
+                    code,
+                    output,
+                )
+    except Exception as exc:  # never crash the build on sweep failure
+        logger.warning(
+            "autobuild_runner: F3 preflight sweep failed unexpectedly (%s) — "
+            "continuing to worktree materialisation; a poisoned prior ref may "
+            "surface as a loud worktree-add failure, which is the safe outcome",
+            exc,
+        )
+
+
 def _worktree_base_dir() -> Path:
     """Resolve the per-build worktree base dir (env-overridable)."""
     raw = (
@@ -1454,7 +1642,15 @@ def _worktree_base_dir() -> Path:
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
-    """``git worktree add <base>/<build_id> <branch>`` reading the LOCAL ref.
+    """``git worktree add --detach <base>/<build_id> <branch>`` (LOCAL ref).
+
+    Uses ``--detach`` (F2, receipted live 2026-07-26 against ddd-demo): the
+    worktree checks out the branch's COMMIT without claiming the branch REF, so
+    it never collides with a checkout (or another worktree) already holding
+    that branch. guardkit's inner flow does not need the outer HEAD to be a
+    named branch — its ``WorktreeManager.create`` bases inner worktrees on an
+    explicit ``base_branch`` (default ``main``) and never queries the outer
+    current branch — so detaching is safe.
 
     Returns the resolved worktree path on success. Raises
     :class:`WorktreeMaterialisationError` (carrying git's output) on failure —
@@ -1466,7 +1662,7 @@ async def _materialise_worktree(
     base.mkdir(parents=True, exist_ok=True)
     worktree_path = (base / build_id).resolve()
     code, output = await _run_git(
-        ["worktree", "add", str(worktree_path), branch],
+        ["worktree", "add", "--detach", str(worktree_path), branch],
         cwd=repo_path,
     )
     if code != 0:
@@ -1631,6 +1827,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                     ),
                 )
             )
+        # F3 — preflight residue sweep, scoped to THIS feature's task refs,
+        # BEFORE materialising the worktree so a poisoned prior run cannot
+        # collide with the fresh add. Never crashes the build.
+        await _sweep_build_refs(repo_path, feature_id)
         try:
             worktree_path = await _materialise_worktree(repo_path, branch, build_id)
         except WorktreeMaterialisationError as exc:
