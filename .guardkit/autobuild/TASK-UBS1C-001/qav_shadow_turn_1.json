@@ -1,0 +1,34 @@
+{
+  "absent_reason": null,
+  "agree": true,
+  "coach_decision": "approve",
+  "provenance": {
+    "bundle_schema_sha": "41a0ebe457",
+    "bundle_sha256": "e5e080ef563a11f58cecce59b13d427544e9fa4b66801a0ebcb2936626e242e8",
+    "endpoint": "http://localhost:9000/v1/chat/completions",
+    "model": "qav-shadow",
+    "prompt_sha256": "3587c78225b811bfb69f7f26fff0559607b51e419a99d6ab122082dffaeaded0",
+    "sampling": {
+      "max_tokens": 4096,
+      "temperature": 0.0
+    },
+    "system_sha256": "d107290370b0e21f3037081894442af46273429626737e2f9db9452cc14950f1",
+    "truncated": false,
+    "usage": {
+      "completion_tokens": 33,
+      "prompt_tokens": 6033,
+      "total_tokens": 6066
+    },
+    "wall_time_s": 30.988542315986706
+  },
+  "shadow": {
+    "findings": [],
+    "json_extracted": true,
+    "raw": null,
+    "verdict": "approve"
+  },
+  "status": "ok",
+  "task_id": "TASK-UBS1C-001",
+  "ts": "2026-07-26T07:31:39Z",
+  "turn": 1
+}
