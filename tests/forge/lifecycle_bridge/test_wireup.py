@@ -58,6 +58,7 @@ from forge.lifecycle_bridge.wireup import (
     DEFAULT_DEADLINE_SECONDS,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
     IDENTITY_UNRESOLVED_FAILURE_REASON,
+    STREAM_NO_TERMINAL_FAILURE_REASON,
     LifecycleBridgeWireup,
     TERMINAL_PAYLOAD_TYPES,
 )
@@ -878,11 +879,14 @@ class TestIdentityUnresolvedPublishesBuildFailed:
         await wireup.shutdown()
 
     @pytest.mark.asyncio
-    async def test_identity_resolved_during_wait_streams_no_failure(
+    async def test_identity_resolved_during_wait_is_not_identity_unresolved(
         self, bridge, translator, fake_publisher
     ) -> None:
         # A slow dispatch that surfaces identity DURING the deadline wait
-        # must NOT be failed — the observer proceeds to stream instead.
+        # must NOT be failed as identity-unresolved — the observer proceeds
+        # to stream instead. The (empty) stream then closes cleanly with no
+        # terminal, so the F6 no-terminal path fires a build-failed carrying
+        # the stream-ended reason (NOT identity-unresolved).
         calls = {"n": 0}
 
         async def _slow_provider(_feature_id: str) -> tuple[str, str] | None:
@@ -907,9 +911,13 @@ class TestIdentityUnresolvedPublishesBuildFailed:
         await wireup.register_ack_handle("FEAT-SLOW", "corr-slow", handle)
         await _drain_observer(wireup, "FEAT-SLOW", timeout=2.0)
 
-        # No identity-unresolved build-failed — the stream (empty) closed
-        # cleanly and the observer left the message for JetStream redelivery.
-        fake_publisher.publish_build_failed.assert_not_awaited()
+        # Identity DID resolve, so the reason is the F6 stream-no-terminal
+        # reason, never IDENTITY_UNRESOLVED_FAILURE_REASON.
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        assert sent.failure_reason != IDENTITY_UNRESOLVED_FAILURE_REASON
+        handle.ack.assert_awaited_once()
         await wireup.shutdown()
 
     @pytest.mark.asyncio

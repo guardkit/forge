@@ -170,6 +170,21 @@ DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: float = 5.0
 #: re-queue can succeed once the dispatch path is healthy.
 IDENTITY_UNRESOLVED_FAILURE_REASON: str = "identity-unresolved"
 
+#: F6 (2026-07-26 defect harvest) — ``failure_reason`` stamped onto the
+#: synthetic ``build-failed`` the observer publishes when a build's SSE
+#: stream closes WITHOUT a terminal envelope and the fetch-on-empty
+#: recovery (:meth:`_fetch_and_replay_on_empty`) could not surface a
+#: terminal state either. Without this prompt terminalisation the
+#: ``builds`` row stays RUNNING until the 300s per-build deadline timer
+#: fires — ``forge status`` misreports a finished build as still RUNNING
+#: for up to five minutes (the ledger-terminal-lag defect). ``recoverable``
+#: is ``True`` because the run is over and only its terminal signal was
+#: lost, so a fresh re-queue can succeed. Fired ONLY after recovery yielded
+#: nothing AND the stream ended cleanly with no terminal ever observed — a
+#: terminal that WAS observed but whose publish failed keeps the inbound
+#: un-acked for the JetStream publish-retry contract (TASK-FRR-PEB-011).
+STREAM_NO_TERMINAL_FAILURE_REASON: str = "stream-ended-without-terminal"
+
 #: ``async (feature_id, correlation_id) -> build_id | None`` — resolves the
 #: durable ``builds.build_id`` for a synthetic terminal so the terminal
 #: write hits the right row (un-wedging dispatch). Production wires a
@@ -669,11 +684,13 @@ class LifecycleBridgeWireup:
             # sleeps the current backoff, and re-opens a fresh stream.
             # On clean stream end (no transient error) the loop exits
             # and the consumer falls back to JetStream redelivery.
-            terminal_seen = await self._consume_with_reconnect(
-                context=context,
-                handle=handle,
-                thread_id=thread_id,
-                run_id=run_id,
+            terminal_seen, terminal_publish_failed = (
+                await self._consume_with_reconnect(
+                    context=context,
+                    handle=handle,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
             )
 
             if not terminal_seen:
@@ -699,23 +716,33 @@ class LifecycleBridgeWireup:
                 )
 
             if not terminal_seen:
-                # Stream closed without a terminal envelope — the
-                # build's outcome is unknown to the bridge. Do NOT ack:
-                # JetStream ``ack_wait`` will redeliver and the consumer
-                # will re-register. The per-build deadline timer (in
-                # :class:`LifecycleBridge`) will eventually publish
-                # ``pipeline.build-failed`` if the sidecar stays
-                # unreachable past the 300s budget (AC-3).
-                logger.warning(
-                    "wireup._observer_loop: stream for feature_id=%s "
-                    "ended without a terminal envelope and "
-                    "run-state fetch did not surface a terminal state; "
-                    "leaving inbound queued message un-acked "
-                    "(JetStream will redeliver, deadline timer will "
-                    "publish build-failed if the sidecar stays "
-                    "unreachable)",
-                    feature_id,
-                )
+                if terminal_publish_failed:
+                    # A terminal envelope WAS observed but its publish
+                    # failed (transient broker error). Leave the inbound
+                    # un-acked so JetStream redelivery retries the *publish*
+                    # of the real terminal — do NOT synthesise a build-failed
+                    # here: the build already reached a real terminal
+                    # (possibly build-complete), so firing a failed envelope
+                    # and acking would both mislabel it and eat the
+                    # redelivery the publish-retry contract
+                    # (TASK-FRR-PEB-011 AC-2/AC-3) depends on.
+                    logger.warning(
+                        "wireup._observer_loop: terminal envelope publish "
+                        "failed for feature_id=%s; leaving inbound queued "
+                        "message un-acked (JetStream redelivery retries the "
+                        "publish, deadline timer is the backstop)",
+                        feature_id,
+                    )
+                else:
+                    # F6 (ledger-terminal-lag defect harvest 2026-07-26):
+                    # the stream ended cleanly with no terminal envelope and
+                    # fetch-on-empty could not recover one. Publish a
+                    # synthetic build-failed and ack now so builds.status
+                    # leaves RUNNING promptly instead of waiting for the 300s
+                    # per-build deadline timer. _on_terminal's detach cancels
+                    # that timer (bridge.detach), so it cannot fire a second
+                    # synthetic build-failed later.
+                    await self._publish_no_terminal_failure(context, handle)
         except asyncio.CancelledError:
             # ``shutdown()`` cancelled the task. Persist the latest
             # ``last_event_id`` semantics live in the bridge's
@@ -759,18 +786,29 @@ class LifecycleBridgeWireup:
         handle: BuildAckHandle,
         thread_id: str | None,
         run_id: str | None,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Drive the SSE stream with :class:`ReconnectPolicy` retry semantics.
+
+        Returns ``(terminal_seen, terminal_publish_failed)`` so the
+        observer can tell a clean no-terminal exit (F6: synthesise a
+        build-failed) apart from a terminal-that-failed-to-publish (leave
+        the inbound un-acked for the JetStream publish-retry contract):
+
+        * ``(True, False)`` — a terminal envelope was published + acked.
+        * ``(False, False)`` — the stream ended cleanly with no terminal.
+        * ``(False, True)`` — a terminal envelope was observed but its
+          publish failed (TASK-FRR-PEB-011 AC-2/AC-3).
 
         AC-2 / AC-4 (TASK-FRR-PEB-008):
 
         * On each iteration, open a fresh ``StreamSource`` and drive
           it via :meth:`_drive_stream_session`.
-        * If the session returns a terminal envelope, return ``True``
-          — the observer is done.
+        * If the session returns a terminal envelope, return
+          ``(True, False)`` — the observer is done.
         * If the session ends cleanly (StopAsyncIteration with no
-          terminal), return ``False`` — let the supervisor surface the
-          orphaned-stream warning and rely on JetStream redelivery.
+          terminal), return ``(False, False)`` — let the supervisor
+          surface the orphaned-stream warning and rely on JetStream
+          redelivery.
         * If the session raises one of :data:`TRANSIENT_STREAM_ERRORS`
           (``httpx.ConnectError``, ``httpx.ReadError``,
           :class:`json.JSONDecodeError`), log at WARNING, sleep the
@@ -845,12 +883,14 @@ class LifecycleBridgeWireup:
                 continue
 
             if terminal_seen:
-                return True
+                return (True, False)
             if ended_cleanly:
-                return False
-            # Defensive — should not be reachable; the session always
-            # returns one of (terminal_seen, ended_cleanly) or raises.
-            return False  # pragma: no cover
+                return (False, False)
+            # ``_drive_stream_session`` returned ``(False, False)`` — a
+            # terminal envelope was observed but its publish failed. Signal
+            # that to the observer so it leaves the inbound un-acked for the
+            # publish-retry redelivery instead of synthesising a build-failed.
+            return (False, True)
 
     # ------------------------------------------------------------------
     # Fetch-on-empty fallback (TASK-REV-PEBR-005 Signature C)
@@ -1528,6 +1568,65 @@ class LifecycleBridgeWireup:
                 "wireup: synthetic build-failed publish FAILED for "
                 "feature_id=%s; leaving the inbound message un-acked so "
                 "JetStream redelivery / next-boot recovery retries",
+                feature_id,
+            )
+
+    async def _publish_no_terminal_failure(
+        self, context: BuildContext, handle: BuildAckHandle
+    ) -> None:
+        """Publish a synthetic ``build-failed`` for a stream with no terminal.
+
+        F6 (2026-07-26 defect harvest): when the SSE stream closes cleanly
+        with no terminal envelope AND :meth:`_fetch_and_replay_on_empty`
+        cannot recover the run's terminal state, the ``builds`` row would
+        otherwise stay RUNNING until the 300s per-build deadline timer fires
+        — ``forge status`` misreports a finished build as still RUNNING.
+        Emit a terminal ``build-failed`` immediately so the ledger leaves
+        RUNNING promptly.
+
+        The terminal sequence mirrors
+        :meth:`_publish_identity_unresolved_failure`: publish first (the
+        :meth:`_publish_event` write-back records the terminal ``builds``
+        row, and loses gracefully to an already-terminal/cancelled row via
+        the recorder's no-resurrection guard), then ack + detach on a
+        successful publish. :meth:`_on_terminal`'s ``detach`` cancels the
+        per-build deadline timer so it cannot fire a second synthetic
+        build-failed. On a publish failure the inbound is left un-acked so
+        JetStream redelivery / the next boot's recovery retries — never a
+        silent drop.
+        """
+        feature_id = context.feature_id
+        build_id = await self._resolve_build_id(feature_id, context.correlation_id)
+        # AC-2: payload construction is the translator's job — the wireup
+        # never constructs pipeline payloads. The public synthetic factory
+        # also attaches the correlation_id (T3 AC-6).
+        payload = self._translator.build_synthetic_failed(
+            feature_id=feature_id,
+            build_id=build_id,
+            correlation_id=context.correlation_id,
+            failure_reason=STREAM_NO_TERMINAL_FAILURE_REASON,
+            recoverable=True,
+        )
+
+        logger.warning(
+            "wireup: feature_id=%s stream ended without a terminal envelope "
+            "and run-state fetch did not surface a terminal state; "
+            "publishing synthetic build-failed (reason=%s build_id=%s) so "
+            "builds.status leaves RUNNING promptly instead of waiting for "
+            "the per-build deadline timer (F6)",
+            feature_id,
+            STREAM_NO_TERMINAL_FAILURE_REASON,
+            build_id,
+        )
+        published = await self._publish_event(payload, feature_id)
+        if published:
+            await self._on_terminal(handle, feature_id, context.correlation_id)
+        else:
+            logger.warning(
+                "wireup: synthetic build-failed publish FAILED for "
+                "feature_id=%s (F6 no-terminal path); leaving the inbound "
+                "message un-acked so JetStream redelivery / next-boot "
+                "recovery retries",
                 feature_id,
             )
 

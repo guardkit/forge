@@ -26,20 +26,31 @@ Test coverage:
 
 * AC-FETCH-1 — empty stream + terminal run → BuildStarted + BuildComplete
   published; ack invoked.
-* AC-FETCH-2 — empty stream + still-running run → no envelopes; no ack
-  (JetStream redelivery recovery preserved).
+* AC-FETCH-2 — empty stream + still-running run (fetcher ``None``) → F6
+  synthetic build-failed published + acked (the stream ended cleanly, so
+  the run is over; only its terminal signal was lost — terminalise
+  promptly rather than wait for the 300s deadline timer).
 * AC-FETCH-3 — empty stream + fetcher returns ``None`` (transport error,
-  SDK shape drift, no identity) → existing un-acked behaviour preserved.
+  SDK shape drift) → same F6 synthetic build-failed + ack.
 * AC-FETCH-4 — empty stream + terminal "failed" run → BuildStarted +
   BuildFailed published; ack invoked.
-* AC-FETCH-5 — empty stream + fetcher itself raises → observer logs and
-  treats as no-snapshot (defence in depth — fetchers are contracted not
-  to raise, but a buggy implementation must not crash the daemon).
+* AC-FETCH-5 — empty stream + fetcher itself raises → observer logs, treats
+  as no-snapshot (defence in depth) and then takes the F6 no-terminal path:
+  synthetic build-failed + ack.
 * AC-FETCH-6 — fetcher is NOT consulted when the SSE iterator did
   produce a terminal envelope (regression lock against double-acking).
 * AC-FETCH-7 — when the fetcher is omitted from the constructor, the
-  default no-op fetcher is used and behaviour matches the pre-PEBR-005
-  un-acked branch (additive-only kwarg).
+  default no-op fetcher is used; the empty stream then takes the F6
+  no-terminal path: synthetic build-failed + ack (additive-only kwarg).
+
+F6 note (2026-07-26 defect harvest): the "empty stream + no recoverable
+terminal" branch used to leave the inbound un-acked and rely on JetStream
+redelivery + the 300s per-build deadline timer. That left ``builds.status``
+RUNNING for up to five minutes for a finished build. The branch now
+publishes a synthetic ``build-failed`` (reason
+``stream-ended-without-terminal``) and acks. The ONE case that stays
+un-acked is a terminal envelope that WAS observed but whose publish failed
+— covered in ``test_publish_failure.py`` (the publish-retry contract).
 """
 
 from __future__ import annotations
@@ -66,7 +77,10 @@ from forge.lifecycle_bridge.translation import (
     StreamEventTranslator,
     VALUES_STREAM_EVENT,
 )
-from forge.lifecycle_bridge.wireup import LifecycleBridgeWireup
+from forge.lifecycle_bridge.wireup import (
+    STREAM_NO_TERMINAL_FAILURE_REASON,
+    LifecycleBridgeWireup,
+)
 from forge.persistence.migrations import lifecycle_bridge_registry as bridge_migration
 from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.build_ack_handle import BuildAckHandle
@@ -313,16 +327,18 @@ class TestFetchOnEmptySuccessfulRun:
 
 
 class TestFetchOnEmptyStillRunning:
-    """AC-FETCH-2: still-running run yields no fallback envelopes.
+    """AC-FETCH-2: fetcher ``None`` on an empty stream → F6 build-failed.
 
     The fetcher's contract is to return ``None`` for non-terminal
-    statuses (``pending``, ``running``). This test asserts the observer
-    leaves the inbound un-acked and falls back to JetStream redelivery
-    — preserving the canonical recovery path.
+    statuses (``pending``, ``running``). Because the SSE stream ended
+    cleanly (StopAsyncIteration) the run is over from the transport's
+    view — its terminal signal was merely lost. The observer terminalises
+    promptly via the F6 synthetic build-failed rather than leaving the
+    ledger RUNNING until the 300s deadline timer.
     """
 
     @pytest.mark.asyncio
-    async def test_no_publish_no_ack_when_run_still_running(
+    async def test_synthetic_failed_and_ack_when_fetch_yields_nothing(
         self,
         bridge: LifecycleBridge,
         translator: StreamEventTranslator,
@@ -330,8 +346,7 @@ class TestFetchOnEmptyStillRunning:
     ) -> None:
         feature_id = "FEAT-FETCH-RUN"
         # Fetcher returns None (production fetcher does this for
-        # non-terminal statuses). The wireup MUST treat None as "no
-        # snapshot" and fall through to the un-acked branch.
+        # non-terminal statuses). Recovery yielded nothing → F6 fires.
         fetcher = AsyncMock(return_value=None)
         wireup = _build_wireup(
             bridge,
@@ -346,12 +361,17 @@ class TestFetchOnEmptyStillRunning:
         await _drain(wireup, feature_id)
 
         fetcher.assert_awaited_once()
-        # No envelopes; no ack — JetStream redelivery is the recovery
-        # path (matches pre-PEBR-005 behaviour for still-running runs).
+        # F6: recovery yielded nothing → synthetic build-failed + ack.
+        # No BuildStarted/BuildComplete (there is no state to replay).
         fake_publisher.publish_build_started.assert_not_awaited()
         fake_publisher.publish_build_complete.assert_not_awaited()
-        fake_publisher.publish_build_failed.assert_not_awaited()
-        handle.ack.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert isinstance(sent, BuildFailedPayload)
+        assert sent.feature_id == feature_id
+        assert sent.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        assert sent.recoverable is True
+        handle.ack.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +384,13 @@ class TestFetchOnEmptyFetcherNone:
 
     The production ``langgraph_run_state_fetcher`` swallows transport
     errors and returns ``None`` (matches ``StreamSource``'s "yielding
-    zero events is a clean exit" contract). The wireup must preserve
-    pre-PEBR-005 un-acked behaviour in this branch.
+    zero events is a clean exit" contract). Recovery yielded nothing, so
+    the observer takes the F6 no-terminal path: synthetic build-failed +
+    ack.
     """
 
     @pytest.mark.asyncio
-    async def test_no_publish_no_ack_when_fetcher_returns_none(
+    async def test_synthetic_failed_and_ack_when_fetcher_returns_none(
         self,
         bridge: LifecycleBridge,
         translator: StreamEventTranslator,
@@ -392,7 +413,10 @@ class TestFetchOnEmptyFetcherNone:
         fetcher.assert_awaited_once()
         fake_publisher.publish_build_started.assert_not_awaited()
         fake_publisher.publish_build_complete.assert_not_awaited()
-        handle.ack.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        handle.ack.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -459,11 +483,13 @@ class TestFetchOnEmptyFetcherRaises:
     The :class:`RunStateFetcher` Protocol contracts that implementations
     never raise (mirrors :class:`StreamSource`'s discipline). Defence in
     depth: a buggy fetcher's exception is logged and downgraded to
-    "no snapshot" so the observer's exit-cleanly path stays intact.
+    "no snapshot" — recovery yielded nothing, so the observer then takes
+    the F6 no-terminal path (synthetic build-failed + ack) rather than
+    crashing.
     """
 
     @pytest.mark.asyncio
-    async def test_fetcher_exception_is_swallowed_and_no_publish(
+    async def test_fetcher_exception_is_swallowed_then_synthetic_failed(
         self,
         bridge: LifecycleBridge,
         translator: StreamEventTranslator,
@@ -489,7 +515,11 @@ class TestFetchOnEmptyFetcherRaises:
 
         fake_publisher.publish_build_started.assert_not_awaited()
         fake_publisher.publish_build_complete.assert_not_awaited()
-        handle.ack.assert_not_awaited()
+        # Fetcher raised → treated as no-snapshot → F6 synthetic failed.
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        handle.ack.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -565,14 +595,14 @@ class TestFetchOnEmptyNotConsultedWhenLiveSSEProducedTerminal:
 class TestFetchOnEmptyDefaultBehaviour:
     """AC-FETCH-7: omitting the fetcher kwarg uses the no-op default.
 
-    Existing wireup callers (unit tests, in-process integration tests)
-    that have not opted into PEBR-005's fetch-on-empty fallback continue
-    to see the pre-PEBR-005 un-acked branch on empty streams. The
-    additive-only kwarg is the contract.
+    The additive-only kwarg is the contract: callers that have not opted
+    into PEBR-005's fetch-on-empty fallback get the default no-op fetcher,
+    which yields no snapshot. Recovery yielded nothing, so the empty stream
+    then takes the F6 no-terminal path — synthetic build-failed + ack.
     """
 
     @pytest.mark.asyncio
-    async def test_omitted_fetcher_preserves_unacked_behaviour(
+    async def test_omitted_fetcher_takes_f6_no_terminal_path(
         self,
         bridge: LifecycleBridge,
         translator: StreamEventTranslator,
@@ -594,7 +624,10 @@ class TestFetchOnEmptyDefaultBehaviour:
         await wireup.register_ack_handle(feature_id, "corr-fetch-default", handle)
         await _drain(wireup, feature_id)
 
-        # No envelopes; no ack — pre-PEBR-005 behaviour preserved.
+        # No replay envelopes (no snapshot), but F6 terminalises promptly.
         fake_publisher.publish_build_started.assert_not_awaited()
         fake_publisher.publish_build_complete.assert_not_awaited()
-        handle.ack.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        handle.ack.assert_awaited_once()
