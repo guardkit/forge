@@ -6,6 +6,12 @@
 # receipt qav_shadow_turn_N.json lands beside coach_turn_N.json).
 autobuild:
   coach:
+    # Coach v4 flip (2026-07-26, Rich's do-it-now): the tuned coach-ft-v4 seat
+    # + the raw v4 wire contract. env GUARDKIT_COACH_CONTRACT / --coach-model
+    # still override. Rollback = delete these two lines (defaults restore
+    # gemma4-coach pairing at launch + the legacy coachsplit contract).
+    contract: v4
+    model: coach-ft-v4
     qav_shadow:
       enabled: true
       endpoint: http://localhost:9000/v1/chat/completions
