@@ -656,6 +656,17 @@ class Supervisor:
     #: breach.
     budget_wall_clock: "Callable[[], datetime] | None" = None
     budget_started_at_reader: "Callable[[str], datetime | None] | None" = None
+    #: ``(build_id) -> float | None`` reader for the most recent Coach score,
+    #: feeding the ``min_coach_score`` floor (FEAT-UBS-002 §3 / AC-05). ``None``
+    #: (the default, and the attended / no-reader case) leaves
+    #: ``last_coach_score`` at ``None`` so the floor stays inert and the guard's
+    #: behaviour is byte-identical to the pre-reader path (AC-03). A reader
+    #: failure degrades to ``None`` with a loud log — never a crash, never a
+    #: false pause. NOTE: the UBS1C runner populates the score on the in-memory
+    #: ``AutobuildRunnerState`` in the streaming path, which the Mode C
+    #: Supervisor does not query by build_id (the ADR-ARCH-033 two-path split);
+    #: the production reader lands with the Mode-C-production (serve.py) lane.
+    budget_coach_score_reader: "Callable[[str], float | None] | None" = None
     #: ``async (build_id, feature_id, payload, verdict, metrics) -> None`` —
     #: publishes the risk=high approval request and pauses the build
     #: (SQLite PAUSED + ``emit_paused_then_interrupt``, ADR-ARCH-021
@@ -1460,10 +1471,13 @@ class Supervisor:
         metrics = BuildBudgetMetrics(
             review_cycles=review_cycles,
             elapsed_wallclock_seconds=self._budget_elapsed_seconds(build_id),
-            # tokens / coach-score stay unmeasured today (ADR-ARCH-033); the
-            # caps for them are inert until the runner populates a real value.
+            # tokens stay unmeasured today (ADR-ARCH-033); its cap is inert
+            # until the runner populates a real value.
             tokens_used=None,
-            last_coach_score=None,
+            # coach-score floor (AC-05): a wired reader supplies the score, so
+            # the min_coach_score branch activates automatically. No reader (the
+            # attended / streaming-path default) leaves it None → floor inert.
+            last_coach_score=self._budget_last_coach_score(build_id),
         )
         verdict = evaluate_budget(guards, metrics)
         if verdict.ok:
@@ -1533,6 +1547,31 @@ class Supervisor:
         if started is None:
             return 0.0
         return max(0.0, (self.budget_wall_clock() - started).total_seconds())
+
+    def _budget_last_coach_score(self, build_id: str) -> float | None:
+        """Most recent Coach score for the build, or ``None`` (AC-05).
+
+        Returns ``None`` when no reader is wired (the attended / streaming-path
+        default) so the ``min_coach_score`` floor stays inert and the guard is
+        byte-identical to the pre-reader path (AC-03). A reader failure degrades
+        to ``None`` with a loud log — enforcement continues on the other caps
+        rather than crashing (mirrors the ``build_mode_reader`` safe-default
+        shape).
+        """
+        if self.budget_coach_score_reader is None:
+            return None
+        try:
+            return self.budget_coach_score_reader(build_id)
+        except Exception as exc:  # noqa: BLE001 — defensive: never crash enforcement
+            logger.error(
+                "supervisor.next_turn (MODE_C): budget_coach_score_reader "
+                "raised %s: %s for build_id=%s; treating coach score as None "
+                "(floor inert this turn, other caps still enforced) (UBS-002)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return None
 
     async def _mode_c_resolve_terminal(
         self,

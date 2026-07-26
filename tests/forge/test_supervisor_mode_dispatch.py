@@ -1147,3 +1147,102 @@ class TestModeCBudgetEnforcement:
         assert recorder == []
         assert doubles["subprocess"].calls == []
         assert report.outcome is TurnOutcome.WAITING
+
+    # ------------------------------------------------------------------
+    # AC-05: coach-score floor via the budget_coach_score_reader DI seam
+    # ------------------------------------------------------------------
+
+    def _coach_floor(self, *, min_coach_score: float, reader, max_review_cycles=None):
+        """Supervisor wired with a min_coach_score floor + a coach-score reader.
+
+        ``reader`` is a ``(build_id) -> float | None`` callable (or one that
+        raises). ``max_review_cycles`` stays ``None`` by default so a coach-only
+        breach is isolated from the review-cycle cap.
+        """
+        supervisor, doubles = _build_supervisor()
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+        supervisor.budget_guards = BudgetGuards(
+            min_coach_score=min_coach_score,
+            max_review_cycles=max_review_cycles,
+        )
+        supervisor.budget_profile_name = "unattended"
+        supervisor.budget_coach_score_reader = reader
+        recorder: list[dict[str, Any]] = []
+
+        async def _pause(**kwargs: Any) -> None:
+            recorder.append(kwargs)
+
+        supervisor.budget_pause = _pause
+        return supervisor, doubles, recorder
+
+    def test_coach_score_below_floor_pauses(self) -> None:
+        # AC-05: a real last_coach_score strictly below the floor breaches the
+        # min_coach_score cap → PAUSED_BUDGET, risk=high, budget_guard_breach.
+        supervisor, doubles, recorder = self._coach_floor(
+            min_coach_score=0.8, reader=lambda _bid: 0.5
+        )
+        doubles["mode_reader"].modes["build-LOWSCORE"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-LOWSCORE"] = _review_entries(1)
+
+        report = _run(supervisor.next_turn("build-LOWSCORE"))
+
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+        assert doubles["subprocess"].calls == []
+        assert len(recorder) == 1
+        payload = recorder[0]["payload"]
+        assert payload.risk_level == "high"
+        assert payload.details["reason"] == "budget_guard_breach"
+        assert payload.details["breached_cap"] == "min_coach_score"
+
+    def test_coach_score_at_floor_proceeds(self) -> None:
+        # AC-05: a score exactly at the floor is NOT a breach (strict `<`);
+        # the build dispatches normally.
+        supervisor, doubles, recorder = self._coach_floor(
+            min_coach_score=0.8, reader=lambda _bid: 0.8
+        )
+        doubles["mode_reader"].modes["build-ATFLOOR"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-ATFLOOR"] = _review_entries(1)
+
+        report = _run(supervisor.next_turn("build-ATFLOOR"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert recorder == []
+        assert len(doubles["subprocess"].calls) == 1
+
+    def test_coach_reader_none_leaves_floor_inert(self) -> None:
+        # AC-03/AC-05: a reader that returns None (or an unwired reader) leaves
+        # last_coach_score None → the floor stays inert → normal dispatch,
+        # byte-identical to the pre-reader path.
+        supervisor, doubles, recorder = self._coach_floor(
+            min_coach_score=0.8, reader=lambda _bid: None
+        )
+        doubles["mode_reader"].modes["build-NOSCORE"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-NOSCORE"] = _review_entries(1)
+
+        report = _run(supervisor.next_turn("build-NOSCORE"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert recorder == []
+        assert len(doubles["subprocess"].calls) == 1
+
+    def test_coach_reader_raises_degrades_and_other_caps_still_enforce(self) -> None:
+        # AC-05: a reader failure degrades to None (loud log) without crashing —
+        # the coach floor goes inert this turn but the OTHER caps still enforce.
+        # Here the review-cycle cap (2, reached) fires despite the coach reader
+        # raising, proving enforcement continued.
+        def _boom(_bid: str) -> float:
+            raise RuntimeError("coach store unreachable")
+
+        supervisor, doubles, recorder = self._coach_floor(
+            min_coach_score=0.8, reader=_boom, max_review_cycles=2
+        )
+        doubles["mode_reader"].modes["build-BOOM"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-BOOM"] = _review_entries(2)
+
+        report = _run(supervisor.next_turn("build-BOOM"))
+
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+        assert doubles["subprocess"].calls == []
+        assert len(recorder) == 1
+        # The breach names the review-cycle cap, not the (degraded) coach floor.
+        assert recorder[0]["payload"].details["breached_cap"] == "max_review_cycles"
