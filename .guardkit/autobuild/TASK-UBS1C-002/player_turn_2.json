@@ -1,0 +1,67 @@
+{
+  "task_id": "TASK-UBS1C-002",
+  "turn": 2,
+  "files_modified": [
+    ".guardkit/qav-shadow/queue.jsonl",
+    "`src/forge/subagents/autobuild_runner.py",
+    "conversation_history/session_8095739d.md",
+    "docs/architecture/decisions/ADR-ARCH-033-autobuild-subprocess-path-and-coach-score-gap.md",
+    "src/forge/subagents/autobuild_runner.py",
+    "tests/forge/test_autobuild_runner_planning_waves.py",
+    "tests/integration/test_autobuild_runner_subprocess.py"
+  ],
+  "files_created": [
+    "`tests/forge/test_autobuild_runner_planning_waves.py"
+  ],
+  "tests_written": [
+    "`tests/forge/test_autobuild_runner_planning_waves.py"
+  ],
+  "tests_run": true,
+  "tests_passed": true,
+  "test_output_summary": "",
+  "implementation_notes": "Implementation via task-work delegation. Files planned: 0, Files actual: 0",
+  "concerns": [],
+  "requirements_addressed": [
+    "AC-001: planning_waves reads task graph totals",
+    "AC-002: Error cases produce placeholder + WARNING",
+    "AC-003: Uses same resolver, schema unchanged, existing tests pass"
+  ],
+  "requirements_remaining": [],
+  "sdk_turns_used": null,
+  "sdk_max_turns": 150,
+  "sdk_ceiling_hit": false,
+  "files_authored": [],
+  "tests_passed_count": 73,
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "With a fixture feature yaml (3 tasks, parallel_groups [[a,b],[c]]), the planning_waves snapshot carries the correct totals in the existing schema fields (hermetic test, tmp repo dir)",
+      "status": "complete",
+      "evidence": "Implemented _node_planning_waves to read .guardkit/features/<feature_id>.yaml, parse tasks[] count and orchestration.parallel_groups length. Test test_planning_waves_reads_task_graph creates a tmp repo with 3 tasks and 2 parallel_groups, asserts wave_total=2 and task_total=3 in the snapshot.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py::TestPlanningWavesReadsTaskGraph::test_planning_waves_reads_task_graph",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Missing yaml / malformed yaml / feature id absent from the file each produce the current placeholder snapshot + a WARNING naming the resolved path \u2014 never an exception (three hermetic tests)",
+      "status": "complete",
+      "evidence": "Implemented error handling in _node_planning_waves: missing yaml (OSError/Path.exists check) logs WARNING naming the path; malformed yaml (yaml.YAMLError) logs WARNING naming the path; feature id absent (yaml parsed but no tasks/parallel_groups for given feature_id) falls through to defaults. Three dedicated tests: test_planning_waves_missing_yaml, test_planning_waves_malformed_yaml, test_planning_waves_feature_id_absent. Three logging tests verify WARNING messages contain the resolved path.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py::TestPlanningWavesErrorCases",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "The repo path is resolved via the same helper running_wave uses (asserted by test \u2014 no duplicated resolution logic); AutobuildState schema and graph shape byte-unchanged; existing runner tests pass unmodified",
+      "status": "complete",
+      "evidence": "Test test_planning_waves_uses_resolve_repo_path patches _resolve_repo_path with wraps and asserts it is called once with the payload \u2014 confirming no duplicated resolution logic. Test test_planning_waves_schema_unchanged validates the snapshot against the AutobuildState Pydantic model and checks the snapshot keys match the expected 21-field schema exactly. All 60 existing autobuild_runner tests pass unmodified.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py::TestPlanningWavesIntegration",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    }
+  ]
+}

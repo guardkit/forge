@@ -91,6 +91,8 @@ from typing import (
     runtime_checkable,
 )
 
+import yaml
+
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
@@ -930,15 +932,19 @@ def _build_snapshot(
     feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
     build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
     correlation_id = payload.get("correlation_id")
+    wave_total_raw = payload.get("wave_total")
+    wave_total = int(wave_total_raw) if wave_total_raw is not None else 1
+    task_total_raw = payload.get("task_total")
+    task_total = int(task_total_raw) if task_total_raw is not None else 1
     state = AutobuildState(
         task_id=str(payload.get("task_id") or build_id),
         build_id=build_id,
         feature_id=feature_id,
         lifecycle=lifecycle,  # type: ignore[arg-type] - validated by AutobuildState's Literal
         wave_index=wave_index,
-        wave_total=int(payload.get("wave_total") or 1),
+        wave_total=wave_total,
         task_index=task_index,
-        task_total=int(payload.get("task_total") or 1),
+        task_total=task_total,
         tasks_completed=tasks_completed,
         tasks_failed=tasks_failed,
         correlation_id=str(correlation_id) if correlation_id else None,
@@ -971,9 +977,73 @@ def _node_starting(state: AutobuildRunnerState) -> dict[str, Any]:
 
 
 def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
-    """Transition to ``planning_waves``."""
+    """Transition to ``planning_waves``, reading the feature task graph.
+
+    Resolves the target repo checkout via ``_resolve_repo_path``, reads
+    ``.guardkit/features/<feature_id>.yaml``, and populates
+    ``wave_total`` and ``task_total`` from the parsed task graph.
+    On any failure (missing repo, missing/malformed yaml, absent feature
+    id in file), falls back to the placeholder snapshot and emits a
+    WARNING naming the resolved path.
+    """
     payload = _extract_launch_payload(list(state.get("messages", [])))
-    snapshot = _build_snapshot(payload, lifecycle="planning_waves")
+    feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+
+    # Resolve the repo path using the same helper as _node_running_wave.
+    repo_path = _resolve_repo_path(payload)
+
+    wave_total = 0
+    task_total = 0
+
+    if repo_path is not None:
+        feature_yaml_path = (
+            repo_path / ".guardkit" / "features" / f"{feature_id}.yaml"
+        )
+        try:
+            if feature_yaml_path.exists():
+                with open(feature_yaml_path, "r") as f:
+                    feature_data = yaml.safe_load(f)
+                if isinstance(feature_data, dict):
+                    tasks = feature_data.get("tasks")
+                    if isinstance(tasks, list):
+                        task_total = len(tasks)
+                    parallel_groups = (
+                        feature_data.get("orchestration", {})
+                        .get("parallel_groups")
+                    )
+                    if isinstance(parallel_groups, list):
+                        wave_total = len(parallel_groups)
+            else:
+                logger.warning(
+                    "autobuild_runner: feature yaml not found at %s "
+                    "(feature_id=%r) — emitting placeholder planning_waves "
+                    "snapshot; run will proceed",
+                    feature_yaml_path,
+                    feature_id,
+                )
+        except yaml.YAMLError as exc:
+            logger.warning(
+                "autobuild_runner: failed to parse feature yaml at %s "
+                "(feature_id=%r, error=%s) — emitting placeholder "
+                "planning_waves snapshot; run will proceed",
+                feature_yaml_path,
+                feature_id,
+                exc,
+            )
+        except OSError as exc:
+            logger.warning(
+                "autobuild_runner: failed to read feature yaml at %s "
+                "(feature_id=%r, error=%s) — emitting placeholder "
+                "planning_waves snapshot; run will proceed",
+                feature_yaml_path,
+                feature_id,
+                exc,
+            )
+
+    enriched_payload = dict(payload)
+    enriched_payload["wave_total"] = wave_total
+    enriched_payload["task_total"] = task_total
+    snapshot = _build_snapshot(enriched_payload, lifecycle="planning_waves")
     return _snapshot_update(snapshot)
 
 
@@ -989,11 +1059,12 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
 #
 # ADR-ARCH-033: this deliberately bypasses ``adapters/guardkit/run.py`` (the
 # one-shot "single boundary") because autobuild is a long-running streaming
-# build. KNOWN GAP: this path does NOT populate ``last_coach_score`` /
-# ``aggregate_coach_score`` (they stay ``None``) — a prerequisite for the
-# FEAT-UBS-002 budget guards. Closing it is gated on capturing a real
-# ``guardkit autobuild --verbose`` transcript (TASK-ABW-OPS rehearsal) so the
-# score parser is built against a verified format, not an assumed one.
+# build. COACH-SCORE GAP CLOSED (TASK-UBS1C-001): the drain loop now parses
+# ``Completed turn N: success|feedback - ...`` decision lines and populates
+# ``last_coach_score`` (1.0 for success, 0.0 for feedback) and
+# ``aggregate_coach_score`` (success ratio over decision-bearing turns).
+# See docs/research/evidence/autobuild-transcripts-2026-07-26/README.md for
+# the evidence backing these decision-derived semantics.
 
 
 #: Environment override for the base directory containing local repo
@@ -1038,6 +1109,55 @@ _GUARDKIT_CHECKPOINT_PATTERN: re.Pattern[str] = re.compile(
     r"\[guardkit-checkpoint\]\s+Turn\s+\d+\s+complete\s+\(tests:\s+(pass|fail)",
     flags=re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Coach-score grammar (TASK-UBS1C-001 — decision-derived semantics)
+# ---------------------------------------------------------------------------
+#
+# ADR-ARCH-033 documented the coach-score gap: ``guardkit autobuild`` emits
+# NO numeric score on stdout. The evidence transcripts (docs/research/evidence/
+# autobuild-transcripts-2026-07-26/) prove the only coach-derived signal is
+# the per-turn decision line:
+#
+#   INFO:guardkit.orchestrator.progress:[<ISO8601>] Completed turn <N>: success - ...
+#   INFO:guardkit.orchestrator.progress:[<ISO8601>] Completed turn <N>: feedback - ...
+#
+# The verdict-emission-failure edge (CV4M archive) emits a WARNING followed by
+# a normal ``Completed turn N: feedback - ...`` line — parsers must treat it
+# as a feedback turn, not a crash.
+#
+# Semantics (evidence-backed, TASK-UBS1C-001):
+#   * ``last_coach_score`` = 1.0 for ``success``, 0.0 for ``feedback``.
+#   * ``aggregate_coach_score`` = success-turn ratio over decision-bearing turns.
+#   * Timeout (no decision lines) leaves scores at their last value / None.
+
+#: Regex matching one decision-bearing progress line.
+#: Captures ``turn_number`` (int) and ``decision`` (``"success"`` | ``"feedback"``).
+#: The verdict-emission-failure WARNING line does NOT match this pattern; only
+#: the subsequent ``Completed turn N: ...`` line does.
+_DECISION_LINE_PATTERN: re.Pattern[str] = re.compile(
+    r"Completed\s+turn\s+(\d+)\s*:\s*(success|feedback)\s+-",
+    flags=re.IGNORECASE,
+)
+
+
+def _parse_decision_line(line: str) -> tuple[int, str] | None:
+    """Extract (turn_number, decision) from a decision-bearing progress line.
+
+    Returns ``(turn_number, decision)`` where ``decision`` is ``"success"`` or
+    ``"feedback"``, or ``None`` when the line does not match the decision
+    grammar.
+
+    Args:
+        line: A decoded stdout line from the guardkit subprocess.
+
+    Returns:
+        ``(turn_number, decision)`` or ``None``.
+    """
+    match = _DECISION_LINE_PATTERN.search(line)
+    if match is None:
+        return None
+    return int(match.group(1)), match.group(2).lower()
 
 
 def _resolve_guardkit_path() -> Path | None:
@@ -1576,9 +1696,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         )
 
     stage_complete_count = 0
+    # Coach-score state (TASK-UBS1C-001).
+    last_coach_score: float | None = None
+    decision_turns: list[str] = []  # "success" or "feedback" per turn
 
     async def _drain_stdout() -> None:
-        nonlocal stage_complete_count
+        nonlocal stage_complete_count, last_coach_score
         if proc.stdout is None:  # defensive — PIPE was requested above
             return
         while True:
@@ -1588,6 +1711,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             decoded = line.decode("utf-8", errors="replace").rstrip()
             if _GUARDKIT_CHECKPOINT_PATTERN.search(decoded):
                 stage_complete_count += 1
+            # Coach-score grammar: parse decision-bearing lines (TASK-UBS1C-001).
+            decision = _parse_decision_line(decoded)
+            if decision is not None:
+                turn_number, decision_type = decision
+                decision_turns.append(decision_type)
+                last_coach_score = 1.0 if decision_type == "success" else 0.0
             logger.debug("autobuild_runner[stdout]: %s", decoded)
 
     timed_out = False
@@ -1643,9 +1772,15 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # tasks_completed=1 so the bridge translator's stage_complete delta can
     # fire (and so the state-channel visibly carries a stage_complete-shaped
     # snapshot for the integration test's mid-stream assertion).
+    # Coach scores are populated from the decision grammar (TASK-UBS1C-001).
     if worktree_path is not None:
         await _remove_worktree(repo_path, worktree_path)
     tasks_completed = max(stage_complete_count, 1)
+    # Compute aggregate_coach_score from the decision-bearing turns.
+    aggregate_coach_score: float | None = None
+    if decision_turns:
+        success_count = sum(1 for d in decision_turns if d == "success")
+        aggregate_coach_score = success_count / len(decision_turns)
     snapshot = _build_snapshot(
         payload,
         lifecycle="running_wave",
@@ -1654,12 +1789,35 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         tasks_completed=tasks_completed,
         tasks_failed=0,
     )
+    # Inject coach scores into the snapshot dict (TASK-UBS1C-001).
+    snapshot["last_coach_score"] = last_coach_score
+    snapshot["aggregate_coach_score"] = aggregate_coach_score
     return _snapshot_update(snapshot)
 
 
 def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
-    """Transition to ``completed`` — terminal lifecycle."""
+    """Transition to ``completed`` — terminal lifecycle.
+
+    Preserves ``last_coach_score`` / ``aggregate_coach_score`` from the
+    preceding ``running_wave`` snapshot (TASK-UBS1C-001).
+    """
     payload = _extract_launch_payload(list(state.get("messages", [])))
+    # Inherit coach scores from the running_wave snapshot if present.
+    async_tasks = state.get("async_tasks") or {}
+    feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+    prev_snapshot = (
+        async_tasks.get(feature_id) if isinstance(async_tasks, Mapping) else None
+    )
+    last_coach_score = (
+        prev_snapshot.get("last_coach_score")
+        if isinstance(prev_snapshot, Mapping)
+        else None
+    )
+    aggregate_coach_score = (
+        prev_snapshot.get("aggregate_coach_score")
+        if isinstance(prev_snapshot, Mapping)
+        else None
+    )
     snapshot = _build_snapshot(
         payload,
         lifecycle="completed",
@@ -1667,6 +1825,10 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         task_index=int(payload.get("task_total") or 1) - 1,
         tasks_completed=int(payload.get("task_total") or 1),
     )
+    if last_coach_score is not None:
+        snapshot["last_coach_score"] = last_coach_score
+    if aggregate_coach_score is not None:
+        snapshot["aggregate_coach_score"] = aggregate_coach_score
     return _snapshot_update(snapshot)
 
 

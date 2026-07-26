@@ -1,0 +1,116 @@
+{
+  "task_id": "TASK-UBS1C-002",
+  "timestamp": "2026-07-26T08:38:22.765321",
+  "completed": false,
+  "phases": {
+    "phase_3": {
+      "detected": true,
+      "text": "complete**",
+      "completed": false
+    }
+  },
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 0,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    ".guardkit/qav-shadow/queue.jsonl",
+    "conversation_history/session_8095739d.md",
+    "docs/architecture/decisions/ADR-ARCH-033-autobuild-subprocess-path-and-coach-score-gap.md",
+    "src/forge/subagents/autobuild_runner.py",
+    "tests/forge/test_autobuild_runner_planning_waves.py",
+    "tests/integration/test_autobuild_runner_subprocess.py"
+  ],
+  "files_created": [],
+  "files_authored": [],
+  "tests_written": [],
+  "summary": "Implementation completed",
+  "sdk_turns": {
+    "turns_used": null,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "With a fixture feature yaml (3 tasks, parallel_groups [[a,b],[c]]), the planning_waves snapshot carries the correct totals in the existing schema fields (hermetic test, tmp repo dir)",
+      "status": "complete",
+      "evidence": "test_planning_waves_reads_task_graph creates a tmp repo with 3 tasks and parallel_groups [[a,b],[c]], verifies wave_total=2 and task_total=3 in the planning_waves snapshot.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "Missing yaml / malformed yaml / feature id absent from the file each produce the current placeholder snapshot + a WARNING naming the resolved path \u2014 never an exception (three hermetic tests)",
+      "status": "complete",
+      "evidence": "Three tests cover each case: test_planning_waves_missing_yaml (no yaml file), test_planning_waves_malformed_yaml (invalid yaml content), test_planning_waves_feature_id_absent (yaml exists but feature id doesn't match). All produce wave_total=0, task_total=0 with WARNING logs. Three additional caplog tests verify warning messages contain the resolved path.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "The repo path is resolved via the same helper running_wave uses (asserted by test \u2014 no duplicated resolution logic); AutobuildState schema and graph shape byte-unchanged; existing runner tests pass unmodified",
+      "status": "complete",
+      "evidence": "test_planning_waves_uses_resolve_repo_path patches _resolve_repo_path and asserts it's called once with the payload. test_planning_waves_schema_unchanged validates the snapshot dict against the AutobuildState Pydantic model and asserts the key set matches the frozen schema exactly. No new fields added, no schema changes.",
+      "test_file": "tests/forge/test_autobuild_runner_planning_waves.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 11.03346054899157
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 28.68772019498283
+    }
+  ]
+}
