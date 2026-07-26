@@ -1,12 +1,13 @@
 id: FEAT-UBS1C
-name: "UBS-001 continuation — coach scores from the proven grammar + planning_waves reads the task graph"
+name: "UBS-001 continuation \u2014 coach scores from the proven grammar + planning_waves\
+  \ reads the task graph"
 description: 'Closes the ADR-ARCH-033 coach-score gap with decision-derived semantics
   proven by the archived real transcripts (docs/research/evidence/autobuild-transcripts-2026-07-26/)
-  and replaces the planning_waves placeholder with a task-graph reader. Graph shape +
-  AutobuildState schema FROZEN (DDR-006). M0 effect: the LOCAL orchestrator gains real
-  progress/score telemetry, prerequisite for FEAT-UBS-002 budget guards.'
+  and replaces the planning_waves placeholder with a task-graph reader. Graph shape
+  + AutobuildState schema FROZEN (DDR-006). M0 effect: the LOCAL orchestrator gains
+  real progress/score telemetry, prerequisite for FEAT-UBS-002 budget guards.'
 created: '2026-07-26T08:05:00.000000'
-status: planned
+status: completed
 complexity: 5
 estimated_tasks: 2
 tasks:
@@ -15,19 +16,37 @@ tasks:
   file_path: tasks/backlog/ubs1c/TASK-UBS1C-001-coach-score-from-decision-grammar.md
   complexity: 5
   dependencies: []
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 60
   requires_infrastructure: []
+  result:
+    total_turns: 1
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 1
+  current_turn: 0
+  started_at: '2026-07-26T08:00:39.421801'
+  completed_at: '2026-07-26T08:39:18.830134'
 - id: TASK-UBS1C-002
   name: planning_waves reads the feature task graph
   file_path: tasks/backlog/ubs1c/TASK-UBS1C-002-planning-waves-reads-task-graph.md
   complexity: 4
   dependencies: []
-  status: pending
+  status: completed
   implementation_mode: task-work
   estimated_minutes: 50
   requires_infrastructure: []
+  result:
+    total_turns: 3
+    final_decision: approved
+    error: null
+    deferred_reason: null
+  turns_completed: 3
+  current_turn: 0
+  started_at: '2026-07-26T08:00:39.425329'
+  completed_at: '2026-07-26T08:39:18.833285'
 orchestration:
   parallel_groups:
   - - TASK-UBS1C-001
@@ -38,7 +57,8 @@ smoke_gates:
   after_wave: 1
   command: 'set -e
 
-    python -m pytest tests/integration/test_autobuild_runner_subprocess.py tests/forge/test_autobuild_runner.py -x -q
+    python -m pytest tests/integration/test_autobuild_runner_subprocess.py tests/forge/test_autobuild_runner.py
+    -x -q
 
     '
   expected_exit: 0
@@ -46,3 +66,16 @@ smoke_gates:
   exit5_is_hard_fail: false
 preflight_strict: false
 evidence_repos: []
+execution:
+  started_at: '2026-07-26T08:00:32.714853'
+  completed_at: '2026-07-26T08:39:29.724821'
+  worktree_path: /home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-UBS1C
+  total_turns: 4
+  tasks_completed: 2
+  tasks_failed: 0
+  current_wave: 1
+  completed_waves:
+  - 1
+  last_updated: '2026-07-26T08:39:29.723380'
+  archived_at: null
+  archived_to: null
