@@ -34,18 +34,21 @@ from typing import Final
 # Phase E1 to widen the planning_runs.state CHECK for the target-terminal
 # chain (FEATURE_SPEC / FEATURE_PLAN / BUILD_QUEUED); bumped to 5 in
 # TASK-UBS-002-integration to add the additive ``builds.profile`` column
-# carrying the ``forge queue --profile`` selection to the daemon. Future
+# carrying the ``forge queue --profile`` selection to the daemon; bumped to
+# 6 to add the additive ``builds.last_coach_score`` column so the UBS1C coach
+# score survives the run for the ``min_coach_score`` budget floor. Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 5
+_SCHEMA_VERSION: Final[int] = 6
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
     (3, "schema_v3.sql"),
     (4, "schema_v4.sql"),
     (5, "schema_v5.sql"),
+    (6, "schema_v6.sql"),
 )
 
 

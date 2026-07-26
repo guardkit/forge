@@ -875,6 +875,58 @@ class SqliteLifecyclePersistence:
             raise
 
     # ------------------------------------------------------------------
+    # Write API — record_last_coach_score
+    # ------------------------------------------------------------------
+
+    def record_last_coach_score(self, build_id: str, score: float) -> None:
+        """Persist the most recent Coach score onto the ``builds`` row.
+
+        Write side of the coach-score store (``schema_v6.sql``). The
+        lifecycle bridge's ``build_state_recorder`` calls this per
+        ``stage-complete`` / ``build-paused`` envelope that carries a
+        ``coach_score``, so the last such write wins — the value read back
+        by :meth:`read_last_coach_score` (the ``min_coach_score`` budget
+        floor's reader) reflects the most recent gated stage.
+
+        This is a **status-preserving** UPDATE of ``last_coach_score``
+        alone — it never touches ``status``, so it is orthogonal to the
+        single-transition-owner rule (``apply_transition`` remains the sole
+        ``builds.status`` writer). A terminal row is a legal target: the
+        score is a record of what happened, not a lifecycle change. A
+        missing ``build_id`` matches zero rows and is a quiet no-op,
+        consistent with the module's other concurrent-race handling.
+
+        Args:
+            build_id: The build whose latest Coach score is being recorded.
+            score: The Coach score (0.0–1.0 in the UBS1C runner).
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+            sqlite3.Error: For any database error. The transaction is
+                rolled back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("record_last_coach_score: build_id must be non-empty")
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET last_coach_score = ?
+                 WHERE build_id = ?
+                """,
+                (float(score), build_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
     # Write API — mark_paused
     # ------------------------------------------------------------------
 
@@ -1167,6 +1219,48 @@ class SqliteLifecyclePersistence:
         if row is None:
             return None
         return _row_to_build_row(row)
+
+    # ------------------------------------------------------------------
+    # Read API — read_last_coach_score
+    # ------------------------------------------------------------------
+
+    def read_last_coach_score(self, build_id: str) -> float | None:
+        """Return the build's most recent Coach score, or ``None``.
+
+        Read side of the coach-score store (``schema_v6.sql``). Returns
+        the ``builds.last_coach_score`` value written by
+        :meth:`record_last_coach_score`, or ``None`` when the build has no
+        recorded score (a historical row that pre-dates the column, or a
+        run that never emitted a gated ``coach_score``).
+
+        The bound method matches the Supervisor's
+        ``budget_coach_score_reader`` DI shape exactly — a sync
+        ``Callable[[str], float | None]`` — so it can be wired directly as
+        that reader when the Mode-C path is activated (activation is a
+        plan-of-record decision, out of scope here; today the store is
+        populated but no production caller reads it).
+
+        Args:
+            build_id: The build whose latest Coach score is being read.
+
+        Returns:
+            The recorded score as a ``float``, or ``None`` if unset or the
+            build does not exist.
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+        """
+        if not build_id:
+            raise ValueError("read_last_coach_score: build_id must be non-empty")
+        with self._reader() as cx:
+            row = cx.execute(
+                "SELECT last_coach_score FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["last_coach_score"] if isinstance(row, sqlite3.Row) else row[0]
+        return float(value) if value is not None else None
 
     # ------------------------------------------------------------------
     # Read API — read_stages

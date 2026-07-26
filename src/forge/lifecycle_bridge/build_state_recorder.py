@@ -33,6 +33,15 @@ row already reached is a silent no-op, and a row already in a terminal
 state is never moved (Group C "no resurrection from terminal") — the
 CLI cancel path may legitimately win the race against a slow terminal
 envelope.
+
+Coach-score store (``schema_v6.sql``): additively, and orthogonally to
+the status write-back, the recorder lands the ``coach_score`` carried by
+``stage-complete`` / ``build-paused`` envelopes on
+``builds.last_coach_score`` (last-wins per envelope). This is the durable
+sink for the UBS1C score that the ``min_coach_score`` budget floor reads
+back via :meth:`SqliteLifecyclePersistence.read_last_coach_score`. The
+score write never touches ``builds.status``, so the status write-back's
+early-returns and idempotency guarantees above are unaffected.
 """
 
 from __future__ import annotations
@@ -44,7 +53,9 @@ from nats_core.events import (
     BuildCancelledPayload,
     BuildCompletePayload,
     BuildFailedPayload,
+    BuildPausedPayload,
     BuildStartedPayload,
+    StageCompletePayload,
 )
 
 from forge.lifecycle.state_machine import (
@@ -74,6 +85,14 @@ _TARGET_STATE_TABLE: dict[type, BuildState] = {
     BuildFailedPayload: BuildState.FAILED,
     BuildCancelledPayload: BuildState.CANCELLED,
 }
+
+#: Payload types that carry a ``coach_score`` the recorder lands durably on
+#: ``builds.last_coach_score`` (``schema_v6.sql``). These are exactly the two
+#: envelopes on which the score survives ``lifecycle_bridge.translation``.
+#: ``BuildCompletePayload`` deliberately carries no score, so the terminal
+#: envelope cannot be the source — the write must happen per stage-complete /
+#: pause, mid-build, which is where the ``min_coach_score`` budget floor reads.
+_COACH_SCORE_CARRIERS: tuple[type, ...] = (StageCompletePayload, BuildPausedPayload)
 
 
 class _RowCursor:
@@ -115,7 +134,38 @@ def build_build_state_recorder(
         the wireup guards against everything else.
     """
 
+    def _record_coach_score(event: "PipelineEvent") -> None:
+        """Land a carried ``coach_score`` on ``builds.last_coach_score``.
+
+        Orthogonal to the status write-back below: it fires for the
+        stage-complete / build-paused envelopes (which never move
+        ``builds.status``) whenever they carry a non-``None`` score, and
+        last-wins per envelope so the column reflects the most recent gated
+        stage. A missing build_id or row is a quiet no-op consistent with
+        the status path's own guards.
+        """
+        if not isinstance(event, _COACH_SCORE_CARRIERS):
+            return
+        score = getattr(event, "coach_score", None)
+        if score is None:
+            return
+        build_id = getattr(event, "build_id", None)
+        if not build_id:
+            logger.warning(
+                "build_state_recorder: %s carries a coach_score but no "
+                "build_id; skipping score write-back",
+                type(event).__name__,
+            )
+            return
+        persistence.record_last_coach_score(build_id, score)
+
     async def _record(event: "PipelineEvent") -> None:
+        # Score write-back is orthogonal to the status write-back: it runs
+        # whether or not the payload maps to a status transition, so it
+        # happens before the ``target is None`` early-return that the
+        # stage-complete / build-paused envelopes take.
+        _record_coach_score(event)
+
         target = _TARGET_STATE_TABLE.get(type(event))
         if target is None:
             return
