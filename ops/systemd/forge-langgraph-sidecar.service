@@ -21,14 +21,22 @@
 #   redesign. (A stale sibling `forge-autobuild-runner.service`, 2026-05-12, is
 #   installed-but-disabled — the superseded earlier attempt; leave it alone.)
 #
-# LOAD-BEARING ENV (do not drop — .env does NOT carry these; verified E2-S3):
-#   FORGE_GUARDKIT_PATH  — the guardkit resolver (not on systemd's minimal PATH)
-#   GUARDKIT_HARNESS=sdk — pins the SDK (Claude API) harness (2026-07-04 attended)
+# LOAD-BEARING ENV (do not drop — the runner spawns guardkit with
+#   env=os.environ.copy(), so this [Service] block is the durable seam that
+#   carries the env into the build subprocess):
+#   OPENAI_BASE_URL            — the local llama-swap seat (:9000); the Player's
+#                                OpenAI-shaped client talks here, never to cloud
+#   OPENAI_API_KEY=dummy       — satisfies that client's key check; NOT a secret
+#   FORGE_GUARDKIT_PATH        — the guardkit resolver (not on systemd's minimal PATH)
+#   GUARDKIT_HARNESS=langgraph — the mission default harness; the 2026-07-26 e2e
+#                                rehearsal ran with it unset -> langgraph
 #   FORGE_CONFIG_PATH / FORGE_DEFAULT_REPO — autobuild_runner launch inputs
 #   PATH=%h/.agentecflow/bin:… — rich enough for the spawned guardkit subprocess
 #   Dropping any of these makes the autobuild build-half launch without its
-#   guardkit resolver / SDK pin and break — the reason a blind `cp` overwrite of
-#   the running unit is unsafe. See ops/systemd/README.md §b for the install rule.
+#   guardkit resolver / local model seat and break — the reason a blind `cp`
+#   overwrite of the running unit is unsafe. See ops/systemd/README.md.
+#   FORGE_NATS_URL is NOT pinned here (F10: no new plaintext credential copy) —
+#   it must live in forge/.env on the host; see ops/systemd/README.md.
 #
 # VENV INSTALL RECIPE (DEFECT #18a, B4 round-17): the `langgraph` binary in the
 #   ExecStart below ships in `langgraph-cli[inmem]`, now declared as the
@@ -65,6 +73,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# The local model seat. The Player's OpenAI-shaped client talks to the local
+# llama-swap server on :9000, never to any cloud; the dummy key only satisfies
+# that client's key check (not a secret). The runner spawns guardkit with
+# env=os.environ.copy() (autobuild_runner.py:1881), so pinning these here is the
+# durable way to carry the seat into the build subprocess — the 2026-07-26 e2e
+# rehearsal proved this pair (base URL + dummy key) reaches real code generation.
+Environment=OPENAI_BASE_URL=http://localhost:9000/v1
+Environment=OPENAI_API_KEY=dummy
 # autobuild_runner reads these — forge-prod does not yet plumb repo
 # through to the launch payload (tracked: TASK-ABW-002).
 Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
@@ -73,10 +89,13 @@ Environment=FORGE_DEFAULT_REPO=appmilla/api_test
 # explicitly, and give the spawned guardkit subprocess a PATH rich enough
 # for its own tool calls (git, claude CLI, etc.).
 Environment=FORGE_GUARDKIT_PATH=%h/.agentecflow/bin/guardkit
-# 2026-07-04 attended run: force the SDK harness (Claude API) — the langgraph
-# default (guardkit TASK-HMIG-011 cutover) stays deferred until local-inference
-# P2 validation. Revert by deleting this line + restarting this unit.
-Environment=GUARDKIT_HARNESS=sdk
+# The mission default harness. The 2026-07-26 e2e rehearsal
+# (build-FEAT-UPT1-20260726112342, merged api_test c5a04be) ran with
+# GUARDKIT_HARNESS UNSET, which resolves to the langgraph default; pin it
+# explicitly so the durable unit matches the proven shape. The earlier
+# GUARDKIT_HARNESS=sdk was a stale 2026-05-15-era pin that contradicts both the
+# mission default and the rehearsal.
+Environment=GUARDKIT_HARNESS=langgraph
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Projects/appmilla_github/forge
 # forge.langgraph.json registers ONLY autobuild_runner (the default langgraph.json
