@@ -1,0 +1,16 @@
+{
+  "task_id": "TASK-UBS1C-001",
+  "checkpoints": [
+    {
+      "turn": 1,
+      "commit_hash": "47133bd62dacfba7155ea2789280bc88d81db6a1",
+      "timestamp": "2026-07-26T08:31:39.082184",
+      "tests_passed": true,
+      "test_count": 0,
+      "message": "[guardkit-checkpoint] Turn 1 complete (tests: pass)",
+      "from_prior_run": false,
+      "evidence_commits": {}
+    }
+  ],
+  "last_updated": "2026-07-26T08:31:39.082258"
+}
