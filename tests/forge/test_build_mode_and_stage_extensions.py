@@ -461,3 +461,86 @@ class TestQueueBuildAcceptsMode:
             (build_id,),
         ).fetchone()
         assert row[0] == "mode-c"
+
+
+# ---------------------------------------------------------------------------
+# Coach-score store — record_last_coach_score / read_last_coach_score
+# (schema_v6; the durable sink feeding the min_coach_score budget floor)
+# ---------------------------------------------------------------------------
+
+
+class TestLastCoachScoreStore:
+    """The write/read pair over the additive ``builds.last_coach_score`` column."""
+
+    def _queued(
+        self, persistence: SqliteLifecyclePersistence, cid: str
+    ) -> str:
+        payload = _make_payload(feature_id=f"FEAT-{cid}", correlation_id=cid)
+        return persistence.record_pending_build(payload)
+
+    def test_read_defaults_to_none_for_fresh_row(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = self._queued(persistence, "corr-cs-1")
+        assert persistence.read_last_coach_score(build_id) is None
+
+    def test_read_none_for_unknown_build(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        assert persistence.read_last_coach_score("build-PHANTOM") is None
+
+    def test_record_then_read_round_trips(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = self._queued(persistence, "corr-cs-2")
+        persistence.record_last_coach_score(build_id, 0.8)
+        assert persistence.read_last_coach_score(build_id) == pytest.approx(0.8)
+
+    def test_record_is_last_wins(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = self._queued(persistence, "corr-cs-3")
+        persistence.record_last_coach_score(build_id, 1.0)
+        persistence.record_last_coach_score(build_id, 0.0)
+        assert persistence.read_last_coach_score(build_id) == pytest.approx(0.0)
+
+    def test_record_leaves_status_untouched(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = self._queued(persistence, "corr-cs-4")
+        persistence.record_last_coach_score(build_id, 0.5)
+        row = persistence.connection.execute(
+            "SELECT status FROM builds WHERE build_id = ?",
+            (build_id,),
+        ).fetchone()
+        assert row[0] == "QUEUED"
+
+    def test_record_missing_row_is_quiet_noop(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        # No row for this build_id — the UPDATE matches zero rows and does
+        # not raise (module norm for concurrent-race writes).
+        persistence.record_last_coach_score("build-PHANTOM", 0.9)
+        assert persistence.read_last_coach_score("build-PHANTOM") is None
+
+    def test_read_is_usable_as_budget_reader_di(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        # The bound method must satisfy the Supervisor's
+        # ``budget_coach_score_reader: Callable[[str], float | None]`` DI.
+        reader: "Callable[[str], float | None]" = persistence.read_last_coach_score
+        build_id = self._queued(persistence, "corr-cs-5")
+        persistence.record_last_coach_score(build_id, 0.42)
+        assert reader(build_id) == pytest.approx(0.42)
+
+    def test_record_empty_build_id_raises(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        with pytest.raises(ValueError):
+            persistence.record_last_coach_score("", 1.0)
+
+    def test_read_empty_build_id_raises(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        with pytest.raises(ValueError):
+            persistence.read_last_coach_score("")

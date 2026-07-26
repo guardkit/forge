@@ -32,8 +32,10 @@ from nats_core.events import (
     BuildCancelledPayload,
     BuildCompletePayload,
     BuildFailedPayload,
+    BuildPausedPayload,
     BuildQueuedPayload,
     BuildStartedPayload,
+    StageCompletePayload,
 )
 
 from forge.adapters.sqlite import connect as sqlite_connect
@@ -292,6 +294,118 @@ class TestRecorderGuards:
                 ),
             )
         assert any("no builds row" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Coach-score store — additive write-back (schema_v6)
+# ---------------------------------------------------------------------------
+
+
+def _coach(persistence: SqliteLifecyclePersistence, build_id: str) -> float | None:
+    """Read the row's ``last_coach_score`` column directly."""
+    row = persistence.connection.execute(
+        "SELECT last_coach_score, status FROM builds WHERE build_id = ?",
+        (build_id,),
+    ).fetchone()
+    assert row is not None
+    return row["last_coach_score"]
+
+
+def _stage_complete(build_id: str, score: float | None) -> StageCompletePayload:
+    return StageCompletePayload(
+        feature_id=_FEATURE_ID,
+        build_id=build_id,
+        stage_label="task-0",
+        target_kind="subagent",
+        target_identifier="autobuild_runner",
+        status="PASSED",
+        gate_mode=None,
+        coach_score=score,
+        duration_secs=0.0,
+        completed_at=datetime.now(UTC).isoformat(),
+        correlation_id="corr-bsr-1",
+    )
+
+
+def _build_paused(build_id: str, score: float | None) -> BuildPausedPayload:
+    return BuildPausedPayload(
+        feature_id=_FEATURE_ID,
+        build_id=build_id,
+        stage_label="awaiting_approval",
+        gate_mode="MANDATORY_HUMAN_APPROVAL",
+        coach_score=score,
+        rationale="awaiting_approval",
+        approval_subject=f"agents.approval.forge.{build_id}",
+        paused_at=datetime.now(UTC).isoformat(),
+        correlation_id="corr-bsr-1",
+    )
+
+
+class TestRecorderCoachScoreStore:
+    def test_stage_complete_with_score_updates_column_status_untouched(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = _queued_build(persistence)
+
+        _record(persistence, _stage_complete(build_id, 1.0))
+
+        assert _coach(persistence, build_id) == pytest.approx(1.0)
+        # stage-complete never moves builds.status — the row stays QUEUED.
+        assert _row(persistence, build_id)["status"] == BuildState.QUEUED.value
+
+    def test_stage_complete_score_none_writes_nothing(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = _queued_build(persistence)
+
+        _record(persistence, _stage_complete(build_id, None))
+
+        assert _coach(persistence, build_id) is None
+
+    def test_two_envelopes_last_score_wins(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = _queued_build(persistence)
+
+        _record(persistence, _stage_complete(build_id, 1.0))
+        _record(persistence, _stage_complete(build_id, 0.0))
+
+        assert _coach(persistence, build_id) == pytest.approx(0.0)
+
+    def test_build_paused_with_score_is_written(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = _queued_build(persistence)
+
+        _record(persistence, _build_paused(build_id, 0.75))
+
+        assert _coach(persistence, build_id) == pytest.approx(0.75)
+        # build-paused stays with the approval machinery — status unchanged.
+        assert _row(persistence, build_id)["status"] == BuildState.QUEUED.value
+
+    def test_score_writable_on_terminal_row_status_untouched(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        """A late stage-complete's score lands even after the row is terminal."""
+        build_id = _queued_build(persistence)
+        _record(
+            persistence,
+            BuildCompletePayload(
+                feature_id=_FEATURE_ID,
+                build_id=build_id,
+                tasks_completed=1,
+                tasks_failed=0,
+                tasks_total=1,
+                duration_seconds=10.0,
+                summary="ok",
+            ),
+        )
+        assert _row(persistence, build_id)["status"] == BuildState.COMPLETE.value
+
+        _record(persistence, _stage_complete(build_id, 0.5))
+
+        assert _coach(persistence, build_id) == pytest.approx(0.5)
+        assert _row(persistence, build_id)["status"] == BuildState.COMPLETE.value
 
 
 # ---------------------------------------------------------------------------

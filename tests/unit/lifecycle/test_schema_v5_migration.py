@@ -61,9 +61,16 @@ def _insert_build(
 
 
 def test_fresh_db_migrates_to_version_5(tmp_path: Path) -> None:
+    # Pin the migration head at v5 so this v5-specific test stays robust to
+    # later additive bumps (v6+); the runner otherwise advances to the newest.
     cx = sqlite_connect.connect_writer(tmp_path / "fresh.db")
     try:
-        assert migrations.apply_at_boot(cx) == 5
+        original = migrations._MIGRATIONS
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 5)
+        try:
+            assert migrations.apply_at_boot(cx) == 5
+        finally:
+            migrations._MIGRATIONS = original
     finally:
         cx.close()
 
@@ -136,8 +143,12 @@ def test_v4_upgrade_adds_column_old_rows_read_null(tmp_path: Path) -> None:
         _insert_build(cx, "legacy-1")
         cx.commit()
 
-        # Upgrade to v5.
-        assert migrations.apply_at_boot(cx) == 5
+        # Upgrade to v5 (pin the head so this v5-scoped test ignores v6+).
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 5)
+        try:
+            assert migrations.apply_at_boot(cx) == 5
+        finally:
+            migrations._MIGRATIONS = original
         assert "profile" in _column_names(cx, "builds")
 
         # The pre-existing row reads back NULL (backward-compatible default).
@@ -155,14 +166,21 @@ def test_v4_upgrade_adds_column_old_rows_read_null(tmp_path: Path) -> None:
 
 
 def test_v5_migration_is_idempotent(tmp_path: Path) -> None:
+    # Pin the head at v5 so idempotency is asserted against the v5 terminal
+    # version, independent of any later additive migration (v6+).
     cx = sqlite_connect.connect_writer(tmp_path / "idem.db")
     try:
-        assert migrations.apply_at_boot(cx) == 5
-        _insert_build(cx, "keep", profile="unattended")
-        cx.commit()
+        original = migrations._MIGRATIONS
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 5)
+        try:
+            assert migrations.apply_at_boot(cx) == 5
+            _insert_build(cx, "keep", profile="unattended")
+            cx.commit()
 
-        # Re-running applies nothing and preserves data.
-        assert migrations.apply_at_boot(cx) == 5
+            # Re-running applies nothing and preserves data.
+            assert migrations.apply_at_boot(cx) == 5
+        finally:
+            migrations._MIGRATIONS = original
         row = cx.execute(
             "SELECT profile FROM builds WHERE build_id='keep'"
         ).fetchone()
