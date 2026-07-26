@@ -3,12 +3,19 @@
 Coverage:
 
 * Unknown profile is rejected before any side effect (UsageError / exit 2).
-* A known unattended profile echoes the resolved caps and the not-yet-plumbed
-  NOTE, and still enqueues successfully.
-* The attended default is silent (no caps banner) and enqueues normally.
+* A known unattended profile echoes the resolved caps + the enforcement-pending
+  NOTE, carries ``profile='unattended'`` to the persistence write, and enqueues
+  successfully.
+* The attended default is silent (no caps banner) and carries ``profile=None``.
+* An attended override against a capped default is now honoured via carriage —
+  it persists ``profile='attended'`` and emits no deferral warning.
 
 Mirrors the ``click.testing.CliRunner`` + fake-persistence harness in
 ``tests.forge.test_cli_mode_flag`` so the suite runs without a NATS broker.
+
+TASK-UBS-002-integration §2(a): ``--profile`` now travels to the daemon on the
+``builds.profile`` row, so the skeleton's "not yet plumbed" assertions are
+replaced by carriage checks + the narrower "enforcement not yet wired" note.
 """
 
 from __future__ import annotations
@@ -66,14 +73,20 @@ class _FakePersistence:
 
     def __init__(self) -> None:
         self.records: list[Any] = []
+        self.profiles: list[str | None] = []
 
     def exists_active_build(self, feature_id: str) -> bool:  # noqa: ARG002
         return False
 
     def queue_build(
-        self, payload: Any, *, mode: BuildMode | str | None = None  # noqa: ARG002
+        self,
+        payload: Any,
+        *,
+        mode: BuildMode | str | None = None,  # noqa: ARG002
+        profile: str | None = None,
     ) -> str:
         self.records.append(payload)
+        self.profiles.append(profile)
         return f"build-{payload.feature_id}"
 
 
@@ -118,7 +131,8 @@ class TestUnknownProfileRejected:
 
 
 class TestKnownProfileEchoesCaps:
-    """AC: a capped profile echoes its caps + the not-yet-plumbed NOTE."""
+    """AC-04: a capped profile echoes its caps + the enforcement-pending NOTE
+    and carries the profile name to the persistence write."""
 
     def test_unattended_echoes_caps_and_note(
         self,
@@ -131,12 +145,17 @@ class TestKnownProfileEchoesCaps:
         assert result.exit_code == 0, result.output
         assert "budget profile 'unattended'" in result.output
         assert "max_review_cycles=2" in result.output
-        assert "not yet plumbed to the daemon" in result.output
+        # The profile now travels to the daemon on the build row; the residual
+        # gap surfaced is the (out-of-scope) enforcement wiring, not carriage.
+        assert "not yet wired into the running supervisor" in result.output
         assert len(fake_persistence.records) == 1
+        # AC-04 carriage: the selected profile reaches the persistence write.
+        assert fake_persistence.profiles == ["unattended"]
 
 
 class TestAttendedDefaultSilent:
-    """AC: the attended default enqueues with no caps banner (ASSUM-010)."""
+    """AC: the attended default enqueues with no caps banner (ASSUM-010) and
+    carries profile=None (→ the daemon applies default_profile)."""
 
     def test_no_profile_is_silent_and_enqueues(
         self,
@@ -148,14 +167,18 @@ class TestAttendedDefaultSilent:
         result = _invoke(config_path, repo_dir, feature_yaml)
         assert result.exit_code == 0, result.output
         assert "budget profile" not in result.output
+        assert "not yet wired" not in result.output
         assert len(fake_persistence.records) == 1
+        # No --profile → NULL carriage → daemon resolves default_profile.
+        assert fake_persistence.profiles == [None]
 
 
 class TestAttendedOverrideAgainstCappedDefault:
-    """AC (review fix): --profile attended against a capped default warns of the
-    mismatch even though the selected profile has no caps to echo."""
+    """AC-04: --profile attended against a capped default is now HONOURED via
+    carriage — it persists profile='attended' (caps off) and emits no deferral
+    warning, because the override truly reaches the daemon row now."""
 
-    def test_attended_override_warns_and_shows_no_caps(
+    def test_attended_override_carries_and_no_warning(
         self,
         tmp_path: Path,
         repo_dir: Path,
@@ -163,8 +186,8 @@ class TestAttendedOverrideAgainstCappedDefault:
         fake_persistence: _FakePersistence,
     ) -> None:
         # Capped default; operator explicitly asks for caps OFF (attended). The
-        # daemon would still apply the capped default — surface that silently no
-        # more.
+        # daemon now resolves the requested attended profile from the build row
+        # rather than falling back to the capped default — no mismatch to warn.
         doc = {
             "queue": {"repo_allowlist": [str(repo_dir)]},
             "budget": {
@@ -182,7 +205,8 @@ class TestAttendedOverrideAgainstCappedDefault:
         assert result.exit_code == 0, result.output
         # attended has no caps -> no caps banner
         assert "budget profile" not in result.output
-        # but the mismatch (daemon applies the capped default) IS surfaced
-        assert "not yet plumbed to the daemon" in result.output
-        assert "default_profile='unattended'" in result.output
+        # attended = caps off -> the enforcement-pending note (caps-only) is silent
+        assert "not yet wired" not in result.output
+        # AC-04 carriage: the override is persisted so the daemon honours it.
+        assert fake_persistence.profiles == ["attended"]
         assert len(fake_persistence.records) == 1

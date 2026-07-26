@@ -32,17 +32,20 @@ from typing import Final
 # The current schema version. Bumped to 3 in TASK-MP-002 to add
 # planning_runs and planning_run_events tables; bumped to 4 in Lane B /
 # Phase E1 to widen the planning_runs.state CHECK for the target-terminal
-# chain (FEATURE_SPEC / FEATURE_PLAN / BUILD_QUEUED). Future schema bumps
-# should follow the same pattern: append a sibling ``schema_v{N}.sql`` and
-# add a ``(N, "schema_v{N}.sql")`` entry to ``_MIGRATIONS`` in ascending
-# order. The runner applies every entry whose version is greater than the
-# current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 4
+# chain (FEATURE_SPEC / FEATURE_PLAN / BUILD_QUEUED); bumped to 5 in
+# TASK-UBS-002-integration to add the additive ``builds.profile`` column
+# carrying the ``forge queue --profile`` selection to the daemon. Future
+# schema bumps should follow the same pattern: append a sibling
+# ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
+# ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
+# version is greater than the current ``schema_version`` ledger row.
+_SCHEMA_VERSION: Final[int] = 5
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
     (3, "schema_v3.sql"),
     (4, "schema_v4.sql"),
+    (5, "schema_v5.sql"),
 )
 
 

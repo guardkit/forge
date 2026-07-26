@@ -47,9 +47,16 @@ def _insert_run(cx: sqlite3.Connection, cid: str, state: str) -> None:
 
 
 def test_fresh_db_migrates_to_version_4(tmp_path: Path) -> None:
+    # Pin the migration head at v4 so this v4-specific test stays robust to
+    # later additive bumps (v5+); the runner otherwise advances to the newest.
     cx = sqlite_connect.connect_writer(tmp_path / "fresh.db")
     try:
-        version = migrations.apply_at_boot(cx)
+        original = migrations._MIGRATIONS
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 4)
+        try:
+            version = migrations.apply_at_boot(cx)
+        finally:
+            migrations._MIGRATIONS = original
         assert version == 4
     finally:
         cx.close()
@@ -117,8 +124,14 @@ def test_v4_is_additive_leaves_other_tables_unchanged(tmp_path: Path) -> None:
         finally:
             migrations._MIGRATIONS = original
 
-        # Now apply v4.
-        migrations.apply_at_boot(cx_v3)
+        # Now apply v4 only (pin the head so a later additive migration —
+        # e.g. v5's builds.profile column — does not bleed into this v4-scoped
+        # additivity assertion).
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 4)
+        try:
+            migrations.apply_at_boot(cx_v3)
+        finally:
+            migrations._MIGRATIONS = original
         assert _table_schema(cx_v3, "builds") == builds_v3
         assert _table_schema(cx_v3, "stage_log") == stage_log_v3
         assert _table_schema(cx_v3, "planning_run_events") == events_v3
@@ -149,8 +162,12 @@ def test_v3_upgrade_preserves_rows_and_foreign_keys(tmp_path: Path) -> None:
         )
         cx.commit()
 
-        # Upgrade to v4.
-        assert migrations.apply_at_boot(cx) == 4
+        # Upgrade to v4 (pin the head so this v4-scoped test ignores v5+).
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 4)
+        try:
+            assert migrations.apply_at_boot(cx) == 4
+        finally:
+            migrations._MIGRATIONS = original
 
         # Data preserved.
         row = cx.execute(
@@ -187,14 +204,21 @@ def test_v3_upgrade_preserves_rows_and_foreign_keys(tmp_path: Path) -> None:
 
 
 def test_v4_migration_is_idempotent(tmp_path: Path) -> None:
+    # Pin the head at v4 so idempotency is asserted against the v4 terminal
+    # version, independent of any later additive migration (v5+).
     cx = sqlite_connect.connect_writer(tmp_path / "idem.db")
     try:
-        assert migrations.apply_at_boot(cx) == 4
-        _insert_run(cx, "keep", "FEATURE_SPEC")
-        cx.commit()
+        original = migrations._MIGRATIONS
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 4)
+        try:
+            assert migrations.apply_at_boot(cx) == 4
+            _insert_run(cx, "keep", "FEATURE_SPEC")
+            cx.commit()
 
-        # Re-running applies nothing and preserves data.
-        assert migrations.apply_at_boot(cx) == 4
+            # Re-running applies nothing and preserves data.
+            assert migrations.apply_at_boot(cx) == 4
+        finally:
+            migrations._MIGRATIONS = original
         row = cx.execute(
             "SELECT state FROM planning_runs WHERE correlation_id='keep'"
         ).fetchone()

@@ -630,13 +630,12 @@ def queue_cmd(
     #    side effect (mirrors the mode-resolution discipline). An unknown name
     #    is rejected here rather than silently falling back to the default.
     #
-    #    NOTE (skeleton): the selected profile is not yet carried across the
-    #    queue→daemon boundary. ``BuildQueuedPayload`` (nats-core) has no
-    #    profile field and the ``builds`` table has no profile column, so a
-    #    per-build ``--profile`` override cannot travel to the daemon today —
-    #    the daemon resolves caps from ``config.budget.default_profile``.
-    #    Plumbing the override (a nats-core field via ADR, or a ``builds``
-    #    column + daemon read) is tracked in TASK-UBS-002-integration.
+    #    TASK-UBS-002-integration §2(a): the validated name is now carried to
+    #    the daemon on the ``builds.profile`` column (schema_v5.sql) — see the
+    #    ``queue_build(..., profile=profile_name)`` write below. The daemon
+    #    reads it back via ``BuildRow.profile`` and resolves caps with
+    #    ``config.budget.resolve(row.profile)`` (NULL → default_profile). The
+    #    nats-core payload deliberately stays profile-free (§2(b) barred).
     try:
         # Pass profile_name straight through — resolve() owns the None→default
         # mapping (models.py), so a future change to that logic is not silently
@@ -662,16 +661,21 @@ def queue_cmd(
             if value is not None
         )
         click.echo(f"budget profile {effective_profile!r}: {rendered}")
-    # Honest-deferral note: fire whenever an explicit --profile override differs
-    # from what the daemon will actually apply (default_profile) — regardless of
-    # whether the selected profile has caps. `--profile attended` against a
-    # capped default is exactly the silent mismatch this surfaces.
-    if profile_name is not None and profile_name != config.budget.default_profile:
+    # Honest-deferral note: the profile is now carried to the daemon on the
+    # ``builds.profile`` row (TASK-UBS-002-integration §2(a)) and resolved via
+    # ``config.budget.resolve(row.profile)``. Budget *enforcement* itself,
+    # however, only runs in a live Mode C supervisor, and wiring the guards
+    # into the production ``serve.py build_supervisor`` remains out of this
+    # task's scope (the FEAT-UBS-002 banner names it an outside dependency).
+    # Surface that residual gap for a capped override so an operator is not
+    # led to believe caps are being enforced yet.
+    if profile_name is not None and guards.caps_enabled:
         click.echo(
-            f"NOTE: --profile {profile_name!r} is not yet plumbed to the daemon "
-            "(FEAT-UBS-002 skeleton); the running daemon applies "
-            f"config.budget.default_profile={config.budget.default_profile!r}. "
-            "See TASK-UBS-002-integration.",
+            f"NOTE: --profile {profile_name!r} is persisted to the build row "
+            "and resolvable by the daemon, but Mode C budget enforcement is "
+            "not yet wired into the running supervisor (serve.py build_supervisor "
+            "— outside TASK-UBS-002-integration). Caps travel but do not yet "
+            "pause a live build.",
             err=True,
         )
 
@@ -791,15 +795,16 @@ def queue_cmd(
     #    a restart.
     try:
         if hasattr(persistence, "queue_build"):
-            persistence.queue_build(payload, mode=build_mode)
+            persistence.queue_build(payload, mode=build_mode, profile=profile_name)
         else:
             # Fallback for in-memory test fakes that pre-date
-            # TASK-MBC8-001's ``queue_build`` alias. The mode is passed
-            # via the payload's open ``ConfigDict(extra="allow")`` slot
-            # so the fake's ``record_pending_build`` can sniff it via
-            # ``getattr(payload, "mode", None)``.
+            # TASK-MBC8-001's ``queue_build`` alias. The mode and profile
+            # are passed via the payload's open ``ConfigDict(extra="allow")``
+            # slot so the fake's ``record_pending_build`` can sniff them via
+            # ``getattr(payload, "mode"/"profile", None)``.
             try:
                 payload.mode = build_mode.value  # type: ignore[attr-defined]
+                payload.profile = profile_name  # type: ignore[attr-defined]
             except (AttributeError, TypeError):
                 # Last-ditch: pass via a kwarg the fake may accept.
                 pass
