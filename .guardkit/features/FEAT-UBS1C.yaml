@@ -1,0 +1,48 @@
+id: FEAT-UBS1C
+name: "UBS-001 continuation — coach scores from the proven grammar + planning_waves reads the task graph"
+description: 'Closes the ADR-ARCH-033 coach-score gap with decision-derived semantics
+  proven by the archived real transcripts (docs/research/evidence/autobuild-transcripts-2026-07-26/)
+  and replaces the planning_waves placeholder with a task-graph reader. Graph shape +
+  AutobuildState schema FROZEN (DDR-006). M0 effect: the LOCAL orchestrator gains real
+  progress/score telemetry, prerequisite for FEAT-UBS-002 budget guards.'
+created: '2026-07-26T08:05:00.000000'
+status: planned
+complexity: 5
+estimated_tasks: 2
+tasks:
+- id: TASK-UBS1C-001
+  name: Populate coach scores from the proven decision grammar
+  file_path: tasks/backlog/ubs1c/TASK-UBS1C-001-coach-score-from-decision-grammar.md
+  complexity: 5
+  dependencies: []
+  status: pending
+  implementation_mode: task-work
+  estimated_minutes: 60
+  requires_infrastructure: []
+- id: TASK-UBS1C-002
+  name: planning_waves reads the feature task graph
+  file_path: tasks/backlog/ubs1c/TASK-UBS1C-002-planning-waves-reads-task-graph.md
+  complexity: 4
+  dependencies: []
+  status: pending
+  implementation_mode: task-work
+  estimated_minutes: 50
+  requires_infrastructure: []
+orchestration:
+  parallel_groups:
+  - - TASK-UBS1C-001
+    - TASK-UBS1C-002
+  estimated_duration_minutes: 110
+  recommended_parallel: 2
+smoke_gates:
+  after_wave: 1
+  command: 'set -e
+
+    python -m pytest tests/integration/test_autobuild_runner_subprocess.py tests/forge/test_autobuild_runner.py -x -q
+
+    '
+  expected_exit: 0
+  timeout: 300
+  exit5_is_hard_fail: false
+preflight_strict: false
+evidence_repos: []
