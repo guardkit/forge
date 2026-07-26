@@ -48,6 +48,31 @@ updated: 2026-07-09T00:00:00Z
 > until Mode C is live. This matches the task's own note: "cannot be
 > end-to-end validated without a real Mode C run."
 >
+> **✅ §2(a) PROFILE CARRIAGE DONE 2026-07-26 (AC-04) — forge-only, additive.**
+> The `--profile` selection now travels to the daemon on the build row (the
+> nats-core seam stays frozen; option §2(b) barred). Shipped:
+> - `src/forge/lifecycle/schema_v5.sql` — additive `ALTER TABLE builds ADD
+>   COLUMN profile TEXT` (NULL-able, no default → `resolve(None)` =
+>   `default_profile` = attended/caps-off = backward-compatible for historical
+>   rows); registered as migration 5 in `migrations.py:40-47`
+>   (`_SCHEMA_VERSION=5`, `_MIGRATIONS += (5, "schema_v5.sql")`).
+> - `persistence.py`: `BuildRow.profile: str | None = None` (L218);
+>   `_row_to_build_row` reads it (defensive keys L303, construction L338);
+>   `record_pending_build(..., profile=)` sniffs `payload.profile` then INSERTs
+>   the column (L723); `queue_build(..., profile=)` forwards it (L794).
+> - `cli/queue.py:798` — `queue_build(payload, mode=..., profile=profile_name)`;
+>   the stale "not yet plumbed" NOTE is replaced by an enforcement-pending NOTE
+>   (fires only for a capped profile) since the profile now reaches the row.
+> Tests: `tests/unit/lifecycle/test_schema_v5_migration.py` (fresh→v5, additive,
+> existing-v4 upgrade reads old rows NULL, idempotent);
+> `tests/forge/test_profile_carriage.py` (unattended lands + daemon
+> `resolve(row.profile)` yields unattended caps; NULL row → default);
+> `test_cli_profile_flag.py` updated to the new truth (carriage asserted).
+> **Still deferred (out of this task's scope):** the daemon-side ENFORCEMENT
+> wiring into `serve.py build_supervisor` — Mode C stays dormant in prod, so
+> caps travel + resolve but do not yet pause a live build. §3 coach-score floor
+> unchanged.
+>
 > **§3 coach-score floor (no change, as scoped):** `last_coach_score` stays
 > `None` (ADR-ARCH-033); the `min_coach_score` branch is inert and
 > activates automatically when the runner feeds a real score. No

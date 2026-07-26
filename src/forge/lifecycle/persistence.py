@@ -209,6 +209,13 @@ class BuildRow(BaseModel):
     # rows that backfilled to ``"mode-a"`` via ``schema_v2.sql``) keep
     # working unchanged.
     mode: BuildMode = BuildMode.MODE_A
+    # FEAT-UBS-002 / TASK-UBS-002-integration — budget-guard profile
+    # selected by ``forge queue --profile`` (``schema_v5.sql``). ``None``
+    # means "no per-build profile requested"; the daemon resolves it via
+    # ``config.budget.resolve(profile)``, which maps ``None`` to
+    # ``default_profile`` (``attended`` = caps off, ASSUM-010). Historical
+    # rows that pre-date the column read back as ``None``.
+    profile: str | None = None
 
 
 class BuildStatusView(BaseModel):
@@ -293,6 +300,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "sdk_timeout_seconds",
             "pending_approval_request_id",
             "mode",
+            "profile",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -327,6 +335,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         sdk_timeout_seconds=int(data.get("sdk_timeout_seconds") or 1800),
         pending_approval_request_id=data.get("pending_approval_request_id"),
         mode=BuildMode(data.get("mode") or BuildMode.MODE_A.value),
+        profile=data.get("profile"),
     )
 
 
@@ -617,7 +626,11 @@ class SqliteLifecyclePersistence:
     # ------------------------------------------------------------------
 
     def record_pending_build(
-        self, payload: Any, *, mode: BuildMode | str | None = None
+        self,
+        payload: Any,
+        *,
+        mode: BuildMode | str | None = None,
+        profile: str | None = None,
     ) -> str:
         """Insert a fresh ``builds`` row in state ``QUEUED``.
 
@@ -643,6 +656,16 @@ class SqliteLifecyclePersistence:
                 :attr:`BuildMode.MODE_A` when neither the keyword nor
                 ``payload.mode`` carries a value, so existing Mode A
                 callers continue to work without modification.
+            profile: Budget-guard profile name selected by ``forge queue
+                --profile`` (FEAT-UBS-002 / TASK-UBS-002-integration).
+                Persisted to ``builds.profile`` so the daemon can resolve
+                caps via ``config.budget.resolve(row.profile)``. Defaults
+                to ``None`` (no per-build profile → the daemon applies
+                ``config.budget.default_profile``); like ``mode`` it also
+                falls back to sniffing ``payload.profile`` when the keyword
+                is omitted, but ``BuildQueuedPayload`` carries no profile
+                field today (option §2(b) is barred) so the CLI passes it
+                explicitly.
 
         Returns:
             The derived ``build_id``.
@@ -663,6 +686,11 @@ class SqliteLifecyclePersistence:
         resolved_mode: BuildMode = (
             BuildMode(mode) if mode is not None else BuildMode.MODE_A
         )
+        # Resolve the budget profile: explicit kwarg wins, otherwise sniff
+        # ``payload.profile`` (absent on today's nats-core payload —
+        # §2(b) barred), otherwise NULL = the daemon's default_profile.
+        if profile is None:
+            profile = getattr(payload, "profile", None)
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -672,9 +700,9 @@ class SqliteLifecyclePersistence:
                     build_id, feature_id, repo, branch, feature_yaml_path,
                     status, triggered_by, originating_adapter,
                     originating_user, correlation_id, parent_request_id,
-                    queued_at, max_turns, sdk_timeout_seconds, mode
+                    queued_at, max_turns, sdk_timeout_seconds, mode, profile
                 ) VALUES (
-                    ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -692,6 +720,7 @@ class SqliteLifecyclePersistence:
                     int(payload.max_turns),
                     int(payload.sdk_timeout_seconds),
                     resolved_mode.value,
+                    profile,
                 ),
             )
             self._cx.execute("COMMIT;")
@@ -762,7 +791,13 @@ class SqliteLifecyclePersistence:
     # Write API — queue_build (TASK-MBC8-001)
     # ------------------------------------------------------------------
 
-    def queue_build(self, payload: Any, *, mode: BuildMode | str | None = None) -> str:
+    def queue_build(
+        self,
+        payload: Any,
+        *,
+        mode: BuildMode | str | None = None,
+        profile: str | None = None,
+    ) -> str:
         """Mode-aware alias of :meth:`record_pending_build`.
 
         TASK-MBC8-001 surfaces a ``queue_build`` entry-point that accepts
@@ -780,11 +815,14 @@ class SqliteLifecyclePersistence:
             mode: Pipeline build mode. Defaults to
                 :attr:`BuildMode.MODE_A` so omitting the keyword
                 preserves Mode A behaviour.
+            profile: Budget-guard profile name (FEAT-UBS-002). Forwarded
+                to :meth:`record_pending_build`; ``None`` persists NULL so
+                the daemon applies ``config.budget.default_profile``.
 
         Returns:
             The derived ``build_id`` string.
         """
-        return self.record_pending_build(payload, mode=mode)
+        return self.record_pending_build(payload, mode=mode, profile=profile)
 
     # ------------------------------------------------------------------
     # Write API — record_stage
