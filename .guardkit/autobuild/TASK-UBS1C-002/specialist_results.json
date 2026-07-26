@@ -1,0 +1,23 @@
+{
+  "phase_4": {
+    "status": "passed",
+    "duration_seconds": 11.059230676997686,
+    "error": null,
+    "tests_run": 27,
+    "tests_failed": 0,
+    "tests_skipped": 0,
+    "resolved_interpreter": "/home/richardwoollcott/Projects/appmilla_github/forge/.guardkit/worktrees/FEAT-UBS1C/.venv/bin/python",
+    "coverage_pct": 0.0,
+    "output_summary": "Result:\ntests/integration/test_autobuild_runner_subprocess.py::TestParseDecisionLine::test_feedback_decision_parsed PASSED [ 88%]\ntests/integration/test_autobuild_runner_subprocess.py::TestParseDecisi",
+    "quality_gates_passed": true
+  },
+  "phase_5": {
+    "status": "passed",
+    "duration_seconds": 51.398651851020986,
+    "error": null,
+    "issues": [],
+    "quality_score": 0.0,
+    "recommendations": [],
+    "output_summary": "Review completed by orchestrator-invoked code-reviewer."
+  }
+}

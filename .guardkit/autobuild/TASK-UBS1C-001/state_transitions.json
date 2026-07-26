@@ -1,0 +1,9 @@
+[
+  {
+    "task_id": "TASK-UBS1C-001",
+    "pre_path": "tasks/backlog/TASK-UBS1C-001-coach-score-from-decision-grammar.md",
+    "post_path": "tasks/design_approved/TASK-UBS1C-001-coach-score-from-decision-grammar.md",
+    "timestamp": "2026-07-26T07:00:39.453461+00:00",
+    "kind": "design_approved_transition"
+  }
+]

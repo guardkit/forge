@@ -1,0 +1,10 @@
+{
+  "command": "set -e\npython -m pytest tests/integration/test_autobuild_runner_subprocess.py tests/forge/test_autobuild_runner.py -x -q\n",
+  "expected_exit": 0,
+  "passed": true,
+  "exit_code": 0,
+  "failing_node_ids": [],
+  "failing_count": 0,
+  "timestamp": "2026-07-26T08:00:39.415428",
+  "note": "session-scoped observation; NOT the qa/known-failures.yaml ledger; used only to suppress mid-build mis-attribution"
+}
