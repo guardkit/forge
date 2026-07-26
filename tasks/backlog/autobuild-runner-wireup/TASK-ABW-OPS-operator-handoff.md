@@ -10,7 +10,7 @@ complexity: 2
 dependencies:
   - TASK-ABW-001
 estimated_minutes: 30
-status: pending
+status: completed
 ---
 
 # TASK-ABW-OPS — Operator handoff: GB10 allowlist + sidecar restart
@@ -37,6 +37,23 @@ manually, then mark the task complete via `/task-complete`.
 
 Source plan: [`docs/research/ideas/autobuild-runner-wireup-plan.md`](../../../docs/research/ideas/autobuild-runner-wireup-plan.md) §Scope items 5 and 7.
 
+**2026-07-26 COMPLETE.** All six ACs are done with receipts. AC-OPS-01/02/03/05
+were executed live in the attended forge e2e rehearsal with Rich (the walk the
+2026-07-26 handoff documents): the rehearsal build `build-FEAT-UPT1-20260726112342`
+ran the full wire (one chat sentence → `queue_build` → JetStream → forge daemon →
+runner worktree → guardkit → local Player + config-baked coach-ft-v4 turn-1
+approve) and merged to api_test `ddd-demo` at `c5a04be` by Rich's word — zero
+frontier calls on the critical path. Note AC-OPS-05 ran against **FEAT-UPT1**
+(GET /uptime), not the fossil-swept FEAT-9E59 this file originally named — the
+runbook now documents FEAT-UPT1 as the living demo feature. AC-OPS-06's
+transcripts are archived at `docs/research/evidence/autobuild-transcripts-2026-07-26/`
+(the negative finding — guardkit emits NO numeric coach score — set the
+decision-derived score semantics; ADR-ARCH-033 closed; the parser landed with
+FEAT-UBS1C `97648b2`). AC-OPS-04's runbook edit landed 2026-07-26 (jarvis
+`bf9c5d7`). The sidecar env is now carried durably by the version-controlled
+systemd unit (`ops/systemd/forge-langgraph-sidecar.service`, forge `c6f590a`,
+F4) — installed, running, and `/proc`-environ-verified the same day.
+
 ## Required operator follow-up
 
 ### 1. Update forge.yaml allowlist on the GB10
@@ -48,7 +65,7 @@ TASK-ABW-001 applies the same check to the resolved repo cwd. The
 allowlist on the GB10 must therefore include the local checkout of the
 demo repo.
 
-- [ ] **AC-OPS-01**: On the GB10 (`promaxgb10-*`), edit
+- [x] **AC-OPS-01** (✅ 2026-07-26): On the GB10 (`promaxgb10-*`), edit
   `~/forge-state/forge.yaml` and add the absolute path to
   `~/Projects/appmilla_github/api_test` to
   `permissions.filesystem.allowlist`. Tildes are not expanded by the
@@ -59,7 +76,7 @@ demo repo.
 The forge config is loaded once at process start; an allowlist edit
 without a restart has no effect.
 
-- [ ] **AC-OPS-02**: Restart forge-prod and confirm via
+- [x] **AC-OPS-02** (✅ 2026-07-26): Restart forge-prod and confirm via
   `forge status` (or the equivalent runbook command) that the new
   allowlist entry is present in the loaded config.
 
@@ -75,7 +92,7 @@ still on an older sidecar is running the **pre-fine-tune Coach**, so the
 deployed behaviour differs from the code on disk. Confirm the restarted sidecar
 is on the `coach-ft-v3` argv before treating any run as representative.
 
-- [ ] **AC-OPS-03**: After TASK-ABW-001 merges and the new
+- [x] **AC-OPS-03** (✅ 2026-07-26, durable unit c6f590a): After TASK-ABW-001 merges and the new
   `forge:latest` image (if rebuilt) is available, restart the
   langgraph-runner sidecar with:
 
@@ -96,13 +113,13 @@ currently documents §4.1 prompts against the stubbed runner. Update it
 post-merge to reflect that real `guardkit autobuild` execution now
 runs against the resolved repo cwd.
 
-- [ ] **AC-OPS-04**: Edit the runbook to remove any "this is a stub —
+- [x] **AC-OPS-04** (✅ 2026-07-26, jarvis bf9c5d7): Edit the runbook to remove any "this is a stub —
   no code is written" caveats and add a note pointing to TASK-ABW-001
   as the change that closed the stub.
 
 ### 5. End-to-end rehearsal against FEAT-9E59
 
-- [ ] **AC-OPS-05**: From a jarvis chat REPL, paste the prompt from
+- [x] **AC-OPS-05** (✅ 2026-07-26 vs FEAT-UPT1, merged c5a04be): From a jarvis chat REPL, paste the prompt from
   `RUNBOOK-jarvis-forge-autobuild-version-endpoint-demo.md` §4.1 and
   observe ~33 min wall-clock. Confirm on the wire:
   - `pipeline.build-queued` + `build-started` + (≥1 `stage-complete`)
@@ -112,7 +129,7 @@ runs against the resolved repo cwd.
     and `GET /version` handler.
   - `pytest` passes when invoked from the worktree.
 
-- [ ] **AC-OPS-06 (ADR-ARCH-033):** Capture and archive the full
+- [x] **AC-OPS-06 (ADR-ARCH-033):** (✅ 2026-07-26, evidence archived, closed via UBS1C 97648b2) Capture and archive the full
   `guardkit autobuild --verbose` transcript from this run — both the runner's
   captured stdout and, if `--nats` streaming is on, the `pipeline.stage-complete.*`
   event payloads. Save under `docs/reviews/` (or the harvest corpus). This
