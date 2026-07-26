@@ -438,6 +438,76 @@ class TestBuildSupervisorWiring:
         assert ctx["lifecycle_emitter"] is fake_emitter
 
 
+class TestBuildSupervisorBudgetPassThrough:
+    """FEAT-UBS-002 — build_supervisor threads every budget DI kwarg onto the
+    Supervisor, and the defaults keep the guard a strict no-op (inert until
+    activation)."""
+
+    def test_budget_kwargs_default_to_supervisor_defaults(
+        self,
+        builder: ForwardContextBuilder,
+        starter: CapturingAsyncTaskStarter,
+        stage_log: FakeStageLogRecorder,
+        state_channel: FakeStateChannel,
+        fake_emitter: MagicMock,
+    ) -> None:
+        # No budget kwargs supplied — every field lands on the dataclass
+        # default so the guard is a no-op (ASSUM-010) and existing callers are
+        # unchanged.
+        sup = build_supervisor(
+            forward_context_builder=builder,
+            async_task_starter=starter,
+            stage_log_recorder=stage_log,
+            state_channel=state_channel,
+            lifecycle_emitter=fake_emitter,
+            async_subagent_middleware=MagicMock(tools=[]),
+            **_supervisor_kwargs(),
+        )
+        assert sup.budget_guards is None
+        assert sup.budget_profile_name == "attended"
+        assert sup.budget_wall_clock is None
+        assert sup.budget_started_at_reader is None
+        assert sup.budget_coach_score_reader is None
+        assert sup.budget_pause is None
+
+    def test_budget_kwargs_pass_through_by_identity(
+        self,
+        builder: ForwardContextBuilder,
+        starter: CapturingAsyncTaskStarter,
+        stage_log: FakeStageLogRecorder,
+        state_channel: FakeStateChannel,
+        fake_emitter: MagicMock,
+    ) -> None:
+        guards = MagicMock(name="BudgetGuards")
+        wall_clock = MagicMock(name="budget_wall_clock")
+        started_at_reader = MagicMock(name="budget_started_at_reader")
+        coach_score_reader = MagicMock(name="budget_coach_score_reader")
+        pause = MagicMock(name="budget_pause")
+
+        sup = build_supervisor(
+            forward_context_builder=builder,
+            async_task_starter=starter,
+            stage_log_recorder=stage_log,
+            state_channel=state_channel,
+            lifecycle_emitter=fake_emitter,
+            async_subagent_middleware=MagicMock(tools=[]),
+            budget_guards=guards,
+            budget_profile_name="unattended",
+            budget_wall_clock=wall_clock,
+            budget_started_at_reader=started_at_reader,
+            budget_coach_score_reader=coach_score_reader,
+            budget_pause=pause,
+            **_supervisor_kwargs(),
+        )
+        # Every kwarg reaches the Supervisor by object identity — no rewrapping.
+        assert sup.budget_guards is guards
+        assert sup.budget_profile_name == "unattended"
+        assert sup.budget_wall_clock is wall_clock
+        assert sup.budget_started_at_reader is started_at_reader
+        assert sup.budget_coach_score_reader is coach_score_reader
+        assert sup.budget_pause is pause
+
+
 # ---------------------------------------------------------------------------
 # AC-002 — supervisor's tool list includes AsyncSubAgentMiddleware tools
 # ---------------------------------------------------------------------------

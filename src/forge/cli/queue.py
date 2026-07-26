@@ -661,21 +661,27 @@ def queue_cmd(
             if value is not None
         )
         click.echo(f"budget profile {effective_profile!r}: {rendered}")
-    # Honest-deferral note: the profile is now carried to the daemon on the
+    # Honest-deferral note: the profile is carried to the daemon on the
     # ``builds.profile`` row (TASK-UBS-002-integration §2(a)) and resolved via
-    # ``config.budget.resolve(row.profile)``. Budget *enforcement* itself,
-    # however, only runs in a live Mode C supervisor, and wiring the guards
-    # into the production ``serve.py build_supervisor`` remains out of this
-    # task's scope (the FEAT-UBS-002 banner names it an outside dependency).
-    # Surface that residual gap for a capped override so an operator is not
-    # led to believe caps are being enforced yet.
+    # ``config.budget.resolve(row.profile)``. The serve-side wiring is now
+    # complete — ``serve.py`` builds the resolved caps
+    # (``resolve_budget_for_build``), the wall-clock reader, and the
+    # ``budget_pause`` collaborator, and ``build_supervisor`` threads them onto
+    # the Supervisor's budget fields; the durable coach-score store is live too.
+    # What remains dormant is the *enforcement loop*: the Mode-C ``next_turn``
+    # driver that would consume those caps to pause a live build has no
+    # production caller yet (activation is a plan-of-record decision). So caps
+    # resolve and the wiring exists, but they do not yet pause a running build.
+    # Surface that for a capped override so an operator is not led to believe
+    # caps are being enforced yet.
     if profile_name is not None and guards.caps_enabled:
         click.echo(
             f"NOTE: --profile {profile_name!r} is persisted to the build row "
-            "and resolvable by the daemon, but Mode C budget enforcement is "
-            "not yet wired into the running supervisor (serve.py build_supervisor "
-            "— outside TASK-UBS-002-integration). Caps travel but do not yet "
-            "pause a live build.",
+            "and resolved by the daemon, and the budget wiring exists in the "
+            "supervisor (serve.py resolve_budget_for_build / make_budget_pause), "
+            "but the Mode C enforcement loop that would pause a live build is "
+            "not yet activated (a plan-of-record decision). Caps travel and "
+            "resolve but do not yet pause a running build.",
             err=True,
         )
 

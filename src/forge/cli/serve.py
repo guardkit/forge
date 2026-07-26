@@ -87,7 +87,10 @@ from forge.pipeline.dispatchers.autobuild_async import (
 from forge.pipeline.supervisor import Supervisor
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
+    from datetime import datetime
+
     from forge.cli._serve_production import LifecycleBridgeWireupParts
+    from forge.config.models import BudgetGuards
     from forge.pipeline import PipelineLifecycleEmitter
     from forge.pipeline.forward_context_builder import ForwardContextBuilder
 
@@ -695,6 +698,12 @@ def build_supervisor(
     subprocess_dispatcher: Callable[..., Awaitable[Any]],
     pr_review_gate: Any,
     async_subagent_middleware: Any | None = None,
+    budget_guards: "BudgetGuards | None" = None,
+    budget_profile_name: str = "attended",
+    budget_wall_clock: "Callable[[], datetime] | None" = None,
+    budget_started_at_reader: "Callable[[str], datetime | None] | None" = None,
+    budget_coach_score_reader: "Callable[[str], float | None] | None" = None,
+    budget_pause: "Callable[..., Awaitable[None]] | None" = None,
 ) -> Supervisor:
     """Construct the production :class:`Supervisor` for ``_run_serve``.
 
@@ -728,6 +737,24 @@ def build_supervisor(
     construct a second one — it accepts the emitter as a parameter and
     threads it into both the supervisor field and the dispatcher
     closure.
+
+    FEAT-UBS-002 budget DI (``budget_guards`` / ``budget_profile_name`` /
+    ``budget_wall_clock`` / ``budget_started_at_reader`` /
+    ``budget_coach_score_reader`` / ``budget_pause``): pass-through kwargs
+    threaded onto the :class:`Supervisor`'s budget fields. Each defaults to
+    the Supervisor dataclass default (an ``attended`` caps-off /
+    unwired-collaborator profile), so every existing caller is unchanged and
+    the guard stays a strict no-op (ASSUM-010). These are wired so the
+    resolved caps + pause collaborator have a home, but they are **inert
+    until activation**: the Mode-C ``next_turn`` enforcement loop that would
+    consume them has no production driver today (``build_mode_reader`` is
+    ``None`` in production and the Supervisor/Mode-C path has no production
+    caller). Activation — wiring these to a next_turn driver — is a
+    plan-of-record decision reserved for Rich, out of scope here. The
+    serve-side helpers :func:`resolve_budget_for_build`,
+    :func:`make_budget_started_at_reader`, :func:`budget_wall_clock`, and
+    :func:`make_budget_pause` build the production values a future driver
+    would pass here.
     """
     middleware = (
         async_subagent_middleware
@@ -757,7 +784,210 @@ def build_supervisor(
         pr_review_gate=pr_review_gate,
         tools=tuple(getattr(middleware, "tools", ()) or ()),
         lifecycle_emitter=lifecycle_emitter,
+        budget_guards=budget_guards,
+        budget_profile_name=budget_profile_name,
+        budget_wall_clock=budget_wall_clock,
+        budget_started_at_reader=budget_started_at_reader,
+        budget_coach_score_reader=budget_coach_score_reader,
+        budget_pause=budget_pause,
     )
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 — production budget wiring (INERT until activation)
+# ---------------------------------------------------------------------------
+#
+# The functions below build the production values a Mode-C ``next_turn`` driver
+# would pass to :func:`build_supervisor`'s budget DI. They are complete and
+# tested, but nothing consumes them yet: the Supervisor/Mode-C path has no
+# production caller (the daemon drives builds via the NATS pipeline consumer)
+# and ``build_mode_reader`` is ``None`` in production, so every build is Mode A.
+# Activation — wiring a ``build_mode_reader`` + a next_turn driver — is a
+# plan-of-record decision reserved for Rich, explicitly out of scope here.
+
+
+def resolve_budget_for_build(
+    pool: Any,
+    config: Any,
+    build_id: str,
+) -> "tuple[BudgetGuards, str]":
+    """Resolve the :class:`BudgetGuards` + profile name for ``build_id``.
+
+    Reads ``builds.profile`` off the persisted row (written by
+    ``forge queue --profile`` — schema_v5.sql) and resolves the caps via
+    ``config.budget.resolve(profile)`` (``models.py``): a ``NULL`` profile maps
+    to ``config.budget.default_profile`` (``attended`` — caps off, ASSUM-010).
+    A missing row is treated the same as a ``NULL`` profile.
+
+    This is the FIRST production ``BudgetConfig.resolve`` call — until now the
+    only caller was ``forge queue`` at CLI echo time (queue.py). It is consumed
+    by the future Mode-C ``next_turn`` driver at per-build Supervisor setup;
+    inert until that activation lands (a plan-of-record decision).
+
+    Returns:
+        ``(guards, resolved_profile_name)`` where ``resolved_profile_name`` is
+        the profile the caps came from (the row's profile, or the config
+        default when the row carries none).
+    """
+    row = pool.get_build_row(build_id)
+    profile_name = row.profile if row is not None else None
+    guards = config.budget.resolve(profile_name)
+    resolved_name = (
+        profile_name if profile_name is not None else config.budget.default_profile
+    )
+    return guards, resolved_name
+
+
+def make_budget_started_at_reader(
+    pool: Any,
+) -> "Callable[[str], datetime | None]":
+    """Build the production ``budget_started_at_reader`` for the wall-clock cap.
+
+    Returns a ``(build_id) -> datetime | None`` reader over
+    ``builds.started_at`` (schema.sql:37 — written on the PREPARING/RUNNING
+    transition; there is no ``created_at`` column). ``None`` when the row is
+    absent or has not started yet, which the Supervisor treats as ``0.0``
+    elapsed (the wall-clock cap is fail-open, never a false pause).
+
+    Inert until activation: no production caller wires this reader onto a live
+    Supervisor today (the Mode-C path has no production driver).
+    """
+
+    def _reader(build_id: str) -> "datetime | None":
+        row = pool.get_build_row(build_id)
+        return row.started_at if row is not None else None
+
+    return _reader
+
+
+def budget_wall_clock() -> "datetime":
+    """Production ``budget_wall_clock`` — the current UTC time.
+
+    Paired with :func:`make_budget_started_at_reader` to measure a build's
+    elapsed wall-clock for the ``max_build_wallclock_seconds`` cap. Absent
+    either collaborator the Supervisor treats elapsed as ``0.0`` (fail-open).
+
+    Inert until activation: no production caller wires this onto a live
+    Supervisor today.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+def make_budget_pause(
+    pool: Any,
+    publish_approval_request: "Callable[[Any, str], Awaitable[None]]",
+    lifecycle_emitter: "PipelineLifecycleEmitter",
+) -> "Callable[..., Awaitable[None]]":
+    """Build the production ``budget_pause`` collaborator the Supervisor awaits.
+
+    Returns the ``async (build_id, feature_id, payload, verdict, metrics) ->
+    None`` callback (supervisor.py budget-pause shape). On a budget breach the
+    Supervisor awaits it to publish the escalation and pause the build, in the
+    order fixed by ADR-ARCH-021:
+
+    1. **Publish** the risk=high :class:`ApprovalRequestPayload` on
+       ``agents.approval.forge.{build_id}`` via ``publish_approval_request``
+       (the daemon's re-emit fn shape — pipeline_consumer.py).
+    2. **Mark PAUSED** in SQLite via ``pool.mark_paused(build_id, request_id)``
+       (persistence.py — an optimistic, status-guarded RUNNING → PAUSED that
+       atomically records ``pending_approval_request_id``). ``request_id`` is
+       the deterministic ``budget-{build_id}-{review_cycles}`` the Supervisor
+       stamped on the payload, so a re-fire is idempotent.
+    3. **Emit** the ``build-paused`` lifecycle event via
+       ``lifecycle_emitter.emit_paused`` (the PLAIN emit — **not**
+       ``emit_paused_then_interrupt``, which awaits a LangGraph ``interrupt()``
+       callable this daemon path does not hold; the resume wire is owned by the
+       NATS approval subscriber, not by this closure).
+
+    Idempotency / non-fighting with ``cli/cancel.py`` is guaranteed *outside*
+    this closure: the Supervisor's already-PAUSED short-circuit means an
+    already-paused build never reaches here, and the deterministic
+    ``request_id`` makes a re-publish a no-op for idempotent responders. This
+    closure's own responsibility is to degrade loudly on a *race* — if
+    ``mark_paused`` raises :class:`InvalidTransitionError` (the row left a
+    pausable state between the Supervisor's read and this write, e.g. a
+    concurrent terminal transition or a cancel), it logs at ERROR and returns
+    without emitting a ``build-paused`` for a row that is not PAUSED. It never
+    crashes the turn. The approval was already published (idempotent by
+    ``request_id``), consistent with the ADR's double-emit tolerance.
+
+    Inert until activation: no production caller wires this onto a live
+    Supervisor today (the Mode-C path has no production driver). Activation is a
+    plan-of-record decision reserved for Rich.
+    """
+
+    async def budget_pause(
+        *,
+        build_id: str,
+        feature_id: str,
+        payload: Any,
+        verdict: Any,
+        metrics: Any,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        from forge.adapters.nats.approval_publisher import (
+            AGENT_ID as _APPROVAL_AGENT_ID,
+        )
+        from forge.adapters.nats.approval_publisher import (
+            APPROVAL_SUBJECT_TEMPLATE,
+        )
+        from forge.lifecycle.state_machine import InvalidTransitionError
+        from forge.pipeline import BuildContext
+        from nats_core.topics import Topics
+
+        approval_subject = Topics.resolve(
+            APPROVAL_SUBJECT_TEMPLATE,
+            agent_id=_APPROVAL_AGENT_ID,
+            task_id=build_id,
+        )
+        request_id = payload.request_id
+
+        # ADR-ARCH-021 step 1: publish the risk=high approval request.
+        await publish_approval_request(payload, approval_subject)
+
+        # ADR-ARCH-021 step 2: mark the SQLite row PAUSED (status-guarded).
+        try:
+            pool.mark_paused(build_id, request_id)
+        except InvalidTransitionError as exc:
+            # Race: the row left a pausable state between the Supervisor's read
+            # and this write. Degrade loudly — the approval is already
+            # published (idempotent by request_id) — and skip the build-paused
+            # emit for a row that is NOT PAUSED. Never crash the turn.
+            logger.error(
+                "budget_pause: mark_paused(%s) rejected (%s); the row is not "
+                "in a pausable state (concurrent terminal/cancel). Approval "
+                "already published on %s; skipping build-paused emit (UBS-002)",
+                build_id,
+                exc,
+                approval_subject,
+            )
+            return
+
+        # ADR-ARCH-021 step 3: emit the build-paused lifecycle event (PLAIN).
+        row = pool.get_build_row(build_id)
+        correlation_id = row.correlation_id if row is not None else feature_id
+        ctx = BuildContext(
+            feature_id=feature_id,
+            build_id=build_id,
+            correlation_id=correlation_id,
+            # wave_total is not consumed by emit_paused; a budget pause is not
+            # wave-scoped, so 0 is an honest placeholder here.
+            wave_total=0,
+        )
+        await lifecycle_emitter.emit_paused(
+            ctx,
+            stage_label=f"budget:{verdict.breached_cap}",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            coach_score=metrics.last_coach_score,
+            rationale=verdict.detail,
+            approval_subject=approval_subject,
+            paused_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    return budget_pause
 
 
 def _configure_logging(level_name: str) -> None:
@@ -1012,12 +1242,16 @@ __all__ = [
     "ServeConfig",
     "SubscriptionState",
     "bind_production_dispatch_chain",
+    "budget_wall_clock",
     "build_supervisor",
     "compose_dispatch_chain",
     "consumer_reconcile_on_boot",
     "deregister",
+    "make_budget_pause",
+    "make_budget_started_at_reader",
     "make_handle_message_dispatcher",
     "open_fleet_client",
+    "resolve_budget_for_build",
     "recovery_reconcile_on_boot",
     "register_on_boot",
     "run_daemon",

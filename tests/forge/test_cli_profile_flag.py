@@ -15,7 +15,8 @@ Mirrors the ``click.testing.CliRunner`` + fake-persistence harness in
 
 TASK-UBS-002-integration §2(a): ``--profile`` now travels to the daemon on the
 ``builds.profile`` row, so the skeleton's "not yet plumbed" assertions are
-replaced by carriage checks + the narrower "enforcement not yet wired" note.
+replaced by carriage checks + the narrower "enforcement loop not yet activated"
+note (the serve-side wiring now exists; only the Mode-C driver is dormant).
 """
 
 from __future__ import annotations
@@ -145,9 +146,10 @@ class TestKnownProfileEchoesCaps:
         assert result.exit_code == 0, result.output
         assert "budget profile 'unattended'" in result.output
         assert "max_review_cycles=2" in result.output
-        # The profile now travels to the daemon on the build row; the residual
-        # gap surfaced is the (out-of-scope) enforcement wiring, not carriage.
-        assert "not yet wired into the running supervisor" in result.output
+        # The profile travels to the daemon and the serve-side wiring now
+        # exists; the residual gap surfaced is the (out-of-scope) enforcement
+        # loop activation, not carriage or wiring.
+        assert "not yet activated" in result.output
         assert len(fake_persistence.records) == 1
         # AC-04 carriage: the selected profile reaches the persistence write.
         assert fake_persistence.profiles == ["unattended"]
@@ -167,7 +169,7 @@ class TestAttendedDefaultSilent:
         result = _invoke(config_path, repo_dir, feature_yaml)
         assert result.exit_code == 0, result.output
         assert "budget profile" not in result.output
-        assert "not yet wired" not in result.output
+        assert "not yet activated" not in result.output
         assert len(fake_persistence.records) == 1
         # No --profile → NULL carriage → daemon resolves default_profile.
         assert fake_persistence.profiles == [None]
@@ -206,7 +208,7 @@ class TestAttendedOverrideAgainstCappedDefault:
         # attended has no caps -> no caps banner
         assert "budget profile" not in result.output
         # attended = caps off -> the enforcement-pending note (caps-only) is silent
-        assert "not yet wired" not in result.output
+        assert "not yet activated" not in result.output
         # AC-04 carriage: the override is persisted so the daemon honours it.
         assert fake_persistence.profiles == ["attended"]
         assert len(fake_persistence.records) == 1
