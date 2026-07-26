@@ -117,3 +117,21 @@ in that shape). We must not add score-parsing on an assumed format.
   *consuming* the existing seam, not altering it.
 - It does not touch `guardkit` (forge-only session; the Coach output format is
   owned across the seam).
+
+## Closure (TASK-UBS1C-001 — 2026-07-26)
+
+The coach-score population gap is **closed** for the interim streaming path.
+`_node_running_wave` now parses `Completed turn <N>: success|feedback - ...`
+decision lines from `guardkit autobuild --verbose` stdout and populates both
+`last_coach_score` (1.0 for success, 0.0 for feedback) and
+`aggregate_coach_score` (success ratio over decision-bearing turns) in the
+snapshot. These scores flow through to `_node_completed` and are emitted by the
+bridge translator.
+
+Evidence backing: `docs/research/evidence/autobuild-transcripts-2026-07-26/README.md`
+documents the negative finding (no numeric `coach_score:` line on stdout) and the
+decision-derived semantics used for parsing.
+
+The runner still bypasses `run.py` (the two-path split persists), but the
+UBS-002 budget guards now have live coach-score data to ratchet against. The
+convergence to a streaming `run.py` variant remains the target end-state.

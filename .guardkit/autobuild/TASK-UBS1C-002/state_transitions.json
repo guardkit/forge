@@ -5,5 +5,12 @@
     "post_path": "tasks/design_approved/TASK-UBS1C-002-planning-waves-reads-task-graph.md",
     "timestamp": "2026-07-26T07:00:39.451625+00:00",
     "kind": "design_approved_transition"
+  },
+  {
+    "task_id": "TASK-UBS1C-002",
+    "pre_path": "tasks/backlog/ubs1c/TASK-UBS1C-002-planning-waves-reads-task-graph.md",
+    "post_path": "tasks/design_approved/TASK-UBS1C-002-planning-waves-reads-task-graph.md",
+    "timestamp": "2026-07-26T07:26:48.072248+00:00",
+    "kind": "design_approved_transition"
   }
 ]
