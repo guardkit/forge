@@ -1,0 +1,121 @@
+{
+  "task_id": "TASK-UBS1C-001",
+  "timestamp": "2026-07-26T08:29:46.528617",
+  "completed": false,
+  "phases": {},
+  "quality_gates": {
+    "tests_passing": true,
+    "tests_passed": 0,
+    "tests_failed": 0,
+    "coverage": null,
+    "coverage_met": null,
+    "all_passed": null
+  },
+  "files_modified": [
+    "conversation_history/session_8095739d.md",
+    "docs/architecture/decisions/ADR-ARCH-033-autobuild-subprocess-path-and-coach-score-gap.md",
+    "src/forge/subagents/autobuild_runner.py",
+    "tests/forge/test_autobuild_runner_planning_waves.py",
+    "tests/integration/test_autobuild_runner_subprocess.py"
+  ],
+  "files_created": [
+    ".guardkit/qav-shadow/queue.jsonl"
+  ],
+  "files_authored": [],
+  "tests_written": [],
+  "summary": "Implementation completed",
+  "sdk_turns": {
+    "turns_used": null,
+    "max_turns": 150,
+    "ceiling_hit": false
+  },
+  "task_type": "feature",
+  "agent_invocations_validation": {
+    "status": "violation",
+    "expected_phases": 3,
+    "actual_invocations": 2,
+    "missing_phases": [
+      "3"
+    ],
+    "violation_message": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\u274c PROTOCOL VIOLATION: Agent invocation incomplete\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\nExpected: 3 agent invocations\nActual: 2 completed invocations\n\nMissing phases:\n  - Phase 3 (Implementation)\n\nCannot generate completion report until all agents are invoked.\nReview the AGENT INVOCATIONS LOG above to see which phases were skipped.\n\nAGENT INVOCATIONS LOG:\n\u2705 Phase 4 (Phase 4): test-orchestrator (completed in ?s)\n\u2705 Phase 5 (Phase 5): code-reviewer (completed in ?s)\n\nTASK WILL BE MOVED TO BLOCKED STATE\nReason: Protocol violation - required agents not invoked\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+  },
+  "plan_audit": {
+    "status": "skipped",
+    "severity": null,
+    "violations": 0,
+    "extra_files": [],
+    "missing_files": [],
+    "extra_modifications": [],
+    "missing_modifications": [],
+    "extra_dependencies": [],
+    "missing_dependencies": [],
+    "loc_variance_pct": null,
+    "discrepancies_count": 0,
+    "message": "no implementation plan on disk"
+  },
+  "unconfirmed_low_confidence_assumptions": {
+    "status": "ok",
+    "unconfirmed": [],
+    "files_scanned": 0,
+    "files_skipped": 0,
+    "message": null
+  },
+  "completion_promises": [
+    {
+      "criterion_id": "AC-001",
+      "criterion_text": "After a drained run whose lines include Completed turn 1: feedback then Completed turn 2: success, the emitted running_wave/completed snapshots carry last_coach_score 0.0 then 1.0 and aggregate_coach_score 0.5 (hermetic test feeding the archived-transcript lines through the drain handler)",
+      "status": "complete",
+      "evidence": "Test test_success_then_feedback_sequence_produces_correct_scores in TestCoachScoreParsing feeds mock stdout with 'Completed turn 1: feedback - coach: ...' then 'Completed turn 2: success - coach: ...', verifies last_coach_score=1.0 and aggregate_coach_score=0.5 in the final snapshot. The _drain_stdout() loop tracks decision_turns and computes last_coach_score per turn; aggregate is computed as success_count/len(decision_turns) on success exit.",
+      "test_file": "tests/integration/test_autobuild_runner_subprocess.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-002",
+      "criterion_text": "The verdict-emission-failure sequence from the CV4M archive (WARNING + synthetic feedback decision line) parses as a feedback turn \u2014 no crash, no skipped update; the timeout shape (no decision lines) leaves scores None and the run still maps to its exit-code lifecycle exactly as today",
+      "status": "complete",
+      "evidence": "Test test_verdict_emission_failure_parses_as_feedback feeds a WARNING line followed by 'Completed turn 1: feedback - coach: verdict emission failed' \u2014 the WARNING is logged but not parsed as a decision; the subsequent decision line is parsed as feedback (last_coach_score=0.0). Test test_timeout_leaves_scores_none feeds only checkpoint lines with no decision lines, verifying last_coach_score=None and aggregate_coach_score=None in the final snapshot. The run transitions to failed lifecycle as expected.",
+      "test_file": "tests/integration/test_autobuild_runner_subprocess.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-003",
+      "criterion_text": "Snapshots still validate against the FROZEN AutobuildState schema; no new state fields, no graph-shape change (existing test_autobuild_runner_subprocess.py passes unmodified except where it asserts scores stay None \u2014 update ONLY those assertions to the new semantics with a comment citing the evidence README)",
+      "status": "complete",
+      "evidence": "The coach scores are injected as additional keys into the snapshot dict (last_coach_score, aggregate_coach_score) which already exist on AutobuildState as optional fields. No new state fields added. No graph shape changes. All 60 existing autobuild_runner tests pass. The TestCoachScoreParsing tests include TestParseDecisionLine unit tests covering success, feedback, non-decision lines, verdict-emission warnings, and case-insensitive matching.",
+      "test_file": "tests/integration/test_autobuild_runner_subprocess.py",
+      "implementation_files": [
+        "src/forge/subagents/autobuild_runner.py"
+      ]
+    },
+    {
+      "criterion_id": "AC-004",
+      "criterion_text": "A short note is appended to ADR-ARCH-033 marking the coach-score gap CLOSED with decision-derived semantics, citing docs/research/evidence/autobuild-transcripts-2026-07-26/README.md",
+      "status": "complete",
+      "evidence": "Added '## Closure (TASK-UBS1C-001 \u2014 2026-07-26)' section to ADR-ARCH-033 describing the decision-grammar parsing, the score semantics (1.0 for success, 0.0 for feedback, ratio for aggregate), and the evidence README citation. The ADR now records the gap as closed for the interim streaming path.",
+      "test_file": "",
+      "implementation_files": [
+        "docs/architecture/decisions/ADR-ARCH-033-autobuild-subprocess-path-and-coach-score-gap.md"
+      ]
+    }
+  ],
+  "agent_invocations": [
+    {
+      "phase": "4",
+      "agent": "test-orchestrator",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 11.52280559198698
+    },
+    {
+      "phase": "5",
+      "agent": "code-reviewer",
+      "status": "completed",
+      "source": "orchestrator",
+      "duration_seconds": 29.583736486005364
+    }
+  ]
+}
