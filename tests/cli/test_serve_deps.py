@@ -510,3 +510,223 @@ class TestSingleSharedClientInvariant:
         )
 
         assert deps is not None
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 (Option-B, stage 1) — per-build budget rides the launch payload
+# ---------------------------------------------------------------------------
+#
+# The dispatch closure resolves ``builds.profile`` → budget caps and attaches a
+# compact ``budget`` dict to the launch payload ONLY when the resolved profile
+# carries a wall-clock cap. An attended / NULL-profile build attaches nothing,
+# keeping the launch bytes byte-equivalent with the pre-budget shape (the
+# caps-off no-op invariant). The runner MIN()s the cap against its env/default
+# subprocess timeout (tested in test_autobuild_runner.py). Both launch branches
+# — legacy no-gate and gate-approved — must carry the same resolved entry.
+
+
+class _RecordingBudgetStarter:
+    """Async-task starter that records each launch context verbatim."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict[str, Any]] = []
+
+    async def astart_async_task(
+        self, subagent_name: str, context: dict[str, Any]
+    ) -> str:
+        self.contexts.append(dict(context))
+        return "task-budget"
+
+
+class _BudgetFakePool:
+    """Minimal pool double: records the build then hands back a profiled row."""
+
+    def __init__(self, *, profile: str | None) -> None:
+        self._profile = profile
+
+    def record_pending_build(self, payload: Any, profile: str | None = None) -> str:
+        return f"build-{payload.feature_id}-budget"
+
+    def get_build_row(self, build_id: str) -> Any:
+        return SimpleNamespace(profile=self._profile)
+
+
+class _NoopContextBuilder:
+    def build_for(self, *, stage: Any, build_id: str, feature_id: str) -> list[Any]:
+        return []
+
+
+class _NoopStageLogRecorder:
+    def record_running(self, **kwargs: Any) -> None:
+        return None
+
+
+class _NoopStateChannel:
+    def initialise_autobuild_state(self, **kwargs: Any) -> None:
+        return None
+
+
+def _make_budget_dispatch_closure(
+    *,
+    pool: _BudgetFakePool,
+    forge_config: ForgeConfig,
+    starter: _RecordingBudgetStarter,
+    gated: bool,
+) -> Any:
+    """Build the ``dispatch_build`` closure directly with fakes.
+
+    ``gated=False`` leaves ``gate_repository``/``gate_state_machine`` unset so
+    the closure takes the legacy no-gate launch branch. ``gated=True`` supplies
+    truthy gate handles; the caller patches ``bound_gate_parts`` +
+    ``maybe_gate_build`` so the gate-approved launch branch fires.
+    """
+    return _serve_deps._build_dispatch_build(
+        sqlite_pool=pool,
+        forward_context_builder=_NoopContextBuilder(),
+        stage_log_recorder=_NoopStageLogRecorder(),
+        state_channel=_NoopStateChannel(),
+        lifecycle_emitter=SimpleNamespace(),
+        async_task_starter=starter,
+        forge_config=forge_config,
+        gate_repository=object() if gated else None,
+        gate_state_machine=object() if gated else None,
+    )
+
+
+def _budget_payload() -> SimpleNamespace:
+    return SimpleNamespace(
+        feature_id="FEAT-BUDGET",
+        repo="guardkit/forge",
+        branch="main",
+        correlation_id="corr-budget",
+        parent_request_id=None,
+        queued_at=datetime(2026, 7, 26, 9, tzinfo=UTC),
+    )
+
+
+async def _noop_ack() -> None:
+    return None
+
+
+class TestBudgetRidesLaunchPayload:
+    """The per-build wall-clock budget is attached to the launch payload."""
+
+    @pytest.mark.asyncio
+    async def test_null_profile_attaches_no_budget_legacy_branch(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # NULL profile → default (attended, caps off) → NO budget key.
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(profile=None)
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=False
+        )
+
+        await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1
+        assert "budget" not in starter.contexts[0], (
+            "an attended / NULL-profile launch must stay byte-equivalent — no "
+            "budget key (ASSUM-010 caps-off no-op)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capped_profile_attaches_budget_legacy_branch(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # ``unattended`` profile carries the default wall-clock cap.
+        from forge.config.models import (
+            DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+        )
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(profile="unattended")
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=False
+        )
+
+        await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1
+        assert starter.contexts[0]["budget"] == {
+            "max_wallclock_seconds": DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+            "profile_name": "unattended",
+        }
+
+    @pytest.mark.asyncio
+    async def test_capped_profile_attaches_budget_gate_approved_branch(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # Same resolution must fire on the gate-approved launch branch.
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+        from forge.config.models import (
+            DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+        )
+        from forge.gating.wrappers import GateOutcome
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(profile="unattended")
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=True
+        )
+
+        async def _approve(**kwargs: Any) -> Any:
+            return GateOutcome.AUTO_APPROVED
+
+        with patch.object(
+            _serve_deps_gating, "bound_gate_parts", lambda: object()
+        ), patch.object(_serve_gate_activation, "maybe_gate_build", _approve):
+            await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1
+        assert starter.contexts[0]["budget"] == {
+            "max_wallclock_seconds": DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+            "profile_name": "unattended",
+        }
+
+
+class TestResolveLaunchBudget:
+    """Unit coverage for the pure ``_resolve_launch_budget`` helper."""
+
+    def test_none_when_no_forge_config(self) -> None:
+        pool = _BudgetFakePool(profile="unattended")
+        assert _serve_deps._resolve_launch_budget(pool, None, "b1") is None
+
+    def test_none_for_null_profile(self, forge_config: ForgeConfig) -> None:
+        pool = _BudgetFakePool(profile=None)
+        assert (
+            _serve_deps._resolve_launch_budget(pool, forge_config, "b1") is None
+        )
+
+    def test_none_when_caps_enabled_but_no_wallclock(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # A profile with a review-cycle cap but no wall-clock cap carries
+        # nothing on this launch path (only the wall-clock cap is enforceable).
+        from forge.config.models import BudgetConfig, BudgetGuards
+
+        cfg = forge_config.model_copy(
+            update={
+                "budget": BudgetConfig(
+                    default_profile="attended",
+                    profiles={
+                        "attended": BudgetGuards(),
+                        "reviews-only": BudgetGuards(max_review_cycles=3),
+                    },
+                )
+            }
+        )
+        pool = _BudgetFakePool(profile="reviews-only")
+        assert _serve_deps._resolve_launch_budget(pool, cfg, "b1") is None
+
+    def test_entry_for_wallclock_profile(self, forge_config: ForgeConfig) -> None:
+        from forge.config.models import (
+            DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+        )
+
+        pool = _BudgetFakePool(profile="unattended")
+        entry = _serve_deps._resolve_launch_budget(pool, forge_config, "b1")
+        assert entry == {
+            "max_wallclock_seconds": DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
+            "profile_name": "unattended",
+        }

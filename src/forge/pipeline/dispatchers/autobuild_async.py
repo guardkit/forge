@@ -334,6 +334,7 @@ async def dispatch_autobuild_async(
     lifecycle_emitter: "PipelineLifecycleEmitter | None" = None,
     branch: str | None = None,
     repo: str | None = None,
+    budget: "dict[str, Any] | None" = None,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -423,6 +424,24 @@ async def dispatch_autobuild_async(
             as ``payload["repo"]`` when set (same one-hop provenance as
             ``branch``); omitted when ``None`` so the runner's existing
             FORGE_DEFAULT_REPO fallback still governs the legacy path.
+        budget: FEAT-UBS-002 (Option-B, stage 1 — the run bounds ITSELF).
+            The compact per-build budget entry the serve-side dispatch
+            resolved from ``builds.profile``, shaped
+            ``{"max_wallclock_seconds": int, "profile_name": str}``. Threaded
+            into the launch payload as ``payload["budget"]`` when set (same
+            one-hop provenance as ``branch``/``repo``); the runner takes the
+            MINIMUM of it and its env/default subprocess timeout so a profile
+            can only TIGHTEN the existing wall-clock bound, never loosen it,
+            and its ``proc.kill`` on expiry is the honest hard stop.
+
+            Only the wall-clock cap rides here because it is the only cap
+            enforceable on this launch path. ``max_review_cycles`` push-in is
+            out of scope (per-task ``--max-turns`` vs whole-build semantics)
+            and ``max_build_tokens`` is UNMEASURED on this path — neither is
+            carried, so this entry never implies an enforceability the runner
+            cannot honour. ``None`` (attended / NULL profile, or the legacy
+            CLI / boot-rearm launch) omits the key entirely, keeping the
+            launch bytes byte-compatible with the pre-budget shape.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -531,6 +550,17 @@ async def dispatch_autobuild_async(
         launch_payload["branch"] = branch
     if repo:
         launch_payload["repo"] = repo
+    # FEAT-UBS-002 (Option-B, stage 1) — attach the compact per-build budget
+    # entry ONLY when one was resolved (an unattended profile with a wall-clock
+    # cap). Added by the same truthy-guard convention as branch/repo so an
+    # attended / NULL-profile launch stays byte-compatible with the pre-budget
+    # payload. The runner reads ``payload["budget"]["max_wallclock_seconds"]``
+    # and MIN()s it against its env/default subprocess timeout, then genuinely
+    # kills the subprocess on expiry — the honest boundary where enforcement is
+    # real. ``max_build_tokens`` is deliberately NOT carried: it is unmeasured
+    # on this path, so nothing here promises token enforcement.
+    if budget:
+        launch_payload["budget"] = budget
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

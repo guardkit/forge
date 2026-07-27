@@ -54,6 +54,8 @@ from forge.subagents.autobuild_runner import (
     _async_tasks_reducer,
     _build_runner_graph,
     _extract_launch_payload,
+    _node_running_wave,
+    _resolve_budget_wallclock_seconds,
     _update_state,
     assert_within_worktree,
     graph,
@@ -879,3 +881,206 @@ class TestAsyncTasksReducer:
         # as a no-op for that key (the existing entry is preserved).
         result = _async_tasks_reducer(current, {"FEAT-X": "not-a-dict"})  # type: ignore[arg-type]
         assert result == current
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 (Option-B, stage 1) — per-build wall-clock budget in the runner
+# ---------------------------------------------------------------------------
+#
+# The serve-side dispatch attaches ``payload["budget"]["max_wallclock_seconds"]``
+# for capped (unattended) profiles. ``_node_running_wave`` takes the MINIMUM of
+# that cap and its env/default subprocess timeout — a profile can only TIGHTEN
+# the bound. On expiry the existing ``proc.kill`` + failed-terminal path fires
+# (the honest hard stop); the failure reason names the budget only when the
+# per-build cap (not the env default) was the binding one.
+
+
+class TestResolveBudgetWallclockSeconds:
+    """Pure coverage for the launch-payload budget-cap extractor."""
+
+    def test_none_when_no_budget_key(self) -> None:
+        assert _resolve_budget_wallclock_seconds({"feature_id": "F"}) is None
+
+    def test_none_when_budget_not_a_mapping(self) -> None:
+        assert _resolve_budget_wallclock_seconds({"budget": "nope"}) is None
+
+    def test_none_when_wallclock_missing(self) -> None:
+        assert (
+            _resolve_budget_wallclock_seconds({"budget": {"profile_name": "u"}})
+            is None
+        )
+
+    def test_none_when_wallclock_non_positive(self) -> None:
+        assert (
+            _resolve_budget_wallclock_seconds({"budget": {"max_wallclock_seconds": 0}})
+            is None
+        )
+
+    def test_none_when_wallclock_unparseable(self) -> None:
+        assert (
+            _resolve_budget_wallclock_seconds(
+                {"budget": {"max_wallclock_seconds": "abc"}}
+            )
+            is None
+        )
+
+    def test_positive_cap_returned_as_float(self) -> None:
+        assert (
+            _resolve_budget_wallclock_seconds({"budget": {"max_wallclock_seconds": 90}})
+            == 90.0
+        )
+
+
+class _BudgetFakeStdout:
+    async def readline(self) -> bytes:
+        return b""  # immediate EOF
+
+
+class _BudgetFakeProc:
+    pid = 4242
+    returncode = 0
+
+    def __init__(self) -> None:
+        self.stdout = _BudgetFakeStdout()
+        self.killed = False
+
+    async def wait(self) -> int:
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class _WaitForController:
+    """Force the outer subprocess ``wait_for`` to time out, capturing the bound.
+
+    The runner calls ``asyncio.wait_for`` twice: first on the
+    ``gather(drain, proc.wait)`` with ``timeout=<effective>`` (which we time
+    out, recording the effective bound), then on ``proc.wait()`` after kill
+    with ``timeout=5.0`` (which we let resolve).
+    """
+
+    def __init__(self) -> None:
+        self.outer_timeout: float | None = None
+        self.calls = 0
+
+    async def __call__(self, aw: Any, timeout: float) -> Any:
+        import asyncio as _asyncio
+
+        self.calls += 1
+        if self.calls == 1:
+            self.outer_timeout = timeout
+            # Drain/cancel the gather so no child coroutine is left un-awaited.
+            fut = _asyncio.ensure_future(aw)
+            fut.cancel()
+            try:
+                await fut
+            except BaseException:  # noqa: BLE001 — cancellation cleanup only
+                pass
+            raise _asyncio.TimeoutError
+        return await aw
+
+
+def _budget_running_wave_description(budget: dict[str, Any] | None) -> str:
+    import json
+
+    payload: dict[str, Any] = {
+        "build_id": "build-FEAT-BUD-1",
+        "feature_id": "FEAT-BUD",
+        "repo": "appmilla/api_test",
+        "correlation_id": "corr-BUD",
+    }
+    if budget is not None:
+        payload["budget"] = budget
+    return (
+        "RUN_AUTOBUILD subagent=autobuild_runner "
+        f"payload={json.dumps(payload, sort_keys=True)}"
+    )
+
+
+async def _run_running_wave_timeout(
+    *, budget: dict[str, Any] | None
+) -> tuple[dict[str, Any], _WaitForController]:
+    import asyncio as _asyncio
+
+    from langchain_core.messages import HumanMessage
+
+    from forge.subagents import autobuild_runner as _ar_mod
+
+    ctl = _WaitForController()
+    description = _budget_running_wave_description(budget)
+    state = {"messages": [HumanMessage(content=description)]}
+
+    with patch.object(
+        _ar_mod, "_resolve_repo_path", lambda payload: Path("/tmp/fake-repo")
+    ), patch.object(
+        _ar_mod, "_resolve_guardkit_path", lambda: Path("/usr/bin/guardkit")
+    ), patch.object(
+        _asyncio, "create_subprocess_exec", _make_budget_subprocess
+    ), patch.object(_asyncio, "wait_for", ctl):
+        result = await _node_running_wave(state)  # type: ignore[arg-type]
+    return result, ctl
+
+
+async def _make_budget_subprocess(*args: Any, **kwargs: Any) -> _BudgetFakeProc:
+    return _BudgetFakeProc()
+
+
+class TestRunningWaveBudgetTimeout:
+    """``_node_running_wave`` prefers the min(env/default, per-build cap)."""
+
+    @pytest.mark.asyncio
+    async def test_budget_cap_binds_and_reason_names_it(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Env default = 3600 (unset); budget cap = 60 < 3600, so it binds.
+        monkeypatch.delenv("FORGE_AUTOBUILD_TIMEOUT_SECONDS", raising=False)
+        with caplog.at_level(logging.WARNING, logger="forge.subagents.autobuild_runner"):
+            result, ctl = await _run_running_wave_timeout(
+                budget={"max_wallclock_seconds": 60, "profile_name": "unattended"}
+            )
+
+        assert ctl.outer_timeout == 60.0, "the tighter per-build cap must win the min()"
+        snap = result["async_tasks"]["FEAT-BUD"]
+        assert snap["lifecycle"] == "failed"
+        reasons = "\n".join(
+            r.getMessage() for r in caplog.records if "transitioning to failed" in r.getMessage()
+        )
+        assert "budget wall-clock cap of 60.0s" in reasons
+        assert "profile='unattended'" in reasons
+        assert "UBS-002" in reasons
+
+    @pytest.mark.asyncio
+    async def test_env_default_binds_when_tighter_than_budget(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Env default = 10 < budget cap 5000, so a profile can only TIGHTEN:
+        # the env default remains the bound and the reason does NOT name budget.
+        monkeypatch.setenv("FORGE_AUTOBUILD_TIMEOUT_SECONDS", "10")
+        with caplog.at_level(logging.WARNING, logger="forge.subagents.autobuild_runner"):
+            result, ctl = await _run_running_wave_timeout(
+                budget={"max_wallclock_seconds": 5000, "profile_name": "unattended"}
+            )
+
+        assert ctl.outer_timeout == 10.0, "a looser budget must never loosen the bound"
+        reasons = "\n".join(
+            r.getMessage() for r in caplog.records if "transitioning to failed" in r.getMessage()
+        )
+        assert "budget wall-clock cap" not in reasons
+        assert "timed out after 10.0s" in reasons
+
+    @pytest.mark.asyncio
+    async def test_no_budget_is_byte_equivalent_env_default(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No budget entry → env/default governs unchanged (pre-budget behaviour).
+        monkeypatch.setenv("FORGE_AUTOBUILD_TIMEOUT_SECONDS", "10")
+        with caplog.at_level(logging.WARNING, logger="forge.subagents.autobuild_runner"):
+            result, ctl = await _run_running_wave_timeout(budget=None)
+
+        assert ctl.outer_timeout == 10.0
+        reasons = "\n".join(
+            r.getMessage() for r in caplog.records if "transitioning to failed" in r.getMessage()
+        )
+        assert "budget wall-clock cap" not in reasons
+        assert "timed out after 10.0s" in reasons
