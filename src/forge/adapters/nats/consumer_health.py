@@ -15,13 +15,18 @@ survived two restarts and 25h live before manual broker surgery cleared it.
 
 The discriminator (the load-bearing idea):
 
-With ``max_ack_pending=1`` the ack-pending set is a singleton and its stream
-sequence is recoverable from ``consumer_info`` alone::
+With ``max_ack_pending=1`` the ack-pending set is a singleton — and the single
+outstanding message is exactly the LAST-DELIVERED one, so its stream sequence is
+recoverable from ``consumer_info`` alone::
 
-    pending_seq = ack_floor.stream_seq + 1
+    pending_seq = delivered.stream_seq
 
-(:class:`~nats.js.api.ConsumerInfo.ack_floor` is an Optional
-:class:`~nats.js.api.SequenceInfo`; guard ``None``.) Then a single honest probe
+(:class:`~nats.js.api.ConsumerInfo.delivered` is an Optional
+:class:`~nats.js.api.SequenceInfo`; guard ``None``. NOT ``ack_floor + 1``: on a
+multi-subject stream the sequences between the consumer's ack floor and its
+delivered watermark belong to other subjects' consumed messages, so ``+1`` can
+point at a legitimately-deleted foreign message and misclassify a real held ack
+as a phantom — live-proven 2026-07-27 against a gate-paused build.) Then a single honest probe
 tells legitimate from phantom:
 
 - ``js.get_msg('PIPELINE', seq=pending_seq)`` **succeeds** → the held message
@@ -73,8 +78,9 @@ class AckSlotReport:
             not exist — no ack slot at all; normal pre-first-attach and right
             after a cure deleted it).
         pending_seq: The stream sequence of the ack-pending message
-            (``ack_floor.stream_seq + 1``), or ``None`` when the slot is free or
-            the sequence could not be derived.
+            (``delivered.stream_seq`` — the singleton outstanding message is the
+            last-delivered one under ``max_ack_pending=1``), or ``None`` when
+            the slot is free or the sequence could not be derived.
         num_ack_pending: ``ConsumerInfo.num_ack_pending`` (``0``/``None`` ⇒ free).
         num_waiting: ``ConsumerInfo.num_waiting`` (a parked pull is idle-good).
         num_pending: ``ConsumerInfo.num_pending`` (undelivered stream backlog).
@@ -172,14 +178,26 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             ),
         )
 
-    # 3. Slot occupied ⇒ derive the pending sequence from the ack floor.
-    #    ack_floor is Optional; without it we cannot name the sequence to probe,
-    #    so we cannot honestly classify — report unknown, never phantom.
-    ack_floor = info.ack_floor
-    if ack_floor is None or ack_floor.stream_seq is None:
+    # 3. Slot occupied ⇒ derive the pending sequence from the DELIVERED
+    #    watermark. With max_ack_pending=1 the single outstanding message is
+    #    exactly the last-delivered one, so pending_seq =
+    #    delivered.stream_seq. NOT ack_floor.stream_seq + 1: on a
+    #    MULTI-SUBJECT stream the sequences between the consumer's ack floor
+    #    and its delivered watermark belong to OTHER subjects (other
+    #    consumers' consumed-and-removed messages), so ack_floor+1 can point
+    #    at a legitimately-deleted foreign message and misclassify a REAL
+    #    held ack as a phantom. Live-proven 2026-07-27: a gate-paused build
+    #    held seq 653 while ack_floor+1 = 649 was a consumed jarvis-side
+    #    message already gone from the stream — the +1 formula would have
+    #    cured (deleted the consumer under) a legitimately paused build.
+    #    delivered is Optional; without it we cannot name the sequence to
+    #    probe, so we cannot honestly classify — report unknown, never
+    #    phantom.
+    delivered = info.delivered
+    if delivered is None or delivered.stream_seq is None:
         logger.warning(
             "ack-slot inspect: consumer '%s' on '%s' has %d ack-pending but no "
-            "ack_floor.stream_seq; reporting status=unknown — cannot name the "
+            "delivered.stream_seq; reporting status=unknown — cannot name the "
             "held sequence, so no cure will be attempted",
             durable,
             stream,
@@ -197,7 +215,7 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             ),
         )
 
-    pending_seq = ack_floor.stream_seq + 1
+    pending_seq = delivered.stream_seq
 
     # 4. Probe the stream for the held message. Present ⇒ legitimate hold;
     #    NotFoundError ⇒ phantom; any other error ⇒ unknown (never phantom).
