@@ -1842,8 +1842,15 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # checkout AS-IS. Either way we log which mode was taken.
     branch_raw = payload.get("branch")
     worktree_path: Path | None = None
+    # F12 — the base branch guardkit must build its inner autobuild branch on.
+    # Threaded from the SAME payload ``branch`` the outer worktree checks out,
+    # in the branch-aware path only; stays ``None`` on the legacy no-branch
+    # path so that launch is byte-identical. Set below and consumed when the
+    # guardkit argv is assembled.
+    base_branch: str | None = None
     if isinstance(branch_raw, str) and branch_raw.strip():
         branch = branch_raw.strip()
+        base_branch = branch
         build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
         if not await _local_branch_exists(repo_path, branch):
             return _snapshot_update(
@@ -1911,6 +1918,19 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         "--fresh",
         "--verbose",
     ]
+    # F12 — the outer worktree is materialised DETACHED (F2, _materialise_worktree
+    # uses ``git worktree add --detach``), so guardkit's cwd carries NO current
+    # branch. guardkit resolves its inner build-branch base as
+    # ``--base-branch flag > cwd current branch > 'main'`` (guardkit
+    # cli/autobuild.py:582, _detect_base_branch:131). A detached cwd silently
+    # falls through to 'main', so a branch-scoped build lands on the WRONG base
+    # (receipted live 2026-07-26: FEAT-UCNT built on main's tip d6969df, cured
+    # by selective merge 8403739). Pin guardkit's tier-1 precedence explicitly
+    # with the SAME branch the outer worktree checked out. The legacy no-branch
+    # path leaves ``base_branch`` None → no flag → guardkit's cwd-current-branch
+    # resolution keeps working there (that shared checkout is on a named branch).
+    if base_branch is not None:
+        argv += ["--base-branch", base_branch]
 
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s timeout=%ss",
