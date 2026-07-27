@@ -53,11 +53,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import click
 
+from forge.adapters.nats.consumer_health import cure_phantom, inspect_ack_slot
 from forge.adapters.nats.fleet_publisher import (
     AGENT_ID,
     deregister,
@@ -69,7 +71,7 @@ from forge.cli._serve_config import (
     DEFAULT_HEALTHZ_PORT,
     ServeConfig,
 )
-from forge.cli._serve_daemon import run_daemon
+from forge.cli._serve_daemon import PIPELINE_STREAM_NAME, run_daemon
 from forge.cli._serve_dispatcher import make_handle_message_dispatcher
 from forge.cli._serve_healthz import run_healthz_server
 from forge.cli._serve_planning import (
@@ -1089,6 +1091,227 @@ async def _close_client_quietly(client: Any) -> None:
         logger.debug("forge-serve: shared client close error (%s)", exc)
 
 
+# ---------------------------------------------------------------------------
+# FEAT-PAC — phantom-ack wedge: boot cure + runtime alarm watchdog
+# ---------------------------------------------------------------------------
+
+
+#: Env var naming the runtime ack-slot watchdog interval in seconds.
+#: Default 300; ``0`` (or any non-positive value) disables the watchdog.
+ACK_WATCHDOG_SECONDS_ENV: str = "FORGE_ACK_WATCHDOG_SECONDS"
+DEFAULT_ACK_WATCHDOG_SECONDS: int = 300
+
+
+def _ack_watchdog_interval_seconds(
+    environ: dict[str, str] | None = None,
+) -> int:
+    """Resolve the runtime ack-slot watchdog interval from the environment.
+
+    Reads :data:`ACK_WATCHDOG_SECONDS_ENV` (default
+    :data:`DEFAULT_ACK_WATCHDOG_SECONDS`). A value of ``0`` — or any
+    non-positive / unparseable value — disables the watchdog (returns
+    ``0``), so a misconfigured env can never crash boot; it just turns the
+    alarm off with a warning.
+
+    Args:
+        environ: Optional mapping to read instead of :data:`os.environ`
+            (tests inject a controlled dict).
+
+    Returns:
+        The interval in seconds, or ``0`` when disabled.
+    """
+    env = environ if environ is not None else os.environ
+    raw = env.get(ACK_WATCHDOG_SECONDS_ENV)
+    if raw is None:
+        return DEFAULT_ACK_WATCHDOG_SECONDS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "forge-serve: %s=%r is not an integer; disabling the ack-slot "
+            "watchdog",
+            ACK_WATCHDOG_SECONDS_ENV,
+            raw,
+        )
+        return 0
+    return value if value > 0 else 0
+
+
+async def _ack_slot_boot_check(
+    client: Any, config: ServeConfig, state: SubscriptionState
+) -> None:
+    """Boot-time ack-slot inspection + phantom cure (FEAT-PAC, the boot step).
+
+    Runs after the reconciles and BEFORE the daemon's pull subscription
+    exists — so a cure (``delete_consumer``) is safe: there is no live
+    ``PullSubscription`` to invalidate mid-fetch, and the daemon recreates
+    the durable bind-or-create on attach.
+
+    Behaviour (spec §"The design" 2):
+
+    * ``healthy`` ⇒ INFO health line (nothing to do).
+    * ``phantom`` ⇒ ERROR naming the wedged sequence, then
+      :func:`cure_phantom`, then **re-inspect with the same check**
+      (fix-and-re-verify) — the re-inspect must report ``healthy``; the
+      cure receipt is logged at WARNING so an operator sees it happened.
+    * ``held`` ⇒ INFO only (a legitimate long-held ack owns the slot).
+    * ``unknown`` ⇒ WARNING, no action (an inspection that could not reach
+      a verdict never triggers a cure).
+
+    The WHOLE step is exception-guarded: a bug in the health check must
+    never block daemon boot. The final ack-slot reading (post-cure if a
+    cure ran) is published to ``state.ack_slot`` for healthz visibility.
+
+    Args:
+        client: The shared raw NATS client (``client.jetstream()`` yields
+            the JetStream context — read-only ``consumer_info`` / ``get_msg``
+            plus, on the phantom path, ``delete_consumer``).
+        config: Daemon config; ``durable_name`` names the consumer. The
+            stream is the :data:`PIPELINE_STREAM_NAME` constant the daemon
+            binds against.
+        state: Shared readiness state; its ``ack_slot`` field is updated.
+    """
+    stream = PIPELINE_STREAM_NAME
+    durable = config.durable_name
+    try:
+        js = client.jetstream()
+        report = await inspect_ack_slot(js, stream, durable)
+        logger.info("forge-serve: ack-slot boot check — %s", report.detail)
+
+        if report.status == "phantom":
+            logger.error(
+                "forge-serve: PHANTOM ack at boot — consumer '%s' (stream "
+                "'%s') holds the ack slot for gone sequence %s; curing by "
+                "deleting the wedged consumer",
+                durable,
+                stream,
+                report.pending_seq,
+            )
+            cured = await cure_phantom(js, stream, durable)
+            # Fix-and-re-verify: re-run the SAME check and require healthy.
+            reverify = await inspect_ack_slot(js, stream, durable)
+            if cured and reverify.status == "healthy":
+                logger.warning(
+                    "forge-serve: phantom-ack CURED at boot — deleted wedged "
+                    "consumer '%s' (was seq %s); re-inspection reports healthy "
+                    "(%s). The daemon will recreate the durable on attach.",
+                    durable,
+                    report.pending_seq,
+                    reverify.detail,
+                )
+            else:
+                logger.error(
+                    "forge-serve: phantom-ack cure did NOT verify healthy "
+                    "(cured=%s, re-inspect=%s: %s) — an operator may need to "
+                    "delete consumer '%s' manually",
+                    cured,
+                    reverify.status,
+                    reverify.detail,
+                    durable,
+                )
+            report = reverify
+        elif report.status == "held":
+            logger.info(
+                "forge-serve: ack-slot boot check — held (legitimate); leaving "
+                "the slot alone"
+            )
+        elif report.status == "unknown":
+            logger.warning(
+                "forge-serve: ack-slot boot check could not reach a verdict "
+                "(%s); taking NO action",
+                report.detail,
+            )
+
+        await state.set_ack_slot(report.status)
+    except Exception as exc:  # noqa: BLE001 — a health-check bug must never block boot
+        logger.warning(
+            "forge-serve: ack-slot boot check failed (%s: %s); continuing boot "
+            "with no cure attempted",
+            type(exc).__name__,
+            exc,
+        )
+
+
+async def _run_ack_watchdog(
+    client: Any,
+    config: ServeConfig,
+    state: SubscriptionState,
+    interval_seconds: int,
+) -> None:
+    """Runtime ack-slot watchdog — ALARM-ONLY in v1 (FEAT-PAC, the watchdog).
+
+    Periodically (every ``interval_seconds``) re-runs the same
+    :func:`inspect_ack_slot` beside the live daemon and publishes the
+    reading to ``state.ack_slot`` for healthz visibility. On ``phantom`` it
+    ERROR-logs the named wedge signature and sets the shared flag.
+
+    It NEVER cures. Deleting the durable under the daemon's live
+    ``PullSubscription`` would invalidate that subscription mid-fetch (the
+    subscription is bound to a specific consumer instance), so the honest
+    v1 is loud alarm + healthz visibility; an operator restart then routes
+    the wedge through :func:`_ack_slot_boot_check`, which cures safely
+    before any subscription exists.
+
+    An interval of ``0`` (or less) disables the watchdog: it logs that it
+    is off and returns immediately. This coroutine is created as a task
+    only when enabled, so it never completes early and trips the
+    ``FIRST_COMPLETED`` shutdown of its siblings.
+
+    Each iteration is exception-guarded so a transient API error cannot
+    kill the alarm; cancellation propagates cleanly for shutdown.
+
+    Args:
+        client: The shared raw NATS client (read-only inspection only).
+        config: Daemon config; ``durable_name`` names the consumer.
+        state: Shared readiness state; ``ack_slot`` is updated each tick.
+        interval_seconds: Poll interval; ``<= 0`` disables.
+    """
+    if interval_seconds <= 0:
+        logger.info(
+            "forge-serve: ack-slot watchdog disabled (%s <= 0)",
+            ACK_WATCHDOG_SECONDS_ENV,
+        )
+        return
+
+    stream = PIPELINE_STREAM_NAME
+    durable = config.durable_name
+    logger.info(
+        "forge-serve: ack-slot watchdog armed — inspecting consumer '%s' on "
+        "stream '%s' every %ds (alarm-only; never cures mid-run)",
+        durable,
+        stream,
+        interval_seconds,
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            js = client.jetstream()
+            report = await inspect_ack_slot(js, stream, durable)
+            if report.status == "phantom":
+                logger.error(
+                    "forge-serve: ack-slot watchdog — PHANTOM ACK WEDGE on "
+                    "consumer '%s' (stream '%s'): the ack slot is held for "
+                    "gone sequence %s and no ack can release it. Dispatch is "
+                    "jammed. This watchdog does NOT cure mid-run (would "
+                    "invalidate the live subscription) — restart the daemon to "
+                    "trigger the boot cure. detail: %s",
+                    durable,
+                    stream,
+                    report.pending_seq,
+                    report.detail,
+                )
+            await state.set_ack_slot(report.status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a watchdog hiccup must not kill the alarm
+            logger.warning(
+                "forge-serve: ack-slot watchdog iteration failed (%s: %s); "
+                "will retry next interval",
+                type(exc).__name__,
+                exc,
+            )
+
+
 async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
     """Open one NATS client, run reconcile_on_boot, then daemon + healthz.
 
@@ -1160,6 +1383,14 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         await recovery_reconcile_on_boot(client)
         await consumer_reconcile_on_boot(client)
 
+        # Step 3.25 — FEAT-PAC phantom-ack boot cure. Runs AFTER the
+        # reconciles but BEFORE ``compose_dispatch_chain`` / the daemon
+        # task, so the durable's pull subscription does not yet exist and
+        # a cure (delete_consumer) is safe — the daemon recreates the
+        # consumer bind-or-create on attach. The step is exception-guarded
+        # internally: a health-check bug can never block boot.
+        await _ack_slot_boot_check(client, config, state)
+
         # Step 3.5 — compose the orchestrator dispatch chain
         # (TASK-FW10-007). Production wiring rebinds
         # :data:`_serve_daemon.dispatch_payload` to a closure built
@@ -1184,8 +1415,26 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             run_healthz_server(config, state),
             name="forge-serve-healthz",
         )
+        tasks: set[asyncio.Task[None]] = {daemon_task, healthz_task}
+
+        # Step 5.5 — FEAT-PAC runtime ack-slot watchdog (alarm-only). Only
+        # created when enabled (interval > 0) so a disabled watchdog never
+        # completes early and trips the FIRST_COMPLETED shutdown below. It
+        # runs beside the daemon and is cancelled with the other tasks on
+        # teardown.
+        watchdog_interval = _ack_watchdog_interval_seconds()
+        if watchdog_interval > 0:
+            tasks.add(
+                asyncio.create_task(
+                    _run_ack_watchdog(
+                        client, config, state, watchdog_interval
+                    ),
+                    name="forge-serve-ack-watchdog",
+                )
+            )
+
         done, pending = await asyncio.wait(
-            {daemon_task, healthz_task},
+            tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:

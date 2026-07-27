@@ -46,10 +46,19 @@ class SubscriptionState:
             flips True (TASK-FW10-001 ASSUM-012). It is one-way: once
             True it stays True for the daemon's lifetime — chain
             composition is not re-run on broker reconnect.
+        ack_slot: The last ack-slot health reading (FEAT-PAC), one of
+            ``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"``.
+            Written by the boot cure step and the runtime watchdog in
+            :mod:`forge.cli.serve`; read by the healthz handler so the
+            phantom-ack wedge is visible to a standing ``curl`` probe.
+            Defaults to ``"unknown"`` until the first boot inspection
+            runs. This flag is advisory-only: it never gates the
+            readiness verdict (the wedge is alarm-only in v1).
     """
 
     live: bool = False
     chain_ready: bool = False
+    ack_slot: str = "unknown"
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def set_live(self, value: bool) -> None:
@@ -78,6 +87,21 @@ class SubscriptionState:
         """
         async with self._lock:
             self.chain_ready = value
+
+    async def set_ack_slot(self, value: str) -> None:
+        """Atomically update :attr:`ack_slot` under the internal lock.
+
+        Called by the FEAT-PAC boot cure step (once, after the boot
+        inspection/cure) and by the runtime watchdog (once per interval).
+        Writers take the lock for consistency with the other setters;
+        the healthz handler reads lock-free like the other flags.
+
+        Args:
+            value: New ack-slot status
+                (``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"``).
+        """
+        async with self._lock:
+            self.ack_slot = value
 
     def is_live(self) -> bool:
         """Return the current :attr:`live` value without taking the lock.

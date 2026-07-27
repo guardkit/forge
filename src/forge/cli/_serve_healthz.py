@@ -95,17 +95,34 @@ async def _healthz_handler(request: web.Request) -> web.Response:
     (the daemon may not have attached yet).
     """
     state: SubscriptionState = request.app[STATE_KEY]
+    # FEAT-PAC healthz seam (this file:_healthz_handler): every response
+    # gains an additive ``ack_slot`` field carrying the last boot/watchdog
+    # ack-slot reading (``healthy`` / ``held`` / ``phantom`` / ``unknown``),
+    # so a standing ``curl :8088/healthz`` makes the phantom-ack wedge
+    # visible. It is advisory-only — the wedge is alarm-only in v1 and does
+    # NOT change the readiness verdict below or any existing key.
+    ack_slot = state.ack_slot
     if not state.is_chain_ready():
         return web.json_response(
-            {"status": "unhealthy", "reason": "chain_not_ready"},
+            {
+                "status": "unhealthy",
+                "reason": "chain_not_ready",
+                "ack_slot": ack_slot,
+            },
             status=503,
         )
     if not state.is_live():
         return web.json_response(
-            {"status": "unhealthy", "reason": "subscription_not_live"},
+            {
+                "status": "unhealthy",
+                "reason": "subscription_not_live",
+                "ack_slot": ack_slot,
+            },
             status=503,
         )
-    return web.json_response({"status": "healthy"}, status=200)
+    return web.json_response(
+        {"status": "healthy", "ack_slot": ack_slot}, status=200
+    )
 
 
 def build_healthz_app(state: SubscriptionState) -> web.Application:
