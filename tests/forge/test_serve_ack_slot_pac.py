@@ -63,12 +63,12 @@ class _FakeConsumerInfo:
         num_ack_pending: int | None = 0,
         num_waiting: int | None = 0,
         num_pending: int | None = 0,
-        ack_floor: _FakeSequenceInfo | None = None,
+        delivered: _FakeSequenceInfo | None = None,
     ) -> None:
         self.num_ack_pending = num_ack_pending
         self.num_waiting = num_waiting
         self.num_pending = num_pending
-        self.ack_floor = ack_floor
+        self.delivered = delivered
 
 
 def _info_healthy() -> _FakeConsumerInfo:
@@ -76,12 +76,13 @@ def _info_healthy() -> _FakeConsumerInfo:
 
 
 def _info_occupied(seq: int = 41) -> _FakeConsumerInfo:
-    # ack_floor.stream_seq = seq ⇒ pending_seq = seq + 1.
+    # delivered.stream_seq = seq ⇒ pending_seq = seq (the singleton
+    # outstanding message IS the last-delivered one under max_ack_pending=1).
     return _FakeConsumerInfo(
         num_ack_pending=1,
         num_waiting=1,
         num_pending=0,
-        ack_floor=_FakeSequenceInfo(seq),
+        delivered=_FakeSequenceInfo(seq),
     )
 
 
@@ -97,9 +98,9 @@ def _js_for_status(status: str) -> AsyncMock:
         js.consumer_info.return_value = _info_occupied()
         js.get_msg.side_effect = NotFoundError()
     elif status == "unknown":
-        # Occupied but no ack_floor ⇒ cannot name the sequence ⇒ unknown.
+        # Occupied but no delivered watermark ⇒ cannot name the sequence ⇒ unknown.
         js.consumer_info.return_value = _FakeConsumerInfo(
-            num_ack_pending=1, num_waiting=1, num_pending=0, ack_floor=None
+            num_ack_pending=1, num_waiting=1, num_pending=0, delivered=None
         )
     elif status == "absent":
         # Durable does not exist ⇒ consumer_info raises NotFoundError.

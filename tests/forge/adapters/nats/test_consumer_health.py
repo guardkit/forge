@@ -11,10 +11,10 @@ Test map:
 * :class:`TestInspectHealthy` — free slot ⇒ ``healthy``, no probe.
 * :class:`TestInspectHeld` — occupied slot + message present ⇒ ``held``.
 * :class:`TestInspectPhantom` — occupied slot + NotFoundError ⇒ ``phantom``.
-* :class:`TestInspectUnknown` — ack_floor None, consumer_info raises, and
+* :class:`TestInspectUnknown` — delivered None, consumer_info raises, and
   get_msg raising a non-NotFound error all ⇒ ``unknown`` (never phantom, never
   a cure).
-* :class:`TestPendingSeqArithmetic` — ``pending_seq == ack_floor.stream_seq+1``.
+* :class:`TestPendingSeqArithmetic` — ``pending_seq == delivered.stream_seq``.
 * :class:`TestCurePhantom` — delete called with (stream, durable); error ⇒
   ``False`` without raising; success ⇒ ``True``.
 """
@@ -57,12 +57,12 @@ class _FakeConsumerInfo:
         num_ack_pending: int | None = 0,
         num_waiting: int | None = 0,
         num_pending: int | None = 0,
-        ack_floor: _FakeSequenceInfo | None = None,
+        delivered: _FakeSequenceInfo | None = None,
     ) -> None:
         self.num_ack_pending = num_ack_pending
         self.num_waiting = num_waiting
         self.num_pending = num_pending
-        self.ack_floor = ack_floor
+        self.delivered = delivered
 
 
 def _make_js(
@@ -145,7 +145,7 @@ class TestInspectHeld:
                 num_ack_pending=1,
                 num_waiting=1,
                 num_pending=0,
-                ack_floor=_FakeSequenceInfo(41),
+                delivered=_FakeSequenceInfo(42),
             ),
             get_msg=object(),  # any non-exception return ⇒ message exists
         )
@@ -171,7 +171,7 @@ class TestInspectPhantom:
                 num_ack_pending=1,
                 num_waiting=1,
                 num_pending=0,
-                ack_floor=_FakeSequenceInfo(99),
+                delivered=_FakeSequenceInfo(100),
             ),
             get_msg=NotFoundError(),
         )
@@ -190,13 +190,13 @@ class TestInspectPhantom:
 
 class TestInspectUnknown:
     @pytest.mark.asyncio
-    async def test_ack_floor_none_is_unknown(self) -> None:
+    async def test_delivered_none_is_unknown(self) -> None:
         js = _make_js(
             consumer_info=_FakeConsumerInfo(
                 num_ack_pending=1,
                 num_waiting=1,
                 num_pending=0,
-                ack_floor=None,
+                delivered=None,
             )
         )
 
@@ -209,11 +209,11 @@ class TestInspectUnknown:
         js.get_msg.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_ack_floor_stream_seq_none_is_unknown(self) -> None:
+    async def test_delivered_stream_seq_none_is_unknown(self) -> None:
         js = _make_js(
             consumer_info=_FakeConsumerInfo(
                 num_ack_pending=1,
-                ack_floor=_FakeSequenceInfo(None),
+                delivered=_FakeSequenceInfo(None),
             )
         )
 
@@ -256,7 +256,7 @@ class TestInspectUnknown:
             consumer_info=_FakeConsumerInfo(
                 num_ack_pending=1,
                 num_waiting=1,
-                ack_floor=_FakeSequenceInfo(10),
+                delivered=_FakeSequenceInfo(11),
             ),
             get_msg=TimeoutError("request timed out"),
         )
@@ -277,16 +277,19 @@ class TestInspectUnknown:
 class TestPendingSeqArithmetic:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("ack_floor_seq", "expected_pending"),
-        [(0, 1), (1, 2), (41, 42), (10099, 10100)],
+        ("delivered_seq", "expected_pending"),
+        [(1, 1), (2, 2), (42, 42), (10100, 10100)],
     )
-    async def test_pending_seq_is_ack_floor_plus_one(
-        self, ack_floor_seq: int, expected_pending: int
+    async def test_pending_seq_is_delivered_stream_seq(
+        self, delivered_seq: int, expected_pending: int
     ) -> None:
+        # With max_ack_pending=1 the single outstanding message IS the
+        # last-delivered one. NOT ack_floor+1 (multi-subject streams put
+        # foreign consumed sequences in that gap — live-proven 2026-07-27).
         js = _make_js(
             consumer_info=_FakeConsumerInfo(
                 num_ack_pending=1,
-                ack_floor=_FakeSequenceInfo(ack_floor_seq),
+                delivered=_FakeSequenceInfo(delivered_seq),
             ),
             get_msg=object(),  # present ⇒ held; we only assert the seq
         )
