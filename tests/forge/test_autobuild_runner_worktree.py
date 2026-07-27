@@ -200,6 +200,26 @@ def test_branch_aware_worktree_happy_path(
     )
     assert str(recorded["cwd"]) != str(throwaway_repo)
 
+    # F12 — the outer worktree is DETACHED, so guardkit's cwd carries no
+    # current branch; the runner must pin guardkit's base explicitly with the
+    # SAME payload branch, else the inner build lands on 'main' (live receipt
+    # FEAT-UCNT, cured by selective merge 8403739). Assert the flag rides the
+    # argv immediately after --verbose, carrying the planning branch.
+    argv = recorded["argv"]
+    assert "--base-branch" in argv, (
+        f"branch-aware launch must pin guardkit's base branch (F12); "
+        f"got argv={argv!r}"
+    )
+    bb_idx = argv.index("--base-branch")
+    assert argv[bb_idx + 1] == PLANNING_BRANCH, (
+        f"--base-branch must carry the payload branch {PLANNING_BRANCH!r}, "
+        f"got {argv[bb_idx + 1]!r}"
+    )
+    assert argv[-2:] == ["--base-branch", PLANNING_BRANCH], (
+        f"--base-branch <branch> must be the argv tail after --verbose; "
+        f"got {argv!r}"
+    )
+
     # Success cleans the worktree up.
     assert not expected_wt.exists(), "success path must remove the worktree"
 
@@ -306,6 +326,22 @@ def test_round17_literal_replay_uses_legacy_shared_checkout(
     # no worktree materialised, and the mode is logged.
     assert recorded["cwd"] == str(throwaway_repo)
     assert not (wt_base / ROUND17_BUILD_ID).exists()
+    # F12 — the legacy no-branch launch stays byte-identical: NO --base-branch
+    # flag (guardkit's cwd-current-branch resolution holds on the shared
+    # checkout, which is on a named branch), and the argv is exactly the
+    # F2-proven six-token shape.
+    argv = recorded["argv"]
+    assert "--base-branch" not in argv, (
+        f"legacy no-branch launch must NOT pin a base branch (byte-identical); "
+        f"got argv={argv!r}"
+    )
+    assert argv[1:] == [
+        "autobuild",
+        "feature",
+        ROUND17_FEATURE_ID,
+        "--fresh",
+        "--verbose",
+    ], f"legacy argv tail must be unchanged; got {argv[1:]!r}"
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "legacy shared-checkout mode" in joined
     assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
