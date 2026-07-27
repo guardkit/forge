@@ -117,6 +117,18 @@ MAX_HISTORY_LIMIT: Final[int] = 1000
 #: Number of recent terminal builds appended to ``read_status`` output.
 _RECENT_TERMINAL_LIMIT: Final[int] = 5
 
+#: Annotation appended to ``builds.budget_breach`` by
+#: :meth:`SqliteLifecyclePersistence.clear_budget_breach` when a human ruling
+#: (the FEAT-UBS-002 stage-3 pre-dispatch gate's approve) authorises a re-queue
+#: of a feature whose prior build hit a budget cap. Clearing is
+#: history-preserving — the detected record stays as the prefix and this marker
+#: records that a human cleared it — so the enforcement reader
+#: (:meth:`~SqliteLifecyclePersistence.latest_breach_for_feature`) treats a
+#: breach carrying it as CLEARED (no longer an active breach). The marker holds
+#: no SQL ``LIKE`` wildcards (``%`` / ``_``), so the readers pattern-match it
+#: verbatim.
+_BUDGET_BREACH_CLEARED_MARKER: Final[str] = " (cleared @ "
+
 
 # ---------------------------------------------------------------------------
 # Domain errors
@@ -983,6 +995,70 @@ class SqliteLifecyclePersistence:
             raise
 
     # ------------------------------------------------------------------
+    # Write API — clear_budget_breach (FEAT-UBS-002 stage 3, GATE)
+    # ------------------------------------------------------------------
+
+    def clear_budget_breach(self, build_id: str, cleared_at: str) -> None:
+        """Annotate ``build_id``'s budget breach as CLEARED (history-preserving).
+
+        The stage-3 pre-dispatch gate calls this when a human ruling — the
+        TASK-GATE-D659 approve path — authorises a re-queue of a feature whose
+        prior build hit a budget cap. Approving the gated build IS the clearing
+        act for the feature going forward: without it the feature's next
+        re-queue would be gated again on a breach the operator already ruled on.
+
+        Rather than DELETE the detected record, this **appends** a
+        :data:`_BUDGET_BREACH_CLEARED_MARKER` ``+ cleared_at + ")"`` annotation
+        to ``builds.budget_breach`` — the honest history stays (what the daemon
+        detected AND that a human then cleared it). The column keeps its
+        honesty-law meaning: it never claims a state the daemon did not effect —
+        a human genuinely approved the re-run.
+
+        **Status-preserving** (never touches ``builds.status``, like
+        :meth:`record_budget_breach`) and **idempotent**: a breach already
+        carrying the cleared marker, a build with no breach, or an absent build
+        all match zero rows and are a quiet no-op — so a redelivered / re-armed
+        approve never double-appends. After clearing,
+        :meth:`latest_breach_for_feature` no longer surfaces this build (a
+        cleared breach is history, not an active breach).
+
+        Args:
+            build_id: The breach-carrying build to annotate cleared.
+            cleared_at: ISO-8601 timestamp of the clearing ruling (injected by
+                the caller from its gate clock — clock hygiene, never
+                ``datetime.now()`` here).
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+            sqlite3.Error: For any database error. The transaction is rolled
+                back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("clear_budget_breach: build_id must be non-empty")
+
+        annotation = f"{_BUDGET_BREACH_CLEARED_MARKER}{cleared_at})"
+        already_cleared = f"%{_BUDGET_BREACH_CLEARED_MARKER}%"
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET budget_breach = budget_breach || ?
+                 WHERE build_id = ?
+                   AND budget_breach IS NOT NULL
+                   AND budget_breach NOT LIKE ?
+                """,
+                (annotation, build_id, already_cleared),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
     # Write API — mark_paused
     # ------------------------------------------------------------------
 
@@ -1358,7 +1434,7 @@ class SqliteLifecyclePersistence:
     # ------------------------------------------------------------------
 
     def latest_breach_for_feature(self, feature_id: str) -> tuple[str, str] | None:
-        """Return the most recent breach-carrying build for ``feature_id``.
+        """Return the most recent build with an ACTIVE (un-cleared) breach.
 
         The stage-3 pre-dispatch gate consults this to decide whether the
         feature's last attempt already hit a budget cap (so a re-queue should
@@ -1368,12 +1444,18 @@ class SqliteLifecyclePersistence:
         non-NULL breach record, or ``None`` when no build of the feature ever
         recorded one.
 
+        A breach a human has **cleared** (annotated by
+        :meth:`clear_budget_breach` with :data:`_BUDGET_BREACH_CLEARED_MARKER`)
+        is skipped — it is retained history, not an active breach — so once the
+        gate approves a re-run the feature's next re-queue is not re-gated on
+        the same, already-ruled-on breach.
+
         Args:
             feature_id: The feature whose builds are scanned.
 
         Returns:
-            ``(build_id, detail)`` for the most recent breach-carrying build,
-            or ``None`` if the feature has no recorded breach.
+            ``(build_id, detail)`` for the most recent build carrying an active
+            (un-cleared) breach, or ``None`` if the feature has no such breach.
 
         Raises:
             ValueError: If ``feature_id`` is empty.
@@ -1387,10 +1469,11 @@ class SqliteLifecyclePersistence:
                   FROM builds
                  WHERE feature_id = ?
                    AND budget_breach IS NOT NULL
+                   AND budget_breach NOT LIKE ?
                  ORDER BY queued_at DESC, build_id DESC
                  LIMIT 1
                 """,
-                (feature_id,),
+                (feature_id, f"%{_BUDGET_BREACH_CLEARED_MARKER}%"),
             ).fetchone()
         if row is None:
             return None

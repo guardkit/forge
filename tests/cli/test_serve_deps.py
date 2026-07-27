@@ -539,16 +539,36 @@ class _RecordingBudgetStarter:
 
 
 class _BudgetFakePool:
-    """Minimal pool double: records the build then hands back a profiled row."""
+    """Minimal pool double: records the build then hands back a profiled row.
 
-    def __init__(self, *, profile: str | None) -> None:
+    ``breach`` seeds the stage-3 pre-dispatch breach gate: ``None`` (default) →
+    the feature has no outstanding breach (the byte-equivalent no-breach path);
+    a ``(prior_build_id, detail)`` tuple → the feature carries an un-cleared
+    breach. ``cleared`` records each :meth:`clear_budget_breach` call so a test
+    can assert the approve path cleared the prior build's marker.
+    """
+
+    def __init__(
+        self,
+        *,
+        profile: str | None,
+        breach: tuple[str, str] | None = None,
+    ) -> None:
         self._profile = profile
+        self._breach = breach
+        self.cleared: list[tuple[str, str]] = []
 
     def record_pending_build(self, payload: Any, profile: str | None = None) -> str:
         return f"build-{payload.feature_id}-budget"
 
     def get_build_row(self, build_id: str) -> Any:
         return SimpleNamespace(profile=self._profile)
+
+    def latest_breach_for_feature(self, feature_id: str) -> tuple[str, str] | None:
+        return self._breach
+
+    def clear_budget_breach(self, build_id: str, cleared_at: str) -> None:
+        self.cleared.append((build_id, cleared_at))
 
 
 class _NoopContextBuilder:
@@ -730,3 +750,181 @@ class TestResolveLaunchBudget:
             "max_wallclock_seconds": DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS,
             "profile_name": "unattended",
         }
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 (Option-B, stage 3, GATE) — the pre-dispatch breach gate
+# ---------------------------------------------------------------------------
+#
+# Before the launch decision (BOTH branches) ``dispatch_build`` reads the
+# feature's outstanding un-cleared ``builds.budget_breach``. No prior breach →
+# dispatch is byte-for-byte what it was before (the no-breach path). A prior
+# un-cleared breach must NEVER launch a fresh build silently:
+#   * gate wired → the build sits genuinely PAUSED at the approval gate; an
+#     APPROVE clears the prior breach (history-preserving) then launches; a
+#     TERMINAL leaves the breach standing and never launches.
+#   * gate NOT wired (soft-failed legacy branch) → no honest PAUSED seam, so the
+#     dispatch is REFUSED (``BudgetBreachDispatchRefused`` → the consumer emits
+#     a terminal build-failed + acks), never launched.
+
+
+class TestBudgetBreachPreDispatchGate:
+    """Stage-3 GATE: a prior un-cleared breach gates / refuses the re-queue."""
+
+    @pytest.mark.asyncio
+    async def test_no_prior_breach_launches_unchanged_legacy_branch(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # No prior breach → identical to today: the legacy branch launches.
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(profile="unattended", breach=None)
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=False
+        )
+
+        await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1  # launched
+        assert pool.cleared == []  # nothing to clear
+
+    @pytest.mark.asyncio
+    async def test_prior_breach_refuses_when_gate_unwired(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # Legacy no-gate branch + an outstanding breach → REFUSE (raise), never
+        # launch. The consumer's dispatch-error path turns the raise into a
+        # terminal build-failed; here we assert the raise + no launch.
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(
+            profile="unattended",
+            breach=("build-PRIOR", "wall_clock: 3712.0s > 3600.0s @ ts"),
+        )
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=False
+        )
+
+        with pytest.raises(_serve_deps.BudgetBreachDispatchRefused) as exc_info:
+            await dispatch(_budget_payload(), _noop_ack)
+
+        assert exc_info.value.feature_id == "FEAT-BUDGET"
+        assert exc_info.value.prior_build_id == "build-PRIOR"
+        assert "3712" in exc_info.value.breach_detail
+        assert starter.contexts == []  # never launched
+        assert pool.cleared == []  # refusal does not clear (breach stands)
+
+    @pytest.mark.asyncio
+    async def test_prior_breach_gated_and_not_launched_when_pending(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # Gate wired, gate PAUSES (holds the slot) → not launched, breach
+        # untouched (no approve yet).
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(
+            profile="unattended", breach=("build-PRIOR", "wall_clock: x @ ts")
+        )
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=True
+        )
+
+        async def _hold(**kwargs: Any) -> Any:
+            return _serve_gate_activation.ALREADY_PAUSED
+
+        with patch.object(
+            _serve_deps_gating, "bound_gate_parts", lambda: object()
+        ), patch.object(_serve_gate_activation, "maybe_gate_build", _hold):
+            await dispatch(_budget_payload(), _noop_ack)
+
+        assert starter.contexts == []  # held slot → not launched
+        assert pool.cleared == []  # not approved → breach stands
+
+    @pytest.mark.asyncio
+    async def test_prior_breach_cleared_on_gate_approve(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # Gate wired + APPROVE → the prior build's breach is cleared (history
+        # via the appended timestamp) AND the build launches.
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+        from forge.gating.wrappers import GateOutcome
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(
+            profile="unattended", breach=("build-PRIOR", "wall_clock: x @ ts")
+        )
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=True
+        )
+
+        async def _approve(**kwargs: Any) -> Any:
+            return GateOutcome.RESUMED
+
+        with patch.object(
+            _serve_deps_gating, "bound_gate_parts", lambda: object()
+        ), patch.object(_serve_gate_activation, "maybe_gate_build", _approve):
+            await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1  # launched
+        assert len(pool.cleared) == 1
+        cleared_build_id, cleared_at = pool.cleared[0]
+        assert cleared_build_id == "build-PRIOR"
+        assert cleared_at  # an ISO timestamp was supplied (clock hygiene)
+
+    @pytest.mark.asyncio
+    async def test_prior_breach_stands_on_gate_reject(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # Gate wired + TERMINAL (reject) → breach stands (not cleared), the
+        # build never launches, and the slot is acked.
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+        from forge.gating.wrappers import GateOutcome
+
+        acked = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(
+            profile="unattended", breach=("build-PRIOR", "wall_clock: x @ ts")
+        )
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=True
+        )
+
+        async def _reject(**kwargs: Any) -> Any:
+            return GateOutcome.CANCELLED
+
+        with patch.object(
+            _serve_deps_gating, "bound_gate_parts", lambda: object()
+        ), patch.object(_serve_gate_activation, "maybe_gate_build", _reject):
+            await dispatch(_budget_payload(), _ack)
+
+        assert starter.contexts == []  # never launched
+        assert pool.cleared == []  # breach stands
+        assert acked == [True]  # slot released
+
+    @pytest.mark.asyncio
+    async def test_no_prior_breach_gate_approve_does_not_clear(
+        self, forge_config: ForgeConfig
+    ) -> None:
+        # No breach + gate approve → launches, and clear is NEVER called.
+        from forge.cli import _serve_deps_gating, _serve_gate_activation
+        from forge.gating.wrappers import GateOutcome
+
+        starter = _RecordingBudgetStarter()
+        pool = _BudgetFakePool(profile="unattended", breach=None)
+        dispatch = _make_budget_dispatch_closure(
+            pool=pool, forge_config=forge_config, starter=starter, gated=True
+        )
+
+        async def _approve(**kwargs: Any) -> Any:
+            return GateOutcome.AUTO_APPROVED
+
+        with patch.object(
+            _serve_deps_gating, "bound_gate_parts", lambda: object()
+        ), patch.object(_serve_gate_activation, "maybe_gate_build", _approve):
+            await dispatch(_budget_payload(), _noop_ack)
+
+        assert len(starter.contexts) == 1
+        assert pool.cleared == []

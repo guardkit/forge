@@ -113,10 +113,44 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "BudgetBreachDispatchRefused",
     "build_pipeline_consumer_deps",
     "build_serve_resume_launcher",
     "is_terminal_status",
 ]
+
+
+class BudgetBreachDispatchRefused(RuntimeError):
+    """Raised by ``dispatch_build`` to REFUSE a breached re-queue with no gate.
+
+    FEAT-UBS-002 (Option-B, stage 3 — the pre-dispatch budget gate). When a
+    feature carries an un-cleared ``builds.budget_breach`` AND the TASK-GATE-D659
+    approval gate is soft-failed this boot (the legacy no-gate launch branch),
+    there is **no honest place a PAUSED state would be real** — the gate is the
+    one seam where PAUSED is genuine, and this lane never marks a row PAUSED it
+    cannot own (the honesty law). Rather than launch a fresh build that would
+    silently spend the same budget again, ``dispatch_build`` raises this; the
+    consumer's dispatch-error path
+    (:func:`forge.adapters.nats.pipeline_consumer.handle_message`, the
+    raise-before-transition convention) publishes a terminal ``build-failed``
+    carrying this reason and acks the JetStream slot. The operator rules, then
+    re-queues.
+
+    When the gate IS wired the breach is handled the honest way instead — the
+    build sits genuinely PAUSED at the approval gate and this is never raised.
+    """
+
+    def __init__(
+        self, *, feature_id: str, prior_build_id: str, breach_detail: str
+    ) -> None:
+        self.feature_id = feature_id
+        self.prior_build_id = prior_build_id
+        self.breach_detail = breach_detail
+        super().__init__(
+            f"budget breach not cleared for {feature_id} "
+            f"(prior build {prior_build_id}: {breach_detail}); refusing to "
+            "dispatch a fresh build without an approval gate to own the pause"
+        )
 
 
 #: Set of canonical ``builds.status`` string values that count as
@@ -611,6 +645,26 @@ def _build_dispatch_build(
         # None rather than blocking dispatch.
         budget_entry = _resolve_launch_budget(sqlite_pool, forge_config, build_id)
 
+        # FEAT-UBS-002 (Option-B, stage 3, GATE) — pre-dispatch breach gate.
+        # A feature whose PRIOR build hit a budget cap (an un-cleared
+        # ``builds.budget_breach``) must NOT quietly launch a fresh build that
+        # would spend the same budget over again. Read the feature's
+        # outstanding breach ONCE now, before the launch decision, so BOTH
+        # branches honour it. ``None`` — no prior breach, or one a human already
+        # cleared — is the common case and yields ZERO new behaviour: the
+        # byte-equivalent no-breach path this stage preserves. Enforcement then
+        # lives only where a state is HONEST: with the gate wired the build sits
+        # genuinely PAUSED at the approval gate (below), and an approve is the
+        # act that clears the breach; with the gate soft-failed there is no
+        # honest PAUSED seam, so a breach is REFUSED outright (never a fake
+        # pause). Note: today's degraded gate mandates human approval for EVERY
+        # dispatch (DF-009 "v1 never auto-approves"), so a breached re-queue on
+        # the wired path inherently pauses for a ruling; forcing a human ruling
+        # SPECIFICALLY for a breach even under a future auto-approve posture
+        # would need breach context threaded into the gate decision (a
+        # gate_check redesign, out of this lane's scope).
+        prior_breach = sqlite_pool.latest_breach_for_feature(payload.feature_id)
+
         # --- Pre-dispatch approval gate (TASK-GATE-D659, R1) -------------
         from forge.cli import _serve_deps_gating, _serve_gate_activation
 
@@ -619,6 +673,31 @@ def _build_dispatch_build(
             # Soft-fail: the approval seam is not wired (a v1.1 gate defect
             # must never brick v1 dispatch — see serve.py _compose). Fall
             # back to legacy no-gate launch so the build still runs.
+            if prior_breach is not None:
+                prior_build_id, breach_detail = prior_breach
+                # Stage-3 GATE, no-gate arm: the one seam where PAUSED is honest
+                # is unavailable this boot, and this lane never marks a row
+                # PAUSED it cannot own. A breached re-queue must not launch
+                # silently, so REFUSE loudly — raise; the consumer publishes a
+                # terminal build-failed (carrying this breach reason) and acks
+                # the slot (pipeline_consumer.handle_message raise-before-
+                # transition convention). The operator rules, then re-queues.
+                logger.error(
+                    "dispatch_build: feature_id=%s carries an un-cleared budget "
+                    "breach from build_id=%s (%s) and the approval gate is NOT "
+                    "wired this boot (new build_id=%s); REFUSING to launch a "
+                    "fresh build silently — no honest PAUSED seam is available "
+                    "(UBS-002 stage 3)",
+                    payload.feature_id,
+                    prior_build_id,
+                    breach_detail,
+                    build_id,
+                )
+                raise BudgetBreachDispatchRefused(
+                    feature_id=payload.feature_id,
+                    prior_build_id=prior_build_id,
+                    breach_detail=breach_detail,
+                )
             logger.warning(
                 "dispatch_build: approval gate not wired (parts=%s repo=%s "
                 "sm=%s) for build_id=%s; launching WITHOUT a gate (legacy)",
@@ -667,6 +746,25 @@ def _build_dispatch_build(
             # Approve / override / auto → R1 deferred observer registration
             # (adjacent to launch, so identity resolves the fresh run) then
             # launch the autobuild runner.
+            if prior_breach is not None:
+                prior_build_id, breach_detail = prior_breach
+                # Stage-3 GATE 'cleared' semantics: the gate APPROVED this
+                # re-queue — a human ruling — so approving the gated build IS
+                # the clearing act for the feature going forward. Annotate the
+                # prior build's breach CLEARED (history-preserving; the detected
+                # record stays) BEFORE launch so the feature's next re-queue is
+                # not re-gated on a breach a human has already ruled on. A gate
+                # TERMINAL instead (the else branch) leaves the breach standing.
+                sqlite_pool.clear_budget_breach(prior_build_id, clock().isoformat())
+                logger.info(
+                    "dispatch_build: gate APPROVED a re-queue of feature_id=%s "
+                    "which carried an un-cleared budget breach from build_id=%s "
+                    "(%s); cleared it (history retained) — the human ruling is "
+                    "the clearing act (UBS-002 stage 3)",
+                    payload.feature_id,
+                    prior_build_id,
+                    breach_detail,
+                )
             logger.info(
                 "dispatch_build: gate approved build_id=%s outcome=%s; "
                 "registering observer + launching autobuild",
@@ -687,6 +785,20 @@ def _build_dispatch_build(
             # Gate terminal (reject / expiry / hard-stop) — the build never
             # started; ack the slot so the next queued build proceeds and
             # never register the bridge observer.
+            if prior_breach is not None:
+                # Stage-3 GATE: the human did NOT approve the re-run, so the
+                # feature's outstanding breach STANDS (not cleared) — the next
+                # re-queue is gated again. Purely observational; the terminal
+                # ack below is unchanged.
+                logger.info(
+                    "dispatch_build: gate TERMINAL (outcome=%s) for a re-queue "
+                    "of feature_id=%s carrying an un-cleared budget breach from "
+                    "build_id=%s; the breach STANDS (not cleared) (UBS-002 "
+                    "stage 3)",
+                    outcome.value,
+                    payload.feature_id,
+                    prior_breach[0],
+                )
             logger.info(
                 "dispatch_build: gate terminal build_id=%s outcome=%s; "
                 "acking slot, not launching",
