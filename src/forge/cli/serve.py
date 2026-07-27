@@ -344,7 +344,53 @@ def bind_production_dispatch_chain(
         register_ack_handle: Any = None
         terminal_publish_ledger: Any = None
         if bridge_wireup_parts is not None:
+            from forge.adapters.nats.approval_publisher import (
+                AGENT_ID as _approval_agent_id,
+            )
+            from forge.adapters.nats.approval_publisher import ApprovalPublisher
+            from forge.lifecycle_bridge.budget_observer import (
+                build_budget_breach_observer,
+            )
             from forge.lifecycle_bridge.wireup import LifecycleBridgeWireup
+            from nats_core.envelope import EventType, MessageEnvelope
+
+            # FEAT-UBS-002 stage 3 — wire the mid-run budget-breach observer
+            # into the bridge so a running build's ``stage-complete`` envelopes
+            # are budget-checked; without it ``builds.budget_breach`` is never
+            # written and the pre-dispatch gate can never fire. The six read /
+            # record / resolve collaborators are composed by
+            # ``build_budget_breach_observer`` from the serve reuse helpers (the
+            # module's documented production-composition path); only the
+            # approval re-emit is supplied here.
+            #
+            # ``publish_approval_request`` reuses the canonical
+            # :class:`ApprovalPublisher` — the same approval-publish
+            # implementation the D659/JNB gate path uses. The observer hands an
+            # ``ApprovalRequestPayload``, so this thin ``(payload, subject)``
+            # adapter wraps it in the approval envelope and calls
+            # ``publish_request``, which resolves the subject from
+            # ``details.build_id`` — byte-identical to the subject the observer
+            # itself computed (same template, ``project=None``), so the passed
+            # ``subject`` is redundant. A co-instance (not the gate parts'
+            # publisher) because the gate parts are composed later in this
+            # closure; ``ApprovalPublisher`` is a stateless wrapper over the
+            # shared client, so the co-instance is behaviourally identical.
+            _budget_approval_publisher = ApprovalPublisher(nats_client=client)
+
+            async def _publish_budget_approval(payload: Any, _subject: str) -> None:
+                await _budget_approval_publisher.publish_request(
+                    MessageEnvelope(
+                        source_id=_approval_agent_id,
+                        event_type=EventType.APPROVAL_REQUEST,
+                        payload=payload.model_dump(mode="json"),
+                    )
+                )
+
+            budget_observer = build_budget_breach_observer(
+                pool=sqlite_pool,
+                config=forge_config,
+                publish_approval_request=_publish_budget_approval,
+            )
 
             wireup = LifecycleBridgeWireup(
                 bridge=bridge_wireup_parts.bridge,
@@ -355,6 +401,7 @@ def bind_production_dispatch_chain(
                 run_state_fetcher=bridge_wireup_parts.run_state_fetcher,
                 build_state_recorder=bridge_wireup_parts.build_state_recorder,
                 build_id_resolver=bridge_wireup_parts.build_id_resolver,
+                budget_observer=budget_observer,
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger

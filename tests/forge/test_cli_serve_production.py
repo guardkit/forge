@@ -934,6 +934,108 @@ class TestLifecycleBridgeWireupComposition:
             "— Gap PEBR-WIREUP regression"
         )
 
+    @pytest.mark.asyncio
+    async def test_compose_wires_budget_breach_observer_into_wireup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """FEAT-UBS-002 stage-3 production-wiring seam.
+
+        The mid-run budget-breach observer is fully built + tested and
+        :class:`LifecycleBridgeWireup` accepts ``budget_observer=``, but the
+        production ``_compose`` site did NOT pass it — so the observer
+        defaulted to ``None`` and mid-run breach detection was dark in
+        production (``builds.budget_breach`` never written; the stage-3
+        pre-dispatch gate never fired). This pins that ``_compose`` composes a
+        NON-None :class:`BudgetBreachObserver` wired with the REAL serve
+        collaborators (the pool's own ``record_budget_breach`` /
+        ``read_last_coach_score`` bound methods plus the approval re-emit
+        adapter) and threads it into the wireup. It is the production-wiring
+        test class the Supervisor lesson already taught once.
+        """
+        from types import SimpleNamespace
+
+        from forge.adapters.sqlite import connect as sqlite_connect
+        from forge.cli import _serve_daemon
+        from forge.cli import _serve_deps_gating
+        from forge.cli import serve as serve_module
+        from forge.config.models import ForgeConfig
+        from forge.lifecycle import migrations
+        from forge.lifecycle.persistence import SqliteLifecyclePersistence
+        from forge.lifecycle_bridge.budget_observer import BudgetBreachObserver
+
+        # Capturing stand-in for the wireup — records the constructor kwargs
+        # so we can inspect the ``budget_observer`` the composer injected. The
+        # local ``from ...wireup import LifecycleBridgeWireup`` inside _compose
+        # resolves this replacement at call time.
+        captured: dict[str, Any] = {}
+
+        class _CapturingWireup:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+                self.register_ack_handle = object()
+
+        monkeypatch.setattr(
+            "forge.lifecycle_bridge.wireup.LifecycleBridgeWireup",
+            _CapturingWireup,
+        )
+
+        cx = sqlite_connect.connect_writer(tmp_path / "forge.db")
+        try:
+            migrations.apply_at_boot(cx)
+            pool = SqliteLifecyclePersistence(connection=cx)
+            config = ForgeConfig.model_validate(
+                {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
+            )
+            client = MagicMock(name="nats-client")
+
+            # The wireup is captured, so the SQLite-bound parts are only passed
+            # through — sentinels are sufficient. The guard under test is the
+            # ``bridge_wireup_parts is not None`` branch that gates the wireup.
+            parts = SimpleNamespace(
+                bridge=object(),
+                translator=object(),
+                stream_source=object(),
+                identity_provider=object(),
+                run_state_fetcher=object(),
+                build_state_recorder=object(),
+                build_id_resolver=object(),
+                terminal_publish_ledger=object(),
+            )
+
+            previous_dispatch = _serve_daemon.dispatch_payload
+            try:
+                compose = serve_module.bind_production_dispatch_chain(
+                    forge_config=config,
+                    sqlite_pool=pool,
+                    bridge_wireup_parts=parts,
+                )
+                await compose(client)
+            finally:
+                _serve_daemon.dispatch_payload = previous_dispatch
+                _serve_deps_gating._reset_for_tests()
+
+            observer = captured["budget_observer"]
+            assert observer is not None, (
+                "the wireup received budget_observer=None — mid-run budget "
+                "breach detection is dark in production (FEAT-UBS-002 stage-3 "
+                "wiring gap)"
+            )
+            assert isinstance(observer, BudgetBreachObserver)
+            # Wired with the REAL serve collaborators, not fakes: the record
+            # + coach-score readers are the pool's own bound methods.
+            assert observer._record_breach == pool.record_budget_breach
+            assert observer._read_coach_score == pool.read_last_coach_score
+            # The approval re-emit is the ApprovalPublisher-backed adapter,
+            # and the resolve / elapsed / clock collaborators are all wired.
+            assert callable(observer._publish_approval_request)
+            assert callable(observer._resolve_budget)
+            assert callable(observer._elapsed_seconds)
+            assert callable(observer._clock)
+        finally:
+            cx.close()
+
     def test_bind_production_serve_creates_lifecycle_bridge_registry_table(
         self,
         monkeypatch: pytest.MonkeyPatch,
