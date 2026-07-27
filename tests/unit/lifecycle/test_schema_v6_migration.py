@@ -64,9 +64,16 @@ def _insert_build(
 
 
 def test_fresh_db_migrates_to_version_6(tmp_path: Path) -> None:
+    # Pin the migration head at v6 so this v6-specific test stays robust to
+    # later additive bumps (v7+); the runner otherwise advances to the newest.
     cx = sqlite_connect.connect_writer(tmp_path / "fresh.db")
     try:
-        assert migrations.apply_at_boot(cx) == 6
+        original = migrations._MIGRATIONS
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 6)
+        try:
+            assert migrations.apply_at_boot(cx) == 6
+        finally:
+            migrations._MIGRATIONS = original
     finally:
         cx.close()
 
@@ -139,8 +146,13 @@ def test_v5_upgrade_adds_column_old_rows_read_null(tmp_path: Path) -> None:
         _insert_build(cx, "legacy-1")
         cx.commit()
 
-        # Upgrade to v6.
-        assert migrations.apply_at_boot(cx) == 6
+        # Upgrade to v6 (pin the head at v6 so a later bump does not perturb
+        # this v6-specific upgrade assertion).
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 6)
+        try:
+            assert migrations.apply_at_boot(cx) == 6
+        finally:
+            migrations._MIGRATIONS = original
         assert "last_coach_score" in _column_names(cx, "builds")
 
         # The pre-existing row reads back NULL (backward-compatible default).
@@ -199,7 +211,11 @@ def test_fresh_and_upgraded_builds_columns_converge(tmp_path: Path) -> None:
 
 
 def test_v6_migration_is_idempotent(tmp_path: Path) -> None:
+    # Pin the migration head at v6 so this v6-specific idempotency test stays
+    # robust to later additive bumps (v7+).
     cx = sqlite_connect.connect_writer(tmp_path / "idem.db")
+    original = migrations._MIGRATIONS
+    migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 6)
     try:
         assert migrations.apply_at_boot(cx) == 6
         _insert_build(cx, "keep", score=0.5)
@@ -218,4 +234,5 @@ def test_v6_migration_is_idempotent(tmp_path: Path) -> None:
         ).fetchone()[0]
         assert n == 1
     finally:
+        migrations._MIGRATIONS = original
         cx.close()

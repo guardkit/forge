@@ -36,12 +36,15 @@ from typing import Final
 # TASK-UBS-002-integration to add the additive ``builds.profile`` column
 # carrying the ``forge queue --profile`` selection to the daemon; bumped to
 # 6 to add the additive ``builds.last_coach_score`` column so the UBS1C coach
-# score survives the run for the ``min_coach_score`` budget floor. Future
+# score survives the run for the ``min_coach_score`` budget floor; bumped to 7
+# in FEAT-UBS-002 stage 2 (DETECT) to add the additive ``builds.budget_breach``
+# column — the serve-daemon observer's HONEST record of a mid-run budget cap
+# breach (first-write-wins; never a status change). Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 6
+_SCHEMA_VERSION: Final[int] = 7
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -49,6 +52,7 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (4, "schema_v4.sql"),
     (5, "schema_v5.sql"),
     (6, "schema_v6.sql"),
+    (7, "schema_v7.sql"),
 )
 
 
