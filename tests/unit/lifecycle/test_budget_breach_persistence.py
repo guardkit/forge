@@ -172,3 +172,89 @@ def test_latest_breach_for_feature_empty_id_raises(
 ) -> None:
     with pytest.raises(ValueError, match="feature_id"):
         persistence.latest_breach_for_feature("")
+
+
+# ---------------------------------------------------------------------------
+# clear_budget_breach (stage-3 GATE — history-preserving clear)
+# ---------------------------------------------------------------------------
+
+
+def test_clear_annotates_history_and_hides_from_enforcement(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    _insert_build(persistence, "b-1", feature_id="FEAT-A")
+    persistence.record_budget_breach("b-1", "wall_clock: 3712.0s > 3600.0s @ ts")
+    assert persistence.latest_breach_for_feature("FEAT-A") == (
+        "b-1",
+        "wall_clock: 3712.0s > 3600.0s @ ts",
+    )
+
+    persistence.clear_budget_breach("b-1", "2026-07-27T10:00:00+00:00")
+
+    # History stays in the column (detected record + the clear annotation)...
+    detail = persistence.read_budget_breach("b-1")
+    assert detail is not None
+    assert detail.startswith("wall_clock: 3712.0s > 3600.0s @ ts")
+    assert "(cleared @ 2026-07-27T10:00:00+00:00)" in detail
+    # ...but a cleared breach is no longer an ACTIVE breach for enforcement.
+    assert persistence.latest_breach_for_feature("FEAT-A") is None
+
+
+def test_clear_is_idempotent(persistence: SqliteLifecyclePersistence) -> None:
+    _insert_build(persistence, "b-1", feature_id="FEAT-A")
+    persistence.record_budget_breach("b-1", "wall_clock: x @ ts")
+    persistence.clear_budget_breach("b-1", "2026-07-27T10:00:00+00:00")
+    first = persistence.read_budget_breach("b-1")
+
+    # A redelivered / re-armed approve must not double-append the marker.
+    persistence.clear_budget_breach("b-1", "2026-07-27T11:11:11+00:00")
+    assert persistence.read_budget_breach("b-1") == first
+
+
+def test_clear_is_status_preserving(persistence: SqliteLifecyclePersistence) -> None:
+    _insert_build(persistence, "b-1", feature_id="FEAT-A", status="RUNNING")
+    persistence.record_budget_breach("b-1", "wall_clock: x @ ts")
+    persistence.clear_budget_breach("b-1", "2026-07-27T10:00:00+00:00")
+    assert _raw_status(persistence, "b-1") == BuildState.RUNNING.value
+
+
+def test_clear_no_breach_is_quiet_noop(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    _insert_build(persistence, "b-1", feature_id="FEAT-A")
+    # A build with no breach → zero rows updated, no raise, still clean.
+    persistence.clear_budget_breach("b-1", "2026-07-27T10:00:00+00:00")
+    assert persistence.read_budget_breach("b-1") is None
+
+
+def test_clear_missing_build_is_quiet_noop(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    persistence.clear_budget_breach("ghost", "2026-07-27T10:00:00+00:00")
+    assert persistence.read_budget_breach("ghost") is None
+
+
+def test_clear_empty_id_raises(persistence: SqliteLifecyclePersistence) -> None:
+    with pytest.raises(ValueError, match="build_id"):
+        persistence.clear_budget_breach("", "2026-07-27T10:00:00+00:00")
+
+
+def test_latest_breach_surfaces_older_active_when_newer_cleared(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    # Newer build's breach was cleared; an older build still carries an active
+    # breach → the reader surfaces the older ACTIVE breach.
+    _insert_build(
+        persistence, "b-old", feature_id="FEAT-A", queued_at="2026-01-01T00:00:00Z"
+    )
+    _insert_build(
+        persistence, "b-new", feature_id="FEAT-A", queued_at="2026-02-01T00:00:00Z"
+    )
+    persistence.record_budget_breach("b-old", "wall_clock: old @ ts")
+    persistence.record_budget_breach("b-new", "coach_score: new @ ts")
+    persistence.clear_budget_breach("b-new", "2026-07-27T10:00:00+00:00")
+
+    assert persistence.latest_breach_for_feature("FEAT-A") == (
+        "b-old",
+        "wall_clock: old @ ts",
+    )
