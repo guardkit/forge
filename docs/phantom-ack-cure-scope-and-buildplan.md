@@ -34,10 +34,14 @@
 
 ### The discriminator (the load-bearing idea)
 
-With `max_ack_pending=1` the ack-pending set is a singleton and its stream sequence is
-recoverable from `consumer_info` alone: `pending_seq = ack_floor.stream_seq + 1`
-(`ConsumerInfo.delivered`/`.ack_floor` are `SequenceInfo{stream_seq,...}`,
-`nats/js/api.py:650/668`; all fields Optional — guard None). Then:
+With `max_ack_pending=1` the ack-pending set is a singleton — the single outstanding
+message is exactly the LAST-DELIVERED one, so `pending_seq = delivered.stream_seq`
+(`ConsumerInfo.delivered` is `SequenceInfo{stream_seq,...}`, `nats/js/api.py:650/668`;
+Optional — guard None. NOT `ack_floor+1`: on the multi-subject PIPELINE stream the
+sequences between the floor and the delivered watermark belong to other subjects'
+consumed messages — live-proven 2026-07-27 when a gate-paused build held seq 653 while
+`ack_floor+1`=649 was a consumed foreign message already gone; the +1 formula would
+have cured a legitimate hold). Then:
 
 - `js.get_msg('PIPELINE', seq=pending_seq)` **succeeds** → the held message still
   exists → a LEGITIMATE long-held ack (an in-flight or redeliverable build). NEVER
