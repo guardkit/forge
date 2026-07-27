@@ -259,6 +259,7 @@ def _build_resume_launcher(
         correlation_id: str | None,
         branch: str | None = None,
         repo: str | None = None,
+        budget: dict[str, Any] | None = None,
     ) -> Any:
         if async_task_starter is None:
             raise RuntimeError(
@@ -272,6 +273,11 @@ def _build_resume_launcher(
         # the boot-rearm resume path restores the row from SQLite and has no
         # payload in scope, so they default to None and the launch stays
         # byte-compatible with the pre-fix shape).
+        #
+        # FEAT-UBS-002 (Option-B, stage 1): ``budget`` rides the same one-hop
+        # provenance. The live dispatch path resolves it from ``builds.profile``
+        # and passes it; the boot-rearm resume path leaves it None (a resume is
+        # not a fresh launch) so the resume bytes stay byte-compatible too.
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -283,6 +289,7 @@ def _build_resume_launcher(
             lifecycle_emitter=lifecycle_emitter,
             branch=branch,
             repo=repo,
+            budget=budget,
         )
 
     return launch
@@ -362,6 +369,56 @@ def _read_build_status(
     return BuildState(raw)
 
 
+def _resolve_launch_budget(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: Any,
+    build_id: str,
+) -> dict[str, Any] | None:
+    """Resolve the compact per-build budget entry for the launch payload.
+
+    FEAT-UBS-002 (Option-B, stage 1 — the run bounds ITSELF). Reads the build's
+    resolved :class:`BudgetGuards` via :func:`resolve_budget_for_build`
+    (``builds.profile`` → ``config.budget.resolve``) and, when the profile has
+    caps enabled AND a wall-clock cap is set, returns the compact
+    ``{"max_wallclock_seconds", "profile_name"}`` dict that rides the launch
+    payload to the runner. The runner takes the MINIMUM of that cap and its
+    env/default subprocess timeout, so a profile can only TIGHTEN the existing
+    bound, never loosen it, and its ``proc.kill`` on expiry is the honest hard
+    stop (this lane never marks a still-running row PAUSED/CANCELLED).
+
+    Returns ``None`` for an attended / NULL profile (caps off, ASSUM-010), a
+    missing ``forge_config``, or a profile whose only caps are non-wall-clock —
+    so the launch payload stays BYTE-EQUIVALENT with the pre-budget shape, the
+    caps-off no-op invariant this whole lane preserves at every stage.
+
+    Only ``max_build_wallclock_seconds`` is carried: it is the ONLY cap
+    honestly enforceable on this live pipeline-consumer path.
+    ``max_review_cycles`` push-in is out of scope (per-task ``--max-turns`` vs
+    whole-build semantic mismatch, coordinator-parked) and ``max_build_tokens``
+    is UNMEASURED here — neither rides the payload, so this entry never implies
+    an enforceability the runner cannot deliver.
+    """
+    if forge_config is None:
+        return None
+    # Local import: the pure resolve helper lives in ``forge.cli.serve``, which
+    # imports this module inside its own composer closures — a module-level
+    # import here would risk an import cycle at CLI ``--help`` load time.
+    from forge.cli.serve import resolve_budget_for_build
+
+    guards, profile_name = resolve_budget_for_build(
+        sqlite_pool, forge_config, build_id
+    )
+    if not guards.caps_enabled:
+        return None
+    wallclock = guards.max_build_wallclock_seconds
+    if wallclock is None:
+        return None
+    return {
+        "max_wallclock_seconds": int(wallclock),
+        "profile_name": profile_name,
+    }
+
+
 def _build_dispatch_build(
     sqlite_pool: SqliteLifecyclePersistence,
     forward_context_builder: Any,
@@ -370,6 +427,7 @@ def _build_dispatch_build(
     lifecycle_emitter: Any,
     async_task_starter: AsyncTaskStarter | None,
     *,
+    forge_config: Any = None,
     gate_repository: Any = None,
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
@@ -543,6 +601,16 @@ def _build_dispatch_build(
                 )
                 return
 
+        # FEAT-UBS-002 (Option-B, stage 1) — resolve the per-build budget entry
+        # ONCE now that ``build_id`` is final (freshly recorded or re-derived on
+        # the runless re-dispatch arm above), so BOTH launch branches — the
+        # legacy no-gate launch and the gate-approved launch — attach the SAME
+        # compact budget dict to the launch payload. Attended / NULL profile →
+        # None (byte-equivalent launch, ASSUM-010). Resolve is fail-open: the
+        # helper reads the just-persisted row; an unresolvable profile yields
+        # None rather than blocking dispatch.
+        budget_entry = _resolve_launch_budget(sqlite_pool, forge_config, build_id)
+
         # --- Pre-dispatch approval gate (TASK-GATE-D659, R1) -------------
         from forge.cli import _serve_deps_gating, _serve_gate_activation
 
@@ -567,6 +635,7 @@ def _build_dispatch_build(
                 correlation_id=payload.correlation_id,
                 branch=payload.branch,
                 repo=payload.repo,
+                budget=budget_entry,
             )
             return
 
@@ -612,6 +681,7 @@ def _build_dispatch_build(
                 correlation_id=payload.correlation_id,
                 branch=payload.branch,
                 repo=payload.repo,
+                budget=budget_entry,
             )
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
@@ -896,6 +966,7 @@ def build_pipeline_consumer_deps(
         state_channel=state_channel,
         lifecycle_emitter=emitter,
         async_task_starter=async_task_starter,
+        forge_config=forge_config,
         gate_repository=gate_repository,
         gate_state_machine=gate_state_machine,
         gate_clock=gate_clock,

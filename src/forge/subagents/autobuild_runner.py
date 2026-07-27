@@ -1386,6 +1386,36 @@ def _resolve_autobuild_timeout_seconds() -> float:
     return parsed
 
 
+def _resolve_budget_wallclock_seconds(payload: Mapping[str, Any]) -> float | None:
+    """Extract the per-build wall-clock budget cap from the launch payload.
+
+    FEAT-UBS-002 (Option-B, stage 1 — the run bounds ITSELF). The serve-side
+    dispatch attaches ``payload["budget"] = {"max_wallclock_seconds", ...}``
+    only when the resolved profile carries a wall-clock cap (an unattended
+    profile). The caller MIN()s this against the env/default subprocess timeout
+    so a profile can only TIGHTEN the bound; on expiry the existing
+    ``proc.kill`` + failed-terminal path is the honest hard stop.
+
+    Returns the positive cap in seconds, or ``None`` when the ``budget`` entry
+    is absent / malformed / non-positive — in which case the caller keeps the
+    env/default timeout unchanged, so an attended / NULL-profile build behaves
+    byte-equivalently to the pre-budget path.
+    """
+    budget = payload.get("budget")
+    if not isinstance(budget, Mapping):
+        return None
+    raw = budget.get("max_wallclock_seconds")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
+
+
 # ---------------------------------------------------------------------------
 # Branch-aware isolated worktrees (DEFECT #19, B4 round-17)
 # ---------------------------------------------------------------------------
@@ -1857,7 +1887,22 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             repo_path,
         )
 
+    # FEAT-UBS-002 (Option-B, stage 1) — the env/default subprocess timeout is
+    # the ceiling; a per-build budget wall-clock cap may only TIGHTEN it. Take
+    # the MIN so a profile can never LOOSEN the existing bound. When the budget
+    # cap is the strictly-binding one, remember it so the timeout-failure reason
+    # names the cap (the honest boundary: on expiry the subprocess is genuinely
+    # killed below — this lane never claims a stop it did not effect).
     timeout_seconds = _resolve_autobuild_timeout_seconds()
+    budget_wallclock = _resolve_budget_wallclock_seconds(payload)
+    budget_bound = False
+    budget_profile: Any = None
+    if budget_wallclock is not None and budget_wallclock < timeout_seconds:
+        timeout_seconds = budget_wallclock
+        budget_bound = True
+        budget_meta = payload.get("budget")
+        if isinstance(budget_meta, Mapping):
+            budget_profile = budget_meta.get("profile_name")
     argv: list[str] = [
         str(guardkit_path),
         "autobuild",
@@ -1955,11 +2000,18 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # guardkit rather than reimplementing its feature-file discovery, and
         # surface it here as a loud failure that KEEPS the worktree so the
         # exact tree is inspectable (DEFECT #19).
-        reason = (
-            f"guardkit autobuild timed out after {timeout_seconds}s"
-            if timed_out
-            else f"guardkit autobuild exit={exit_code}"
-        )
+        if timed_out and budget_bound:
+            # FEAT-UBS-002 — the per-build budget cap (not the env default) was
+            # the binding bound, so name it in the honest failure reason.
+            reason = (
+                f"guardkit autobuild exceeded the budget wall-clock cap of "
+                f"{timeout_seconds}s (profile={budget_profile!r}) — killed "
+                "(UBS-002)"
+            )
+        elif timed_out:
+            reason = f"guardkit autobuild timed out after {timeout_seconds}s"
+        else:
+            reason = f"guardkit autobuild exit={exit_code}"
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
