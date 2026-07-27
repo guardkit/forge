@@ -927,6 +927,62 @@ class SqliteLifecyclePersistence:
             raise
 
     # ------------------------------------------------------------------
+    # Write API — record_budget_breach (FEAT-UBS-002 stage 2, DETECT)
+    # ------------------------------------------------------------------
+
+    def record_budget_breach(self, build_id: str, detail: str) -> None:
+        """Land the daemon's HONEST record of a mid-run budget cap breach.
+
+        Write side of the budget-breach store (``schema_v7.sql``). The
+        ``forge serve`` lifecycle-bridge observer calls this on the FIRST cap
+        breach it detects for a build, with ``detail`` a compact human-readable
+        one-liner (e.g. ``wall_clock: 3712.0s > 3600.0s @ <iso-ts>``).
+
+        **First-write-wins** — the UPDATE carries ``AND budget_breach IS NULL``
+        so a *later* breach never overwrites the first, mirroring
+        :func:`forge.pipeline.budget_guard.evaluate_budget`'s first-breach-wins
+        ordering. A build that has already recorded a breach (or does not
+        exist) matches zero rows and is a quiet no-op.
+
+        This is a **status-preserving** UPDATE of ``budget_breach`` alone — it
+        never touches ``status``, honouring the honesty law of this lane: the
+        daemon records what it *detected*, it does not claim (pause / cancel) a
+        state it did not effect. ``apply_transition`` remains the sole
+        ``builds.status`` writer.
+
+        Args:
+            build_id: The build whose first budget breach is being recorded.
+            detail: Compact human-readable breach record (cap, measurement vs
+                cap, ISO-8601 timestamp).
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+            sqlite3.Error: For any database error. The transaction is rolled
+                back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("record_budget_breach: build_id must be non-empty")
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET budget_breach = ?
+                 WHERE build_id = ?
+                   AND budget_breach IS NULL
+                """,
+                (detail, build_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
     # Write API — mark_paused
     # ------------------------------------------------------------------
 
@@ -1261,6 +1317,86 @@ class SqliteLifecyclePersistence:
             return None
         value = row["last_coach_score"] if isinstance(row, sqlite3.Row) else row[0]
         return float(value) if value is not None else None
+
+    # ------------------------------------------------------------------
+    # Read API — read_budget_breach (FEAT-UBS-002 stage 2, DETECT)
+    # ------------------------------------------------------------------
+
+    def read_budget_breach(self, build_id: str) -> str | None:
+        """Return the build's recorded budget-breach detail, or ``None``.
+
+        Read side of the budget-breach store (``schema_v7.sql``). Returns the
+        ``builds.budget_breach`` string written by :meth:`record_budget_breach`
+        (the first breach detected for the build — first-write-wins), or
+        ``None`` when the build recorded no breach (a clean run, or a
+        historical row that pre-dates the column).
+
+        Args:
+            build_id: The build whose breach record is being read.
+
+        Returns:
+            The recorded breach detail as a ``str``, or ``None`` if unset or
+            the build does not exist.
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+        """
+        if not build_id:
+            raise ValueError("read_budget_breach: build_id must be non-empty")
+        with self._reader() as cx:
+            row = cx.execute(
+                "SELECT budget_breach FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["budget_breach"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(value) if value is not None else None
+
+    # ------------------------------------------------------------------
+    # Read API — latest_breach_for_feature (stage-3 pre-dispatch gate)
+    # ------------------------------------------------------------------
+
+    def latest_breach_for_feature(self, feature_id: str) -> tuple[str, str] | None:
+        """Return the most recent breach-carrying build for ``feature_id``.
+
+        The stage-3 pre-dispatch gate consults this to decide whether the
+        feature's last attempt already hit a budget cap (so a re-queue should
+        pause for approval rather than silently spending the budget again).
+        Scans the feature's ``builds`` rows, newest first by ``queued_at``, and
+        returns the ``(build_id, budget_breach)`` of the first row carrying a
+        non-NULL breach record, or ``None`` when no build of the feature ever
+        recorded one.
+
+        Args:
+            feature_id: The feature whose builds are scanned.
+
+        Returns:
+            ``(build_id, detail)`` for the most recent breach-carrying build,
+            or ``None`` if the feature has no recorded breach.
+
+        Raises:
+            ValueError: If ``feature_id`` is empty.
+        """
+        if not feature_id:
+            raise ValueError("latest_breach_for_feature: feature_id must be non-empty")
+        with self._reader() as cx:
+            row = cx.execute(
+                """
+                SELECT build_id, budget_breach
+                  FROM builds
+                 WHERE feature_id = ?
+                   AND budget_breach IS NOT NULL
+                 ORDER BY queued_at DESC, build_id DESC
+                 LIMIT 1
+                """,
+                (feature_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, sqlite3.Row):
+            return (str(row["build_id"]), str(row["budget_breach"]))
+        return (str(row[0]), str(row[1]))
 
     # ------------------------------------------------------------------
     # Read API — read_stages

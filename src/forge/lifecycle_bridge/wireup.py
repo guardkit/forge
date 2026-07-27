@@ -69,7 +69,15 @@ import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Protocol,
+)
 
 from nats_core.events import (
     BuildCancelledPayload,
@@ -98,6 +106,12 @@ from forge.lifecycle_bridge.translation import (
     VALUES_STREAM_EVENT,
 )
 from forge.pipeline.build_ack_handle import BuildAckHandle
+
+if TYPE_CHECKING:  # pragma: no cover - import-time only
+    from forge.lifecycle_bridge.budget_observer import (
+        BudgetBreachObserver,
+        BudgetObserverSession,
+    )
 
 
 def _build_transient_stream_errors() -> tuple[type[BaseException], ...]:
@@ -435,6 +449,7 @@ class LifecycleBridgeWireup:
         shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         clock: Callable[[], datetime] | None = None,
         build_id_resolver: "BuildIdResolver | None" = None,
+        budget_observer: "BudgetBreachObserver | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -484,6 +499,19 @@ class LifecycleBridgeWireup:
         # identity-unresolved build-failed. ``None`` (unit tiers) falls back
         # to feature_id; production wires a SQLite reader.
         self._build_id_resolver = build_id_resolver
+        # FEAT-UBS-002 stage 2 (DETECT) — mid-run budget-breach detector.
+        # ``None`` (the default, and every attended / caps-off deployment) makes
+        # the observer's budget hook a strict no-op: zero extra DB / publish
+        # calls, byte-identical to the pre-lane observer. When wired, the hook
+        # evaluates the budget after each published ``stage-complete`` and, on
+        # the first breach, RECORDS + ESCALATES without ever pausing / cancelling
+        # / rewriting ``builds.status`` (the honesty law of this lane).
+        self._budget_observer = budget_observer
+        # Per-feature budget-detection state (one session per observer task).
+        # Created at observer start when a detector is wired, dropped in the
+        # observer's ``finally`` — so the review-cycle count resets on bridge
+        # restart (documented in budget_observer).
+        self._budget_sessions: dict[str, "BudgetObserverSession"] = {}
         # Per-feature observer tasks. Keyed on ``feature_id`` (AC-5);
         # supervisor queries answered from the bridge's in-memory dict
         # never traverse this map.
@@ -659,6 +687,11 @@ class LifecycleBridgeWireup:
         """
         feature_id = context.feature_id
         correlation_id = context.correlation_id
+        # FEAT-UBS-002 stage 2 — open a fresh per-observer budget-detection
+        # session when a detector is wired. In-memory only: a bridge restart
+        # starts a fresh session (the review-cycle count resets by design).
+        if self._budget_observer is not None:
+            self._budget_sessions[feature_id] = self._budget_observer.new_session()
         try:
             identity = await self._wait_for_identity(feature_id)
             if identity is None:
@@ -774,6 +807,9 @@ class LifecycleBridgeWireup:
             # registration for the same feature_id can succeed.
             self._observers.pop(feature_id, None)
             self._handles.pop(feature_id, None)
+            # Drop the per-observer budget session (in-memory state does not
+            # outlive the observer — FEAT-UBS-002 stage 2).
+            self._budget_sessions.pop(feature_id, None)
 
     # ------------------------------------------------------------------
     # SSE consumption with reconnect (TASK-FRR-PEB-008 AC-2 / AC-4)
@@ -1261,6 +1297,14 @@ class LifecycleBridgeWireup:
             if event is None:
                 continue
             published_ok = await self._publish_event(event, feature_id)
+            # FEAT-UBS-002 stage 2 (DETECT) — evaluate the budget AFTER the
+            # non-terminal publish. Only StageCompletePayload advances a build's
+            # budget consumption; the hook records + escalates a breach but
+            # never changes the stream's control flow (it does not pause /
+            # cancel / short-circuit the loop). Strict no-op when no detector is
+            # wired (caps-off byte-equivalence).
+            if isinstance(event, StageCompletePayload):
+                await self._observe_budget(event, feature_id)
             if isinstance(event, TERMINAL_PAYLOAD_TYPES):
                 if published_ok:
                     terminal_seen = True
@@ -1288,6 +1332,44 @@ class LifecycleBridgeWireup:
                 )
                 return (False, False)
         return (terminal_seen, True)
+
+    # ------------------------------------------------------------------
+    # Budget-breach detection (FEAT-UBS-002 stage 2)
+    # ------------------------------------------------------------------
+
+    async def _observe_budget(
+        self, event: StageCompletePayload, feature_id: str
+    ) -> None:
+        """Feed a published ``stage-complete`` to the budget detector.
+
+        Fully exception-guarded: a budget bug must NEVER break the lifecycle
+        stream — the bridge is more load-bearing than enforcement. On any
+        failure the observer logs loudly and continues; the run reaches its own
+        bounded terminal and the F6 contracts stand. A strict no-op when no
+        detector is wired or no session exists (caps-off byte-equivalence).
+        """
+        observer = self._budget_observer
+        if observer is None:
+            return
+        session = self._budget_sessions.get(feature_id)
+        if session is None:
+            return
+        try:
+            await observer.observe_stage_complete(
+                session,
+                build_id=event.build_id,
+                feature_id=feature_id,
+                coach_score=event.coach_score,
+            )
+        except Exception as exc:  # noqa: BLE001 — enforcement must not break the stream
+            logger.error(
+                "wireup._observe_budget: budget detector raised (%s) for "
+                "feature_id=%s build_id=%s; observer continues (the lifecycle "
+                "stream is more load-bearing than budget enforcement) (UBS-002)",
+                exc,
+                feature_id,
+                getattr(event, "build_id", None),
+            )
 
     # ------------------------------------------------------------------
     # Publisher dispatch
