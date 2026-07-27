@@ -101,6 +101,9 @@ def _js_for_status(status: str) -> AsyncMock:
         js.consumer_info.return_value = _FakeConsumerInfo(
             num_ack_pending=1, num_waiting=1, num_pending=0, ack_floor=None
         )
+    elif status == "absent":
+        # Durable does not exist ⇒ consumer_info raises NotFoundError.
+        js.consumer_info.side_effect = NotFoundError()
     else:  # pragma: no cover - guard
         raise ValueError(status)
     return js
@@ -155,11 +158,15 @@ class TestAckWatchdogInterval:
 
 class TestAckSlotBootCheck:
     @pytest.mark.asyncio
-    async def test_phantom_is_cured_and_reverified_healthy(self) -> None:
-        # consumer_info: 1st call (detection) ⇒ occupied/phantom; 2nd call
-        # (re-inspect after the cure delete) ⇒ healthy.
+    async def test_phantom_is_cured_and_reverify_reads_absent(self) -> None:
+        # PRODUCTION TRUTH (coordinator-review regression pin): after the cure
+        # deletes the durable, the re-inspect's consumer_info raises
+        # NotFoundError — the consumer is GONE. inspect_ack_slot must classify
+        # that as "absent" (cured success: no consumer ⇒ no ack slot), NOT
+        # fall into the generic error branch as "unknown" (which made a real
+        # cure impossible to verify — the mocked-healthy re-inspect masked it).
         js = AsyncMock()
-        js.consumer_info.side_effect = [_info_occupied(41), _info_healthy()]
+        js.consumer_info.side_effect = [_info_occupied(41), NotFoundError()]
         js.get_msg.side_effect = NotFoundError()  # detection probe ⇒ phantom
         client = _client_with_js(js)
         state = SubscriptionState()
@@ -171,8 +178,38 @@ class TestAckSlotBootCheck:
         js.delete_consumer.assert_awaited_once_with(STREAM, DURABLE)
         # Two inspections happened: detect + re-verify.
         assert js.consumer_info.await_count == 2
-        # Fix-and-re-verify landed healthy and was published to healthz state.
+        # Fix-and-re-verify: the deleted consumer reads "absent" = cured.
+        assert state.ack_slot == "absent"
+
+    @pytest.mark.asyncio
+    async def test_phantom_cure_also_accepts_mocked_healthy_reverify(self) -> None:
+        # Completeness: a "healthy" re-inspect (slot free) is also a success.
+        js = AsyncMock()
+        js.consumer_info.side_effect = [_info_occupied(41), _info_healthy()]
+        js.get_msg.side_effect = NotFoundError()
+        client = _client_with_js(js)
+        state = SubscriptionState()
+
+        await _ack_slot_boot_check(client, ServeConfig(), state)
+
+        js.delete_consumer.assert_awaited_once_with(STREAM, DURABLE)
         assert state.ack_slot == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_absent_at_first_boot_is_normal_and_never_deletes(self) -> None:
+        # First-ever boot: the durable does not exist until the daemon's
+        # bind-or-create attach. The boot check must treat that as normal
+        # (INFO), never delete, and publish "absent".
+        js = AsyncMock()
+        js.consumer_info.side_effect = NotFoundError()
+        client = _client_with_js(js)
+        state = SubscriptionState()
+
+        await _ack_slot_boot_check(client, ServeConfig(), state)
+
+        js.delete_consumer.assert_not_called()
+        js.get_msg.assert_not_awaited()
+        assert state.ack_slot == "absent"
 
     @pytest.mark.asyncio
     async def test_held_never_deletes(self) -> None:
@@ -288,7 +325,7 @@ class TestAckWatchdog:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "status", ["healthy", "held", "phantom", "unknown"]
+        "status", ["healthy", "held", "phantom", "unknown", "absent"]
     )
     async def test_never_deletes_on_any_status(
         self, monkeypatch: pytest.MonkeyPatch, status: str

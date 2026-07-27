@@ -47,8 +47,8 @@ class SubscriptionState:
             True it stays True for the daemon's lifetime — chain
             composition is not re-run on broker reconnect.
         ack_slot: The last ack-slot health reading (FEAT-PAC), one of
-            ``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"``.
-            Written by the boot cure step and the runtime watchdog in
+            ``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"`` /
+            ``"absent"``. Written by the boot cure step and the runtime watchdog in
             :mod:`forge.cli.serve`; read by the healthz handler so the
             phantom-ack wedge is visible to a standing ``curl`` probe.
             Defaults to ``"unknown"`` until the first boot inspection
@@ -98,7 +98,8 @@ class SubscriptionState:
 
         Args:
             value: New ack-slot status
-                (``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"``).
+                (``"healthy"`` / ``"held"`` / ``"phantom"`` / ``"unknown"`` /
+                ``"absent"``).
         """
         async with self._lock:
             self.ack_slot = value
