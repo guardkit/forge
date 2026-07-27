@@ -1188,20 +1188,24 @@ async def _ack_slot_boot_check(
                 report.pending_seq,
             )
             cured = await cure_phantom(js, stream, durable)
-            # Fix-and-re-verify: re-run the SAME check and require healthy.
+            # Fix-and-re-verify: re-run the SAME check. Success reads
+            # "absent" (the durable was just deleted — no consumer, no ack
+            # slot); "healthy" is also accepted for completeness. Any other
+            # reading means the wedge was NOT cleared.
             reverify = await inspect_ack_slot(js, stream, durable)
-            if cured and reverify.status == "healthy":
+            if cured and reverify.status in ("absent", "healthy"):
                 logger.warning(
                     "forge-serve: phantom-ack CURED at boot — deleted wedged "
-                    "consumer '%s' (was seq %s); re-inspection reports healthy "
-                    "(%s). The daemon will recreate the durable on attach.",
+                    "consumer '%s' (was seq %s); re-inspection confirms the "
+                    "slot is gone (%s). The daemon will recreate the durable "
+                    "on attach.",
                     durable,
                     report.pending_seq,
                     reverify.detail,
                 )
             else:
                 logger.error(
-                    "forge-serve: phantom-ack cure did NOT verify healthy "
+                    "forge-serve: phantom-ack cure did NOT verify "
                     "(cured=%s, re-inspect=%s: %s) — an operator may need to "
                     "delete consumer '%s' manually",
                     cured,
@@ -1210,6 +1214,12 @@ async def _ack_slot_boot_check(
                     durable,
                 )
             report = reverify
+        elif report.status == "absent":
+            logger.info(
+                "forge-serve: ack-slot boot check — consumer does not exist "
+                "yet (normal on first boot); the daemon will create it on "
+                "attach"
+            )
         elif report.status == "held":
             logger.info(
                 "forge-serve: ack-slot boot check — held (legitimate); leaving "
@@ -1299,6 +1309,15 @@ async def _run_ack_watchdog(
                     stream,
                     report.pending_seq,
                     report.detail,
+                )
+            elif report.status == "absent":
+                logger.warning(
+                    "forge-serve: ack-slot watchdog — consumer '%s' does not "
+                    "exist on stream '%s' while the daemon is running; its "
+                    "pull subscription is likely invalid (was the durable "
+                    "deleted externally?). No action taken.",
+                    durable,
+                    stream,
                 )
             await state.set_ack_slot(report.status)
         except asyncio.CancelledError:

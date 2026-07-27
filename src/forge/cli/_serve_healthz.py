@@ -97,7 +97,7 @@ async def _healthz_handler(request: web.Request) -> web.Response:
     state: SubscriptionState = request.app[STATE_KEY]
     # FEAT-PAC healthz seam (this file:_healthz_handler): every response
     # gains an additive ``ack_slot`` field carrying the last boot/watchdog
-    # ack-slot reading (``healthy`` / ``held`` / ``phantom`` / ``unknown``),
+    # ack-slot reading (``healthy`` / ``held`` / ``phantom`` / ``unknown`` / ``absent``),
     # so a standing ``curl :8088/healthz`` makes the phantom-ack wedge
     # visible. It is advisory-only — the wedge is alarm-only in v1 and does
     # NOT change the readiness verdict below or any existing key.

@@ -235,6 +235,22 @@ class TestInspectUnknown:
         js.get_msg.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_consumer_not_found_is_absent_not_unknown(self) -> None:
+        # Coordinator-review regression pin: a MISSING durable is its own
+        # honest verdict ("absent" — no consumer, no ack slot), NOT a generic
+        # error. This is the state right after a phantom cure deletes the
+        # consumer (the re-verify must land here) and on a first-ever boot.
+        js = _make_js(consumer_info=NotFoundError())
+
+        report = await inspect_ack_slot(js, STREAM, DURABLE)
+
+        assert report.status == "absent"
+        assert report.pending_seq is None
+        assert report.num_ack_pending == 0
+        assert "does not exist" in report.detail
+        js.get_msg.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_get_msg_other_error_is_unknown_not_phantom(self) -> None:
         js = _make_js(
             consumer_info=_FakeConsumerInfo(

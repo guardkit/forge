@@ -56,7 +56,7 @@ from nats.js.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
-AckSlotStatus = Literal["healthy", "held", "phantom", "unknown"]
+AckSlotStatus = Literal["healthy", "held", "phantom", "unknown", "absent"]
 
 
 @dataclass
@@ -67,9 +67,11 @@ class AckSlotReport:
         status: One of ``"healthy"`` (slot free — nothing ack-pending),
             ``"held"`` (a real message occupies the slot — a legitimate
             long-held ack), ``"phantom"`` (the ack-pending message is gone from
-            the stream — the wedge; safe to cure), or ``"unknown"`` (the
+            the stream — the wedge; safe to cure), ``"unknown"`` (the
             inspection could not reach a verdict — an API error or a missing
-            ack-floor; never cured).
+            ack-floor; never cured), or ``"absent"`` (the durable consumer does
+            not exist — no ack slot at all; normal pre-first-attach and right
+            after a cure deleted it).
         pending_seq: The stream sequence of the ack-pending message
             (``ack_floor.stream_seq + 1``), or ``None`` when the slot is free or
             the sequence could not be derived.
@@ -107,9 +109,28 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
         An :class:`AckSlotReport`. Never raises for broker/API errors — those
         are folded into an ``"unknown"`` report.
     """
-    # 1. Read consumer state. An API error here is not a wedge — report unknown.
+    # 1. Read consumer state. A missing consumer is its own honest verdict:
+    #    no consumer ⇒ no ack slot exists at all ⇒ trivially no wedge. This is
+    #    the normal state on a first-ever boot (before the daemon's
+    #    bind-or-create attach) and immediately after a phantom cure deleted
+    #    the durable — the post-cure re-inspect MUST land here, not in the
+    #    generic error branch, or a successful cure could never verify.
     try:
         info = await js.consumer_info(stream, durable)
+    except NotFoundError:
+        return AckSlotReport(
+            status="absent",
+            pending_seq=None,
+            num_ack_pending=0,
+            num_waiting=0,
+            num_pending=0,
+            detail=(
+                f"consumer '{durable}' does not exist on stream '{stream}' — "
+                "no ack slot exists (normal before the daemon's first attach, "
+                "or right after a cure deleted it; the daemon recreates it "
+                "bind-or-create on attach)"
+            ),
+        )
     except Exception as exc:  # noqa: BLE001 — absence-of-failure: never claim phantom
         logger.warning(
             "ack-slot inspect: consumer_info(%s, %s) failed (%s: %s); "
