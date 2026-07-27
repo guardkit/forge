@@ -128,7 +128,9 @@ class TestHealthzWhenLive:
 
         # Assert
         assert resp.status == 200
-        assert payload == {"status": "healthy"}
+        # FEAT-PAC adds an additive ``ack_slot`` field (default "unknown"
+        # on fresh state); the existing ``status`` key is unchanged.
+        assert payload == {"status": "healthy", "ack_slot": "unknown"}
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +160,7 @@ class TestHealthzWhenNotLive:
         assert payload == {
             "status": "unhealthy",
             "reason": "chain_not_ready",
+            "ack_slot": "unknown",
         }
 
     @pytest.mark.asyncio
@@ -331,7 +334,10 @@ class TestStateTransitionsAreReflected:
                     f"http://127.0.0.1:{port}/healthz"
                 ) as resp:
                     assert resp.status == 200
-                    assert (await resp.json()) == {"status": "healthy"}
+                    assert (await resp.json()) == {
+                        "status": "healthy",
+                        "ack_slot": "unknown",
+                    }
 
             await state.set_live(False)
 
@@ -343,6 +349,7 @@ class TestStateTransitionsAreReflected:
                     assert (await resp.json()) == {
                         "status": "unhealthy",
                         "reason": "subscription_not_live",
+                        "ack_slot": "unknown",
                     }
         finally:
             await _stop_server(task)
@@ -459,6 +466,7 @@ class TestHealthzChainReadyGate:
         assert payload == {
             "status": "unhealthy",
             "reason": "chain_not_ready",
+            "ack_slot": "unknown",
         }
 
     @pytest.mark.asyncio
@@ -473,7 +481,7 @@ class TestHealthzChainReadyGate:
             payload = await resp.json()
 
         assert resp.status == 200
-        assert payload == {"status": "healthy"}
+        assert payload == {"status": "healthy", "ack_slot": "unknown"}
 
     @pytest.mark.asyncio
     async def test_row3_chain_ready_subscription_dropped_is_unhealthy(
@@ -498,6 +506,7 @@ class TestHealthzChainReadyGate:
         assert payload == {
             "status": "unhealthy",
             "reason": "subscription_not_live",
+            "ack_slot": "unknown",
         }
 
 
@@ -534,6 +543,76 @@ class TestSubscriptionStateChainReady:
 
         asyncio.run(_flip_chain())
         assert state.is_healthy() is True
+
+
+class TestHealthzAckSlotField:
+    """FEAT-PAC — healthz gains an additive ``ack_slot`` field.
+
+    The field carries the last boot/watchdog ack-slot reading so a
+    standing ``curl :8088/healthz`` makes the phantom-ack wedge visible.
+    It must be present in every response WITHOUT changing any existing
+    key (``status`` / ``reason``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_ack_slot_present_and_reflects_state_on_healthy(
+        self,
+    ) -> None:
+        # Arrange — healthy daemon, but the ack slot reads "phantom"
+        # (the wedge coexists with a live, chain-ready daemon in v1).
+        state = SubscriptionState()
+        await state.set_chain_ready(True)
+        await state.set_live(True)
+        await state.set_ack_slot("phantom")
+        app = build_healthz_app(state)
+
+        # Act
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/healthz")
+            payload = await resp.json()
+
+        # Assert — existing keys unchanged; ack_slot reflects the reading.
+        assert resp.status == 200
+        assert payload["status"] == "healthy"
+        assert "reason" not in payload
+        assert payload["ack_slot"] == "phantom"
+
+    @pytest.mark.asyncio
+    async def test_ack_slot_default_unknown_present_and_keys_unchanged(
+        self,
+    ) -> None:
+        # Fresh state: ack_slot defaults to "unknown" and the existing
+        # 200 healthy payload keeps its exact ``status`` value.
+        state = SubscriptionState()
+        await state.set_chain_ready(True)
+        await state.set_live(True)
+        app = build_healthz_app(state)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/healthz")
+            payload = await resp.json()
+
+        assert resp.status == 200
+        assert payload == {"status": "healthy", "ack_slot": "unknown"}
+
+    @pytest.mark.asyncio
+    async def test_ack_slot_present_on_unhealthy_without_disturbing_keys(
+        self,
+    ) -> None:
+        # The field appears on 503 responses too; ``status`` and
+        # ``reason`` are byte-unchanged.
+        state = SubscriptionState()
+        await state.set_ack_slot("held")
+        app = build_healthz_app(state)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/healthz")
+            payload = await resp.json()
+
+        assert resp.status == 503
+        assert payload["status"] == "unhealthy"
+        assert payload["reason"] == "chain_not_ready"
+        assert payload["ack_slot"] == "held"
 
 
 # Keep ``web`` imported (used implicitly via aiohttp.test_utils) so tools
