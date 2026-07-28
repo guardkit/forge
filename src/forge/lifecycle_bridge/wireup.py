@@ -301,7 +301,16 @@ class StreamSource(Protocol):
 #: reads from the ``async_tasks`` SQLite mirror (DDR-006); unit tests
 #: pass a deterministic fake. ``None`` means "no run yet"; the observer
 #: backs off and retries up to ``identity_resolution_attempts`` times.
-IdentityProvider = Callable[[str], Awaitable[tuple[str, str] | None]]
+#:
+#: SIGNATURE (FEAT-FTR, 2026-07-28): ``(feature_id, correlation_id)``.
+#: Resolution MUST be exact-match on THIS dispatch's correlation id — a
+#: feature-only lookup returns the newest EXISTING row, which during the
+#: sidecar's async state-channel write lag is the PREVIOUS build's row.
+#: Live receipt: FEAT-UDBE requeue 2026-07-28 10:41 — the observer resolved
+#: the prior run, found it finished, and replayed its terminal as a false
+#: BuildFailed while the new build ran healthy. A stale hit is worse than a
+#: miss: a miss keeps polling (correct); a stale hit fabricates a terminal.
+IdentityProvider = Callable[[str, str], Awaitable[tuple[str, str] | None]]
 
 #: Write-back seam invoked after each *successful* publish so the
 #: ``builds`` row tracks the lifecycle the bridge just put on the wire
@@ -326,7 +335,9 @@ def _default_identity_provider() -> IdentityProvider:
     :meth:`LifecycleBridgeWireup._wait_for_identity`).
     """
 
-    async def _provider(feature_id: str) -> tuple[str, str] | None:
+    async def _provider(
+        feature_id: str, correlation_id: str
+    ) -> tuple[str, str] | None:
         return None
 
     return _provider
@@ -693,7 +704,9 @@ class LifecycleBridgeWireup:
         if self._budget_observer is not None:
             self._budget_sessions[feature_id] = self._budget_observer.new_session()
         try:
-            identity = await self._wait_for_identity(feature_id)
+            identity = await self._wait_for_identity(
+                feature_id, context.correlation_id
+            )
             if identity is None:
                 # FWD-002 (WS3-S6): identity did not resolve within the
                 # initial poll budget. Do NOT fall through to stream with
@@ -1517,7 +1530,9 @@ class LifecycleBridgeWireup:
     # Identity resolution
     # ------------------------------------------------------------------
 
-    async def _wait_for_identity(self, feature_id: str) -> tuple[str, str] | None:
+    async def _wait_for_identity(
+        self, feature_id: str, correlation_id: str
+    ) -> tuple[str, str] | None:
         """Poll :data:`IdentityProvider` until it returns a non-``None`` pair.
 
         Returns ``None`` when ``identity_resolution_attempts`` polls
@@ -1526,7 +1541,9 @@ class LifecycleBridgeWireup:
         """
         for attempt in range(self._identity_resolution_attempts):
             try:
-                identity = await self._identity_provider(feature_id)
+                identity = await self._identity_provider(
+                    feature_id, correlation_id
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "wireup._wait_for_identity: identity_provider raised "
@@ -1583,7 +1600,9 @@ class LifecycleBridgeWireup:
             if self._shutting_down:
                 break
             try:
-                identity = await self._identity_provider(feature_id)
+                identity = await self._identity_provider(
+                    feature_id, context.correlation_id
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "wireup._await_identity_until_deadline: identity_provider "

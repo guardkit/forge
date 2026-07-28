@@ -175,7 +175,9 @@ def _make_stream_source(parts: list[StreamPart]):
 
 
 def _identity_provider(thread_id: str = "thread-x", run_id: str = "run-x"):
-    async def _provider(_feature_id: str) -> tuple[str, str] | None:
+    async def _provider(
+        _feature_id: str, _correlation_id: str = ""
+    ) -> tuple[str, str] | None:
         return (thread_id, run_id)
 
     return _provider
@@ -798,7 +800,9 @@ class TestModuleSurface:
 
 
 def _never_resolves():
-    async def _provider(_feature_id: str) -> tuple[str, str] | None:
+    async def _provider(
+        _feature_id: str, _correlation_id: str = ""
+    ) -> tuple[str, str] | None:
         return None
 
     return _provider
@@ -889,7 +893,9 @@ class TestIdentityUnresolvedPublishesBuildFailed:
         # the stream-ended reason (NOT identity-unresolved).
         calls = {"n": 0}
 
-        async def _slow_provider(_feature_id: str) -> tuple[str, str] | None:
+        async def _slow_provider(
+            _feature_id: str, _correlation_id: str = ""
+        ) -> tuple[str, str] | None:
             calls["n"] += 1
             # First (initial budget) poll misses; a later poll resolves.
             if calls["n"] >= 2:

@@ -136,7 +136,9 @@ def _empty_stream_source():
 
 
 def _identity_resolved(thread_id: str = "thread-x", run_id: str = "run-x"):
-    async def _provider(_feature_id: str) -> tuple[str, str] | None:
+    async def _provider(
+        _feature_id: str, _correlation_id: str = ""
+    ) -> tuple[str, str] | None:
         return (thread_id, run_id)
 
     return _provider

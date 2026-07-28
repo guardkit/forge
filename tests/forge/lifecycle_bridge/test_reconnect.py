@@ -336,7 +336,9 @@ def _make_publisher() -> MagicMock:
 
 
 def _identity(_feature_id: str) -> Any:
-    async def _provider(_fid: str) -> tuple[str, str] | None:
+    async def _provider(
+        _fid: str, _correlation_id: str = ""
+    ) -> tuple[str, str] | None:
         return ("thread-x", "run-x")
 
     return _provider

@@ -240,13 +240,24 @@ def _build_async_tasks_identity_provider(
         conforming to :data:`IdentityProvider`.
     """
 
-    async def _provider(feature_id: str) -> tuple[str, str] | None:
+    async def _provider(
+        feature_id: str, correlation_id: str
+    ) -> tuple[str, str] | None:
         # Step 1 — SQLite lookup against the shared writer connection.
+        # FEAT-FTR (2026-07-28): exact-match on THIS dispatch's
+        # correlation_id, never feature-newest. During the sidecar's async
+        # state-channel write lag the newest EXISTING row is the PREVIOUS
+        # build's — resolving it made the observer replay the prior run's
+        # terminal as a false BuildFailed on a same-feature requeue (live
+        # receipt: FEAT-UDBE 10:41). A miss returns None and the wireup
+        # keeps polling until THIS build's row lands — the only honest
+        # semantics. ORDER BY kept as a defensive tiebreak only.
         try:
             row = sqlite_pool.connection.execute(
                 "SELECT task_id FROM async_tasks WHERE feature_id = ? "
+                "AND correlation_id = ? "
                 "ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                (feature_id,),
+                (feature_id, correlation_id),
             ).fetchone()
         except sqlite3.Error as exc:
             logger.warning(
