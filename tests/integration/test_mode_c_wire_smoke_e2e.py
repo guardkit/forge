@@ -29,13 +29,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-# Module-level skip — no need to import anything broker-specific when
-# the runner has no broker URL to point at.
+# Module-level skip — this test publishes a REAL build_queued envelope, so
+# it requires the EXPLICIT live-broker opt-in (register 2a2, 2026-07-28):
+# env-PRESENCE arming let an operator's convenience FORGE_NATS_URL export
+# publish junk builds to the production broker three times (FEAT-D70CDF /
+# FEAT-3E094C / FEAT-089E6F+812C4B), two of which reached the production
+# gate and Slack. The root tests/conftest.py additionally overrides broker
+# env vars to an unroutable address unless the opt-in is set.
 _NATS_URL = os.environ.get("FORGE_NATS_URL")
-if not _NATS_URL:
+if os.environ.get("FORGE_ALLOW_LIVE_BROKER") != "1" or not _NATS_URL:
     pytest.skip(
-        "Mode C wire smoke E2E requires FORGE_NATS_URL to point at a live "
-        "NATS broker (TASK-F8-002 AC-10).",
+        "Mode C wire smoke E2E publishes a REAL build-queued envelope; it "
+        "requires the EXPLICIT opt-in FORGE_ALLOW_LIVE_BROKER=1 plus "
+        "FORGE_NATS_URL pointing at a broker you own (TASK-F8-002 AC-10; "
+        "register 2a2 broker-isolation fence).",
         allow_module_level=True,
     )
 
