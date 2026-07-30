@@ -87,6 +87,7 @@ from typing import (
     Any,
     Literal,
     Protocol,
+    TextIO,
     get_args,
     runtime_checkable,
 )
@@ -1719,6 +1720,204 @@ _RECEIPT_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild",
 )
 
+#: FEAT-DRF — the per-build failure pack, written beside the exported receipt
+#: families in ``$FORGE_RECEIPTS_DIR/<build_id>/``.
+STDOUT_LOG_NAME: str = "autobuild-stdout.log"
+FAILURE_MANIFEST_NAME: str = "failure-manifest.json"
+
+
+def _receipts_root() -> Path:
+    """Resolve the durable receipts root (FEAT-DRC / FEAT-DRF).
+
+    ``$FORGE_RECEIPTS_DIR`` wins; the default rides
+    ``~/forge-state/receipts``. Path arithmetic only — never touches disk and
+    never raises (a home-less environment falls back to the literal default).
+    """
+    raw = os.environ.get(RECEIPTS_DIR_ENV, DEFAULT_RECEIPTS_DIR)
+    try:
+        return Path(raw).expanduser()
+    except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
+        return Path(raw)
+
+
+def _resolve_receipt_build_id(
+    payload: Mapping[str, Any], worktree_path: Path | None, feature_id: str
+) -> str:
+    """The build's receipts directory name — one resolution for every consumer.
+
+    The success-path export, the FEAT-DRF failure-path export, the stdout tee
+    and the failure manifest must all land in the SAME
+    ``<receipts_root>/<build_id>/`` directory, so they share this helper.
+    Byte-equivalent to the expression the FEAT-DRC success call site used
+    (``payload build_id`` else the worktree directory name).
+    """
+    raw = payload.get("build_id")
+    if raw:
+        return str(raw)
+    if worktree_path is not None:
+        return worktree_path.name
+    return f"build-{feature_id}-pending"
+
+
+def _exported_receipt_families(build_id: str) -> list[str]:
+    """Which receipt families actually landed under ``<receipts>/<build_id>/``.
+
+    Read back from the DESTINATION (not the source) so the failure manifest
+    records what a diagnoser will really find. Best-effort: any filesystem
+    error yields whatever was confirmed so far, never an exception.
+    """
+    families: list[str] = []
+    try:
+        dest_root = _receipts_root() / build_id
+        for family in _RECEIPT_FAMILIES:
+            if (dest_root / family).is_dir():
+                families.append(family)
+    except Exception:  # noqa: BLE001 — best-effort: never block the terminal flow
+        return families
+    return families
+
+
+class _StdoutTee:
+    """Best-effort tee of the guardkit subprocess's stdout (FEAT-DRF, Lane 1).
+
+    Until this lane the drain loop scraped its regexes and threw every line
+    away (``logger.debug`` only, and the sidecar unit does not run at DEBUG),
+    so the guardkit orchestration narrative — decision lines, warnings,
+    orchestrator tracebacks — survived nowhere per-build. Each decoded line is
+    now appended to ``<receipts_root>/<build_id>/autobuild-stdout.log``.
+
+    Posture (identical to :func:`_export_receipts`): the tee NEVER alters the
+    build outcome. The file is opened LAZILY on the first line, so a build that
+    prints nothing leaves no file; the handle is line-buffered so a killed or
+    timed-out build still leaves the narrative up to the last drained line; and
+    the FIRST file error logs one WARNING and permanently disables the tee for
+    the run (no per-line log storm, no exception into the drain loop).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: TextIO | None = None
+        self._disabled = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
+    def write(self, line: str) -> None:
+        if self._disabled:
+            return
+        try:
+            if self._handle is None:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._handle = self._path.open(
+                    "a", encoding="utf-8", errors="replace", buffering=1
+                )
+                logger.info(
+                    "autobuild_runner: teeing subprocess stdout -> %s", self._path
+                )
+            self._handle.write(f"{line}\n")
+        except Exception as exc:  # noqa: BLE001 — best-effort: never block the drain
+            self._disable(exc)
+
+    def _disable(self, exc: BaseException) -> None:
+        self._disabled = True
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001 — already failing; nothing to add
+                pass
+        logger.warning(
+            "autobuild_runner: stdout tee DISABLED for %s (%s: %s) — the build "
+            "is unaffected; no further tee attempts this run",
+            self._path,
+            type(exc).__name__,
+            exc,
+        )
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort to the last byte
+            logger.warning(
+                "autobuild_runner: stdout tee close failed for %s (%s: %s)",
+                self._path,
+                type(exc).__name__,
+                exc,
+            )
+
+
+def _write_failure_manifest(
+    *,
+    build_id: str,
+    payload: Mapping[str, Any],
+    reason: str,
+    timed_out: bool,
+    exit_code: int,
+    worktree_path: Path | None,
+    branch: str | None,
+    exported_families: list[str],
+) -> None:
+    """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
+
+    The only cross-layer pointer a failed build left before this lane was the
+    reason STRING on ``pipeline.build-failed`` / SQLite; a diagnoser had to
+    walk a ``/tmp`` tree that the next reboot deletes. This drops
+    ``failure-manifest.json`` beside the exported receipts so the pack is
+    self-describing: which build/feature/correlation failed, why, whether the
+    kill was a timeout, the exit code, WHERE the kept worktree is, on which
+    branch, when, and which receipt families made it out.
+
+    Best-effort by the same principle as everything else in the pack: it never
+    raises and never alters the build's outcome.
+    """
+    try:
+        dest_root = _receipts_root() / build_id
+        dest_root.mkdir(parents=True, exist_ok=True)
+        feature_id = payload.get("feature_id")
+        correlation_id = payload.get("correlation_id")
+        manifest = {
+            "build_id": build_id,
+            "feature_id": str(feature_id) if feature_id is not None else None,
+            "correlation_id": (
+                str(correlation_id) if correlation_id is not None else None
+            ),
+            "reason": reason,
+            "timed_out": timed_out,
+            "exit_code": exit_code,
+            # The failure path KEEPS its worktree (DEFECT #19) — name it so the
+            # pack points back at the exact tree the build ran against.
+            "worktree_path": (
+                str(worktree_path) if worktree_path is not None else None
+            ),
+            "branch": branch,
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+            "receipt_families_exported": exported_families,
+        }
+        (dest_root / FAILURE_MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        logger.info(
+            "autobuild_runner: failure manifest written for %s -> %s",
+            build_id,
+            dest_root / FAILURE_MANIFEST_NAME,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
+        logger.warning(
+            "autobuild_runner: failure manifest NOT written for %s (%s: %s) — "
+            "the build outcome is unaffected",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+
 
 def _export_receipts(worktree_path: Path, build_id: str) -> bool:
     """Copy the build's receipts out of the worktree before removal (FEAT-DRC).
@@ -1736,12 +1935,14 @@ def _export_receipts(worktree_path: Path, build_id: str) -> bool:
     (an export of whatever exists — including nothing — is still a success).
     Returns ``False`` only on a real copy failure, logged at WARNING; the
     caller then KEEPS the worktree so the receipts are never silently lost.
+
+    FEAT-DRF also calls this on the FAILURE path, where it is purely additive:
+    the worktree is kept there either way, so the copy is a durability upgrade
+    (a reboot's ``/tmp`` sweep can no longer destroy the forensics) and the
+    return value has no bearing on the outcome.
     """
     try:
-        receipts_root = Path(
-            os.environ.get(RECEIPTS_DIR_ENV, DEFAULT_RECEIPTS_DIR)
-        ).expanduser()
-        dest_root = receipts_root / build_id
+        dest_root = _receipts_root() / build_id
         exported: list[str] = []
         for family in _RECEIPT_FAMILIES:
             src = worktree_path / family
@@ -1936,6 +2137,9 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # checkout AS-IS. Either way we log which mode was taken.
     branch_raw = payload.get("branch")
     worktree_path: Path | None = None
+    # FEAT-DRF — the branch this build ran against, recorded in the failure
+    # manifest (stays None on the legacy no-branch path).
+    payload_branch: str | None = None
     # F12 — the base branch guardkit must build its inner autobuild branch on.
     # Threaded from the SAME payload ``branch`` the outer worktree checks out,
     # in the branch-aware path only; stays ``None`` on the legacy no-branch
@@ -1945,6 +2149,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     if isinstance(branch_raw, str) and branch_raw.strip():
         branch = branch_raw.strip()
         base_branch = branch
+        payload_branch = branch
         build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
         if not await _local_branch_exists(repo_path, branch):
             return _snapshot_update(
@@ -1987,6 +2192,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             feature_id,
             repo_path,
         )
+
+    # FEAT-DRC/FEAT-DRF — one receipts directory name for this build, shared by
+    # the stdout tee, the success-path export and the failure pack.
+    receipt_build_id = _resolve_receipt_build_id(payload, worktree_path, feature_id)
 
     # FEAT-UBS-002 (Option-B, stage 1) — the env/default subprocess timeout is
     # the ceiling; a per-build budget wall-clock cap may only TIGHTEN it. Take
@@ -2059,24 +2268,37 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     last_coach_score: float | None = None
     decision_turns: list[str] = []  # "success" or "feedback" per turn
 
+    # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
+    # handle is created lazily on the first line) so a build that prints
+    # nothing leaves no empty file.
+    stdout_tee = _StdoutTee(_receipts_root() / receipt_build_id / STDOUT_LOG_NAME)
+
     async def _drain_stdout() -> None:
         nonlocal stage_complete_count, last_coach_score
         if proc.stdout is None:  # defensive — PIPE was requested above
             return
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace").rstrip()
-            if _GUARDKIT_CHECKPOINT_PATTERN.search(decoded):
-                stage_complete_count += 1
-            # Coach-score grammar: parse decision-bearing lines (TASK-UBS1C-001).
-            decision = _parse_decision_line(decoded)
-            if decision is not None:
-                turn_number, decision_type = decision
-                decision_turns.append(decision_type)
-                last_coach_score = 1.0 if decision_type == "success" else 0.0
-            logger.debug("autobuild_runner[stdout]: %s", decoded)
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                if _GUARDKIT_CHECKPOINT_PATTERN.search(decoded):
+                    stage_complete_count += 1
+                # Coach-score grammar: parse decision-bearing lines (TASK-UBS1C-001).
+                decision = _parse_decision_line(decoded)
+                if decision is not None:
+                    turn_number, decision_type = decision
+                    decision_turns.append(decision_type)
+                    last_coach_score = 1.0 if decision_type == "success" else 0.0
+                # FEAT-DRF: tee BEFORE the debug log so the narrative survives
+                # whatever the journald level is. Never raises (see _StdoutTee).
+                stdout_tee.write(decoded)
+                logger.debug("autobuild_runner[stdout]: %s", decoded)
+        finally:
+            # Runs on normal EOF, on the timeout cancel and on the FEAT-FCT
+            # interrupt cancel alike — the log is always flushed and closed.
+            stdout_tee.close()
 
     timed_out = False
     try:
@@ -2154,6 +2376,26 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             reason = f"guardkit autobuild timed out after {timeout_seconds}s"
         else:
             reason = f"guardkit autobuild exit={exit_code}"
+        # FEAT-DRF (Lane 1) — the FAILURE PACK. Strictly ADDITIVE: the worktree
+        # is still KEPT (nothing below removes it) and the reason still carries
+        # the forensics pointer; we merely COPY the same three receipt families
+        # FEAT-DRC exports on success into <receipts>/<build_id>/ so the
+        # evidence outlives the next reboot's /tmp sweep, then drop a manifest
+        # indexing the pack. Both are best-effort and cannot alter the outcome.
+        exported_families: list[str] = []
+        if worktree_path is not None:
+            _export_receipts(worktree_path, receipt_build_id)
+            exported_families = _exported_receipt_families(receipt_build_id)
+        _write_failure_manifest(
+            build_id=receipt_build_id,
+            payload=payload,
+            reason=reason,
+            timed_out=timed_out,
+            exit_code=exit_code,
+            worktree_path=worktree_path,
+            branch=payload_branch,
+            exported_families=exported_families,
+        )
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
@@ -2173,7 +2415,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         await _finalize_success_worktree(
             repo_path,
             worktree_path,
-            str(payload.get("build_id") or worktree_path.name),
+            receipt_build_id,
         )
     tasks_completed = max(stage_complete_count, 1)
     # Compute aggregate_coach_score from the decision-bearing turns.
