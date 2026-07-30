@@ -657,3 +657,144 @@ def test_sweep_never_crashes_on_unexpected_error(
 
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "preflight sweep failed unexpectedly" in joined
+
+
+# ---------------------------------------------------------------------------
+# FEAT-DRC — durable receipt export before success-path removal (register 2a4)
+# ---------------------------------------------------------------------------
+
+
+def _make_receipt_tree(worktree: Path) -> dict[str, Path]:
+    """Populate a fake outer-worktree .guardkit with all three receipt families."""
+    files = {}
+    for rel in (
+        ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
+        ".guardkit/autobuild-private/TASK-X-001/spec_conformance/conformance.json",
+        ".guardkit/qav-shadow/queue.jsonl",
+        ".guardkit/autobuild/FEAT-X/review-summary.md",
+    ):
+        p = worktree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"receipt::{rel}")
+        files[rel] = p
+    return files
+
+
+class TestExportReceipts:
+    def test_exports_all_families_preserving_layout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        assert ar._export_receipts(worktree, "build-X-1") is True
+
+        for rel in (
+            ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
+            ".guardkit/autobuild-private/TASK-X-001/spec_conformance/conformance.json",
+            ".guardkit/qav-shadow/queue.jsonl",
+            ".guardkit/autobuild/FEAT-X/review-summary.md",
+        ):
+            exported = dest_root / "build-X-1" / rel
+            assert exported.is_file(), rel
+            assert exported.read_text() == f"receipt::{rel}"
+
+    def test_missing_families_still_succeed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        (worktree / ".guardkit/qav-shadow").mkdir(parents=True)
+        (worktree / ".guardkit/qav-shadow/queue.jsonl").write_text("{}")
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        assert ar._export_receipts(worktree, "build-X-2") is True
+        assert (
+            tmp_path / "receipts/build-X-2/.guardkit/qav-shadow/queue.jsonl"
+        ).is_file()
+
+    def test_empty_worktree_export_is_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        assert ar._export_receipts(worktree, "build-X-3") is True
+
+    def test_copy_failure_returns_false_never_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        with patch.object(
+            ar.shutil, "copytree", side_effect=OSError("disk full")
+        ):
+            assert ar._export_receipts(worktree, "build-X-4") is False
+
+    def test_default_destination_expands_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The default rides ~/forge-state/receipts; point HOME at tmp so the
+        # test never touches the real estate.
+        monkeypatch.delenv(ar.RECEIPTS_DIR_ENV, raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+
+        assert ar._export_receipts(worktree, "build-X-5") is True
+        assert (
+            tmp_path
+            / "forge-state/receipts/build-X-5/.guardkit/qav-shadow/queue.jsonl"
+        ).is_file()
+
+
+class TestFinalizeSuccessWorktree:
+    def test_export_success_then_removal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        calls: list[tuple[Path, Path]] = []
+
+        async def _fake_remove(repo: Path, wt: Path) -> None:
+            calls.append((repo, wt))
+
+        with patch.object(ar, "_remove_worktree", _fake_remove):
+            asyncio.run(
+                ar._finalize_success_worktree(tmp_path, worktree, "build-X-6")
+            )
+
+        assert calls == [(tmp_path, worktree)]
+        assert (
+            tmp_path / "receipts/build-X-6/.guardkit/qav-shadow/queue.jsonl"
+        ).is_file()
+
+    def test_export_failure_keeps_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # FEAT-DRC crux: removal is CONDITIONAL on the export — a failed
+        # export keeps the worktree (forensics posture), and the call still
+        # returns cleanly (the build outcome is never altered).
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        calls: list[tuple[Path, Path]] = []
+
+        async def _fake_remove(repo: Path, wt: Path) -> None:
+            calls.append((repo, wt))
+
+        with (
+            patch.object(ar, "_remove_worktree", _fake_remove),
+            patch.object(
+                ar.shutil, "copytree", side_effect=OSError("disk full")
+            ),
+        ):
+            asyncio.run(
+                ar._finalize_success_worktree(tmp_path, worktree, "build-X-7")
+            )
+
+        assert calls == []  # never removed
+        assert worktree.is_dir()  # kept on disk

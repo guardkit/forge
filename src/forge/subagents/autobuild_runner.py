@@ -1703,6 +1703,100 @@ async def _materialise_worktree(
     return worktree_path
 
 
+#: Env var naming the durable receipts root (FEAT-DRC). Default rides
+#: ``~/forge-state`` (bind-mounted at ``/var/forge`` in forge-prod, so the
+#: daemon and accrual counters can read ``/var/forge/receipts/<build_id>/``).
+RECEIPTS_DIR_ENV: str = "FORGE_RECEIPTS_DIR"
+DEFAULT_RECEIPTS_DIR: str = "~/forge-state/receipts"
+
+#: The receipt families exported before the success-path worktree removal
+#: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
+#: FEAT-SCG conformance snapshot live under ``autobuild-private``; the shadow
+#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``.
+_RECEIPT_FAMILIES: tuple[str, ...] = (
+    ".guardkit/autobuild-private",
+    ".guardkit/qav-shadow",
+    ".guardkit/autobuild",
+)
+
+
+def _export_receipts(worktree_path: Path, build_id: str) -> bool:
+    """Copy the build's receipts out of the worktree before removal (FEAT-DRC).
+
+    On build SUCCESS the outer worktree is removed, which — until this lane —
+    destroyed every receipt guardkit wrote there under the isolated topology
+    (coach verdicts, evidence dossiers, the spec-conformance snapshot, the
+    qav-shadow receipt; proven on FEAT-UDBE 2026-07-28, the M4 blocker). This
+    helper copies the :data:`_RECEIPT_FAMILIES` that exist to
+    ``$FORGE_RECEIPTS_DIR/<build_id>/`` (default
+    ``~/forge-state/receipts/<build_id>/``), preserving relative layout.
+
+    Best-effort by the same principle as :func:`_remove_worktree`: it NEVER
+    raises and never alters the build's outcome. Missing families are fine
+    (an export of whatever exists — including nothing — is still a success).
+    Returns ``False`` only on a real copy failure, logged at WARNING; the
+    caller then KEEPS the worktree so the receipts are never silently lost.
+    """
+    try:
+        receipts_root = Path(
+            os.environ.get(RECEIPTS_DIR_ENV, DEFAULT_RECEIPTS_DIR)
+        ).expanduser()
+        dest_root = receipts_root / build_id
+        exported: list[str] = []
+        for family in _RECEIPT_FAMILIES:
+            src = worktree_path / family
+            if not src.is_dir():
+                continue
+            dest = dest_root / family
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+            exported.append(family)
+        if exported:
+            logger.info(
+                "autobuild_runner: receipts exported for %s -> %s (%s)",
+                build_id,
+                dest_root,
+                ", ".join(exported),
+            )
+        else:
+            logger.info(
+                "autobuild_runner: no receipt families present in %s for %s "
+                "— nothing to export",
+                worktree_path,
+                build_id,
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
+        logger.warning(
+            "autobuild_runner: receipt export FAILED for %s (%s: %s) — the "
+            "worktree will be KEPT so the receipts are not lost",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+async def _finalize_success_worktree(
+    repo_path: Path, worktree_path: Path, build_id: str
+) -> None:
+    """Success-path worktree finalization: export receipts, THEN remove.
+
+    FEAT-DRC ordering crux: the removal is CONDITIONAL on the export —
+    an export failure keeps the worktree on disk (the failure path's own
+    forensics posture; the F3 preflight prune does not delete directories,
+    and a kept tree never regresses a succeeded build).
+    """
+    if _export_receipts(worktree_path, build_id):
+        await _remove_worktree(repo_path, worktree_path)
+    else:
+        logger.warning(
+            "autobuild_runner: keeping worktree %s — receipts were not "
+            "exported (see the export WARNING above)",
+            worktree_path,
+        )
+
+
 async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
     """Best-effort worktree removal — called ONLY on the success path.
 
@@ -2046,7 +2140,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # snapshot for the integration test's mid-stream assertion).
     # Coach scores are populated from the decision grammar (TASK-UBS1C-001).
     if worktree_path is not None:
-        await _remove_worktree(repo_path, worktree_path)
+        # FEAT-DRC: export the build's receipts BEFORE removal; on export
+        # failure the worktree is kept (see _finalize_success_worktree).
+        await _finalize_success_worktree(
+            repo_path,
+            worktree_path,
+            str(payload.get("build_id") or worktree_path.name),
+        )
     tasks_completed = max(stage_complete_count, 1)
     # Compute aggregate_coach_score from the decision-bearing turns.
     aggregate_coach_score: float | None = None
