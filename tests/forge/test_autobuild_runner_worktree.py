@@ -29,8 +29,11 @@ fallback) and the #18b terminal-state guarantee.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -798,6 +801,280 @@ class TestFinalizeSuccessWorktree:
 
         assert calls == []  # never removed
         assert worktree.is_dir()  # kept on disk
+
+
+# ---------------------------------------------------------------------------
+# FEAT-DRF — the FAILURE PACK: failure-path export + stdout tee + manifest
+# (debugging-residual design pass, Lane 1)
+# ---------------------------------------------------------------------------
+
+
+_DRF_STDOUT_LINES = [
+    b"[guardkit] wave 0 starting\n",
+    b"[guardkit-coach] TASK-X-001 turn 1: feedback\n",
+    b"Traceback (most recent call last):\n",
+]
+
+
+def _invoke_seeding_receipts(
+    description: str,
+    repo: Path,
+    *,
+    exit_code: int,
+    recorded: dict[str, Any],
+    lines: list[bytes] | None = None,
+):
+    """Drive a full graph run whose fake guardkit WRITES receipts in its cwd.
+
+    The real guardkit leaves the three ``.guardkit`` receipt families in the
+    tree it ran in; the stub reproduces that so the failure-path export has
+    real receipts to copy.
+    """
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _stub(*args: Any, **kwargs: Any) -> Any:
+        prog = str(args[0]) if args else ""
+        if prog.endswith("guardkit"):
+            cwd = kwargs.get("cwd")
+            recorded["cwd"] = cwd
+            recorded["argv"] = list(args)
+            if cwd:
+                _make_receipt_tree(Path(cwd))
+            return _FakeProc(exit_code, list(lines or _DRF_STDOUT_LINES))
+        return await real_exec(*args, **kwargs)
+
+    with patch.object(ar, "_resolve_repo_path", lambda payload: repo), patch.object(
+        ar, "_resolve_guardkit_path", lambda: Path("/usr/bin/guardkit")
+    ), patch.object(asyncio, "create_subprocess_exec", _stub):
+        graph = ar._build_runner_graph()
+        return asyncio.run(
+            graph.ainvoke({"messages": [HumanMessage(content=description)]})
+        )
+
+
+def _branch_aware_launch() -> str:
+    return _launch(
+        '{"build_id": "%s", "feature_id": "%s", "correlation_id": "%s", '
+        '"branch": "%s", "repo": "appmilla/api_test"}'
+        % (ROUND17_BUILD_ID, ROUND17_FEATURE_ID, ROUND17_CORR, PLANNING_BRANCH)
+    )
+
+
+class TestFailurePackEndToEnd:
+    def test_failed_build_exports_receipts_writes_manifest_and_keeps_worktree(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The failure path gains DURABILITY without losing the kept tree.
+
+        Before FEAT-DRF a failed build's whole evidence base sat under /tmp
+        (the 07-30 cold boot deleted it). The export is purely additive: the
+        worktree must STILL be kept and STILL be named in the failure reason.
+        """
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        recorded: dict[str, Any] = {}
+        result = _invoke_seeding_receipts(
+            _branch_aware_launch(), throwaway_repo, exit_code=1, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
+
+        # (1) The worktree is STILL KEPT — the export never took it away.
+        expected_wt = (wt_base / ROUND17_BUILD_ID).resolve()
+        assert expected_wt.is_dir(), "failure must still KEEP the worktree"
+
+        # (2) All three receipt families are now durable, layout preserved.
+        pack = receipts / ROUND17_BUILD_ID
+        for rel in (
+            ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
+            ".guardkit/autobuild-private/TASK-X-001/spec_conformance/conformance.json",
+            ".guardkit/qav-shadow/queue.jsonl",
+            ".guardkit/autobuild/FEAT-X/review-summary.md",
+        ):
+            assert (pack / rel).is_file(), rel
+            assert (pack / rel).read_text() == f"receipt::{rel}"
+
+        # (3) The manifest indexes the pack.
+        manifest = json.loads((pack / ar.FAILURE_MANIFEST_NAME).read_text())
+        assert manifest["build_id"] == ROUND17_BUILD_ID
+        assert manifest["feature_id"] == ROUND17_FEATURE_ID
+        assert manifest["correlation_id"] == ROUND17_CORR
+        assert manifest["reason"] == "guardkit autobuild exit=1"
+        assert manifest["timed_out"] is False
+        assert manifest["exit_code"] == 1
+        assert manifest["worktree_path"] == str(expected_wt)
+        assert manifest["branch"] == PLANNING_BRANCH
+        assert sorted(manifest["receipt_families_exported"]) == sorted(
+            ar._RECEIPT_FAMILIES
+        )
+        # An ISO-8601 UTC instant the diagnoser can order packs by.
+        assert datetime.fromisoformat(manifest["failed_at"]).tzinfo is not None
+
+        # (4) The stdout narrative survived the run.
+        tee_log = (pack / ar.STDOUT_LOG_NAME).read_text()
+        assert "Traceback (most recent call last):" in tee_log
+
+    def test_success_path_writes_no_failure_manifest(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FEAT-DRC's success behaviour is untouched: export + removal, no manifest."""
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        recorded: dict[str, Any] = {}
+        result = _invoke_seeding_receipts(
+            _branch_aware_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        assert not (wt_base / ROUND17_BUILD_ID).exists(), "success still removes"
+
+        pack = receipts / ROUND17_BUILD_ID
+        assert (pack / ".guardkit/qav-shadow/queue.jsonl").is_file()
+        assert not (pack / ar.FAILURE_MANIFEST_NAME).exists(), (
+            "a succeeded build must never carry a failure manifest"
+        )
+        # The tee rides every build, not just failed ones.
+        assert "[guardkit] wave 0 starting" in (pack / ar.STDOUT_LOG_NAME).read_text()
+
+    def test_unwritable_receipts_root_never_regresses_the_failure(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Whole pack is best-effort: an unwritable root warns, never raises.
+
+        The receipts root is a regular FILE here, so every pack write (tee,
+        export, manifest) fails at mkdir. The build must still fail loud with
+        its worktree kept and its forensics pointer intact.
+        """
+        wt_base = tmp_path / "worktrees"
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory")
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(blocked))
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_seeding_receipts(
+                _branch_aware_launch(),
+                throwaway_repo,
+                exit_code=1,
+                recorded=recorded,
+            )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
+        expected_wt = (wt_base / ROUND17_BUILD_ID).resolve()
+        assert expected_wt.is_dir(), "the kept-worktree posture is unconditional"
+
+        messages = [r.getMessage() for r in caplog.records]
+        joined = " ".join(messages)
+        assert "worktree KEPT for forensics" in joined
+        assert "stdout tee DISABLED" in joined
+        assert "failure manifest NOT written" in joined
+        # ONE tee warning for the whole run, whatever the line count.
+        assert sum("stdout tee DISABLED" in m for m in messages) == 1
+        assert blocked.read_text() == "not a directory"  # nothing clobbered it
+
+
+class TestStdoutTee:
+    def test_lazy_open_then_appends_every_line(self, tmp_path: Path) -> None:
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        tee = ar._StdoutTee(log)
+        assert not log.exists(), "no line drained yet -> no file"
+
+        tee.write("first")
+        tee.write("second")
+        tee.close()
+
+        assert log.read_text() == "first\nsecond\n"
+        assert tee.disabled is False
+
+    def test_file_error_warns_once_and_disables(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("file, not a dir")
+        tee = ar._StdoutTee(blocker / "sub" / ar.STDOUT_LOG_NAME)
+
+        with caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            for _ in range(5):
+                tee.write("line")  # must never raise
+            tee.close()
+
+        assert tee.disabled is True
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if "stdout tee DISABLED" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+
+class TestFailureManifest:
+    def test_legacy_no_worktree_failure_still_gets_a_manifest(
+        self, tmp_path: Path
+    ) -> None:
+        """No worktree (legacy shared-checkout path) -> nulls, never a crash."""
+        receipts = tmp_path / "receipts"
+        with patch.dict(os.environ, {ar.RECEIPTS_DIR_ENV: str(receipts)}):
+            ar._write_failure_manifest(
+                build_id="build-DRF-1",
+                payload={"feature_id": "FEAT-DRF", "correlation_id": "corr-1"},
+                reason="guardkit autobuild timed out after 30s",
+                timed_out=True,
+                exit_code=-1,
+                worktree_path=None,
+                branch=None,
+                exported_families=[],
+            )
+        manifest = json.loads(
+            (receipts / "build-DRF-1" / ar.FAILURE_MANIFEST_NAME).read_text()
+        )
+        assert manifest["worktree_path"] is None
+        assert manifest["branch"] is None
+        assert manifest["timed_out"] is True
+        assert manifest["exit_code"] == -1
+        assert manifest["receipt_families_exported"] == []
+
+    def test_manifest_write_failure_is_swallowed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory")
+        with patch.dict(os.environ, {ar.RECEIPTS_DIR_ENV: str(blocked)}), caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            ar._write_failure_manifest(  # must not raise
+                build_id="build-DRF-2",
+                payload={},
+                reason="boom",
+                timed_out=False,
+                exit_code=2,
+                worktree_path=None,
+                branch=None,
+                exported_families=[],
+            )
+        assert "failure manifest NOT written" in " ".join(
+            r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
