@@ -1406,6 +1406,19 @@ class LifecycleBridgeWireup:
         can refuse to ack / detach when the *terminal* envelope failed
         to publish — preserving SQLite state for the T9 recovery cycle.
         """
+        # FEAT-UBS-002 / Rich's 2026-07-30 ruling — a budget cap-KILLED build
+        # must ARM the TASK-GATE-D659 pre-dispatch breach gate. The runner
+        # marks the failed snapshot; the translator threads the marker onto
+        # the typed payload; here — the one seam EVERY translated event
+        # passes (the live SSE session AND the fetch-on-empty replay) — the
+        # durable ``builds.budget_breach`` marker is recorded BEFORE the
+        # publish, so even a failed publish leaves the gate armed (the SQL
+        # first-write-wins makes the JetStream-redelivery re-record a no-op).
+        # Observer-DETECTED breach semantics are untouched.
+        if isinstance(event, BuildFailedPayload) and getattr(
+            event, "budget_cap_killed", False
+        ):
+            self._record_cap_kill_breach(event, feature_id)
         method_name = _PUBLISH_METHOD_TABLE.get(type(event))
         if method_name is None:
             logger.warning(
@@ -1453,6 +1466,47 @@ class LifecycleBridgeWireup:
         # (TASK-FRR-PEB-011 AC-2/AC-3) relies on to retry the publish.
         await self._record_build_state(event, feature_id)
         return True
+
+    def _record_cap_kill_breach(
+        self, event: BuildFailedPayload, feature_id: str
+    ) -> None:
+        """Record ``builds.budget_breach`` for a runner cap-KILLED build.
+
+        Fully exception-guarded, mirroring :meth:`_observe_budget`: the
+        lifecycle stream is more load-bearing than budget enforcement, so a
+        recorder fault logs loudly and the publish proceeds. When no budget
+        observer is wired (some unit tiers; a caps-off boot) there is no
+        persistence seam to record through — log the miss loudly rather than
+        failing silent, since a cap-kill only ever originates from a
+        budget-capped (unattended-profile) launch.
+        """
+        observer = self._budget_observer
+        if observer is None:
+            logger.error(
+                "wireup._record_cap_kill_breach: build_id=%s feature_id=%s "
+                "arrived cap-KILLED but NO budget observer is wired — the "
+                "breach marker CANNOT be recorded and the D659 pre-dispatch "
+                "gate will NOT arm for the re-queue (UBS-002)",
+                event.build_id,
+                feature_id,
+            )
+            return
+        try:
+            observer.record_cap_kill(
+                build_id=event.build_id,
+                feature_id=feature_id,
+                detail=event.failure_reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — enforcement must not break the stream
+            logger.error(
+                "wireup._record_cap_kill_breach: recorder raised (%s) for "
+                "build_id=%s feature_id=%s; observer continues (the lifecycle "
+                "stream is more load-bearing than budget enforcement) "
+                "(UBS-002)",
+                exc,
+                event.build_id,
+                feature_id,
+            )
 
     async def _record_build_state(self, event: PipelineEvent, feature_id: str) -> None:
         """Invoke the :data:`BuildStateRecorder`, downgrading any failure.

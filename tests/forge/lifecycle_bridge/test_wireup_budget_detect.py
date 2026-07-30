@@ -687,3 +687,333 @@ class TestProductionFactoryComposition:
         assert _row_status(persistence, build_id) == BuildState.COMPLETE.value
 
         await wireup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Cap-KILL arms the D659 pre-dispatch gate (Rich's 2026-07-30 ruling)
+# ---------------------------------------------------------------------------
+#
+# A build the RUNNER killed at its budget wall-clock cap (FEAT-UBS-002 stage
+# 1) dies BEFORE any further stage-complete, so the stage-complete DETECT path
+# above can never record its breach — before this arc a cap-killed feature's
+# re-queue silently SKIPPED the stage-3 pre-dispatch gate. The runner now
+# stamps ``budget_cap_killed`` (+ the flat ``error_message`` reason) on the
+# failed snapshot; the translator threads the marker onto the typed
+# ``BuildFailedPayload``; the wireup records ``builds.budget_breach`` at its
+# publish choke point. These tests drive the WHOLE chain: the runner's own
+# snapshot shape → real translator → real wireup → real migrated SQLite →
+# the REAL ``dispatch_build`` closure refusing the re-queue.
+
+
+def _cap_kill_reason() -> str:
+    return (
+        "guardkit autobuild exceeded the budget wall-clock cap of 60.0s "
+        "(profile='unattended') — killed (UBS-002)"
+    )
+
+
+def _runner_failed_part(
+    feature_id: str,
+    build_id: str,
+    *,
+    budget_cap_killed: bool,
+) -> StreamPart:
+    """A terminal failed part built from the RUNNER'S OWN snapshot shape."""
+    from forge.subagents import autobuild_runner as ar
+
+    snap = ar._build_failed_snapshot(
+        {
+            "feature_id": feature_id,
+            "build_id": build_id,
+            "correlation_id": _CORRELATION_ID,
+        },
+        reason=_cap_kill_reason() if budget_cap_killed else "guardkit autobuild exit=1",
+        budget_cap_killed=budget_cap_killed,
+    )
+    return StreamPart(
+        event=VALUES_STREAM_EVENT,
+        data={"async_tasks": {feature_id: snap}},
+        id=None,
+    )
+
+
+def _cap_kill_parts(
+    feature_id: str, build_id: str, *, budget_cap_killed: bool = True
+) -> list[StreamPart]:
+    return [
+        _state_part(feature_id, build_id=build_id, lifecycle="starting"),
+        _state_part(feature_id, build_id=build_id, lifecycle="running_wave"),
+        _runner_failed_part(
+            feature_id, build_id, budget_cap_killed=budget_cap_killed
+        ),
+    ]
+
+
+class _RecordingStarter:
+    """Async-task starter double recording each launch context."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict] = []
+
+    async def astart_async_task(self, subagent_name: str, context: dict) -> str:
+        self.contexts.append(dict(context))
+        return "task-capkill"
+
+
+class _NoopContextBuilder:
+    def build_for(self, *, stage, build_id: str, feature_id: str) -> list:
+        return []
+
+
+class _NoopStageLogRecorder:
+    def record_running(self, **kwargs) -> None:
+        return None
+
+
+class _NoopStateChannel:
+    def initialise_autobuild_state(self, **kwargs) -> None:
+        return None
+
+
+class _GatePoolAdapter:
+    """Dispatch-pool double whose BREACH reads hit the REAL persistence.
+
+    ``record_pending_build`` / ``get_build_row`` are faked (the re-queue's
+    fresh row is not under test; a NULL profile keeps the launch payload
+    budget-free), while ``latest_breach_for_feature`` / ``clear_budget_breach``
+    delegate to the real migrated DB — so the gate decision rides the exact
+    marker the cap-kill chain recorded.
+    """
+
+    def __init__(self, persistence: SqliteLifecyclePersistence) -> None:
+        self._persistence = persistence
+
+    def record_pending_build(self, payload, profile=None) -> str:
+        return f"build-{payload.feature_id}-requeue"
+
+    def get_build_row(self, build_id: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(profile=None)
+
+    def latest_breach_for_feature(self, feature_id: str):
+        return self._persistence.latest_breach_for_feature(feature_id)
+
+    def clear_budget_breach(self, build_id: str, cleared_at: str) -> None:
+        self._persistence.clear_budget_breach(build_id, cleared_at)
+
+
+def _requeue_dispatch(persistence: SqliteLifecyclePersistence, starter):
+    """The REAL ``dispatch_build`` closure, gate-unwired (legacy branch)."""
+    from types import SimpleNamespace
+
+    from forge.cli import _serve_deps
+    from forge.config.models import (
+        FilesystemPermissions,
+        ForgeConfig,
+        PermissionsConfig,
+    )
+
+    config = ForgeConfig(
+        permissions=PermissionsConfig(
+            filesystem=FilesystemPermissions(allowlist=[Path("/tmp")]),
+        ),
+    )
+    return _serve_deps._build_dispatch_build(
+        sqlite_pool=_GatePoolAdapter(persistence),
+        forward_context_builder=_NoopContextBuilder(),
+        stage_log_recorder=_NoopStageLogRecorder(),
+        state_channel=_NoopStateChannel(),
+        lifecycle_emitter=SimpleNamespace(),
+        async_task_starter=starter,
+        forge_config=config,
+        gate_repository=None,
+        gate_state_machine=None,
+    )
+
+
+def _requeue_payload():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        feature_id=_FEATURE_ID,
+        repo="appmilla/api_test",
+        branch="main",
+        correlation_id="corr-requeue",
+        parent_request_id=None,
+        queued_at=datetime.now(UTC),
+    )
+
+
+async def _noop_ack() -> None:
+    return None
+
+
+class TestCapKillArmsBreachGate:
+    @pytest.mark.asyncio
+    async def test_cap_killed_build_records_breach_and_requeue_is_refused(
+        self,
+        registry: BridgeRegistry,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        build_id = _queued_build(persistence)
+        approval_publish = AsyncMock(name="publish_approval_request")
+        observer = _make_observer(
+            persistence,
+            guards=BudgetGuards(max_build_wallclock_seconds=60),
+            profile_name="unattended",
+            elapsed_seconds=0.0,
+            publish=approval_publish,
+        )
+        parts = _cap_kill_parts(_FEATURE_ID, build_id)
+
+        bridge = LifecycleBridge(registry=registry)
+        wireup = _build_wireup(
+            bridge=bridge,
+            translator=translator,
+            fake_publisher=fake_publisher,
+            persistence=persistence,
+            build_id=build_id,
+            parts=parts,
+            budget_observer=observer,
+        )
+        handle = _make_handle()
+        await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
+        await _drain(wireup, _FEATURE_ID)
+
+        # (1) The cap-kill landed a DURABLE breach marker — the exact flag the
+        # D659 pre-dispatch gate reads.
+        detail = persistence.read_budget_breach(build_id)
+        assert detail is not None
+        assert detail.startswith("wall_clock: ")
+        assert "UBS-002" in detail
+        assert detail.endswith(_FIXED_TS.isoformat())
+        assert persistence.latest_breach_for_feature(_FEATURE_ID) == (
+            build_id,
+            detail,
+        )
+
+        # (2) RECORD-ONLY: the build is already dead — no mid-run escalation
+        # (that is the stage-complete observer's seam, untouched here).
+        approval_publish.assert_not_awaited()
+
+        # (3) The terminal flow is unchanged: build-failed published + acked.
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        failed_payload = fake_publisher.publish_build_failed.await_args.args[0]
+        assert failed_payload.failure_reason == _cap_kill_reason()
+        handle.ack.assert_awaited_once()
+
+        # (4) Idempotence: a JetStream-redelivery re-record is a no-op (SQL
+        # first-write-wins) — the original detail stands.
+        observer.record_cap_kill(
+            build_id=build_id, feature_id=_FEATURE_ID, detail="redelivered"
+        )
+        assert persistence.read_budget_breach(build_id) == detail
+
+        # (5) THE RULING'S PIN: the feature's re-queue is routed through the
+        # stage-3 breach gate. Gate-unwired boot → REFUSED loudly, never a
+        # silent fresh launch.
+        from forge.cli import _serve_deps
+
+        starter = _RecordingStarter()
+        dispatch = _requeue_dispatch(persistence, starter)
+        with pytest.raises(_serve_deps.BudgetBreachDispatchRefused) as exc_info:
+            await dispatch(_requeue_payload(), _noop_ack)
+        assert exc_info.value.feature_id == _FEATURE_ID
+        assert exc_info.value.prior_build_id == build_id
+        assert "UBS-002" in exc_info.value.breach_detail
+        assert starter.contexts == []
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_plain_failure_does_not_arm_the_gate(
+        self,
+        registry: BridgeRegistry,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        """Negative control — gate semantics for ordinary failures unchanged."""
+        build_id = _queued_build(persistence)
+        approval_publish = AsyncMock(name="publish_approval_request")
+        observer = _make_observer(
+            persistence,
+            guards=BudgetGuards(max_build_wallclock_seconds=60),
+            profile_name="unattended",
+            elapsed_seconds=0.0,
+            publish=approval_publish,
+        )
+        parts = _cap_kill_parts(_FEATURE_ID, build_id, budget_cap_killed=False)
+
+        bridge = LifecycleBridge(registry=registry)
+        wireup = _build_wireup(
+            bridge=bridge,
+            translator=translator,
+            fake_publisher=fake_publisher,
+            persistence=persistence,
+            build_id=build_id,
+            parts=parts,
+            budget_observer=observer,
+        )
+        handle = _make_handle()
+        await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
+        await _drain(wireup, _FEATURE_ID)
+
+        assert persistence.read_budget_breach(build_id) is None
+        assert persistence.latest_breach_for_feature(_FEATURE_ID) is None
+
+        # The re-queue launches exactly as before this lane.
+        starter = _RecordingStarter()
+        dispatch = _requeue_dispatch(persistence, starter)
+        await dispatch(_requeue_payload(), _noop_ack)
+        assert len(starter.contexts) == 1
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cap_kill_without_observer_logs_loud_and_never_breaks_stream(
+        self,
+        registry: BridgeRegistry,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+        persistence: SqliteLifecyclePersistence,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No wired observer → the marker cannot record; fail LOUD, not silent.
+
+        The lifecycle stream is more load-bearing than budget enforcement:
+        the terminal must still publish + ack.
+        """
+        import logging
+
+        build_id = _queued_build(persistence)
+        parts = _cap_kill_parts(_FEATURE_ID, build_id)
+
+        bridge = LifecycleBridge(registry=registry)
+        wireup = _build_wireup(
+            bridge=bridge,
+            translator=translator,
+            fake_publisher=fake_publisher,
+            persistence=persistence,
+            build_id=build_id,
+            parts=parts,
+            budget_observer=None,
+        )
+        handle = _make_handle()
+        with caplog.at_level(
+            logging.ERROR, logger="forge.lifecycle_bridge.wireup"
+        ):
+            await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
+            await _drain(wireup, _FEATURE_ID)
+
+        assert persistence.read_budget_breach(build_id) is None
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        handle.ack.assert_awaited_once()
+        assert any(
+            "NO budget observer" in r.getMessage() for r in caplog.records
+        )
+
+        await wireup.shutdown()

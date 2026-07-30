@@ -1084,3 +1084,94 @@ class TestRunningWaveBudgetTimeout:
         )
         assert "budget wall-clock cap" not in reasons
         assert "timed out after 10.0s" in reasons
+
+
+class TestCapKillArmsBreachGateSnapshot:
+    """Rich's 2026-07-30 ruling — a budget-cap KILL must arm the D659 gate.
+
+    The runner's half of the arc: ONLY the budget-bound timeout stamps the
+    ``budget_cap_killed`` marker on the failed snapshot (the flag the daemon
+    turns into ``builds.budget_breach``); an env-default timeout or a plain
+    non-zero exit must NOT (they are not budget breaches). The reason always
+    rides as the flat ``error_message`` (07-30 coach finding 5).
+    """
+
+    @pytest.mark.asyncio
+    async def test_budget_bound_timeout_stamps_cap_kill_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FORGE_AUTOBUILD_TIMEOUT_SECONDS", raising=False)
+        result, _ctl = await _run_running_wave_timeout(
+            budget={"max_wallclock_seconds": 60, "profile_name": "unattended"}
+        )
+        snap = result["async_tasks"]["FEAT-BUD"]
+        assert snap["lifecycle"] == "failed"
+        assert snap["budget_cap_killed"] is True
+        assert "budget wall-clock cap of 60.0s" in snap["error_message"]
+        assert "UBS-002" in snap["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_env_default_timeout_is_not_a_cap_kill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The env default binds (10 < 5000): a kill at the OPERATOR's bound is
+        # not a budget breach and must never arm the gate.
+        monkeypatch.setenv("FORGE_AUTOBUILD_TIMEOUT_SECONDS", "10")
+        result, _ctl = await _run_running_wave_timeout(
+            budget={"max_wallclock_seconds": 5000, "profile_name": "unattended"}
+        )
+        snap = result["async_tasks"]["FEAT-BUD"]
+        assert snap["lifecycle"] == "failed"
+        assert "budget_cap_killed" not in snap
+        assert "timed out after 10.0s" in snap["error_message"]
+
+    def test_node_failed_refresh_preserves_failure_metadata(self) -> None:
+        """``_node_failed`` re-stamps the channel — the metadata must survive.
+
+        The refreshed snapshot is the FINAL state a fetch-on-empty replay
+        translates (fast failures finish before the SSE stream opens); if the
+        refresh dropped the flat fields, the wire would silently fall back to
+        the generic reason and the cap-kill marker — the D659 arming signal —
+        would be lost exactly where it matters.
+        """
+        from langchain_core.messages import HumanMessage
+
+        from forge.subagents import autobuild_runner as _ar_mod
+
+        description = _budget_running_wave_description(
+            {"max_wallclock_seconds": 60, "profile_name": "unattended"}
+        )
+        reason = (
+            "guardkit autobuild exceeded the budget wall-clock cap of 60.0s "
+            "(profile='unattended') — killed (UBS-002)"
+        )
+        prior = _ar_mod._build_failed_snapshot(
+            {"feature_id": "FEAT-BUD", "build_id": "build-FEAT-BUD-1"},
+            reason=reason,
+            budget_cap_killed=True,
+        )
+        state = {
+            "messages": [HumanMessage(content=description)],
+            "async_tasks": {"FEAT-BUD": prior},
+        }
+        update = _ar_mod._node_failed(state)  # type: ignore[arg-type]
+        refreshed = update["async_tasks"]["FEAT-BUD"]
+        assert refreshed["lifecycle"] == "failed"
+        assert refreshed["error_message"] == reason
+        assert refreshed["budget_cap_killed"] is True
+
+    def test_node_failed_refresh_adds_no_metadata_when_none_existed(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        from forge.subagents import autobuild_runner as _ar_mod
+
+        description = _budget_running_wave_description(None)
+        state = {
+            "messages": [HumanMessage(content=description)],
+            "async_tasks": {},
+        }
+        update = _ar_mod._node_failed(state)  # type: ignore[arg-type]
+        refreshed = update["async_tasks"]["FEAT-BUD"]
+        assert refreshed["lifecycle"] == "failed"
+        assert "error_message" not in refreshed
+        assert "budget_cap_killed" not in refreshed

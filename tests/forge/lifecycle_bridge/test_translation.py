@@ -418,6 +418,75 @@ class TestFailureReasonFormat:
         assert out.failure_reason == "autobuild failed (sse)"
 
 
+class TestRunnerFailedSnapshotRidesTheWire:
+    """07-30 coach finding 5 — pin the runner↔translator failure contract.
+
+    ``autobuild_runner._build_failed_snapshot``'s docstring long CLAIMED the
+    reason "ends up on the wire via the pipeline.build-failed envelope", but
+    the snapshot carried no error metadata, so every runner failure surfaced
+    as the generic ``"autobuild failed (sse)"``. These tests drive the
+    RUNNER'S OWN snapshot (not a hand-built fixture) through the real
+    translator, so any future drift in either module's shape breaks here.
+    """
+
+    @staticmethod
+    def _translate_runner_failure(
+        *, reason: str, budget_cap_killed: bool = False
+    ) -> BuildFailedPayload:
+        from forge.subagents import autobuild_runner as ar
+
+        feature_id = "FEAT-XLAT-001"
+        snap = ar._build_failed_snapshot(
+            {
+                "feature_id": feature_id,
+                "build_id": "build-FEAT-XLAT-001-wire",
+                "correlation_id": "corr-xlat-001",
+            },
+            reason=reason,
+            budget_cap_killed=budget_cap_killed,
+        )
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        translator.translate(
+            _state_part(ctx.feature_id, lifecycle="running_wave"), ctx
+        )
+        out = translator.translate(
+            StreamPart(
+                event=VALUES_STREAM_EVENT,
+                data={"async_tasks": {feature_id: snap}},
+                id=None,
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildFailedPayload)
+        return out
+
+    def test_runner_failure_reason_rides_pipeline_build_failed(self) -> None:
+        reason = "guardkit autobuild exit=1 (worktree KEPT for forensics: /tmp/wt)"
+        out = self._translate_runner_failure(reason=reason)
+        assert out.failure_reason == reason, (
+            "the runner's reason must ride the wire verbatim — the generic "
+            "'autobuild failed (sse)' fallback means the flat error_message "
+            "contract broke"
+        )
+
+    def test_cap_kill_marker_threads_onto_the_typed_payload(self) -> None:
+        reason = (
+            "guardkit autobuild exceeded the budget wall-clock cap of 60.0s "
+            "(profile='unattended') — killed (UBS-002)"
+        )
+        out = self._translate_runner_failure(reason=reason, budget_cap_killed=True)
+        assert getattr(out, "budget_cap_killed", False) is True
+        assert out.failure_reason == reason
+        # The marker is attachment-only (correlation_id shape): the wire
+        # bytes of the v1 payload stay unchanged.
+        assert "budget_cap_killed" not in out.model_dump()
+
+    def test_plain_failure_carries_no_cap_kill_marker(self) -> None:
+        out = self._translate_runner_failure(reason="guardkit autobuild exit=2")
+        assert getattr(out, "budget_cap_killed", False) is False
+
+
 # ---------------------------------------------------------------------------
 # Property: every StreamPart produces ≤ 1 envelope (no double-emits)
 # ---------------------------------------------------------------------------

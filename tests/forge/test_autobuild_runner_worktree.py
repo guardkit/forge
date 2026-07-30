@@ -692,7 +692,9 @@ class TestExportReceipts:
         dest_root = tmp_path / "receipts"
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
 
-        assert ar._export_receipts(worktree, "build-X-1") is True
+        ok, families = ar._export_receipts(worktree, "build-X-1")
+        assert ok is True
+        assert sorted(families) == sorted(ar._RECEIPT_FAMILIES)
 
         for rel in (
             ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
@@ -712,7 +714,11 @@ class TestExportReceipts:
         (worktree / ".guardkit/qav-shadow/queue.jsonl").write_text("{}")
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
 
-        assert ar._export_receipts(worktree, "build-X-2") is True
+        ok, families = ar._export_receipts(worktree, "build-X-2")
+        assert ok is True
+        assert families == [".guardkit/qav-shadow"], (
+            "only the family that exists rides the per-run exported list"
+        )
         assert (
             tmp_path / "receipts/build-X-2/.guardkit/qav-shadow/queue.jsonl"
         ).is_file()
@@ -723,7 +729,7 @@ class TestExportReceipts:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
-        assert ar._export_receipts(worktree, "build-X-3") is True
+        assert ar._export_receipts(worktree, "build-X-3") == (True, [])
 
     def test_copy_failure_returns_false_never_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -734,7 +740,9 @@ class TestExportReceipts:
         with patch.object(
             ar.shutil, "copytree", side_effect=OSError("disk full")
         ):
-            assert ar._export_receipts(worktree, "build-X-4") is False
+            ok, families = ar._export_receipts(worktree, "build-X-4")
+        assert ok is False
+        assert families == [], "a family that never copied must not be claimed"
 
     def test_default_destination_expands_home(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -746,7 +754,8 @@ class TestExportReceipts:
         worktree = tmp_path / "wt"
         _make_receipt_tree(worktree)
 
-        assert ar._export_receipts(worktree, "build-X-5") is True
+        ok, _families = ar._export_receipts(worktree, "build-X-5")
+        assert ok is True
         assert (
             tmp_path
             / "forge-state/receipts/build-X-5/.guardkit/qav-shadow/queue.jsonl"
@@ -1170,10 +1179,205 @@ def test_pack_permissions_are_owner_only(
     dest = tmp_path / "receipts"
     monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest))
 
-    assert ar._export_receipts(worktree, "build-PERM-1") is True
+    ok, _families = ar._export_receipts(worktree, "build-PERM-1")
+    assert ok is True
 
     pack = dest / "build-PERM-1"
     assert (pack.stat().st_mode & 0o777) == 0o700
     qav = pack / ".guardkit/qav-shadow/queue.jsonl"
     assert (qav.stat().st_mode & 0o777) == 0o600
     assert (qav.parent.stat().st_mode & 0o777) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# FEAT-DRF residuals (07-30 coach findings 2/3) — run-scoped packs
+# ---------------------------------------------------------------------------
+
+
+class TestRunScopedStdoutLog:
+    """Finding 2 (logs): build_id reuse appends runs into ONE log — the tee
+    now delimits each run's segment with a header line on the lazy open."""
+
+    def test_each_runs_segment_is_delimited(self, tmp_path: Path) -> None:
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        payload = {"build_id": "build-R-1", "correlation_id": "corr-1"}
+
+        first = ar._StdoutTee(
+            log, run_header=ar._stdout_run_header(payload, "FEAT-R")
+        )
+        first.write("run-one line")
+        first.close()
+
+        second = ar._StdoutTee(
+            log, run_header=ar._stdout_run_header(payload, "FEAT-R")
+        )
+        second.write("run-two line")
+        second.close()
+
+        lines = log.read_text().splitlines()
+        headers = [
+            i
+            for i, line in enumerate(lines)
+            if line.startswith(ar.STDOUT_RUN_HEADER_PREFIX)
+        ]
+        assert len(headers) == 2, "one separator per run segment"
+        # Each run's narrative sits under its own header.
+        assert lines[headers[0] + 1] == "run-one line"
+        assert lines[headers[1] + 1] == "run-two line"
+        # The header names the run's identity for the diagnoser.
+        assert "feature_id=FEAT-R" in lines[headers[0]]
+        assert "build_id=build-R-1" in lines[headers[0]]
+        assert "correlation_id=corr-1" in lines[headers[0]]
+
+    def test_silent_run_still_leaves_no_file(self, tmp_path: Path) -> None:
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        tee = ar._StdoutTee(
+            log, run_header=ar._stdout_run_header({}, "FEAT-R")
+        )
+        tee.close()
+        assert not log.exists(), (
+            "the header rides the lazy open — a build that prints nothing "
+            "must still leave no file"
+        )
+
+    def test_headerless_tee_is_byte_identical_legacy(self, tmp_path: Path) -> None:
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        tee = ar._StdoutTee(log)
+        tee.write("only line")
+        tee.close()
+        assert log.read_text() == "only line\n"
+
+
+class TestFailureManifestArchiveOnReuse:
+    """Finding 2 (manifests): a reused build_id must never DESTROY the prior
+    run's failure-manifest.json — it is archived aside, uniquely named."""
+
+    def _write(self, build_id: str, reason: str) -> None:
+        ar._write_failure_manifest(
+            build_id=build_id,
+            payload={"feature_id": "FEAT-RM", "correlation_id": "corr-rm"},
+            reason=reason,
+            timed_out=False,
+            exit_code=1,
+            worktree_path=None,
+            branch=None,
+            exported_families=[],
+        )
+
+    def test_prior_manifest_survives_a_second_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        pack = receipts / "build-RM-1"
+
+        self._write("build-RM-1", "first failure")
+        self._write("build-RM-1", "second failure")
+
+        latest = json.loads((pack / ar.FAILURE_MANIFEST_NAME).read_text())
+        assert latest["reason"] == "second failure"
+
+        archived = sorted(
+            p
+            for p in pack.glob("failure-manifest.*.json")
+            if p.name != ar.FAILURE_MANIFEST_NAME
+        )
+        assert len(archived) == 1, "the first run's manifest was archived"
+        prior = json.loads(archived[0].read_text())
+        assert prior["reason"] == "first failure"
+
+    def test_three_runs_leave_two_uniquely_named_archives(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        pack = receipts / "build-RM-2"
+
+        self._write("build-RM-2", "first")
+        self._write("build-RM-2", "second")
+        self._write("build-RM-2", "third")
+
+        latest = json.loads((pack / ar.FAILURE_MANIFEST_NAME).read_text())
+        assert latest["reason"] == "third"
+        archived = sorted(
+            p
+            for p in pack.glob("failure-manifest.*.json")
+            if p.name != ar.FAILURE_MANIFEST_NAME
+        )
+        assert len(archived) == 2
+        assert len({p.name for p in archived}) == 2, "unique archive names"
+        reasons = {json.loads(p.read_text())["reason"] for p in archived}
+        assert reasons == {"first", "second"}
+
+    def test_unparseable_prior_manifest_still_archived_by_mtime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        pack = receipts / "build-RM-3"
+        pack.mkdir(parents=True)
+        (pack / ar.FAILURE_MANIFEST_NAME).write_text("{not json")
+
+        self._write("build-RM-3", "fresh failure")
+
+        latest = json.loads((pack / ar.FAILURE_MANIFEST_NAME).read_text())
+        assert latest["reason"] == "fresh failure"
+        archived = [
+            p
+            for p in pack.glob("failure-manifest.*.json")
+            if p.name != ar.FAILURE_MANIFEST_NAME
+        ]
+        assert len(archived) == 1
+        assert archived[0].read_text() == "{not json"
+
+
+class TestExportedFamiliesAreThisRunsOnly:
+    """Finding 2 (manifest honesty): ``receipt_families_exported`` reports
+    ONLY families THIS run exported — never a destination read-back that
+    claims an earlier run's leftovers."""
+
+    def test_stale_destination_family_is_not_claimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        # An earlier run of the reused build_id left the qav-shadow family.
+        stale = receipts / "build-STALE-1/.guardkit/qav-shadow"
+        stale.mkdir(parents=True)
+        (stale / "queue.jsonl").write_text("{}")
+
+        # THIS run's worktree carries only the autobuild family.
+        worktree = tmp_path / "wt"
+        (worktree / ".guardkit/autobuild/FEAT-X").mkdir(parents=True)
+        (worktree / ".guardkit/autobuild/FEAT-X/review-summary.md").write_text("r")
+
+        ok, families = ar._export_receipts(worktree, "build-STALE-1")
+        assert ok is True
+        assert families == [".guardkit/autobuild"], (
+            "the stale qav-shadow leftover must not be claimed as this "
+            "run's export"
+        )
+
+
+class TestLegacyPendingPackUniqueness:
+    """Finding 3: legacy no-build_id packs must not collapse into one shared
+    ``-pending`` location — each run gets a unique pack directory."""
+
+    def test_two_legacy_resolutions_differ(self) -> None:
+        first = ar._resolve_receipt_build_id({}, None, "FEAT-L")
+        second = ar._resolve_receipt_build_id({}, None, "FEAT-L")
+        assert first != second
+        assert first.startswith("build-FEAT-L-pending-")
+        assert second.startswith("build-FEAT-L-pending-")
+
+    def test_payload_build_id_tier_is_untouched(self) -> None:
+        assert (
+            ar._resolve_receipt_build_id(
+                {"build_id": "build-EXPLICIT-1"}, None, "FEAT-L"
+            )
+            == "build-EXPLICIT-1"
+        )
+
+    def test_worktree_name_tier_is_untouched(self, tmp_path: Path) -> None:
+        wt = tmp_path / "build-FROM-WT-1"
+        assert ar._resolve_receipt_build_id({}, wt, "FEAT-L") == "build-FROM-WT-1"

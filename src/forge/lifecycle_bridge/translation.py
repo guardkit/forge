@@ -209,6 +209,13 @@ class _Snapshot:
     #: pre-T3-runner builds, deterministic-failure paths).
     error_class: str | None
     error_message: str | None
+    #: ``True`` only when the runner marked this failed snapshot as a budget
+    #: wall-clock cap KILL (``autobuild_runner._build_failed_snapshot``'s flat
+    #: ``budget_cap_killed`` field, FEAT-UBS-002 stage 1 / Rich's 2026-07-30
+    #: ruling). :meth:`StreamEventTranslator._build_failed` threads it onto
+    #: the typed payload so the wireup can ARM the TASK-GATE-D659 pre-dispatch
+    #: breach gate for the feature's next re-queue.
+    budget_cap_killed: bool = False
 
 
 def _extract_error_metadata(
@@ -302,6 +309,7 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
             ),
             error_class=error_class,
             error_message=error_message,
+            budget_cap_killed=bool(snap.get("budget_cap_killed", False)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.debug(
@@ -598,6 +606,15 @@ class StreamEventTranslator:
             failed_task_id=None,
         )
         attach_correlation_id_to_v1_payload(payload, correlation_id)
+        if snap.budget_cap_killed:
+            # FEAT-UBS-002 / Rich's 2026-07-30 ruling: thread the runner's
+            # cap-KILL marker onto the typed payload (same post-construction
+            # attachment shape as ``correlation_id`` — ``model_dump`` output
+            # is unchanged, so the wire bytes stay v1-compatible) so the
+            # wireup can record ``builds.budget_breach`` and ARM the D659
+            # pre-dispatch gate. Readers use
+            # ``getattr(payload, "budget_cap_killed", False)``.
+            object.__setattr__(payload, "budget_cap_killed", True)
         return payload
 
     def _build_cancelled(
