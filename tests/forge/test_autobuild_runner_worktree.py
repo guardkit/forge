@@ -1158,3 +1158,22 @@ def test_cancelled_run_kills_and_reaps_the_guardkit_child(
     asyncio.run(_drive())
     assert proc.kill_calls >= 1  # the child was killed, not orphaned
     assert proc.returncode == -9  # and reaped
+
+
+def test_pack_permissions_are_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FEAT-DRF coach finding: the pack persists the full subprocess narrative
+    durably — dirs must be 0700 and files 0600 regardless of umask."""
+    worktree = tmp_path / "wt"
+    _make_receipt_tree(worktree)
+    dest = tmp_path / "receipts"
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest))
+
+    assert ar._export_receipts(worktree, "build-PERM-1") is True
+
+    pack = dest / "build-PERM-1"
+    assert (pack.stat().st_mode & 0o777) == 0o700
+    qav = pack / ".guardkit/qav-shadow/queue.jsonl"
+    assert (qav.stat().st_mode & 0o777) == 0o600
+    assert (qav.parent.stat().st_mode & 0o777) == 0o700
