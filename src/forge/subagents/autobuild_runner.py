@@ -1740,6 +1740,28 @@ def _receipts_root() -> Path:
         return Path(raw)
 
 
+def _harden_pack_permissions(root: Path) -> None:
+    """Restrict a receipts pack to the owner (0700 dirs / 0600 files).
+
+    FEAT-DRF coach finding: the pack persists the FULL guardkit subprocess
+    narrative durably (and ~/forge-state is bind-mounted into forge-prod);
+    under the operator umask the defaults were group/world-readable — the
+    wrong posture for an estate with a live credential-exposure history.
+    Best-effort: permission errors are swallowed (the pack's existence beats
+    its mode; never fail an export over chmod).
+    """
+    try:
+        if not root.exists():
+            return
+        for path in [root, *root.rglob("*")]:
+            try:
+                path.chmod(0o700 if path.is_dir() else 0o600)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def _resolve_receipt_build_id(
     payload: Mapping[str, Any], worktree_path: Path | None, feature_id: str
 ) -> str:
@@ -1816,6 +1838,7 @@ class _StdoutTee:
                 self._handle = self._path.open(
                     "a", encoding="utf-8", errors="replace", buffering=1
                 )
+                _harden_pack_permissions(self._path.parent)
                 logger.info(
                     "autobuild_runner: teeing subprocess stdout -> %s", self._path
                 )
@@ -1904,6 +1927,7 @@ def _write_failure_manifest(
         (dest_root / FAILURE_MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+        _harden_pack_permissions(dest_root)
         logger.info(
             "autobuild_runner: failure manifest written for %s -> %s",
             build_id,
@@ -1966,6 +1990,7 @@ def _export_receipts(worktree_path: Path, build_id: str) -> bool:
                 worktree_path,
                 build_id,
             )
+        _harden_pack_permissions(dest_root)
         return True
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
