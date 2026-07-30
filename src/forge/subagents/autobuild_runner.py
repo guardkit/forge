@@ -2084,6 +2084,34 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             asyncio.gather(_drain_stdout(), proc.wait()),
             timeout=timeout_seconds,
         )
+    except asyncio.CancelledError:
+        # FEAT-FCT: a langgraph interrupt (runs.cancel action="interrupt")
+        # cancels this node's task. Reap the guardkit child BEFORE the
+        # cancellation propagates — without this the child survives
+        # orphaned and keeps building (the 2026-07-28 orphan class). The
+        # re-raise lets langgraph record the interrupt; no snapshot is
+        # emitted, and the worktree survives (removal is success-path-only)
+        # so the build's receipts are preserved.
+        logger.warning(
+            "autobuild_runner: run cancelled (interrupt) feature_id=%s — "
+            "killing guardkit subprocess pid=%s",
+            feature_id,
+            proc.pid,
+        )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.warning(
+                "autobuild_runner: subprocess not confirmed dead after "
+                "kill() on cancel — pid=%s feature_id=%s",
+                proc.pid,
+                feature_id,
+            )
+        raise
     except asyncio.TimeoutError:
         timed_out = True
         logger.warning(
