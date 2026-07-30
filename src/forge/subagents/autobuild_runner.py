@@ -78,6 +78,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1725,6 +1726,26 @@ _RECEIPT_FAMILIES: tuple[str, ...] = (
 STDOUT_LOG_NAME: str = "autobuild-stdout.log"
 FAILURE_MANIFEST_NAME: str = "failure-manifest.json"
 
+#: Stable prefix of the per-run separator line the stdout tee writes at the
+#: top of each run's segment (07-30 coach finding 2 — build_id reuse appends
+#: a second run's narrative to the same log; the separator makes the segments
+#: explicit). Kept as a module constant so diagnosers and tests share one
+#: grammar.
+STDOUT_RUN_HEADER_PREFIX: str = "===== autobuild run"
+
+
+def _stdout_run_header(payload: Mapping[str, Any], feature_id: str) -> str:
+    """One-line run separator for the (append-mode) per-build stdout log."""
+    build_id = payload.get("build_id")
+    correlation_id = payload.get("correlation_id")
+    return (
+        f"{STDOUT_RUN_HEADER_PREFIX} "
+        f"started={datetime.now(timezone.utc).isoformat()} "
+        f"feature_id={feature_id} "
+        f"build_id={build_id if build_id else '<none>'} "
+        f"correlation_id={correlation_id if correlation_id else '<none>'} ====="
+    )
+
 
 def _receipts_root() -> Path:
     """Resolve the durable receipts root (FEAT-DRC / FEAT-DRF).
@@ -1771,32 +1792,25 @@ def _resolve_receipt_build_id(
     and the failure manifest must all land in the SAME
     ``<receipts_root>/<build_id>/`` directory, so they share this helper.
     Byte-equivalent to the expression the FEAT-DRC success call site used
-    (``payload build_id`` else the worktree directory name).
+    (``payload build_id`` else the worktree directory name) on the first two
+    tiers.
+
+    LEGACY fallback (07-30 coach finding 3): a payload with NO ``build_id``
+    and NO worktree previously collapsed EVERY such run of a feature into one
+    shared ``build-<feature_id>-pending`` pack — a second legacy run silently
+    interleaved its logs and overwrote the first run's manifest. The fallback
+    is now unique PER RUN (UTC stamp + random token). The wire-side snapshot
+    identity (``_build_snapshot``'s ``build-<feature_id>-pending``) is
+    deliberately untouched — this names the RECEIPTS directory only, and the
+    manifest's ``feature_id``/``correlation_id`` keep the pack correlatable.
     """
     raw = payload.get("build_id")
     if raw:
         return str(raw)
     if worktree_path is not None:
         return worktree_path.name
-    return f"build-{feature_id}-pending"
-
-
-def _exported_receipt_families(build_id: str) -> list[str]:
-    """Which receipt families actually landed under ``<receipts>/<build_id>/``.
-
-    Read back from the DESTINATION (not the source) so the failure manifest
-    records what a diagnoser will really find. Best-effort: any filesystem
-    error yields whatever was confirmed so far, never an exception.
-    """
-    families: list[str] = []
-    try:
-        dest_root = _receipts_root() / build_id
-        for family in _RECEIPT_FAMILIES:
-            if (dest_root / family).is_dir():
-                families.append(family)
-    except Exception:  # noqa: BLE001 — best-effort: never block the terminal flow
-        return families
-    return families
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return f"build-{feature_id}-pending-{stamp}-{uuid.uuid4().hex[:6]}"
 
 
 class _StdoutTee:
@@ -1814,10 +1828,19 @@ class _StdoutTee:
     timed-out build still leaves the narrative up to the last drained line; and
     the FIRST file error logs one WARNING and permanently disables the tee for
     the run (no per-line log storm, no exception into the drain loop).
+
+    Run scoping (07-30 coach finding 2): the log is APPEND-mode, so a reused
+    ``build_id`` (JetStream redelivery / runless re-dispatch) lands a second
+    run's narrative in the SAME file. When ``run_header`` is given it is
+    written as the first line of this run's segment (on the lazy open, so a
+    silent build still leaves no file) — distinct runs are then explicitly
+    delimited instead of silently interleaved. A header-less construction
+    behaves byte-identically to the pre-finding tee.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, run_header: str | None = None) -> None:
         self._path = path
+        self._run_header = run_header
         self._handle: TextIO | None = None
         self._disabled = False
 
@@ -1839,6 +1862,8 @@ class _StdoutTee:
                     "a", encoding="utf-8", errors="replace", buffering=1
                 )
                 _harden_pack_permissions(self._path.parent)
+                if self._run_header is not None:
+                    self._handle.write(f"{self._run_header}\n")
                 logger.info(
                     "autobuild_runner: teeing subprocess stdout -> %s", self._path
                 )
@@ -1877,6 +1902,57 @@ class _StdoutTee:
             )
 
 
+def _archive_prior_manifest(manifest_path: Path) -> None:
+    """Move an earlier run's ``failure-manifest.json`` aside, uniquely named.
+
+    07-30 coach finding 2: a reused ``build_id`` (JetStream redelivery /
+    runless re-dispatch) previously OVERWROTE the prior run's manifest — the
+    first failure's index was silently lost. The prior file is renamed to
+    ``failure-manifest.<stamp>.json`` (stamp from its own ``failed_at``, else
+    its mtime), with a numeric suffix on a same-stamp collision, so
+    ``failure-manifest.json`` stays the LATEST run (no consumer-visible layout
+    change) while every earlier run's manifest survives.
+
+    Best-effort: on ANY error it logs one WARNING and returns — the caller
+    then overwrites, which is exactly the pre-finding behaviour (degrade,
+    never block the pack).
+    """
+    try:
+        stamp: str | None = None
+        try:
+            prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw = prior.get("failed_at")
+            if isinstance(raw, str) and raw:
+                stamp = datetime.fromisoformat(raw).strftime("%Y%m%dT%H%M%S%f")
+        except Exception:  # noqa: BLE001 — unparseable prior manifest: fall back
+            stamp = None
+        if stamp is None:
+            stamp = datetime.fromtimestamp(
+                manifest_path.stat().st_mtime, tz=timezone.utc
+            ).strftime("%Y%m%dT%H%M%S%f")
+        candidate = manifest_path.with_name(f"failure-manifest.{stamp}.json")
+        counter = 1
+        while candidate.exists():
+            candidate = manifest_path.with_name(
+                f"failure-manifest.{stamp}-{counter}.json"
+            )
+            counter += 1
+        manifest_path.rename(candidate)
+        logger.info(
+            "autobuild_runner: prior failure manifest archived -> %s "
+            "(build_id reuse — the earlier run's index is preserved)",
+            candidate,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort: never block the pack
+        logger.warning(
+            "autobuild_runner: could not archive the prior failure manifest "
+            "%s (%s: %s) — it will be overwritten (pre-finding behaviour)",
+            manifest_path,
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _write_failure_manifest(
     *,
     build_id: str,
@@ -1898,12 +1974,19 @@ def _write_failure_manifest(
     kill was a timeout, the exit code, WHERE the kept worktree is, on which
     branch, when, and which receipt families made it out.
 
+    ``failure-manifest.json`` always indexes the LATEST run; an existing
+    manifest from an earlier run of a reused ``build_id`` is archived aside
+    first (:func:`_archive_prior_manifest`), never silently destroyed.
+
     Best-effort by the same principle as everything else in the pack: it never
     raises and never alters the build's outcome.
     """
     try:
         dest_root = _receipts_root() / build_id
         dest_root.mkdir(parents=True, exist_ok=True)
+        manifest_path = dest_root / FAILURE_MANIFEST_NAME
+        if manifest_path.exists():
+            _archive_prior_manifest(manifest_path)
         feature_id = payload.get("feature_id")
         correlation_id = payload.get("correlation_id")
         manifest = {
@@ -1924,14 +2007,14 @@ def _write_failure_manifest(
             "failed_at": datetime.now(timezone.utc).isoformat(),
             "receipt_families_exported": exported_families,
         }
-        (dest_root / FAILURE_MANIFEST_NAME).write_text(
+        manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         _harden_pack_permissions(dest_root)
         logger.info(
             "autobuild_runner: failure manifest written for %s -> %s",
             build_id,
-            dest_root / FAILURE_MANIFEST_NAME,
+            manifest_path,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
@@ -1943,7 +2026,7 @@ def _write_failure_manifest(
         )
 
 
-def _export_receipts(worktree_path: Path, build_id: str) -> bool:
+def _export_receipts(worktree_path: Path, build_id: str) -> tuple[bool, list[str]]:
     """Copy the build's receipts out of the worktree before removal (FEAT-DRC).
 
     On build SUCCESS the outer worktree is removed, which — until this lane —
@@ -1957,17 +2040,21 @@ def _export_receipts(worktree_path: Path, build_id: str) -> bool:
     Best-effort by the same principle as :func:`_remove_worktree`: it NEVER
     raises and never alters the build's outcome. Missing families are fine
     (an export of whatever exists — including nothing — is still a success).
-    Returns ``False`` only on a real copy failure, logged at WARNING; the
-    caller then KEEPS the worktree so the receipts are never silently lost.
+    Returns ``(ok, exported_families)``: ``ok`` is ``False`` only on a real
+    copy failure, logged at WARNING; the caller then KEEPS the worktree so the
+    receipts are never silently lost. ``exported_families`` names ONLY the
+    families THIS RUN actually copied (07-30 coach finding 2: the manifest
+    previously read the destination back, so families left by an earlier run
+    of a reused ``build_id`` were falsely claimed as this run's exports).
 
     FEAT-DRF also calls this on the FAILURE path, where it is purely additive:
     the worktree is kept there either way, so the copy is a durability upgrade
     (a reboot's ``/tmp`` sweep can no longer destroy the forensics) and the
-    return value has no bearing on the outcome.
+    ``ok`` component has no bearing on the outcome.
     """
+    exported: list[str] = []
     try:
         dest_root = _receipts_root() / build_id
-        exported: list[str] = []
         for family in _RECEIPT_FAMILIES:
             src = worktree_path / family
             if not src.is_dir():
@@ -1991,7 +2078,7 @@ def _export_receipts(worktree_path: Path, build_id: str) -> bool:
                 build_id,
             )
         _harden_pack_permissions(dest_root)
-        return True
+        return True, exported
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
             "autobuild_runner: receipt export FAILED for %s (%s: %s) — the "
@@ -2000,7 +2087,7 @@ def _export_receipts(worktree_path: Path, build_id: str) -> bool:
             type(exc).__name__,
             exc,
         )
-        return False
+        return False, exported
 
 
 async def _finalize_success_worktree(
@@ -2013,7 +2100,8 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    if _export_receipts(worktree_path, build_id):
+    ok, _families = _export_receipts(worktree_path, build_id)
+    if ok:
         await _remove_worktree(repo_path, worktree_path)
     else:
         logger.warning(
@@ -2060,28 +2148,51 @@ def _with_worktree_forensics(reason: str, worktree_path: Path | None) -> str:
 
 
 def _build_failed_snapshot(
-    payload: Mapping[str, Any], *, reason: str
+    payload: Mapping[str, Any],
+    *,
+    reason: str,
+    budget_cap_killed: bool = False,
 ) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
-    The bridge translator's :func:`_build_failed`
-    (``forge.lifecycle_bridge.translation``) publishes the snapshot's
-    failure metadata; the reason we set here ends up on the wire via the
-    ``pipeline.build-failed.<feature_id>`` envelope. We always set
-    ``tasks_failed=1`` so the bridge's stage_complete delta also fires
-    where applicable.
+    The ``reason`` rides the snapshot as the flat ``error_message`` field —
+    the exact shape the bridge translator's ``_extract_error_metadata``
+    (``forge.lifecycle_bridge.translation``) reads — so the translator's
+    ``_build_failed`` puts it on the wire as ``failure_reason`` on the
+    ``pipeline.build-failed.<feature_id>`` envelope. (07-30 coach finding 5:
+    an earlier revision of this docstring CLAIMED the wire ride without
+    setting the field, so every runner failure surfaced as the generic
+    ``"autobuild failed (sse)"``; the flat field is what makes the claim
+    true, pinned by ``test_translation.py``'s runner-shape wire test.)
+    ``error_message`` is an EXTRA key beside the ``AutobuildState`` dump —
+    the model's ``extra="ignore"`` keeps any re-validation safe, and the
+    ``async_tasks`` reducer copies raw dicts, so the key survives the state
+    channel.
+
+    We always set ``tasks_failed=1`` so the bridge's stage_complete delta
+    also fires where applicable.
 
     Args:
         payload: Parsed launch payload (consulted for ``feature_id``,
             ``build_id``, ``correlation_id``).
         reason: Free-form failure reason — written into the runner log
-            and surfaced to operators reading the snapshot.
+            and surfaced to operators reading the snapshot AND the wire.
+        budget_cap_killed: ``True`` ONLY when the runner killed the guardkit
+            subprocess at its per-build budget wall-clock cap (FEAT-UBS-002
+            stage 1, ``budget_bound`` timeout). Rides the snapshot as a flat
+            ``budget_cap_killed`` marker so the daemon can ARM the
+            TASK-GATE-D659 pre-dispatch breach gate (Rich's 2026-07-30
+            ruling: a cap-KILL is a budget breach; without the marker a
+            cap-killed feature's re-queue silently skipped the gate, because
+            ``builds.budget_breach`` was only ever written by the
+            stage-complete observer and a cap kill precedes any
+            stage-complete).
 
     Returns:
         A snapshot dict suitable for :func:`_snapshot_update`.
     """
     logger.warning("autobuild_runner: transitioning to failed: %s", reason)
-    return _build_snapshot(
+    snapshot = _build_snapshot(
         payload,
         lifecycle="failed",
         wave_index=0,
@@ -2089,6 +2200,10 @@ def _build_failed_snapshot(
         tasks_completed=0,
         tasks_failed=1,
     )
+    snapshot["error_message"] = reason
+    if budget_cap_killed:
+        snapshot["budget_cap_killed"] = True
+    return snapshot
 
 
 async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
@@ -2296,7 +2411,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
     # handle is created lazily on the first line) so a build that prints
     # nothing leaves no empty file.
-    stdout_tee = _StdoutTee(_receipts_root() / receipt_build_id / STDOUT_LOG_NAME)
+    stdout_tee = _StdoutTee(
+        _receipts_root() / receipt_build_id / STDOUT_LOG_NAME,
+        run_header=_stdout_run_header(payload, feature_id),
+    )
 
     async def _drain_stdout() -> None:
         nonlocal stage_complete_count, last_coach_score
@@ -2407,10 +2525,14 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # FEAT-DRC exports on success into <receipts>/<build_id>/ so the
         # evidence outlives the next reboot's /tmp sweep, then drop a manifest
         # indexing the pack. Both are best-effort and cannot alter the outcome.
+        # 07-30 coach finding 2: the manifest reports ONLY the families THIS
+        # RUN exported (the per-run list `_export_receipts` returns) — never a
+        # destination read-back that would claim an earlier run's leftovers.
         exported_families: list[str] = []
         if worktree_path is not None:
-            _export_receipts(worktree_path, receipt_build_id)
-            exported_families = _exported_receipt_families(receipt_build_id)
+            _ok, exported_families = _export_receipts(
+                worktree_path, receipt_build_id
+            )
         _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,
@@ -2425,6 +2547,11 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             _build_failed_snapshot(
                 payload,
                 reason=_with_worktree_forensics(reason, worktree_path),
+                # Rich's 2026-07-30 ruling: a budget-cap KILL arms the D659
+                # breach gate. Only the budget-bound timeout qualifies — an
+                # env-default timeout or a plain non-zero exit is NOT a
+                # budget breach and must not arm the gate.
+                budget_cap_killed=timed_out and budget_bound,
             )
         )
 
@@ -2529,6 +2656,18 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
         tasks_completed=int(existing.get("tasks_completed") or 0),
         tasks_failed=tasks_failed,
     )
+    # Preserve the failure metadata the running_wave node stamped on the
+    # channel. This refresh is the FINAL state a fetch-on-empty replay
+    # (wireup._fetch_and_replay_on_empty) will translate — dropping the flat
+    # fields here would strip the wire's failure_reason back to the generic
+    # fallback and lose the cap-kill marker the D659 gate arming rides on
+    # (Rich's 2026-07-30 ruling) exactly on the fast-failure path where the
+    # run finishes before the SSE stream opens.
+    error_message = existing.get("error_message")
+    if error_message is not None:
+        snapshot["error_message"] = error_message
+    if existing.get("budget_cap_killed"):
+        snapshot["budget_cap_killed"] = True
     return _snapshot_update(snapshot)
 
 

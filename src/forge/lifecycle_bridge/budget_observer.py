@@ -147,6 +147,51 @@ class BudgetBreachObserver:
         """Return fresh per-observer state (one per build observer)."""
         return BudgetObserverSession()
 
+    def record_cap_kill(
+        self, *, build_id: str, feature_id: str, detail: str
+    ) -> None:
+        """Durably ARM the stage-3 pre-dispatch gate for a cap-KILLED build.
+
+        Rich's 2026-07-30 ruling: a build the RUNNER killed at its per-build
+        budget wall-clock cap (FEAT-UBS-002 stage 1) must arm the same
+        TASK-GATE-D659 pre-dispatch breach gate an observer-DETECTED breach
+        does. The kill precedes any further ``stage-complete``, so the
+        :meth:`observe_stage_complete` detection path can never fire for it —
+        before this method, a cap-killed feature's re-queue silently SKIPPED
+        the gate (``builds.budget_breach`` stayed NULL). The wireup calls
+        this when a terminal ``build-failed`` arrives carrying the runner's
+        ``budget_cap_killed`` marker.
+
+        RECORD-ONLY, deliberately: the build is already dead at its own
+        bounded end, so there is nothing to escalate mid-run — the gate
+        itself forces the human ruling on the feature's NEXT re-queue
+        (``dispatch_build`` stage 3). Observer-detected breach semantics
+        (record + escalate on ``stage-complete``) are untouched.
+
+        First-write-wins is enforced by the durable layer
+        (``record_budget_breach`` updates only ``WHERE budget_breach IS
+        NULL``), so a redelivered terminal — or an earlier observer-detected
+        record for the same build — is never overwritten. No session state is
+        touched: sessions belong to the stage-complete detection path.
+
+        Args:
+            build_id: The cap-killed build.
+            feature_id: Its feature (log context only).
+            detail: The runner's failure reason (names the cap and the
+                UBS-002 provenance).
+        """
+        self._record_breach(
+            build_id, f"wall_clock: {detail} @ {self._clock().isoformat()}"
+        )
+        logger.warning(
+            "budget_observer: budget cap-KILL recorded for build_id=%s "
+            "feature_id=%s (%s) — the D659 pre-dispatch breach gate is ARMED "
+            "for this feature's next re-queue (UBS-002)",
+            build_id,
+            feature_id,
+            detail,
+        )
+
     async def observe_stage_complete(
         self,
         session: BudgetObserverSession,
