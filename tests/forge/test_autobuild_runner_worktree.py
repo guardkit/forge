@@ -798,3 +798,86 @@ class TestFinalizeSuccessWorktree:
 
         assert calls == []  # never removed
         assert worktree.is_dir()  # kept on disk
+
+
+# ---------------------------------------------------------------------------
+# FEAT-FCT — CancelledError reaps the guardkit child (register 2b, RUNNING half)
+# ---------------------------------------------------------------------------
+
+
+class _HangingProc:
+    """A fake guardkit proc that runs until kill() — cancel-reap fixture."""
+
+    pid = 424242
+
+    def __init__(self) -> None:
+        self._dead = asyncio.Event()
+        self.kill_calls = 0
+        self.returncode: int | None = None
+
+    class _Stdout:
+        def __init__(self, dead: asyncio.Event) -> None:
+            self._dead = dead
+
+        async def readline(self) -> bytes:
+            await self._dead.wait()
+            return b""
+
+    @property
+    def stdout(self) -> "_HangingProc._Stdout":
+        return _HangingProc._Stdout(self._dead)
+
+    async def wait(self) -> int:
+        await self._dead.wait()
+        self.returncode = -9
+        return -9
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._dead.set()
+
+
+def test_cancelled_run_kills_and_reaps_the_guardkit_child(
+    tmp_path: Path,
+) -> None:
+    """FEAT-FCT: a langgraph interrupt cancels the node's task — the runner
+    must kill+reap the guardkit subprocess and re-raise, never orphan it
+    (the 2026-07-28 orphan class)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "seed")
+
+    proc = _HangingProc()
+    started = asyncio.Event()
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _stub(*args: Any, **kwargs: Any) -> Any:
+        prog = str(args[0]) if args else ""
+        if prog.endswith("guardkit"):
+            started.set()
+            return proc
+        return await real_exec(*args, **kwargs)
+
+    async def _drive() -> None:
+        with patch.object(
+            ar, "_resolve_repo_path", lambda payload: repo
+        ), patch.object(
+            ar, "_resolve_guardkit_path", lambda: Path("/usr/bin/guardkit")
+        ), patch.object(asyncio, "create_subprocess_exec", _stub):
+            graph = ar._build_runner_graph()
+            payload = '{"feature_id": "FEAT-FCT1", "build_id": "build-FEAT-FCT1-1"}'
+            task = asyncio.ensure_future(
+                graph.ainvoke(
+                    {"messages": [HumanMessage(content=_launch(payload))]}
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=10.0)
+            await asyncio.sleep(0.05)  # let the wait block engage
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_drive())
+    assert proc.kill_calls >= 1  # the child was killed, not orphaned
+    assert proc.returncode == -9  # and reaped

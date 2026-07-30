@@ -21,7 +21,9 @@ best-effort, via :class:`SqliteRowCancelledNotifier`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +64,86 @@ class CliRuntime:
 def _noop_async_call(*_args: object, **_kwargs: object) -> None:
     """No-op pass-through for the AsyncTask{Canceller,Updater} seams."""
     return None
+
+
+def _langgraph_interrupt_canceller(
+    runner_url: str | None = None,
+) -> Callable[[str], bool]:
+    """Production canceller for the ``cancel_async_task`` seam (FEAT-FCT).
+
+    Until this lane the seam was wired to :func:`_noop_async_call`, so a CLI
+    cancel on a RUNNING build flipped the ledger row while the sidecar's
+    guardkit run kept executing (register 2b; FWD-005 fixed only the
+    paused-at-gate path). This callable issues the DESIGNED interrupt
+    (FRR-PEB scope §7): ``runs.cancel(thread_id, run_id, action="interrupt")``
+    against the langgraph sidecar, where ``task_id == thread_id`` (the same
+    identity the FTR-fixed provider established).
+
+    BEST-EFFORT BY DESIGN: any failure (no runner URL configured, sidecar
+    unreachable, no run on the thread) is logged and returns ``False`` —
+    the CLI cancel's Group D row transition proceeds either way, exactly as
+    before. What changes is only that a reachable sidecar's run now actually
+    gets interrupted (and the runner reaps the guardkit child — see the
+    ``CancelledError`` branch in ``autobuild_runner``).
+    """
+
+    def _cancel(task_id: str) -> bool:
+        url = runner_url or os.environ.get("FORGE_AUTOBUILD_RUNNER_URL")
+        if not url:
+            logger.warning(
+                "cancel_async_task: FORGE_AUTOBUILD_RUNNER_URL not set — "
+                "interrupt NOT attempted for task_id=%s (row transition "
+                "proceeds; the run, if any, continues)",
+                task_id,
+            )
+            return False
+        try:
+            from langgraph_sdk import get_client
+
+            async def _run() -> bool:
+                client = get_client(url=url)
+                runs = await client.runs.list(task_id, limit=1)
+                if not runs:
+                    logger.warning(
+                        "cancel_async_task: no runs on thread %s — nothing "
+                        "to interrupt",
+                        task_id,
+                    )
+                    return False
+                first = runs[0]
+                run_id = (
+                    first.get("run_id")
+                    if isinstance(first, dict)
+                    else getattr(first, "run_id", None)
+                )
+                if not run_id:
+                    logger.warning(
+                        "cancel_async_task: run on thread %s has no run_id "
+                        "— cannot interrupt",
+                        task_id,
+                    )
+                    return False
+                await client.runs.cancel(task_id, run_id, action="interrupt")
+                logger.info(
+                    "cancel_async_task: interrupt issued thread=%s run=%s",
+                    task_id,
+                    run_id,
+                )
+                return True
+
+            return asyncio.run(_run())
+        except Exception as exc:  # noqa: BLE001 — best-effort: never strand the CLI cancel
+            logger.warning(
+                "cancel_async_task: interrupt attempt failed for task_id=%s "
+                "(%s: %s) — row transition proceeds; the run may still be "
+                "executing",
+                task_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
+    return _cancel
 
 
 def _noop_synthetic_injector(_payload: object) -> None:
@@ -199,7 +281,9 @@ def build_cli_runtime(
             synthetic_injector=synthetic_injector or _noop_synthetic_injector,
         ),
         async_task_canceller=AsyncTaskCanceller(
-            async_task_canceller or _noop_async_call
+            # FEAT-FCT: the production default issues a real langgraph
+            # interrupt (was the _noop_async_call register-2b gap).
+            async_task_canceller or _langgraph_interrupt_canceller()
         ),
         async_task_updater=AsyncTaskUpdater(async_task_updater or _noop_async_call),
         build_canceller=SqliteBuildCanceller(persistence),
