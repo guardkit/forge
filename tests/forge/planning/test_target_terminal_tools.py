@@ -29,6 +29,8 @@ from forge.planning.target_terminal_tools import (
     TargetTestRootsUnresolved,
     ToolOutcome,
     discover_target_test_roots,
+    discover_ts_shape_test_roots,
+    shallow_discover_test_roots,
     make_dcl_author,
     make_normalize_feature_spec,
     make_validate_feature_plan,
@@ -37,9 +39,28 @@ from forge.planning.target_terminal_tools import (
     resolve_normalizer_command,
 )
 
+def _find_sibling_checkout(name: str) -> Path:
+    """First ancestor directory that CONTAINS a checkout called ``name``.
+
+    Replaces a fixed ``parents[4]`` hop, which was only correct when the tests
+    ran from the forge repo root: inside a git worktree
+    (``forge/.guardkit/worktrees/<LANE>/tests/forge/planning``) it resolved to
+    ``forge/.guardkit/worktrees/api_test``, so the live-checkout test silently
+    SKIPPED in every worktree run — the one venue the lanes actually work in.
+    Returns a non-existent path when nothing is found, so the callers' skip
+    guards still fire in a clean CI image.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / name
+        if candidate.is_dir():
+            return candidate
+    return here.parents[-1] / name
+
+
 # The real api_test sibling checkout (Rich's estate); present on the dev host,
 # absent in a clean CI image — the REAL-repo assertion skips when it is missing.
-_REAL_API_TEST = Path(__file__).resolve().parents[4] / "api_test"
+_REAL_API_TEST = _find_sibling_checkout("api_test")
 
 
 # ---------------------------------------------------------------------------
@@ -857,20 +878,204 @@ def test_discovery_empty_when_no_tests_tree(tmp_path: Path) -> None:
     assert discover_target_test_roots(tmp_path) == []
 
 
+# ---------------------------------------------------------------------------
+# THE REAL TEST-ROOT CURE (design §D.3(ii)) — the TypeScript shapes.
+#
+# The stage-B stopgap was to BEND ts-api-test: move ``tests/health.test.ts`` to
+# ``tests/health/health.test.ts`` so the Python-shaped discovery had a
+# subdirectory to find. These tests make that bend reversible — the ORIGINAL
+# flat shape now discovers, so the repo can move back.
+# ---------------------------------------------------------------------------
+
+
+def _ts_api_test_original_shape(root: Path) -> None:
+    """ts-api-test EXACTLY as scaffolded, before the stage-B shape-bend.
+
+    Verified against the real checkout (design §C): ``tests/health.test.ts``
+    flat, sources under ``src/``, no ``tests/<name>/`` subdirectory anywhere.
+    """
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "health.test.ts").write_text(
+        "import { describe, it } from 'vitest';\n", encoding="utf-8"
+    )
+    (root / "src" / "health").mkdir(parents=True)
+    (root / "src" / "health" / "routes.ts").write_text("export {};\n", encoding="utf-8")
+    (root / "package.json").write_text('{"name": "ts-api-test"}\n', encoding="utf-8")
+
+
+def test_flat_ts_shape_discovers_tests_itself(tmp_path: Path) -> None:
+    """ts-api-test's ORIGINAL flat shape yields ``["tests"]``, never ``[]``.
+
+    ``[]`` was the near-blocker: the descriptor emitted ``test_roots: []`` and
+    ASSUM-010 then made ANY ``smoke_gates`` block a plan-containment error, so a
+    TypeScript feature could not carry an inter-wave smoke gate at all.
+    """
+    _ts_api_test_original_shape(tmp_path)
+    assert discover_ts_shape_test_roots(tmp_path) == ["tests"]
+    assert discover_target_test_roots(tmp_path) == ["tests"]
+
+
+def test_the_stage_b_shape_bend_still_works_unchanged(tmp_path: Path) -> None:
+    """The bent shape (``tests/health/health.test.ts``) is untouched by the cure.
+
+    Reversibility cuts both ways: the repo may move back to flat, and it may
+    also stay bent. The bent tree is a plain Python-shaped subdirectory, so
+    guardkit's own discovery answers it and the TS pass adds nothing.
+    """
+    (tmp_path / "tests" / "health").mkdir(parents=True)
+    (tmp_path / "tests" / "health" / "health.test.ts").write_text("", encoding="utf-8")
+    assert discover_ts_shape_test_roots(tmp_path) == []
+    assert discover_target_test_roots(tmp_path) == ["tests/health"]
+
+
+def test_singular_test_dir_flat(tmp_path: Path) -> None:
+    (tmp_path / "test").mkdir()
+    (tmp_path / "test" / "app.spec.ts").write_text("", encoding="utf-8")
+    assert discover_target_test_roots(tmp_path) == ["test"]
+
+
+def test_singular_test_dir_with_subdirectories(tmp_path: Path) -> None:
+    (tmp_path / "test" / "health").mkdir(parents=True)
+    (tmp_path / "test" / "health" / "health.test.ts").write_text("", encoding="utf-8")
+    (tmp_path / "test" / "users").mkdir(parents=True)
+    (tmp_path / "test" / "users" / "users.test.ts").write_text("", encoding="utf-8")
+    assert discover_target_test_roots(tmp_path) == ["test/health", "test/users"]
+
+
+def test_colocated_dunder_tests_under_src(tmp_path: Path) -> None:
+    (tmp_path / "src" / "health" / "__tests__").mkdir(parents=True)
+    (tmp_path / "src" / "health" / "__tests__" / "routes.test.ts").write_text(
+        "", encoding="utf-8"
+    )
+    (tmp_path / "src" / "users" / "__tests__").mkdir(parents=True)
+    (tmp_path / "src" / "users" / "__tests__" / "svc.spec.tsx").write_text(
+        "", encoding="utf-8"
+    )
+    assert discover_target_test_roots(tmp_path) == [
+        "src/health/__tests__",
+        "src/users/__tests__",
+    ]
+
+
+def test_empty_dunder_tests_dir_is_not_a_root(tmp_path: Path) -> None:
+    (tmp_path / "src" / "health" / "__tests__").mkdir(parents=True)
+    assert discover_ts_shape_test_roots(tmp_path) == []
+
+
+def test_node_modules_is_never_walked(tmp_path: Path) -> None:
+    """An installed dependency tree must not contribute roots (or cost)."""
+    vendored = tmp_path / "src" / "node_modules" / "left-pad" / "__tests__"
+    vendored.mkdir(parents=True)
+    (vendored / "index.test.js").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "health" / "__tests__").mkdir(parents=True)
+    (tmp_path / "src" / "health" / "__tests__" / "a.test.ts").write_text(
+        "", encoding="utf-8"
+    )
+    assert discover_ts_shape_test_roots(tmp_path) == ["src/health/__tests__"]
+
+
+# --- REGRESSION PINS: the Python shape is byte-unchanged --------------------
+
+
+def test_python_shape_gains_nothing_from_the_ts_pass(tmp_path: Path) -> None:
+    """api_test's shape — flat ``test_*.py`` beside per-suite dirs — is untouched."""
+    (tmp_path / "tests" / "health").mkdir(parents=True)
+    (tmp_path / "tests" / "users").mkdir(parents=True)
+    (tmp_path / "tests" / "test_main.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests" / "conftest.py").write_text("", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("", encoding="utf-8")
+
+    assert discover_ts_shape_test_roots(tmp_path) == []
+    assert discover_target_test_roots(tmp_path) == ["tests/health", "tests/users"]
+
+
+def test_a_python_repo_with_a_singular_test_dir_is_unchanged(tmp_path: Path) -> None:
+    """``test/`` opens ONLY on TypeScript evidence — a Python ``test/`` tree is
+    invisible to discovery exactly as it is today."""
+    (tmp_path / "test" / "pkg").mkdir(parents=True)
+    (tmp_path / "test" / "pkg" / "test_thing.py").write_text("", encoding="utf-8")
+    assert discover_ts_shape_test_roots(tmp_path) == []
+    assert discover_target_test_roots(tmp_path) == []
+
+
+def test_ts_discovery_never_raises_on_a_missing_tree(tmp_path: Path) -> None:
+    assert discover_ts_shape_test_roots(tmp_path / "nope") == []
+
+
+# --- The guardkit-less degraded fallback ------------------------------------
+
+
+def test_shallow_fallback_reproduces_the_per_suite_python_shape(
+    tmp_path: Path,
+) -> None:
+    """The degraded path no longer answers the round-10 defect shape.
+
+    It used to return a bare ``["tests"]`` — a PREFIX of every ``tests/<x>``
+    path, which is exactly what let 008 invent ``tests/smoke`` and pass the
+    in-session containment gate. It now returns the same per-suite roots
+    guardkit would.
+    """
+    (tmp_path / "tests" / "health").mkdir(parents=True)
+    (tmp_path / "tests" / "users").mkdir(parents=True)
+    (tmp_path / "tests" / "__pycache__").mkdir()
+    assert shallow_discover_test_roots(tmp_path) == ["tests/health", "tests/users"]
+    assert "tests" not in shallow_discover_test_roots(tmp_path)
+
+
+def test_shallow_fallback_knows_the_flat_ts_shape(tmp_path: Path) -> None:
+    _ts_api_test_original_shape(tmp_path)
+    assert shallow_discover_test_roots(tmp_path) == ["tests"]
+
+
+def test_shallow_fallback_empty_on_a_bare_repo(tmp_path: Path) -> None:
+    assert shallow_discover_test_roots(tmp_path) == []
+
+
 @pytest.mark.skipif(
     not (_REAL_API_TEST / "tests").is_dir(),
     reason="real api_test sibling checkout not present",
 )
 def test_discovery_against_the_REAL_api_test_checkout() -> None:
-    """Against Rich's REAL api_test checkout, the descriptor roots are exactly
-    the set guardkit's ``feature validate`` reports — the round-10 byte-identical
-    roots (tests/health, tests/users) plus tests/version since the FEAT-B70F
-    merge (``e0ad48a``, the B4 first live pass) landed the /version endpoint's
-    tests (dated truth-update 2026-07-16). A live-fixture test: when the real
-    checkout legitimately grows a root, update this list with a dated note —
-    never loosen it to a pattern."""
+    """Against Rich's REAL api_test checkout, discovery returns a well-SHAPED
+    root set — never a hard-coded inventory of that checkout's contents.
+
+    THE ROT THIS FIXES (second-repo readiness, 2026-07-31). This assertion used
+    to pin the exact list ``["tests/health", "tests/users", "tests/version"]``
+    with an instruction to "update this list with a dated note — never loosen
+    it to a pattern". That instruction made a forge unit test a downstream
+    consumer of a SIBLING WORKING TREE's contents: every feature api_test grows
+    breaks forge's suite for a reason that has nothing to do with forge. It had
+    already been updated once by hand (FEAT-B70F / tests/version) and it broke
+    again on FEAT-TIME's merge, which landed ``tests/time``.
+
+    What is actually worth asserting is the CONTRACT, and it is fully
+    shape-expressible: discovery of a real Python checkout yields a non-empty
+    set, every entry is a proper subdirectory of ``tests/`` (never bare
+    ``tests``, which is the round-10 defect that let 008 invent ``tests/smoke``
+    as a "prefix"), the set is sorted and duplicate-free, and each entry names a
+    directory that exists on disk. The exact inventory is api_test's business.
+
+    Exact-contents pinning of a live checkout is now out of bounds for this
+    file (design §F.5): a fixture that needs specific contents is a COMMITTED
+    fixture under ``tests/``, built with ``tmp_path`` — see the shape tests
+    above, which do exactly that.
+    """
     roots = discover_target_test_roots(_REAL_API_TEST)
-    assert roots == ["tests/health", "tests/users", "tests/version"]
+
+    # Non-empty: a real Python checkout with a tests/ tree has roots.
+    assert roots, "real api_test checkout yielded no test roots"
+    # Sorted, duplicate-free.
+    assert roots == sorted(roots)
+    assert len(roots) == len(set(roots))
+    for root in roots:
+        # A proper SUBDIRECTORY of tests/ — never bare "tests".
+        assert root.startswith("tests/"), root
+        assert root != "tests"
+        suffix = root[len("tests/") :]
+        assert suffix, root
+        assert "/" not in suffix, f"{root}: roots are one level deep"
+        assert (_REAL_API_TEST / root).is_dir(), f"{root} is not a directory"
 
 
 # ---------------------------------------------------------------------------
@@ -1156,3 +1361,20 @@ def test_p5_combine_keeps_tail_and_marks_truncated_head() -> None:
 
 def test_p5_combine_no_streams_is_empty() -> None:
     assert ttt._combine_validate_error_streams(stdout_tail="", stderr="") == ""
+
+
+def test_python_only_dunder_tests_dir_is_not_a_root(tmp_path):
+    """The src/**/__tests__ shape is TS-gated: a Python repo's answer stays []."""
+    (tmp_path / "src" / "pkg" / "__tests__").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "__tests__" / "test_x.py").write_text("def test_x(): pass\n")
+    from forge.planning.target_terminal_tools import discover_target_test_roots
+
+    assert discover_target_test_roots(tmp_path) == []
+
+
+def test_ts_dunder_tests_dir_is_a_root(tmp_path):
+    (tmp_path / "src" / "pkg" / "__tests__").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "__tests__" / "x.test.ts").write_text("test\n")
+    from forge.planning.target_terminal_tools import discover_target_test_roots
+
+    assert "src/pkg/__tests__" in discover_target_test_roots(tmp_path)

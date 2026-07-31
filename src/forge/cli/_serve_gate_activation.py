@@ -761,8 +761,21 @@ async def rearm_paused_gates(
             # so a subscribe that raises leaves it unset — hence the bounded
             # wait below. The done-callback retrieves any exception the task
             # dies with so asyncio does not warn about an orphaned failure.
+            # SECOND-REPO LAW: the boot-rearm launch must name its repo. The
+            # sweep already holds ``build_row`` (fetched above for the recovery
+            # envelope) and ``builds.repo`` is a REQUIRED column, so the value
+            # is right here — the historical ``repo=None`` was a gap, not a
+            # shortage of information. Without it the runner's repo-less
+            # refusal would terminate every re-armed build (and, before that
+            # refusal existed, it silently built FORGE_DEFAULT_REPO — repo #1 —
+            # whatever repo the feature actually belonged to).
             task = asyncio.create_task(
-                _rearm_dispatch(deps=deps, snap=snap, resume_launcher=resume_launcher),
+                _rearm_dispatch(
+                    deps=deps,
+                    snap=snap,
+                    resume_launcher=resume_launcher,
+                    repo=getattr(build_row, "repo", None),
+                ),
                 name=f"rearm-gate-{snap.build_id}",
             )
             _track_rearm_task(task)
@@ -830,6 +843,7 @@ async def _rearm_dispatch(
     deps: Any,
     snap: "PausedBuildSnapshot",
     resume_launcher: Callable[..., Any],
+    repo: str | None = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -840,6 +854,12 @@ async def _rearm_dispatch(
     deferred launch); a terminal outcome (reject / expiry) needs no launch —
     its ack rides the duplicate-terminal redelivery of the held build-queued
     message.
+
+    ``repo`` is the ``builds.repo`` of the row being re-armed, threaded so the
+    resumed launch names its own target repository instead of leaning on the
+    daemon's environment default. It is forwarded verbatim (``None`` only when
+    the caller could not read a row, which the sweep already treats as corrupt
+    state).
     """
     outcome, _decision = await await_and_dispatch(
         deps=deps,
@@ -861,5 +881,6 @@ async def _rearm_dispatch(
             build_id=snap.build_id,
             feature_id=snap.feature_id,
             correlation_id=snap.correlation_id,
+            repo=repo,
         )
     return outcome

@@ -1084,6 +1084,54 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
 #: ``~/Projects/appmilla_github`` per the source plan's single-host layout.
 FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
 
+#: Environment name of the single-repo default. Historically (TASK-ABW-002)
+#: this was consulted UNCONDITIONALLY whenever a launch arrived with no
+#: ``repo``, at INFO. With one registered target that was harmless; with two it
+#: is a WRONG-REPO BUILD THAT LOOKS GREEN — the daemon quietly builds repo #1
+#: and reports success for a feature that belongs to repo #2. It is now honoured
+#: ONLY when :data:`FORGE_DEFAULT_REPO_OPT_IN_ENV` explicitly rides with it.
+FORGE_DEFAULT_REPO_ENV: str = "FORGE_DEFAULT_REPO"
+
+#: Explicit opt-in that licenses the :data:`FORGE_DEFAULT_REPO_ENV` fallback.
+#: Set it to ``1`` (also accepted: ``true``/``yes``/``on``, case-insensitive)
+#: to say "this daemon really does serve a single repo and a repo-less launch
+#: should build it". Absent, a repo-less launch is REFUSED with a structured
+#: terminal rather than silently defaulted.
+#:
+#: Deploy note (attended, NOT edited by this lane): the durable unit
+#: ``ops/systemd/forge-langgraph-sidecar.service`` carries
+#: ``Environment=FORGE_DEFAULT_REPO=appmilla/api_test`` and no opt-in line, so
+#: after this change that unit's default is INERT and a repo-less launch fails
+#: loudly. The attended deploy either deletes that line (recommended — the
+#: serve path threads ``repo`` correctly) or adds
+#: ``Environment=FORGE_DEFAULT_REPO_OPT_IN=1`` beside it.
+FORGE_DEFAULT_REPO_OPT_IN_ENV: str = "FORGE_DEFAULT_REPO_OPT_IN"
+
+#: Values of :data:`FORGE_DEFAULT_REPO_OPT_IN_ENV` that count as "yes".
+_DEFAULT_REPO_OPT_IN_TRUTHY: frozenset[str] = frozenset(
+    {"1", "true", "yes", "on"}
+)
+
+#: The plain-words refusal a repo-less launch terminates with. Names the defect
+#: (a silent default is a wrong-repo build), names the two cures, and never
+#: hides behind an internal id. Surfaced as ``error_message`` on the failed
+#: snapshot, which the lifecycle bridge puts on the wire as ``failure_reason``.
+MISSING_REPO_REFUSAL: str = (
+    "launch payload carries no repo — refusing to build. Building the "
+    "environment default instead would silently build a DIFFERENT repository "
+    "than the one this feature belongs to, and that build looks green. "
+    "Send 'repo' in the launch payload (the serve path already does), or, only "
+    "if this daemon genuinely serves a single repo, set "
+    "FORGE_DEFAULT_REPO_OPT_IN=1 alongside FORGE_DEFAULT_REPO=<org>/<repo>."
+)
+
+#: Refusal used when the opt-in flag is set but names no repo to fall back to.
+MISSING_DEFAULT_REPO_REFUSAL: str = (
+    "launch payload carries no repo and FORGE_DEFAULT_REPO_OPT_IN is set but "
+    "FORGE_DEFAULT_REPO is empty — refusing to build. Set FORGE_DEFAULT_REPO="
+    "<org>/<repo>, or send 'repo' in the launch payload."
+)
+
 #: Environment override for the absolute path to the ``guardkit`` binary.
 #: When unset, :func:`_resolve_guardkit_path` falls back to
 #: :func:`shutil.which("guardkit")`.
@@ -1267,6 +1315,46 @@ def _load_filesystem_allowlist() -> list[Path] | None:
     return None
 
 
+def _default_repo_opt_in_enabled() -> bool:
+    """True iff the operator explicitly licensed the FORGE_DEFAULT_REPO fallback.
+
+    Reads :data:`FORGE_DEFAULT_REPO_OPT_IN_ENV` and compares (lower-cased,
+    stripped) against :data:`_DEFAULT_REPO_OPT_IN_TRUTHY`. Anything else —
+    including unset, empty, ``0`` and a typo — is "no", so the fallback is
+    off by default and a typo fails CLOSED (a refusal) rather than open (a
+    wrong-repo build).
+    """
+    return (
+        os.environ.get(FORGE_DEFAULT_REPO_OPT_IN_ENV, "").strip().lower()
+        in _DEFAULT_REPO_OPT_IN_TRUTHY
+    )
+
+
+def repo_resolution_failure_reason(payload: Mapping[str, Any]) -> str:
+    """The structured terminal reason for a failed repo resolution.
+
+    Split from :func:`_resolve_repo_path` (which stays a plain
+    ``payload -> Path | None`` seam, because the runner's tests patch it) so
+    the node can name WHICH failure happened instead of emitting one generic
+    "unable to resolve repo path for repo=None" for every cause.
+
+    A launch that carried no repo at all gets :data:`MISSING_REPO_REFUSAL` (or
+    :data:`MISSING_DEFAULT_REPO_REFUSAL` when the opt-in is set but names no
+    repo) — the plain-words refusal that says a silent default would be a
+    wrong-repo build. Every other cause (path absent, not a directory, not a
+    git repo, outside the allowlist) keeps the historical wording, with the
+    resolver's own WARNING lines carrying the specifics.
+    """
+    repo_raw = payload.get("repo")
+    if not isinstance(repo_raw, str) or not repo_raw.strip():
+        if not _default_repo_opt_in_enabled():
+            return MISSING_REPO_REFUSAL
+        if not os.environ.get(FORGE_DEFAULT_REPO_ENV, "").strip():
+            return MISSING_DEFAULT_REPO_REFUSAL
+        repo_raw = os.environ.get(FORGE_DEFAULT_REPO_ENV, "").strip()
+    return f"unable to resolve repo path for repo={repo_raw!r}"
+
+
 def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     """Resolve the absolute local checkout for ``payload['repo']``.
 
@@ -1279,9 +1367,14 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     3. Is inside the configured filesystem allowlist (when discoverable
        via :func:`_load_filesystem_allowlist`).
 
-    On any failure, returns ``None`` and logs a WARNING with the structured
-    reason. The caller transitions to ``failed`` with that reason on the
-    snapshot.
+    A launch that carries no ``repo`` is REFUSED (returns ``None``, logged at
+    ERROR) unless :data:`FORGE_DEFAULT_REPO_OPT_IN_ENV` explicitly licenses the
+    :data:`FORGE_DEFAULT_REPO_ENV` fallback — see
+    :func:`_default_repo_opt_in_enabled`. There is no silent default.
+
+    On any failure, returns ``None`` and logs the structured reason. The caller
+    turns that into a failed snapshot via
+    :func:`repo_resolution_failure_reason`.
 
     Args:
         payload: Parsed launch payload — must carry the ``repo`` key
@@ -1294,26 +1387,34 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     """
     repo_raw = payload.get("repo")
     if not isinstance(repo_raw, str) or not repo_raw.strip():
-        # TEMP HOTFIX (TASK-ABW-002 tracked): the upstream dispatcher closure
-        # (forge.cli.serve.dispatcher) only forwards build_id/feature_id/
-        # rationale to dispatch_autobuild_async, so payload.repo is absent
-        # in production launches. Fall back to FORGE_DEFAULT_REPO until the
-        # upstream contract is widened to plumb the BuildQueuedPayload
-        # repo/branch/feature_yaml_path through to launch_payload.
-        env_repo = os.environ.get("FORGE_DEFAULT_REPO", "").strip()
-        if env_repo:
-            logger.info(
-                "autobuild_runner: payload.repo missing; using "
-                "FORGE_DEFAULT_REPO=%s",
-                env_repo,
-            )
-            repo_raw = env_repo
-        else:
-            logger.warning(
-                "autobuild_runner: missing or empty 'repo' in launch payload "
-                "and FORGE_DEFAULT_REPO unset — cannot resolve checkout path"
+        # SECOND-REPO LAW: a launch with no repo is REFUSED, never defaulted.
+        # The TASK-ABW-002 hotfix used to consult FORGE_DEFAULT_REPO here
+        # unconditionally and at INFO. That was survivable while exactly one
+        # repo was registered; with a second target the silent value is repo #1
+        # and the result is a wrong-repo build that reports green. The
+        # environment default is now a licensed choice, not a shrug: it applies
+        # only when FORGE_DEFAULT_REPO_OPT_IN explicitly rides with it, and even
+        # then it announces itself at WARNING.
+        env_repo = os.environ.get(FORGE_DEFAULT_REPO_ENV, "").strip()
+        if not _default_repo_opt_in_enabled():
+            logger.error(
+                "autobuild_runner: %s (FORGE_DEFAULT_REPO=%r was NOT used)",
+                MISSING_REPO_REFUSAL,
+                env_repo or None,
             )
             return None
+        if not env_repo:
+            logger.error("autobuild_runner: %s", MISSING_DEFAULT_REPO_REFUSAL)
+            return None
+        logger.warning(
+            "autobuild_runner: payload.repo missing; %s=%s used under an "
+            "explicit %s opt-in — every launch on this daemon that loses its "
+            "repo will build THIS repository",
+            FORGE_DEFAULT_REPO_ENV,
+            env_repo,
+            FORGE_DEFAULT_REPO_OPT_IN_ENV,
+        )
+        repo_raw = env_repo
 
     # Accept ``org/repo`` and bare ``repo`` (defensive — the BuildQueuedPayload
     # field is loosely shaped; only the basename matters for the local layout).
@@ -2359,17 +2460,18 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         )
     feature_id = feature_id_raw.strip()
 
-    # TEMP HOTFIX (TASK-ABW-002): the early guard previously short-circuited
-    # before _resolve_repo_path's FORGE_DEFAULT_REPO fallback could fire.
-    # Delegate the missing-repo decision entirely to the resolver so the
-    # fallback path is reachable.
-
+    # The missing-repo decision lives entirely in the resolver (the runner's
+    # tests patch _resolve_repo_path, so an early guard here would bypass the
+    # seam). The resolver REFUSES a repo-less launch unless the operator opted
+    # in to the FORGE_DEFAULT_REPO fallback; the reason helper names which of
+    # the causes fired so the terminal says the defect plainly instead of
+    # "repo=None".
     repo_path = _resolve_repo_path(payload)
     if repo_path is None:
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
-                reason=f"unable to resolve repo path for repo={payload.get('repo')!r}",
+                reason=repo_resolution_failure_reason(payload),
             )
         )
 

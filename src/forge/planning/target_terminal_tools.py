@@ -64,7 +64,10 @@ __all__ = [
     "FrontmatterRepairResult",
     "repair_frontmatter_feature_id",
     "repair_plan_task_frontmatter",
+    "TS_TEST_FILE_SUFFIXES",
     "discover_target_test_roots",
+    "discover_ts_shape_test_roots",
+    "shallow_discover_test_roots",
     "make_dcl_author",
     "make_normalize_feature_spec",
     "make_validate_feature_plan",
@@ -216,6 +219,241 @@ TEST_ROOT_DISCOVERY_MODULE_CANDIDATES: tuple[str, ...] = (
 )
 
 
+#: Filename suffixes that mark a file as a TypeScript/JavaScript test. These are
+#: the vitest/jest/mocha conventions, not a guess: ``*.test.ts`` / ``*.spec.ts``
+#: and their tsx/js/mjs siblings. Used ONLY as *evidence* that a directory is a
+#: TS test tree — never to build a command.
+TS_TEST_FILE_SUFFIXES: tuple[str, ...] = (
+    ".test.ts",
+    ".test.tsx",
+    ".test.mts",
+    ".test.js",
+    ".test.jsx",
+    ".test.mjs",
+    ".spec.ts",
+    ".spec.tsx",
+    ".spec.mts",
+    ".spec.js",
+    ".spec.jsx",
+    ".spec.mjs",
+)
+
+#: Directory names never walked when looking for ``src/**/__tests__`` — build
+#: output and dependency trees. ``node_modules`` first and foremost: without it
+#: a single walk of a real TypeScript app would stat tens of thousands of paths.
+_TS_WALK_SKIP_NAMES: frozenset[str] = frozenset(
+    {
+        "node_modules",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        ".next",
+        ".turbo",
+        ".svelte-kit",
+        "__pycache__",
+    }
+)
+
+#: How deep under ``src/`` a ``__tests__`` directory is looked for. Six levels
+#: covers every layout seen in practice and keeps the walk bounded.
+_TS_DUNDER_TESTS_MAX_DEPTH: int = 6
+
+#: Names never returned as a test root even when present as a subdirectory.
+#: Mirrors guardkit's own ``_TEST_ROOT_SKIP_NAMES`` so the two discoveries agree
+#: on what a root is NOT.
+_TEST_ROOT_SKIP_NAMES: frozenset[str] = frozenset(
+    {"__pycache__", ".pytest_cache", "node_modules"}
+)
+
+
+def _is_ts_test_file(name: str) -> bool:
+    """True iff ``name`` ends with one of :data:`TS_TEST_FILE_SUFFIXES`."""
+    return any(name.endswith(suffix) for suffix in TS_TEST_FILE_SUFFIXES)
+
+
+def _has_flat_ts_tests(directory: Path) -> bool:
+    """True iff ``directory`` holds a TS test file as an IMMEDIATE child."""
+    try:
+        return any(
+            child.is_file() and _is_ts_test_file(child.name)
+            for child in directory.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _contains_ts_tests(directory: Path, *, max_depth: int = 2) -> bool:
+    """True iff a TS test file exists at or below ``directory``, depth-bounded.
+
+    Used as the EVIDENCE gate for the singular ``test/`` directory: a Python
+    repo that happens to carry ``test/`` must keep returning exactly what it
+    returns today, so that branch only opens when the tree actually holds
+    TypeScript tests.
+    """
+    if max_depth < 0:
+        return False
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        try:
+            if child.is_file():
+                if _is_ts_test_file(child.name):
+                    return True
+                continue
+            if not child.is_dir():
+                continue
+        except OSError:
+            continue
+        if child.name in _TS_WALK_SKIP_NAMES or child.name.startswith("."):
+            continue
+        if _contains_ts_tests(child, max_depth=max_depth - 1):
+            return True
+    return False
+
+
+def _eligible_subdir_names(directory: Path) -> list[str]:
+    """Immediate subdirectory names of ``directory``, cache/vendor dirs removed.
+
+    Byte-compatible with guardkit's own filter (dot-prefixed names and
+    :data:`_TEST_ROOT_SKIP_NAMES` are dropped) so the Python shape keeps
+    producing exactly what it produces today.
+    """
+    try:
+        names = [
+            child.name
+            for child in directory.iterdir()
+            if child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in _TEST_ROOT_SKIP_NAMES
+        ]
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def _discover_dunder_tests_roots(src_dir: Path, repo_root: Path) -> list[str]:
+    """Return every non-empty ``src/**/__tests__`` directory, repo-relative.
+
+    The colocated-tests convention (jest/vitest). Bounded by
+    :data:`_TS_DUNDER_TESTS_MAX_DEPTH` and skipping
+    :data:`_TS_WALK_SKIP_NAMES`, so a repo with an installed ``node_modules``
+    is not walked into.
+    """
+    found: list[str] = []
+
+    def _walk(directory: Path, depth: int) -> None:
+        if depth > _TS_DUNDER_TESTS_MAX_DEPTH:
+            return
+        try:
+            children = list(directory.iterdir())
+        except OSError:
+            return
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            if child.name in _TS_WALK_SKIP_NAMES or child.name.startswith("."):
+                continue
+            if child.name == "__tests__":
+                try:
+                    non_empty = any(
+                        entry.is_file() and _is_ts_test_file(entry.name)
+                        for entry in child.iterdir()
+                    )
+                except OSError:
+                    non_empty = False
+                if non_empty:
+                    found.append(child.relative_to(repo_root).as_posix())
+                # A __tests__ dir is a leaf root; do not descend further.
+                continue
+            _walk(child, depth + 1)
+
+    _walk(src_dir, 1)
+    return found
+
+
+def discover_ts_shape_test_roots(repo_path: Path | str) -> list[str]:
+    """Return the TypeScript-shaped test roots of ``repo_path`` (sorted).
+
+    THE REAL TEST-ROOT CURE (TypeScript-lane design §D.3(ii)). guardkit's
+    ``discover_test_roots`` answers one shape only — the immediate
+    SUBDIRECTORIES of ``tests/`` — which is the Python packaging convention.
+    A TypeScript repo scaffolded the normal way has none of those: vitest's
+    default layout is a FLAT ``tests/health.test.ts``, so discovery returned
+    ``[]``, the 008 descriptor emitted ``test_roots: []``, and ASSUM-010 then
+    turned any ``smoke_gates`` block into a plan-containment error. The repo was
+    bent to fit the tool (``tests/health/health.test.ts``) as a dated, reversible
+    stopgap. This function is the cure that makes that bend reversible.
+
+    Three shapes are taught, each purely ADDITIVE and each gated on TypeScript
+    EVIDENCE so a Python repo's answer is byte-unchanged:
+
+    1. **flat ``tests/``** — ``tests`` itself is a root when it holds
+       ``*.test.ts`` / ``*.spec.ts`` (and tsx/js/mjs siblings) as immediate
+       children. This is ts-api-test's original shape.
+    2. **singular ``test/``** — its eligible subdirectories become
+       ``test/<name>``, plus ``test`` itself when it holds flat TS test files.
+       The whole branch only opens when a TS test file exists at or below
+       ``test/``, so a Python repo carrying a ``test/`` directory still gets
+       nothing from it.
+    3. **``src/**/__tests__/``** — the colocated convention; every non-empty
+       ``__tests__`` directory under ``src/`` is a root, bounded in depth and
+       never walking into ``node_modules``/build output.
+
+    The honest cost of shape 1, stated plainly: ``tests`` is a root whose name
+    is a PREFIX of every ``tests/<x>`` path, which is exactly the geometry that
+    let the round-10 incident's in-session containment gate pass an invented
+    ``tests/smoke``. For a flat TS repo there is no more precise truth to tell —
+    ``tests`` really is the only root — so the containment gate is weaker on
+    that shape by nature, not by accident.
+
+    Pure and side-effect-free; every ``OSError`` degrades to "found nothing".
+    Never raises.
+    """
+    root = Path(repo_path)
+    roots: list[str] = []
+
+    tests_dir = root / "tests"
+    if tests_dir.is_dir() and _has_flat_ts_tests(tests_dir):
+        roots.append("tests")
+
+    test_dir = root / "test"
+    if test_dir.is_dir() and _contains_ts_tests(test_dir):
+        roots.extend(f"test/{name}" for name in _eligible_subdir_names(test_dir))
+        if _has_flat_ts_tests(test_dir):
+            roots.append("test")
+
+    src_dir = root / "src"
+    if src_dir.is_dir():
+        roots.extend(_discover_dunder_tests_roots(src_dir, root))
+
+    return sorted(set(roots))
+
+
+def shallow_discover_test_roots(repo_path: Path | str) -> list[str]:
+    """Degraded, guardkit-free test-root discovery (both shapes).
+
+    Used ONLY when guardkit's own ``discover_test_roots`` cannot be imported —
+    an interpreter where the real ``feature validate`` oracle cannot run either.
+    Reproduces guardkit's Python shape (immediate subdirectories of ``tests/``)
+    instead of the historical bare ``["tests"]`` guess, and adds the TypeScript
+    shapes from :func:`discover_ts_shape_test_roots`, so the degraded answer has
+    the same geometry as the healthy one.
+    """
+    root = Path(repo_path)
+    roots: list[str] = []
+    tests_dir = root / "tests"
+    if tests_dir.is_dir():
+        roots.extend(f"tests/{name}" for name in _eligible_subdir_names(tests_dir))
+    roots.extend(discover_ts_shape_test_roots(root))
+    return sorted(set(roots))
+
+
 class TargetTestRootsUnresolved(RuntimeError):
     """guardkit's ``discover_test_roots`` is not importable in this interpreter.
 
@@ -245,6 +483,21 @@ def discover_target_test_roots(
     (``installer/core/commands/lib/smoke_gates_nudge.py:42``), so the 008
     descriptor carries exactly what the pre-commit oracle will enforce.
 
+    THE TYPESCRIPT SHAPES RIDE ON TOP (design §D.3(ii)). guardkit's function
+    answers the Python shape only. Its answer is kept verbatim and UNIONed with
+    :func:`discover_ts_shape_test_roots`, which is purely additive and gated on
+    TypeScript evidence — so a Python checkout's roots are byte-unchanged, and a
+    TypeScript checkout stops answering ``[]``.
+
+    This does NOT put forge out of step with the downstream oracle. guardkit's
+    ``feature validate`` decides a smoke-gate path by EXISTENCE
+    (``feature_loader.py:927`` / ``:1135`` — ``not (repo_root / p).exists()``);
+    ``discover_test_roots`` only renders the "Available test roots" line of the
+    resulting error message. A root this function adds is a directory that
+    exists, so a plan built on it passes the oracle. The guardkit-side twin —
+    teaching the same shapes to ``discover_test_roots`` so the ERROR MESSAGE
+    lists them too — is a guardkit-venue change and is reported, not made here.
+
     Raises :class:`TargetTestRootsUnresolved` — naming BOTH candidates — when
     neither module imports (a guardkit-less interpreter).
     """
@@ -260,7 +513,16 @@ def discover_target_test_roots(
             continue
         # guardkit's discover_test_roots(repo_root) -> sorted list[str] of
         # ``tests/<name>`` paths; [] when there is no tests/ tree.
-        return list(module.discover_test_roots(Path(repo_path)))
+        python_roots = list(module.discover_test_roots(Path(repo_path)))
+        ts_roots = [
+            root
+            for root in discover_ts_shape_test_roots(repo_path)
+            if root not in python_roots
+        ]
+        if not ts_roots:
+            # Python-shape repo: byte-identical to what guardkit returned.
+            return python_roots
+        return sorted(python_roots + ts_roots)
     raise TargetTestRootsUnresolved(
         "target-terminal test-root discovery could not import guardkit's "
         "discover_test_roots: none of the candidates import in this "

@@ -227,13 +227,22 @@ class _FakeResumeLauncher:
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(
-        self, *, build_id: str, feature_id: str, correlation_id: str | None
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        correlation_id: str | None,
+        repo: str | None = None,
     ) -> None:
+        # ``repo`` is the SECOND-REPO thread: the rearm sweep reads it off the
+        # restored builds row and hands it to the launch, so a re-armed build
+        # never falls through to the daemon's environment default.
         self.calls.append(
             {
                 "build_id": build_id,
                 "feature_id": feature_id,
                 "correlation_id": correlation_id,
+                "repo": repo,
             }
         )
 
@@ -428,6 +437,9 @@ class TestPostRestartApproveLaunches:
                 "build_id": build_id,
                 "feature_id": FEATURE_ID,
                 "correlation_id": CORRELATION_ID,
+                # Threaded from the restored builds row (_make_payload's repo),
+                # NOT left None for FORGE_DEFAULT_REPO to fill in.
+                "repo": "guardkit/forge",
             }
         ]
         # Exactly one build-resumed on the wire (real decision/responder).

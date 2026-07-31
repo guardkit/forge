@@ -41,16 +41,45 @@ def _already_importable() -> bool:
     return False
 
 
+def find_sibling_checkout(name: str, marker: Path | str | None = None) -> Path | None:
+    """Locate a sibling estate checkout by walking UP from this file.
+
+    The old form was ``Path(__file__).resolve().parents[3].parent / name`` — a
+    fixed hop count that is only correct when the tests run from the forge
+    repo's own root. Inside a git worktree (``forge/.guardkit/worktrees/<LANE>/
+    tests/forge/planning``) the same arithmetic lands on
+    ``forge/.guardkit/worktrees/<name>``, which never exists, so guardkit's
+    discovery silently went missing and the descriptor tests failed for a reason
+    that had nothing to do with the code under test.
+
+    Walking up and taking the first ancestor that actually CONTAINS the
+    checkout is correct from both places, and still finds nothing (returns
+    ``None``) in a clean CI image — which is what the callers' guards want.
+
+    Args:
+        name: Checkout directory name, e.g. ``"guardkit"``.
+        marker: Optional path RELATIVE to the checkout that must be a file for
+            the candidate to count. Guards against matching an unrelated
+            directory of the same name.
+    """
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / name
+        if not candidate.is_dir():
+            continue
+        if marker is not None and not (candidate / marker).is_file():
+            continue
+        return candidate
+    return None
+
+
 def _ensure_guardkit_discovery_importable() -> None:
     if _already_importable():
         return
-    # tests/forge/planning/conftest.py -> forge repo root is parents[3].
-    forge_root = Path(__file__).resolve().parents[3]
-    guardkit_checkout = forge_root.parent / "guardkit"
-    marker = guardkit_checkout / "installer" / "core" / "commands" / "lib" / (
+    marker_rel = Path("installer") / "core" / "commands" / "lib" / (
         "smoke_gates_nudge.py"
     )
-    if marker.is_file():
+    guardkit_checkout = find_sibling_checkout("guardkit", marker_rel)
+    if guardkit_checkout is not None:
         # APPEND (lowest priority), never insert(0): the guardkit checkout root
         # exposes several top-level packages (api/, lib/, tests/, main.py) that
         # would shadow forge's own if prepended. Appending lets forge + stdlib +
