@@ -1682,8 +1682,8 @@ class PlanningRunDriver:
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id}: feature {feature_id} queued for "
-            f"build on forge's Mode B pipeline (branch {branch}); paused at the "
-            "build approval gate for the human tap.",
+            f"build on the pipeline's planning chain (branch {branch}); paused at "
+            "the build approval gate for your tap.",
             level="info",
         )
         logger.info(
@@ -2003,8 +2003,8 @@ class PlanningRunDriver:
         )
         await self._notify(
             correlation_id,
-            f"Planning run {correlation_id}: the seat authored the DCL capability "
-            f"{artifact_rel} for {feature_id} (§10 protocol) and committed it with "
+            f"Planning run {correlation_id}: the spec-writer authored the DCL "
+            f"capability {artifact_rel} for {feature_id} and committed it with "
             f"the plan on branch {branch}.",
             level="info",
         )
@@ -2173,8 +2173,9 @@ class PlanningRunDriver:
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id}: DCL authoring produced no artifact "
-            f"({exit_class}: {reason}); continuing to the pass bars / gate / "
-            "build with no .dcl (the absence discipline carries it).",
+            f"({exit_class}: {reason}); continuing to the pass bars, the gate and "
+            "the build without it — a missing capability file is recorded "
+            "honestly, never invented.",
             level="warning",
         )
         logger.warning(
@@ -2429,8 +2430,8 @@ class PlanningRunDriver:
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id}: registered {len(bars)} per-task QA "
-            f"pass bar(s) for {feature_id} on branch {branch} (from the 007 "
-            "seed) before queueing the build.",
+            f"pass bar(s) for {feature_id} on branch {branch} (seeded from the "
+            "machine spec) before queueing the build.",
             level="info",
         )
         logger.info(
