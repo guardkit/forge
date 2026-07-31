@@ -357,6 +357,102 @@ class TestBootSweepInterruptedRuns:
         assert run is not None
         assert len(recovered) >= 0  # Returns list of recovered correlation_ids
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chain_state",
+        [PlanningState.FEATURE_SPEC, PlanningState.FEATURE_PLAN],
+    )
+    async def test_machine_chain_run_recovered_at_boot(
+        self, tmp_db: Path, chain_state: PlanningState
+    ) -> None:
+        """A run killed INSIDE the target-terminal chain is re-driven at boot.
+
+        FEATURE_SPEC / FEATURE_PLAN are non-terminal and are NOT PAUSED, so
+        ``rearm_paused_planning_runs`` never sees them. Before they were swept
+        here, a daemon restart mid-chain left the run with no terminal, no
+        notification and — when it was killed holding a live confirmation card
+        — an approve tap that went nowhere forever.
+        """
+        pool = connect_writer(tmp_db)
+        # The chain states only exist with the target terminal on.
+        store = SqlitePlanningRunStore(pool, target_terminal_enabled=True)
+        store.record_queued(
+            correlation_id=CORRELATION_ID,
+            originating_user=RICH,
+            expected_approver=RICH,
+            request_text="Interrupted machine-chain run",
+            triggered_by="cli",
+        )
+        for to_state in (
+            PlanningState.RUNNING,
+            PlanningState.FEATURE_SPEC,
+            PlanningState.FEATURE_PLAN,
+        ):
+            store.transition(
+                correlation_id=CORRELATION_ID,
+                to_state=to_state,
+                actor_identity=RICH,
+            )
+            if to_state is chain_state:
+                break
+        assert store._get_run(CORRELATION_ID)["state"] == chain_state.value
+
+        fake_dispatcher = FakeDispatcher()
+        recovered = await sweep_interrupted_planning_runs(
+            tmp_db,
+            dispatch_callable=fake_dispatcher.dispatch_stage,
+            clock=FixedClock(),
+        )
+
+        assert recovered == [CORRELATION_ID]
+        assert fake_dispatcher.dispatched == [CORRELATION_ID]
+
+    @pytest.mark.asyncio
+    async def test_terminal_and_paused_runs_are_not_swept(self, tmp_db: Path) -> None:
+        """The sweep still owns exactly the non-terminal, non-PAUSED states.
+
+        PAUSED belongs to the rearm path (it re-emits the persisted checkpoint
+        card verbatim); terminal runs are done. Neither may be re-driven here.
+        """
+        pool = connect_writer(tmp_db)
+        store = SqlitePlanningRunStore(pool, target_terminal_enabled=True)
+        for cid, states in (
+            ("swp-paused", (PlanningState.RUNNING, PlanningState.PAUSED)),
+            ("swp-failed", (PlanningState.RUNNING, PlanningState.FAILED)),
+            (
+                "swp-build-queued",
+                (
+                    PlanningState.RUNNING,
+                    PlanningState.FEATURE_SPEC,
+                    PlanningState.FEATURE_PLAN,
+                    PlanningState.BUILD_QUEUED,
+                ),
+            ),
+        ):
+            store.record_queued(
+                correlation_id=cid,
+                originating_user=RICH,
+                expected_approver=RICH,
+                request_text=cid,
+                triggered_by="cli",
+            )
+            for to_state in states:
+                store.transition(
+                    correlation_id=cid,
+                    to_state=to_state,
+                    actor_identity=RICH,
+                )
+
+        fake_dispatcher = FakeDispatcher()
+        recovered = await sweep_interrupted_planning_runs(
+            tmp_db,
+            dispatch_callable=fake_dispatcher.dispatch_stage,
+            clock=FixedClock(),
+        )
+
+        assert recovered == []
+        assert fake_dispatcher.dispatched == []
+
 
 class TestBusFailureResilience:
     """AC-4: Bus failure during PAUSED -> run remains PAUSED, recoverable."""

@@ -23,8 +23,9 @@ It wires, behind ``planning.enabled``:
 5. **Recovery functions**:
    - :func:`rearm_paused_planning_runs`: re-arms PAUSED runs after restart
      (arm-before-post, verbatim persisted request_id).
-   - :func:`sweep_interrupted_planning_runs`: re-drives QUEUED / RUNNING
-     runs through the re-entrant driver (RT-05 / RT-08).
+   - :func:`sweep_interrupted_planning_runs`: re-drives QUEUED / RUNNING /
+     FEATURE_SPEC / FEATURE_PLAN runs through the re-entrant driver
+     (RT-05 / RT-08) — every non-terminal state rearm does not own.
 
 Architecture
 ------------
@@ -1331,6 +1332,15 @@ async def sweep_interrupted_planning_runs(
        handoff's RT-08 idempotency means a run that crashed between the
        branch commit and the record update completes instead of being
        terminally failed.
+    3. FEATURE_SPEC / FEATURE_PLAN runs (crash mid target-terminal chain,
+       Lane B): re-driven through the SAME re-entrant driver, which
+       resumes those states directly from durable history (every leg is
+       idempotent on its own durable event). Without this a run killed
+       inside the machine chain is enumerated by NOBODY — not here, not by
+       :func:`rearm_paused_planning_runs` (PAUSED only) — and sits forever
+       with no terminal and no notification. That is exactly how a daemon
+       restart used to strand a live auth-confirmation door: the owner's
+       card stayed on screen and their tap went into the void.
 
     Without a dispatcher (planning composition soft-failed this boot) runs
     are LEFT IN PLACE with a loud ERROR — a single bad boot (transient
@@ -1358,10 +1368,19 @@ async def sweep_interrupted_planning_runs(
 
         recovered: list[str] = []
 
+        # Every NON-terminal, NON-PAUSED state (PAUSED is rearm's, and only
+        # rearm re-emits the persisted checkpoint card). FEATURE_SPEC /
+        # FEATURE_PLAN are inert when the target terminal is off — those states
+        # are unreachable — so this stays a no-op for the flag-off posture.
         interrupted = [
-            ("QUEUED", run) for run in store.list_runs_by_state(PlanningState.QUEUED)
-        ] + [
-            ("RUNNING", run) for run in store.list_runs_by_state(PlanningState.RUNNING)
+            (state.value, run)
+            for state in (
+                PlanningState.QUEUED,
+                PlanningState.RUNNING,
+                PlanningState.FEATURE_SPEC,
+                PlanningState.FEATURE_PLAN,
+            )
+            for run in store.list_runs_by_state(state)
         ]
 
         if dispatch_callable is None:

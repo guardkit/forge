@@ -42,6 +42,7 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import PlanningConfig, TargetTerminalConfig
 from forge.gating.identity import derive_request_id
 from forge.lifecycle import migrations
+from forge.planning import driver as driver_module
 from forge.planning.driver import (
     BuildTriggerResult,
     PlanningDriverDeps,
@@ -95,6 +96,18 @@ class FakePublisher:
 
     async def publish_request(self, envelope: Any) -> None:
         self.envelopes.append(envelope)
+
+
+class AuthCardUndeliverablePublisher(FakePublisher):
+    """A wire that swallows every card EXCEPT the auth-confirmation one, which
+    it refuses — the "the owner can never answer" case."""
+
+    async def publish_request(self, envelope: Any) -> None:
+        self.envelopes.append(envelope)
+        if envelope.payload["details"].get("checkpoint_type") == (
+            "auth_surface_confirmation"
+        ):
+            raise RuntimeError("broker refused the auth confirmation card")
 
 
 class ScriptedSubscriber:
@@ -320,12 +333,33 @@ class _Harness:
         self.ctx = ctx
 
 
+class SharedScriptSubscriberFactory:
+    """One shared response script across EVERY wait in a run.
+
+    The default per-call factory hands each waiter a fresh single-approve
+    script; a run that pauses TWICE (the product-docs checkpoint, then the
+    auth-confirmation door) needs the answers to arrive in ORDER, from one
+    script, exactly as one human answering two cards would.
+    """
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.approvers: list[Any] = []
+
+    def __call__(self, expected_approver: Any, armed: Any) -> ScriptedSubscriber:
+        self.approvers.append(expected_approver)
+        return ScriptedSubscriber(self.script, armed)
+
+
 def _make_driver(
     store: SqlitePlanningRunStore,
     *,
     target_terminal_enabled: bool = True,
     git_runner: Any | None = None,
     repo_path: str = "/srv/repos/api_test",
+    subscriber_factory: Any | None = None,
+    originator_wait_seconds: int = 3600,
+    publisher: FakePublisher | None = None,
     spec_result: Any | None = None,
     plan_result: Any | None = None,
     plan_result_factory: Any | None = None,
@@ -349,7 +383,7 @@ def _make_driver(
         return datetime.now(UTC)
 
     repository, state_machine = build_planning_gate_adapters(store, clock=clock)
-    publisher = FakePublisher()
+    publisher = publisher or FakePublisher()
     notifications: list[tuple[str, str, str]] = []
     counters = {
         "po": 0,
@@ -364,8 +398,12 @@ def _make_driver(
     validated_bars: list[str] = []
     validated_registries: list[str] = []
 
-    def subscriber_factory(expected_approver: Any, armed: Any) -> ScriptedSubscriber:
+    def _default_subscriber_factory(
+        expected_approver: Any, armed: Any
+    ) -> ScriptedSubscriber:
         return ScriptedSubscriber([_approve()], armed)
+
+    subscriber_factory = subscriber_factory or _default_subscriber_factory
 
     async def dispatch_po(*, plan_run_id: str, correlation_id: str, **_: Any) -> Any:
         counters["po"] += 1
@@ -488,6 +526,7 @@ def _make_driver(
         enabled=True,
         target_repo_paths={TARGET_REPO: repo_path},
         target_terminal=TargetTerminalConfig(enabled=target_terminal_enabled),
+        originator_wait_seconds=originator_wait_seconds,
     )
 
     deps = PlanningDriverDeps(
@@ -523,6 +562,7 @@ def _make_driver(
             "build_triggers": build_triggers,
             "validated_bars": validated_bars,
             "validated_registries": validated_registries,
+            "publisher": publisher,
         },
     )
 
@@ -1360,13 +1400,75 @@ def _leg_sha(store: SqlitePlanningRunStore, stage_label: str) -> str | None:
     return None
 
 
-@pytest.mark.asyncio
-async def test_round19_auth_flagged_seed_refuses_machine_registration(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(a) The LITERAL round-19 seed is auth_surface_bearing: true — forge
-    REFUSES machine registration LOUDLY (SPL-007 §A.2 + the seed's basis
-    verbatim); no bars minted, no BUILD_QUEUED, nothing beyond the plan."""
+def _leg_details(store: SqlitePlanningRunStore, stage_label: str) -> dict[str, Any]:
+    """Details of the latest ``approved`` event for ``stage_label``."""
+    latest: dict[str, Any] = {}
+    for e in store.list_events(CID):
+        if e["stage_label"] == stage_label and e["status"] == "approved":
+            latest = json.loads(e["details_json"] or "{}") or {}
+    return latest
+
+
+# ---------------------------------------------------------------------------
+# THE AUTH-CONFIRMATION DOOR (cure for live run dff0cd00, 2026-07-31)
+#
+# Before the cure an auth_surface_bearing seed KILLED the run at the pass-bar
+# leg. The flag is a keyword detector on the spec text and fires on specs that
+# PROVE their own authlessness, and SPL-007 §A.2's own words are "requires human
+# confirmation" — so the run now pauses for the owner's one-tap answer, reusing
+# the assumptions-checkpoint mechanics. Confirm ⇒ the unflagged path exactly;
+# reject / no answer ⇒ the honest terminal that shipped before.
+# ---------------------------------------------------------------------------
+
+#: The door's durable stage label / wire discriminator — pinned literally here
+#: (a drift changes the request_id on the wire and jarvis's rendering key).
+_AUTH_DOOR_STAGE = "qa-pass-bars-auth-confirm"
+_AUTH_DOOR_CHECKPOINT_TYPE = "auth_surface_confirmation"
+
+
+def _auth_door_request_id(attempt: int = 0) -> str:
+    return derive_request_id(
+        build_id=PLAN_RUN_ID, stage_label=_AUTH_DOOR_STAGE, attempt_count=attempt
+    )
+
+
+def _auth_door_answer(
+    decision: str, *, decided_by: str = ORIGINATOR, attempt: int = 0
+) -> ApprovalResponsePayload:
+    return ApprovalResponsePayload(
+        request_id=_auth_door_request_id(attempt),
+        decision=decision,
+        decided_by=decided_by,
+    )
+
+
+def _auth_door_card(h: _Harness) -> dict[str, Any]:
+    """The ONE auth-confirmation card the run put in front of the owner."""
+    cards = [
+        env.payload["details"]
+        for env in h.ctx["publisher"].envelopes
+        if env.payload["details"].get("checkpoint_type") == _AUTH_DOOR_CHECKPOINT_TYPE
+    ]
+    assert len(cards) == 1, f"expected exactly one auth card, got {len(cards)}"
+    return cards[0]
+
+
+def _door_events(store: SqlitePlanningRunStore) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (e["status"], json.loads(e["details_json"] or "{}"))
+        for e in store.list_events(CID)
+        if e["stage_label"] == _AUTH_DOOR_STAGE
+    ]
+
+
+def _auth_flagged_harness(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+    *,
+    script: list[Any],
+    originator_wait_seconds: int = 3600,
+    publisher: FakePublisher | None = None,
+) -> tuple[_Harness, Path]:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
@@ -1377,35 +1479,468 @@ async def test_round19_auth_flagged_seed_refuses_machine_registration(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
         plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        subscriber_factory=SharedScriptSubscriberFactory(script),
+        originator_wait_seconds=originator_wait_seconds,
+        publisher=publisher,
+    )
+    return h, repo
+
+
+@pytest.mark.asyncio
+async def test_auth_flagged_seed_confirmed_resumes_exactly_as_unflagged(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(a) CONFIRM: the LITERAL round-19 auth-flagged seed no longer kills the
+    run — the owner taps confirm and machine registration proceeds EXACTLY as
+    the unflagged path (three schema-green bars, then BUILD_QUEUED)."""
+    h, repo = _auth_flagged_harness(
+        store, tmp_path, script=[_approve(), _auth_door_answer("approve")]
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+
+    # Byte-for-byte the unflagged outcome: one validated bar per plan task,
+    # each minted authless, and the build queued exactly once.
+    assert h.ctx["counters"]["pass_bar_validate"] == 3
+    assert set(h.ctx["validated_bars"]) == {
+        "qa/pass-bar-TASK-VER-001.yaml",
+        "qa/pass-bar-TASK-VER-002.yaml",
+        "qa/pass-bar-TASK-VER-003.yaml",
+    }
+    assert h.ctx["counters"]["build_trigger"] == 1
+
+    branch = f"planning/{CID}"
+    for task_id in ("TASK-VER-001", "TASK-VER-002", "TASK-VER-003"):
+        raw = subprocess.run(
+            ["git", "show", f"{branch}:qa/pass-bar-{task_id}.yaml"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+        bar = yaml.safe_load(raw)
+        _assert_pass_bar_schema(bar)
+        assert bar["task_id"] == task_id
+        # Confirmed authless — and the seed's auth basis never leaks into a bar.
+        assert bar["auth_surface_bearing"] is False
+        assert "auth_surface_basis" not in bar
+
+    # The owner's act is on the durable record, and on the leg's own receipt.
+    statuses = [status for status, _details in _door_events(store)]
+    assert statuses == ["GATED", "approved"]
+    confirmation = _door_events(store)[-1][1]["auth_confirmation"]
+    assert confirmation["outcome"] == "confirmed"
+    assert confirmation["decided_by"] == ORIGINATOR
+    assert confirmation["request_id"] == _auth_door_request_id(0)
+    bars_receipt = _leg_details(store, "qa-pass-bars")
+    assert bars_receipt["auth_confirmation"]["decided_by"] == ORIGINATOR
+
+
+@pytest.mark.asyncio
+async def test_auth_door_card_speaks_plain_language_and_quotes_the_basis(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The card the owner reads: the seed's OWN flagged words quoted verbatim,
+    what confirming does, what rejecting does, what silence does — in plain
+    language, threaded to the run's approver, with no jargon as a label."""
+    h, _repo = _auth_flagged_harness(
+        store, tmp_path, script=[_approve(), _auth_door_answer("approve")]
+    )
+
+    await h.driver.drive(CID)
+
+    card = _auth_door_card(h)
+    assert card["expected_approver"] == ORIGINATOR
+    assert card["build_id"] == PLAN_RUN_ID
+    summary = card["summary"]
+    # The seed's own basis, verbatim — the owner judges the actual evidence.
+    assert summary["flagged_lines"] == [
+        "auth signals detected: auth token 'auth' in scenario (deferred — "
+        "requires human confirmation per SPL-007 CONTRACT §A.2)"
+    ]
+    # Both outcomes are spelled out, plus what happens if he never answers.
+    assert "register the quality bars" in summary["confirm_means"]
+    assert "carry on" in summary["confirm_means"]
+    assert "attended" in summary["reject_means"]
+    assert "1 hour" in summary["no_answer_means"]
+    assert summary["feature"] == "version-endpoint"
+    # Plain language: no internal identifiers or clause codes as the labels the
+    # owner reads first.
+    for field in ("title", "what_happened", "confirm_means", "reject_means"):
+        assert "auth_surface_bearing" not in summary[field]
+        assert "SPL-007" not in summary[field]
+        assert "pass-bar-seed" not in summary[field]
+    # The run told the originator it is WAITING, not broken.
+    opened = [m for _cid, m, lvl in h.ctx["notifications"] if lvl == "info"]
+    assert any("often a false alarm" in m for m in opened)
+
+
+@pytest.mark.asyncio
+async def test_auth_door_rejected_takes_the_honest_terminal(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(b) REJECT: the owner says it really is a sign-in surface — the run
+    takes the SAME honest terminal that shipped before (SPL-007 §A.2 + the
+    seed's basis verbatim), plus which way the door closed. No bars, no
+    build, no idempotency sentinel."""
+    h, repo = _auth_flagged_harness(
+        store, tmp_path, script=[_approve(), _auth_door_answer("reject")]
     )
 
     await h.driver.drive(CID)
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.FAILED.value
-    assert run["state"] != PlanningState.BUILD_QUEUED.value
-    # Not a single bar was validated or minted, and the build was never queued.
     assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
-    # The refusal names the clause and the seed's OWN basis verbatim.
+
+    # The honest failure text is UNCHANGED — clause, posture, seed basis verbatim.
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
     assert "SPL-007 §A.2" in reasons
     assert "attended registration" in reasons
     assert "requires human confirmation per SPL-007 CONTRACT §A.2" in reasons
+    # ...and it names the door's verdict rather than pretending nobody was asked.
+    assert "confirmed this IS a sign-in surface" in reasons
+
     # No qa/pass-bar file landed on the branch.
-    branch = f"planning/{CID}"
     show = subprocess.run(
-        ["git", "show", f"{branch}:qa/pass-bar-TASK-VER-001.yaml"],
+        ["git", "show", f"planning/{CID}:qa/pass-bar-TASK-VER-001.yaml"],
         cwd=repo,
         capture_output=True,
         text=True,
     )
     assert show.returncode != 0
-    # The idempotency sentinel was NOT recorded (the leg refused, not completed).
+    # The pass-bar idempotency sentinel was NOT recorded (refused, not completed).
     assert not any(
         e["stage_label"] == "qa-pass-bars" and e["status"] == "approved"
         for e in store.list_events(CID)
     )
+    # The door's own verdict is durable, and is NOT the confirmed sentinel.
+    assert [status for status, _d in _door_events(store)] == ["GATED", "rejected"]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_unanswered_times_out_to_the_honest_terminal(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """(c) SILENCE: nobody answers inside the wait window — the run takes the
+    same honest terminal, naming the timeout, and never registers a bar."""
+    h, _repo = _auth_flagged_harness(
+        store, tmp_path, script=[_approve()], originator_wait_seconds=1
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "SPL-007 §A.2" in reasons
+    assert "attended registration" in reasons
+    assert "Nobody answered the confirmation card" in reasons
+    assert [status for status, _d in _door_events(store)] == ["GATED", "timed_out"]
+    # The wait window is spoken in human units on the card.
+    assert "1 second" in _auth_door_card(h)["summary"]["no_answer_means"]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_undeliverable_card_takes_the_honest_terminal(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A card that cannot be put on the wire is not a silent wait: the run
+    stops immediately with the honest terminal, saying nobody could answer."""
+    h, _repo = _auth_flagged_harness(
+        store,
+        tmp_path,
+        script=[_approve(), _auth_door_answer("approve")],
+        publisher=AuthCardUndeliverablePublisher(),
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "SPL-007 §A.2" in reasons
+    assert "could not be delivered" in reasons
+    assert [status for status, _d in _door_events(store)] == ["GATED", "undeliverable"]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_ignores_a_stranger_and_a_foreign_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The door is pinned to the run's own approver and to its OWN card: a
+    stranger's confirm and a reply to a different request_id are both ignored,
+    and the run ends on the honest timeout — never on someone else's tap."""
+    h, _repo = _auth_flagged_harness(
+        store,
+        tmp_path,
+        script=[
+            _approve(),
+            _auth_door_answer("approve", decided_by="U_STRANGER"),
+            # A late reply to the product-docs card, not to this door.
+            ApprovalResponsePayload(
+                request_id=_request_id(0), decision="approve", decided_by=ORIGINATOR
+            ),
+        ],
+        originator_wait_seconds=1,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    assert [status for status, _d in _door_events(store)] == ["GATED", "timed_out"]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_confirmation_is_never_re_asked_on_a_re_drive(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A crash between the owner's tap and the bars commit must not re-ask: the
+    durable confirmation short-circuits the door on the next drive."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+
+    # Drive once, confirming at the door, then rewind the durable record to the
+    # crash window: the plan is committed, the confirmation is given, but the
+    # bars leg never completed.
+    factory = SharedScriptSubscriberFactory([_approve(), _auth_door_answer("approve")])
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        subscriber_factory=factory,
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    door_openings = sum(
+        1 for status, _d in _door_events(store) if status == "GATED"
+    )
+    assert door_openings == 1
+
+    # The re-drive of a completed run is already a no-op; the load-bearing
+    # assertion is the door's own short-circuit, asserted directly.
+    assert h.driver._has_leg_event(CID, _AUTH_DOOR_STAGE) is True
+    outcome = await h.driver._auth_surface_confirmation_door(
+        store.get_run(CID),
+        CID,
+        seed=yaml.safe_load(_ROUND19_SEED_AUTH),
+        basis="anything",
+    )
+    assert outcome == "confirmed"
+    # No second card, no second door-opening event.
+    assert sum(1 for status, _d in _door_events(store) if status == "GATED") == 1
+    assert (
+        len(
+            [
+                env
+                for env in h.ctx["publisher"].envelopes
+                if env.payload["details"].get("checkpoint_type")
+                == _AUTH_DOOR_CHECKPOINT_TYPE
+            ]
+        )
+        == 1
+    )
+
+
+def _auth_cards(publisher: FakePublisher) -> list[Any]:
+    """Every auth-confirmation envelope this wire has carried, in order."""
+    return [
+        env
+        for env in publisher.envelopes
+        if env.payload["details"].get("checkpoint_type") == _AUTH_DOOR_CHECKPOINT_TYPE
+    ]
+
+
+class ArmOnlyTheFirstWaitFactory:
+    """Arms the product-docs waiter, then hands out subscriptions that NEVER arm.
+
+    The wire the arm-before-post guard exists for: the door's subscription never
+    comes up, so the card is never published and NOBODY is ever asked.
+    """
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.calls = 0
+
+    def __call__(self, expected_approver: Any, armed: Any) -> ScriptedSubscriber:
+        self.calls += 1
+        if self.calls == 1:
+            return ScriptedSubscriber(self.script, armed)
+        return ScriptedSubscriber([], None)
+
+
+@pytest.mark.asyncio
+async def test_auth_door_survives_a_restart_and_re_emits_the_same_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A daemon killed with the card LIVE must not orphan it.
+
+    The run parks mid-chain at FEATURE_PLAN (the boot sweep's job to re-drive —
+    asserted in ``tests/cli/test_serve_planning.py``), and the next drive
+    RE-OPENS the same door: the persisted request_id is re-emitted VERBATIM, so
+    the card still on the owner's screen is the card their tap answers. Minting
+    a fresh id here would show two cards and silently drop the answer to the
+    visible one.
+    """
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    publisher = FakePublisher()  # ONE wire across both boots
+
+    def _boot(script: list[Any]) -> _Harness:
+        return _make_driver(
+            store,
+            git_runner=git,
+            repo_path=str(repo),
+            spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
+            plan_result_factory=_plan_result_native_versions,
+            pass_bar_validate_fn=_schema_pass_bar_oracle,
+            subscriber_factory=SharedScriptSubscriberFactory(script),
+            publisher=publisher,
+        )
+
+    # BOOT 1: the owner is asked — then the daemon dies with the card live.
+    first = _boot([_approve()])
+    task = asyncio.create_task(first.driver.drive(CID))
+    for _ in range(600):
+        await asyncio.sleep(0.01)
+        if _auth_cards(publisher):
+            break
+    assert _auth_cards(publisher), "the door never put a card on the wire"
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Parked mid-chain with an OPEN door: no terminal, no verdict, no bars.
+    assert store.get_run(CID)["state"] == PlanningState.FEATURE_PLAN.value
+    assert [status for status, _d in _door_events(store)] == ["GATED"]
+
+    # BOOT 2 (what the boot sweep does): the owner taps the card they can STILL
+    # SEE — the first card's request_id — and it is honoured.
+    second = _boot([_auth_door_answer("approve")])
+    await second.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert second.ctx["counters"]["build_trigger"] == 1
+    # ONE card IDENTITY across both boots — the re-emission is verbatim.
+    assert len(_auth_cards(publisher)) == 2
+    assert {env.payload["request_id"] for env in _auth_cards(publisher)} == {
+        _auth_door_request_id(0)
+    }
+    assert {
+        env.payload["details"]["attempt_count"] for env in _auth_cards(publisher)
+    } == {0}
+    # The durable record says what happened: opened, re-opened, confirmed.
+    assert [status for status, _d in _door_events(store)] == [
+        "GATED",
+        "reopened",
+        "approved",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_never_published_says_undeliverable_not_silence(
+    store: SqlitePlanningRunStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card that never reached the wire is NOT "nobody answered".
+
+    When the response subscription never arms, arm-before-post never posts —
+    so the owner was never ASKED. Telling them nobody answered would be a
+    falsehood; the run takes the undeliverable terminal instead.
+    """
+    monkeypatch.setattr(driver_module, "_ARM_TIMEOUT_SECONDS", 0.05)
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        subscriber_factory=ArmOnlyTheFirstWaitFactory([_approve()]),
+        originator_wait_seconds=1,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    # Zero auth cards ever reached the wire — the proof the claim must match.
+    assert _auth_cards(h.ctx["publisher"]) == []
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "SPL-007 §A.2" in reasons
+    assert "could not be delivered" in reasons
+    assert "Nobody answered" not in reasons
+    assert [status for status, _d in _door_events(store)] == ["GATED", "undeliverable"]
+
+
+@pytest.mark.asyncio
+async def test_auth_door_defer_is_named_never_reported_as_silence(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A 'later' answer is an ANSWER — recorded and named, never swallowed.
+
+    The door rides the same generic approval consumer as the product-docs
+    checkpoint, whose decision literal includes ``defer``. Waiting on after a
+    defer ends the run claiming "nobody answered the confirmation card" — told
+    to the very person who answered it.
+    """
+    h, repo = _auth_flagged_harness(
+        store,
+        tmp_path,
+        script=[_approve(), _auth_door_answer("defer")],
+        originator_wait_seconds=3600,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 0
+    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "SPL-007 §A.2" in reasons
+    assert "set the confirmation card aside" in reasons
+    assert "Nobody answered" not in reasons
+
+    # The durable row names the answer the owner actually gave.
+    statuses = [status for status, _d in _door_events(store)]
+    assert statuses == ["GATED", "deferred"]
+    verdict = _door_events(store)[-1][1]["auth_confirmation"]
+    assert verdict["decision"] == "defer"
+    assert verdict["decided_by"] == ORIGINATOR
+    assert verdict["request_id"] == _auth_door_request_id(0)
+
+    # No bar landed on the branch and no idempotency sentinel was written.
+    show = subprocess.run(
+        ["git", "show", f"planning/{CID}:qa/pass-bar-TASK-VER-001.yaml"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show.returncode != 0
+    # ...and the card itself told the owner that 'later' stops the run.
+    later = _auth_door_card(h)["summary"]["later_means"]
+    assert "stops the run" in later
 
 
 @pytest.mark.asyncio
@@ -1490,6 +2025,15 @@ async def test_round19_authless_seed_mints_three_validated_bars(
     assert h.ctx["counters"]["build_trigger"] == 1
     # The registered sha recorded on the leg event is the plan sha.
     assert _leg_event_sha_field(store, "qa-pass-bars", "registered_at_sha") == plan_sha
+    # THE UNFLAGGED PATH IS UNTOUCHED by the auth-confirmation door: no door
+    # event, no confirmation card, and the leg receipt carries no auth block.
+    assert _door_events(store) == []
+    assert not [
+        env
+        for env in h.ctx["publisher"].envelopes
+        if env.payload["details"].get("checkpoint_type") == _AUTH_DOOR_CHECKPOINT_TYPE
+    ]
+    assert "auth_confirmation" not in _leg_details(store, "qa-pass-bars")
 
 
 def _leg_event_sha_field(
