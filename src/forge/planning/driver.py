@@ -3905,6 +3905,7 @@ class PlanningRunDriver:
         from forge.planning.target_terminal_tools import (
             TargetTestRootsUnresolved,
             discover_target_test_roots,
+            shallow_discover_test_roots,
         )
 
         try:
@@ -3913,20 +3914,25 @@ class PlanningRunDriver:
             # Degraded path: guardkit absent from the interpreter. Production
             # images always ship guardkit (the Dockerfile asserts the import),
             # so this only fires in a guardkit-less env where the real
-            # ``feature validate`` oracle cannot run either. Fall back to the
-            # historical shallow checkout-root discovery so the descriptor is
-            # still built and the run reaches the oracle (the last line of
-            # defense) rather than crashing — log LOUDLY.
+            # ``feature validate`` oracle cannot run either. Fall back to
+            # forge's own discovery so the descriptor is still built and the run
+            # reaches the oracle (the last line of defense) rather than crashing
+            # — log LOUDLY.
+            #
+            # The old fallback returned bare ``["tests"]`` / ``["test"]``, which
+            # is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a prefix of
+            # every ``tests/<x>`` path, so the in-session containment gate waves
+            # through an invented subdirectory. The replacement reproduces
+            # guardkit's per-suite Python shape AND the TypeScript shapes, so the
+            # degraded answer has the same geometry as the healthy one.
             logger.warning(
                 "target_repo_descriptor: guardkit test-root discovery "
-                "unavailable (%s); falling back to shallow checkout-root "
-                "discovery — 008 will NOT receive the exact tests/<name> set",
+                "unavailable (%s); falling back to forge's own shallow "
+                "discovery — the roots are shape-correct but are not the "
+                "oracle's own answer",
                 exc,
             )
-            root = Path(repo_path)
-            test_roots = [
-                name for name in ("tests", "test") if (root / name).is_dir()
-            ]
+            test_roots = shallow_discover_test_roots(repo_path)
         return {"repo": target_repo, "test_roots": test_roots}
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:

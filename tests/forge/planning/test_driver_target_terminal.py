@@ -3167,3 +3167,77 @@ async def test_s2_capture_default_off_writes_no_row_no_dir(
     # No dcl-author event (provably inert), no capture dir.
     assert not any(e["stage_label"] == "dcl-author" for e in store.list_events(CID))
     assert not (repo / ".guardkit" / "dcl-capture").exists()
+
+
+# ---------------------------------------------------------------------------
+# THE TYPESCRIPT SHAPE ON THE PLANNING PATH (design §D.3(ii))
+#
+# The descriptor is where empty test roots become a plan failure: ``[]`` →
+# ASSUM-010 turns ANY ``smoke_gates`` block into a containment error. These pin
+# that the flat TypeScript shape reaches the 008 descriptor as a real root, and
+# that the Python shape's descriptor is byte-unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_descriptor_carries_the_flat_typescript_root(tmp_path: Path) -> None:
+    """ts-api-test's ORIGINAL flat shape yields ``test_roots: ["tests"]``.
+
+    Before the cure this was ``[]`` — the near-blocker that forced the repo to
+    be bent into ``tests/health/health.test.ts`` for stage B. With a real root
+    in the descriptor the bend is reversible.
+    """
+    repo = tmp_path / "ts-api-test"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "health.test.ts").write_text(
+        "import { it } from 'vitest';\n", encoding="utf-8"
+    )
+    (repo / "src" / "health").mkdir(parents=True)
+    (repo / "src" / "health" / "routes.ts").write_text("export {};\n", encoding="utf-8")
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/ts-api-test", str(repo)
+    )
+    assert descriptor == {
+        "repo": "appmilla/ts-api-test",
+        "test_roots": ["tests"],
+    }
+
+
+def test_descriptor_for_a_python_repo_is_unchanged(tmp_path: Path) -> None:
+    """Regression pin: the api_test shape produces exactly what it produced
+    before the TypeScript shapes were taught — the exact per-suite roots and
+    nothing else."""
+    repo = tmp_path / "api_test"
+    (repo / "tests" / "health").mkdir(parents=True)
+    (repo / "tests" / "users").mkdir(parents=True)
+    (repo / "tests" / "test_main.py").write_text("", encoding="utf-8")
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    assert descriptor == {
+        "repo": "appmilla/api_test",
+        "test_roots": ["tests/health", "tests/users"],
+    }
+
+
+def test_descriptor_degrades_shape_correctly_without_guardkit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With guardkit unimportable, the fallback is shape-correct, not a bare
+    ``["tests"]`` — the round-10 defect shape that let 008 invent a prefix."""
+    from forge.planning import target_terminal_tools as ttt
+
+    repo = tmp_path / "api_test"
+    (repo / "tests" / "health").mkdir(parents=True)
+    (repo / "tests" / "users").mkdir(parents=True)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> list[str]:
+        raise ttt.TargetTestRootsUnresolved("no guardkit in this interpreter")
+
+    monkeypatch.setattr(ttt, "discover_target_test_roots", _boom)
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]

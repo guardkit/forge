@@ -303,10 +303,18 @@ def _build_resume_launcher(
                 "should pass a fake starter via the kwarg."
             )
         # DEFECT #19 activation (B4 round-17): forward ``branch``/``repo`` from
-        # the accepted BuildQueuedPayload (the live approve path passes them;
-        # the boot-rearm resume path restores the row from SQLite and has no
-        # payload in scope, so they default to None and the launch stays
-        # byte-compatible with the pre-fix shape).
+        # the accepted BuildQueuedPayload (the live approve path passes them).
+        #
+        # SECOND-REPO LAW (this lane): the boot-rearm resume path has no payload
+        # in scope, but it DOES hold the restored ``builds`` row — and
+        # ``builds.repo`` is a required column. ``rearm_paused_gates`` now
+        # passes ``repo=build_row.repo`` through ``_rearm_dispatch``, so a
+        # re-armed launch names its own repository. ``branch`` still defaults to
+        # None on that path deliberately: threading it would flip the resume
+        # from the shared-checkout launch to the DEFECT #19 isolated-worktree
+        # launch, a behaviour change the rearm path has never been proved
+        # against. ``repo`` alone is the correctness fix; ``branch`` stays a
+        # separate, ledgered question.
         #
         # FEAT-UBS-002 (Option-B, stage 1): ``budget`` rides the same one-hop
         # provenance. The live dispatch path resolves it from ``builds.profile``
