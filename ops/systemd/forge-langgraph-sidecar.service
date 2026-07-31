@@ -84,7 +84,6 @@ Environment=OPENAI_API_KEY=dummy
 # autobuild_runner reads these — forge-prod does not yet plumb repo
 # through to the launch payload (tracked: TASK-ABW-002).
 Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
-Environment=FORGE_DEFAULT_REPO=appmilla/api_test
 # guardkit is not on systemd's minimal PATH — point the resolver at it
 # explicitly, and give the spawned guardkit subprocess a PATH rich enough
 # for its own tool calls (git, claude CLI, etc.).
