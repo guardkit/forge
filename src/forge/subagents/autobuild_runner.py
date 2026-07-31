@@ -99,6 +99,8 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
 
+from forge.subagents import build_monitor
+
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from forge.pipeline import BuildContext, PipelineLifecycleEmitter
 
@@ -1059,6 +1061,13 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
 # payload + environment, and the rewritten ``_node_running_wave`` body
 # orchestrates the subprocess with timeout + exit-code mapping.
 #
+# BUILD MONITOR (2026-07-31): ``--fresh`` is correct for a FIRST launch (a
+# brand-new outer worktree has no saved state to honour) and wrong for every
+# relaunch — it is guardkit's "destroy saved state" flag, which is why a killed
+# build used to be a total loss. The relaunch decision now lives in
+# :func:`forge.subagents.build_monitor.plan_relaunch` and always resolves to
+# ``--resume`` in the kept worktree or an honest refusal.
+#
 # ADR-ARCH-033: this deliberately bypasses ``adapters/guardkit/run.py`` (the
 # one-shot "single boundary") because autobuild is a long-running streaming
 # build. COACH-SCORE GAP CLOSED (TASK-UBS1C-001): the drain loop now parses
@@ -1081,12 +1090,26 @@ FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
 FORGE_GUARDKIT_PATH_ENV: str = "FORGE_GUARDKIT_PATH"
 
 #: Environment override for the autobuild subprocess timeout, in seconds.
-#: Defaults to ``3600`` (60 minutes) per TASK-ABW-001 §Scope item 5.
+#: Originally ``3600`` (60 minutes) per TASK-ABW-001 §Scope item 5 — see the
+#: demotion note on :data:`DEFAULT_AUTOBUILD_TIMEOUT_SECONDS`. The env var is
+#: still honoured for an operator who sets it WITH CAUSE.
 FORGE_AUTOBUILD_TIMEOUT_ENV: str = "FORGE_AUTOBUILD_TIMEOUT_SECONDS"
 
-#: Default subprocess timeout (seconds). Operators may override via
-#: :data:`FORGE_AUTOBUILD_TIMEOUT_ENV`.
-DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 3600
+#: Default subprocess wall clock (seconds) — DEMOTED to a far-out INSANITY
+#: BOUND by the build-monitor lane (Rich's 2026-07-30 ruling; design §e).
+#:
+#: It used to be 3600s and it used to be the effective supervisor: a healthy
+#: multi-wave build got killed mid-work by a number nothing in the build had
+#: declared, and the kill was a total loss because the relaunch was hardwired
+#: to ``--fresh``. Liveness is now derived from the build's own semantic
+#: diagnostic stream (:mod:`forge.subagents.build_monitor`); this clock is a
+#: tripwire for "the monitor itself is broken", never a work-limiter.
+#:
+#: What is NOT demoted: the per-build BUDGET wall-clock cap (FEAT-UBS-002).
+#: That bounds SPEND, a different job, it still MIN()s against this ceiling so
+#: a profile can only ever TIGHTEN, and its expiry is still a genuine kill that
+#: arms the D659 breach gate.
+DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 86400
 
 #: Default base directory for repo checkouts when
 #: :data:`FORGE_REPO_BASE_ENV` is unset. Resolved at call time via
@@ -1416,6 +1439,24 @@ def _resolve_budget_wallclock_seconds(payload: Mapping[str, Any]) -> float | Non
     if seconds <= 0:
         return None
     return seconds
+
+
+def _resolve_resume_attempt_no(payload: Mapping[str, Any]) -> int:
+    """Which resume attempt WOULD this build's relaunch be? (1-based.)
+
+    A first launch carries no ``resume_attempt``, so its relaunch would be
+    attempt 1. A dispatch that is itself a resume stamps the count it ran as,
+    and the next attempt is one higher — that is how the design's hard cap of
+    two resume attempts stays enforceable across separate node runs, and how
+    an external resumer can check the stamp before double-building (design §j
+    risk 7).
+    """
+    raw = payload.get("resume_attempt")
+    try:
+        prior = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        prior = 0
+    return max(prior, 0) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1963,6 +2004,10 @@ def _write_failure_manifest(
     worktree_path: Path | None,
     branch: str | None,
     exported_families: list[str],
+    wedged: bool = False,
+    semantic_state: Mapping[str, Any] | None = None,
+    resume: Mapping[str, Any] | None = None,
+    task_counts: build_monitor.TaskCounts | None = None,
 ) -> None:
     """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
 
@@ -1977,6 +2022,19 @@ def _write_failure_manifest(
     ``failure-manifest.json`` always indexes the LATEST run; an existing
     manifest from an earlier run of a reused ``build_id`` is archived aside
     first (:func:`_archive_prior_manifest`), never silently destroyed.
+
+    The build-monitor lane adds four fields, all additive:
+
+    * ``wedged`` — this kill was the semantic monitor's call, not a clock's.
+    * ``semantic_state_at_kill`` — what was in flight when the build went
+      quiet (task, turn, decision, files_changed, phase, the ledger's
+      counters), so a diagnoser gets a NAMED task instead of a build-level
+      guess.
+    * ``resume`` — the relaunch decision (design §d): the exact
+      ``--resume`` command in the kept worktree, or an honest refusal. It is
+      never a ``--fresh`` command.
+    * ``tasks_completed`` / ``tasks_failed`` / ``tasks_completed_source`` —
+      the honest ledger-derived counts at the moment of failure.
 
     Best-effort by the same principle as everything else in the pack: it never
     raises and never alters the build's outcome.
@@ -2006,6 +2064,21 @@ def _write_failure_manifest(
             "branch": branch,
             "failed_at": datetime.now(timezone.utc).isoformat(),
             "receipt_families_exported": exported_families,
+            # --- build monitor (2026-07-31) -----------------------------
+            "wedged": wedged,
+            "semantic_state_at_kill": (
+                dict(semantic_state) if semantic_state is not None else None
+            ),
+            "resume": dict(resume) if resume is not None else None,
+            "tasks_completed": (
+                task_counts.tasks_completed if task_counts is not None else None
+            ),
+            "tasks_failed": (
+                task_counts.tasks_failed if task_counts is not None else None
+            ),
+            "tasks_completed_source": (
+                task_counts.source if task_counts is not None else None
+            ),
         }
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -2152,6 +2225,7 @@ def _build_failed_snapshot(
     *,
     reason: str,
     budget_cap_killed: bool = False,
+    task_counts: build_monitor.TaskCounts | None = None,
 ) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
@@ -2187,6 +2261,14 @@ def _build_failed_snapshot(
             ``builds.budget_breach`` was only ever written by the
             stage-complete observer and a cap kill precedes any
             stage-complete).
+        task_counts: Honest per-task attribution read from the build's OWN
+            ledger (``.guardkit/features/<FEAT>.yaml``) — the build-monitor
+            lane's §c fix. When given, the failed snapshot reports what the
+            build actually completed before it died instead of the blanket
+            ``tasks_completed=0``; a wedged 3-task build that finished 2 says
+            2. When ``None`` (every pre-subprocess validation failure — no
+            build ran, so there is nothing to attribute) the historical
+            ``0 completed / 1 failed`` shape is preserved byte-for-byte.
 
     Returns:
         A snapshot dict suitable for :func:`_snapshot_update`.
@@ -2195,14 +2277,23 @@ def _build_failed_snapshot(
     snapshot = _build_snapshot(
         payload,
         lifecycle="failed",
-        wave_index=0,
+        wave_index=task_counts.wave_index if task_counts is not None else 0,
         task_index=0,
-        tasks_completed=0,
-        tasks_failed=1,
+        tasks_completed=(
+            task_counts.tasks_completed if task_counts is not None else 0
+        ),
+        # A failed terminal always carries tasks_failed>=1: the bridge
+        # translator's stage_complete delta reads it, and downstream consumers
+        # treat >=1 as "this build failed" (design §j risk 9).
+        tasks_failed=(
+            max(task_counts.tasks_failed, 1) if task_counts is not None else 1
+        ),
     )
     snapshot["error_message"] = reason
     if budget_cap_killed:
         snapshot["budget_cap_killed"] = True
+    if task_counts is not None:
+        snapshot["tasks_completed_source"] = task_counts.source
     return snapshot
 
 
@@ -2222,17 +2313,40 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
        ``asyncio.create_subprocess_exec(guardkit_path, "autobuild",
        "feature", feature_id, "--fresh", "--verbose",
        cwd=resolved_repo_path, env=os.environ.copy())`` and stream the
-       combined stdout/stderr line-by-line. Each
-       ``[guardkit-checkpoint] Turn N complete (tests: pass|fail)`` line
-       bumps an internal counter so the returned ``running_wave``
-       snapshot carries ``tasks_completed=1`` (stage_complete fallback).
-    5. On exit code 0, return a ``running_wave`` snapshot with
-       ``tasks_completed=1`` — the conditional edge then routes to
-       :func:`_node_completed`.
+       combined stdout/stderr line-by-line.
+    5. On exit code 0, return a ``running_wave`` snapshot whose
+       ``tasks_completed`` is read from the build's OWN ledger — the
+       conditional edge then routes to :func:`_node_completed`.
     6. On non-zero exit, signal, or timeout, kill any surviving process
-       and return a ``failed`` snapshot with ``tasks_failed=1`` and
+       and return a ``failed`` snapshot with ``tasks_failed>=1`` and
        ``"guardkit autobuild exit=<code>"`` as the reason — the
        conditional edge routes to :func:`_node_failed`.
+
+    THE BUILD MONITOR (2026-07-31, Rich's 2026-07-30 ruling — design
+    ``ai-transition/docs/build-monitor-design-pass-2026-07-31.md``)
+    ==============================================================
+
+    Two contracts stated in this docstring were LIES and are now gone:
+
+    * *"the snapshot carries ``tasks_completed=1``"* — the runner counted
+      CHECKPOINT COMMIT lines (which are TURNS) and reported
+      ``max(count, 1)``. A 3-task build with 9 turns reported 9; a wedged
+      build reported 1. Counts now come from
+      ``.guardkit/features/<FEAT>.yaml``, the same ledger guardkit's own
+      resume trusts, and the snapshot names its provenance in
+      ``tasks_completed_source``.
+    * *the blind wall clock supervises the build* — it does not. A
+      :class:`~forge.subagents.build_monitor.BuildMonitor` watches the
+      semantic diagnostic stream this loop already drains (turn
+      completions, task starts, wave boundaries) plus the build's on-disk
+      ledger, progress logs and inner-worktree HEAD. A build with NO
+      semantic progress and NO state movement for a window derived from
+      the build's own per-task budget is declared WEDGED: honest terminal
+      (never the word "timeout"), the existing failure pack, and a manifest
+      ``resume`` block carrying the ``--resume`` relaunch — never
+      ``--fresh``, which destroys the saved state and makes the kill a
+      total loss. The env/default clock demotes to an insanity bound; the
+      per-build BUDGET cap is untouched (it bounds spend, a different job).
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
 
@@ -2416,6 +2530,25 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         run_header=_stdout_run_header(payload, feature_id),
     )
 
+    # THE BUILD MONITOR — semantic liveness over the stream this loop already
+    # drains, plus the build's own on-disk ledger. Rooted at the build's cwd so
+    # both the isolated-worktree and legacy shared-checkout paths are watched.
+    # The monitor reconstructs guardkit's own timeout arithmetic from the SAME
+    # environment the subprocess is launched with (``env=os.environ.copy()``
+    # above), so its multiplier/floor mirror is guardkit's number rather than a
+    # guess — see build_monitor.resolve_timeout_multiplier.
+    monitor: build_monitor.BuildMonitor | None = None
+    if build_monitor.monitor_enabled():
+        monitor = build_monitor.BuildMonitor(root=run_cwd, feature_id=feature_id)
+    else:
+        logger.warning(
+            "autobuild_runner: build monitor DISABLED via %s — this build is "
+            "supervised by the wall clock alone (%ss)",
+            build_monitor.BUILD_MONITOR_ENABLED_ENV,
+            timeout_seconds,
+        )
+    wedge_verdict: build_monitor.WedgeVerdict | None = None
+
     async def _drain_stdout() -> None:
         nonlocal stage_complete_count, last_coach_score
         if proc.stdout is None:  # defensive — PIPE was requested above
@@ -2426,6 +2559,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 if not line:
                     break
                 decoded = line.decode("utf-8", errors="replace").rstrip()
+                # Liveness first: the monitor sees every line, and classifies
+                # semantic ticks apart from heartbeats/noise itself.
+                if monitor is not None:
+                    monitor.note_stdout_line(decoded)
                 if _GUARDKIT_CHECKPOINT_PATTERN.search(decoded):
                     stage_complete_count += 1
                 # Coach-score grammar: parse decision-bearing lines (TASK-UBS1C-001).
@@ -2442,6 +2579,53 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             # Runs on normal EOF, on the timeout cancel and on the FEAT-FCT
             # interrupt cancel alike — the log is always flushed and closed.
             stdout_tee.close()
+
+    async def _watch_for_wedge() -> None:
+        """Poll the build's semantic state; kill it only when truly wedged.
+
+        Runs BESIDE the drain (not inside the gather) so a finished build is
+        never held up waiting for the next poll tick. Cancelled the moment the
+        subprocess is reaped.
+        """
+        nonlocal wedge_verdict
+        if monitor is None:
+            return
+        interval = monitor.poll_interval_seconds
+        while proc.returncode is None:
+            await asyncio.sleep(interval)
+            if proc.returncode is not None:
+                return
+            try:
+                verdict = monitor.poll()
+            except Exception as exc:  # noqa: BLE001 — a monitor defect must
+                # never kill a healthy build: log and keep watching.
+                logger.warning(
+                    "autobuild_runner: build monitor poll failed (%s: %s) — "
+                    "the build is unaffected and the watch continues",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if not verdict.wedged:
+                continue
+            wedge_verdict = verdict
+            logger.warning(
+                "autobuild_runner: WEDGED feature_id=%s — %s; killing "
+                "guardkit subprocess pid=%s (the worktree is KEPT and the "
+                "failure pack carries the resume command)",
+                feature_id,
+                verdict.reason(),
+                proc.pid,
+            )
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return
+
+    watch_task: Any = None
+    if monitor is not None:
+        watch_task = asyncio.ensure_future(_watch_for_wedge())
 
     timed_out = False
     try:
@@ -2498,16 +2682,34 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 proc.pid,
                 feature_id,
             )
+    finally:
+        # The subprocess is reaped (or the node is being cancelled): stop the
+        # watch AND retrieve it. Cancelling an already-finished task is a
+        # no-op. The drain lives INSIDE the finally deliberately: the FEAT-FCT
+        # interrupt path re-raises CancelledError, so anything after the
+        # try/except never runs — a drain placed there would leave the watch
+        # task pending on exactly the cancel path, which is the "Task was
+        # destroyed but it is pending" warning this block exists to prevent.
+        if watch_task is not None:
+            if not watch_task.done():
+                watch_task.cancel()
+            await asyncio.gather(watch_task, return_exceptions=True)
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 
-    if timed_out or exit_code != 0:
+    if wedge_verdict is not None or timed_out or exit_code != 0:
         # A non-zero exit also covers guardkit's own refusal on a missing
         # feature YAML in the (worktree) tree — we delegate that detection to
         # guardkit rather than reimplementing its feature-file discovery, and
         # surface it here as a loud failure that KEEPS the worktree so the
         # exact tree is inspectable (DEFECT #19).
-        if timed_out and budget_bound:
+        if wedge_verdict is not None:
+            # THE MONITOR'S CALL — it killed the subprocess itself, so the
+            # non-zero exit below is OUR signal, not guardkit's verdict. The
+            # reason is semantic and never says "timeout": it names the last
+            # task, turn, decision, files_changed and phase (design §d).
+            reason = wedge_verdict.reason()
+        elif timed_out and budget_bound:
             # FEAT-UBS-002 — the per-build budget cap (not the env default) was
             # the binding bound, so name it in the honest failure reason.
             reason = (
@@ -2516,9 +2718,52 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 "(UBS-002)"
             )
         elif timed_out:
-            reason = f"guardkit autobuild timed out after {timeout_seconds}s"
+            # The demoted clock (design §e): an expiry here means the MONITOR
+            # is broken, not that the build overran a work limit.
+            reason = (
+                f"guardkit autobuild timed out after {timeout_seconds}s "
+                "(insanity bound — the semantic build monitor is the "
+                "supervisor; an expiry here means the monitor itself failed)"
+            )
         else:
             reason = f"guardkit autobuild exit={exit_code}"
+
+        # Honest attribution at exit (design §c): the build's own ledger, else
+        # the task ids stdout showed STARTING — never a turn count, and never
+        # the max(count, 1) that made a wedged build claim one completed task.
+        ledger = monitor.ledger() if monitor is not None else None
+        task_counts = build_monitor.resolve_task_counts(
+            ledger,
+            stdout_task_ids=(
+                monitor.stdout_task_ids if monitor is not None else ()
+            ),
+            succeeded=False,
+        )
+        # The relaunch decision (design §d): RESUME in the kept worktree, or an
+        # honest refusal. Never --fresh — that flag destroys the saved state
+        # and makes the kill a total loss.
+        relaunch = build_monitor.plan_relaunch(
+            feature_id=feature_id,
+            guardkit_path=guardkit_path,
+            worktree_path=worktree_path,
+            base_branch=base_branch,
+            attempt_no=_resolve_resume_attempt_no(payload),
+        )
+        if relaunch.possible:
+            logger.warning(
+                "autobuild_runner: relaunch for %s is RESUME (attempt %s): "
+                "cd %s && %s",
+                feature_id,
+                relaunch.attempt_no,
+                relaunch.cwd,
+                relaunch.command(),
+            )
+        else:
+            logger.warning(
+                "autobuild_runner: no resume relaunch for %s — %s",
+                feature_id,
+                relaunch.reason,
+            )
         # FEAT-DRF (Lane 1) — the FAILURE PACK. Strictly ADDITIVE: the worktree
         # is still KEPT (nothing below removes it) and the reason still carries
         # the forensics pointer; we merely COPY the same three receipt families
@@ -2542,11 +2787,18 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             worktree_path=worktree_path,
             branch=payload_branch,
             exported_families=exported_families,
+            wedged=wedge_verdict is not None,
+            semantic_state=(
+                monitor.semantic_state() if monitor is not None else None
+            ),
+            resume=relaunch.to_manifest(),
+            task_counts=task_counts,
         )
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
                 reason=_with_worktree_forensics(reason, worktree_path),
+                task_counts=task_counts,
                 # Rich's 2026-07-30 ruling: a budget-cap KILL arms the D659
                 # breach gate. Only the budget-bound timeout qualifies — an
                 # env-default timeout or a plain non-zero exit is NOT a
@@ -2555,12 +2807,35 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         )
 
-    # Success — clean up the isolated worktree (DEFECT #19: remove on SUCCESS,
-    # keep on failure) then return a running_wave snapshot with
-    # tasks_completed=1 so the bridge translator's stage_complete delta can
-    # fire (and so the state-channel visibly carries a stage_complete-shaped
-    # snapshot for the integration test's mid-stream assertion).
-    # Coach scores are populated from the decision grammar (TASK-UBS1C-001).
+    # Success. Read the build's OWN ledger FIRST — the success path removes the
+    # worktree, and the ledger lives inside it (design §c: the counts come from
+    # the same .guardkit/features/<FEAT>.yaml guardkit's resume trusts, NOT
+    # from counting checkpoint-commit lines, which are TURNS).
+    success_counts = build_monitor.resolve_task_counts(
+        monitor.ledger() if monitor is not None else None,
+        stdout_task_ids=(monitor.stdout_task_ids if monitor is not None else ()),
+        succeeded=True,
+    )
+    if success_counts.source == build_monitor.SOURCE_ASSUMED_SINGLE_UNIT:
+        logger.warning(
+            "autobuild_runner: no readable task ledger and no task-start lines "
+            "for %s — reporting the succeeded build as ONE completed unit and "
+            "naming the assumption in tasks_completed_source (this is the "
+            "last-resort tier, not a measurement)",
+            feature_id,
+        )
+    elif success_counts.source == build_monitor.SOURCE_FEATURE_LEDGER_SUCCESS_FLOOR:
+        logger.warning(
+            "autobuild_runner: %s exited 0 but its ledger reports zero "
+            "completed tasks — flooring tasks_completed at %s so the wire's "
+            "stage_complete delta still fires, and naming the floor in "
+            "tasks_completed_source",
+            feature_id,
+            success_counts.tasks_completed,
+        )
+
+    # Clean up the isolated worktree (DEFECT #19: remove on SUCCESS, keep on
+    # failure). Coach scores come from the decision grammar (TASK-UBS1C-001).
     if worktree_path is not None:
         # FEAT-DRC: export the build's receipts BEFORE removal; on export
         # failure the worktree is kept (see _finalize_success_worktree).
@@ -2569,7 +2844,6 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             worktree_path,
             receipt_build_id,
         )
-    tasks_completed = max(stage_complete_count, 1)
     # Compute aggregate_coach_score from the decision-bearing turns.
     aggregate_coach_score: float | None = None
     if decision_turns:
@@ -2578,14 +2852,26 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     snapshot = _build_snapshot(
         payload,
         lifecycle="running_wave",
-        wave_index=0,
+        wave_index=success_counts.wave_index,
         task_index=0,
-        tasks_completed=tasks_completed,
-        tasks_failed=0,
+        tasks_completed=success_counts.tasks_completed,
+        tasks_failed=success_counts.tasks_failed,
     )
     # Inject coach scores into the snapshot dict (TASK-UBS1C-001).
     snapshot["last_coach_score"] = last_coach_score
     snapshot["aggregate_coach_score"] = aggregate_coach_score
+    # Name the provenance of the counts on the wire (design §c).
+    snapshot["tasks_completed_source"] = success_counts.source
+    logger.info(
+        "autobuild_runner: %s succeeded — %s checkpoint TURNS seen on stdout, "
+        "tasks_completed=%s tasks_failed=%s (source=%s). Turns are NOT tasks: "
+        "the counts come from the build's ledger, never from this stream.",
+        feature_id,
+        stage_complete_count,
+        success_counts.tasks_completed,
+        success_counts.tasks_failed,
+        success_counts.source,
+    )
     return _snapshot_update(snapshot)
 
 
@@ -2594,6 +2880,13 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
 
     Preserves ``last_coach_score`` / ``aggregate_coach_score`` from the
     preceding ``running_wave`` snapshot (TASK-UBS1C-001).
+
+    Build-monitor lane (design §c): when the running_wave snapshot carries a
+    MEASURED task count (``tasks_completed_source`` — read from the build's own
+    ledger), the terminal inherits it rather than re-deriving the count from
+    the launch payload's ``task_total``. The payload's number is the PLAN; the
+    ledger's is what the build actually did, and the terminal is what the wire
+    and every downstream consumer sees.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     # Inherit coach scores from the running_wave snapshot if present.
@@ -2612,17 +2905,33 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         if isinstance(prev_snapshot, Mapping)
         else None
     )
+    measured_source = (
+        prev_snapshot.get("tasks_completed_source")
+        if isinstance(prev_snapshot, Mapping)
+        else None
+    )
+    if measured_source:
+        wave_index = int(prev_snapshot.get("wave_index") or 0)
+        tasks_completed = int(prev_snapshot.get("tasks_completed") or 0)
+        tasks_failed = int(prev_snapshot.get("tasks_failed") or 0)
+    else:
+        wave_index = int(payload.get("wave_total") or 1) - 1
+        tasks_completed = int(payload.get("task_total") or 1)
+        tasks_failed = 0
     snapshot = _build_snapshot(
         payload,
         lifecycle="completed",
-        wave_index=int(payload.get("wave_total") or 1) - 1,
+        wave_index=wave_index,
         task_index=int(payload.get("task_total") or 1) - 1,
-        tasks_completed=int(payload.get("task_total") or 1),
+        tasks_completed=tasks_completed,
+        tasks_failed=tasks_failed,
     )
     if last_coach_score is not None:
         snapshot["last_coach_score"] = last_coach_score
     if aggregate_coach_score is not None:
         snapshot["aggregate_coach_score"] = aggregate_coach_score
+    if measured_source:
+        snapshot["tasks_completed_source"] = measured_source
     return _snapshot_update(snapshot)
 
 
@@ -2668,6 +2977,10 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
         snapshot["error_message"] = error_message
     if existing.get("budget_cap_killed"):
         snapshot["budget_cap_killed"] = True
+    # Same reasoning for the build monitor's attribution provenance: the
+    # terminal must say WHERE its task counts came from.
+    if existing.get("tasks_completed_source"):
+        snapshot["tasks_completed_source"] = existing["tasks_completed_source"]
     return _snapshot_update(snapshot)
 
 
