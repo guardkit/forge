@@ -82,6 +82,7 @@ __all__ = [
     "BuildStatusView",
     "DuplicateBuildError",
     "SqliteBuildCanceller",
+    "SqliteBuildModeReader",
     "SqliteBuildResumer",
     "SqliteBuildSnapshotReader",
     "SqliteLifecyclePersistence",
@@ -1709,6 +1710,69 @@ class SqliteBuildSnapshotReader:
             build_id=build_id,
             lifecycle=BuildLifecycle.OTHER_RUNNING,
         )
+
+
+class SqliteBuildModeReader:
+    """SQLite-backed :class:`forge.pipeline.supervisor.BuildModeReader`.
+
+    The conductor's revival, Stage 1b (design pass §a.1). The mode data
+    already round-trips end to end — ``forge queue --mode {a|b|c}`` writes
+    it, ``schema_v2.sql`` backfills historical rows to ``"mode-a"``, and
+    :class:`BuildRow` hydrates it — so the only missing inch was a reader
+    the conductor could hold. This is that inch, and nothing more.
+
+    Two deliberate contract points:
+
+    * **A missing row reads MODE_A**, not an exception. An unknown
+      ``build_id`` is not evidence that a build wants the fix journey, and
+      the safe answer to "which brain drives this?" is always the routine
+      path.
+    * **A broken pool raises**, and is *meant* to. The supervisor's
+      degrade rail (:meth:`Supervisor._read_build_mode`) catches anything
+      this reader throws and falls back to MODE_A with a loud log, so a
+      half-wired or unhealthy conductor degrades to today's behaviour
+      rather than crashing a build. Swallowing the error here would only
+      hide the SQLite fault from that log.
+
+    Args:
+        persistence: The daemon's lifecycle persistence facade (the
+            shared "sqlite_pool"). No second connection is opened — the
+            reader goes through the facade's read-only session like every
+            other adapter in this module.
+    """
+
+    __slots__ = ("_persistence",)
+
+    def __init__(self, persistence: SqliteLifecyclePersistence) -> None:
+        self._persistence = persistence
+
+    def get_build_mode(self, build_id: str) -> BuildMode:
+        """Return the :class:`BuildMode` recorded for ``build_id``.
+
+        Args:
+            build_id: Build whose mode to read. Non-empty.
+
+        Returns:
+            The row's :attr:`BuildRow.mode`, or :attr:`BuildMode.MODE_A`
+            when no row exists for ``build_id``.
+
+        Raises:
+            ValueError: If ``build_id`` is empty — a caller bug, surfaced
+                loudly rather than answered with a default.
+        """
+        if not build_id:
+            raise ValueError(
+                "SqliteBuildModeReader.get_build_mode: build_id must be non-empty"
+            )
+        row = self._persistence.get_build_row(build_id)
+        if row is None:
+            logger.debug(
+                "SqliteBuildModeReader: no builds row for build_id=%s; "
+                "answering MODE_A (the routine path)",
+                build_id,
+            )
+            return BuildMode.MODE_A
+        return row.mode
 
 
 class SqliteBuildCanceller:

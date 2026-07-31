@@ -212,12 +212,22 @@ def _seed_approved(
 class TestStageCommandMapping:
     """AC: SYSTEM_ARCH/SYSTEM_DESIGN/FEATURE_SPEC/FEATURE_PLAN map correctly."""
 
-    def test_subprocess_stage_commands_covers_exactly_four_stages(self) -> None:
+    def test_subprocess_stage_commands_covers_exactly_six_stages(self) -> None:
+        """The four planning stages plus the fix journey's two.
+
+        The two fix-journey rows landed with the conductor's revival
+        (Stage 1a, design pass §a.4). The set is asserted exhaustively so
+        a stage added to :class:`StageClass` without a deliberate decision
+        about whether it is a subprocess stage fails here rather than at
+        the first dispatch.
+        """
         assert set(SUBPROCESS_STAGE_COMMANDS) == {
             StageClass.SYSTEM_ARCH,
             StageClass.SYSTEM_DESIGN,
             StageClass.FEATURE_SPEC,
             StageClass.FEATURE_PLAN,
+            StageClass.TASK_REVIEW,
+            StageClass.TASK_WORK,
         }
 
     def test_subprocess_stage_commands_have_expected_subcommand_tokens(

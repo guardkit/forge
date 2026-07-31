@@ -67,6 +67,7 @@ References
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -512,7 +513,20 @@ class PRReviewGate(Protocol):
         auto_approve: bool,
         rationale: str,
     ) -> Any:  # pragma: no cover - protocol stub
-        """Submit the PR-review gate decision and return the gate's record."""
+        """Submit the gate decision and return the gate's record.
+
+        Since the conductor's revival (design pass §c) the production
+        implementation of this protocol is
+        :class:`~forge.pipeline.merge_ready_checkpoint.MergeReadyCheckpointPublisher`
+        — **the merge-ready checkpoint**, the plain name for what this
+        leg does. It never opens a pull request; it pushes the
+        gates-green branch and publishes the same approve-click merge
+        card the routine path delivers. The return value may be
+        awaitable: every supervisor call site funnels through
+        :meth:`Supervisor._submit_merge_ready_checkpoint`, which awaits
+        it when it is. A plain (non-awaitable) return is unchanged
+        behaviour for every pre-existing implementation.
+        """
         ...
 
 
@@ -705,6 +719,78 @@ class Supervisor:
         init=False,
         repr=False,
     )
+
+    # ------------------------------------------------------------------
+    # Internal: the merge-ready checkpoint (design pass §c, Stage 1c)
+    # ------------------------------------------------------------------
+
+    async def _submit_merge_ready_checkpoint(
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        auto_approve: bool,
+        rationale: str,
+    ) -> Any:
+        """The ONE funnel every ``pr_review_gate`` call site goes through.
+
+        Design pass §c.2: "``pr_review_gate.submit_decision`` is
+        re-pointed at this merge-card publisher — one implementation, all
+        four call sites." The four are the ``_dispatch`` router branch,
+        the Mode B post-autobuild route, the Mode C planner-chosen
+        dispatch, and the Mode C terminal route; each now calls this
+        method instead of the gate directly.
+
+        The funnel does exactly one thing beyond forwarding: it awaits an
+        awaitable result. The production publisher pushes a branch and
+        publishes a card, both async; every pre-existing (synchronous)
+        implementation returns a plain value and is forwarded verbatim,
+        which is why the flag-off tree is byte-for-byte unchanged.
+        """
+        result = self.pr_review_gate.submit_decision(
+            build_id=build_id,
+            feature_id=feature_id,
+            auto_approve=auto_approve,
+            rationale=rationale,
+        )
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    @staticmethod
+    def _merge_card_turn_outcome(result: Any) -> TurnOutcome:
+        """Map a merge-ready checkpoint result onto a :class:`TurnOutcome`.
+
+        The hard precondition of design pass §c.3 made visible to the
+        driver loop: **a red gate is not a dispatch.** It either loops
+        back into the fix cycle (``WAITING`` — the conductor's next
+        review pass picks the branch up) or terminates the journey
+        FAILED with a pack (``TERMINAL``). A no-commit checkpoint is a
+        silent ``TERMINAL`` (§c.6 — a receipt, never a card).
+
+        Any result that is NOT a
+        :class:`~forge.pipeline.merge_ready_checkpoint.MergeCardDecision`
+        — every pre-existing gate implementation, every test double —
+        maps to ``DISPATCHED``, which is exactly what these call sites
+        recorded before this method existed. That is the backwards-compat
+        invariant this whole lane preserves.
+        """
+        from forge.pipeline.merge_ready_checkpoint import (
+            MergeCardDecision,
+            MergeCardOutcome,
+        )
+
+        if not isinstance(result, MergeCardDecision):
+            return TurnOutcome.DISPATCHED
+        if result.outcome is MergeCardOutcome.CARD_PUBLISHED:
+            return TurnOutcome.DISPATCHED
+        if result.outcome is MergeCardOutcome.RED_GATE_FAILED:
+            return TurnOutcome.TERMINAL
+        if result.outcome is MergeCardOutcome.NO_COMMITS_SILENT:
+            return TurnOutcome.TERMINAL
+        # RED_GATE_LOOP_BACK / PUBLISH_FAILED — the journey has not been
+        # delivered and has not ended; the driver loop waits and re-plans.
+        return TurnOutcome.WAITING
 
     # ------------------------------------------------------------------
     # Public API
@@ -937,9 +1023,12 @@ class Supervisor:
         # 7. Route to the dispatcher.
         dispatch_result = await self._dispatch(build_id=build_id, choice=choice)
 
-        # 8. Successful dispatch — assemble the report.
+        # 8. Successful dispatch — assemble the report. For every stage
+        #    except the merge-ready checkpoint this is DISPATCHED verbatim;
+        #    a red-gate checkpoint result maps to WAITING / TERMINAL so a
+        #    refused delivery is never recorded as a dispatch (§c.3).
         report = TurnReport(
-            outcome=TurnOutcome.DISPATCHED,
+            outcome=self._merge_card_turn_outcome(dispatch_result),
             build_id=build_id,
             permitted_stages=permitted_stages,
             chosen_stage=choice.stage,
@@ -1170,18 +1259,17 @@ class Supervisor:
         feature_id = decision.feature_id
 
         if decision.route == _MODE_B_PR_REVIEW:
-            # Advance to PR-review via the existing constitutional gate
-            # path. The supervisor invokes the gate directly — Mode B's
-            # planner is authoritative; auto_approve is False (operator
-            # approves) by ASSUM-011.
-            dispatch_result = self.pr_review_gate.submit_decision(
+            # The merge-ready checkpoint (design pass §c) — call site 2 of
+            # 4. Mode B's planner is authoritative; auto_approve is False
+            # (the owner says the merge word) by ASSUM-011.
+            dispatch_result = await self._submit_merge_ready_checkpoint(
                 build_id=build_id,
                 feature_id=feature_id or "",
                 auto_approve=False,
                 rationale=rationale,
             )
             report = TurnReport(
-                outcome=TurnOutcome.DISPATCHED,
+                outcome=self._merge_card_turn_outcome(dispatch_result),
                 build_id=build_id,
                 permitted_stages=permitted,
                 chosen_stage=StageClass.PULL_REQUEST_REVIEW,
@@ -1300,6 +1388,32 @@ class Supervisor:
             build, history, has_commits=has_commits
         )
 
+        if plan.is_waiting:
+            # The planner is waiting on an in-flight prerequisite — the
+            # review is not yet approved, or a /task-work is still
+            # running (design pass §h.1). A wait is NOT a terminal: the
+            # terminal handler reads history structurally and would
+            # classify a mid-cycle build as CLEAN_REVIEW_NO_COMMITS or
+            # PR_REVIEW, ending a build that has work still in flight.
+            # Report the wait and let the driver loop re-plan when the
+            # in-flight stage resolves.
+            rationale = plan.rationale or (
+                f"MODE_C planner waiting ({plan.wait})"
+            )
+            logger.info(
+                "supervisor.next_turn (MODE_C): waiting — %s (build_id=%s)",
+                rationale,
+                build_id,
+            )
+            report = TurnReport(
+                outcome=TurnOutcome.WAITING,
+                build_id=build_id,
+                permitted_stages=frozenset(MODE_C_CHAIN),
+                rationale=rationale,
+            )
+            self._record_safe(report)
+            return report
+
         if plan.next_stage is None:
             return await self._mode_c_resolve_terminal(
                 build_id=build_id,
@@ -1339,18 +1453,18 @@ class Supervisor:
         rationale = plan.rationale or f"MODE_C planner chose {chosen_stage.value}"
 
         if chosen_stage is StageClass.PULL_REQUEST_REVIEW:
-            # Mode C: a clean follow-up review with commits advances
-            # straight to PR-review. The constitutional guard veto
-            # applies but only on auto-approve (which the planner does
-            # not request).
-            dispatch_result = self.pr_review_gate.submit_decision(
+            # The merge-ready checkpoint (design pass §c) — call site 3 of
+            # 4. A clean follow-up review with commits advances straight
+            # to it. The constitutional guard veto applies but only on
+            # auto-approve, which the planner does not request.
+            dispatch_result = await self._submit_merge_ready_checkpoint(
                 build_id=build_id,
                 feature_id="",
                 auto_approve=False,
                 rationale=rationale,
             )
             report = TurnReport(
-                outcome=TurnOutcome.DISPATCHED,
+                outcome=self._merge_card_turn_outcome(dispatch_result),
                 build_id=build_id,
                 permitted_stages=permitted,
                 chosen_stage=chosen_stage,
@@ -1632,14 +1746,17 @@ class Supervisor:
             return report
 
         if decision.outcome is _ModeCHandlerTerminal.PR_REVIEW:
-            dispatch_result = self.pr_review_gate.submit_decision(
+            # The merge-ready checkpoint (design pass §c) — call site 4 of
+            # 4. The terminal handler has already consulted the commit
+            # probe, so reaching here means "there are commits to merge".
+            dispatch_result = await self._submit_merge_ready_checkpoint(
                 build_id=build_id,
                 feature_id="",
                 auto_approve=False,
                 rationale=decision.rationale,
             )
             report = TurnReport(
-                outcome=TurnOutcome.DISPATCHED,
+                outcome=self._merge_card_turn_outcome(dispatch_result),
                 build_id=build_id,
                 permitted_stages=permitted,
                 chosen_stage=StageClass.PULL_REQUEST_REVIEW,
@@ -1650,6 +1767,11 @@ class Supervisor:
             return report
 
         # CLEAN_REVIEW_NO_FIXES / CLEAN_REVIEW_NO_COMMITS / FAILED → terminal.
+        # NO-COMMIT TERMINALS STAY SILENT (design pass §c.6): these three
+        # branches never touch ``pr_review_gate`` — a fix journey that
+        # finds nothing to fix, or produces no commits, ends with a
+        # receipt, never a card. The owner hears about work only when
+        # there is a merge word to say.
         report = TurnReport(
             outcome=TurnOutcome.TERMINAL,
             build_id=build_id,
@@ -1769,11 +1891,13 @@ class Supervisor:
             )
 
         if stage is StageClass.PULL_REQUEST_REVIEW:
-            # PR-review uses the FEAT-FORGE-004 gate surface, not a
-            # dispatcher. Auto-approve has already been sanitised by
-            # the constitutional guard; we forward whatever flag
-            # survived that gate.
-            return self.pr_review_gate.submit_decision(
+            # The merge-ready checkpoint (design pass §c) — call site 1 of
+            # 4. It uses the FEAT-FORGE-004 approve-click gate surface,
+            # not a dispatcher, and it has never opened a pull request.
+            # Auto-approve has already been sanitised by the
+            # constitutional guard; we forward whatever flag survived it
+            # (the publisher refuses auto-approve again, belt and braces).
+            return await self._submit_merge_ready_checkpoint(
                 build_id=build_id,
                 feature_id=choice.feature_id or "",
                 auto_approve=choice.auto_approve,

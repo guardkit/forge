@@ -465,6 +465,7 @@ def _build_dispatch_build(
     gate_repository: Any = None,
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
+    conductor_router: Callable[..., Any] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -475,6 +476,21 @@ def _build_dispatch_build(
     terminal (reject / expiry / hard-stop) it acks the JetStream slot and
     never launches; while paused it holds the slot un-acked (the runner is
     launched by the R1 approve callback).
+
+    ``conductor_router`` (conductor revival, Stage 1c — design pass §a.2)
+    is the ONE seam through which a dequeued fix-journey build is handed
+    to the conductor's turn loop **instead of** the direct autobuild
+    launch. It is an ``async (**launch_kwargs) -> bool`` predicate:
+    ``True`` means "the conductor took this build", ``False`` means "not
+    mine — launch it the routine way".
+
+    **The prime invariant of this lane lives on this parameter.** ``None``
+    — which is what the composition root passes whenever
+    ``conductor.enabled`` is off, i.e. always by default — leaves both
+    launch branches calling ``launch(...)`` with byte-identical kwargs in
+    byte-identical order. The router is consulted only when it exists, so
+    the flag-off dequeue path is not merely equivalent to today's, it is
+    the same call sequence (asserted by the flag-off call-sequence test).
     """
     launch = _build_resume_launcher(
         forward_context_builder,
@@ -484,6 +500,34 @@ def _build_dispatch_build(
         async_task_starter,
     )
     clock = gate_clock or _utc_now
+
+    async def launch_or_conduct(**launch_kwargs: Any) -> Any:
+        """Route one accepted build: conductor first (if wired), else launch.
+
+        With no router wired this is a straight pass-through to
+        ``launch`` — the flag-off byte-equivalence guarantee.
+        """
+        if conductor_router is not None:
+            try:
+                taken = await conductor_router(**launch_kwargs)
+            except Exception as exc:  # noqa: BLE001 — never brick the routine path
+                logger.error(
+                    "dispatch_build: conductor_router raised (%s) for "
+                    "build_id=%s; falling back to the routine launch so the "
+                    "build still runs (the conductor earns jobs, it never "
+                    "blocks one)",
+                    exc,
+                    launch_kwargs.get("build_id"),
+                )
+                taken = False
+            if taken:
+                logger.info(
+                    "dispatch_build: build_id=%s handed to the conductor's "
+                    "turn loop; NOT launching the routine autobuild",
+                    launch_kwargs.get("build_id"),
+                )
+                return None
+        return await launch(**launch_kwargs)
 
     async def dispatch_build(
         payload: "BuildQueuedPayload",
@@ -708,7 +752,7 @@ def _build_dispatch_build(
             )
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
-            await launch(
+            await launch_or_conduct(
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
@@ -773,7 +817,7 @@ def _build_dispatch_build(
             )
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
-            await launch(
+            await launch_or_conduct(
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
@@ -953,6 +997,7 @@ def build_pipeline_consumer_deps(
     gate_repository: Any = None,
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
+    conductor_router: Callable[..., Any] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -996,6 +1041,13 @@ def build_pipeline_consumer_deps(
             ``deps.dispatch_build`` raises :class:`RuntimeError` so a
             missing wiring surfaces during the first dispatch rather
             than silently dropping the build.
+        conductor_router: Optional ``async (**launch_kwargs) -> bool``
+            seam (conductor revival Stage 1c). ``None`` — the default,
+            and what the composition root passes while
+            ``conductor.enabled`` is off — leaves the dequeue path
+            byte-for-byte today's: every accepted build goes straight to
+            the routine autobuild launch. See
+            :func:`_build_dispatch_build`.
 
     Returns:
         A fully wired
@@ -1082,6 +1134,7 @@ def build_pipeline_consumer_deps(
         gate_repository=gate_repository,
         gate_state_machine=gate_state_machine,
         gate_clock=gate_clock,
+        conductor_router=conductor_router,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,

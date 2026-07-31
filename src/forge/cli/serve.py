@@ -574,6 +574,24 @@ def bind_production_dispatch_chain(
                 exc,
             )
 
+        # Conductor revival, Stage 1c — the last inch of the daemon seam.
+        # ``build_conductor_router`` returns ``None`` whenever the
+        # conductor is switched off (the default), which leaves the
+        # dequeue path byte-for-byte today's: every accepted build goes
+        # straight to the routine autobuild launch. Composed under DDR-007
+        # boot protection so a conductor defect can never brick intake.
+        try:
+            conductor_router = build_conductor_router(
+                pool=sqlite_pool, config=forge_config
+            )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            conductor_router = None
+            logger.error(
+                "forge-serve: conductor router composition FAILED (%s) — the "
+                "conductor stays INERT; every build takes the routine path",
+                exc,
+            )
+
         deps = build_pipeline_consumer_deps(
             client,
             forge_config,
@@ -585,6 +603,7 @@ def bind_production_dispatch_chain(
             gate_repository=gate_repository,
             gate_state_machine=gate_state_machine,
             gate_clock=_gate_wall_clock,
+            conductor_router=conductor_router,
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first
@@ -753,6 +772,13 @@ def build_supervisor(
     budget_started_at_reader: "Callable[[str], datetime | None] | None" = None,
     budget_coach_score_reader: "Callable[[str], float | None] | None" = None,
     budget_pause: "Callable[..., Awaitable[None]] | None" = None,
+    # ----- conductor revival, Stage 1b (design pass §a.1 / §a.3) -------
+    build_mode_reader: Any | None = None,
+    mode_c_planner: Any | None = None,
+    mode_c_history_reader: Any | None = None,
+    mode_c_terminal_handler: Any | None = None,
+    mode_c_commit_probe: Any | None = None,
+    fix_task_context_builder: Any | None = None,
 ) -> Supervisor:
     """Construct the production :class:`Supervisor` for ``_run_serve``.
 
@@ -804,6 +830,29 @@ def build_supervisor(
     :func:`make_budget_started_at_reader`, :func:`budget_wall_clock`, and
     :func:`make_budget_pause` build the production values a future driver
     would pass here.
+
+    Conductor mode DI (``build_mode_reader`` / ``mode_c_planner`` /
+    ``mode_c_history_reader`` / ``mode_c_terminal_handler`` /
+    ``mode_c_commit_probe`` / ``fix_task_context_builder``) — the
+    conductor's revival, Stage 1b (design pass §a.1, §a.3). Until now this
+    factory wired thirteen routine-path collaborators and **zero** mode
+    fields: it could not pass them even if a caller wanted to, so the
+    conductor was unreachable from production by construction. These are
+    pass-through kwargs onto the matching :class:`Supervisor` fields, each
+    defaulting to ``None`` — the dataclass's own default — so every
+    existing caller composes byte-for-byte unchanged (the
+    ``supervisor.py`` TASK-MBC8-008 backwards-compat invariant).
+
+    ``None`` on ``build_mode_reader`` is the safety rail, not an
+    oversight: :meth:`Supervisor._read_build_mode` answers MODE_A for an
+    unwired *or raising* reader, so every build takes the routine path and
+    the remaining mode collaborators are never consulted. The Mode B
+    fields are deliberately absent from this signature — the full journey
+    was retired as a production destination by the 2026-07-31 ruling
+    (design pass §e) and stays ``None`` by the same invariant.
+
+    :func:`build_conductor_mode_kwargs` builds the production values for
+    these six, gated on the ``conductor.enabled`` flag.
     """
     middleware = (
         async_subagent_middleware
@@ -839,20 +888,150 @@ def build_supervisor(
         budget_started_at_reader=budget_started_at_reader,
         budget_coach_score_reader=budget_coach_score_reader,
         budget_pause=budget_pause,
+        build_mode_reader=build_mode_reader,
+        mode_c_planner=mode_c_planner,
+        mode_c_history_reader=mode_c_history_reader,
+        mode_c_terminal_handler=mode_c_terminal_handler,
+        mode_c_commit_probe=mode_c_commit_probe,
+        fix_task_context_builder=fix_task_context_builder,
     )
 
 
 # ---------------------------------------------------------------------------
-# FEAT-UBS-002 — production budget wiring (INERT until activation)
+# The conductor's activation wiring (design pass §a.1 / §a.3, Stage 1b)
+# ---------------------------------------------------------------------------
+
+
+def build_conductor_mode_kwargs(
+    *,
+    pool: Any,
+    config: Any,
+    base_branch: str = "main",
+    worktree_allowlist: Any | None = None,
+    forward_context_builder: Any | None = None,
+    failure_pack_source_reader: Any | None = None,
+    receipts_root: Any | None = None,
+) -> "dict[str, Any]":
+    """Build the conductor's mode collaborators — or nothing, when it is off.
+
+    **The flag is the switch now.** Rich's word activating the conductor
+    was given by the 2026-07-30 ruling, so the sentence
+    ``serve.py`` used to carry — "activation is a plan-of-record decision
+    reserved for Rich" — is discharged. What reserves activation today is
+    a config flag, ``conductor.enabled`` in ``forge.yaml``
+    (:data:`forge.config.conductor.CONDUCTOR_FLAG_PATH`), and it defaults
+    **OFF**. One switch, two readers: ``forge queue`` refuses a fix
+    journey while it is off (so no build row sits stuck), and this factory
+    hands back ``{}`` — leaving every mode field ``None``, which is
+    byte-for-byte today's routine path.
+
+    With the flag on, the four collaborators the fix journey needs are
+    constructed here:
+
+    * ``build_mode_reader`` — :class:`SqliteBuildModeReader` over
+      ``builds.mode`` (the column already round-trips end to end).
+    * ``mode_c_planner`` — :class:`ModeCCyclePlanner`, a stateless pure
+      function with zero dependencies. Constructing it is the whole job.
+    * ``mode_c_history_reader`` — :class:`SqliteModeCHistoryReader`, the
+      ``stage_log`` → planner projection (design pass §h.3).
+    * ``mode_c_terminal_handler`` + ``mode_c_commit_probe`` — the default
+      handler wired **explicitly**, paired with a real git commit probe
+      over the build's worktree. The handler raises without a probe on the
+      one branch that splits "hand back a gates-green branch" from "ended
+      quietly, nothing changed", so the two are wired as a pair or not at
+      all.
+
+    ``fix_task_context_builder`` is built here as of Stage 1c, but only
+    when a ``forward_context_builder`` is supplied: it is an ADAPTER over
+    that builder (design pass §b.2), extending it with the failed build's
+    failure-pack index. Without the builder to adapt there is nothing to
+    wrap, so the field stays ``None`` and the supervisor threads the
+    fix-task ref alone (it already guards the call site).
+
+    Args:
+        pool: The daemon's :class:`SqliteLifecyclePersistence` facade.
+        config: The loaded :class:`ForgeConfig`. Read only through
+            :func:`forge.config.conductor.conductor_enabled`, which
+            answers ``False`` for ``None`` and for any shape it does not
+            recognise — a misread config leaves the conductor inert.
+        base_branch: Left side of the commit probe's ``<base>..HEAD``
+            range. See :mod:`forge.pipeline.mode_c_commit_probe`.
+        worktree_allowlist: Optional FEAT-FORGE-005 allowlist, forwarded
+            to the commit probe for defence-in-depth on the recorded
+            worktree path.
+        forward_context_builder: The daemon's shipped
+            :class:`~forge.pipeline.forward_context_builder.ForwardContextBuilder`.
+            When supplied, ``fix_task_context_builder`` is wired as an
+            adapter over it.
+        failure_pack_source_reader: ``(fix_build_id) -> str | None`` —
+            which FAILED build's pack this journey repairs. ``None``
+            reads the fix journey's own receipts directory.
+        receipts_root: Injectable receipts root (tests); ``None`` uses
+            the routine path's own law.
+
+    Returns:
+        Keyword arguments for :func:`build_supervisor` — empty when the
+        conductor is switched off.
+    """
+    from forge.config.conductor import conductor_enabled
+    from forge.lifecycle.persistence import SqliteBuildModeReader
+    from forge.pipeline.mode_c_commit_probe import make_mode_c_commit_probe
+    from forge.pipeline.mode_c_history_reader import SqliteModeCHistoryReader
+    from forge.pipeline.mode_c_planner import ModeCCyclePlanner
+    from forge.pipeline.terminal_handlers.mode_c import evaluate_terminal
+
+    if not conductor_enabled(config):
+        logger.info(
+            "conductor: switched OFF (%s) — no mode collaborators wired; "
+            "every build takes the routine path",
+            "conductor.enabled",
+        )
+        return {}
+
+    logger.info(
+        "conductor: switched ON (conductor.enabled) — wiring the mode "
+        "reader, the fix-journey planner, the stage_log projection, and "
+        "the terminal handler + commit probe (base_branch=%s)",
+        base_branch,
+    )
+    kwargs: dict[str, Any] = {
+        "build_mode_reader": SqliteBuildModeReader(pool),
+        "mode_c_planner": ModeCCyclePlanner(),
+        "mode_c_history_reader": SqliteModeCHistoryReader(pool),
+        "mode_c_terminal_handler": evaluate_terminal,
+        "mode_c_commit_probe": make_mode_c_commit_probe(
+            pool,
+            base_branch=base_branch,
+            worktree_allowlist=worktree_allowlist,
+        ),
+    }
+    if forward_context_builder is not None:
+        from forge.pipeline.fix_task_context_builder import FixTaskContextBuilder
+
+        kwargs["fix_task_context_builder"] = FixTaskContextBuilder(
+            forward_context_builder,
+            source_build_id_reader=failure_pack_source_reader,
+            receipts_root=receipts_root,
+        )
+        logger.info(
+            "conductor: fix_task_context_builder wired (forward context + "
+            "failure-pack index, design pass §b.2)"
+        )
+    return kwargs
+
+
+# ---------------------------------------------------------------------------
+# FEAT-UBS-002 — production budget wiring (CONSUMED by the driver loop)
 # ---------------------------------------------------------------------------
 #
-# The functions below build the production values a Mode-C ``next_turn`` driver
-# would pass to :func:`build_supervisor`'s budget DI. They are complete and
-# tested, but nothing consumes them yet: the Supervisor/Mode-C path has no
-# production caller (the daemon drives builds via the NATS pipeline consumer)
-# and ``build_mode_reader`` is ``None`` in production, so every build is Mode A.
-# Activation — wiring a ``build_mode_reader`` + a next_turn driver — is a
-# plan-of-record decision reserved for Rich, explicitly out of scope here.
+# The four functions below build the production values a Mode-C ``next_turn``
+# driver passes to :func:`build_supervisor`'s budget DI. Both reasons they sat
+# unconsumed are now discharged: :func:`build_supervisor` takes the mode fields
+# and :func:`build_conductor_mode_kwargs` builds them (Stage 1b), and
+# :func:`build_conductor_budget_kwargs` — the per-build supervisor setup of the
+# Stage-1c turn loop (design pass §a.2 / §b.1) — is the caller they were
+# waiting for. They remain INERT in the sense that matters: the conductor is
+# switched off by default, so nothing constructs them on the routine path.
 
 
 def resolve_budget_for_build(
@@ -1037,6 +1216,251 @@ def make_budget_pause(
         )
 
     return budget_pause
+
+
+# ---------------------------------------------------------------------------
+# The conductor's driver loop — per-build setup + the daemon seam (Stage 1c)
+# ---------------------------------------------------------------------------
+
+
+def build_conductor_budget_kwargs(
+    *,
+    pool: Any,
+    config: Any,
+    build_id: str,
+    publish_approval_request: "Callable[[Any, str], Awaitable[None]] | None" = None,
+    lifecycle_emitter: "PipelineLifecycleEmitter | None" = None,
+    coach_score_reader: "Callable[[str], float | None] | None" = None,
+) -> "dict[str, Any]":
+    """Wire the four serve-side budget builders for ONE conductor-driven build.
+
+    Design pass §b.1 — the consumer path's shipped budget enforcement
+    (Option-B / UBEM, live) folds into the conductor loop: "the driver
+    loop's per-build supervisor setup wires the four serve-side
+    builders." This is that setup, and these are those four:
+
+    * :func:`resolve_budget_for_build` — caps + profile name, read off
+      ``builds.profile`` (``forge queue --profile``).
+    * :func:`make_budget_started_at_reader` — the wall-clock cap's start
+      anchor, over ``builds.started_at``.
+    * :func:`budget_wall_clock` — the wall-clock cap's now.
+    * :func:`make_budget_pause` — publish the risk-high escalation, mark
+      PAUSED, emit ``build-paused``, in the ADR-ARCH-021 order.
+
+    THE CAP-MAPPING LAW (design pass §h.7). "One follow-up review" is
+    ``max_review_cycles: 2``, never ``1``:
+    :func:`~forge.pipeline.budget_guard.count_review_cycles` counts ALL
+    review entries, and a bounded fix journey has an initial review plus
+    one follow-up — two. A profile written with ``1`` false-pauses every
+    fix build before its mandatory follow-up. The mapping is pinned in
+    the built-in ``fix-journey`` profile
+    (:data:`~forge.config.models.FIX_JOURNEY_MAX_REVIEW_CYCLES`) and by a
+    test that a profile of ``1`` would breach at the follow-up.
+
+    ``publish_approval_request`` / ``lifecycle_emitter`` are what
+    :func:`make_budget_pause` needs; without both, the pause collaborator
+    is left ``None`` — the supervisor then still ENFORCES the cap (it
+    refuses the dispatch) but cannot publish the escalation. Never a
+    silent continue.
+
+    Returns:
+        Keyword arguments for :func:`build_supervisor`.
+    """
+    guards, profile_name = resolve_budget_for_build(pool, config, build_id)
+    kwargs: dict[str, Any] = {
+        "budget_guards": guards,
+        "budget_profile_name": profile_name,
+        "budget_wall_clock": budget_wall_clock,
+        "budget_started_at_reader": make_budget_started_at_reader(pool),
+        "budget_coach_score_reader": coach_score_reader,
+    }
+    if publish_approval_request is not None and lifecycle_emitter is not None:
+        kwargs["budget_pause"] = make_budget_pause(
+            pool, publish_approval_request, lifecycle_emitter
+        )
+    else:
+        logger.warning(
+            "conductor: budget_pause is NOT wired for build_id=%s "
+            "(publish_approval_request=%s lifecycle_emitter=%s) — a cap "
+            "breach will still REFUSE the dispatch, but no escalation card "
+            "will be published",
+            build_id,
+            publish_approval_request is not None,
+            lifecycle_emitter is not None,
+        )
+    logger.info(
+        "conductor: budget wired for build_id=%s profile=%s caps_enabled=%s",
+        build_id,
+        profile_name,
+        guards.caps_enabled,
+    )
+    return kwargs
+
+
+def build_conductor_router(
+    *,
+    pool: Any,
+    config: Any,
+    supervisor_factory: "Callable[..., Any] | None" = None,
+    driver_deps_factory: "Callable[..., Any] | None" = None,
+    spawn: "Callable[..., Any] | None" = None,
+) -> "Callable[..., Any] | None":
+    """Build the daemon seam that hands a fix journey to the conductor.
+
+    Design pass §a.2 — "in the daemon, when a dequeued build's mode is
+    mode-c, hand it to a per-build turn loop instead of the direct
+    autobuild launch."
+
+    **Returns ``None`` when the conductor is switched off**, and that is
+    the whole prime invariant of this lane: ``_serve_deps`` passes the
+    result straight through as ``conductor_router``, and a ``None`` router
+    leaves the dequeue path calling ``launch(...)`` with byte-identical
+    kwargs in byte-identical order — today's tree exactly.
+
+    With the flag on, the returned predicate is consulted once per
+    accepted build:
+
+    * The build's mode is read through the SAME reader Stage 1b wired
+      (:class:`SqliteBuildModeReader`). Anything that is not the fix
+      journey answers ``False`` immediately, so a routine build under an
+      ON flag still takes the routine path untouched.
+    * A fix journey gets a per-build :class:`Supervisor` (its budget
+      collaborators from :func:`build_conductor_budget_kwargs`) and a
+      turn loop, spawned as a supervised background task so the consumer
+      fetch loop is never blocked by a whole journey.
+
+    ``supervisor_factory`` is injected rather than composed here on
+    purpose. ``build_supervisor`` needs thirteen routine-path
+    collaborators that the daemon does not construct today (it has never
+    had a Supervisor), and inventing adapters for them inside this lane
+    would be exactly the "no behaviour change" breach the lane exists to
+    avoid. With the flag ON and no factory injected the router refuses to
+    pretend: it logs loudly and stays ``None``, so the conductor is inert
+    rather than half-wired.
+
+    Args:
+        pool: The daemon's SQLite persistence facade.
+        config: The loaded :class:`ForgeConfig`.
+        supervisor_factory: ``(build_id) -> Supervisor`` (may be async).
+        driver_deps_factory: ``(build_id, supervisor) ->
+            ConductorDriverDeps``. Defaults to a deps container carrying
+            only the supervisor — enough to drive, honest about what is
+            not yet wired.
+        spawn: ``(coro) -> Any`` task starter; defaults to a tracked
+            :func:`asyncio.create_task`.
+    """
+    from forge.config.conductor import conductor_enabled
+
+    if not conductor_enabled(config):
+        logger.info(
+            "conductor: switched OFF — no driver loop; every dequeued build "
+            "takes the routine autobuild launch (byte-for-byte today's path)"
+        )
+        return None
+
+    if supervisor_factory is None:
+        logger.error(
+            "conductor: switched ON but no supervisor_factory is wired — the "
+            "daemon composes no Supervisor today. Staying INERT (no driver "
+            "loop) rather than half-wiring one; every build takes the routine "
+            "path. Wire a factory to activate the fix journey."
+        )
+        return None
+
+    from forge.lifecycle.modes import BuildMode
+    from forge.lifecycle.persistence import SqliteBuildModeReader
+    from forge.pipeline.conductor_driver import (
+        ConductorDriverDeps,
+        drive_fix_journey,
+    )
+
+    mode_reader = SqliteBuildModeReader(pool)
+    spawn_task = spawn if spawn is not None else _spawn_conductor_task
+
+    async def conductor_router(**launch_kwargs: Any) -> bool:
+        """Return ``True`` iff the conductor took this build."""
+        build_id = launch_kwargs.get("build_id")
+        if not build_id:  # pragma: no cover - defensive
+            return False
+        try:
+            mode = mode_reader.get_build_mode(build_id)
+        except Exception as exc:  # noqa: BLE001 — degrade to the routine path
+            logger.error(
+                "conductor: mode read raised %s: %s for build_id=%s; the "
+                "build takes the routine path (the degrade rail)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return False
+        if mode is not BuildMode.MODE_C:
+            return False
+
+        try:
+            supervisor = await _maybe_await_value(supervisor_factory(build_id))
+            if driver_deps_factory is not None:
+                deps = await _maybe_await_value(
+                    driver_deps_factory(build_id, supervisor)
+                )
+            else:
+                deps = ConductorDriverDeps(supervisor=supervisor)
+        except Exception as exc:  # noqa: BLE001 — never brick the routine path
+            logger.error(
+                "conductor: per-build setup raised %s: %s for build_id=%s; "
+                "the build takes the routine path",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return False
+
+        logger.info(
+            "conductor: build_id=%s is a fix journey — handing it to the "
+            "turn loop instead of the routine autobuild launch",
+            build_id,
+        )
+        spawn_task(drive_fix_journey(build_id, deps))
+        return True
+
+    return conductor_router
+
+
+#: Strong references to the per-build conductor tasks. ``asyncio`` keeps
+#: only a weak reference to a bare :func:`asyncio.create_task` result, so a
+#: whole fix journey could be garbage-collected mid-flight without this.
+_CONDUCTOR_TASKS: "set[Any]" = set()
+
+
+def _spawn_conductor_task(coro: Any) -> Any:
+    """Start a supervised background task for one fix journey."""
+    import asyncio
+
+    task = asyncio.ensure_future(coro)
+    _CONDUCTOR_TASKS.add(task)
+    task.add_done_callback(_CONDUCTOR_TASKS.discard)
+    task.add_done_callback(_log_conductor_task_exception)
+    return task
+
+
+def _log_conductor_task_exception(task: Any) -> None:
+    """Surface a dead conductor task loudly instead of at GC time."""
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+    except Exception:  # noqa: BLE001 - pragma: no cover - defensive
+        return
+    if exc is not None:
+        logger.error("conductor: turn loop task died: %s", exc)
+
+
+async def _maybe_await_value(value: Any) -> Any:
+    """Await ``value`` when it is awaitable, else return it unchanged."""
+    import inspect
+
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _configure_logging(level_name: str) -> None:
@@ -1558,6 +1982,9 @@ __all__ = [
     "SubscriptionState",
     "bind_production_dispatch_chain",
     "budget_wall_clock",
+    "build_conductor_budget_kwargs",
+    "build_conductor_mode_kwargs",
+    "build_conductor_router",
     "build_supervisor",
     "compose_dispatch_chain",
     "consumer_reconcile_on_boot",

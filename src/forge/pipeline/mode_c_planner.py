@@ -8,6 +8,12 @@ Termination is reviewer-driven (FEAT-FORGE-008 ASSUM-010): a follow-up
 review that returns no further fix tasks ends the cycle. There is no
 numeric iteration cap.
 
+A plan is one of exactly three things — dispatch, terminal, or **wait**
+(:class:`ModeCWait`). The wait variant was made explicit by the
+conductor's revival (Stage 1a, design pass §h.1): an in-flight
+``/task-work`` previously fell through to "all fix tasks completed" and
+scheduled a premature follow-up review. It now yields a wait.
+
 Two terminal outcomes are possible (ASSUM-005, ASSUM-007, ASSUM-017):
 
 * :attr:`ModeCTerminal.CLEAN_REVIEW` — a review (initial or follow-up)
@@ -60,10 +66,12 @@ from forge.pipeline.mode_chains_data import MODE_C_CHAIN
 from forge.pipeline.stage_taxonomy import StageClass
 
 __all__ = [
+    "FixTaskLookup",
     "FixTaskRef",
     "ModeCCyclePlanner",
     "ModeCPlan",
     "ModeCTerminal",
+    "ModeCWait",
     "StageEntry",
     "plan_next_stage",
 ]
@@ -116,6 +124,72 @@ class ModeCTerminal(StrEnum):
 
     CLEAN_REVIEW = "clean-review"
     FAILED = "failed"
+
+
+class ModeCWait(StrEnum):
+    """Why the planner is waiting rather than dispatching or terminating.
+
+    The third plan variant, made explicit by the conductor's revival
+    (Stage 1a, design pass §h.1). Before it, "wait" and "terminate" were
+    both encoded as ``next_stage=None`` and told apart only by whether
+    ``terminal`` happened to be set — and the in-flight fix-task case did
+    not even reach that: it fell through to "all fix tasks completed" and
+    scheduled a *premature follow-up review* while a ``/task-work`` was
+    still running. The code comment at that site admitted the encoding was
+    wrong-if-reached. It is now right-if-reached: an in-flight fix task
+    yields :attr:`FIX_TASK_IN_FLIGHT`, never a dispatch.
+
+    A waiting plan means: nothing to do this tick; the build is neither
+    advanced nor finished; re-plan when the in-flight stage resolves. The
+    driver loop must **not** run the terminal handler on a waiting plan —
+    the handler reads history structurally and would classify a mid-cycle
+    build as a terminal outcome.
+
+    Members:
+        REVIEW_AWAITING_APPROVAL: The most recent ``/task-review`` has not
+            reached ``approved`` (still pending / running). Dispatching
+            ``/task-work`` before the review is approved would breach the
+            Group B prerequisite invariant.
+        FIX_TASK_IN_FLIGHT: A ``/task-work`` is still running for a fix
+            task in the current review's list. The next fix task's slot
+            cannot be judged open or closed until it resolves.
+    """
+
+    REVIEW_AWAITING_APPROVAL = "review-awaiting-approval"
+    FIX_TASK_IN_FLIGHT = "fix-task-in-flight"
+
+
+@dataclass(frozen=True, slots=True)
+class FixTaskLookup:
+    """Result of the "which fix task is next?" walk — three outcomes, typed.
+
+    The helper used to answer with ``str | None``, which collapsed two
+    genuinely different answers ("nothing left to do — schedule the
+    follow-up review" and "the next one is still running — wait") into the
+    same ``None``. The caller could only act on one of them, so it acted
+    on the wrong one for the other (design pass risk h.1). Three named
+    outcomes cannot be misread.
+
+    Exactly one of the three is true on every instance:
+
+    * ``fix_task_id`` is set — dispatch ``/task-work`` for it.
+    * ``in_flight_id`` is set — wait; that fix task is still running.
+    * both are ``None`` — every fix task in the current review's list has
+      reached a terminal status; schedule the follow-up review.
+    """
+
+    fix_task_id: str | None = None
+    in_flight_id: str | None = None
+
+    @property
+    def is_wait(self) -> bool:
+        """``True`` iff a fix task is still in flight."""
+        return self.in_flight_id is not None
+
+    @property
+    def is_exhausted(self) -> bool:
+        """``True`` iff every fix task has reached a terminal status."""
+        return self.fix_task_id is None and self.in_flight_id is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,10 +264,14 @@ class ModeCPlan:
     * ``next_stage`` is ``None`` and ``terminal`` is set. The build has
       reached a terminal outcome — :attr:`ModeCTerminal.CLEAN_REVIEW` or
       :attr:`ModeCTerminal.FAILED`.
-    * Both ``next_stage`` and ``terminal`` are ``None`` — the planner is
-      waiting on an in-flight prerequisite (e.g. the most recent review
-      has not yet been approved). The supervisor records the wait and
-      retries on the next reasoning loop tick.
+    * Both ``next_stage`` and ``terminal`` are ``None`` and ``wait`` is
+      set — the planner is waiting on an in-flight prerequisite (the most
+      recent review is not yet approved, or a ``/task-work`` is still
+      running). The supervisor records the wait and retries on the next
+      tick; it must NOT run the terminal handler on a waiting plan.
+
+    ``wait`` is the discriminator to branch on — checking
+    ``next_stage is None`` alone cannot tell a wait from a terminal.
 
     Attributes:
         permitted_stages: Frozenset of stage classes that are dispatchable
@@ -207,6 +285,9 @@ class ModeCPlan:
             otherwise.
         terminal: A :class:`ModeCTerminal` outcome when the build is done,
             otherwise ``None``.
+        wait: A :class:`ModeCWait` reason when the planner is waiting on
+            an in-flight prerequisite, otherwise ``None``. Set iff both
+            ``next_stage`` and ``terminal`` are ``None``.
         rationale: A short human-readable string explaining the decision.
             The supervisor logs this against the build's stage history.
     """
@@ -215,7 +296,19 @@ class ModeCPlan:
     next_stage: StageClass | None
     next_fix_task: FixTaskRef | None = None
     terminal: ModeCTerminal | None = None
+    wait: ModeCWait | None = None
     rationale: str = ""
+
+    @property
+    def is_waiting(self) -> bool:
+        """``True`` iff this plan is a wait — neither dispatch nor terminal.
+
+        The single predicate callers branch on. Kept as a property (rather
+        than leaving callers to test ``wait is not None``) so the driver
+        loop reads as ``if plan.is_waiting:`` and cannot accidentally
+        re-derive the old, wrong ``next_stage is None`` test.
+        """
+        return self.wait is not None
 
 
 # Frozenset of Mode C dispatchable stages; built once at import time so
@@ -314,6 +407,7 @@ class ModeCCyclePlanner:
             return ModeCPlan(
                 permitted_stages=permitted,
                 next_stage=None,
+                wait=ModeCWait.REVIEW_AWAITING_APPROVAL,
                 rationale=(
                     "/task-review awaiting approval "
                     f"(status={latest_review.status!r})"
@@ -331,23 +425,42 @@ class ModeCCyclePlanner:
             )
 
         # Find the next fix task that has not yet reached a terminal
-        # status under this review's work iteration.
-        next_id = self._next_undispatched_fix_task(
+        # status under this review's work iteration. Three outcomes,
+        # each typed on the lookup (design pass §h.1) — the "still
+        # running" case must NOT fall through to the follow-up review.
+        lookup = self._next_undispatched_fix_task(
             history=history,
             latest_review_idx=latest_review_idx,
             fix_tasks=fix_tasks,
         )
 
-        if next_id is not None:
+        if lookup.fix_task_id is not None:
             ref = FixTaskRef(
-                fix_task_id=next_id,
+                fix_task_id=lookup.fix_task_id,
                 review_history_index=latest_review_idx,
             )
             return ModeCPlan(
                 permitted_stages=permitted,
                 next_stage=StageClass.TASK_WORK,
                 next_fix_task=ref,
-                rationale=f"dispatch /task-work for fix task {next_id!r}",
+                rationale=(
+                    f"dispatch /task-work for fix task {lookup.fix_task_id!r}"
+                ),
+            )
+
+        if lookup.is_wait:
+            # A /task-work is still running for this fix task. Wait —
+            # scheduling the follow-up review here would review a
+            # half-finished cycle and (worse) put a second stage in
+            # flight for the same build.
+            return ModeCPlan(
+                permitted_stages=permitted,
+                next_stage=None,
+                wait=ModeCWait.FIX_TASK_IN_FLIGHT,
+                rationale=(
+                    f"/task-work still in flight for fix task "
+                    f"{lookup.in_flight_id!r} — waiting"
+                ),
             )
 
         # All fix tasks reached terminal status — schedule a follow-up
@@ -382,7 +495,7 @@ class ModeCCyclePlanner:
         history: Sequence[StageEntry],
         latest_review_idx: int,
         fix_tasks: tuple[str, ...],
-    ) -> str | None:
+    ) -> FixTaskLookup:
         """Return the first fix task whose ``/task-work`` slot is open.
 
         Walks ``fix_tasks`` in declaration order and returns the first
@@ -393,6 +506,13 @@ class ModeCCyclePlanner:
         :data:`_TERMINAL_STATUSES` — including ``"failed"``. ASSUM-008
         ("failure isolated to its fix task") means a failed slot still
         unblocks dispatch of the *next* fix task.
+
+        Returns a :class:`FixTaskLookup` rather than ``str | None``: the
+        "still running" answer and the "nothing left" answer are
+        different instructions to the caller and must not share an
+        encoding (design pass §h.1 — the named in-code defect this
+        replaces returned ``None`` for both, so an in-flight fix task
+        scheduled a premature follow-up review).
         """
         # Collect terminal-status work entries for the current review
         # iteration only — earlier iterations may have re-emitted the
@@ -418,21 +538,16 @@ class ModeCCyclePlanner:
                 continue
             if fix_task_id in in_flight_ids:
                 # A prior ``/task-work`` is still running for this fix
-                # task — wait. Returning ``None`` from here triggers the
-                # caller's "schedule follow-up review" branch which is
-                # wrong; instead we return a sentinel that the caller
-                # interprets as "already in flight". The simplest
-                # encoding: return the same fix_task_id (the supervisor
-                # will see a duplicate dispatch as a no-op via the
-                # stage-ordering guard) — but that is brittle. Safer
-                # to wait by returning None *and* let the caller's
-                # follow-up-review branch handle it; in practice the
-                # supervisor never planning while a stage is in flight
-                # so this branch is largely defensive.
-                return None
-            return fix_task_id
+                # task. This is the WAIT answer, and it is its own
+                # variant — not a ``None`` shared with "nothing left to
+                # do". The caller turns it into a waiting plan; it never
+                # reaches the follow-up-review branch.
+                return FixTaskLookup(in_flight_id=fix_task_id)
+            return FixTaskLookup(fix_task_id=fix_task_id)
 
-        return None
+        # Every fix task in this review's list has a terminal
+        # ``/task-work`` slot — the cycle's fan-out is exhausted.
+        return FixTaskLookup()
 
     @staticmethod
     def _decide_clean_review(

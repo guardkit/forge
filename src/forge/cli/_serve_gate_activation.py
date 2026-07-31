@@ -69,6 +69,7 @@ __all__ = [
     "ALREADY_PAUSED",
     "HOLD_SLOT",
     "GateDispatchOutcome",
+    "make_merge_card_publisher",
     "maybe_gate_build",
     "outcome_launches",
     "rearm_paused_gates",
@@ -125,6 +126,11 @@ def _log_rearm_task_exception(task: "asyncio.Task[Any]") -> None:
 _GATE_STAGE_LABEL: str = "autobuild"
 _GATE_TARGET_KIND: str = "subagent"
 _GATE_TARGET_IDENTIFIER: str = "autobuild_runner"
+
+#: Target identifier for the merge-ready checkpoint's card. Same target
+#: KIND as the pre-dispatch gate (a subagent), different identifier so
+#: the two cards are distinguishable in the gate's own records.
+_MERGE_CARD_TARGET_IDENTIFIER: str = "merge_ready_checkpoint"
 
 #: :class:`GateOutcome` members that mean "permission granted — launch the
 #: build". The remaining members (``FAILED`` / ``CANCELLED`` / ``TIMED_OUT``)
@@ -409,6 +415,114 @@ async def maybe_gate_build(
         outcome.value,
     )
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# The merge-ready checkpoint's card — the SAME approve-click machinery.
+# ---------------------------------------------------------------------------
+
+
+def make_merge_card_publisher(
+    *,
+    parts: "ApprovalGateParts",
+    sqlite_pool: SqliteLifecyclePersistence,
+    gate_repository: "GateRepository",
+    gate_state_machine: "StateMachine",
+    clock: Callable[[], datetime],
+) -> Callable[..., Any]:
+    """Compose the merge card's ``publish_card`` seam (design pass §c.2).
+
+    The conductor's merge-ready checkpoint must deliver "the SAME
+    approve-click merge card the consumer path already delivers"
+    (DF-021, settled live 2026-07-23). So it composes the SAME machinery
+    this module already owns — :func:`gate_check` over
+    :func:`make_gate_check_deps`, with the publisher swapped for
+    :class:`_MirroredApprovalPublisher` so the AGENTS approval request
+    goes out FIRST and the ``build-paused`` envelope (the one that
+    renders the card) SECOND. Nothing here builds an envelope, and
+    **jarvis is not touched**: the card rides the existing publisher
+    seams verbatim.
+
+    The single difference from :func:`maybe_gate_build` is the stage
+    label. The pre-dispatch gate labels its card ``"autobuild"``; this
+    one is labelled with the phrase-book plain name — *the merge-ready
+    checkpoint* — because that is what a human reads on the card, and
+    user surfaces speak human. The durable stage enum
+    (``pull-request-review``) is deliberately NOT renamed; only the copy
+    changes.
+
+    There are no synthetic pre-gate transitions here. The pre-dispatch
+    gate drives QUEUED → PREPARING → RUNNING because it runs before the
+    build starts; a merge-ready checkpoint fires on a build that is
+    already RUNNING, and the gate's own ``transition_to_paused`` does the
+    RUNNING → PAUSED hop.
+
+    Returns:
+        ``async (*, build_id, feature_id, rationale, branch, gates) ->
+        GateOutcome`` — the seam
+        :class:`~forge.pipeline.merge_ready_checkpoint.MergeReadyCheckpointPublisher`
+        calls once its gates-green precondition has passed.
+    """
+    from forge.cli._serve_deps_gating import make_gate_check_deps
+    from forge.pipeline.merge_ready_checkpoint import MERGE_READY_CHECKPOINT_LABEL
+
+    async def publish_card(
+        *,
+        build_id: str,
+        feature_id: str,
+        rationale: str = "",
+        branch: str | None = None,
+        gates: Any = None,
+    ) -> Any:
+        row = sqlite_pool.get_build_row(build_id)
+        correlation_id = row.correlation_id if row is not None else ""
+        resolved_feature = feature_id or (row.feature_id if row is not None else "")
+        ctx = BuildContext(
+            feature_id=resolved_feature,
+            build_id=build_id,
+            correlation_id=correlation_id or "",
+            wave_total=1,
+        )
+        deps = make_gate_check_deps(
+            parts,
+            priors_reader=EmptyPriorsReader(),
+            adjustments_reader=EmptyAdjustmentsReader(),
+            rules_reader=EmptyRulesReader(),
+            repository=gate_repository,
+            state_machine=gate_state_machine,
+            reasoning_model_call=degraded_dispatch_gate_model,
+            ctx=ctx,
+            clock=clock,
+        )
+        if parts.emitter is not None:
+            deps.publisher = _MirroredApprovalPublisher(
+                parts.publisher,
+                emitter=parts.emitter,
+                build_context=ctx,
+                clock=clock,
+            )
+        logger.info(
+            "merge card: publishing %s for build_id=%s branch=%s (feature_id=%s)",
+            MERGE_READY_CHECKPOINT_LABEL,
+            build_id,
+            branch,
+            resolved_feature,
+        )
+        outcome, _decision = await gate_check(
+            deps=deps,
+            build_id=build_id,
+            feature_id=resolved_feature,
+            stage_label=MERGE_READY_CHECKPOINT_LABEL,
+            target_kind=_GATE_TARGET_KIND,  # type: ignore[arg-type]
+            target_identifier=_MERGE_CARD_TARGET_IDENTIFIER,
+            coach_score=None,
+            criterion_breakdown={},
+            detection_findings=[],
+            attempt_count=0,
+        )
+        return outcome
+
+    return publish_card
 
 
 def _read_status_and_pending(
