@@ -1562,7 +1562,7 @@ async def test_auth_door_card_speaks_plain_language_and_quotes_the_basis(
         "requires human confirmation per SPL-007 CONTRACT §A.2)"
     ]
     # Both outcomes are spelled out, plus what happens if he never answers.
-    assert "register the quality bars" in summary["confirm_means"]
+    assert "register the quality checklist" in summary["confirm_means"]
     assert "carry on" in summary["confirm_means"]
     assert "attended" in summary["reject_means"]
     assert "1 hour" in summary["no_answer_means"]
@@ -1597,13 +1597,27 @@ async def test_auth_door_rejected_takes_the_honest_terminal(
     assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
 
-    # The honest failure text is UNCHANGED — clause, posture, seed basis verbatim.
+    # THE OWNER'S TEXT — plain names ruling (2026-07-31). The Slack message
+    # names the stage in plain words, says what happened and that nothing was
+    # built. Not one internal label survives into it.
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "SPL-007 §A.2" in reasons
-    assert "attended registration" in reasons
-    assert "requires human confirmation per SPL-007 CONTRACT §A.2" in reasons
+    assert "stopped at registering the quality checklist" in reasons
+    assert "flagged this feature as sitting behind a sign-in" in reasons
     # ...and it names the door's verdict rather than pretending nobody was asked.
     assert "confirmed this IS a sign-in surface" in reasons
+    assert "Nothing was registered and nothing was built" in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons, (
+            f"{internal!r} leaked into the owner-facing message: {reasons!r}"
+        )
+
+    # THE MACHINE'S RECORD — the durable FAILED row keeps the clause, the flag
+    # name and the seed's basis VERBATIM. That is the receipt an operator greps.
+    error = run["error"]
+    assert "SPL-007 §A.2" in error
+    assert "auth_surface_bearing" in error
+    assert "attended registration" in error
+    assert "requires human confirmation per SPL-007 CONTRACT §A.2" in error
 
     # No qa/pass-bar file landed on the branch.
     show = subprocess.run(
@@ -1638,9 +1652,12 @@ async def test_auth_door_unanswered_times_out_to_the_honest_terminal(
     assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "SPL-007 §A.2" in reasons
-    assert "attended registration" in reasons
+    assert "stopped at registering the quality checklist" in reasons
     assert "Nobody answered the confirmation card" in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons
+    # The clause and the flag stay on the durable record, never in Slack.
+    assert "SPL-007 §A.2" in store.get_run(CID)["error"]
     assert [status for status, _d in _door_events(store)] == ["GATED", "timed_out"]
     # The wait window is spoken in human units on the card.
     assert "1 second" in _auth_door_card(h)["summary"]["no_answer_means"]
@@ -1665,8 +1682,11 @@ async def test_auth_door_undeliverable_card_takes_the_honest_terminal(
     assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "SPL-007 §A.2" in reasons
+    assert "stopped at registering the quality checklist" in reasons
     assert "could not be delivered" in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons
+    assert "SPL-007 §A.2" in store.get_run(CID)["error"]
     assert [status for status, _d in _door_events(store)] == ["GATED", "undeliverable"]
 
 
@@ -1888,9 +1908,12 @@ async def test_auth_door_never_published_says_undeliverable_not_silence(
     # Zero auth cards ever reached the wire — the proof the claim must match.
     assert _auth_cards(h.ctx["publisher"]) == []
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "SPL-007 §A.2" in reasons
+    assert "stopped at registering the quality checklist" in reasons
     assert "could not be delivered" in reasons
     assert "Nobody answered" not in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons
+    assert "SPL-007 §A.2" in store.get_run(CID)["error"]
     assert [status for status, _d in _door_events(store)] == ["GATED", "undeliverable"]
 
 
@@ -1918,9 +1941,12 @@ async def test_auth_door_defer_is_named_never_reported_as_silence(
     assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "SPL-007 §A.2" in reasons
+    assert "stopped at registering the quality checklist" in reasons
     assert "set the confirmation card aside" in reasons
     assert "Nobody answered" not in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons
+    assert "SPL-007 §A.2" in store.get_run(CID)["error"]
 
     # The durable row names the answer the owner actually gave.
     statuses = [status for status, _d in _door_events(store)]
