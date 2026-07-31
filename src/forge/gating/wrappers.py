@@ -88,6 +88,7 @@ from typing import Any, Protocol, runtime_checkable
 from forge.adapters.langgraph import resume_value_as
 from forge.gating.identity import derive_request_id
 from forge.gating.sqlite_adapters import StaleTransitionError
+from forge.pipeline.stage_names import plain_stage_name
 from forge.gating.models import (
     CalibrationAdjustment,
     ConstitutionalRule,
@@ -777,9 +778,15 @@ def _build_request_envelope(
     payload = ApprovalRequestPayload(
         request_id=request_id,
         agent_id=SOURCE_ID,
+        # CARD COPY — a human reads this (stage-names ruling, 2026-07-31). The
+        # stage is named by its PLAIN name from the one table
+        # (:mod:`forge.pipeline.stage_names`); the internal ``stage_label`` and
+        # ``gate_mode`` still ride the envelope's ``details`` verbatim, so no
+        # machine consumer loses anything.
         action_description=(
-            f"Gate {decision.mode.value} on stage {decision.stage_label!r} "
-            f"target={decision.target_identifier!r}"
+            f"The build is waiting at {plain_stage_name(decision.stage_label)} "
+            f"for a human word "
+            f"(build {decision.build_id}, {decision.target_identifier})."
         ),
         risk_level=_derive_risk_level(decision),
         details=details,

@@ -53,6 +53,7 @@ import yaml
 
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.lifecycle.identifiers import validate_feature_id
+from forge.pipeline.stage_names import plain_stage_name
 from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
     PlanningEscalationContext,
@@ -184,31 +185,35 @@ _AUTH_CONFIRM_CHECKPOINT_TYPE = "auth_surface_confirmation"
 
 #: The one-line pause rationale carried on the door's envelope.
 _AUTH_CONFIRM_RATIONALE = (
-    "A quality-bar seed was flagged as sitting behind a sign-in; the owner "
-    "confirms whether that is real before the bars register automatically."
+    "The quality checklist's seed was flagged as sitting behind a sign-in; the "
+    "owner confirms whether that is real before the checklist registers "
+    "automatically."
 )
 
 #: What the honest terminal adds AFTER the unchanged refusal text, naming which
 #: way the door closed. Plain language — the owner reads these.
+#: (Vocabulary refreshed 2026-07-31: "bars" → the plain-name noun for the
+#: ``qa-pass-bars`` stage, "the quality checklist" — see
+#: :mod:`forge.pipeline.stage_names`.)
 _AUTH_DOOR_TERMINAL_SUFFIX = {
     "rejected": (
         "The owner read the flagged lines and confirmed this IS a sign-in "
-        "surface, so these bars must be registered attended."
+        "surface, so the quality checklist must be registered attended."
     ),
     "timed_out": (
         "Nobody answered the confirmation card inside the wait window, so the "
-        "run stopped rather than register the bars unattended."
+        "run stopped rather than register the quality checklist unattended."
     ),
     "undeliverable": (
         "The confirmation card could not be delivered, so nobody could answer "
-        "it; these bars must be registered attended."
+        "it; the quality checklist must be registered attended."
     ),
     # An ANSWER that decided nothing (the generic approval consumer's "later" /
     # defer round). Never reported as silence — the owner DID touch the card.
     "deferred": (
         "The owner set the confirmation card aside instead of deciding it "
-        "either way, so the run stopped rather than register the bars "
-        "unattended; nothing was registered."
+        "either way, so the run stopped rather than register the quality "
+        "checklist unattended."
     ),
 }
 
@@ -623,9 +628,13 @@ class PlanningRunDriver:
                     stage_label="planning-dispatch",
                     reason=decision.reason,
                 )
+                # The planner's ``reason`` is the MACHINE string (it embeds the
+                # internal stage label) and stays verbatim on the durable row
+                # above. The owner is told which stage stopped in PLAIN words,
+                # with the dispatch's own error detail after it.
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id} failed: {decision.reason}",
+                    self._dispatch_failure_message(correlation_id, decision),
                     level="error",
                 )
                 return
@@ -767,9 +776,13 @@ class PlanningRunDriver:
             stage_label="product_owner",
             reason=f"PO dispatch {outcome_value}: {reason or 'no reason supplied'}",
         )
+        # The owner reads the PLAIN name of the leg, never the enum member name
+        # (stage-names ruling); the internal label stays on the durable row and
+        # in the log line above.
         await self._notify(
             correlation_id,
-            f"Planning run {correlation_id} failed at PRODUCT_OWNER ({outcome_value}).",
+            f"Planning run {correlation_id} stopped at "
+            f"{plain_stage_name('product_owner')} ({outcome_value}).",
             level="error",
         )
         return False
@@ -2277,6 +2290,12 @@ class PlanningRunDriver:
                 row, correlation_id, seed=seed, basis=basis
             )
             if door != "confirmed":
+                # TWO AUDIENCES (the 2026-07-31 stage-names ruling). The
+                # MACHINE reason — durable FAILED row + logs — keeps the clause
+                # reference, the flag name and the seed's basis VERBATIM: that
+                # is the receipt an operator greps. The OWNER's sentence names
+                # NONE of them; it says which stage stopped, in plain words,
+                # why, and that nothing was built.
                 return await self._fail_leg(
                     correlation_id,
                     _QA_PASS_BARS_STAGE,
@@ -2284,6 +2303,13 @@ class PlanningRunDriver:
                     f"attended registration per {_SPL_007_AUTH_CLAUSE}; refusing "
                     f"machine registration. Seed auth_surface_basis: {basis} "
                     f"{_AUTH_DOOR_TERMINAL_SUFFIX[door]}",
+                    owner_message=(
+                        f"Planning run {correlation_id} stopped at "
+                        f"{plain_stage_name(_QA_PASS_BARS_STAGE)}: the spec "
+                        "checker flagged this feature as sitting behind a "
+                        f"sign-in. {_AUTH_DOOR_TERMINAL_SUFFIX[door]} Nothing "
+                        "was registered and nothing was built."
+                    ),
                 )
             # Confirmed: from here the leg is BYTE-IDENTICAL to the unflagged
             # path. The owner's act is carried onto the leg's durable receipt.
@@ -2732,7 +2758,7 @@ class PlanningRunDriver:
                     correlation_id,
                     f"Planning run {correlation_id}: {response.decided_by} "
                     "confirmed there is no sign-in here — registering the "
-                    "quality bars as authless and carrying on with the build.",
+                    "quality checklist as authless and carrying on with the build.",
                     level="info",
                 )
                 logger.info(
@@ -2906,14 +2932,14 @@ class PlanningRunDriver:
             "title": "Does this feature sit behind a sign-in?",
             "what_happened": (
                 "The spec checker flagged this feature as sitting behind a "
-                "sign-in, so its quality bars — the checks each task has to "
+                "sign-in, so its quality checklist — the checks each task has to "
                 "pass — were not registered automatically. That check is a "
                 "keyword scan of the spec text, so it fires just as readily on "
                 "a spec that proves the feature needs NO sign-in at all."
             ),
             "flagged_lines": list(basis_lines),
             "confirm_means": (
-                "Confirm — there is no sign-in here: register the quality bars "
+                "Confirm — there is no sign-in here: register the quality checklist "
                 "as authless and let the build carry on, exactly as it would "
                 "for an unflagged feature."
             ),
@@ -2946,7 +2972,7 @@ class PlanningRunDriver:
             "feature as sitting behind a sign-in, which is often a false alarm "
             "— nothing has failed. "
             f"{who} has a card to decide: confirm there is no sign-in and the "
-            "quality bars register as authless and the build carries on; "
+            "quality checklist registers as authless and the build carries on; "
             "reject and the run stops so they can be registered attended. No "
             f"answer within {self._plain_wait(wait_seconds)} stops the run too."
         )
@@ -3413,14 +3439,64 @@ class PlanningRunDriver:
             return None
         return target_repo, repo_path
 
+    @staticmethod
+    def _dispatch_failure_message(correlation_id: str, decision: Fail) -> str:
+        """The owner's sentence for a planner-reported dispatch failure.
+
+        The planner's ``reason`` is machine text ("Dispatch failed for
+        feature-spec: <detail>"). The owner reads the stage's PLAIN name and the
+        dispatch's own detail — never the internal label. The machine string is
+        untouched on the durable row and in the logs.
+        """
+        stage = getattr(decision, "stage", None)
+        reason = str(decision.reason or "").strip()
+        if stage is None:
+            return f"Planning run {correlation_id} stopped: {reason}"
+        prefix = f"Dispatch failed for {stage.value}"
+        detail = reason[len(prefix) :] if reason.startswith(prefix) else reason
+        detail = detail.lstrip(":").strip()
+        stopped = (
+            f"Planning run {correlation_id} stopped at {plain_stage_name(stage.value)}"
+        )
+        return f"{stopped}: {detail}" if detail else f"{stopped}."
+
     async def _fail_leg(
-        self, correlation_id: str, stage_label: str, reason: str
+        self,
+        correlation_id: str,
+        stage_label: str,
+        reason: str,
+        *,
+        owner_message: str | None = None,
     ) -> bool:
-        """Move the run to FAILED, notify, and return False (loud terminal)."""
+        """Move the run to FAILED, notify, and return False (loud terminal).
+
+        TWO AUDIENCES, deliberately split (the 2026-07-31 stage-names ruling):
+
+        * the MACHINE record — the durable FAILED row and the logs — keeps
+          ``stage_label`` and ``reason`` VERBATIM. Grep, correlation and every
+          receipt depend on them being the internal strings;
+        * the OWNER's message — what lands in Slack — names the stage by its
+          PLAIN NAME (:func:`plain_stage_name`, the noun's single source), never
+          the internal label.
+
+        ``owner_message`` lets a leg with something genuinely human to say
+        compose its own sentence (the auth door does). When it is omitted the
+        default sentence is composed here: the plain noun plus the leg's reason.
+        """
         self._fail(correlation_id, stage_label=stage_label, reason=reason)
+        logger.error(
+            "planning driver: run %s FAILED at %s: %s",
+            correlation_id,
+            stage_label,
+            reason,
+        )
         await self._notify(
             correlation_id,
-            f"Planning run {correlation_id} failed at {stage_label}: {reason}",
+            owner_message
+            or (
+                f"Planning run {correlation_id} stopped at "
+                f"{plain_stage_name(stage_label)}: {reason}"
+            ),
             level="error",
         )
         return False

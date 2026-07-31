@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.gating.models import GateDecision, GateMode
+from forge.pipeline.stage_names import plain_stage_name
 from forge.planning.revision import (
     aggregate_outcome,
     dialogue_cycle,
@@ -375,10 +376,14 @@ def build_planning_approval_envelope(
     payload = ApprovalRequestPayload(
         request_id=request_id,
         agent_id="forge",
+        # CARD COPY — a human reads this (stage-names ruling, 2026-07-31). The
+        # stage is named by its PLAIN name from the one table; the internal
+        # ``stage_label`` still rides the envelope's ``details`` verbatim for
+        # every machine that consumes it.
         action_description=(
-            f"Mode P planning checkpoint {stage_label!r} for run "
-            f"{plan_run_id!r} awaits approval by "
-            f"{expected_approver or 'a human approver'}"
+            f"The full journey is waiting at {plain_stage_name(stage_label)} "
+            f"for {expected_approver or 'a human approver'}'s word "
+            f"(planning run {plan_run_id})."
         ),
         risk_level="medium",
         details=details,

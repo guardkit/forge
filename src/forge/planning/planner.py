@@ -190,10 +190,19 @@ class Fail:
     Returned when a stage dispatch fails (status "failed" or "error").
 
     Attributes:
-        reason: Specific failure reason from the dispatch error.
+        reason: Specific failure reason from the dispatch error. The MACHINE
+            string — it embeds the internal stage label and is what lands on
+            the durable FAILED row and in the logs.
+        stage: The stage class whose dispatch failed, carried separately so a
+            RENDER SITE can name it in plain words
+            (:func:`forge.pipeline.stage_names.plain_stage_name`) instead of
+            re-parsing it back out of ``reason``. Optional (defaults to
+            ``None``) so nothing that constructs a ``Fail`` by reason alone
+            has to change.
     """
 
     reason: str
+    stage: StageClass | None = None
 
 
 @dataclass(frozen=True)
@@ -283,7 +292,7 @@ def plan_next_step(
                 if error_detail
                 else f"Dispatch failed for {event.stage.value}"
             )
-            return Fail(reason=reason)
+            return Fail(reason=reason, stage=event.stage)
 
     # Empty history → dispatch PRODUCT_OWNER
     if not history:
