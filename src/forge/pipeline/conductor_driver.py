@@ -146,12 +146,19 @@ class ConductorRunOutcome(StrEnum):
     Members:
         COMPLETED: The supervisor reported ``TERMINAL``; the journey
             closed out and exported its receipts.
-        DELIVERED: The merge-ready checkpoint published its card. The
-            journey is done and the only remaining act is the owner's
-            merge word — which is not a conductor turn. The loop STOPS
-            here; re-planning would re-publish the card on every tick,
-            which is act inflation (design pass risk h.5) dressed up as
-            a retry.
+        DELIVERED: The merge-ready checkpoint published its card AND the
+            owner approved it. The journey is done. The loop STOPS here;
+            re-planning would re-publish the card on every tick, which is
+            act inflation (design pass risk h.5) dressed up as a retry.
+        DECLINED: The card was published and the owner said no (rejected
+            / cancelled / hard-stopped). Stopping is right either way —
+            but the run report must say what actually happened. Until
+            Stage 2 this read ``DELIVERED``, because the loop keyed only
+            on ``card_published`` and never looked at the verdict: a
+            declined merge was reported as a delivery.
+        EXPIRED: The card was published and no answer arrived inside the
+            approval window. Not a delivery, not a refusal — a silence,
+            and the report says so.
         PAUSED_BUDGET: A budget cap was breached. The build is paused
             with a risk-high escalation out; the loop stopped and the
             queue moves on (design pass §d Stage 3).
@@ -171,6 +178,8 @@ class ConductorRunOutcome(StrEnum):
 
     COMPLETED = "completed"
     DELIVERED = "delivered"
+    DECLINED = "declined"
+    EXPIRED = "expired"
     PAUSED_BUDGET = "paused-budget"
     WAIT_EXPIRED = "wait-expired"
     NOTHING_CHANGED = "nothing-changed"
@@ -392,23 +401,26 @@ class ConductorTurnLoop:
                 # re-planned from here would re-publish the card on every
                 # tick. Duck-typed on purpose: the driver stays a domain
                 # module and never imports the delivery leg.
+                card_outcome = _classify_card_result(report)
                 await self._close_out(build_id, report)
                 logger.info(
-                    "conductor: build_id=%s delivered after %d turn(s) — the "
-                    "merge card is published and the merge word is the "
-                    "owner's; the loop stops here",
+                    "conductor: build_id=%s stopped after %d turn(s) with "
+                    "outcome=%s — the merge card was published and the "
+                    "owner's answer is the last word",
                     build_id,
                     turns,
+                    card_outcome.value,
                 )
                 return ConductorRunReport(
-                    outcome=ConductorRunOutcome.DELIVERED,
+                    outcome=card_outcome,
                     build_id=build_id,
                     turns=turns,
                     last_report=report,
                     stage_receipts=tuple(self._stage_receipts),
                     rationale=(
                         getattr(report, "rationale", "")
-                        or "the merge-ready checkpoint published its card"
+                        or f"the merge-ready checkpoint's card was "
+                        f"{card_outcome.value}"
                     ),
                 )
 
@@ -464,11 +476,37 @@ class ConductorTurnLoop:
                 )
 
             if outcome is TurnOutcome.DISPATCHED or outcome in _WAITING_OUTCOMES:
-                # THE TURN-SERIAL BELT: a dispatched stage is in flight,
-                # so the loop MUST NOT plan again until it settles. The
-                # settle signal and the approval/resume signal are the
-                # same durable-row change, so one structured wait serves
-                # both branches.
+                # THE TURN-SERIAL BELT: the loop must never plan while a
+                # stage is in flight. But "in flight" is a question with
+                # two answers, and treating them as one was what made a
+                # fix journey die at its first turn (Stage 2 shakeout
+                # item 4):
+                #
+                #   * The fix journey's stages dispatch through
+                #     ``dispatch_subprocess_stage``, which is AWAITED
+                #     inside ``next_turn``. By the time the turn report
+                #     exists the subprocess has already exited and its
+                #     stage_log row is written. The await IS the
+                #     serialisation; there is nothing left to wait for,
+                #     and waiting anyway meant every journey expired its
+                #     window and stopped after one review.
+                #   * A turn that genuinely parked on something external
+                #     — an unresolved gate, an in-flight prerequisite —
+                #     has no settled dispatch result, and THAT is what the
+                #     structured wait exists for.
+                #
+                # So: a settled dispatch re-plans immediately; everything
+                # else waits. The nothing-changed rule is the backstop
+                # against a re-plan that makes no progress.
+                if _dispatch_settled(report):
+                    logger.debug(
+                        "conductor: build_id=%s turn %d settled inside the "
+                        "turn (the dispatch was awaited) — re-planning "
+                        "without a wait",
+                        build_id,
+                        turns,
+                    )
+                    continue
                 progressed = await self._structured_wait(build_id, report)
                 if not progressed:
                     reason = (
@@ -748,6 +786,93 @@ class ConductorTurnLoop:
                 build_id,
             )
             return None
+
+
+#: The owner's answer, as the approve-click machinery words it, mapped onto
+#: the honest run-report outcome. Matched on the LOWERCASED verdict token so
+#: this domain module keeps no import edge to the gating package: the
+#: production card publisher returns a ``GateOutcome`` whose members are
+#: ``RESUMED`` (the owner approved and the build resumes), ``OVERRIDDEN``
+#: (approved with an override), ``CANCELLED`` (rejected), ``FAILED`` (a
+#: hard-stop verdict), ``TIMED_OUT`` (the window closed with no answer) and
+#: ``AUTO_APPROVED`` (which the merge card can never produce — the merge word
+#: is human forever, refused twice over).
+_CARD_VERDICT_WORDS: dict[str, "ConductorRunOutcome"] = {
+    "resumed": ConductorRunOutcome.DELIVERED,
+    "overridden": ConductorRunOutcome.DELIVERED,
+    "auto_approved": ConductorRunOutcome.DELIVERED,
+    "approved": ConductorRunOutcome.DELIVERED,
+    "cancelled": ConductorRunOutcome.DECLINED,
+    "canceled": ConductorRunOutcome.DECLINED,
+    "rejected": ConductorRunOutcome.DECLINED,
+    "failed": ConductorRunOutcome.DECLINED,
+    "timed_out": ConductorRunOutcome.EXPIRED,
+    "expired": ConductorRunOutcome.EXPIRED,
+}
+
+
+#: Terminal ``StageDispatchStatus`` values, as words. Matched on the
+#: lowercased token so the driver keeps no import edge to the dispatcher
+#: package — the same duck-typing discipline the card check uses.
+_SETTLED_DISPATCH_STATUSES: frozenset[str] = frozenset(
+    {"success", "failed", "degraded"}
+)
+
+
+def _dispatch_settled(report: Any) -> bool:
+    """``True`` when this turn's dispatch already ran to completion.
+
+    A fix-journey stage is dispatched by awaiting a subprocess, so its
+    result is terminal the instant the turn report exists. A
+    ``MergeCardDecision`` deliberately does NOT answer ``True`` here: its
+    own outcomes are routed by
+    :meth:`Supervisor._merge_card_turn_outcome` and a red-gate loop-back
+    is a genuine wait, not a settled stage.
+    """
+    result = getattr(report, "dispatch_result", None)
+    if result is None:
+        return False
+    if hasattr(result, "card_published"):
+        return False
+    status = getattr(result, "status", None)
+    if status is None:
+        return False
+    token = str(getattr(status, "value", None) or status).strip().lower()
+    return token in _SETTLED_DISPATCH_STATUSES
+
+
+def _classify_card_result(report: Any) -> ConductorRunOutcome:
+    """Pick the honest WORD for a published card's ending.
+
+    Stage 2 shakeout item 7. Stopping is right whatever the owner said —
+    but the run report has to say WHICH thing happened. Before this the
+    loop keyed only on ``card_published``, so a REJECTED or expired merge
+    card was written up as ``DELIVERED``: the machine claiming a delivery
+    the owner had refused.
+
+    ``card_result`` carries whatever the publisher returned. Duck-typed
+    against its ``value``/``name``/``str`` so the driver stays a domain
+    module with no import edge to the gating package or the delivery leg.
+    An unreadable verdict answers ``DELIVERED`` — the pre-Stage-2 word —
+    because that is the only honest reading of "a card was published and
+    we cannot tell what came back", and it is logged so the gap is visible
+    rather than inferred.
+    """
+    decision = getattr(report, "dispatch_result", None)
+    raw = getattr(decision, "card_result", None)
+    if raw is None:
+        return ConductorRunOutcome.DELIVERED
+    token = str(getattr(raw, "value", None) or getattr(raw, "name", None) or raw)
+    mapped = _CARD_VERDICT_WORDS.get(token.strip().lower())
+    if mapped is None:
+        logger.warning(
+            "conductor: merge card returned %r, which is not a verdict this "
+            "loop recognises — reporting 'delivered' and saying so here "
+            "rather than inventing a word",
+            token,
+        )
+        return ConductorRunOutcome.DELIVERED
+    return mapped
 
 
 def _card_was_published(report: Any) -> bool:

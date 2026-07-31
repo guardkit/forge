@@ -11,9 +11,10 @@ argv shapes are the point, and they are what this module pins:
 * ``task-work`` dispatches by *fix task* subject — the identifier on the
   reference the conductor threads through as the ``fix_task`` dispatcher
   kwarg.
-* Both carry the queue's Mode C wire pair when supplied:
-  ``--parent-feature`` (the ``parent_feature`` the queue read out of the
-  fix-task YAML) and ``--feature-yaml`` (that YAML itself).
+* Both carry ``--feature-yaml`` (the fix-task YAML the queue was given)
+  when supplied — and NEVER ``--parent-feature``: nothing in the estate
+  accepts that flag, and the queue resolves the parent feature out of the
+  YAML by design, so the one artefact carries both identifiers.
 * Both carry ``--correlation-id`` — the exact-match identity law (FTR: a
   false terminal once killed a healthy build) needs every stage dispatch
   to mint and thread its own id, and with N task-work siblings per cycle
@@ -206,12 +207,12 @@ class TestTaskReviewArgv:
         writer: FakeStageLogWriter,
         runner: FakeSubprocessRunner,
     ) -> None:
-        """``--parent-feature`` / ``--feature-yaml`` mirror the queue.
+        """``--feature-yaml`` mirrors the queue; there is no second flag.
 
         ``forge queue --mode c TASK-XXX --feature-yaml <fix-task.yaml>``
-        reads ``parent_feature`` out of that YAML and puts both
-        identifiers on the wire. The dispatch looks at the same two
-        artefacts rather than re-deriving them.
+        reads ``parent_feature`` out of that YAML. Handing the subprocess
+        the YAML hands it the parent feature too — through the one
+        artefact that owns it.
         """
         await _dispatch(
             stage=StageClass.TASK_REVIEW,
@@ -220,13 +221,13 @@ class TestTaskReviewArgv:
             writer=writer,
             runner=runner,
             task_id="TASK-FIX007",
-            parent_feature="FEAT-FIX007",
             fix_task_yaml="/work/tasks/fix-task.yaml",
         )
 
-        pairs = _argv_pairs(runner.calls[0]["args"])
-        assert pairs["--parent-feature"] == "FEAT-FIX007"
+        argv = runner.calls[0]["args"]
+        pairs = _argv_pairs(argv)
         assert pairs["--feature-yaml"] == "/work/tasks/fix-task.yaml"
+        assert "--parent-feature" not in argv
 
     @pytest.mark.asyncio
     async def test_review_argv_omits_the_optional_pair_when_absent(
@@ -256,11 +257,10 @@ class TestTaskReviewArgv:
         writer: FakeStageLogWriter,
         runner: FakeSubprocessRunner,
     ) -> None:
-        """One identifier slot per concept — the parent rides its own flag.
+        """One identifier slot — the fix journey dispatches by task.
 
-        Emitting both ``--feature-id`` and ``--parent-feature`` would give
-        the subprocess two names for the same thing and no rule for which
-        wins.
+        Emitting ``--feature-id`` alongside ``--task-id`` would give the
+        subprocess two subjects and no rule for which wins.
         """
         await _dispatch(
             stage=StageClass.TASK_REVIEW,
@@ -270,12 +270,11 @@ class TestTaskReviewArgv:
             runner=runner,
             feature_id="FEAT-FIX007",
             task_id="TASK-FIX007",
-            parent_feature="FEAT-FIX007",
         )
         assert "--feature-id" not in runner.calls[0]["args"]
 
     @pytest.mark.asyncio
-    async def test_review_argv_appends_forward_context_text_entries(
+    async def test_the_conductors_forward_context_is_the_one_source(
         self,
         reader: FakeStageLogReader,
         builder: ForwardContextBuilder,
@@ -283,7 +282,55 @@ class TestTaskReviewArgv:
         writer: FakeStageLogWriter,
         runner: FakeSubprocessRunner,
     ) -> None:
-        """Forward context still flows — the new shape is additive."""
+        """A supplied ``forward_context`` IS the context for the dispatch.
+
+        The conductor's fix-task context builder is an adapter over this
+        very ``ForwardContextBuilder`` that also reads the failed build's
+        failure pack, and it resolves in Mode C with the fix-task ref.
+        Re-deriving from the builder here would resolve it a second time,
+        in Mode A shape, and drop the pack half — two sources, one wrong.
+        """
+        _seed_approved(
+            reader,
+            build_id=BUILD_ID,
+            stage=StageClass.TASK_REVIEW,
+            text="prior review notes",
+        )
+        await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=runner,
+            task_id="TASK-FIX007",
+            forward_context={
+                "context_entries": [
+                    {"flag": "--context", "value": "the review said X", "kind": "text"}
+                ],
+                "failure_pack": {"build_id": "build-failed-1", "reason": "gates red"},
+            },
+        )
+        argv = runner.calls[0]["args"]
+        assert argv[:2] == ["--build-id", BUILD_ID]
+        assert "the review said X" in argv
+        # The pack index rides the same ``--context`` slot — no new flag.
+        assert any("build-failed-1" in a for a in argv)
+
+    @pytest.mark.asyncio
+    async def test_no_forward_context_means_no_context_entries(
+        self,
+        reader: FakeStageLogReader,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+        runner: FakeSubprocessRunner,
+    ) -> None:
+        """Honestly less context, never a guessed one.
+
+        With nothing threaded the dispatch carries no context entries and
+        says so at INFO. The alternative — asking the builder in Mode A
+        shape for a Mode C stage — is a wrong answer dressed as an answer.
+        """
         _seed_approved(
             reader,
             build_id=BUILD_ID,
@@ -298,10 +345,40 @@ class TestTaskReviewArgv:
             runner=runner,
             task_id="TASK-FIX007",
         )
-        argv = runner.calls[0]["args"]
-        # The subject prefix comes first; context entries are appended.
-        assert argv.index("--task-id") < len(argv)
-        assert argv[:2] == ["--build-id", BUILD_ID]
+        assert runner.calls[0]["args"] == [
+            "--build-id",
+            BUILD_ID,
+            "--correlation-id",
+            CORRELATION_ID,
+            "--task-id",
+            "TASK-FIX007",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_context_entry_is_dropped_not_raised(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+        runner: FakeSubprocessRunner,
+    ) -> None:
+        """A fix journey must not die because one entry had the wrong shape."""
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=runner,
+            task_id="TASK-FIX007",
+            forward_context={
+                "context_entries": [
+                    "not-a-mapping",
+                    {"flag": "--context", "value": "good", "kind": "text"},
+                ]
+            },
+        )
+        assert result.status is StageDispatchStatus.SUCCESS
+        assert "good" in runner.calls[0]["args"]
 
     @pytest.mark.asyncio
     async def test_review_without_task_id_is_refused_structurally(
@@ -430,12 +507,11 @@ class TestTaskWorkArgv:
             writer=writer,
             runner=runner,
             fix_task=ref,
-            parent_feature="FEAT-FIX007",
             fix_task_yaml=Path("/work/tasks/fix-task.yaml"),
         )
-        pairs = _argv_pairs(runner.calls[0]["args"])
-        assert pairs["--parent-feature"] == "FEAT-FIX007"
-        assert pairs["--feature-yaml"] == "/work/tasks/fix-task.yaml"
+        argv = runner.calls[0]["args"]
+        assert _argv_pairs(argv)["--feature-yaml"] == "/work/tasks/fix-task.yaml"
+        assert "--parent-feature" not in argv
 
     @pytest.mark.asyncio
     async def test_work_argv_does_not_thread_the_review_back_reference(
@@ -613,7 +689,6 @@ class TestCorrelationIdAndNoRegression:
             writer=writer,
             runner=runner,
             task_id="TASK-FIX007",
-            parent_feature="FEAT-FIX007",
             fix_task_yaml="/work/tasks/fix-task.yaml",
         )
         argv = runner.calls[0]["args"]

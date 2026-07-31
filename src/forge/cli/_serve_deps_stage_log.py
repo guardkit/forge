@@ -51,7 +51,9 @@ References:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
+from pathlib import PurePath
 from typing import Any, Mapping, Protocol
 
 from forge.lifecycle.persistence import StageLogEntry
@@ -66,7 +68,10 @@ __all__ = [
     "AUTOBUILD_LIFECYCLE_STATE_VALUE",
     "AUTOBUILD_RUNNING_STATUS",
     "AUTOBUILD_TARGET_KIND",
+    "FIX_JOURNEY_TARGET_KIND",
+    "build_fix_journey_stage_log_writer",
     "build_stage_log_recorder",
+    "default_fix_tasks_extractor",
 ]
 
 
@@ -331,3 +336,247 @@ def build_stage_log_recorder(sqlite_pool: _StageLogWriter) -> StageLogRecorder:
             f"{type(sqlite_pool).__name__}"
         )
     return _AutobuildStageLogRecorder(sqlite_pool)
+
+
+# ---------------------------------------------------------------------------
+# The fix journey's stage_log writer — THE ``fix_tasks`` PRODUCER
+# ---------------------------------------------------------------------------
+#
+# Conductor revival Stage 2, shakeout item 5.
+#
+# ``mode_c_history_reader.FIX_TASKS_DETAILS_KEY`` documents a strict contract:
+# an approved ``task-review`` row carries its typed fix-task list in
+# ``details_json``, and the projection turns that list into the planner's
+# fan-out. Until now **nothing wrote it**. The projection had a reader with no
+# producer, so every real review row was "malformed" by its own contract and
+# the journey hard-stopped before it ever dispatched a fix.
+#
+# This is the producer. It is a ``StageLogWriter`` (the write-side Protocol the
+# subprocess dispatcher calls once per dispatch) that records the fix journey's
+# two stages with the two keys the projection reads back:
+#
+#   * a ``task-review`` row carries ``fix_tasks`` — ALWAYS, even when the
+#     finding is "nothing" (an empty array is the legitimate clean-review
+#     answer; an ABSENT key is the malformed one);
+#   * a ``task-work`` row carries ``fix_task_id`` — the fix task it was
+#     dispatched against, so the planner's walk can tell dispatched work from
+#     outstanding work instead of dispatching the same fix twice.
+#
+# Round-trip, not two half-contracts: the reader's constants are imported here
+# rather than re-spelled, so a rename cannot leave the writer and the reader
+# disagreeing in silence.
+
+
+#: ``stage_log.target_kind`` for a fix-journey dispatch row. The work went to a
+#: GuardKit subprocess — the same convention the skip recorder uses
+#: (``local_tool``), because the column encodes *what kind of thing* received
+#: the work.
+FIX_JOURNEY_TARGET_KIND: str = "local_tool"
+
+#: ``stage_log.status`` values, mapped from the dispatcher's own discriminator.
+#: The schema's CHECK allows only PASSED / FAILED / GATED / SKIPPED; the
+#: projection maps PASSED → ``approved`` and FAILED → ``failed``, which is
+#: exactly the planner vocabulary a completed dispatch should produce.
+_DISPATCH_STATUS_TO_STAGE_LOG: Mapping[str, str] = {
+    "success": "PASSED",
+    "failed": "FAILED",
+    "degraded": "FAILED",
+}
+
+#: Canonical fix-task identifier shape. Mirrors the queue's boundary regex
+#: (``cli/queue.py::_TASK_ID_REGEX``) widened by the per-fix-task suffix a
+#: review assigns (``TASK-ABC123-004`` / ``TASK-ABC123-A``).
+_FIX_TASK_ID_RE = re.compile(r"^TASK-[A-Z0-9]{3,12}(?:-[A-Za-z0-9]+)*$")
+
+
+def default_fix_tasks_extractor(
+    *,
+    artefact_paths: "tuple[str, ...]",
+    rationale: str,
+) -> tuple[str, ...]:
+    """Recover a review's typed fix-task list from what the dispatch returned.
+
+    ``/task-review`` emits one task artefact per fix it wants done; the
+    dispatcher hands those paths back on
+    :attr:`~forge.pipeline.dispatchers.subprocess.StageDispatchResult.artefact_paths`
+    after allowlist gating. The identifier is the artefact's own file stem —
+    the same ``TASK-XXX`` name a developer types into ``/task-work``.
+
+    Deliberately conservative, because risk h.3 (the least-proven seam) is
+    exactly "if task-review's output parsing is loose, the planner fans out
+    wrong":
+
+    * only stems matching the canonical identifier shape are taken — a
+      ``README.md`` or a coach verdict in the artefact list is not a fix task;
+    * order is preserved and duplicates are dropped, because the projection
+      REFUSES a list with duplicates (the planner matches dispatched work by
+      identity, so a repeated id makes the walk ambiguous);
+    * an empty result is returned honestly as an empty tuple — a clean review
+      is a real outcome, and the writer records the key either way.
+
+    ``rationale`` is accepted (and currently unused) so an operator can swap in
+    a richer extractor over the subprocess's own text output without changing
+    a call site. This default reads only what the dispatcher already proved:
+    paths inside the worktree allowlist.
+    """
+    seen: list[str] = []
+    for raw in artefact_paths or ():
+        stem = PurePath(str(raw)).stem
+        if not _FIX_TASK_ID_RE.match(stem):
+            continue
+        if stem in seen:
+            continue
+        seen.append(stem)
+    return tuple(seen)
+
+
+class _FixJourneyStageLogWriter:
+    """``StageLogWriter`` that records the two keys the projection reads.
+
+    Module-private; construct via :func:`build_fix_journey_stage_log_writer`.
+
+    One instance is bound per *dispatch* for ``task-work`` (via
+    :meth:`for_fix_task`) because the fix-task identifier is a property of the
+    dispatch, not of the writer — and the dispatcher's ``record_dispatch``
+    Protocol has no slot for it. Binding rather than widening the Protocol
+    keeps the dispatcher's surface untouched.
+    """
+
+    __slots__ = ("_persistence", "_extractor", "_clock", "_fix_task_id")
+
+    def __init__(
+        self,
+        persistence: _StageLogWriter,
+        *,
+        fix_tasks_extractor: "Any" = None,
+        clock: "Any" = None,
+        fix_task_id: str | None = None,
+    ) -> None:
+        self._persistence = persistence
+        self._extractor = fix_tasks_extractor or default_fix_tasks_extractor
+        self._clock = clock if clock is not None else _utc_now
+        self._fix_task_id = fix_task_id
+
+    def for_fix_task(self, fix_task_id: str | None) -> "_FixJourneyStageLogWriter":
+        """Return a sibling writer bound to one fix task's dispatch."""
+        return _FixJourneyStageLogWriter(
+            self._persistence,
+            fix_tasks_extractor=self._extractor,
+            clock=self._clock,
+            fix_task_id=fix_task_id,
+        )
+
+    def record_dispatch(
+        self,
+        *,
+        build_id: str,
+        stage: StageClass,
+        feature_id: str | None,
+        correlation_id: str,
+        status: "Any",
+        artefact_paths: "tuple[str, ...]",
+        rationale: str,
+        exit_code: int,
+        duration_secs: float,
+    ) -> None:
+        """Write the fix-journey dispatch row, with the projection's keys."""
+        from forge.pipeline.mode_c_history_reader import (
+            FIX_TASK_ID_DETAILS_KEY,
+            FIX_TASKS_DETAILS_KEY,
+        )
+
+        status_value = str(getattr(status, "value", status)).lower()
+        row_status = _DISPATCH_STATUS_TO_STAGE_LOG.get(status_value, "FAILED")
+
+        details: dict[str, Any] = {
+            "correlation_id": correlation_id,
+            "rationale": rationale,
+            "exit_code": exit_code,
+            "artefact_paths": list(artefact_paths or ()),
+        }
+        if feature_id:
+            details["feature_id"] = feature_id
+
+        target_identifier = feature_id or build_id
+        if stage is StageClass.TASK_REVIEW:
+            # ALWAYS present on a review row. The projection treats an
+            # absent key on an approved review as malformed and hard-stops
+            # the journey — correctly: "an approved review must state its
+            # finding, even when the finding is 'nothing'."
+            fix_tasks = tuple(
+                self._extractor(
+                    artefact_paths=tuple(artefact_paths or ()),
+                    rationale=rationale,
+                )
+            )
+            details[FIX_TASKS_DETAILS_KEY] = list(fix_tasks)
+            logger.info(
+                "fix_journey_stage_log: task-review row for build_id=%s "
+                "records %d fix task(s): %s",
+                build_id,
+                len(fix_tasks),
+                ", ".join(fix_tasks) or "none (clean review)",
+            )
+        elif stage is StageClass.TASK_WORK:
+            if self._fix_task_id:
+                details[FIX_TASK_ID_DETAILS_KEY] = self._fix_task_id
+                target_identifier = self._fix_task_id
+            else:
+                # Unattributable work. The projection refuses it loudly
+                # (a row read as "never dispatched" would dispatch the fix
+                # a second time), so say so here where it can be fixed.
+                logger.error(
+                    "fix_journey_stage_log: task-work row for build_id=%s has "
+                    "NO fix_task_id bound — the projection will hard-stop the "
+                    "journey rather than risk a double dispatch",
+                    build_id,
+                )
+
+        now: datetime = self._clock()
+        entry = StageLogEntry(
+            build_id=build_id,
+            stage_label=stage.value,
+            target_kind=FIX_JOURNEY_TARGET_KIND,
+            target_identifier=target_identifier,
+            status=row_status,
+            gate_mode=None,
+            coach_score=None,
+            threshold_applied=None,
+            started_at=now,
+            completed_at=now,
+            duration_secs=float(duration_secs),
+            details=details,
+        )
+        self._persistence.record_stage(entry)
+
+
+def build_fix_journey_stage_log_writer(
+    sqlite_pool: _StageLogWriter,
+    *,
+    fix_tasks_extractor: "Any" = None,
+    clock: "Any" = None,
+) -> "_FixJourneyStageLogWriter":
+    """Build the conductor's ``stage_log`` writer — the ``fix_tasks`` producer.
+
+    Args:
+        sqlite_pool: Object exposing ``record_stage(entry)``. Production
+            passes the daemon's shared persistence facade — no second pool.
+        fix_tasks_extractor: ``(*, artefact_paths, rationale) ->
+            Iterable[str]``. Defaults to
+            :func:`default_fix_tasks_extractor`.
+        clock: Zero-arg UTC ``datetime`` source; defaults to ``now``.
+
+    Returns:
+        A ``StageLogWriter`` whose ``task-review`` rows the Mode C history
+        projection can actually read back.
+    """
+    record_stage = getattr(sqlite_pool, "record_stage", None)
+    if not callable(record_stage):
+        raise TypeError(
+            "build_fix_journey_stage_log_writer: sqlite_pool must expose a "
+            "callable record_stage(entry: StageLogEntry) -> None method; got "
+            f"{type(sqlite_pool).__name__}"
+        )
+    return _FixJourneyStageLogWriter(
+        sqlite_pool, fix_tasks_extractor=fix_tasks_extractor, clock=clock
+    )

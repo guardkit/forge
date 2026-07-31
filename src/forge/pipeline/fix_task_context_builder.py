@@ -62,6 +62,13 @@ class FixTaskContextBuilder:
             parent-build column today — an honest seam, not a guess.
         receipts_root: Injectable receipts root (tests point it at a
             ``tmp_path``); ``None`` uses the routine path's own law.
+        review_artefact_paths_reader: ``(build_id, fix_task) ->
+            Iterable[str]`` — the artefact paths the originating
+            ``/task-review`` emitted, which the forward-context builder
+            gates through the worktree allowlist and threads onto
+            ``--context``. ``None`` (the default) yields no paths; the
+            review's findings then reach the fix task through the
+            failure-pack index alone. See :meth:`_translate_fix_task`.
     """
 
     def __init__(
@@ -70,10 +77,12 @@ class FixTaskContextBuilder:
         *,
         source_build_id_reader: Callable[[str], str | None] | None = None,
         receipts_root: "Path | str | None" = None,
+        review_artefact_paths_reader: Callable[[str, Any], Any] | None = None,
     ) -> None:
         self._forward = forward_context_builder
         self._source_reader = source_build_id_reader
         self._receipts_root = receipts_root
+        self._review_artefact_paths_reader = review_artefact_paths_reader
 
     def __call__(
         self,
@@ -100,6 +109,71 @@ class FixTaskContextBuilder:
 
     # -- internals ----------------------------------------------------
 
+    def _translate_fix_task(self, build_id: str, fix_task: Any) -> Any:
+        """Translate the PLANNER's fix-task ref into the BUILDER's.
+
+        Two distinct ``FixTaskRef`` types exist in the tree and the
+        conductor sits between them:
+
+        * :class:`forge.pipeline.mode_c_planner.FixTaskRef` — what the
+          planner mints and the supervisor threads (``fix_task_id`` /
+          ``review_history_index`` / ``review_stage_label``).
+        * :class:`forge.pipeline.forward_context_builder.FixTaskRef` —
+          what ``build_for`` consumes (``fix_task_id`` /
+          ``task_review_entry_id`` / ``review_artefact_paths``), and whose
+          ``to_json()`` becomes the ``--fix-task`` argv payload.
+
+        Handing the planner's value straight to the builder raised
+        ``AttributeError: 'FixTaskRef' object has no attribute 'to_json'``
+        — which this adapter's own except-clause then swallowed into "no
+        forward context entries". The fix task was dispatched with the
+        review's findings silently missing, and nothing said so. The
+        translation is the adapter's actual job; doing it here is what
+        makes the ``--fix-task`` entry appear at all.
+
+        ``review_artefact_paths`` come from the injected
+        ``review_artefact_paths_reader`` when one is wired; absent it they
+        are empty, and the review's findings ride the failure-pack index
+        instead. Empty is honest — a guessed path list is not.
+        """
+        from forge.pipeline.forward_context_builder import (
+            FixTaskRef as ForwardFixTaskRef,
+        )
+
+        if fix_task is None or isinstance(fix_task, ForwardFixTaskRef):
+            return fix_task
+        fix_task_id = getattr(fix_task, "fix_task_id", None)
+        if not fix_task_id:
+            return fix_task
+        entry_id = getattr(fix_task, "task_review_entry_id", None)
+        if not entry_id:
+            # The planner's back-reference is an INDEX into its history,
+            # not a stage_log entry_id. Render it as the audit anchor it
+            # is rather than inventing a row identifier.
+            label = getattr(fix_task, "review_stage_label", "task-review")
+            index = getattr(fix_task, "review_history_index", None)
+            entry_id = f"{label}#{index}" if index is not None else str(label)
+        paths: tuple[str, ...] = ()
+        if self._review_artefact_paths_reader is not None:
+            try:
+                raw = self._review_artefact_paths_reader(build_id, fix_task)
+                paths = tuple(str(p) for p in (raw or ()))
+            except Exception as exc:  # noqa: BLE001 — a reader defect is not fatal
+                logger.warning(
+                    "fix_task_context_builder: review_artefact_paths_reader "
+                    "raised %s: %s for build_id=%s fix_task_id=%s — the fix "
+                    "task carries no review artefact paths",
+                    type(exc).__name__,
+                    exc,
+                    build_id,
+                    fix_task_id,
+                )
+        return ForwardFixTaskRef(
+            fix_task_id=str(fix_task_id),
+            task_review_entry_id=str(entry_id),
+            review_artefact_paths=paths,
+        )
+
     def _build_entries(
         self, stage: StageClass, build_id: str, fix_task: Any
     ) -> list[dict[str, Any]]:
@@ -109,7 +183,7 @@ class FixTaskContextBuilder:
                 build_id,
                 None,
                 mode=BuildMode.MODE_C,
-                fix_task=fix_task,
+                fix_task=self._translate_fix_task(build_id, fix_task),
             )
         except Exception as exc:  # noqa: BLE001 — a builder defect is not fatal
             logger.warning(

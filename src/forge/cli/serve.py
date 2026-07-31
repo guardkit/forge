@@ -574,16 +574,40 @@ def bind_production_dispatch_chain(
                 exc,
             )
 
-        # Conductor revival, Stage 1c — the last inch of the daemon seam.
+        # Conductor revival — the daemon seam, now ACTIVATED (Stage 2,
+        # shakeout item 3).
+        #
         # ``build_conductor_router`` returns ``None`` whenever the
         # conductor is switched off (the default), which leaves the
         # dequeue path byte-for-byte today's: every accepted build goes
-        # straight to the routine autobuild launch. Composed under DDR-007
-        # boot protection so a conductor defect can never brick intake.
+        # straight to the routine autobuild launch. That is checked here
+        # before anything else is built, so with the flag OFF this block
+        # composes NOTHING — it is a literal pass-through, which is the
+        # regression the flag-off pin asserts at this level.
+        #
+        # With the flag ON, Stage 1's honest gap closes: the router was
+        # called with no ``supervisor_factory`` and therefore stayed inert
+        # even when switched on ("the daemon composes no Supervisor
+        # today"). It composes one now, plus the driver deps that Stage 1
+        # left all-``None`` — without which the first non-terminal turn
+        # died WAIT_EXPIRED with no receipts.
+        #
+        # Composed under DDR-007 boot protection so a conductor defect can
+        # never brick intake.
+        conductor_router = None
         try:
-            conductor_router = build_conductor_router(
-                pool=sqlite_pool, config=forge_config
-            )
+            from forge.config.conductor import conductor_enabled
+
+            if conductor_enabled(forge_config):
+                conductor_router = _compose_conductor_router(
+                    sqlite_pool=sqlite_pool,
+                    forge_config=forge_config,
+                    lifecycle_emitter=emitter,
+                    gate_parts=gate_parts,
+                    gate_repository=gate_repository,
+                    gate_state_machine=gate_state_machine,
+                    clock=_gate_wall_clock,
+                )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             conductor_router = None
             logger.error(
@@ -997,7 +1021,15 @@ def build_conductor_mode_kwargs(
     kwargs: dict[str, Any] = {
         "build_mode_reader": SqliteBuildModeReader(pool),
         "mode_c_planner": ModeCCyclePlanner(),
-        "mode_c_history_reader": SqliteModeCHistoryReader(pool),
+        "mode_c_history_reader": SqliteModeCHistoryReader(
+            pool,
+            # Risk h.3 guard (C2 coach-driven): the projection drops a review's
+            # OWN subject task from its fix-task list, so a review re-emitting
+            # its subject artefact can never fan /task-work out against itself.
+            subject_task_id_reader=lambda build_id: getattr(
+                pool.get_build_row(build_id), "task_id", None
+            ),
+        ),
         "mode_c_terminal_handler": evaluate_terminal,
         "mode_c_commit_probe": make_mode_c_commit_probe(
             pool,
@@ -1295,6 +1327,120 @@ def build_conductor_budget_kwargs(
         guards.caps_enabled,
     )
     return kwargs
+
+
+def _compose_conductor_router(
+    *,
+    sqlite_pool: Any,
+    forge_config: Any,
+    lifecycle_emitter: Any,
+    gate_parts: Any,
+    gate_repository: Any,
+    gate_state_machine: Any,
+    clock: "Callable[[], datetime]",
+) -> "Callable[..., Any] | None":
+    """Compose the ACTIVATED conductor router (Stage 2, shakeout item 3).
+
+    Called only when ``conductor.enabled`` is on — the flag is checked by
+    the caller *before* this function is reached, so the flag-off tree
+    never constructs a single object from this path. That ordering is the
+    regression pin: OFF is a literal pass-through, not an equivalent one.
+
+    What this assembles, in the order the pieces depend on each other:
+
+    1. The **forward-context builder** and the **worktree allowlist** the
+       routine path already builds from ``forge.yaml``'s filesystem
+       allowlist — the fix journey runs inside the same fences.
+    2. The **merge card publisher**
+       (:func:`forge.cli._serve_gate_activation.make_merge_card_publisher`)
+       — the SAME approve-click machinery the consumer path delivers
+       through, so the merge-ready checkpoint publishes the card that
+       already exists rather than inventing a second surface. Absent gate
+       parts (a boot where the approval seam failed to construct) it stays
+       ``None``, which is *delivery OFF*: the checkpoint still runs its
+       gates-green precondition and reports honestly, and no card is ever
+       claimed that was not sent.
+    3. The **supervisor factory** and the **driver deps factory** — the
+       two things ``build_conductor_router`` refused to invent for itself.
+    4. The router, which reads the dequeued build's mode and answers
+       ``False`` for anything that is not a fix journey.
+
+    ``gates_green_reader`` is deliberately left unwired. The full gate set
+    on a candidate branch has no production reader in this tree yet, and
+    the checkpoint treats "no reader" as UNKNOWN, which it treats as RED.
+    So the conductor can run a whole fix journey and will NOT publish a
+    merge card until a real gate reader is wired — which is exactly the
+    §c.3 precondition ("proven green", never "not proven red") holding by
+    construction rather than by intention. Stage 2's attended shadow
+    replay is where that reader earns its wiring.
+    """
+    from pathlib import Path
+
+    from forge.adapters.guardkit.run import run as guardkit_run
+    from forge.cli._serve_conductor import (
+        build_conductor_driver_deps_factory,
+        build_conductor_supervisor_factory,
+    )
+    from forge.cli._serve_deps_forward_context import (
+        ForgeConfigWorktreeAllowlist,
+        _normalise_root,
+        build_forward_context_builder,
+        build_stage_log_reader,
+    )
+
+    forward_context_builder = build_forward_context_builder(
+        build_stage_log_reader(sqlite_pool), forge_config
+    )
+    allowlist_roots = [
+        Path(p) for p in forge_config.permissions.filesystem.allowlist
+    ]
+    worktree_allowlist = ForgeConfigWorktreeAllowlist(
+        allowed_roots=tuple(
+            _normalise_root(entry)
+            for entry in forge_config.permissions.filesystem.allowlist
+        )
+    )
+
+    publish_card: Any = None
+    if gate_parts is not None:
+        from forge.cli._serve_gate_activation import make_merge_card_publisher
+
+        publish_card = make_merge_card_publisher(
+            parts=gate_parts,
+            sqlite_pool=sqlite_pool,
+            gate_repository=gate_repository,
+            gate_state_machine=gate_state_machine,
+            clock=clock,
+        )
+    else:
+        logger.warning(
+            "conductor: no approval gate parts this boot — the merge-ready "
+            "checkpoint runs with DELIVERY OFF. A fix journey will still run "
+            "and leave receipts; it will publish no card and will say so"
+        )
+
+    supervisor_factory = build_conductor_supervisor_factory(
+        pool=sqlite_pool,
+        config=forge_config,
+        forward_context_builder=forward_context_builder,
+        worktree_allowlist=worktree_allowlist,
+        read_allowlist=allowlist_roots,
+        subprocess_runner=guardkit_run,
+        lifecycle_emitter=lifecycle_emitter,
+        publish_card=publish_card,
+        gates_green_reader=None,
+    )
+    driver_deps_factory = build_conductor_driver_deps_factory(
+        pool=sqlite_pool,
+        config=forge_config,
+        subscriber_factory=None,
+    )
+    return build_conductor_router(
+        pool=sqlite_pool,
+        config=forge_config,
+        supervisor_factory=supervisor_factory,
+        driver_deps_factory=driver_deps_factory,
+    )
 
 
 def build_conductor_router(

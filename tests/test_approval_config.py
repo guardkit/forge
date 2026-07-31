@@ -232,6 +232,9 @@ class TestApprovalYamlRoundTrip:
                 # Lane B / Phase E1 (B1) target-terminal flag — default-OFF; the
                 # unfiltered round-trip dump always includes it.
                 "target_terminal": {"enabled": False},
+                # ``planning.dcl`` — the machine-authored DCL seat's single-slot
+                # flag. Default-ON; the unfiltered dump always includes it.
+                "dcl": {"author_at_plan_commit": True},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages); the unfiltered
             # round-trip dump always includes it with default values.
@@ -240,6 +243,10 @@ class TestApprovalYamlRoundTrip:
                 "run_live_gate": True,
                 "reservation_backend": "none",
                 "deploy_record_dir": "docs/state",
+                # ``deploy.execution_surface`` — where the deploy stage runs.
+                # Defaults to ``local``; always present in the dump.
+                "execution_surface": "local",
+                "sidecar_url": "http://127.0.0.1:8125",
             },
             # ``review_gate`` was added by WS3-S5 (adversarial merge gate); the
             # unfiltered round-trip dump always includes it, so declare defaults.
@@ -255,6 +262,20 @@ class TestApprovalYamlRoundTrip:
                 "min_refuters": 2,
                 "record_dir": "qa",
             },
+            # ``resource_preflight`` was added by E2-S4 (run-entry memory /
+            # disk headroom preflight); the unfiltered dump always includes it.
+            "resource_preflight": {
+                "enabled": True,
+                "min_available_memory_gb": 8.0,
+                "min_available_disk_gb": 20.0,
+                "working_path": None,
+            },
+            # ``conductor`` — the fix journey's activation flag (the conductor
+            # revival). Default-OFF: the flag is what reserves activation, and
+            # OFF is byte-for-byte the routine path. It is a first-class config
+            # section, so the unfiltered round-trip dump always includes it and
+            # this exhaustive fixture must declare it.
+            "conductor": {"enabled": False},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

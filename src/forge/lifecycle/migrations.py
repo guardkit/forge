@@ -44,7 +44,7 @@ from typing import Final
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 7
+_SCHEMA_VERSION: Final[int] = 8
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -53,6 +53,12 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (5, "schema_v5.sql"),
     (6, "schema_v6.sql"),
     (7, "schema_v7.sql"),
+    # v8 (conductor revival Stage 2) — the additive ``builds.task_id``
+    # column: the fix journey's DURABLE subject. The queue has always put
+    # the task identifier on the wire for a mode-c build; nothing persisted
+    # it, so a fix-journey dispatch had no subject to name and the
+    # subprocess dispatcher refused it.
+    (8, "schema_v8.sql"),
 )
 
 
