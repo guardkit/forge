@@ -229,6 +229,13 @@ class BuildRow(BaseModel):
     # ``default_profile`` (``attended`` = caps off, ASSUM-010). Historical
     # rows that pre-date the column read back as ``None``.
     profile: str | None = None
+    # Conductor revival Stage 2 (``schema_v8.sql``) — the fix journey's
+    # DURABLE subject. ``forge queue --mode c TASK-XXX`` puts the task
+    # identifier on the wire (``BuildQueuedPayload.task_id``, required iff
+    # mode-c); this column is where it lands so every stage of the journey
+    # — and a daemon that restarts mid-journey — can name the same subject.
+    # ``None`` for every Mode A / Mode B build and every historical row.
+    task_id: str | None = None
 
 
 class BuildStatusView(BaseModel):
@@ -314,6 +321,14 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "pending_approval_request_id",
             "mode",
             "profile",
+            # The additive columns, in ``ALTER TABLE`` order — which is the
+            # order SQLite returns them for ``SELECT *``: v6, v7, then v8's
+            # ``task_id`` (the fix journey's durable subject). The tail was
+            # short by two before v8 added a third, which would have shifted
+            # ``task_id`` onto ``last_coach_score``'s value.
+            "last_coach_score",
+            "budget_breach",
+            "task_id",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -349,6 +364,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         pending_approval_request_id=data.get("pending_approval_request_id"),
         mode=BuildMode(data.get("mode") or BuildMode.MODE_A.value),
         profile=data.get("profile"),
+        task_id=data.get("task_id"),
     )
 
 
@@ -704,6 +720,14 @@ class SqliteLifecyclePersistence:
         # §2(b) barred), otherwise NULL = the daemon's default_profile.
         if profile is None:
             profile = getattr(payload, "profile", None)
+        # Resolve the fix journey's subject (``schema_v8.sql``). The queue has
+        # always put ``task_id`` on the wire for a mode-c build (required iff
+        # mode-c by the nats-core validator) and nothing persisted it, so the
+        # conductor had no durable subject to dispatch ``/task-review`` against.
+        # Sniffed off the payload rather than added as a kwarg: every caller
+        # already passes the payload, and the wire field is the single source.
+        # ``None`` for Mode A / Mode B — the routine path is untouched.
+        task_id: str | None = getattr(payload, "task_id", None)
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -713,9 +737,10 @@ class SqliteLifecyclePersistence:
                     build_id, feature_id, repo, branch, feature_yaml_path,
                     status, triggered_by, originating_adapter,
                     originating_user, correlation_id, parent_request_id,
-                    queued_at, max_turns, sdk_timeout_seconds, mode, profile
+                    queued_at, max_turns, sdk_timeout_seconds, mode, profile,
+                    task_id
                 ) VALUES (
-                    ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -734,6 +759,7 @@ class SqliteLifecyclePersistence:
                     int(payload.sdk_timeout_seconds),
                     resolved_mode.value,
                     profile,
+                    task_id,
                 ),
             )
             self._cx.execute("COMMIT;")

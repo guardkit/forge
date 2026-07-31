@@ -768,6 +768,15 @@ class Supervisor:
         FAILED with a pack (``TERMINAL``). A no-commit checkpoint is a
         silent ``TERMINAL`` (§c.6 — a receipt, never a card).
 
+        **The three no-card endings are TERMINAL, not WAITING** (Stage 2
+        shakeout item 6). ``PUBLISH_FAILED`` used to map to ``WAITING``,
+        which let the driver re-plan and re-issue the card up to three
+        more times for one merge word. A publish that raised may already
+        have put the envelope on the wire; ``DELIVERY_NOT_WIRED`` has no
+        mechanism to wait for; and ``ALREADY_CHECKPOINTED`` means the one
+        card is spent. Each ends the journey honestly with a pack instead
+        of waiting for something that is not coming.
+
         Any result that is NOT a
         :class:`~forge.pipeline.merge_ready_checkpoint.MergeCardDecision`
         — every pre-existing gate implementation, every test double —
@@ -784,12 +793,21 @@ class Supervisor:
             return TurnOutcome.DISPATCHED
         if result.outcome is MergeCardOutcome.CARD_PUBLISHED:
             return TurnOutcome.DISPATCHED
-        if result.outcome is MergeCardOutcome.RED_GATE_FAILED:
+        if result.outcome in (
+            MergeCardOutcome.RED_GATE_FAILED,
+            MergeCardOutcome.NO_COMMITS_SILENT,
+            MergeCardOutcome.PUBLISH_FAILED,
+            MergeCardOutcome.DELIVERY_NOT_WIRED,
+            MergeCardOutcome.ALREADY_CHECKPOINTED,
+        ):
             return TurnOutcome.TERMINAL
-        if result.outcome is MergeCardOutcome.NO_COMMITS_SILENT:
-            return TurnOutcome.TERMINAL
-        # RED_GATE_LOOP_BACK / PUBLISH_FAILED — the journey has not been
-        # delivered and has not ended; the driver loop waits and re-plans.
+        # RED_GATE_LOOP_BACK — the only checkpoint outcome that re-enters
+        # the fix cycle. No card was published on this path. HONEST CAVEAT
+        # (C2 coach, 2026-07-31): in the CURRENT production composition
+        # subscriber_factory and gates_green_reader are unwired (None), so
+        # this WAITING cannot arm a resume and the journey ends WAIT_EXPIRED
+        # — a red-gate stop mis-worded as a wait expiry. First item of the
+        # attended shadow replay; until then this comment is the truth.
         return TurnOutcome.WAITING
 
     # ------------------------------------------------------------------

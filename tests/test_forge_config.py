@@ -248,6 +248,9 @@ class TestYamlRoundTrip:
                 "frontier_timeout_seconds": 30,
                 "model_resolution": {"model": None, "fallbacks": []},
                 "target_terminal": {"enabled": False},
+                # ``planning.dcl`` — the machine-authored DCL seat's
+                # single-slot flag. Default-ON; always in the dump.
+                "dcl": {"author_at_plan_commit": True},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages) — like
             # ``planning`` above, the unfiltered round-trip dump always includes
@@ -257,6 +260,10 @@ class TestYamlRoundTrip:
                 "run_live_gate": True,
                 "reservation_backend": "none",
                 "deploy_record_dir": "docs/state",
+                # ``deploy.execution_surface`` — where the deploy stage runs.
+                # Defaults to ``local``; always present in the dump.
+                "execution_surface": "local",
+                "sidecar_url": "http://127.0.0.1:8125",
             },
             # ``review_gate`` was added by WS3-S5 (adversarial merge gate) — like
             # ``deploy`` above, the unfiltered round-trip dump always includes
@@ -283,6 +290,12 @@ class TestYamlRoundTrip:
                 "min_available_disk_gb": 20.0,
                 "working_path": None,
             },
+            # ``conductor`` — the fix journey's activation flag (the conductor
+            # revival). Default-OFF: the flag is what reserves activation, and
+            # OFF is byte-for-byte the routine path. It is a first-class config
+            # section, so the unfiltered round-trip dump always includes it and
+            # this exhaustive fixture must declare it.
+            "conductor": {"enabled": False},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

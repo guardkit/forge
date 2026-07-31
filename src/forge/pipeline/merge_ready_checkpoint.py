@@ -52,6 +52,25 @@ The three laws it enforces
 * **Never auto-merge** (§c.4, ADR-ARCH-026). ``auto_approve=True`` is
   refused here as well as by the constitutional guard upstream: belt and
   braces on "the merge word is human forever".
+* **ONE card per journey — the publish latch** (§c.5 / risk h.5, Stage 2
+  shakeout item 6). The moment a publish is *attempted* on a build the
+  checkpoint latches: any later ``submit_decision`` for that build answers
+  :attr:`MergeCardOutcome.ALREADY_CHECKPOINTED` and publishes nothing.
+
+  Why a latch and not a re-issue. Before this, a publish that raised
+  reported ``PUBLISH_FAILED``, the supervisor mapped that to ``WAITING``,
+  and the driver re-planned — so a single flaky publish could re-issue the
+  card up to three more times. Three cards for one merge word is act
+  inflation dressed up as a retry. And re-issuing is not even the estate's
+  mechanism for a lost card: the merge card rides the SAME approve-click
+  machinery as the pre-dispatch gate, whose ``request_id`` is durable and
+  whose re-emit is owned by ``rearm_paused_gates`` at boot and by the
+  subscriber's refresh loop within the window. Re-publishing from here
+  would duplicate a job something else already owns, against a row that is
+  already PAUSED. So a raised publish is an **honest terminal** carrying
+  ``card_may_be_on_the_wire`` — the journey stops, the pack says what
+  happened, and the existing rearm path is what gets the card in front of
+  the owner.
 
 The stage enum is deliberately NOT renamed — ``PULL_REQUEST_REVIEW``
 names durable ``stage_log`` rows and renaming it would be cosmetic churn
@@ -148,9 +167,17 @@ class MergeCardOutcome(StrEnum):
         RED_GATE_LOOP_BACK: A gate is red; back into the fix cycle.
         RED_GATE_FAILED: A gate is red and there is no cycle left; FAILED
             with a pack.
-        PUBLISH_FAILED: The gates were green but the card publish itself
-            raised. No card reached Rich; the journey holds rather than
-            claiming a delivery it did not make.
+        PUBLISH_FAILED: The gates were green and the card publish RAISED.
+            The envelope may already be on the wire, so this is a
+            **terminal** — never a retry. See the class-level note below.
+        DELIVERY_NOT_WIRED: The gates were green and no card publisher is
+            wired at all (the shadow-replay posture, design pass Stage 2
+            where delivery is deliberately OFF). Nothing reached the wire
+            and nothing will; the journey ends honestly rather than
+            waiting for a delivery that has no mechanism.
+        ALREADY_CHECKPOINTED: A checkpoint already fired for this build
+            and its publish was attempted. Bounded to the ONE card
+            (design pass risk h.5) — this decision publishes nothing.
     """
 
     CARD_PUBLISHED = "card-published"
@@ -158,6 +185,8 @@ class MergeCardOutcome(StrEnum):
     RED_GATE_LOOP_BACK = "red-gate-loop-back"
     RED_GATE_FAILED = "red-gate-failed"
     PUBLISH_FAILED = "publish-failed"
+    DELIVERY_NOT_WIRED = "delivery-not-wired"
+    ALREADY_CHECKPOINTED = "already-checkpointed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,8 +213,14 @@ class MergeCardDecision:
             auto-approve and this publisher refused it.
         rationale: The rationale carried through from the caller, plus
             this leg's own note.
-        card_result: Whatever the card publisher returned. Never
-            interpreted here.
+        card_result: Whatever the card publisher returned — for the
+            production publisher this is the owner's verdict on the card
+            (approved / declined / expired). Never interpreted here; the
+            driver loop reads it to pick the honest outcome WORD for the
+            run report (Stage 2 shakeout item 7).
+        card_may_be_on_the_wire: ``True`` when a publish was attempted and
+            raised, so the envelope may or may not have reached the owner.
+            The reason this decision is terminal rather than retried.
         failure_pack: Path of the failure pack written on the
             TERMINATE_FAILED branch, when one was written.
     """
@@ -201,6 +236,7 @@ class MergeCardDecision:
     auto_approve_refused: bool = False
     rationale: str = ""
     card_result: Any | None = None
+    card_may_be_on_the_wire: bool = False
     failure_pack: Any | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
@@ -281,6 +317,13 @@ class MergeReadyCheckpointPublisher:
         self._push_branch = push_branch
         self._red_gate_action = red_gate_action
         self._failure_pack_writer = failure_pack_writer
+        # THE PUBLISH LATCH — build ids whose card publish has been
+        # ATTEMPTED. Armed before the await, so even a raise inside the
+        # publisher leaves it armed: "we may have put a card on the wire"
+        # is the state that must never be retried. A red gate does NOT
+        # arm it — looping back into the fix cycle and checkpointing again
+        # later is the design, and that path never reached a publisher.
+        self._published: set[str] = set()
 
     async def submit_decision(
         self,
@@ -296,6 +339,29 @@ class MergeReadyCheckpointPublisher:
         four supervisor call sites reach this one implementation without
         changing what they pass.
         """
+        if build_id in self._published:
+            # Bounded to the ONE card. See the class docstring's latch
+            # note: a second checkpoint on a build whose publish was
+            # already attempted publishes nothing, ever.
+            logger.warning(
+                "%s: build_id=%s has ALREADY had its card publish attempted "
+                "— publishing NOTHING. A fix journey delivers exactly one "
+                "merge card; re-issuing it would be act inflation, and the "
+                "gate's own rearm/refresh path owns re-emitting a card the "
+                "owner has not answered",
+                MERGE_READY_CHECKPOINT_LABEL,
+                build_id,
+            )
+            return MergeCardDecision(
+                outcome=MergeCardOutcome.ALREADY_CHECKPOINTED,
+                build_id=build_id,
+                feature_id=feature_id,
+                rationale=(
+                    f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: already "
+                    "checkpointed — one card per journey"
+                ).strip(" |"),
+            )
+
         auto_approve_refused = False
         if auto_approve:
             # ADR-ARCH-026 / §c.4 — the merge word is human forever. The
@@ -389,7 +455,7 @@ class MergeReadyCheckpointPublisher:
                 build_id,
             )
             return MergeCardDecision(
-                outcome=MergeCardOutcome.PUBLISH_FAILED,
+                outcome=MergeCardOutcome.DELIVERY_NOT_WIRED,
                 build_id=build_id,
                 feature_id=feature_id,
                 branch=branch,
@@ -404,6 +470,10 @@ class MergeReadyCheckpointPublisher:
                 details={"delivery_wired": False},
             )
 
+        # ARM THE LATCH BEFORE THE AWAIT. From here on the envelope may
+        # have reached the wire, and "may have" is the state that must
+        # never be retried.
+        self._published.add(build_id)
         try:
             card_result = await _maybe_await(
                 self._publish_card(
@@ -416,13 +486,24 @@ class MergeReadyCheckpointPublisher:
             )
         except Exception as exc:  # noqa: BLE001 — a publish failure is not a merge
             logger.error(
-                "%s: card publish raised %s: %s for build_id=%s — NO card "
-                "reached the owner; the journey holds rather than claiming a "
-                "delivery it did not make",
+                "%s: card publish raised %s: %s for build_id=%s — the journey "
+                "STOPS here and never re-publishes. The envelope may already "
+                "be on the wire; the gate's durable request_id plus "
+                "rearm_paused_gates own getting it in front of the owner, and "
+                "a second card from here would be a second act",
                 MERGE_READY_CHECKPOINT_LABEL,
                 type(exc).__name__,
                 exc,
                 build_id,
+            )
+            failure_pack = await self._write_failure_pack(
+                build_id=build_id,
+                feature_id=feature_id,
+                gates=gates,
+                reason=(
+                    f"{MERGE_READY_CHECKPOINT_LABEL}: card publish raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
             )
             return MergeCardDecision(
                 outcome=MergeCardOutcome.PUBLISH_FAILED,
@@ -433,10 +514,13 @@ class MergeReadyCheckpointPublisher:
                 push_modelled=self._push_branch is None,
                 gates=gates,
                 auto_approve_refused=auto_approve_refused,
+                card_may_be_on_the_wire=True,
                 rationale=(
                     f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: publish "
-                    f"failed ({type(exc).__name__})"
+                    f"failed ({type(exc).__name__}) — the card may be on the "
+                    "wire; NOT re-published"
                 ).strip(" |"),
+                failure_pack=failure_pack,
                 details={"publish_error": f"{type(exc).__name__}: {exc}"},
             )
 
@@ -581,7 +665,12 @@ class MergeReadyCheckpointPublisher:
         return action if isinstance(action, RedGateAction) else RedGateAction.LOOP_BACK
 
     async def _write_failure_pack(
-        self, *, build_id: str, feature_id: str, gates: GatesReport
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        gates: GatesReport,
+        reason: str | None = None,
     ) -> Any | None:
         if self._failure_pack_writer is None:
             return None
@@ -590,7 +679,8 @@ class MergeReadyCheckpointPublisher:
                 self._failure_pack_writer(
                     build_id=build_id,
                     feature_id=feature_id,
-                    reason=(
+                    reason=reason
+                    or (
                         f"{MERGE_READY_CHECKPOINT_LABEL}: gates "
                         f"{gates.status.value} "
                         f"({', '.join(gates.failed_gates) or gates.detail})"

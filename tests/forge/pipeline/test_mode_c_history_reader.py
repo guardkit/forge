@@ -626,3 +626,31 @@ class TestSqliteReader:
         with caplog.at_level(logging.ERROR):
             assert reader.has_commits("build-x") is False
         assert "git went away" in caplog.text
+
+
+class TestSubjectTaskExclusion:
+    """Risk h.3, C2-coach-driven: a review listing the build's OWN subject task
+    must not hand the planner a fix task equal to the subject."""
+
+    def test_subject_task_dropped_from_fix_tasks(self):
+        from forge.pipeline.mode_c_history_reader import project_mode_c_history
+
+        row = _row(
+            stage_label="task-review",
+            status="PASSED",
+            details={"fix_tasks": ["TASK-DRF001", "TASK-DRF001-A"], "gate_mode": "mode-c"},
+        )
+        entries = project_mode_c_history([row], subject_task_id="TASK-DRF001")
+        (entry,) = entries
+        assert entry.fix_tasks == ("TASK-DRF001-A",)
+
+    def test_no_subject_given_keeps_list_verbatim(self):
+        from forge.pipeline.mode_c_history_reader import project_mode_c_history
+
+        row = _row(
+            stage_label="task-review",
+            status="PASSED",
+            details={"fix_tasks": ["TASK-DRF001"], "gate_mode": "mode-c"},
+        )
+        (entry,) = project_mode_c_history([row])
+        assert entry.fix_tasks == ("TASK-DRF001",)

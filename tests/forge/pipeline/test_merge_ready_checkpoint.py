@@ -335,14 +335,20 @@ class TestCardDelivery:
         assert "ConnectionError" in decision.details["publish_error"]
 
     def test_delivery_off_records_the_decision_without_publishing(self) -> None:
-        """Design-pass Stage 2's shadow replay: gates run, no card goes out."""
+        """Design-pass Stage 2's shadow replay: gates run, no card goes out.
+
+        Its own outcome word since Stage 2: "no publisher is wired" is a
+        deliberate posture, not a failed publish, and conflating the two
+        made the driver wait for a delivery that had no mechanism.
+        """
         publisher = MergeReadyCheckpointPublisher(
             publish_card=None, gates_green_reader=lambda **_: True
         )
 
         decision = _submit(publisher)
 
-        assert decision.outcome is MergeCardOutcome.PUBLISH_FAILED
+        assert decision.outcome is MergeCardOutcome.DELIVERY_NOT_WIRED
+        assert decision.card_may_be_on_the_wire is False
         assert decision.card_published is False
         assert decision.details == {"delivery_wired": False}
         assert decision.gates is not None and decision.gates.is_green

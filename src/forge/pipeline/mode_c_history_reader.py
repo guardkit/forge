@@ -187,6 +187,8 @@ class _StageLogReader(Protocol):
 
 def project_mode_c_history(
     rows: Iterable[Any],
+    *,
+    subject_task_id: str | None = None,
 ) -> tuple[StageEntry, ...]:
     """Project ``stage_log`` rows into the planner's ``StageEntry`` contract.
 
@@ -214,7 +216,7 @@ def project_mode_c_history(
         if stage_class is None:
             continue
         try:
-            projected.append(_project_row(row, stage_class))
+            projected.append(_project_row(row, stage_class, subject_task_id=subject_task_id))
         except ProjectionError as exc:
             problems.append(f"row {index} ({label}): {exc}")
 
@@ -238,7 +240,7 @@ def project_mode_c_history(
     return tuple(projected)
 
 
-def _project_row(row: Any, stage_class: StageClass) -> StageEntry:
+def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | None = None) -> StageEntry:
     """Project one Mode C ``stage_log`` row. Raises :class:`ProjectionError`."""
     details = getattr(row, "details", None)
     if details is None:
@@ -254,7 +256,7 @@ def _project_row(row: Any, stage_class: StageClass) -> StageEntry:
         return StageEntry(
             stage_class=stage_class,
             status=status,
-            fix_tasks=_project_fix_tasks(details, status=status),
+            fix_tasks=_project_fix_tasks(details, status=status, subject_task_id=subject_task_id),
             hard_stop=hard_stop,
         )
 
@@ -303,6 +305,7 @@ def _project_fix_tasks(
     details: Mapping[str, Any],
     *,
     status: str,
+    subject_task_id: str | None = None,
 ) -> tuple[str, ...]:
     """Recover the typed fix-task list from an approved review's output.
 
@@ -345,6 +348,19 @@ def _project_fix_tasks(
             "identity, so duplicates make the walk ambiguous"
         )
 
+    if subject_task_id and subject_task_id in fix_tasks:
+        # Risk h.3, driven by the C2 coach: a review that re-emits or touches
+        # its OWN subject's task artefact must not make the planner fan a
+        # /task-work out against the build's own subject. Dropped loudly,
+        # never silently ambiguous.
+        logger.warning(
+            "mode_c_history: task-review listed the build's own subject task "
+            "%s as a fix task — dropped (a review's subject is never its own "
+            "fix)",
+            subject_task_id,
+        )
+        fix_tasks = [t for t in fix_tasks if t != subject_task_id]
+
     return tuple(fix_tasks)
 
 
@@ -380,16 +396,18 @@ class SqliteModeCHistoryReader:
             the supervisor already gives it precedence.
     """
 
-    __slots__ = ("_pool", "_has_commits_reader")
+    __slots__ = ("_pool", "_has_commits_reader", "_subject_task_id_reader")
 
     def __init__(
         self,
         pool: _StageLogReader,
         *,
         has_commits_reader: Callable[[str], bool] | None = None,
+        subject_task_id_reader: Callable[[str], str | None] | None = None,
     ) -> None:
         self._pool = pool
         self._has_commits_reader = has_commits_reader
+        self._subject_task_id_reader = subject_task_id_reader
 
     def get_mode_c_history(self, build_id: str) -> Sequence[StageEntry]:
         """Return the projected Mode C history for ``build_id``."""
@@ -398,7 +416,12 @@ class SqliteModeCHistoryReader:
                 "SqliteModeCHistoryReader.get_mode_c_history: build_id must "
                 "be non-empty"
             )
-        return project_mode_c_history(self._pool.read_stages(build_id))
+        subject: str | None = None
+        if self._subject_task_id_reader is not None:
+            subject = self._subject_task_id_reader(build_id)
+        return project_mode_c_history(
+            self._pool.read_stages(build_id), subject_task_id=subject
+        )
 
     def has_commits(self, build_id: str) -> bool:
         """Return the flag driving the planner's clean-follow-up branch.

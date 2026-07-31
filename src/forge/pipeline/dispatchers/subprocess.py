@@ -17,8 +17,8 @@ stages of the **fix journey** — the conductor's first bounded job:
 - :attr:`~forge.pipeline.stage_taxonomy.StageClass.TASK_WORK`     → ``/task-work``
 
 The fix-journey stages dispatch by *task* subject rather than by feature
-(``--task-id``, plus the queue's ``--parent-feature`` / ``--feature-yaml``
-pair); see :func:`_build_argv_for_stage` for the two argv shapes.
+(``--task-id``, plus the queue's ``--feature-yaml``); see
+:func:`_build_argv_for_stage` for the two argv shapes.
 
 The dispatcher is intentionally a *thin composition layer* (per
 TASK-MAG7-008 Implementation Notes). Worktree confinement, allowlist
@@ -79,7 +79,7 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.pipeline.forward_context_builder import (
@@ -391,6 +391,83 @@ def _context_entries_to_argv(
     return argv, extra_paths, warnings
 
 
+#: ``--context`` flag for the failure-pack summary entry. The fix journey's
+#: forward context carries the failed build's pack index alongside the
+#: review→work entries; it rides the same ``--context`` slot as every other
+#: text entry so the subprocess needs no new flag to read it.
+_FAILURE_PACK_FLAG: str = "--context"
+
+
+def _entries_from_forward_context(
+    forward_context: Mapping[str, Any],
+) -> list[ContextEntry]:
+    """Rehydrate :class:`ContextEntry` values from the conductor's context.
+
+    The conductor's ``fix_task_context_builder`` returns a JSON-safe
+    mapping — ``{"context_entries": [{"flag", "value", "kind"}, …],
+    "failure_pack": {...} | None}`` — because it rides a dispatch payload
+    and a ``stage_log`` row. This turns it back into the typed entries the
+    argv builder already knows how to partition, so the two shapes never
+    diverge into two argv assemblers.
+
+    Malformed elements are DROPPED with a warning rather than raising: the
+    dispatcher's contract is "never raise past the boundary", and a fix
+    journey that dies because one context entry was the wrong shape would
+    be a worse failure than one that runs with less context.
+    """
+    entries: list[ContextEntry] = []
+    raw_entries = forward_context.get("context_entries") or ()
+    if isinstance(raw_entries, (str, bytes)) or not isinstance(
+        raw_entries, (list, tuple)
+    ):
+        logger.warning(
+            "dispatch_subprocess_stage: forward_context['context_entries'] is "
+            "%s, expected a list — dispatching with no context entries",
+            type(raw_entries).__name__,
+        )
+        raw_entries = ()
+    for element in raw_entries:
+        if isinstance(element, ContextEntry):
+            entries.append(element)
+            continue
+        if not isinstance(element, Mapping):
+            logger.warning(
+                "dispatch_subprocess_stage: forward-context entry %r is not a "
+                "mapping; dropped",
+                element,
+            )
+            continue
+        flag = element.get("flag")
+        value = element.get("value")
+        kind = element.get("kind", "text")
+        if not isinstance(flag, str) or not isinstance(value, str):
+            logger.warning(
+                "dispatch_subprocess_stage: forward-context entry %r has no "
+                "string flag/value; dropped",
+                element,
+            )
+            continue
+        entries.append(
+            ContextEntry(flag=flag, value=value, kind=str(kind) or "text")
+        )
+
+    pack = forward_context.get("failure_pack")
+    if isinstance(pack, Mapping) and pack:
+        # The pack index is a small JSON summary, not a path — it rides as
+        # an inline text entry so the subprocess reads the evidence the
+        # failed build left without a second file-resolution hop.
+        import json
+
+        entries.append(
+            ContextEntry(
+                flag=_FAILURE_PACK_FLAG,
+                value=json.dumps({"failure_pack": dict(pack)}, sort_keys=True),
+                kind="text",
+            )
+        )
+    return entries
+
+
 def _filter_artefact_paths(
     *,
     paths: list[str],
@@ -528,8 +605,8 @@ def _build_argv_for_stage(
     forward_context_builder: ForwardContextBuilder,
     task_id: str | None = None,
     fix_task: FixTaskReference | None = None,
-    parent_feature: str | None = None,
     fix_task_yaml: str | None = None,
+    forward_context: "Mapping[str, Any] | None" = None,
 ) -> _DispatchPlan:
     """Assemble the subprocess argv + extra_context_paths for ``stage``.
 
@@ -545,7 +622,6 @@ def _build_argv_for_stage(
 
         task-review --build-id <build> --correlation-id <cid>
                     --task-id <task_id>
-                    [--parent-feature <FEAT-XXX>]
                     [--feature-yaml <fix-task.yaml>]
                     <forward-context pairs…>
 
@@ -554,30 +630,66 @@ def _build_argv_for_stage(
 
         task-work   --build-id <build> --correlation-id <cid>
                     --task-id <fix_task.fix_task_id>
-                    [--parent-feature <FEAT-XXX>]
                     [--feature-yaml <fix-task.yaml>]
                     <forward-context pairs…>
 
-    ``--parent-feature`` / ``--feature-yaml`` mirror the queue's Mode C
-    wire shape: ``forge queue --mode c TASK-XXX --feature-yaml <fix-task
-    YAML>`` reads ``parent_feature`` out of that YAML and puts *both*
-    identifiers on the wire in their canonical slots
-    (``_load_parent_feature_from_fix_task_yaml`` in ``cli/queue.py``).
-    Threading them here keeps the dispatched subprocess looking at the
-    same two artefacts the queue resolved, instead of re-deriving them.
-    Both are optional: absent, the argv simply omits them.
+    ``--feature-yaml`` mirrors the queue's Mode C wire shape: ``forge
+    queue --mode c TASK-XXX --feature-yaml <fix-task YAML>``. Threading it
+    here keeps the dispatched subprocess looking at the same artefact the
+    queue resolved instead of re-deriving it. It is optional: absent, the
+    argv simply omits it.
+
+    **No ``--parent-feature`` pair.** It was emitted here until Stage 2 and
+    nothing in the estate accepts it: neither ``guardkit task-review`` nor
+    ``guardkit task-work`` declares the flag, so a dispatch carrying it
+    would have died on an unknown argument. The parent feature is resolved
+    by the queue *out of the fix-task YAML*, by design
+    (``_load_parent_feature_from_fix_task_yaml`` in ``cli/queue.py``) — so
+    handing the subprocess ``--feature-yaml`` hands it the parent feature
+    too, through the one artefact that owns it. One identifier, one source.
 
     ``--feature-id`` is deliberately NOT emitted for the fix-journey
-    stages even when a ``feature_id`` is supplied — the parent feature
-    rides on ``--parent-feature`` so the two identifier slots stay
-    unambiguous, matching the wire.
+    stages even when a ``feature_id`` is supplied — the fix journey
+    dispatches by task subject, and a second identifier slot on the same
+    argv is exactly the cross-attribution ambiguity the subject refusal
+    guards against.
+
+    **The forward context has ONE source per stage class, stated here.**
+
+    * *Planning stages* — the injected ``forward_context_builder``, asked
+      exactly as it always was. Byte-for-byte unchanged.
+    * *Fix-journey stages* — the ``forward_context`` the CONDUCTOR built
+      and threaded in. The conductor's
+      :class:`~forge.pipeline.fix_task_context_builder.FixTaskContextBuilder`
+      is an adapter over that same :class:`ForwardContextBuilder` which
+      additionally reads the failed build's failure-pack index, and it
+      resolves in Mode C with the fix-task reference — the only call
+      shape that yields the review→work data dependency. Asking the
+      builder again from here would resolve it a second time, in Mode A
+      shape, and then silently drop the pack half: two sources, one of
+      them wrong. So this function never re-derives a fix journey's
+      context. With none supplied the dispatch carries no context entries
+      and says so at INFO — honestly less context, never a guessed one.
     """
     subcommand = SUBPROCESS_STAGE_COMMANDS[stage]
-    entries = forward_context_builder.build_for(
-        stage=stage,
-        build_id=build_id,
-        feature_id=feature_id,
-    )
+    if forward_context is not None:
+        entries = _entries_from_forward_context(forward_context)
+    elif stage in MODE_C_STAGES:
+        logger.info(
+            "dispatch_subprocess_stage: no forward_context threaded for "
+            "fix-journey stage=%s build_id=%s — dispatching with NO context "
+            "entries. The conductor's fix_task_context_builder is the one "
+            "source for this stage class; the dispatcher does not re-derive it",
+            stage.value,
+            build_id,
+        )
+        entries = []
+    else:
+        entries = forward_context_builder.build_for(
+            stage=stage,
+            build_id=build_id,
+            feature_id=feature_id,
+        )
     text_argv, path_args, warnings = _context_entries_to_argv(entries)
     argv: list[str] = [
         "--build-id",
@@ -596,8 +708,6 @@ def _build_argv_for_stage(
         else:
             subject = str(task_id)
         argv.extend(["--task-id", subject])
-        if parent_feature is not None:
-            argv.extend(["--parent-feature", parent_feature])
         if fix_task_yaml is not None:
             argv.extend(["--feature-yaml", str(fix_task_yaml)])
     elif feature_id is not None:
@@ -673,8 +783,8 @@ async def dispatch_subprocess_stage(
     feature_id: str | None = None,
     task_id: str | None = None,
     fix_task: FixTaskReference | None = None,
-    parent_feature: str | None = None,
     fix_task_yaml: str | None = None,
+    forward_context: Mapping[str, Any] | None = None,
     timeout_seconds: int = 600,
     with_nats_streaming: bool = True,
     extra_args: list[str] | None = None,
@@ -725,8 +835,7 @@ async def dispatch_subprocess_stage(
             refused with a structured FAILED result — the same
             safe-default stance :class:`StageOrderingGuard` takes.
             The two fix-journey stages carry ``None`` here: their
-            identifiers are ``task_id`` / ``fix_task`` and (optionally)
-            ``parent_feature``.
+            identifier is ``task_id`` / ``fix_task``.
         task_id: Fix journey only — the build's Mode C task identifier
             (the ``TASK-XXX`` positional the queue put on the wire).
             It is the ``--task-id`` subject of every ``task-review``
@@ -739,12 +848,22 @@ async def dispatch_subprocess_stage(
             by every other stage. A ``TASK_WORK`` dispatch without one is
             refused with a structured FAILED result rather than run
             against an inferred subject.
-        parent_feature: Fix journey only — the parent ``FEAT-XXX`` the
-            queue resolved from the fix-task YAML's ``parent_feature``
-            field. Emitted as ``--parent-feature`` when supplied.
         fix_task_yaml: Fix journey only — path to the fix-task YAML the
             build was queued with (``--feature-yaml`` on the queue
-            surface). Emitted as ``--feature-yaml`` when supplied.
+            surface). Emitted as ``--feature-yaml`` when supplied. This is
+            also how the parent feature reaches the subprocess: the queue
+            resolves ``parent_feature`` *out of this YAML* by design, so
+            the artefact carries it and no second flag is needed (there is
+            no ``--parent-feature`` — nothing in the estate accepts one).
+        forward_context: Fix journey only — the context the conductor
+            already built for this dispatch
+            (:class:`~forge.pipeline.fix_task_context_builder.FixTaskContextBuilder`:
+            the review→work entries PLUS the failed build's failure-pack
+            index). When supplied it is THE source of context for this
+            dispatch and ``forward_context_builder`` is not consulted —
+            one source of truth, because the conductor's builder is an
+            adapter over that very builder and asking both would drop the
+            pack half on the floor.
         timeout_seconds: Forwarded to the runner. Defaults to the
             FEAT-FORGE-005 600-second contract (ASSUM-001).
         with_nats_streaming: Forwarded to the runner. Defaults to
@@ -838,8 +957,8 @@ async def dispatch_subprocess_stage(
             forward_context_builder=forward_context_builder,
             task_id=task_id,
             fix_task=fix_task,
-            parent_feature=parent_feature,
             fix_task_yaml=fix_task_yaml,
+            forward_context=forward_context,
         )
         full_args = list(plan.args)
         if extra_args:

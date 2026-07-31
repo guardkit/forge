@@ -64,9 +64,17 @@ def _insert_build(
 
 
 def test_fresh_db_migrates_to_version_7(tmp_path: Path) -> None:
+    """A fresh DB carries v7 — pinned against the ledger, not a literal.
+
+    ``apply_at_boot`` reports the schema version it left the database at,
+    so a literal ``7`` here breaks every time a later additive column
+    lands (v8 added ``builds.task_id``). What this test is actually about
+    is "v7 is applied and is not the last word", so assert exactly that.
+    """
     cx = sqlite_connect.connect_writer(tmp_path / "fresh.db")
     try:
-        assert migrations.apply_at_boot(cx) == 7
+        assert migrations.apply_at_boot(cx) == migrations._SCHEMA_VERSION
+        assert migrations._SCHEMA_VERSION >= 7
     finally:
         cx.close()
 
@@ -139,8 +147,8 @@ def test_v6_upgrade_adds_column_old_rows_read_null(tmp_path: Path) -> None:
         _insert_build(cx, "legacy-1")
         cx.commit()
 
-        # Upgrade to v7.
-        assert migrations.apply_at_boot(cx) == 7
+        # Upgrade past v7.
+        assert migrations.apply_at_boot(cx) == migrations._SCHEMA_VERSION
         assert "budget_breach" in _column_names(cx, "builds")
 
         # The pre-existing row reads back NULL (backward-compatible default).
@@ -201,12 +209,12 @@ def test_fresh_and_upgraded_builds_columns_converge(tmp_path: Path) -> None:
 def test_v7_migration_is_idempotent(tmp_path: Path) -> None:
     cx = sqlite_connect.connect_writer(tmp_path / "idem.db")
     try:
-        assert migrations.apply_at_boot(cx) == 7
+        assert migrations.apply_at_boot(cx) == migrations._SCHEMA_VERSION
         _insert_build(cx, "keep", breach="coach_score: 0.0 < 0.5 floor @ ts")
         cx.commit()
 
         # Re-running applies nothing and preserves data.
-        assert migrations.apply_at_boot(cx) == 7
+        assert migrations.apply_at_boot(cx) == migrations._SCHEMA_VERSION
         row = cx.execute(
             "SELECT budget_breach FROM builds WHERE build_id='keep'"
         ).fetchone()
