@@ -110,6 +110,34 @@ def config_path(tmp_path: Path, repo_dir: Path) -> Path:
     )
 
 
+@pytest.fixture
+def conductor_config_path(tmp_path: Path, repo_dir: Path) -> Path:
+    """``config_path`` with the conductor switched ON.
+
+    The fix journey (``--mode c``) is refused at queue time while the
+    conductor is off (revival design pass §h.8) — a build nothing drives
+    must never become a queue row. The Mode C *identifier* tests below
+    are about what rides on the wire, not about activation, so they run
+    against an activated config; the refusal itself is covered in
+    ``tests/forge/test_cli_queue_mode_refusal.py``.
+    """
+    return _write_yaml(
+        tmp_path / "forge-conductor.yaml",
+        {
+            "queue": {
+                "default_max_turns": 5,
+                "default_sdk_timeout_seconds": 1800,
+                "default_history_limit": 50,
+                "repo_allowlist": [str(repo_dir)],
+            },
+            "conductor": {"enabled": True},
+            "permissions": {
+                "filesystem": {"allowlist": [str(tmp_path)]},
+            },
+        },
+    )
+
+
 class _FakePersistence:
     """In-memory persistence stand-in that records ``queue_build`` calls.
 
@@ -135,10 +163,20 @@ class _FakePersistence:
         return self.active
 
     def queue_build(
-        self, payload: Any, *, mode: BuildMode | str | None = None
+        self,
+        payload: Any,
+        *,
+        mode: BuildMode | str | None = None,
+        profile: str | None = None,
     ) -> str:
+        # ``profile`` mirrors the production signature
+        # (``SqliteLifecyclePersistence.queue_build``), which grew the
+        # kwarg with the budget-guard integration. The double had drifted
+        # behind it, so every CLI test that reached persistence died on a
+        # TypeError rather than on its own assertion — a pre-existing
+        # red unrelated to the mode surface. Kept in step here.
         self.calls.append(("queue_build", payload))
-        self.queue_build_kwargs.append({"mode": mode})
+        self.queue_build_kwargs.append({"mode": mode, "profile": profile})
         if self.raise_duplicate:
             raise DuplicateBuildError(payload.feature_id, payload.correlation_id)
         resolved = (
@@ -198,10 +236,14 @@ class TestQueueModeFlag:
         "flag,expected",
         [
             ("a", BuildMode.MODE_A),
-            ("b", BuildMode.MODE_B),
             # Case-insensitive — Click's case_sensitive=False on the choice.
             ("A", BuildMode.MODE_A),
-            ("B", BuildMode.MODE_B),
+            # ``b``/``B`` used to live here. The full journey (Mode B) was
+            # retired as a production destination on 2026-07-31 — it is
+            # superseded by the spec-writer chain — so it can no longer
+            # reach a persisted row at all. Its refusal is asserted in
+            # ``TestModeBRetired`` below and in
+            # ``tests/forge/test_cli_queue_mode_refusal.py``.
         ],
     )
     def test_explicit_mode_flag_maps_to_build_mode(
@@ -316,14 +358,23 @@ class TestQueueModeFlag:
 class TestModeBSingleFeature:
     """``forge queue --mode b <FEAT-ID>`` requires exactly one feature."""
 
-    def test_mode_b_with_one_feature_succeeds(
+    def test_mode_b_with_one_feature_is_refused_as_retired(
         self,
         config_path: Path,
         repo_dir: Path,
         feature_yaml: Path,
-        captured_publish: list[tuple[str, bytes]],  # noqa: ARG002
+        captured_publish: list[tuple[str, bytes]],
         fake_persistence: _FakePersistence,
     ) -> None:
+        """The well-formed Mode B invocation is refused, not queued.
+
+        This test used to assert a successful enqueue. Rich's 2026-07-31
+        ruling retired the full journey as a production destination — no
+        driver exists for it and none is planned — so a well-formed
+        ``--mode b`` is now the *worst* case, not the happy one: it would
+        write a row nothing ever picks up. It must exit nonzero having
+        written nothing.
+        """
         from forge.cli.main import main
 
         runner = CliRunner()
@@ -342,9 +393,11 @@ class TestModeBSingleFeature:
                 "b",
             ],
         )
-        assert result.exit_code == 0, result.output
-        _, persisted_mode = fake_persistence.records[0]
-        assert persisted_mode is BuildMode.MODE_B
+        assert result.exit_code != 0
+        assert fake_persistence.records == []
+        assert fake_persistence.calls == []
+        assert captured_publish == []
+        assert "spec-writer chain" in result.output
 
     def test_mode_b_with_two_features_is_rejected_at_parse_time(
         self,
@@ -405,7 +458,7 @@ class TestModeCSubject:
     def test_mode_c_populates_task_id_and_parent_feature_on_payload(
         self,
         flag: str,
-        config_path: Path,
+        conductor_config_path: Path,
         repo_dir: Path,
         fix_task_yaml: Path,
         captured_publish: list[tuple[str, bytes]],  # noqa: ARG002
@@ -419,7 +472,7 @@ class TestModeCSubject:
             main,
             [
                 "--config",
-                str(config_path),
+                str(conductor_config_path),
                 "queue",
                 "TASK-FIX007",
                 "--repo",
@@ -442,7 +495,7 @@ class TestModeCSubject:
 
     def test_mode_c_rejects_non_task_positional_at_cli_boundary(
         self,
-        config_path: Path,
+        conductor_config_path: Path,
         repo_dir: Path,
         fix_task_yaml: Path,
         captured_publish: list[tuple[str, bytes]],
@@ -456,7 +509,7 @@ class TestModeCSubject:
             main,
             [
                 "--config",
-                str(config_path),
+                str(conductor_config_path),
                 "queue",
                 "FEAT-FIX007",  # wrong shape for Mode C
                 "--repo",
@@ -475,7 +528,7 @@ class TestModeCSubject:
 
     def test_mode_c_requires_parent_feature_in_fix_task_yaml(
         self,
-        config_path: Path,
+        conductor_config_path: Path,
         repo_dir: Path,
         feature_yaml: Path,  # the bare YAML without parent_feature
         captured_publish: list[tuple[str, bytes]],
@@ -489,7 +542,7 @@ class TestModeCSubject:
             main,
             [
                 "--config",
-                str(config_path),
+                str(conductor_config_path),
                 "queue",
                 "TASK-FIX007",
                 "--repo",
@@ -509,7 +562,7 @@ class TestModeCSubject:
 
     def test_mode_c_rejects_non_feat_parent_in_fix_task_yaml(
         self,
-        config_path: Path,
+        conductor_config_path: Path,
         repo_dir: Path,
         tmp_path: Path,
         captured_publish: list[tuple[str, bytes]],
@@ -527,7 +580,7 @@ class TestModeCSubject:
             main,
             [
                 "--config",
-                str(config_path),
+                str(conductor_config_path),
                 "queue",
                 "TASK-FIX007",
                 "--repo",

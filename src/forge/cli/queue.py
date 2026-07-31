@@ -6,6 +6,14 @@ Behavioural contract (``API-cli.md §3.3``)
 The ``forge queue`` command implements the **write-then-publish**
 discipline (concern ``sc_002`` from TASK-REV-3EEE). The flow is, in order:
 
+0. **Refuse unactivated modes** — ``--mode b`` (retired: the full journey
+   is the spec-writer chain's job now) and ``--mode c`` while the
+   conductor is switched off are refused with a plain-language message
+   and a nonzero exit, *before any side effect*. The decision comes from
+   :func:`forge.config.conductor.mode_refusal_reason`, the same seam the
+   conductor's driver loop reads. Without this, the CLI reports a
+   successful enqueue for a build no production code will ever drive and
+   the row sits PENDING forever (revival design pass risk h.8).
 1. **Validate ``feature_id``** through
    :func:`forge.lifecycle.identifiers.validate_feature_id` (concern
    ``sc_003``). On :class:`InvalidIdentifierError` we exit ``4`` *before*
@@ -68,6 +76,7 @@ from typing import Any, Protocol
 
 import click
 
+from forge.config.conductor import mode_refusal_reason
 from forge.config.models import ForgeConfig
 from forge.lifecycle.identifiers import (
     InvalidIdentifierError,
@@ -128,22 +137,31 @@ _MODE_FLAG_TO_BUILD_MODE: dict[str, BuildMode] = {
     "c": BuildMode.MODE_C,
 }
 
-#: Help text for ``--mode``. References FEAT-FORGE-008 chain shapes
-#: verbatim so operators do not need to read source code to choose a
-#: mode (AC: "Help text for --mode references the FEAT-FORGE-008 chain
-#: shapes verbatim").
+#: Help text for ``--mode``. Speaks the phrase-book's plain names first —
+#: an operator choosing a mode reads what the mode *does*, and what it
+#: costs them, before any codename. The FEAT-FORGE-008 chain shapes stay
+#: in brackets so nobody has to read source code to see the stage order
+#: (AC: "Help text for --mode references the FEAT-FORGE-008 chain shapes
+#: verbatim"), and each mode says plainly whether it is switched on.
 _MODE_HELP_TEXT = (
-    "Pipeline build mode (FEAT-FORGE-008). "
-    "'a' = Mode A: full greenfield run "
+    "Which journey this build takes (chain shapes from FEAT-FORGE-008 in "
+    "brackets). "
+    "'a' = the routine build — the default, and the only mode switched on: "
+    "the pipeline picks up one queued build, runs it, and reports the "
+    "outcome "
     "(product-owner -> architect -> system-arch -> system-design -> "
     "feature-spec -> task-review -> autobuild -> pull-request-review). "
-    "'b' = Mode B: add-feature-to-existing-project "
-    "(starts at /feature-spec, skips product-owner / architect / "
-    "/system-arch / /system-design; ASSUM-001). "
-    "'c' = Mode C: review-and-fix cycle "
-    "(/task-review pairs with /task-work per fix task; "
-    "optional pull-request-review terminator; ASSUM-004). "
-    "Default 'a' preserves backwards compatibility."
+    "'b' = RETIRED and REFUSED: the full journey — one plain sentence "
+    "through to a merged feature — is handled by the spec-writer chain "
+    "now, so queueing this mode writes nothing and exits nonzero "
+    "(it used to start at /feature-spec and skip product-owner / "
+    "architect / /system-arch / /system-design; ASSUM-001). "
+    "'c' = the fix journey — review a failed build and work through "
+    "bounded fixes, driven by the conductor "
+    "(/task-review pairs with /task-work per fix task, then the "
+    "merge-ready checkpoint; ASSUM-004). REFUSED until the conductor is "
+    "switched on with 'conductor.enabled: true' in forge.yaml. "
+    "Default 'a'."
 )
 
 
@@ -625,6 +643,19 @@ def queue_cmd(
     positional_id = feature_ids[0]
 
     config = _require_forge_config(config_obj)
+
+    # 0a. Refuse any mode nothing in production will drive — BEFORE every
+    #     side effect, including the budget echo below. A queued row in an
+    #     unactivated mode is the silently-stuck-row defect (revival design
+    #     pass risk h.8): the CLI reports success, the row sits PENDING
+    #     forever, and nobody finds out until someone reads the queue by
+    #     hand. Refusing at queue time is the cure; the read comes from the
+    #     same seam the conductor's driver loop reads, so the two can never
+    #     disagree about whether a mode is live.
+    refusal = mode_refusal_reason(build_mode, config)
+    if refusal is not None:
+        click.echo(refusal, err=True)
+        sys.exit(EXIT_MODE_USAGE)
 
     # 0. FEAT-UBS-002 — resolve + validate the budget-guard profile BEFORE any
     #    side effect (mirrors the mode-resolution discipline). An unknown name

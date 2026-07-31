@@ -104,6 +104,34 @@ ATTENDED_PROFILE_NAME = "attended"
 DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES = 2
 DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS = 5400  # 90 minutes
 
+#: The conductor's fix-journey profile name (revival design pass §d Stage 3).
+FIX_JOURNEY_PROFILE_NAME = "fix-journey"
+
+#: THE CAP-MAPPING LAW (design pass §h.7) — read this before changing it.
+#:
+#: The bound Rich ruled is "**ONE follow-up review** per fix build". The cap
+#: that enforces it is NOT 1. ``count_review_cycles``
+#: (``pipeline/budget_guard.py``) counts **every** review entry in the
+#: build's history, and a bounded fix journey has TWO: the initial
+#: ``/task-review`` that finds the fix tasks, and the ONE follow-up
+#: ``/task-review`` that confirms they landed. The guard is consulted
+#: *before* the step it would allow, with ``>=`` semantics, so:
+#:
+#:     max_review_cycles = 2  ->  initial review, fixes, ONE follow-up. ✅
+#:     max_review_cycles = 1  ->  breach at the MANDATORY follow-up. ❌
+#:
+#: Writing ``1`` here therefore guarantees a false pause on every single fix
+#: build — the build would escalate risk-high and pause before doing the one
+#: thing that proves the fix worked. The mapping is pinned by a test that
+#: shows a profile of ``1`` breaching at the follow-up while ``2`` passes;
+#: that test pins the MAPPING, not the mistake.
+FIX_JOURNEY_MAX_REVIEW_CYCLES = 2
+
+#: Wall-clock cap for the fix journey — "on from day one" (design pass §d
+#: Stage 3). A fix journey is a bounded repair, not a feature build, so it
+#: is held tighter than the ``unattended`` build profile.
+FIX_JOURNEY_MAX_BUILD_WALLCLOCK_SECONDS = 3600  # 60 minutes
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -423,13 +451,28 @@ class BudgetGuards(BaseModel):
 
 
 def _default_budget_profiles() -> dict[str, BudgetGuards]:
-    """Two built-in profiles: ``attended`` (caps off) and ``unattended``."""
+    """Three built-in profiles: ``attended``, ``unattended``, ``fix-journey``.
+
+    ``fix-journey`` is the conductor's bounded repair profile (revival
+    design pass §d Stage 3). Its ``max_review_cycles`` is **2, and must
+    stay 2** — see :data:`FIX_JOURNEY_MAX_REVIEW_CYCLES` for the
+    cap-mapping law: "one follow-up review" counts the initial review
+    too, so a ``1`` here false-pauses every fix build before the
+    mandatory follow-up.
+    """
     return {
         ATTENDED_PROFILE_NAME: BudgetGuards(),  # all None — ASSUM-010 preserved
         "unattended": BudgetGuards(
             max_review_cycles=DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES,
             max_build_wallclock_seconds=(
                 DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS
+            ),
+        ),
+        FIX_JOURNEY_PROFILE_NAME: BudgetGuards(
+            # = the initial /task-review + ONE follow-up. NEVER 1.
+            max_review_cycles=FIX_JOURNEY_MAX_REVIEW_CYCLES,
+            max_build_wallclock_seconds=(
+                FIX_JOURNEY_MAX_BUILD_WALLCLOCK_SECONDS
             ),
         ),
     }
@@ -924,6 +967,38 @@ class ResourcePreflightConfig(BaseModel):
     )
 
 
+class ConductorConfig(BaseModel):
+    """The conductor's activation switch (revival design pass §a.5 / §h.8).
+
+    The conductor (codename: the Supervisor) is the pipeline's full brain —
+    it can walk a whole journey rather than a single build. It is fully
+    built and, in production, completely unplugged: no mode reader, no
+    driver loop. This section is the single switch that activates it.
+
+    ``enabled`` defaults to **False** and is the *only* field Stage 1
+    introduces. With the switch off the tree is byte-for-byte today's
+    behaviour: every build falls through to the routine path (Mode A),
+    and ``forge queue --mode c`` is refused at queue time rather than
+    writing a build row nothing would ever pick up.
+
+    Deliberately its own section rather than a field on ``PipelineConfig``:
+    activation is a plan-of-record decision reserved to the owner, and it
+    must be readable at a glance in ``forge.yaml``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the conductor (the full-journey brain). "
+            "False (the default) = the conductor is inert: every build runs "
+            "the routine path and 'forge queue --mode c' is refused at queue "
+            "time. True = the fix journey is activated."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -969,6 +1044,15 @@ class ForgeConfig(BaseModel):
             "until reviewer-seat SLMs land in WS4 (Q2 = attended-v1)."
         ),
     )
+    conductor: ConductorConfig = Field(
+        default_factory=ConductorConfig,
+        description=(
+            "The conductor's activation switch (revival design pass §a.5). "
+            "Defaults to disabled (enabled=False) — with it off the tree is "
+            "byte-for-byte today's behaviour and '--mode c' is refused at "
+            "queue time."
+        ),
+    )
     resource_preflight: ResourcePreflightConfig = Field(
         default_factory=ResourcePreflightConfig,
         description=(
@@ -1001,9 +1085,13 @@ __all__ = [
     "DEFAULT_STALE_HEARTBEAT_SECONDS",
     "DEFAULT_UNATTENDED_MAX_BUILD_WALLCLOCK_SECONDS",
     "DEFAULT_UNATTENDED_MAX_REVIEW_CYCLES",
+    "FIX_JOURNEY_MAX_BUILD_WALLCLOCK_SECONDS",
+    "FIX_JOURNEY_MAX_REVIEW_CYCLES",
+    "FIX_JOURNEY_PROFILE_NAME",
     "ApprovalConfig",
     "BudgetConfig",
     "BudgetGuards",
+    "ConductorConfig",
     "DeployStageConfig",
     "FilesystemPermissions",
     "FleetConfig",

@@ -10,6 +10,16 @@ dispatch the four subprocess Mode A stages:
 - :attr:`~forge.pipeline.stage_taxonomy.StageClass.FEATURE_SPEC`  → ``/feature-spec``
 - :attr:`~forge.pipeline.stage_taxonomy.StageClass.FEATURE_PLAN`  → ``/feature-plan``
 
+…and, since the conductor's revival (Stage 1a, design pass §a.4), the two
+stages of the **fix journey** — the conductor's first bounded job:
+
+- :attr:`~forge.pipeline.stage_taxonomy.StageClass.TASK_REVIEW`   → ``/task-review``
+- :attr:`~forge.pipeline.stage_taxonomy.StageClass.TASK_WORK`     → ``/task-work``
+
+The fix-journey stages dispatch by *task* subject rather than by feature
+(``--task-id``, plus the queue's ``--parent-feature`` / ``--feature-yaml``
+pair); see :func:`_build_argv_for_stage` for the two argv shapes.
+
 The dispatcher is intentionally a *thin composition layer* (per
 TASK-MAG7-008 Implementation Notes). Worktree confinement, allowlist
 enforcement, the 600-second timeout, and the universal "never raises"
@@ -83,6 +93,8 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "FixTaskReference",
+    "MODE_C_STAGES",
     "StageDispatchStatus",
     "StageDispatchResult",
     "StageLogWriter",
@@ -113,7 +125,29 @@ SUBPROCESS_STAGE_COMMANDS: dict[StageClass, str] = {
     StageClass.SYSTEM_DESIGN: "system-design",
     StageClass.FEATURE_SPEC: "feature-spec",
     StageClass.FEATURE_PLAN: "feature-plan",
+    # Conductor revival, Stage 1a (design pass §a.4): the fix journey's
+    # two stages. Everything around this map was already Mode-C-aware —
+    # the conductor's router lists both stages in ``_SUBPROCESS_STAGES``
+    # and the build-system adapter already runs both subcommands with bus
+    # streaming (``forge.tools.guardkit`` guardkit_task_review /
+    # guardkit_task_work) — but these two rows were absent, so the very
+    # first fix-journey dispatch raised ValueError one line below. The
+    # rows alone do not dispatch: see ``_build_argv_for_stage`` for the
+    # two argv shapes that make them real (risk h.2).
+    StageClass.TASK_REVIEW: "task-review",
+    StageClass.TASK_WORK: "task-work",
 }
+
+
+#: The fix journey's stages (design pass §a.4). Both take a ``--task-id``
+#: subject rather than a ``--feature-id``: the review's subject is the
+#: build's own task, and each work dispatch's subject is one fix task the
+#: review emitted. Kept local to the dispatcher because the *argv* split
+#: is a dispatcher concern — ``stage_taxonomy`` already carries the
+#: orthogonal ``PER_FIX_TASK_STAGES`` fan-out tag.
+MODE_C_STAGES: frozenset[StageClass] = frozenset(
+    {StageClass.TASK_REVIEW, StageClass.TASK_WORK}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +286,32 @@ class StageLogWriter(Protocol):
     ) -> None:  # pragma: no cover - protocol stub
         """Record a stage_log row for the just-completed dispatch."""
         ...
+
+
+@runtime_checkable
+class FixTaskReference(Protocol):
+    """Structural view of the fix-task reference the conductor threads in.
+
+    The conductor's Mode C turn puts
+    :class:`forge.pipeline.mode_c_planner.FixTaskRef` on the dispatcher
+    kwargs as ``fix_task`` (``supervisor.py`` "MODE_C planner chose
+    TASK_WORK" branch). The dispatcher only needs two of its fields, and
+    typing them structurally keeps this module free of an import from the
+    planner (which drags in ``forge.lifecycle.persistence``) — the same
+    Protocol-over-collaborator discipline every other seam here follows.
+
+    Attributes:
+        fix_task_id: The fix-task identifier the review emitted. Becomes
+            the ``--task-id`` subject of the ``task-work`` dispatch.
+        review_history_index: Back-reference to the ``/task-review``
+            history entry that emitted the identifier. **Not** threaded
+            onto argv — the build system has no flag for it; it is the
+            audit anchor recorded on the ``stage_log`` row by the Mode C
+            terminal handler's attribution helper.
+    """
+
+    fix_task_id: str
+    review_history_index: int
 
 
 #: Subprocess-runner callable signature.
@@ -414,6 +474,51 @@ def _record_safely(
         )
 
 
+def _mode_c_subject_refusal(
+    *,
+    stage: StageClass,
+    task_id: str | None,
+    fix_task: FixTaskReference | None,
+) -> str | None:
+    """Return a refusal rationale when a fix-journey dispatch has no subject.
+
+    Both fix-journey stages are dispatched *by subject*, and a subject-less
+    dispatch is a wiring bug, not a runtime condition:
+
+    * ``task-review`` reviews the build's own task — its subject is the
+      Mode C ``task_id`` the queue put on the wire and on the build row.
+    * ``task-work`` works one fix task — its subject is the
+      ``fix_task_id`` on the reference the conductor threads through.
+
+    Dispatching either with no subject would run the build system against
+    whatever it inferred from the worktree — the cross-attribution risk
+    the per-feature ``feature_id`` refusal already guards against. We take
+    the same stance: refuse, structured, never guess.
+
+    Returns:
+        ``None`` when the dispatch has its subject; otherwise the rationale
+        string for a FAILED result.
+    """
+    if stage is StageClass.TASK_REVIEW:
+        if task_id is None or not str(task_id).strip():
+            return (
+                "fix-journey stage 'task-review' dispatched without task_id; "
+                "refusing rather than review an inferred subject"
+            )
+        return None
+    if stage is StageClass.TASK_WORK:
+        fix_task_id = getattr(fix_task, "fix_task_id", None) if fix_task else None
+        if fix_task_id is None or not str(fix_task_id).strip():
+            return (
+                "fix-journey stage 'task-work' dispatched without a fix-task "
+                "reference; refusing rather than risk cross-fix-task "
+                "attribution (the conductor threads it as dispatcher kwarg "
+                "'fix_task')"
+            )
+        return None
+    return None
+
+
 def _build_argv_for_stage(
     *,
     stage: StageClass,
@@ -421,8 +526,52 @@ def _build_argv_for_stage(
     correlation_id: str,
     feature_id: str | None,
     forward_context_builder: ForwardContextBuilder,
+    task_id: str | None = None,
+    fix_task: FixTaskReference | None = None,
+    parent_feature: str | None = None,
+    fix_task_yaml: str | None = None,
 ) -> _DispatchPlan:
-    """Assemble the subprocess argv + extra_context_paths for ``stage``."""
+    """Assemble the subprocess argv + extra_context_paths for ``stage``.
+
+    Three argv shapes now live here.
+
+    **The four planning stages** (unchanged, byte-for-byte): a
+    ``--build-id`` / ``--correlation-id`` prefix, ``--feature-id`` on the
+    per-feature ones, then the forward-context text pairs.
+
+    **task-review** (the fix journey's opening and follow-up legs) — the
+    subject is the build's Mode C task, exactly the shape the build-system
+    adapter already runs (``guardkit task-review --task-id TASK-XXX``)::
+
+        task-review --build-id <build> --correlation-id <cid>
+                    --task-id <task_id>
+                    [--parent-feature <FEAT-XXX>]
+                    [--feature-yaml <fix-task.yaml>]
+                    <forward-context pairs…>
+
+    **task-work** (one dispatch per fix task the review emitted) — the
+    same shape with the *fix task* as the subject::
+
+        task-work   --build-id <build> --correlation-id <cid>
+                    --task-id <fix_task.fix_task_id>
+                    [--parent-feature <FEAT-XXX>]
+                    [--feature-yaml <fix-task.yaml>]
+                    <forward-context pairs…>
+
+    ``--parent-feature`` / ``--feature-yaml`` mirror the queue's Mode C
+    wire shape: ``forge queue --mode c TASK-XXX --feature-yaml <fix-task
+    YAML>`` reads ``parent_feature`` out of that YAML and puts *both*
+    identifiers on the wire in their canonical slots
+    (``_load_parent_feature_from_fix_task_yaml`` in ``cli/queue.py``).
+    Threading them here keeps the dispatched subprocess looking at the
+    same two artefacts the queue resolved, instead of re-deriving them.
+    Both are optional: absent, the argv simply omits them.
+
+    ``--feature-id`` is deliberately NOT emitted for the fix-journey
+    stages even when a ``feature_id`` is supplied — the parent feature
+    rides on ``--parent-feature`` so the two identifier slots stay
+    unambiguous, matching the wire.
+    """
     subcommand = SUBPROCESS_STAGE_COMMANDS[stage]
     entries = forward_context_builder.build_for(
         stage=stage,
@@ -436,8 +585,24 @@ def _build_argv_for_stage(
         "--correlation-id",
         correlation_id,
     ]
-    if feature_id is not None:
+
+    if stage in MODE_C_STAGES:
+        # The fix journey's subject: the build's task for a review, the
+        # fix task for a work dispatch. ``_mode_c_subject_refusal`` has
+        # already guaranteed the subject is present by the time we get
+        # here, so the lookups below cannot yield None.
+        if stage is StageClass.TASK_WORK:
+            subject = str(getattr(fix_task, "fix_task_id"))
+        else:
+            subject = str(task_id)
+        argv.extend(["--task-id", subject])
+        if parent_feature is not None:
+            argv.extend(["--parent-feature", parent_feature])
+        if fix_task_yaml is not None:
+            argv.extend(["--feature-yaml", str(fix_task_yaml)])
+    elif feature_id is not None:
         argv.extend(["--feature-id", feature_id])
+
     argv.extend(text_argv)
     return _DispatchPlan(
         subcommand=subcommand,
@@ -506,6 +671,10 @@ async def dispatch_subprocess_stage(
     stage_log_writer: StageLogWriter,
     subprocess_runner: SubprocessRunner,
     feature_id: str | None = None,
+    task_id: str | None = None,
+    fix_task: FixTaskReference | None = None,
+    parent_feature: str | None = None,
+    fix_task_yaml: str | None = None,
     timeout_seconds: int = 600,
     with_nats_streaming: bool = True,
     extra_args: list[str] | None = None,
@@ -555,6 +724,27 @@ async def dispatch_subprocess_stage(
             Per-feature stages called without a ``feature_id`` are
             refused with a structured FAILED result — the same
             safe-default stance :class:`StageOrderingGuard` takes.
+            The two fix-journey stages carry ``None`` here: their
+            identifiers are ``task_id`` / ``fix_task`` and (optionally)
+            ``parent_feature``.
+        task_id: Fix journey only — the build's Mode C task identifier
+            (the ``TASK-XXX`` positional the queue put on the wire).
+            It is the ``--task-id`` subject of every ``task-review``
+            dispatch, initial and follow-up. Required for
+            ``TASK_REVIEW``; ignored by every other stage.
+        fix_task: Fix journey only — the :class:`FixTaskReference` the
+            conductor threads through as the ``fix_task`` dispatcher
+            kwarg. Its ``fix_task_id`` is the ``--task-id`` subject of a
+            ``task-work`` dispatch. Required for ``TASK_WORK``; ignored
+            by every other stage. A ``TASK_WORK`` dispatch without one is
+            refused with a structured FAILED result rather than run
+            against an inferred subject.
+        parent_feature: Fix journey only — the parent ``FEAT-XXX`` the
+            queue resolved from the fix-task YAML's ``parent_feature``
+            field. Emitted as ``--parent-feature`` when supplied.
+        fix_task_yaml: Fix journey only — path to the fix-task YAML the
+            build was queued with (``--feature-yaml`` on the queue
+            surface). Emitted as ``--feature-yaml`` when supplied.
         timeout_seconds: Forwarded to the runner. Defaults to the
             FEAT-FORGE-005 600-second contract (ASSUM-001).
         with_nats_streaming: Forwarded to the runner. Defaults to
@@ -574,7 +764,7 @@ async def dispatch_subprocess_stage(
     Raises:
         ValueError: If ``stage`` is not in
             :data:`SUBPROCESS_STAGE_COMMANDS`. This is a programming
-            error, not a runtime condition — the four-stage contract is
+            error, not a runtime condition — the six-stage contract is
             part of the dispatcher's API surface, not data-driven.
         asyncio.CancelledError: Re-raised so the caller's async context
             unwinds correctly. Mirrors the
@@ -593,11 +783,26 @@ async def dispatch_subprocess_stage(
     # take. Surface it as a structured FAILED so the supervisor sees a
     # uniform shape across "the dispatcher refused" and "the subprocess
     # itself failed".
+    # Two subject refusals, one shape. The per-feature one has always
+    # been here; the fix-journey one is its Stage-1a twin (design pass
+    # §a.4) — ``PER_FEATURE_STAGES`` deliberately excludes TASK_REVIEW /
+    # TASK_WORK, so without this check a subject-less fix-journey
+    # dispatch would sail straight through.
+    subject_refusal: str | None = None
     if stage in PER_FEATURE_STAGES and feature_id is None:
-        rationale = (
+        subject_refusal = (
             f"per-feature stage {stage.value!r} dispatched without feature_id; "
             "refusing rather than risk cross-feature artefact attribution"
         )
+    else:
+        subject_refusal = _mode_c_subject_refusal(
+            stage=stage,
+            task_id=task_id,
+            fix_task=fix_task,
+        )
+
+    if subject_refusal is not None:
+        rationale = subject_refusal
         result = _failed_result(
             stage=stage,
             build_id=build_id,
@@ -631,6 +836,10 @@ async def dispatch_subprocess_stage(
             correlation_id=correlation_id,
             feature_id=feature_id,
             forward_context_builder=forward_context_builder,
+            task_id=task_id,
+            fix_task=fix_task,
+            parent_feature=parent_feature,
+            fix_task_yaml=fix_task_yaml,
         )
         full_args = list(plan.args)
         if extra_args:

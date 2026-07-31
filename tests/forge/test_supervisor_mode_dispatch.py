@@ -719,6 +719,86 @@ class TestModeCSubprocessRouting:
         assert call["fix_task"].fix_task_id == "FIX-1"
 
 
+class TestModeCWaitIsNotATerminal:
+    """Revival Stage 1a / risk h.1 — a waiting plan must not be closed out.
+
+    The planner now distinguishes "waiting on something in flight" from
+    "the cycle is over" (:class:`ModeCWait`). The supervisor has to honour
+    that distinction, because the terminal handler reads history
+    *structurally*: hand it a mid-cycle build and it happily classifies it
+    as CLEAN_REVIEW_NO_COMMITS or PR_REVIEW — ending a build that still has
+    a ``/task-work`` running.
+    """
+
+    def test_in_flight_fix_task_reports_waiting_not_terminal(self) -> None:
+        supervisor, doubles = _build_supervisor()
+        doubles["mode_reader"].modes["build-CWAIT"] = BuildMode.MODE_C
+        doubles["ordering_reader"].approved.add(
+            ("build-CWAIT", StageClass.TASK_REVIEW, None)
+        )
+        doubles["mode_c_history"].histories["build-CWAIT"] = [
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_REVIEW,
+                status="approved",
+                fix_tasks=("FIX-1",),
+            ),
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_WORK,
+                status="running",
+                fix_task_id="FIX-1",
+            ),
+        ]
+        # A commit probe that would push the terminal handler down the
+        # PR_REVIEW route if it were ever consulted. It must not be.
+        doubles["mode_c_history"].commits["build-CWAIT"] = True
+
+        report = _run(supervisor.next_turn("build-CWAIT"))
+
+        assert report.outcome is TurnOutcome.WAITING
+        assert report.chosen_stage is None
+        # No second stage put in flight for the same build.
+        assert doubles["subprocess"].calls == []
+        # …and emphatically no merge-ready checkpoint card.
+        assert doubles["pr_gate"].submissions == []
+        assert "FIX-1" in report.rationale
+
+    def test_unapproved_review_reports_waiting_not_terminal(self) -> None:
+        supervisor, doubles = _build_supervisor()
+        doubles["mode_reader"].modes["build-CWAIT2"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-CWAIT2"] = [
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_REVIEW,
+                status="pending",
+            ),
+        ]
+
+        report = _run(supervisor.next_turn("build-CWAIT2"))
+
+        assert report.outcome is TurnOutcome.WAITING
+        assert doubles["subprocess"].calls == []
+        assert doubles["pr_gate"].submissions == []
+
+    def test_a_real_terminal_still_resolves_through_the_handler(self) -> None:
+        """The wait branch must not swallow genuine terminals.
+
+        A clean initial review is a terminal, not a wait — it has to keep
+        reaching the terminal handler, or a finished build never closes.
+        """
+        supervisor, doubles = _build_supervisor()
+        doubles["mode_reader"].modes["build-CTERM"] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories["build-CTERM"] = [
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_REVIEW,
+                status="approved",
+                fix_tasks=(),
+            ),
+        ]
+
+        report = _run(supervisor.next_turn("build-CTERM"))
+
+        assert report.outcome is TurnOutcome.TERMINAL
+
+
 # ---------------------------------------------------------------------------
 # AC: Mode C TASK_WORK threads fix-task ref via ForwardContextBuilder shim
 # ---------------------------------------------------------------------------
