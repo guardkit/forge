@@ -1452,7 +1452,7 @@ class Supervisor:
                 build_id=build_id,
                 permitted_stages=permitted,
                 chosen_stage=StageClass.TASK_REVIEW,
-                rationale="MODE_C build already PAUSED; budget guard parks it",
+                rationale="a fix-journey build is already paused; the budget guard parked it",
             )
             self._record_safe(report)
             return report

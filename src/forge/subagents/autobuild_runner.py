@@ -622,7 +622,7 @@ class LifecycleEmitterAdapter:
                 stage_label=state.waiting_for or "awaiting_approval",
                 gate_mode="MANDATORY_HUMAN_APPROVAL",
                 coach_score=state.last_coach_score,
-                rationale=state.waiting_for or "autobuild paused for approval",
+                rationale=state.waiting_for or "the build is paused for approval",
                 approval_subject=(f"agents.approval.forge.{state.build_id}"),
                 paused_at=now_iso,
             )
