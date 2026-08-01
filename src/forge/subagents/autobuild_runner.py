@@ -80,6 +80,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -1856,12 +1857,34 @@ DEFAULT_RECEIPTS_DIR: str = "~/forge-state/receipts"
 #: The receipt families exported before the success-path worktree removal
 #: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
 #: FEAT-SCG conformance snapshot live under ``autobuild-private``; the shadow
-#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``.
+#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``;
+#: the DCL machine-authoring corpus under ``dcl-capture`` (added by the
+#: receipts-landing lane — it was written by every build and destroyed with
+#: the worktree on success, exactly the FEAT-UDBE loss class).
 _RECEIPT_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild-private",
     ".guardkit/qav-shadow",
     ".guardkit/autobuild",
+    ".guardkit/dcl-capture",
 )
+
+#: Where guardkit registers its per-task INNER worktrees inside the outer
+#: build worktree (``WorktreeManager._build_branch_name`` →
+#: ``.guardkit/worktrees/<task_or_feature_id>``). The receipts-landing lane's
+#: find: the richest receipts of a run — ``player_turn_*.json``,
+#: ``qav_shadow_turn_*.json``, ``task_work_results.json``,
+#: ``turn_state_turn_*.json``, ``specialist_results.json``,
+#: ``state_transitions.json`` — are written by the task worker in the INNER
+#: tree and were NEVER exported; the outer tree only ever carried the
+#: orchestrator's thinner copies (proven on the kept FEAT-153C tree, whose
+#: inner ``qav-shadow/queue.jsonl`` held the run's shadow verdict and the
+#: outer's did not).
+_INNER_WORKTREES_REL: str = ".guardkit/worktrees"
+
+#: Destination prefix for an inner worktree's families, so an inner copy can
+#: never clobber the outer tree's same-named family:
+#: ``<receipts>/<build_id>/worktrees/<name>/.guardkit/<family>``.
+_INNER_EXPORT_PREFIX: str = "worktrees"
 
 #: FEAT-DRF — the per-build failure pack, written beside the exported receipt
 #: families in ``$FORGE_RECEIPTS_DIR/<build_id>/``.
@@ -2104,7 +2127,7 @@ def _write_failure_manifest(
     exit_code: int,
     worktree_path: Path | None,
     branch: str | None,
-    exported_families: list[str],
+    receipts: "ReceiptExport | None" = None,
     wedged: bool = False,
     semantic_state: Mapping[str, Any] | None = None,
     resume: Mapping[str, Any] | None = None,
@@ -2118,7 +2141,11 @@ def _write_failure_manifest(
     ``failure-manifest.json`` beside the exported receipts so the pack is
     self-describing: which build/feature/correlation failed, why, whether the
     kill was a timeout, the exit code, WHERE the kept worktree is, on which
-    branch, when, and which receipt families made it out.
+    branch, when, and which receipt families made it out — with, since the
+    receipts-landing lane, the families that did NOT and why
+    (``receipt_families_skipped``) plus the per-family file tally
+    (``receipt_file_counts``), so the pack can never claim an export that
+    produced nothing.
 
     ``failure-manifest.json`` always indexes the LATEST run; an existing
     manifest from an earlier run of a reused ``build_id`` is archived aside
@@ -2164,7 +2191,23 @@ def _write_failure_manifest(
             ),
             "branch": branch,
             "failed_at": datetime.now(timezone.utc).isoformat(),
-            "receipt_families_exported": exported_families,
+            # Receipts-landing lane: the manifest never claims an export that
+            # produced nothing. `exported` carries ONLY families that landed
+            # >=1 file; every other family is named in `skipped` with its
+            # reason, and `file_counts` is the per-family tally a reader can
+            # check against the pack on disk.
+            "receipt_families_exported": (
+                list(receipts.exported) if receipts is not None else []
+            ),
+            "receipt_families_skipped": (
+                [dict(row) for row in receipts.skipped]
+                if receipts is not None
+                else []
+            ),
+            "receipt_file_counts": (
+                dict(receipts.file_counts) if receipts is not None else {}
+            ),
+            "receipt_export_ok": receipts.ok if receipts is not None else None,
             # --- build monitor (2026-07-31) -----------------------------
             "wedged": wedged,
             "semantic_state_at_kill": (
@@ -2200,7 +2243,58 @@ def _write_failure_manifest(
         )
 
 
-def _export_receipts(worktree_path: Path, build_id: str) -> tuple[bool, list[str]]:
+@dataclass(frozen=True)
+class ReceiptExport:
+    """The honest outcome of one receipt export (receipts-landing lane).
+
+    ``exported`` names ONLY families that actually put at least one FILE on
+    disk under ``<receipts>/<build_id>/``; ``skipped`` names every family that
+    did not, WITH its reason (``missing`` / ``empty`` / ``copy-failed: ...``).
+    The failure manifest publishes both, so it can never again claim an export
+    that produced nothing. ``file_counts`` is the per-family file tally — the
+    receipt a reader can check against the directory.
+    """
+
+    ok: bool = True
+    exported: list[str] = field(default_factory=list)
+    skipped: list[dict[str, str]] = field(default_factory=list)
+    file_counts: dict[str, int] = field(default_factory=dict)
+
+
+def _count_files(root: Path) -> int:
+    """Number of regular files under ``root`` (0 when absent/unreadable)."""
+    try:
+        return sum(1 for p in root.rglob("*") if p.is_file())
+    except OSError:  # pragma: no cover — unreadable mid-walk
+        return 0
+
+
+def _receipt_export_sources(worktree_path: Path) -> list[tuple[str, Path]]:
+    """``[(label, source_dir)]`` — every family this build could export.
+
+    The OUTER worktree's families come first under their plain
+    ``.guardkit/<family>`` label. Then each INNER task worktree registered at
+    ``.guardkit/worktrees/<name>/`` contributes its own families under a
+    ``worktrees/<name>/.guardkit/<family>`` label, so both survive side by
+    side and neither overwrites the other. Path arithmetic + one directory
+    listing; never raises.
+    """
+    sources: list[tuple[str, Path]] = [
+        (family, worktree_path / family) for family in _RECEIPT_FAMILIES
+    ]
+    inner_root = worktree_path / _INNER_WORKTREES_REL
+    try:
+        inner_dirs = sorted(p for p in inner_root.iterdir() if p.is_dir())
+    except OSError:
+        inner_dirs = []
+    for inner in inner_dirs:
+        for family in _RECEIPT_FAMILIES:
+            label = f"{_INNER_EXPORT_PREFIX}/{inner.name}/{family}"
+            sources.append((label, inner / family))
+    return sources
+
+
+def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
     """Copy the build's receipts out of the worktree before removal (FEAT-DRC).
 
     On build SUCCESS the outer worktree is removed, which — until this lane —
@@ -2211,15 +2305,23 @@ def _export_receipts(worktree_path: Path, build_id: str) -> tuple[bool, list[str
     ``$FORGE_RECEIPTS_DIR/<build_id>/`` (default
     ``~/forge-state/receipts/<build_id>/``), preserving relative layout.
 
+    The receipts-landing lane widened the source set: the families are read
+    from the outer worktree AND from every INNER task worktree under
+    ``.guardkit/worktrees/`` (see :func:`_receipt_export_sources`), because the
+    task worker's own receipts live only there and died with the tree.
+
     Best-effort by the same principle as :func:`_remove_worktree`: it NEVER
     raises and never alters the build's outcome. Missing families are fine
     (an export of whatever exists — including nothing — is still a success).
-    Returns ``(ok, exported_families)``: ``ok`` is ``False`` only on a real
-    copy failure, logged at WARNING; the caller then KEEPS the worktree so the
-    receipts are never silently lost. ``exported_families`` names ONLY the
-    families THIS RUN actually copied (07-30 coach finding 2: the manifest
-    previously read the destination back, so families left by an earlier run
-    of a reused ``build_id`` were falsely claimed as this run's exports).
+    Returns a :class:`ReceiptExport`: ``ok`` is ``False`` only on a real copy
+    failure, logged at WARNING; the caller then KEEPS the worktree so the
+    receipts are never silently lost — and the remaining families are still
+    attempted, so one bad family never costs the others. ``exported`` names
+    ONLY the families THIS RUN actually copied (07-30 coach finding 2: the
+    manifest previously read the destination back, so families left by an
+    earlier run of a reused ``build_id`` were falsely claimed as this run's
+    exports) AND only those that landed at least one FILE — an existing but
+    EMPTY family is reported in ``skipped``, never claimed as an export.
 
     FEAT-DRF also calls this on the FAILURE path, where it is purely additive:
     the worktree is kept there either way, so the copy is a durability upgrade
@@ -2227,32 +2329,65 @@ def _export_receipts(worktree_path: Path, build_id: str) -> tuple[bool, list[str
     ``ok`` component has no bearing on the outcome.
     """
     exported: list[str] = []
+    skipped: list[dict[str, str]] = []
+    file_counts: dict[str, int] = {}
+    ok = True
+    dest_root = _receipts_root() / build_id
     try:
-        dest_root = _receipts_root() / build_id
-        for family in _RECEIPT_FAMILIES:
-            src = worktree_path / family
+        for label, src in _receipt_export_sources(worktree_path):
             if not src.is_dir():
+                skipped.append({"family": label, "reason": "missing"})
                 continue
-            dest = dest_root / family
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src, dest, dirs_exist_ok=True)
-            exported.append(family)
+            n_files = _count_files(src)
+            if n_files == 0:
+                # An empty directory copies to an empty directory: the pack
+                # would carry a family that produced NOTHING. Say so instead.
+                skipped.append({"family": label, "reason": "empty"})
+                continue
+            dest = dest_root / label
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 — one family must not cost the rest
+                ok = False
+                skipped.append(
+                    {
+                        "family": label,
+                        "reason": f"copy-failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+                logger.warning(
+                    "autobuild_runner: receipt family %s NOT exported for %s "
+                    "(%s: %s) — the worktree will be KEPT so the receipts are "
+                    "not lost",
+                    label,
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            landed = _count_files(dest)
+            if landed == 0:  # pragma: no cover — copytree landed nothing
+                ok = False
+                skipped.append({"family": label, "reason": "copied-nothing"})
+                continue
+            exported.append(label)
+            file_counts[label] = landed
         if exported:
             logger.info(
                 "autobuild_runner: receipts exported for %s -> %s (%s)",
                 build_id,
                 dest_root,
-                ", ".join(exported),
+                ", ".join(f"{f}:{file_counts[f]}" for f in exported),
             )
         else:
             logger.info(
-                "autobuild_runner: no receipt families present in %s for %s "
-                "— nothing to export",
+                "autobuild_runner: no receipt families with content in %s for "
+                "%s — nothing to export",
                 worktree_path,
                 build_id,
             )
         _harden_pack_permissions(dest_root)
-        return True, exported
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
             "autobuild_runner: receipt export FAILED for %s (%s: %s) — the "
@@ -2261,7 +2396,10 @@ def _export_receipts(worktree_path: Path, build_id: str) -> tuple[bool, list[str
             type(exc).__name__,
             exc,
         )
-        return False, exported
+        ok = False
+    return ReceiptExport(
+        ok=ok, exported=exported, skipped=skipped, file_counts=file_counts
+    )
 
 
 async def _finalize_success_worktree(
@@ -2274,8 +2412,8 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    ok, _families = _export_receipts(worktree_path, build_id)
-    if ok:
+    result = _export_receipts(worktree_path, build_id)
+    if result.ok:
         await _remove_worktree(repo_path, worktree_path)
     else:
         logger.warning(
@@ -2868,18 +3006,16 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         # FEAT-DRF (Lane 1) — the FAILURE PACK. Strictly ADDITIVE: the worktree
         # is still KEPT (nothing below removes it) and the reason still carries
-        # the forensics pointer; we merely COPY the same three receipt families
+        # the forensics pointer; we merely COPY the same receipt families
         # FEAT-DRC exports on success into <receipts>/<build_id>/ so the
         # evidence outlives the next reboot's /tmp sweep, then drop a manifest
         # indexing the pack. Both are best-effort and cannot alter the outcome.
         # 07-30 coach finding 2: the manifest reports ONLY the families THIS
         # RUN exported (the per-run list `_export_receipts` returns) — never a
         # destination read-back that would claim an earlier run's leftovers.
-        exported_families: list[str] = []
+        receipts_result: ReceiptExport | None = None
         if worktree_path is not None:
-            _ok, exported_families = _export_receipts(
-                worktree_path, receipt_build_id
-            )
+            receipts_result = _export_receipts(worktree_path, receipt_build_id)
         _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,
@@ -2888,7 +3024,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             exit_code=exit_code,
             worktree_path=worktree_path,
             branch=payload_branch,
-            exported_families=exported_families,
+            receipts=receipts_result,
             wedged=wedge_verdict is not None,
             semantic_state=(
                 monitor.semantic_state() if monitor is not None else None
