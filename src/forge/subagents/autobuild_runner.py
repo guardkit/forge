@@ -2446,6 +2446,362 @@ async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# SAME-FEATURE REQUEUE SWEEP (register find, 2026-08-01 — driven live)
+# ---------------------------------------------------------------------------
+#
+# THE FIND. A FAILED build KEEPS its outer worktree for forensics (DEFECT #19),
+# and that kept tree still holds guardkit's INNER
+# ``<outer>/.guardkit/worktrees/<task_id>`` worktree with the feature's
+# ``autobuild/<task_id>`` branch checked out. A SAME-FEATURE requeue therefore
+# dispatches fresh into a repo where that branch is alive and claimed, and
+# guardkit dies in seconds — "branch already exists and automatic cleanup
+# failed", exit 2. Observed TWICE in one afternoon (build ...141436 blocked
+# build ...145157).
+#
+# WHY THE EXISTING F3 SWEEP DID NOT COVER IT. :func:`_sweep_build_refs` is
+# deliberately NON-destructive: it DETACHES the stale inner worktree and
+# deletes the branch, and it falls back to prune-only when this feature's
+# ``.guardkit/features/<FEAT>.yaml`` is not readable in the SHARED checkout —
+# which is the live shape, because that yaml lives on the PLANNING branch the
+# shared tree is usually not on. Prune-only leaves the branch alive, and the
+# requeue dies. That sweep is left byte-unchanged; this is a second, narrower
+# pass that runs FIRST on the fresh path only.
+#
+# THE POSTURE. Destruction is allowed here ONLY behind the F11 forensics law:
+# never destroy un-exported evidence. So the pass (1) VERIFIES the prior
+# build's durable export (``failure-manifest.json`` under the receipts root)
+# and exports it first when absent, (2) sweeps — inner ``worktree remove
+# --force`` → prune → ``branch -D`` → remove the outer tree → prune, each step
+# LOUD-logged with the prior build id named, (3) lets the fresh dispatch
+# proceed. Any step that cannot be completed raises
+# :class:`PriorBuildSweepError`, which the caller turns into the runner's
+# existing honest refusal (a failed terminal naming the prior build) — never a
+# silent half-state, and never a fresh dispatch onto residue we could not clear.
+#
+# SCOPE FENCE. Only registered worktrees living UNDER the per-build worktree
+# base (``<base>/<build_id>/...``), whose outer build id is NOT this build's,
+# and whose checked-out branch is ``autobuild/<T>`` for a task id T declared by
+# THIS feature. Another feature's refs, and worktrees outside the base, are
+# never touched.
+
+
+class PriorBuildSweepError(RuntimeError):
+    """A prior same-feature build's residue could not be swept (register find).
+
+    Raised instead of proceeding, so the fresh dispatch refuses loudly rather
+    than launching into a repo whose ``autobuild/<task_id>`` branch is still
+    claimed (guardkit exit 2) or whose forensics we failed to export.
+    """
+
+
+def _prior_outer_root(inner_path: Path, base: Path) -> Path | None:
+    """``<base>/<prior_build_id>`` for an inner worktree, else ``None``.
+
+    ``_materialise_worktree`` lays every outer worktree down as
+    ``<base>/<build_id>``; guardkit then nests its inner worktrees at
+    ``<outer>/.guardkit/worktrees/<task_id>``. So the FIRST path component
+    under the base names the prior build. Anything not under the base (a
+    hand-made worktree, a lane worktree in the repo itself) returns ``None``
+    and is left strictly alone.
+    """
+    try:
+        rel = inner_path.resolve().relative_to(base)
+    except (ValueError, OSError):
+        return None
+    if not rel.parts:
+        return None
+    return base / rel.parts[0]
+
+
+def _feature_task_ids_any(
+    repo_path: Path, outer_root: Path, feature_id: str
+) -> list[str] | None:
+    """This feature's task ids, read from the shared checkout OR the prior tree.
+
+    The shared checkout is the first source (identical to
+    :func:`_sweep_build_refs`). When it has no readable
+    ``.guardkit/features/<FEAT>.yaml`` — the live shape, since that file lives
+    on the planning branch — the PRIOR build's kept outer worktree is consulted
+    instead: it was materialised from the very branch this dispatch targets, so
+    it carries the authoritative task graph. Returns ``None`` when neither
+    source is readable, and the caller then leaves the residue alone (ownership
+    unproven ⇒ never destroy).
+    """
+    ids = _feature_task_ids(repo_path, feature_id)
+    if ids:
+        return ids
+    return _feature_task_ids(outer_root, feature_id)
+
+
+def _prior_export_is_present(prior_build_id: str) -> bool:
+    """Is the prior build's durable failure pack already on disk? (F11 gate.)"""
+    return (
+        _receipts_root() / prior_build_id / FAILURE_MANIFEST_NAME
+    ).exists()
+
+
+def _export_prior_build_evidence(
+    outer_root: Path, prior_build_id: str, feature_id: str, branches: list[str]
+) -> None:
+    """Export a prior build's evidence BEFORE anything of it is destroyed (F11).
+
+    Reuses the existing export helpers verbatim — :func:`_export_receipts` for
+    the receipt families and :func:`_write_failure_manifest` for the pack index
+    — so the pack a sweep-time export produces has the same shape as one the
+    failed run would have written itself. The manifest's ``reason`` says
+    plainly that the runner (not the failed build) wrote it.
+
+    Raises :class:`PriorBuildSweepError` when the evidence cannot be made
+    durable: an un-exported prior build must never be swept.
+    """
+    ok, families = _export_receipts(outer_root, prior_build_id)
+    if not ok:
+        raise PriorBuildSweepError(
+            f"prior build {prior_build_id!r} receipts could not be exported "
+            f"from its kept worktree {outer_root} — refusing to sweep "
+            "un-exported evidence (F11 forensics law)"
+        )
+    _write_failure_manifest(
+        build_id=prior_build_id,
+        payload={"build_id": prior_build_id, "feature_id": feature_id},
+        reason=(
+            "prior build's evidence exported by the same-feature requeue "
+            "sweep — the failed run left a kept worktree but no durable "
+            "failure manifest"
+        ),
+        timed_out=False,
+        exit_code=-1,
+        worktree_path=outer_root,
+        branch=", ".join(branches) if branches else None,
+        exported_families=families,
+    )
+    if not _prior_export_is_present(prior_build_id):
+        raise PriorBuildSweepError(
+            f"prior build {prior_build_id!r} still has no "
+            f"{FAILURE_MANIFEST_NAME} under {_receipts_root()} after an export "
+            "attempt — refusing to sweep un-exported evidence (F11 forensics "
+            "law)"
+        )
+    logger.info(
+        "autobuild_runner: requeue sweep — prior build %s evidence exported "
+        "-> %s (families: %s)",
+        prior_build_id,
+        _receipts_root() / prior_build_id,
+        ", ".join(families) if families else "none present",
+    )
+
+
+async def _sweep_prior_build_residue(
+    repo_path: Path, feature_id: str, *, current_build_id: str
+) -> None:
+    """Clear a PRIOR same-feature build's kept worktree + branch (register find).
+
+    Fresh-path only, and a no-op unless a registered worktree under the
+    per-build worktree base belongs to an EARLIER build of THIS feature. See
+    the region header above for the find, the posture and the scope fence.
+
+    Every failure — including an unexpected one — leaves as a
+    :class:`PriorBuildSweepError`. Unlike :func:`_sweep_build_refs` (which is
+    non-destructive and therefore degrades to a warning), this pass can leave
+    the repo half-swept, so it must never be swallowed.
+
+    Raises:
+        PriorBuildSweepError: any step failed. The caller refuses the dispatch
+            loudly; a half-swept repo is never handed to guardkit.
+    """
+    try:
+        await _sweep_prior_build_residue_impl(
+            repo_path, feature_id, current_build_id=current_build_id
+        )
+    except PriorBuildSweepError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a destructive pass never degrades
+        raise PriorBuildSweepError(
+            f"the same-feature requeue sweep failed unexpectedly "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+
+
+async def _sweep_prior_build_residue_impl(
+    repo_path: Path, feature_id: str, *, current_build_id: str
+) -> None:
+    """Body of :func:`_sweep_prior_build_residue` (see its docstring)."""
+    try:
+        base = _worktree_base_dir().resolve()
+    except OSError:  # pragma: no cover — unresolvable base ⇒ nothing to sweep
+        return
+    if not base.exists():
+        return
+
+    # DISCOVERY degrades; DESTRUCTION refuses. Failing to even LOOK touches
+    # nothing, so it can never leave a half-swept repo — it is the pre-cure
+    # behaviour exactly (any real collision then surfaces as the loud
+    # worktree-add / guardkit failure). Only once residue is FOUND and proven
+    # to be this feature's does every further failure become a refusal.
+    try:
+        registered = await _list_registered_worktrees(repo_path)
+    except Exception as exc:  # noqa: BLE001 — discovery is not destruction
+        logger.warning(
+            "autobuild_runner: requeue sweep — could not enumerate the "
+            "worktrees of %s (%s: %s); NOTHING was touched. A prior "
+            "same-feature build's residue, if any, is left for the dispatch "
+            "to hit loudly.",
+            repo_path,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    # outer_root -> [(inner_path, branch), ...]
+    prior: dict[Path, list[tuple[Path, str]]] = {}
+    for path, branch in registered:
+        if branch is None or not branch.startswith("autobuild/"):
+            continue
+        outer_root = _prior_outer_root(path, base)
+        if outer_root is None or outer_root.name == current_build_id:
+            continue
+        prior.setdefault(outer_root, []).append((path, branch))
+    if not prior:
+        return
+
+    for outer_root, entries in sorted(prior.items()):
+        prior_build_id = outer_root.name
+        task_ids = _feature_task_ids_any(repo_path, outer_root, feature_id)
+        if task_ids is None:
+            logger.warning(
+                "autobuild_runner: requeue sweep — prior build %s holds "
+                "autobuild branches but this feature's task ids are unreadable "
+                "in %s and in the kept tree; ownership UNPROVEN, leaving it "
+                "alone (the fresh dispatch may still fail loudly on the "
+                "claimed branch)",
+                prior_build_id,
+                repo_path,
+            )
+            continue
+        owned = [
+            (inner, branch)
+            for inner, branch in entries
+            if branch[len("autobuild/") :] in set(task_ids)
+        ]
+        if not owned:
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s holds no "
+                "task branch of feature %s; left untouched",
+                prior_build_id,
+                feature_id,
+            )
+            continue
+
+        for inner, branch in owned:
+            logger.warning(
+                "autobuild_runner: requeue sweep — prior build %s kept "
+                "worktree found for feature %s: branch %s is still checked "
+                "out at %s; a fresh same-feature dispatch would die on it "
+                "(guardkit: branch already exists)",
+                prior_build_id,
+                feature_id,
+                branch,
+                inner,
+            )
+
+        # (1) F11 — durable evidence first, ALWAYS, before any destruction.
+        # Coordinator cure (SL1 coach BLOCKER): the manifest's presence proves
+        # a FILE exists, not that the receipts do — the live failure path
+        # writes the manifest even when the receipt export itself failed
+        # (ok=False). So the export runs UNCONDITIONALLY here (copytree is
+        # dirs_exist_ok=True, so a re-export over a good prior pack is an
+        # idempotent no-op) and the manifest check is only the post-verify.
+        if _prior_export_is_present(prior_build_id):
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s has a "
+                "durable manifest (%s); re-exporting anyway before any "
+                "destruction (idempotent; a manifest is not the receipts)",
+                prior_build_id,
+                _receipts_root() / prior_build_id / FAILURE_MANIFEST_NAME,
+            )
+        else:
+            logger.warning(
+                "autobuild_runner: requeue sweep — prior build %s has NO "
+                "durable export under %s; exporting it BEFORE any destruction "
+                "(F11 forensics law)",
+                prior_build_id,
+                _receipts_root(),
+            )
+        _export_prior_build_evidence(
+            outer_root,
+            prior_build_id,
+            feature_id,
+            [branch for _inner, branch in owned],
+        )
+
+        # (2) Sweep — each step loud, each step naming the prior build.
+        for inner, branch in owned:
+            code, output = await _run_git(
+                ["worktree", "remove", "--force", str(inner)], cwd=repo_path
+            )
+            if code != 0 and inner.exists():
+                raise PriorBuildSweepError(
+                    f"prior build {prior_build_id!r}: `git worktree remove "
+                    f"--force {inner}` failed (exit={code}): {output}"
+                )
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s: removed "
+                "inner worktree %s (branch %s)",
+                prior_build_id,
+                inner,
+                branch,
+            )
+
+        code, output = await _run_git(["worktree", "prune"], cwd=repo_path)
+        logger.info(
+            "autobuild_runner: requeue sweep — prior build %s: `git worktree "
+            "prune` exit=%s%s",
+            prior_build_id,
+            code,
+            f" ({output})" if output else "",
+        )
+
+        for _inner, branch in owned:
+            if not await _local_branch_exists(repo_path, branch):
+                continue
+            code, output = await _run_git(
+                ["branch", "-D", branch], cwd=repo_path
+            )
+            if code != 0:
+                raise PriorBuildSweepError(
+                    f"prior build {prior_build_id!r}: `git branch -D {branch}` "
+                    f"failed (exit={code}): {output}"
+                )
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s: deleted "
+                "branch %s",
+                prior_build_id,
+                branch,
+            )
+
+        try:
+            shutil.rmtree(outer_root, ignore_errors=False)
+        except OSError as exc:
+            raise PriorBuildSweepError(
+                f"prior build {prior_build_id!r}: could not remove its kept "
+                f"outer worktree {outer_root} ({type(exc).__name__}: {exc})"
+            ) from exc
+        logger.info(
+            "autobuild_runner: requeue sweep — prior build %s: removed outer "
+            "worktree tree %s (its evidence is durable under %s)",
+            prior_build_id,
+            outer_root,
+            _receipts_root() / prior_build_id,
+        )
+        await _run_git(["worktree", "prune"], cwd=repo_path)
+        logger.info(
+            "autobuild_runner: requeue sweep — prior build %s swept; the "
+            "fresh dispatch for feature %s may proceed",
+            prior_build_id,
+            feature_id,
+        )
+
+
 def _with_worktree_forensics(reason: str, worktree_path: Path | None) -> str:
     """Append the kept-worktree forensics pointer to a failure ``reason``.
 
@@ -2654,6 +3010,27 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                         f"{repo_path} — refusing to fetch (DEFECT #19: the "
                         "runner reads the local ref only and never touches the "
                         "shared checkout)"
+                    ),
+                )
+            )
+        # SAME-FEATURE REQUEUE SWEEP (register find 2026-08-01) — a PRIOR
+        # failed build of THIS feature keeps its worktree for forensics, and
+        # that tree still claims the feature's autobuild/<task_id> branch, so
+        # this fresh dispatch would die in seconds ("branch already exists").
+        # Runs FIRST (before the non-destructive F3 pass) and only after the
+        # prior build's evidence is durable. A sweep it cannot complete is an
+        # honest refusal, never a half-swept repo handed to guardkit.
+        try:
+            await _sweep_prior_build_residue(
+                repo_path, feature_id, current_build_id=build_id
+            )
+        except PriorBuildSweepError as exc:
+            return _snapshot_update(
+                _build_failed_snapshot(
+                    payload,
+                    reason=(
+                        "refusing the fresh dispatch: a prior same-feature "
+                        f"build's residue could not be swept — {exc}"
                     ),
                 )
             )
