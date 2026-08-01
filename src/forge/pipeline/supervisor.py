@@ -802,12 +802,25 @@ class Supervisor:
         ):
             return TurnOutcome.TERMINAL
         # RED_GATE_LOOP_BACK — the only checkpoint outcome that re-enters
-        # the fix cycle. No card was published on this path. HONEST CAVEAT
-        # (C2 coach, 2026-07-31): in the CURRENT production composition
-        # subscriber_factory and gates_green_reader are unwired (None), so
-        # this WAITING cannot arm a resume and the journey ends WAIT_EXPIRED
-        # — a red-gate stop mis-worded as a wait expiry. First item of the
-        # attended shadow replay; until then this comment is the truth.
+        # the fix cycle. No card was published on this path.
+        #
+        # WAITING is the right word HERE, and the driver picks the right
+        # word THERE (shadow-replay item 1, 2026-08-01). The distinction
+        # this method cannot make, and does not try to:
+        #
+        #   * a loop-back with a resume seam wired is a genuine wait — the
+        #     conductor's next review pass picks the branch up, and the
+        #     re-plan is legitimate;
+        #   * a loop-back with NO resume seam has nothing to wake it, so
+        #     the driver terminates the journey
+        #     ``ConductorRunOutcome.RED_GATE_STOP`` — naming the red gate
+        #     in the report and the failure pack. It is never written up
+        #     as ``WAIT_EXPIRED`` any more; a red-gate refusal is not a
+        #     silence, and the old caveat here said exactly that.
+        #
+        # Whether the wait can arm is a property of the driver's deps, not
+        # of a checkpoint result, which is why the branch lives in
+        # ``conductor_driver`` and this mapping stays as it is.
         return TurnOutcome.WAITING
 
     # ------------------------------------------------------------------
@@ -1518,26 +1531,52 @@ class Supervisor:
             "feature_id": None,
             "rationale": rationale,
         }
+        # BOTH Mode C stages carry forward context (shadow-replay item 4).
+        #
+        # Only TASK_WORK asked for it before, which left
+        # ``ForwardContextBuilder._build_for_mode_c``'s TASK_REVIEW branch
+        # — "consume every approved /task-work row", the AC-005 contract —
+        # as unreachable code. The consequence was not cosmetic: the
+        # FOLLOW-UP review, the one that decides whether the fixes landed,
+        # was dispatched blind to the very work it is reviewing. It saw
+        # the worktree and nothing else.
+        #
+        # The fix-task ref is the ONLY difference between the two calls:
+        # TASK_WORK threads the ref it is about to work on, TASK_REVIEW
+        # has no single subject (its subject is *all* the completed fix
+        # work) and passes ``None``. The builder already reads the rows
+        # itself for that branch.
+        wants_forward_context = chosen_stage in (
+            StageClass.TASK_WORK,
+            StageClass.TASK_REVIEW,
+        )
+        fix_task_for_context: Any | None = None
         if chosen_stage is StageClass.TASK_WORK and plan.next_fix_task is not None:
+            fix_task_for_context = plan.next_fix_task
             dispatcher_kwargs["fix_task"] = plan.next_fix_task
-            if self.fix_task_context_builder is not None:
-                try:
-                    dispatcher_kwargs["forward_context"] = (
-                        self.fix_task_context_builder(
-                            chosen_stage,
-                            build_id,
-                            plan.next_fix_task,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 — defensive
-                    logger.warning(
-                        "supervisor.next_turn (MODE_C): "
-                        "fix_task_context_builder raised %s: %s for "
-                        "build_id=%s — dispatching without forward_context",
-                        type(exc).__name__,
-                        exc,
-                        build_id,
-                    )
+        elif chosen_stage is StageClass.TASK_WORK:
+            # TASK_WORK with no ref: nothing to build context around, and
+            # the builder's own guard says so. Unchanged behaviour.
+            wants_forward_context = False
+
+        if wants_forward_context and self.fix_task_context_builder is not None:
+            try:
+                dispatcher_kwargs["forward_context"] = self.fix_task_context_builder(
+                    chosen_stage,
+                    build_id,
+                    fix_task_for_context,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "supervisor.next_turn (MODE_C): "
+                    "fix_task_context_builder raised %s: %s for "
+                    "build_id=%s stage=%s — dispatching without "
+                    "forward_context",
+                    type(exc).__name__,
+                    exc,
+                    build_id,
+                    getattr(chosen_stage, "value", chosen_stage),
+                )
 
         dispatch_result = await self.subprocess_dispatcher(**dispatcher_kwargs)
         report = TurnReport(

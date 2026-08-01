@@ -361,6 +361,45 @@ class TestTheWholeFixJourney:
         assert SOURCE_BUILD_ID in blob
         assert "failure_pack" in blob
 
+    def test_the_followup_review_sees_every_completed_fix_task(self, rig) -> None:
+        """Shadow-replay item 4, round-tripped through the REAL builder.
+
+        ``ForwardContextBuilder._build_for_mode_c``'s TASK_REVIEW branch —
+        "consume every approved /task-work row" — was unreachable: the
+        supervisor asked for forward context on TASK_WORK only. So the
+        follow-up review, the leg that decides whether the fixes landed,
+        was dispatched blind to the work it was reviewing.
+
+        Here the whole journey runs through the real builder, the real
+        stage_log projection and a real SQLite database, and the assertion
+        is on the ARGV the second review is actually dispatched with.
+        """
+        rig.run(FakeCardDelivery())
+
+        reviews = [c for c in rig.guardkit.calls if c["subcommand"] == "task-review"]
+        contexts = list(reviews[1]["extra_context_paths"] or ())
+
+        for fix_task in FIX_TASKS:
+            assert any(f"{fix_task}.patch" in c for c in contexts), (
+                f"the follow-up review was dispatched without {fix_task}'s "
+                f"work artefact; its context paths were {contexts}"
+            )
+
+    def test_the_opening_review_carries_no_work_artefacts(self, rig) -> None:
+        """The context is the CYCLE's, not a constant.
+
+        The first review runs before any fix work exists, so its context
+        has no work artefacts to carry. If it did, the builder would be
+        emitting something it did not read from the rows.
+        """
+        rig.run(FakeCardDelivery())
+
+        opening = [
+            c for c in rig.guardkit.calls if c["subcommand"] == "task-review"
+        ][0]
+
+        assert not (opening["extra_context_paths"] or ())
+
     def test_the_journey_closes_out_durably(self, rig) -> None:
         rig.run(FakeCardDelivery())
 
@@ -408,7 +447,31 @@ class TestARedGateNeverPublishes:
         report = rig.run(delivery, gates_green=False)
 
         assert delivery.publishes == []
-        assert report.outcome is not ConductorRunOutcome.DELIVERED
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
+
+    def test_a_red_gate_journey_says_RED_GATE_not_wait_expired(self, rig) -> None:
+        """Shadow-replay item 1 — the honest WORD, pinned to the word.
+
+        This test used to assert ``is not DELIVERED``, which every stop in
+        the enum satisfies. What it actually observed, and did not say,
+        was ``WAIT_EXPIRED``: a red gate written up as "nobody answered".
+        """
+        report = rig.run(FakeCardDelivery(), gates_green=False)
+
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
+        assert report.outcome is not ConductorRunOutcome.WAIT_EXPIRED
+        assert "red" in report.rationale.lower()
+
+    def test_the_red_gate_pack_names_the_red_gate(self, rig) -> None:
+        """A pack that says "wait expired" sends a diagnoser to the wrong place."""
+        rig.run(FakeCardDelivery(), gates_green=False)
+
+        manifest = json.loads(
+            (rig.receipts_root / BUILD_ID / "failure-manifest.json").read_text()
+        )
+        assert manifest["outcome"] == ConductorRunOutcome.RED_GATE_STOP.value
+        assert "gates red" in manifest["reason"] or "gates" in manifest["reason"]
+        assert "wait" not in manifest["reason"].lower()
 
     def test_a_red_gate_journey_leaves_its_own_failure_pack(self, rig) -> None:
         rig.run(FakeCardDelivery(), gates_green=False)

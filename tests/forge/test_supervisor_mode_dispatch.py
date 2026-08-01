@@ -328,6 +328,13 @@ def _build_supervisor() -> tuple[Supervisor, dict[str, Any]]:
         captured_fix_tasks.append(
             {"stage": stage, "build_id": build_id, "fix_task": fix_task}
         )
+        # ``fix_task`` is None for the follow-up TASK_REVIEW — its subject
+        # is every completed fix task, not one of them (the real builder
+        # reads the rows itself). Mirror that here rather than blowing up
+        # inside the supervisor's defensive except-clause, which would
+        # hide the very call under test.
+        if fix_task is None:
+            return {"stage": stage.value}
         return {"--fix-task": fix_task.fix_task_id}
 
     supervisor = Supervisor(
@@ -828,6 +835,64 @@ class TestModeCFixTaskInjection:
         assert len(captured) == 1
         assert captured[0]["stage"] is StageClass.TASK_WORK
         assert captured[0]["fix_task"].fix_task_id == "FIX-A"
+
+    def test_the_followup_review_also_gets_forward_context(self) -> None:
+        """Shadow-replay item 4 — BOTH Mode C stages carry context.
+
+        Only TASK_WORK asked for it, which left the builder's TASK_REVIEW
+        branch ("consume every approved /task-work row") unreachable and
+        dispatched the follow-up review blind to the work it reviews.
+        """
+        supervisor, doubles = _build_supervisor()
+        doubles["mode_reader"].modes["build-FX"] = BuildMode.MODE_C
+        doubles["ordering_reader"].approved.add(
+            ("build-FX", StageClass.TASK_REVIEW, None)
+        )
+        doubles["ordering_reader"].approved.add(
+            ("build-FX", StageClass.TASK_WORK, None)
+        )
+        doubles["mode_c_history"].histories["build-FX"] = [
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_REVIEW,
+                status="approved",
+                fix_tasks=("FIX-A",),
+            ),
+            ModeCStageEntry(
+                stage_class=StageClass.TASK_WORK,
+                status="approved",
+                fix_task_id="FIX-A",
+            ),
+        ]
+
+        report = _run(supervisor.next_turn("build-FX"))
+
+        assert report.chosen_stage is StageClass.TASK_REVIEW
+        captured = doubles["captured_fix_tasks"]
+        assert [c["stage"] for c in captured] == [StageClass.TASK_REVIEW]
+        # No single fix task is its subject — every completed one is.
+        assert captured[0]["fix_task"] is None
+        # And the context actually reached the dispatcher.
+        call = doubles["subprocess"].calls[-1]
+        assert call["forward_context"] == {"stage": "task-review"}
+
+    def test_task_work_with_no_fix_task_ref_asks_for_no_context(self) -> None:
+        """Unchanged behaviour on the one TASK_WORK path that has no ref.
+
+        The builder's own guard refuses a ref-less TASK_WORK, so asking
+        would only produce a warning and an empty context.
+        """
+        supervisor, doubles = _build_supervisor()
+        doubles["mode_reader"].modes["build-FX"] = BuildMode.MODE_C
+        doubles["ordering_reader"].approved.add(
+            ("build-FX", StageClass.TASK_REVIEW, None)
+        )
+        doubles["mode_c_history"].histories["build-FX"] = []
+
+        _run(supervisor.next_turn("build-FX"))
+
+        # The opening review is the chosen stage here; TASK_WORK never ran
+        # without a ref, so nothing asserts about it beyond "no crash".
+        assert doubles["captured_fix_tasks"][0]["stage"] is StageClass.TASK_REVIEW
 
 
 # ---------------------------------------------------------------------------

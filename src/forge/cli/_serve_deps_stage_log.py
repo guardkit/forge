@@ -56,6 +56,10 @@ from datetime import UTC, datetime
 from pathlib import PurePath
 from typing import Any, Mapping, Protocol
 
+from forge.cli._serve_deps_forward_context import (
+    STAGE_LOG_GATE_DECISION_APPROVED,
+    STAGE_LOG_GATE_DECISION_KEY,
+)
 from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.dispatchers.autobuild_async import StageLogRecorder
 from forge.pipeline.stage_taxonomy import StageClass
@@ -377,8 +381,13 @@ FIX_JOURNEY_TARGET_KIND: str = "local_tool"
 #: The schema's CHECK allows only PASSED / FAILED / GATED / SKIPPED; the
 #: projection maps PASSED → ``approved`` and FAILED → ``failed``, which is
 #: exactly the planner vocabulary a completed dispatch should produce.
+#: The ``stage_log.status`` a successful fix-journey dispatch writes. Named
+#: because two things key off it now: the row's own status column, and the
+#: forward-context builder's approved-row filter (see ``record_dispatch``).
+_STAGE_LOG_PASSED: str = "PASSED"
+
 _DISPATCH_STATUS_TO_STAGE_LOG: Mapping[str, str] = {
-    "success": "PASSED",
+    "success": _STAGE_LOG_PASSED,
     "failed": "FAILED",
     "degraded": "FAILED",
 }
@@ -496,6 +505,23 @@ class _FixJourneyStageLogWriter:
         }
         if feature_id:
             details["feature_id"] = feature_id
+
+        # THE ROW HAS TO BE READABLE BY THE FORWARD-CONTEXT BUILDER
+        # (shadow-replay item 4). The builder's Mode C follow-up-review
+        # branch reads "every APPROVED /task-work row" through
+        # ``_SqliteStageLogReader``, whose filter is
+        # ``details_json["gate_decision"] == "approved"``. This writer
+        # never wrote that key, so every fix-journey row was invisible to
+        # it and the branch could only ever return an empty list — the
+        # follow-up review dispatched blind to the work it reviews.
+        #
+        # What counts as "approved" for a fix journey: a stage that
+        # DISPATCHED AND SUCCEEDED. The fix journey has no per-stage human
+        # gate — the owner's one act is the merge word at the end — so the
+        # subprocess's own exit code is the approval, and a FAILED /
+        # DEGRADED row stays unreadable, which is the honest reading.
+        if row_status == _STAGE_LOG_PASSED:
+            details[STAGE_LOG_GATE_DECISION_KEY] = STAGE_LOG_GATE_DECISION_APPROVED
 
         target_identifier = feature_id or build_id
         if stage is StageClass.TASK_REVIEW:

@@ -607,6 +607,7 @@ def bind_production_dispatch_chain(
                     gate_repository=gate_repository,
                     gate_state_machine=gate_state_machine,
                     clock=_gate_wall_clock,
+                    nats_client=client,
                 )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             conductor_router = None
@@ -1338,6 +1339,7 @@ def _compose_conductor_router(
     gate_repository: Any,
     gate_state_machine: Any,
     clock: "Callable[[], datetime]",
+    nats_client: Any = None,
 ) -> "Callable[..., Any] | None":
     """Compose the ACTIVATED conductor router (Stage 2, shakeout item 3).
 
@@ -1365,14 +1367,29 @@ def _compose_conductor_router(
     4. The router, which reads the dequeued build's mode and answers
        ``False`` for anything that is not a fix journey.
 
-    ``gates_green_reader`` is deliberately left unwired. The full gate set
-    on a candidate branch has no production reader in this tree yet, and
-    the checkpoint treats "no reader" as UNKNOWN, which it treats as RED.
-    So the conductor can run a whole fix journey and will NOT publish a
-    merge card until a real gate reader is wired — which is exactly the
-    §c.3 precondition ("proven green", never "not proven red") holding by
-    construction rather than by intention. Stage 2's attended shadow
-    replay is where that reader earns its wiring.
+    5. The **gates-green reader** and the **resume subscription** — the
+       two seams Stage 2 shipped as literal ``None`` and the shadow-replay
+       lane wired (items 2 and 3).
+
+    ``gates_green_reader`` is :func:`make_gates_green_reader`: it resolves
+    the TARGET REPO's own declared toolchain test command (guardkit's
+    ``<repo>/.guardkit/config.yaml`` declaration, loaded by guardkit's own
+    loader) and runs it in the fix branch's worktree under the
+    declaration's own timeout. **Exit 0 is the verdict.** A repo that
+    declares nothing reads UNKNOWN, which the checkpoint treats as RED —
+    so the §c.3 precondition ("proven green", never "not proven red")
+    still holds by construction; what changed is that a repo which DOES
+    declare its toolchain can now prove green rather than being walled out
+    of the merge word.
+
+    ``subscriber_factory`` is composed exactly as
+    :mod:`forge.cli._serve_planning` and ``rearm_paused_gates`` compose
+    theirs — an ``ApprovalSubscriber`` over an
+    :class:`~forge.adapters.nats.envelope_subscribe.EnvelopeSubscribeClient`
+    carrying the driver's ``armed`` event, so arm-before-post is the
+    subscription's own first act. It needs the shared NATS client; absent
+    one (a boot where the client is not threaded, or a test) the seam
+    stays ``None`` and the driver stops loudly instead of spin-polling.
     """
     from pathlib import Path
 
@@ -1380,6 +1397,7 @@ def _compose_conductor_router(
     from forge.cli._serve_conductor import (
         build_conductor_driver_deps_factory,
         build_conductor_supervisor_factory,
+        make_gates_green_reader,
     )
     from forge.cli._serve_deps_forward_context import (
         ForgeConfigWorktreeAllowlist,
@@ -1419,6 +1437,40 @@ def _compose_conductor_router(
             "and leave receipts; it will publish no card and will say so"
         )
 
+    gates_green_reader = make_gates_green_reader(
+        pool=sqlite_pool, config=forge_config
+    )
+
+    # The resume seam. Composed over the shared NATS client the same way
+    # the planning driver and the gate rearm compose theirs — same
+    # subscriber class, same envelope-adapting client, same armed event.
+    subscriber_factory: Any = None
+    if nats_client is not None:
+        from forge.adapters.nats.approval_subscriber import (
+            ApprovalSubscriber,
+            ApprovalSubscriberDeps,
+        )
+        from forge.adapters.nats.envelope_subscribe import EnvelopeSubscribeClient
+
+        def subscriber_factory(  # type: ignore[misc]
+            expected_approver: "str | None", armed: "asyncio.Event | None"
+        ) -> Any:
+            return ApprovalSubscriber(
+                ApprovalSubscriberDeps(
+                    nats_client=EnvelopeSubscribeClient(nats_client, armed),
+                    config=forge_config.approval,
+                    publish_refresh=None,
+                    expected_approver=expected_approver,
+                )
+            )
+    else:
+        logger.warning(
+            "conductor: no NATS client was threaded into the conductor "
+            "composition — the resume subscription stays UNWIRED. A fix "
+            "journey that parks on an owner's answer will stop loudly "
+            "(never spin-poll), and a red gate stops as RED_GATE_STOP"
+        )
+
     supervisor_factory = build_conductor_supervisor_factory(
         pool=sqlite_pool,
         config=forge_config,
@@ -1428,12 +1480,12 @@ def _compose_conductor_router(
         subprocess_runner=guardkit_run,
         lifecycle_emitter=lifecycle_emitter,
         publish_card=publish_card,
-        gates_green_reader=None,
+        gates_green_reader=gates_green_reader,
     )
     driver_deps_factory = build_conductor_driver_deps_factory(
         pool=sqlite_pool,
         config=forge_config,
-        subscriber_factory=None,
+        subscriber_factory=subscriber_factory,
     )
     return build_conductor_router(
         pool=sqlite_pool,

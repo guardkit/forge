@@ -564,6 +564,113 @@ class TestStructuredWait:
 
 
 # ---------------------------------------------------------------------------
+# THE RED-GATE HONEST WORD (shadow-replay item 1)
+# ---------------------------------------------------------------------------
+
+
+def _red_gate_report() -> TurnReport:
+    """A WAITING turn whose dispatch result is a REAL red-gate loop-back.
+
+    Built from the production :class:`MergeCardDecision` so the duck-typed
+    ``loops_back`` / ``gates`` reads under test are the real fields, not a
+    stub that happens to answer the same way.
+    """
+    from forge.pipeline.merge_ready_checkpoint import (
+        GatesReport,
+        GateStatus,
+        MergeCardDecision,
+        MergeCardOutcome,
+    )
+
+    return TurnReport(
+        outcome=TurnOutcome.WAITING,
+        build_id=BUILD_ID,
+        rationale="the merge-ready checkpoint looped back",
+        dispatch_result=MergeCardDecision(
+            outcome=MergeCardOutcome.RED_GATE_LOOP_BACK,
+            build_id=BUILD_ID,
+            gates=GatesReport(
+                status=GateStatus.RED,
+                failed_gates=("declared toolchain test",),
+                detail="`npm test` exited 1",
+            ),
+        ),
+    )
+
+
+class TestTheRedGateHonestWord:
+    def test_a_red_gate_with_no_resume_seam_stops_RED_GATE_STOP(self) -> None:
+        """The lane's sharpest item: never WAIT_EXPIRED for a red gate.
+
+        With no resume seam the loop-back has nothing to wake it, so the
+        journey stops — and the stop is named for what caused it.
+        """
+        supervisor = FakeSupervisor(script=[_red_gate_report()] * 5)
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
+        assert report.outcome is not ConductorRunOutcome.WAIT_EXPIRED
+        assert supervisor.calls == [BUILD_ID]  # one turn, no spin
+
+    def test_the_stop_names_the_failing_gate(self) -> None:
+        supervisor = FakeSupervisor(script=[_red_gate_report()])
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert "declared toolchain test" in report.rationale
+        assert "red" in report.rationale.lower()
+
+    def test_the_failure_pack_carries_the_red_gate_word(self) -> None:
+        packs: list[dict[str, Any]] = []
+        supervisor = FakeSupervisor(script=[_red_gate_report()])
+        deps = _deps(
+            supervisor,
+            write_failure_pack=lambda **kw: packs.append(kw) or "pack-key",
+        )
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, deps))
+
+        assert report.failure_pack == "pack-key"
+        assert packs[0]["outcome"] == ConductorRunOutcome.RED_GATE_STOP.value
+        assert "declared toolchain test" in packs[0]["reason"]
+
+    def test_a_red_gate_WITH_a_resume_seam_stays_a_legitimate_wait(self) -> None:
+        """The other half of the ruling: a re-plan IS legitimate here.
+
+        A loop-back that something can wake is the design — the next
+        review pass picks the branch up. So with a wait seam wired the
+        turn waits, the loop re-plans, and RED_GATE_STOP is never reached.
+        """
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                _red_gate_report(),
+                _report(TurnOutcome.TERMINAL, rationale="re-planned and closed"),
+            ]
+        )
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait)))
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert len(supervisor.calls) == 2  # it really did re-plan
+        assert wait.subscribe_calls  # and it really did wait first
+
+    def test_a_plain_waiting_turn_is_still_a_wait_expiry(self) -> None:
+        """The new word is reachable ONLY from a red-gate loop-back.
+
+        A WAITING turn that is not a checkpoint result keeps the old
+        outcome exactly — this branch must not swallow the wait-expiry
+        stop it sits next to.
+        """
+        supervisor = FakeSupervisor(script=[_report(TurnOutcome.WAITING)])
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.WAIT_EXPIRED
+
+
+# ---------------------------------------------------------------------------
 # Stop rules
 # ---------------------------------------------------------------------------
 

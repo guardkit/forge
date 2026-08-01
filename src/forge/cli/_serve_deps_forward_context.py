@@ -272,13 +272,22 @@ def build_forward_context_builder(
 #: (e.g. the supervisor terminal handlers). Rows that lack this key are
 #: treated as not-yet-approved and filtered out, matching the Protocol
 #: contract on :class:`StageLogReader`.
-_DETAILS_GATE_DECISION_KEY: str = "gate_decision"
+#: Public names for the two constants above. The fix journey's own
+#: ``stage_log`` writer (:mod:`forge.cli._serve_deps_stage_log`) has to
+#: write the SAME key/value this reader filters on, or its rows are
+#: invisible to the forward-context builder — which is exactly how the
+#: Mode C follow-up-review branch ended up dead. One source, imported,
+#: never a re-typed string literal.
+STAGE_LOG_GATE_DECISION_KEY: str = "gate_decision"
+STAGE_LOG_GATE_DECISION_APPROVED: str = "approved"
+
+_DETAILS_GATE_DECISION_KEY: str = STAGE_LOG_GATE_DECISION_KEY
 
 #: Value of :data:`_DETAILS_GATE_DECISION_KEY` that admits a row to the
 #: forward-context builder. Matches the ``_STATUS_APPROVED`` constant used by
 #: :mod:`forge.pipeline.mode_c_planner` and
 #: :mod:`forge.pipeline.terminal_handlers.mode_c`.
-_GATE_DECISION_APPROVED: str = "approved"
+_GATE_DECISION_APPROVED: str = STAGE_LOG_GATE_DECISION_APPROVED
 
 #: Key under which the per-feature scoping discriminator is echoed onto
 #: ``stage_log.details_json`` by :class:`_AutobuildStageLogRecorder` (TASK-FW10-004).

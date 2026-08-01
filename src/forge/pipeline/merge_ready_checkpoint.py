@@ -56,6 +56,11 @@ The three laws it enforces
   shakeout item 6). The moment a publish is *attempted* on a build the
   checkpoint latches: any later ``submit_decision`` for that build answers
   :attr:`MergeCardOutcome.ALREADY_CHECKPOINTED` and publishes nothing.
+  The latch has **two halves** — an in-process set and an injected
+  DURABLE probe over the gate's own rows, because the publisher is built
+  fresh per build and a restart would otherwise re-card. See
+  :meth:`MergeReadyCheckpointPublisher._already_carded`, which also names
+  the one residual window this does not close.
 
   Why a latch and not a re-issue. Before this, a publish that raised
   reported ``PUBLISH_FAILED``, the supervisor mapped that to ``WAITING``,
@@ -297,6 +302,14 @@ class MergeReadyCheckpointPublisher:
         failure_pack_writer: ``(*, build_id, feature_id, reason, gates)
             -> Any`` — writes the journey's own failure pack on the
             TERMINATE_FAILED branch.
+        published_probe: ``(build_id) -> bool`` — **the DURABLE half of
+            the one-card latch.** ``True`` when a merge card has already
+            been published for this build according to a durable row
+            (production reads the gate's own ``stage_log`` rows). ``None``
+            leaves the latch in-memory-only, which is what every test
+            double and every pre-existing caller gets. See
+            :meth:`_already_carded` for the exact residual window this
+            closes and the one it does not.
     """
 
     def __init__(
@@ -309,6 +322,7 @@ class MergeReadyCheckpointPublisher:
         push_branch: Callable[..., Any] | None = None,
         red_gate_action: Callable[[str, GatesReport], RedGateAction] | None = None,
         failure_pack_writer: Callable[..., Any] | None = None,
+        published_probe: Callable[[str], Any] | None = None,
     ) -> None:
         self._publish_card = publish_card
         self._gates_green_reader = gates_green_reader
@@ -317,12 +331,16 @@ class MergeReadyCheckpointPublisher:
         self._push_branch = push_branch
         self._red_gate_action = red_gate_action
         self._failure_pack_writer = failure_pack_writer
+        self._published_probe = published_probe
         # THE PUBLISH LATCH — build ids whose card publish has been
         # ATTEMPTED. Armed before the await, so even a raise inside the
         # publisher leaves it armed: "we may have put a card on the wire"
         # is the state that must never be retried. A red gate does NOT
         # arm it — looping back into the fix cycle and checkpointing again
         # later is the design, and that path never reached a publisher.
+        #
+        # This set is PROCESS state, which is why it is only half the
+        # latch: see :meth:`_already_carded`.
         self._published: set[str] = set()
 
     async def submit_decision(
@@ -339,7 +357,7 @@ class MergeReadyCheckpointPublisher:
         four supervisor call sites reach this one implementation without
         changing what they pass.
         """
-        if build_id in self._published:
+        if await self._already_carded(build_id):
             # Bounded to the ONE card. See the class docstring's latch
             # note: a second checkpoint on a build whose publish was
             # already attempted publishes nothing, ever.
@@ -549,6 +567,72 @@ class MergeReadyCheckpointPublisher:
         )
 
     # -- internals ----------------------------------------------------
+
+    async def _already_carded(self, build_id: str) -> bool:
+        """Has this build's merge card already been published? Both halves.
+
+        **The in-memory half** (``self._published``) is armed the instant
+        a publish is *attempted*, before the await. It is exact within one
+        process and worthless across a restart: the publisher is
+        constructed per build by the supervisor factory, so a daemon that
+        restarts mid-journey builds a fresh publisher with an empty set
+        and would happily card the same build a second time. One journey,
+        two merge cards, for one merge word.
+
+        **The durable half** (``published_probe``) closes that. Production
+        wires it to the gate's OWN rows: the merge card rides
+        ``gate_check``, which writes a ``stage_log`` row labelled with the
+        merge-ready checkpoint before it ever waits for the owner. That
+        row is durable, it is written on the SAME publish, and — unlike
+        ``builds.pending_approval_request_id`` — it survives the owner
+        answering, so the probe stays true for the rest of the build's
+        life. A restart therefore reads "already carded" and refuses.
+
+        **The residual window, honestly.** The durable row is written
+        *inside* ``publish_card``, a few statements after the in-memory
+        latch arms. A daemon killed in exactly that interval leaves no
+        durable evidence, so a restart could re-card. The window is the
+        span between arming the latch and the gate's first SQLite write —
+        milliseconds, no I/O of ours in between, and it is only reachable
+        by a hard kill (a raise inside the publisher is already terminal
+        via ``PUBLISH_FAILED``). Closing it completely would need the
+        checkpoint to own a durable pre-publish intent row of its own,
+        which means a second writer racing the gate's state machine for
+        the same fact — the exact shape of the false-terminal defect the
+        FTR lesson bans. So it stays open, named here, rather than closed
+        by a mechanism that would cost more than it buys.
+
+        A probe that RAISES answers "not carded" and says so loudly: an
+        unreadable probe must not wedge a journey that has never carded,
+        and the in-memory half still covers the same-process case.
+        """
+        if build_id in self._published:
+            return True
+        if self._published_probe is None:
+            return False
+        try:
+            carded = bool(await _maybe_await(self._published_probe(build_id)))
+        except Exception as exc:  # noqa: BLE001 — an unreadable probe is not a card
+            logger.error(
+                "%s: published_probe raised %s: %s for build_id=%s — falling "
+                "back to the in-process latch alone. A restart-crossing "
+                "duplicate card is NOT guarded on this turn",
+                MERGE_READY_CHECKPOINT_LABEL,
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return False
+        if carded:
+            logger.warning(
+                "%s: a DURABLE merge-card row already exists for build_id=%s "
+                "— this publisher instance has published nothing, so this is "
+                "a restart (or a second journey) meeting a card that is "
+                "already out. Publishing nothing",
+                MERGE_READY_CHECKPOINT_LABEL,
+                build_id,
+            )
+        return carded
 
     async def _read_branch(self, build_id: str) -> str | None:
         if self._branch_reader is None:
