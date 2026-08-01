@@ -1607,3 +1607,564 @@ class TestLegacyPendingPackUniqueness:
     def test_worktree_name_tier_is_untouched(self, tmp_path: Path) -> None:
         wt = tmp_path / "build-FROM-WT-1"
         assert ar._resolve_receipt_build_id({}, wt, "FEAT-L") == "build-FROM-WT-1"
+
+
+# ---------------------------------------------------------------------------
+# SAME-FEATURE REQUEUE SWEEP (register find, 2026-08-01 — driven live)
+# ---------------------------------------------------------------------------
+#
+# THE FIND: a FAILED build keeps its outer worktree for forensics, and that
+# kept tree still holds guardkit's INNER worktree with the feature's
+# ``autobuild/<task_id>`` branch checked out — so a SAME-FEATURE requeue's
+# fresh dispatch died in seconds ("branch already exists and automatic cleanup
+# failed", exit 2). Twice in one afternoon: build ...141436 blocked ...145157.
+#
+# These drive the cure at the runner's fresh path against a REAL git repo with
+# a REAL nested worktree (only guardkit is stubbed): export-present → swept and
+# dispatched; export-absent → exported THEN swept; sweep-failure → loud refusal
+# with nothing half-done silently.
+
+PRIOR_BUILD_ID = "build-FEAT-A058-20260801141436"
+REQUEUE_BUILD_ID = "build-FEAT-A058-20260801145157"
+PRIOR_TASK_ID = "TASK-A058-001"
+PRIOR_BRANCH = f"autobuild/{PRIOR_TASK_ID}"
+
+
+def _stage_prior_kept_build(
+    repo: Path, wt_base: Path, *, feature_yaml_in: str
+) -> tuple[Path, Path]:
+    """Reproduce a FAILED build's kept residue exactly as the live estate leaves it.
+
+    ``<wt_base>/<PRIOR_BUILD_ID>`` is the kept OUTER worktree (detached, per
+    F2) and ``<outer>/.guardkit/worktrees/<TASK>`` is guardkit's INNER worktree
+    holding ``autobuild/<TASK>`` — registered in the SHARED repo's common
+    gitdir, which is why it outlives the failed build and blocks the requeue.
+
+    ``feature_yaml_in`` selects where the task graph is readable: ``"repo"``
+    (shared checkout), ``"prior"`` (only the kept tree — the LIVE shape, since
+    the yaml rides the planning branch), or ``"both"``.
+    """
+    outer = (wt_base / PRIOR_BUILD_ID).resolve()
+    outer.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "--detach", str(outer), PLANNING_BRANCH)
+    inner = outer / ".guardkit" / "worktrees" / PRIOR_TASK_ID
+    inner.parent.mkdir(parents=True, exist_ok=True)
+    _git(outer, "worktree", "add", "-b", PRIOR_BRANCH, str(inner), "main")
+    (inner / "forensic.txt").write_text("evidence")
+    # The failed build's receipts, still only inside the kept tree.
+    _make_receipt_tree(outer)
+    if feature_yaml_in in ("repo", "both"):
+        _write_guardkit_feature(repo, ROUND17_FEATURE_ID, [PRIOR_TASK_ID])
+    if feature_yaml_in in ("prior", "both"):
+        _write_guardkit_feature(outer, ROUND17_FEATURE_ID, [PRIOR_TASK_ID])
+    assert _branch_exists(repo, PRIOR_BRANCH)
+    return outer, inner
+
+
+def _requeue_launch() -> str:
+    """The SAME feature, a NEW build id — the dispatch that died live."""
+    return _launch(
+        '{"build_id": "%s", "feature_id": "%s", "correlation_id": "%s", '
+        '"branch": "%s", "repo": "appmilla/api_test"}'
+        % (REQUEUE_BUILD_ID, ROUND17_FEATURE_ID, ROUND17_CORR, PLANNING_BRANCH)
+    )
+
+
+def _seed_prior_pack(receipts: Path) -> Path:
+    """A prior build that DID export its failure pack durably."""
+    pack = receipts / PRIOR_BUILD_ID
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / ar.FAILURE_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "build_id": PRIOR_BUILD_ID,
+                "feature_id": ROUND17_FEATURE_ID,
+                "reason": "guardkit autobuild exit=2",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return pack
+
+
+class TestRequeueSweepExportPresent:
+    def test_prior_kept_tree_is_swept_and_the_fresh_dispatch_proceeds(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Export VERIFIED → sweep → dispatch. The live blocker is gone."""
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+        pack = _seed_prior_pack(receipts)
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke(
+                _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+            )
+
+        # (1) The fresh dispatch actually RAN — in its OWN worktree.
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        assert recorded.get("cwd") == str((wt_base / REQUEUE_BUILD_ID).resolve())
+
+        # (2) Every piece of the prior build's blocking residue is gone.
+        assert not _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        assert not inner.exists()
+        assert not outer.exists()
+        porcelain = _git(throwaway_repo, "worktree", "list", "--porcelain")
+        assert str(outer) not in porcelain, "the stale registration must be pruned"
+
+        # (3) The prior build's durable evidence is untouched by the sweep.
+        assert (pack / ar.FAILURE_MANIFEST_NAME).is_file()
+
+        # (4) Every step is LOUD and names the prior build id.
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert f"prior build {PRIOR_BUILD_ID} kept worktree found" in joined
+        assert f"prior build {PRIOR_BUILD_ID} has a durable manifest" in joined  # cure: re-export always; a manifest is not the receipts
+        assert f"prior build {PRIOR_BUILD_ID}: removed inner worktree" in joined
+        assert (
+            f"prior build {PRIOR_BUILD_ID}: deleted branch {PRIOR_BRANCH}"
+            in joined
+        )
+        assert (
+            f"prior build {PRIOR_BUILD_ID}: removed outer worktree tree" in joined
+        )
+        assert f"prior build {PRIOR_BUILD_ID} swept" in joined
+
+    def test_task_graph_read_from_the_kept_tree_when_the_checkout_lacks_it(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The LIVE shape: the feature yaml rides the planning branch only.
+
+        The non-destructive F3 pass degrades to prune-only here (no task ids in
+        the shared checkout) — which is precisely why the requeue died. The
+        sweep proves ownership from the PRIOR build's own kept tree instead.
+        """
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="prior"
+        )
+        _seed_prior_pack(receipts)
+        assert not (
+            throwaway_repo / ".guardkit" / "features" / f"{ROUND17_FEATURE_ID}.yaml"
+        ).exists()
+
+        recorded: dict[str, Any] = {}
+        result = _invoke(
+            _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        assert not _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        assert not outer.exists()
+        assert recorded.get("cwd") == str((wt_base / REQUEUE_BUILD_ID).resolve())
+
+
+class TestRequeueSweepExportAbsent:
+    def test_un_exported_prior_evidence_is_exported_before_it_is_destroyed(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """F11: never destroy un-exported evidence — export it FIRST, then sweep."""
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="both"
+        )
+        assert not (receipts / PRIOR_BUILD_ID).exists()
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke(
+                _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+            )
+
+        # (1) The prior build's receipts are now DURABLE, layout preserved.
+        pack = receipts / PRIOR_BUILD_ID
+        for rel in (
+            ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
+            ".guardkit/autobuild-private/TASK-X-001/spec_conformance/conformance.json",
+            ".guardkit/qav-shadow/queue.jsonl",
+            ".guardkit/autobuild/FEAT-X/review-summary.md",
+        ):
+            assert (pack / rel).is_file(), rel
+            assert (pack / rel).read_text() == f"receipt::{rel}"
+
+        # (2) The pack is self-describing and says WHO wrote it.
+        manifest = json.loads((pack / ar.FAILURE_MANIFEST_NAME).read_text())
+        assert manifest["build_id"] == PRIOR_BUILD_ID
+        assert manifest["feature_id"] == ROUND17_FEATURE_ID
+        assert "requeue sweep" in manifest["reason"]
+        assert manifest["worktree_path"] == str(outer)
+        assert manifest["branch"] == PRIOR_BRANCH
+        assert sorted(manifest["receipt_families_exported"]) == sorted(
+            ar._RECEIPT_FAMILIES
+        )
+
+        # (3) Only THEN was the residue destroyed, and the requeue dispatched.
+        assert not _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        assert not inner.exists()
+        assert not outer.exists()
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        assert recorded.get("cwd") == str((wt_base / REQUEUE_BUILD_ID).resolve())
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert f"prior build {PRIOR_BUILD_ID} has NO durable export" in joined
+        assert f"prior build {PRIOR_BUILD_ID} evidence exported" in joined
+
+
+class TestRequeueSweepFailureIsAnHonestRefusal:
+    def test_branch_delete_failure_refuses_the_dispatch_loudly(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sweep it cannot finish is a REFUSAL — guardkit is never launched."""
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        _stage_prior_kept_build(throwaway_repo, wt_base, feature_yaml_in="repo")
+        _seed_prior_pack(receipts)
+
+        real_run_git = ar._run_git
+
+        async def _fail_branch_delete(args: list[str], *, cwd: Path):
+            if args[:2] == ["branch", "-D"]:
+                return 1, "error: git refused to delete the branch"
+            return await real_run_git(args, cwd=cwd)
+
+        monkeypatch.setattr(ar, "_run_git", _fail_branch_delete)
+
+        recorded: dict[str, Any] = {}
+        result = _invoke(
+            _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
+        assert "refusing the fresh dispatch" in message
+        assert PRIOR_BUILD_ID in message
+        assert f"git branch -D {PRIOR_BRANCH}" in message
+
+        # No half-state handed onward: guardkit never ran, no fresh worktree.
+        assert "cwd" not in recorded, "guardkit must NOT be launched on a refusal"
+        assert not (wt_base / REQUEUE_BUILD_ID).exists()
+
+    def test_un_exportable_evidence_refuses_before_destroying_anything(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F11 is a HARD gate: an export that fails stops the sweep dead."""
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+        monkeypatch.setattr(ar, "_export_receipts", lambda wt, bid: (False, []))
+
+        recorded: dict[str, Any] = {}
+        result = _invoke(
+            _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
+        assert "refusing the fresh dispatch" in message
+        assert "F11 forensics law" in message
+
+        # NOTHING was destroyed: the evidence is still exactly where it was.
+        assert outer.is_dir()
+        assert inner.is_dir()
+        assert (inner / "forensic.txt").read_text() == "evidence"
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        assert "cwd" not in recorded
+
+    def test_unexpected_failure_surfaces_as_a_sweep_refusal(
+        self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike the non-destructive F3 pass, this one never degrades quietly."""
+        monkeypatch.setenv(
+            ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "worktrees")
+        )
+        (tmp_path / "worktrees").mkdir()
+
+        async def _boom(repo_path, feature_id, *, current_build_id):
+            raise RuntimeError("git exploded")
+
+        monkeypatch.setattr(ar, "_sweep_prior_build_residue_impl", _boom)
+        with pytest.raises(ar.PriorBuildSweepError) as excinfo:
+            asyncio.run(
+                ar._sweep_prior_build_residue(
+                    throwaway_repo, ROUND17_FEATURE_ID, current_build_id="b1"
+                )
+            )
+        assert "failed unexpectedly" in str(excinfo.value)
+        assert "git exploded" in str(excinfo.value)
+
+
+class TestRequeueSweepScopeFence:
+    """What the sweep must NEVER touch."""
+
+    def test_no_prior_residue_is_a_pure_no_op(
+        self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The F3 family's world is unchanged: no destructive verb is issued."""
+        wt_base = tmp_path / "worktrees"
+        wt_base.mkdir()  # SL1 coach: the base must EXIST or the run short-circuits
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        _write_guardkit_feature(throwaway_repo, ROUND17_FEATURE_ID, ["TASK-X-1"])
+
+        seq: list[list[str]] = []
+        real = ar._run_git
+
+        async def _rec(args: list[str], *, cwd: Path):
+            seq.append(list(args))
+            return await real(args, cwd=cwd)
+
+        monkeypatch.setattr(ar, "_run_git", _rec)
+        recorded: dict[str, Any] = {}
+        result = _invoke(
+            _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        add_idx = next(i for i, c in enumerate(seq) if c[:2] == ["worktree", "add"])
+        assert not [
+            c for c in seq[:add_idx] if c[:3] == ["worktree", "remove", "--force"]
+        ], f"no prior residue ⇒ no destructive verb before the add; got {seq!r}"
+        assert not [c for c in seq[:add_idx] if c[:2] == ["branch", "-D"]]
+
+    def test_another_features_kept_tree_is_left_alone(
+        self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A concurrent build of ANOTHER feature owns its own residue."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+        # This dispatch is for a DIFFERENT feature, whose task ids do not
+        # include the kept tree's.
+        _write_guardkit_feature(throwaway_repo, "FEAT-OTHER", ["TASK-OTHER-1"])
+
+        asyncio.run(
+            ar._sweep_prior_build_residue(
+                throwaway_repo, "FEAT-OTHER", current_build_id=REQUEUE_BUILD_ID
+            )
+        )
+
+        assert outer.is_dir()
+        assert inner.is_dir()
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+
+    def test_a_worktree_outside_the_build_base_is_never_swept(
+        self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hand-made / lane worktrees live outside the base and stay put."""
+        monkeypatch.setenv(
+            ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "worktrees")
+        )
+        (tmp_path / "worktrees").mkdir()
+        _write_guardkit_feature(
+            throwaway_repo, ROUND17_FEATURE_ID, [PRIOR_TASK_ID]
+        )
+        outside = tmp_path / "hand_made"
+        _git(throwaway_repo, "worktree", "add", "-b", PRIOR_BRANCH, str(outside),
+             "main")
+
+        asyncio.run(
+            ar._sweep_prior_build_residue(
+                throwaway_repo,
+                ROUND17_FEATURE_ID,
+                current_build_id=REQUEUE_BUILD_ID,
+            )
+        )
+
+        assert outside.is_dir()
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+
+    def test_this_builds_own_worktree_is_never_swept(
+        self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The current build id is excluded by construction."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+
+        asyncio.run(
+            ar._sweep_prior_build_residue(
+                throwaway_repo,
+                ROUND17_FEATURE_ID,
+                current_build_id=PRIOR_BUILD_ID,
+            )
+        )
+
+        assert outer.is_dir()
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+
+    def test_ownership_unprovable_leaves_the_residue_alone(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No readable task graph anywhere ⇒ ownership UNPROVEN ⇒ never destroy."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        outer, _inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="none"
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            asyncio.run(
+                ar._sweep_prior_build_residue(
+                    throwaway_repo,
+                    ROUND17_FEATURE_ID,
+                    current_build_id=REQUEUE_BUILD_ID,
+                )
+            )
+
+        assert outer.is_dir()
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "ownership UNPROVEN" in joined
+
+
+class TestPriorOuterRootResolution:
+    def test_inner_worktree_resolves_to_its_build_root(self, tmp_path: Path) -> None:
+        base = (tmp_path / "wt").resolve()
+        inner = base / "build-X" / ".guardkit" / "worktrees" / "TASK-1"
+        inner.mkdir(parents=True)
+        assert ar._prior_outer_root(inner, base) == base / "build-X"
+
+    def test_path_outside_the_base_is_none(self, tmp_path: Path) -> None:
+        base = (tmp_path / "wt").resolve()
+        base.mkdir()
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        assert ar._prior_outer_root(other, base) is None
+
+    def test_the_base_itself_is_none(self, tmp_path: Path) -> None:
+        base = (tmp_path / "wt").resolve()
+        base.mkdir()
+        assert ar._prior_outer_root(base, base) is None
+
+
+class TestRequeueSweepDiscoveryDegrades:
+    """Failing to LOOK is not failing to SWEEP — nothing is touched, so it is
+    the pre-cure behaviour, not a refusal (the monitor family's all-stubbed
+    subprocess seam drives exactly this shape)."""
+
+    def test_enumeration_failure_is_a_warned_no_op_not_a_refusal(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        outer, _inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+
+        async def _boom(repo_path: Path):
+            raise RuntimeError("git worktree list exploded")
+
+        monkeypatch.setattr(ar, "_list_registered_worktrees", _boom)
+        with caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            # Must NOT raise.
+            asyncio.run(
+                ar._sweep_prior_build_residue(
+                    throwaway_repo,
+                    ROUND17_FEATURE_ID,
+                    current_build_id=REQUEUE_BUILD_ID,
+                )
+            )
+
+        assert outer.is_dir(), "a discovery failure must destroy nothing"
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "could not enumerate the worktrees" in joined
+        assert "NOTHING was touched" in joined
+
+
+class TestManifestIsNotTheReceipts:
+    """Coordinator-cure pin (SL1 coach BLOCKER): a prior pack whose manifest
+    exists but whose receipt families never landed must STILL be exported
+    before destruction — a manifest is a file, not the evidence."""
+
+    def test_manifest_present_receipts_absent_still_exports(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        _outer, _inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="both"
+        )
+        # A manifest ALREADY EXISTS for the prior build — but no receipt
+        # families ever landed (the live ok=False export shape).
+        prior_dir = receipts / PRIOR_BUILD_ID
+        prior_dir.mkdir(parents=True)
+        (prior_dir / ar.FAILURE_MANIFEST_NAME).write_text(
+            json.dumps({"build_id": PRIOR_BUILD_ID, "receipt_families_exported": []})
+        )
+
+        recorded: dict[str, Any] = {}
+        _invoke(_requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded)
+
+        # The receipts landed anyway — the manifest was never trusted as proof.
+        assert (
+            prior_dir / ".guardkit" / "qav-shadow" / "queue.jsonl"
+        ).is_file(), (
+            "manifest presence was treated as the receipts — the only copy "
+            "was destroyed un-exported (the SL1 blocker resurfacing)"
+        )
