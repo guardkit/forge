@@ -667,8 +667,18 @@ def test_sweep_never_crashes_on_unexpected_error(
 # ---------------------------------------------------------------------------
 
 
+#: The families :func:`_make_receipt_tree` seeds in the OUTER tree. Not the
+#: whole of ``_RECEIPT_FAMILIES`` — ``dcl-capture`` is deliberately absent so
+#: every assertion below also proves the honest "missing" accounting.
+_OUTER_SEEDED_FAMILIES: tuple[str, ...] = (
+    ".guardkit/autobuild-private",
+    ".guardkit/qav-shadow",
+    ".guardkit/autobuild",
+)
+
+
 def _make_receipt_tree(worktree: Path) -> dict[str, Path]:
-    """Populate a fake outer-worktree .guardkit with all three receipt families."""
+    """Populate a fake outer-worktree .guardkit with three receipt families."""
     files = {}
     for rel in (
         ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
@@ -683,6 +693,35 @@ def _make_receipt_tree(worktree: Path) -> dict[str, Path]:
     return files
 
 
+def _make_inner_receipt_tree(worktree: Path, name: str = "FEAT-X") -> list[str]:
+    """Seed an INNER task worktree the way guardkit's WorktreeManager does.
+
+    Mirrors the kept FEAT-153C tree: the task worker's OWN receipts —
+    ``player_turn_*.json``, ``qav_shadow_turn_*.json``,
+    ``task_work_results.json`` — plus an inner ``qav-shadow/queue.jsonl`` that
+    holds a record the OUTER queue never received.
+    """
+    rels = [
+        f".guardkit/worktrees/{name}/.guardkit/autobuild/TASK-X-001/player_turn_1.json",
+        f".guardkit/worktrees/{name}/.guardkit/autobuild/TASK-X-001/qav_shadow_turn_1.json",
+        f".guardkit/worktrees/{name}/.guardkit/autobuild/TASK-X-001/task_work_results.json",
+        f".guardkit/worktrees/{name}/.guardkit/qav-shadow/queue.jsonl",
+        f".guardkit/worktrees/{name}/.guardkit/dcl-capture/queue.jsonl",
+    ]
+    for rel in rels:
+        p = worktree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"inner::{rel}")
+    return rels
+
+
+def _skip_reason(result: "ar.ReceiptExport", family: str) -> str | None:
+    for row in result.skipped:
+        if row["family"] == family:
+            return row["reason"]
+    return None
+
+
 class TestExportReceipts:
     def test_exports_all_families_preserving_layout(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -692,9 +731,9 @@ class TestExportReceipts:
         dest_root = tmp_path / "receipts"
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
 
-        ok, families = ar._export_receipts(worktree, "build-X-1")
-        assert ok is True
-        assert sorted(families) == sorted(ar._RECEIPT_FAMILIES)
+        result = ar._export_receipts(worktree, "build-X-1")
+        assert result.ok is True
+        assert sorted(result.exported) == sorted(_OUTER_SEEDED_FAMILIES)
 
         for rel in (
             ".guardkit/autobuild-private/TASK-X-001/coach_turn_1.json",
@@ -714,9 +753,9 @@ class TestExportReceipts:
         (worktree / ".guardkit/qav-shadow/queue.jsonl").write_text("{}")
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
 
-        ok, families = ar._export_receipts(worktree, "build-X-2")
-        assert ok is True
-        assert families == [".guardkit/qav-shadow"], (
+        result = ar._export_receipts(worktree, "build-X-2")
+        assert result.ok is True
+        assert result.exported == [".guardkit/qav-shadow"], (
             "only the family that exists rides the per-run exported list"
         )
         assert (
@@ -729,7 +768,10 @@ class TestExportReceipts:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
-        assert ar._export_receipts(worktree, "build-X-3") == (True, [])
+        result = ar._export_receipts(worktree, "build-X-3")
+        assert result.ok is True
+        assert result.exported == []
+        assert result.file_counts == {}
 
     def test_copy_failure_returns_false_never_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -740,9 +782,14 @@ class TestExportReceipts:
         with patch.object(
             ar.shutil, "copytree", side_effect=OSError("disk full")
         ):
-            ok, families = ar._export_receipts(worktree, "build-X-4")
-        assert ok is False
-        assert families == [], "a family that never copied must not be claimed"
+            result = ar._export_receipts(worktree, "build-X-4")
+        assert result.ok is False
+        assert result.exported == [], (
+            "a family that never copied must not be claimed"
+        )
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "copy-failed:"
+        )
 
     def test_default_destination_expands_home(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -754,12 +801,184 @@ class TestExportReceipts:
         worktree = tmp_path / "wt"
         _make_receipt_tree(worktree)
 
-        ok, _families = ar._export_receipts(worktree, "build-X-5")
-        assert ok is True
+        result = ar._export_receipts(worktree, "build-X-5")
+        assert result.ok is True
         assert (
             tmp_path
             / "forge-state/receipts/build-X-5/.guardkit/qav-shadow/queue.jsonl"
         ).is_file()
+
+
+class TestInnerWorktreeReceiptsLand:
+    """THE FIND: the task worker's receipts live in the INNER worktree.
+
+    Until this lane the export read only the OUTER tree, so the richest
+    per-turn evidence of every succeeded build — and the run's own shadow
+    verdict — was removed with the worktree (FEAT-UDBE's 07-28 loss, one
+    level down).
+    """
+
+    def test_inner_families_land_as_namespaced_subdirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        rels = _make_inner_receipt_tree(worktree)
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        result = ar._export_receipts(worktree, "build-IN-1")
+        assert result.ok is True
+
+        pack = dest_root / "build-IN-1"
+        for rel in rels:
+            # The inner tree's layout is preserved verbatim under the pack.
+            landed = pack / rel.replace(".guardkit/worktrees/", "worktrees/", 1)
+            assert landed.is_file(), rel
+            assert landed.read_text() == f"inner::{rel}"
+
+        assert "worktrees/FEAT-X/.guardkit/autobuild" in result.exported
+        assert "worktrees/FEAT-X/.guardkit/qav-shadow" in result.exported
+        assert "worktrees/FEAT-X/.guardkit/dcl-capture" in result.exported
+
+    def test_inner_copy_never_clobbers_the_outer_family(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both queues survive — the outer's and the inner's fuller one."""
+        worktree = tmp_path / "wt"
+        (worktree / ".guardkit/qav-shadow").mkdir(parents=True)
+        (worktree / ".guardkit/qav-shadow/queue.jsonl").write_text("outer-6\n")
+        inner_q = worktree / ".guardkit/worktrees/FEAT-X/.guardkit/qav-shadow"
+        inner_q.mkdir(parents=True)
+        (inner_q / "queue.jsonl").write_text("outer-6\ninner-7\n")
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        ar._export_receipts(worktree, "build-IN-2")
+
+        pack = dest_root / "build-IN-2"
+        assert (
+            pack / ".guardkit/qav-shadow/queue.jsonl"
+        ).read_text() == "outer-6\n"
+        assert (
+            pack / "worktrees/FEAT-X/.guardkit/qav-shadow/queue.jsonl"
+        ).read_text() == "outer-6\ninner-7\n"
+
+    def test_every_inner_worktree_is_exported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_inner_receipt_tree(worktree, "TASK-X-001")
+        _make_inner_receipt_tree(worktree, "TASK-X-002")
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        result = ar._export_receipts(worktree, "build-IN-3")
+
+        for name in ("TASK-X-001", "TASK-X-002"):
+            assert (
+                dest_root
+                / "build-IN-3"
+                / f"worktrees/{name}/.guardkit/autobuild"
+                / "TASK-X-001/task_work_results.json"
+            ).is_file(), name
+            assert f"worktrees/{name}/.guardkit/qav-shadow" in result.exported
+
+    def test_no_inner_worktrees_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        result = ar._export_receipts(worktree, "build-IN-4")
+        assert result.ok is True
+        assert not any(f.startswith("worktrees/") for f in result.exported)
+
+    def test_dcl_capture_family_is_exported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DCL machine-authoring corpus is a receipt family too."""
+        worktree = tmp_path / "wt"
+        (worktree / ".guardkit/dcl-capture").mkdir(parents=True)
+        (worktree / ".guardkit/dcl-capture/queue.jsonl").write_text("{}\n")
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        result = ar._export_receipts(worktree, "build-DCL-1")
+        assert ".guardkit/dcl-capture" in result.exported
+        assert (
+            dest_root / "build-DCL-1/.guardkit/dcl-capture/queue.jsonl"
+        ).is_file()
+
+
+class TestExportAccountingIsHonest:
+    """The manifest must never claim an export that produced nothing."""
+
+    def test_empty_family_is_skipped_not_claimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        # The directory EXISTS but holds no file — the pre-lane code copied it
+        # and claimed the family in the manifest.
+        (worktree / ".guardkit/qav-shadow").mkdir(parents=True)
+        (worktree / ".guardkit/autobuild/FEAT-X").mkdir(parents=True)
+        (worktree / ".guardkit/autobuild/FEAT-X/events.jsonl").write_text("{}")
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        result = ar._export_receipts(worktree, "build-HON-1")
+        assert result.exported == [".guardkit/autobuild"]
+        assert _skip_reason(result, ".guardkit/qav-shadow") == "empty"
+        assert _skip_reason(result, ".guardkit/autobuild-private") == "missing"
+        assert result.file_counts == {".guardkit/autobuild": 1}
+        assert not (dest_root / "build-HON-1/.guardkit/qav-shadow").exists(), (
+            "an empty family must not leave an empty directory in the pack"
+        )
+
+    def test_file_counts_match_the_pack_on_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        _make_inner_receipt_tree(worktree)
+        dest_root = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
+
+        result = ar._export_receipts(worktree, "build-HON-2")
+        pack = dest_root / "build-HON-2"
+        for family, count in result.file_counts.items():
+            on_disk = sum(1 for p in (pack / family).rglob("*") if p.is_file())
+            assert on_disk == count, family
+        assert sum(result.file_counts.values()) == 9
+
+    def test_one_bad_family_never_costs_the_others(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        real_copytree = ar.shutil.copytree
+
+        def _flaky(*args: Any, **kwargs: Any) -> Any:
+            # shutil.copytree recurses through the module global, so this stub
+            # sees the inner calls too — match on the source only.
+            src = args[0] if args else kwargs.get("src")
+            if str(src).endswith("qav-shadow"):
+                raise OSError("disk full")
+            return real_copytree(*args, **kwargs)
+
+        with patch.object(ar.shutil, "copytree", _flaky):
+            result = ar._export_receipts(worktree, "build-HON-3")
+
+        assert result.ok is False, "a real copy failure keeps the worktree"
+        assert sorted(result.exported) == [
+            ".guardkit/autobuild",
+            ".guardkit/autobuild-private",
+        ]
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "copy-failed:"
+        )
 
 
 class TestFinalizeSuccessWorktree:
@@ -920,8 +1139,16 @@ class TestFailurePackEndToEnd:
         assert manifest["worktree_path"] == str(expected_wt)
         assert manifest["branch"] == PLANNING_BRANCH
         assert sorted(manifest["receipt_families_exported"]) == sorted(
-            ar._RECEIPT_FAMILIES
+            _OUTER_SEEDED_FAMILIES
         )
+        # ...and the family the stub never wrote is named honestly instead of
+        # being claimed as an export that produced nothing.
+        assert {
+            row["family"]: row["reason"]
+            for row in manifest["receipt_families_skipped"]
+        }[".guardkit/dcl-capture"] == "missing"
+        assert manifest["receipt_export_ok"] is True
+        assert manifest["receipt_file_counts"][".guardkit/qav-shadow"] == 1
         # An ISO-8601 UTC instant the diagnoser can order packs by.
         assert datetime.fromisoformat(manifest["failed_at"]).tzinfo is not None
 
@@ -1052,7 +1279,7 @@ class TestFailureManifest:
                 exit_code=-1,
                 worktree_path=None,
                 branch=None,
-                exported_families=[],
+                receipts=None,
             )
         manifest = json.loads(
             (receipts / "build-DRF-1" / ar.FAILURE_MANIFEST_NAME).read_text()
@@ -1079,7 +1306,7 @@ class TestFailureManifest:
                 exit_code=2,
                 worktree_path=None,
                 branch=None,
-                exported_families=[],
+                receipts=None,
             )
         assert "failure manifest NOT written" in " ".join(
             r.getMessage() for r in caplog.records
@@ -1179,8 +1406,7 @@ def test_pack_permissions_are_owner_only(
     dest = tmp_path / "receipts"
     monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest))
 
-    ok, _families = ar._export_receipts(worktree, "build-PERM-1")
-    assert ok is True
+    assert ar._export_receipts(worktree, "build-PERM-1").ok is True
 
     pack = dest / "build-PERM-1"
     assert (pack.stat().st_mode & 0o777) == 0o700
@@ -1261,7 +1487,7 @@ class TestFailureManifestArchiveOnReuse:
             exit_code=1,
             worktree_path=None,
             branch=None,
-            exported_families=[],
+            receipts=None,
         )
 
     def test_prior_manifest_survives_a_second_run(
@@ -1351,9 +1577,9 @@ class TestExportedFamiliesAreThisRunsOnly:
         (worktree / ".guardkit/autobuild/FEAT-X").mkdir(parents=True)
         (worktree / ".guardkit/autobuild/FEAT-X/review-summary.md").write_text("r")
 
-        ok, families = ar._export_receipts(worktree, "build-STALE-1")
-        assert ok is True
-        assert families == [".guardkit/autobuild"], (
+        result = ar._export_receipts(worktree, "build-STALE-1")
+        assert result.ok is True
+        assert result.exported == [".guardkit/autobuild"], (
             "the stale qav-shadow leftover must not be claimed as this "
             "run's export"
         )
