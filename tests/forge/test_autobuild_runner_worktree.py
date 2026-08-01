@@ -1824,8 +1824,14 @@ class TestRequeueSweepExportAbsent:
         assert "requeue sweep" in manifest["reason"]
         assert manifest["worktree_path"] == str(outer)
         assert manifest["branch"] == PRIOR_BRANCH
+        # SL3 truth: only families that actually LANDED files are listed;
+        # the staged prior tree seeds three of the candidate families.
         assert sorted(manifest["receipt_families_exported"]) == sorted(
-            ar._RECEIPT_FAMILIES
+            [
+                ".guardkit/autobuild-private",
+                ".guardkit/qav-shadow",
+                ".guardkit/autobuild",
+            ]
         )
 
         # (3) Only THEN was the residue destroyed, and the requeue dispatched.
@@ -1895,7 +1901,7 @@ class TestRequeueSweepFailureIsAnHonestRefusal:
         outer, inner = _stage_prior_kept_build(
             throwaway_repo, wt_base, feature_yaml_in="repo"
         )
-        monkeypatch.setattr(ar, "_export_receipts", lambda wt, bid: (False, []))
+        monkeypatch.setattr(ar, "_export_receipts", lambda wt, bid: ar.ReceiptExport(ok=False))
 
         recorded: dict[str, Any] = {}
         result = _invoke(
