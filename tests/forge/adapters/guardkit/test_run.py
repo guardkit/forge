@@ -130,8 +130,20 @@ class TestCommandComposition:
         self,
         worktree: Path,
         allowlist: list[Path],
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # ``argv[0]`` is no longer a hardcoded constant — it is the head of
+        # the resolution ladder (see test_run_binary_resolution.py). Pin it
+        # through the env rung so this test asserts the *shape* of the argv
+        # without depending on what the host happens to have installed.
+        binary = tmp_path / "bin" / "guardkit"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        monkeypatch.setattr(run_module, "_resolved_guardkit_binary", None)
+        monkeypatch.setenv(run_module.GUARDKIT_PATH_ENV, str(binary))
+
         capture: dict[str, Any] = {}
         monkeypatch.setattr(
             run_module,
@@ -153,7 +165,7 @@ class TestCommandComposition:
 
         cmd = capture["command"]
         assert isinstance(cmd, list)
-        assert cmd[0] == "/usr/local/bin/guardkit"
+        assert cmd[0] == str(binary)
         assert cmd[1] == "feature-spec"
         assert cmd[2:4] == ["--feature", "FEAT-001"]
 

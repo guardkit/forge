@@ -36,15 +36,27 @@ Behaviour contract (per ADR-ARCH-025 and the task acceptance criteria):
   resolution entirely (DDR-005);
 - ``extra_context_paths`` are merged for the current call only — the
   resolver remains stateless (ASSUM-005, ASSUM-007);
-- the function holds no module-level mutable state, so two concurrent
-  ``run()`` invocations against the same worktree do not interfere
-  (ASSUM-006).
+- the function holds no *per-call* module-level mutable state, so two
+  concurrent ``run()`` invocations against the same worktree do not
+  interfere (ASSUM-006). The single module-level cache is the write-once
+  binary resolution below, which carries no per-call information.
+
+Binary resolution (design pass ``leg-invocation-design-pass-2026-08-02``
+§d stage-1 venue-B): the spawn's ``argv[0]`` was hardcoded to
+``/usr/local/bin/guardkit``, which exists only inside the container — so
+outside it this seam could not spawn at all. It now walks the same ladder
+the long-running autobuild path walks (``FORGE_GUARDKIT_PATH`` → ``PATH`` →
+``~/.agentecflow/bin/guardkit``), resolved once and logged at INFO on first
+use; the container's binary keeps winning because ``/usr/local/bin`` is on
+the image's ``PATH``. Nothing else about the dispatch contract moves.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -60,10 +72,153 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+#: Environment override for the absolute path to the ``guardkit``
+#: executable. Deliberately the *same* operator knob the long-running
+#: autobuild path already honours
+#: (:data:`forge.subagents.autobuild_runner.FORGE_GUARDKIT_PATH_ENV`) — one
+#: env var configures both seams. Declared locally rather than imported so
+#: the adapter layer keeps no dependency on the subagent layer.
+GUARDKIT_PATH_ENV: str = "FORGE_GUARDKIT_PATH"
+
+#: The executable's name, as looked up on ``PATH`` (rung 2).
+_GUARDKIT_BINARY_NAME: str = "guardkit"
+
+#: Last-resort rung: the local launcher the installer writes. Expanded with
+#: :func:`os.path.expanduser` at resolution time (so ``$HOME`` is read then,
+#: not at import).
+_AGENTECFLOW_GUARDKIT: str = "~/.agentecflow/bin/guardkit"
+
+#: The container's install location (``Dockerfile`` runtime stage symlinks
+#: ``/opt/venv/bin/guardkit-py`` here). It is *not* a rung of its own: it is
+#: reached through the PATH rung, because ``/usr/local/bin`` is on the image's
+#: default ``PATH`` and no earlier entry (``/opt/venv/bin``) ships a file
+#: named ``guardkit`` — only ``guardkit-py``. Retained as documentation and
+#: as the name the hardening corpus checks.
 _GUARDKIT_BINARY: str = "/usr/local/bin/guardkit"
+
 _DEFAULT_TIMEOUT_SECONDS: int = 600  # ASSUM-001
 _KILL_GRACE_SECONDS: float = 5.0  # SIGTERM → SIGKILL grace window
 _GRAPHITI_PREFIX: str = "graphiti"
+
+
+# ---------------------------------------------------------------------------
+# Binary resolution (design pass 2026-08-02 §d stage-1 venue-B)
+# ---------------------------------------------------------------------------
+
+
+#: Memoised result of :func:`_resolve_guardkit_binary`. The module's
+#: "no mutable module state" property (ASSUM-006) is preserved in substance:
+#: this cache is *write-once, idempotent and read-only thereafter*, it is
+#: filled by a purely synchronous helper (no ``await`` inside, so two
+#: concurrent ``run()`` calls cannot interleave mid-resolution), and it never
+#: participates in a call's result beyond supplying ``argv[0]``. Only a
+#: successful resolution is cached — a failure is retried on the next call so
+#: an operator who installs the binary mid-process is picked up.
+_resolved_guardkit_binary: str | None = None
+
+
+def _is_executable_file(path: str) -> bool:
+    """Return ``True`` iff ``path`` is an existing, executable file."""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _absolute(path: str) -> str:
+    """Expand ``~`` and make absolute **without following symlinks**.
+
+    Deliberately :func:`os.path.abspath`, not :meth:`Path.resolve` (which the
+    autobuild path uses): in the container ``/usr/local/bin/guardkit`` is a
+    symlink to ``/opt/venv/bin/guardkit-py``, and resolving it would spawn —
+    and receipt — a different path than the one the image installs. The
+    ladder must hand the spawn the path it actually found.
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _remember_guardkit_binary(path: str, *, rung: str) -> str:
+    """Cache ``path`` as the resolved binary and log it once, at INFO."""
+    global _resolved_guardkit_binary
+    _resolved_guardkit_binary = path
+    logger.info(
+        "guardkit adapter: resolved guardkit binary to %s (via %s)",
+        path,
+        rung,
+    )
+    return path
+
+
+def _resolve_guardkit_binary() -> tuple[str | None, list[str]]:
+    """Resolve the ``guardkit`` executable, once, lazily.
+
+    Resolution ladder — the same one
+    :func:`forge.subagents.autobuild_runner._resolve_guardkit_path` walks for
+    the long-running build path, extended with the local-launcher rung:
+
+    1. :data:`GUARDKIT_PATH_ENV` (``FORGE_GUARDKIT_PATH``), when it points at
+       an executable file. A set-but-unusable value logs a WARNING and falls
+       through rather than failing the dispatch.
+    2. :func:`shutil.which` on :data:`_GUARDKIT_BINARY_NAME`. This is the rung
+       the container takes: ``/usr/local/bin/guardkit`` is on the image's
+       ``PATH`` and nothing ahead of it shadows the name, so the container's
+       binary still wins whenever it is present.
+    3. :data:`_AGENTECFLOW_GUARDKIT` — the local installer's launcher, the
+       only one that exists outside the container on the fleet boxes.
+
+    The first success is memoised in :data:`_resolved_guardkit_binary` and
+    logged once at INFO.
+
+    Returns:
+        ``(path, searched)``. ``path`` is ``None`` only when every rung
+        missed; ``searched`` is the human-readable list of what was tried, in
+        order, for the honest dispatch failure. On a memo hit ``searched`` is
+        empty — it is only ever read on the failure path.
+    """
+    if _resolved_guardkit_binary is not None:
+        return _resolved_guardkit_binary, []
+
+    searched: list[str] = []
+
+    # Rung 1 — explicit operator override.
+    override = os.environ.get(GUARDKIT_PATH_ENV, "").strip()
+    if override:
+        candidate = _absolute(override)
+        searched.append(f"{GUARDKIT_PATH_ENV}={override!r} -> {candidate}")
+        if _is_executable_file(candidate):
+            return _remember_guardkit_binary(
+                candidate, rung=GUARDKIT_PATH_ENV
+            ), searched
+        logger.warning(
+            "guardkit adapter: %s=%r does not resolve to an executable file "
+            "— falling back to PATH lookup",
+            GUARDKIT_PATH_ENV,
+            override,
+        )
+    else:
+        searched.append(f"{GUARDKIT_PATH_ENV} (unset)")
+
+    # Rung 2 — PATH lookup (the container's /usr/local/bin/guardkit).
+    which_result = shutil.which(_GUARDKIT_BINARY_NAME)
+    if which_result:
+        searched.append(
+            f"PATH lookup for {_GUARDKIT_BINARY_NAME!r} -> {which_result}"
+        )
+        return _remember_guardkit_binary(
+            _absolute(which_result), rung="PATH"
+        ), searched
+    searched.append(f"PATH lookup for {_GUARDKIT_BINARY_NAME!r} (not found)")
+
+    # Rung 3 — the local installer's launcher.
+    fallback = _absolute(_AGENTECFLOW_GUARDKIT)
+    searched.append(f"{_AGENTECFLOW_GUARDKIT} -> {fallback}")
+    if _is_executable_file(fallback):
+        return _remember_guardkit_binary(
+            fallback, rung=_AGENTECFLOW_GUARDKIT
+        ), searched
+
+    logger.warning(
+        "guardkit adapter: guardkit binary not found — searched %s",
+        "; ".join(searched),
+    )
+    return None, searched
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +382,18 @@ async def run(
                 allowlist=read_allowlist,
             )
 
+        # The binary the spawn will use. Resolved once per process, lazily,
+        # AFTER the cwd guards (a refused cwd never needs a binary) and
+        # BEFORE any resolver work (a missing binary must not pay for
+        # context resolution it will never use).
+        guardkit_binary, searched = _resolve_guardkit_binary()
+        if guardkit_binary is None:
+            return _binary_not_found_result(
+                subcommand=subcommand,
+                duration_secs=time.monotonic() - started_at,
+                searched=searched,
+            )
+
         # Graphiti subcommands skip the resolver entirely (DDR-005).
         context_flags: list[str] = []
         if not _is_graphiti_subcommand(subcommand):
@@ -259,7 +426,7 @@ async def run(
 
         nats_flag = ["--nats"] if with_nats_streaming else []
         command: list[str] = [
-            _GUARDKIT_BINARY,
+            guardkit_binary,
             subcommand,
             *args,
             *context_flags,
@@ -284,7 +451,7 @@ async def run(
                         f"subprocess refused by permissions layer: {exc}"
                     ),
                     details={
-                        "binary": _GUARDKIT_BINARY,
+                        "binary": guardkit_binary,
                         "subcommand": subcommand,
                         "error": str(exc),
                     },
@@ -375,6 +542,46 @@ def _is_within(child: Path, parent: Path) -> bool:
         return child == parent or child.is_relative_to(parent)
     except ValueError:
         return False
+
+
+def _binary_not_found_result(
+    *,
+    subcommand: str,
+    duration_secs: float,
+    searched: list[str],
+) -> GuardKitResult:
+    """Build a ``status="failed"`` result for an unresolvable binary.
+
+    The same honest-dispatch-failure shape every other refusal on this
+    boundary uses (never raises, ``exit_code=-1``, a structured warning), and
+    it **names every rung that was tried** so the operator is told what to
+    fix rather than being handed a bare ``FileNotFoundError`` from the spawn.
+    """
+    detail = (
+        f"guardkit binary not found — searched: {'; '.join(searched)}. "
+        f"Set {GUARDKIT_PATH_ENV} to the executable, put it on PATH, or "
+        f"install the launcher at {_AGENTECFLOW_GUARDKIT}."
+    )
+    return GuardKitResult(
+        status="failed",
+        subcommand=subcommand,
+        duration_secs=duration_secs,
+        stdout_tail="",
+        stderr=detail,
+        exit_code=-1,
+        warnings=[
+            GuardKitWarning(
+                code="guardkit_binary_not_found",
+                message=detail,
+                details={
+                    "searched": list(searched),
+                    "env_var": GUARDKIT_PATH_ENV,
+                    "binary_name": _GUARDKIT_BINARY_NAME,
+                    "fallback": _AGENTECFLOW_GUARDKIT,
+                },
+            )
+        ],
+    )
 
 
 def _refused_cwd_result(

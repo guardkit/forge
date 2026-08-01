@@ -67,3 +67,47 @@ def _fence_receipts_root(tmp_path_factory: pytest.TempPathFactory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(RECEIPTS_DIR_ENV, str(fenced))
         yield
+
+
+#: The one-shot GuardKit adapter's binary override (mirrors
+#: :data:`forge.adapters.guardkit.run.GUARDKIT_PATH_ENV`).
+GUARDKIT_PATH_ENV = "FORGE_GUARDKIT_PATH"
+
+#: Explicit opt-in for an attended run that genuinely wants the host's real
+#: ``guardkit`` launcher on the adapter's resolution ladder.
+LIVE_GUARDKIT_OPT_IN_ENV = "FORGE_ALLOW_HOST_GUARDKIT"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _fence_guardkit_binary(tmp_path_factory: pytest.TempPathFactory):
+    """Keep the REAL ``guardkit`` launcher off the adapter's ladder.
+
+    ``forge.adapters.guardkit.run`` used to hardcode ``argv[0]`` to
+    ``/usr/local/bin/guardkit`` — a path that exists only inside the image, so
+    a test that forgot to stub ``_execute_subprocess`` failed fast with
+    ``FileNotFoundError``. Now that the adapter resolves through
+    ``FORGE_GUARDKIT_PATH`` → ``PATH`` → ``~/.agentecflow/bin/guardkit``, that
+    same missed stub would spawn the operator's REAL launcher on the host.
+
+    The fence pins the override at a throwaway script that refuses loudly
+    (exit 97), which also makes every adapter test host-independent: the argv
+    the suite asserts no longer depends on what this box has installed.
+    Function-scoped ``monkeypatch`` in a test still wins (it runs later), and
+    the resolution tests set their own rungs explicitly.
+    """
+    if os.environ.get(LIVE_GUARDKIT_OPT_IN_ENV) == "1":
+        yield
+        return
+    fenced_dir = tmp_path_factory.mktemp("forge-guardkit-fence")
+    fenced = fenced_dir / "guardkit"
+    fenced.write_text(
+        "#!/bin/sh\n"
+        "echo 'forge test fence: the real guardkit binary is never spawned "
+        "in tests (unset FORGE_GUARDKIT_PATH or set "
+        "FORGE_ALLOW_HOST_GUARDKIT=1 for an attended run)' >&2\n"
+        "exit 97\n"
+    )
+    fenced.chmod(0o755)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(GUARDKIT_PATH_ENV, str(fenced))
+        yield

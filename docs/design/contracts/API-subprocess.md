@@ -71,7 +71,7 @@ async def run(
     with_nats_streaming: bool = True,
 ) -> GuardKitResult:
     cmd = [
-        "/usr/local/bin/guardkit",
+        _resolve_guardkit_binary(),        # see the ladder below
         subcommand,
         *args,
         *(["--nats"] if with_nats_streaming else []),
@@ -83,6 +83,26 @@ async def run(
     )
     return parse_guardkit_output(raw, subcommand=subcommand)
 ```
+
+**`argv[0]` — the resolution ladder** (leg-invocation design pass 2026-08-02
+§d stage-1 venue-B). `argv[0]` was the literal `/usr/local/bin/guardkit`, which
+exists only inside the image, so outside the container this seam could not
+spawn at all. It now walks the same ladder the long-running autobuild path
+walks, resolved **once** per process and logged at INFO on first use:
+
+1. `FORGE_GUARDKIT_PATH`, when it names an executable file (a set-but-unusable
+   value warns and falls through);
+2. `PATH` lookup for `guardkit` — **the container's rung**: `/usr/local/bin` is
+   on the image's `PATH` and nothing ahead of it ships a file of that name
+   (`/opt/venv/bin` holds `guardkit-py`), so the image's binary still wins. The
+   found path is used **unresolved**, so the argv names the installed symlink,
+   not its target;
+3. `~/.agentecflow/bin/guardkit` — the local installer's launcher.
+
+Every rung missing is not an exception: the boundary returns its usual
+`status="failed"` result with a `guardkit_binary_not_found` warning naming each
+rung it searched. Only a *success* is memoised, so a binary installed later in
+the process's life is picked up.
 
 ### 3.2 Progress stream integration
 
