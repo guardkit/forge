@@ -360,27 +360,98 @@ class TestTheWaitWindow:
 
 
 class TestFlagOffIsALiteralPassThrough:
-    def test_flag_off_composes_no_conductor_at_all(
-        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    """The flag-off pin, driven through the REAL production seam.
+
+    This class used to hold a test that monkeypatched the composer, then
+    asserted ``conductor_enabled(config) is False`` and that the recorder
+    was empty — without ever invoking anything that could have called the
+    composer. It passed on a tree where the composer ran unconditionally.
+    A pin that cannot fail is not a pin (shadow-replay item 6).
+
+    So both tests below actually call
+    :func:`~forge.cli.serve.bind_production_dispatch_chain` and drive the
+    closure it returns, which is the ONE code path where the daemon
+    decides whether to compose a conductor. Fakes stand at the NATS,
+    gating and consumer-deps edges, exactly as
+    ``tests/cli/test_serve_planning_wiring.py`` does for the same closure
+    — the suite stays network-free.
+    """
+
+    @staticmethod
+    def _drive_boot(
+        pool: SqliteLifecyclePersistence,
+        *,
+        conductor_on: bool,
+        recorder: "list[dict[str, Any]]",
+        tmp_path: Path,
+    ) -> None:
+        """Run the production dispatch-chain composition once."""
+        from unittest.mock import MagicMock, patch
+
+        class _FakeNats:
+            async def subscribe(self, subject: str, callback: Any) -> Any:
+                return MagicMock()
+
+            async def publish(self, subject: str, body: bytes) -> None:
+                return None
+
+        def _record(**kwargs: Any) -> Any:
+            recorder.append(kwargs)
+            return None
+
+        with (
+            patch.object(serve_mod, "_compose_conductor_router", _record),
+            patch("forge.cli._serve_deps_gating.bind_gate_parts") as gate_parts,
+            patch("forge.cli._serve_deps.build_pipeline_consumer_deps") as deps,
+            patch(
+                "forge.cli._serve_deps_lifecycle.build_publisher_and_emitter"
+            ) as publisher,
+        ):
+            gate_parts.return_value = None
+            deps.return_value = MagicMock()
+            publisher.return_value = (MagicMock(), MagicMock())
+
+            compose = serve_mod.bind_production_dispatch_chain(
+                forge_config=_config(conductor_on=conductor_on),
+                sqlite_pool=pool,
+                db_path=tmp_path / "forge.db",
+            )
+            asyncio.run(compose(_FakeNats()))
+
+    def test_flag_off_never_enters_the_composer(
+        self, pool: SqliteLifecyclePersistence, tmp_path: Path
     ) -> None:
         """OFF must not construct a single conductor object.
 
         Not "equivalent behaviour" — nothing built. The flag is checked
-        before the composer is reached, so this asserts the composer is
-        never entered rather than that it happened to return ``None``.
+        BEFORE the composer is reached, so this asserts the composer is
+        never entered, having actually run the boot path that would enter
+        it.
         """
-        entered: list[int] = []
-        monkeypatch.setattr(
-            serve_mod,
-            "_compose_conductor_router",
-            lambda **_kw: entered.append(1),
+        entered: list[dict[str, Any]] = []
+
+        self._drive_boot(
+            pool, conductor_on=False, recorder=entered, tmp_path=tmp_path
         )
 
-        from forge.config.conductor import conductor_enabled
-
-        config = _config(conductor_on=False)
-        assert conductor_enabled(config) is False
         assert entered == []
+
+    def test_flag_on_enters_the_composer_exactly_once(
+        self, pool: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        """The control that makes the flag-off assertion mean something.
+
+        Same boot, same fakes, flag flipped — the composer is entered, and
+        the shared NATS client reaches it (item 3: without the client the
+        resume subscription cannot be composed at all).
+        """
+        entered: list[dict[str, Any]] = []
+
+        self._drive_boot(pool, conductor_on=True, recorder=entered, tmp_path=tmp_path)
+
+        assert len(entered) == 1
+        assert entered[0]["nats_client"] is not None
+        assert entered[0]["sqlite_pool"] is pool
 
     def test_flag_off_router_is_none(self, pool: SqliteLifecyclePersistence) -> None:
         assert (
@@ -433,3 +504,614 @@ class TestFlagOffIsALiteralPassThrough:
         assert captured["supervisor_factory"] is not None
         assert captured["driver_deps_factory"] is not None
         assert router is not None
+
+
+# ---------------------------------------------------------------------------
+# Item 2 — gates_green_reader: a REAL bounded evaluation
+# ---------------------------------------------------------------------------
+
+
+class _Declaration:
+    """Stands in for guardkit's ``ToolchainDeclaration`` (duck-typed)."""
+
+    def __init__(self, test: str | None, test_timeout: int = 300) -> None:
+        self.test = test
+        self.test_timeout = test_timeout
+
+
+def _gates_config(repo_paths: "dict[str, str] | None" = None) -> ForgeConfig:
+    raw: dict[str, Any] = {
+        "pipeline": {
+            "build_queue_subject": "pipeline.build-queued.team-a",
+            "approved_originators": ["terminal"],
+        },
+        "permissions": {"filesystem": {"allowlist": ["/work"]}},
+        "conductor": {"enabled": True},
+    }
+    if repo_paths is not None:
+        raw["planning"] = {"target_repo_paths": repo_paths}
+    return ForgeConfig.model_validate(raw)
+
+
+@pytest.fixture
+def gates_pool(tmp_path: Path) -> SqliteLifecyclePersistence:
+    """A build row whose worktree really exists on disk."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "gates.db")
+    migrations.apply_at_boot(cx)
+    cx.execute(
+        "INSERT INTO builds (build_id, feature_id, repo, branch, "
+        "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
+        "started_at, worktree_path, mode, task_id) VALUES (?, 'FEAT-G', "
+        "'org/target', 'fix/g', 'f.yaml', 'RUNNING', 'cli', 'corr-g', "
+        "'2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', ?, 'mode-c', "
+        "'TASK-G')",
+        (BUILD_ID, str(worktree)),
+    )
+    cx.commit()
+    return SqliteLifecyclePersistence(connection=cx)
+
+
+class TestGatesGreenReader:
+    """The exit-code-is-the-verdict law, and every honest degrade around it."""
+
+    @staticmethod
+    def _reader(
+        pool: Any,
+        *,
+        declaration: Any,
+        exit_code: "int | None" = 0,
+        calls: "list[dict[str, Any]] | None" = None,
+        repo_paths: "dict[str, str] | None" = None,
+    ) -> Any:
+        from forge.cli._serve_conductor import make_gates_green_reader
+
+        def _run(*, command: str, cwd: Any, timeout_seconds: int):
+            if calls is not None:
+                calls.append(
+                    {
+                        "command": command,
+                        "cwd": str(cwd),
+                        "timeout_seconds": timeout_seconds,
+                    }
+                )
+            return exit_code, f"`{command}` exited {exit_code}"
+
+        return make_gates_green_reader(
+            pool=pool,
+            config=_gates_config(
+                repo_paths
+                if repo_paths is not None
+                else {"org/target": "/canonical/target"}
+            ),
+            declaration_loader=lambda _root: declaration,
+            command_runner=_run,
+        )
+
+    def test_exit_zero_is_green(self, gates_pool: Any) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(
+            gates_pool, declaration=_Declaration("npm test"), exit_code=0
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.GREEN
+
+    def test_a_non_zero_exit_is_red_and_never_unknown(self, gates_pool: Any) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(
+            gates_pool, declaration=_Declaration("npm test"), exit_code=1
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.RED
+        assert report.failed_gates  # a red gate names something
+
+    def test_it_runs_the_declared_command_in_the_fix_worktree(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        """Declared command, fix branch's worktree, the declaration's bound."""
+        calls: list[dict[str, Any]] = []
+
+        self._reader(
+            gates_pool,
+            declaration=_Declaration("uv run pytest -q", test_timeout=900),
+            calls=calls,
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert calls == [
+            {
+                "command": "uv run pytest -q",
+                "cwd": str(tmp_path / "wt"),
+                "timeout_seconds": 900,
+            }
+        ]
+
+    def test_no_declaration_is_an_honest_unknown_and_runs_nothing(
+        self, gates_pool: Any
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list[dict[str, Any]] = []
+        report = self._reader(gates_pool, declaration=None, calls=calls)(
+            build_id=BUILD_ID, branch="fix/g"
+        )
+
+        assert report.status is GateStatus.UNKNOWN
+        assert report.is_green is False  # UNKNOWN is red-safe
+        assert calls == []
+
+    def test_a_declaration_with_no_test_command_is_unknown(
+        self, gates_pool: Any
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(gates_pool, declaration=_Declaration(None))(
+            build_id=BUILD_ID, branch="fix/g"
+        )
+
+        assert report.status is GateStatus.UNKNOWN
+
+    def test_an_unmapped_repo_is_unknown_never_the_worktree(
+        self, gates_pool: Any
+    ) -> None:
+        """The declaration is read from the CANONICAL repo, or not at all.
+
+        Falling back to the worktree would let a fix journey that edited
+        ``.guardkit/config.yaml`` green itself.
+        """
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list[dict[str, Any]] = []
+        report = self._reader(
+            gates_pool,
+            declaration=_Declaration("npm test"),
+            calls=calls,
+            repo_paths={},
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.UNKNOWN
+        assert calls == []
+
+    def test_a_timeout_is_unknown_not_red_and_not_green(
+        self, gates_pool: Any
+    ) -> None:
+        """We did not observe a verdict, so we do not report one."""
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(
+            gates_pool, declaration=_Declaration("npm test"), exit_code=None
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.UNKNOWN
+
+    def test_a_raising_runner_is_unknown_never_green(self, gates_pool: Any) -> None:
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        def _boom(**_kw: Any):
+            raise RuntimeError("the runner fell over")
+
+        read = make_gates_green_reader(
+            pool=gates_pool,
+            config=_gates_config({"org/target": "/canonical/target"}),
+            declaration_loader=lambda _root: _Declaration("npm test"),
+            command_runner=_boom,
+        )
+
+        assert read(build_id=BUILD_ID).status is GateStatus.UNKNOWN
+
+    def test_a_missing_build_row_is_unknown(self, gates_pool: Any) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(gates_pool, declaration=_Declaration("npm test"))(
+            build_id="build-does-not-exist"
+        )
+
+        assert report.status is GateStatus.UNKNOWN
+
+    def test_the_checkpoint_publishes_on_a_green_reader_and_not_on_a_red_one(
+        self, gates_pool: Any
+    ) -> None:
+        """End to end through the REAL checkpoint: the reader decides the card."""
+        from forge.cli._serve_conductor import make_merge_ready_checkpoint
+
+        published: list[dict[str, Any]] = []
+
+        def _run_case(exit_code: int) -> Any:
+            checkpoint = make_merge_ready_checkpoint(
+                pool=gates_pool,
+                publish_card=lambda **kw: published.append(kw) or "RESUMED",
+                gates_green_reader=self._reader(
+                    gates_pool,
+                    declaration=_Declaration("npm test"),
+                    exit_code=exit_code,
+                ),
+                published_probe=lambda _bid: False,
+            )
+            return asyncio.run(
+                checkpoint.submit_decision(
+                    build_id=BUILD_ID,
+                    feature_id="FEAT-G",
+                    auto_approve=False,
+                    rationale="r",
+                )
+            )
+
+        red = _run_case(1)
+        assert red.card_published is False
+        assert published == []
+
+        green = _run_case(0)
+        assert green.card_published is True
+        assert len(published) == 1
+
+
+# ---------------------------------------------------------------------------
+# Item 3 — the resume seam, over the REAL subscriber surface
+# ---------------------------------------------------------------------------
+
+
+class _FakeSubscriber:
+    """Records what the seam asked for; arms exactly as the real one does."""
+
+    def __init__(self, armed: Any, response: Any = "APPROVED") -> None:
+        self._armed = armed
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def await_response(
+        self,
+        build_id: str,
+        *,
+        stage_label: str,
+        attempt_count: int = 0,
+        timeout_seconds: int | None = None,
+    ) -> Any:
+        self.calls.append(
+            {
+                "build_id": build_id,
+                "stage_label": stage_label,
+                "attempt_count": attempt_count,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if self._armed is not None:
+            self._armed.set()
+        return self._response
+
+
+class TestTheResumeSeam:
+    def test_it_calls_the_REAL_subscriber_method(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The shape correction: ``await_response``, not ``wait_for_response``.
+
+        The Stage-2 seam called a method no subscriber in this tree has.
+        A ``SIGNATURE-BINDING`` fake would not have caught it either —
+        only calling the seam does. This test binds the fake's own
+        ``await_response`` signature against the REAL
+        :class:`~forge.adapters.nats.approval_subscriber.ApprovalSubscriber`'s.
+        """
+        import inspect
+
+        from forge.adapters.nats.approval_subscriber import ApprovalSubscriber
+        from forge.cli._serve_conductor import make_conductor_subscribe_resume
+        from forge.gating.identity import derive_request_id
+
+        request_id = derive_request_id(
+            build_id=BUILD_ID,
+            stage_label="the merge-ready checkpoint",
+            attempt_count=2,
+        )
+        pool.mark_paused(BUILD_ID, request_id)
+
+        made: list[_FakeSubscriber] = []
+
+        def factory(expected_approver: Any, armed: Any) -> Any:
+            sub = _FakeSubscriber(armed)
+            made.append(sub)
+            return sub
+
+        seam = make_conductor_subscribe_resume(
+            pool=pool, subscriber_factory=factory, expected_approver="rich"
+        )
+        armed = asyncio.Event()
+        result = asyncio.run(
+            seam(BUILD_ID, armed=armed, timeout_seconds=45)
+        )
+
+        assert result == "APPROVED"
+        assert armed.is_set()
+        call = made[0].calls[0]
+        # The pair is READ BACK off the durable request_id, not invented.
+        assert call["stage_label"] == "the merge-ready checkpoint"
+        assert call["attempt_count"] == 2
+        assert call["timeout_seconds"] == 45
+        # And the call is one the real subscriber would accept.
+        inspect.signature(ApprovalSubscriber.await_response).bind(
+            object(), BUILD_ID, **{k: v for k, v in call.items() if k != "build_id"}
+        )
+
+    def test_no_pending_request_arms_and_answers_immediately(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Never leave the driver's arm-timeout to fire on a resolved wait."""
+        from forge.cli._serve_conductor import make_conductor_subscribe_resume
+
+        called: list[int] = []
+        seam = make_conductor_subscribe_resume(
+            pool=pool,
+            subscriber_factory=lambda *_a: called.append(1),
+        )
+        armed = asyncio.Event()
+
+        assert asyncio.run(seam(BUILD_ID, armed=armed, timeout_seconds=5)) is None
+        assert armed.is_set()
+        assert called == []
+
+    def test_an_unparseable_legacy_id_still_waits(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from forge.cli._serve_conductor import make_conductor_subscribe_resume
+
+        pool.mark_paused(BUILD_ID, "a-legacy-id-with-no-structure")
+        made: list[_FakeSubscriber] = []
+
+        seam = make_conductor_subscribe_resume(
+            pool=pool,
+            subscriber_factory=lambda _a, armed: made.append(
+                _FakeSubscriber(armed)
+            )
+            or made[-1],
+        )
+        armed = asyncio.Event()
+
+        assert asyncio.run(seam(BUILD_ID, armed=armed, timeout_seconds=5))
+        assert made[0].calls[0]["attempt_count"] == 0
+
+    def test_an_unwired_factory_leaves_the_driver_seam_none(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The honest degrade: stop loudly, never spin-poll."""
+        deps = build_conductor_driver_deps_factory(
+            pool=pool, config=_config(conductor_on=True), subscriber_factory=None
+        )(BUILD_ID, object())
+
+        assert deps.subscribe_resume is None
+
+    def test_a_wired_factory_fills_the_driver_seam(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        deps = build_conductor_driver_deps_factory(
+            pool=pool,
+            config=_config(conductor_on=True),
+            subscriber_factory=lambda _a, armed: _FakeSubscriber(armed),
+        )(BUILD_ID, object())
+
+        assert deps.subscribe_resume is not None
+
+    def test_the_composition_wires_the_seam_when_a_client_is_present(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Item 3's composition half: the client reaches the deps factory."""
+        captured: dict[str, Any] = {}
+        original = serve_mod.build_conductor_router
+
+        class _FakeNats:
+            async def subscribe(self, subject: str, callback: Any) -> Any:
+                return object()
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        serve_mod.build_conductor_router = _capture  # type: ignore[assignment]
+        try:
+            serve_mod._compose_conductor_router(
+                sqlite_pool=pool,
+                forge_config=_config(conductor_on=True),
+                lifecycle_emitter=None,
+                gate_parts=None,
+                gate_repository=None,
+                gate_state_machine=None,
+                clock=lambda: None,
+                nats_client=_FakeNats(),
+            )
+        finally:
+            serve_mod.build_conductor_router = original  # type: ignore[assignment]
+
+        deps = captured["driver_deps_factory"](BUILD_ID, object())
+        assert deps.subscribe_resume is not None
+
+    def test_the_composition_leaves_the_seam_unwired_without_a_client(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        captured: dict[str, Any] = {}
+        original = serve_mod.build_conductor_router
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        serve_mod.build_conductor_router = _capture  # type: ignore[assignment]
+        try:
+            serve_mod._compose_conductor_router(
+                sqlite_pool=pool,
+                forge_config=_config(conductor_on=True),
+                lifecycle_emitter=None,
+                gate_parts=None,
+                gate_repository=None,
+                gate_state_machine=None,
+                clock=lambda: None,
+            )
+        finally:
+            serve_mod.build_conductor_router = original  # type: ignore[assignment]
+
+        deps = captured["driver_deps_factory"](BUILD_ID, object())
+        assert deps.subscribe_resume is None
+
+
+# ---------------------------------------------------------------------------
+# Item 5 — the one-card latch, restart-safe
+# ---------------------------------------------------------------------------
+
+
+class TestTheDurableOneCardLatch:
+    @staticmethod
+    def _checkpoint(pool: Any, published: list) -> Any:
+        from forge.cli._serve_conductor import make_merge_ready_checkpoint
+
+        return make_merge_ready_checkpoint(
+            pool=pool,
+            publish_card=lambda **kw: published.append(kw) or "RESUMED",
+            gates_green_reader=lambda **_kw: True,
+        )
+
+    @staticmethod
+    def _submit(checkpoint: Any) -> Any:
+        return asyncio.run(
+            checkpoint.submit_decision(
+                build_id=BUILD_ID,
+                feature_id="FEAT-FIX007",
+                auto_approve=False,
+                rationale="r",
+            )
+        )
+
+    def test_a_fresh_publisher_over_a_carded_build_publishes_nothing(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """THE RESTART CASE. Two publisher instances, one card.
+
+        Before the durable half, a daemon restart mid-journey built a
+        fresh publisher with an empty in-memory latch and would card the
+        same build again — two cards for one merge word.
+        """
+        from forge.pipeline.merge_ready_checkpoint import MergeCardOutcome
+
+        published: list[dict[str, Any]] = []
+
+        first = self._submit(self._checkpoint(pool, published))
+        assert first.outcome is MergeCardOutcome.CARD_PUBLISHED
+
+        # Simulate what the gate's own writer does on that publish: the
+        # durable row bearing the merge card's target identifier.
+        self._record_a_merge_card_row(pool)
+
+        # A NEW publisher — exactly what a restarted daemon composes.
+        second = self._submit(self._checkpoint(pool, published))
+
+        assert second.outcome is MergeCardOutcome.ALREADY_CHECKPOINTED
+        assert len(published) == 1
+
+    def test_without_the_durable_row_a_fresh_publisher_would_re_card(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The control that makes the test above mean something.
+
+        Same two instances, no durable row — the in-memory latch alone
+        does not survive, which is precisely the hole item 5 named.
+        """
+        published: list[dict[str, Any]] = []
+
+        self._submit(self._checkpoint(pool, published))
+        self._submit(self._checkpoint(pool, published))
+
+        assert len(published) == 2
+
+    def test_a_raising_probe_never_wedges_a_journey_that_never_carded(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from forge.cli._serve_conductor import make_merge_ready_checkpoint
+        from forge.pipeline.merge_ready_checkpoint import MergeCardOutcome
+
+        published: list[dict[str, Any]] = []
+
+        def _boom(_build_id: str) -> bool:
+            raise RuntimeError("the probe fell over")
+
+        decision = self._submit(
+            make_merge_ready_checkpoint(
+                pool=pool,
+                publish_card=lambda **kw: published.append(kw) or "RESUMED",
+                gates_green_reader=lambda **_kw: True,
+                published_probe=_boom,
+            )
+        )
+
+        assert decision.outcome is MergeCardOutcome.CARD_PUBLISHED
+        assert len(published) == 1
+
+    def test_the_probe_reads_the_gates_own_row(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from forge.cli._serve_conductor import (
+            make_conductor_merge_card_published_probe,
+        )
+
+        probe = make_conductor_merge_card_published_probe(pool=pool)
+        assert probe(BUILD_ID) is False
+
+        self._record_a_merge_card_row(pool)
+        assert probe(BUILD_ID) is True
+
+    def test_an_unrelated_gate_row_is_not_a_merge_card(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The pre-dispatch gate's card must not latch the merge card."""
+        from datetime import datetime, timezone
+
+        from forge.cli._serve_conductor import (
+            make_conductor_merge_card_published_probe,
+        )
+        from forge.lifecycle.persistence import StageLogEntry
+
+        now = datetime.now(timezone.utc)
+        pool.record_stage(
+            StageLogEntry(
+                build_id=BUILD_ID,
+                stage_label="autobuild",
+                target_kind="subagent",
+                target_identifier="autobuild_runner",
+                status="GATED",
+                gate_mode=None,
+                coach_score=None,
+                threshold_applied=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={},
+            )
+        )
+
+        assert make_conductor_merge_card_published_probe(pool=pool)(BUILD_ID) is False
+
+    @staticmethod
+    def _record_a_merge_card_row(pool: Any) -> None:
+        from datetime import datetime, timezone
+
+        from forge.cli._serve_gate_activation import _MERGE_CARD_TARGET_IDENTIFIER
+        from forge.lifecycle.persistence import StageLogEntry
+        from forge.pipeline.merge_ready_checkpoint import (
+            MERGE_READY_CHECKPOINT_LABEL,
+        )
+
+        now = datetime.now(timezone.utc)
+        pool.record_stage(
+            StageLogEntry(
+                build_id=BUILD_ID,
+                stage_label=MERGE_READY_CHECKPOINT_LABEL,
+                target_kind="subagent",
+                target_identifier=_MERGE_CARD_TARGET_IDENTIFIER,
+                status="GATED",
+                gate_mode="MANDATORY_HUMAN_APPROVAL",
+                coach_score=None,
+                threshold_applied=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"gate_pause": {"request_id": "r", "attempt_count": 0}},
+            )
+        )

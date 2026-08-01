@@ -164,6 +164,15 @@ class ConductorRunOutcome(StrEnum):
             queue moves on (design pass §d Stage 3).
         WAIT_EXPIRED: The structured wait's durable window ran out with
             no response. A loud stop with a pack.
+        RED_GATE_STOP: The merge-ready checkpoint found a RED gate, looped
+            back into the fix cycle, and there was no resume seam wired to
+            carry that loop-back anywhere. The journey stops because the
+            gate is red — and the report SAYS the gate is red. Before this
+            member the same stop was written up as ``WAIT_EXPIRED``: a
+            red-gate refusal mis-worded as a silence. When a resume seam
+            IS wired the loop-back stays a legitimate wait (the next
+            review pass re-plans), so this member is reached only on the
+            can't-arm path.
         NOTHING_CHANGED: Consecutive identical turns with no durable
             change — the cure-then-retry ladder's stop rung.
         TURN_CAP: The hard turn ceiling was reached. A planner defect,
@@ -182,6 +191,7 @@ class ConductorRunOutcome(StrEnum):
     EXPIRED = "expired"
     PAUSED_BUDGET = "paused-budget"
     WAIT_EXPIRED = "wait-expired"
+    RED_GATE_STOP = "red-gate-stop"
     NOTHING_CHANGED = "nothing-changed"
     TURN_CAP = "turn-cap"
     NOT_DRIVEN = "not-driven"
@@ -507,6 +517,50 @@ class ConductorTurnLoop:
                         turns,
                     )
                     continue
+
+                # THE RED-GATE HONEST WORD (shadow-replay item 1).
+                #
+                # ``RED_GATE_LOOP_BACK`` is mapped to ``WAITING`` by the
+                # supervisor, and that mapping is right: a red gate
+                # re-enters the fix cycle, and the conductor's next review
+                # pass is what picks the branch up. But a loop-back only
+                # goes anywhere if something can WAKE the loop — and with
+                # no resume seam wired the wait cannot arm, so the journey
+                # died ``WAIT_EXPIRED``: "nobody answered" as the write-up
+                # of "the gate was red and we refused to card it".
+                #
+                # So the word is chosen by what the loop can actually do:
+                #
+                #   * resume seam wired → the loop-back is a legitimate
+                #     wait; fall through to the structured wait unchanged.
+                #   * no resume seam → stop NOW with RED_GATE_STOP, and
+                #     name the failing gates in the rationale and the pack.
+                if _is_red_gate_loop_back(report) and not self._can_arm_a_wait():
+                    reason = _red_gate_reason(report)
+                    logger.error(
+                        "conductor: build_id=%s stopped after %d turn(s) — %s "
+                        "(no resume seam is wired, so the fix cycle's "
+                        "loop-back has nothing to wake it; this is a RED "
+                        "GATE stop, not a wait expiry)",
+                        build_id,
+                        turns,
+                        reason,
+                    )
+                    pack = await self._write_pack(
+                        build_id,
+                        reason=reason,
+                        outcome=ConductorRunOutcome.RED_GATE_STOP,
+                    )
+                    return ConductorRunReport(
+                        outcome=ConductorRunOutcome.RED_GATE_STOP,
+                        build_id=build_id,
+                        turns=turns,
+                        last_report=report,
+                        stage_receipts=tuple(self._stage_receipts),
+                        rationale=reason,
+                        failure_pack=pack,
+                    )
+
                 progressed = await self._structured_wait(build_id, report)
                 if not progressed:
                     reason = (
@@ -702,6 +756,18 @@ class ConductorTurnLoop:
 
     # -- side seams ---------------------------------------------------
 
+    def _can_arm_a_wait(self) -> bool:
+        """``True`` when a structured wait could actually arm.
+
+        The same two seams :meth:`_structured_wait` checks first. Read
+        here as well so the loop can pick the honest WORD *before* it
+        enters a wait it already knows cannot arm.
+        """
+        deps = self._deps
+        return (
+            deps.wait_window_reader is not None and deps.subscribe_resume is not None
+        )
+
     @staticmethod
     def _fingerprint(report: Any) -> tuple[Any, ...]:
         """Identity of a turn for the nothing-changed rule."""
@@ -873,6 +939,48 @@ def _classify_card_result(report: Any) -> ConductorRunOutcome:
         )
         return ConductorRunOutcome.DELIVERED
     return mapped
+
+
+def _is_red_gate_loop_back(report: Any) -> bool:
+    """``True`` when this turn's dispatch result is a RED-GATE loop-back.
+
+    Duck-typed against
+    :class:`~forge.pipeline.merge_ready_checkpoint.MergeCardDecision`'s
+    ``loops_back`` property — the same no-import-edge discipline
+    :func:`_card_was_published` uses. Every other dispatch result (and
+    every test double that is not a decision) answers ``False``, so the
+    honest-word branch is reachable only from the one outcome that means
+    it.
+    """
+    return getattr(getattr(report, "dispatch_result", None), "loops_back", False) is True
+
+
+def _red_gate_reason(report: Any) -> str:
+    """Plain-language reason naming the RED GATE, for the report and pack.
+
+    Reads the decision's :class:`GatesReport` duck-typed. The failing gate
+    NAMES are what a human needs first; the free-form detail is the
+    fallback when the reader named none (an UNKNOWN gate set, for
+    instance, which the checkpoint also treats as red).
+    """
+    decision = getattr(report, "dispatch_result", None)
+    gates = getattr(decision, "gates", None)
+    status = getattr(getattr(gates, "status", None), "value", None) or "red"
+    failed = tuple(getattr(gates, "failed_gates", ()) or ())
+    detail = getattr(gates, "detail", "") or ""
+    if failed:
+        named = ", ".join(str(gate) for gate in failed)
+        return (
+            f"the merge-ready checkpoint found the gates {status}: {named} — "
+            "no merge card was published and the fix cycle has nowhere to "
+            "loop back to"
+        )
+    return (
+        f"the merge-ready checkpoint found the gates {status}"
+        + (f" ({detail})" if detail else "")
+        + " — no merge card was published and the fix cycle has nowhere to "
+        "loop back to"
+    )
 
 
 def _card_was_published(report: Any) -> bool:
