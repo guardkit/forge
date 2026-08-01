@@ -2555,8 +2555,11 @@ def _export_prior_build_evidence(
     Raises :class:`PriorBuildSweepError` when the evidence cannot be made
     durable: an un-exported prior build must never be swept.
     """
-    ok, families = _export_receipts(outer_root, prior_build_id)
-    if not ok:
+    # Merge seam (SL3 x SL1, coordinator-resolved): _export_receipts now
+    # returns the receipts-landing lane's honest ReceiptExport; the sweep
+    # consumes it the same way the failure path does.
+    export = _export_receipts(outer_root, prior_build_id)
+    if not export.ok:
         raise PriorBuildSweepError(
             f"prior build {prior_build_id!r} receipts could not be exported "
             f"from its kept worktree {outer_root} — refusing to sweep "
@@ -2574,7 +2577,7 @@ def _export_prior_build_evidence(
         exit_code=-1,
         worktree_path=outer_root,
         branch=", ".join(branches) if branches else None,
-        exported_families=families,
+        receipts=export,
     )
     if not _prior_export_is_present(prior_build_id):
         raise PriorBuildSweepError(
@@ -2588,7 +2591,7 @@ def _export_prior_build_evidence(
         "-> %s (families: %s)",
         prior_build_id,
         _receipts_root() / prior_build_id,
-        ", ".join(families) if families else "none present",
+        ", ".join(export.exported) if export.exported else "none present",
     )
 
 
