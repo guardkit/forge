@@ -240,6 +240,16 @@ class StageEntry:
         fix_task_id: For ``/task-work`` entries, the identifier of the fix
             task this dispatch worked on. ``None`` for entries that are
             not ``/task-work``.
+        finding_anchors: For ``/task-review`` entries, the location
+            identities of what the review found (LI stage-2 §5) —
+            ``<file>|<severity>`` per finding. **Three-valued on purpose:**
+            ``None`` means the row states nothing about anchors (a legacy
+            row, or one whose key was unreadable), an empty tuple means the
+            review reported no findings, and a populated tuple is the
+            review's report. The planner does not read this field — the
+            conductor's review-cycle no-progress stop does — but it is
+            projected here because ``StageEntry`` is the one shape the
+            history is read through.
         hard_stop: Whether the gate decision was a hard-stop. A hard-stop
             on ``/task-review`` terminates the build with FAILED regardless
             of the ``status`` string (gate vocabularies vary).
@@ -249,6 +259,7 @@ class StageEntry:
     status: str
     fix_tasks: tuple[str, ...] = field(default=())
     fix_task_id: str | None = None
+    finding_anchors: tuple[str, ...] | None = None
     hard_stop: bool = False
 
 

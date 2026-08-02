@@ -15,6 +15,10 @@ Coverage map:
   externally-resolved short-circuit, expiry.
 - The stop rules (:class:`TestStopRules`): nothing-changed, turn ceiling,
   a raising ``next_turn``.
+- The review-cycle no-progress stop
+  (:class:`TestReviewCycleNoProgressStop`, LI stage-2 §5): finding anchors
+  compared across review cycles, replay-shaped against the runaway
+  ledger's 347/355 pair.
 - The receipts seams (:class:`TestReceiptSeams`): per-turn export, the
   failure pack on a loud stop, and the "receipts never block a journey"
   posture.
@@ -26,11 +30,17 @@ does not declare ``pytest-asyncio``.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
+from forge.adapters.guardkit.parser import parse_guardkit_output
+from forge.pipeline.dispatchers.subprocess import (
+    StageDispatchResult,
+    StageDispatchStatus,
+)
 from forge.pipeline.conductor_driver import (
     ConductorDriverDeps,
     ConductorRunOutcome,
@@ -830,3 +840,463 @@ class TestReceiptSeams:
         )
 
         assert report.outcome is ConductorRunOutcome.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# The review-cycle no-progress stop (LI stage-2 §5, FB3)
+# ---------------------------------------------------------------------------
+
+
+class TestReviewCycleNoProgressStop:
+    """Replay-shaped: real leg stdout → real parser → real dispatch result.
+
+    The runaway ledger is the fixture. Review rows 347 / 355 / 363 / 371
+    emitted byte-identical findings four cycles running and the turn-level
+    rule never fired, because a ``/task-work`` turn sits between every pair
+    of reviews and breaks the adjacency its fingerprint needs. So these
+    drives interleave work turns exactly as the real journey does — a rule
+    proven only on back-to-back reviews would prove nothing about the
+    failure it exists to catch.
+
+    Nothing here is a mock of the thing under test: the anchors travel the
+    real path (the builder's marker-block text → forge's own
+    ``parse_guardkit_output`` → a real ``StageDispatchResult``) and only
+    the supervisor, which is not what FB3 changed, is a double.
+    """
+
+    @staticmethod
+    def _review_stdout(findings: list[dict[str, Any]] | None) -> str:
+        """The builder's ``render_marker_block`` shape, verbatim.
+
+        ``None`` = the leg emitted NO ``## Detection Findings`` section at
+        all, which is the fail-closed case. An empty list is the very
+        different "it looked and found nothing".
+        """
+        lines = ["## Artefacts", "- /w/tasks/TASK-FIX007-001.yaml", ""]
+        if findings is not None:
+            lines.append("## Detection Findings")
+            lines.append("```json")
+            lines.append(json.dumps(findings, indent=2))
+            lines.append("```")
+        return "\n".join(lines)
+
+    @classmethod
+    def _review_dispatch_result(
+        cls, findings: list[dict[str, Any]] | None
+    ) -> StageDispatchResult:
+        parsed = parse_guardkit_output(
+            subcommand="task-review",
+            stdout=cls._review_stdout(findings),
+            stderr="",
+            exit_code=0,
+            duration_secs=1.0,
+        )
+        return StageDispatchResult(
+            status=StageDispatchStatus.SUCCESS,
+            stage=StageClass.TASK_REVIEW,
+            build_id=BUILD_ID,
+            feature_id=None,
+            correlation_id="corr-1",
+            artefact_paths=tuple(parsed.artefacts),
+            rationale="task-review completed",
+            exit_code=0,
+            duration_secs=1.0,
+            subcommand="task-review",
+            detection_findings=tuple(parsed.detection_findings or ()),
+            detection_findings_reported=parsed.detection_findings is not None,
+        )
+
+    @classmethod
+    def _review_turn(
+        cls, findings: list[dict[str, Any]] | None, *, rationale: str
+    ) -> TurnReport:
+        return TurnReport(
+            outcome=TurnOutcome.DISPATCHED,
+            build_id=BUILD_ID,
+            chosen_stage=StageClass.TASK_REVIEW,
+            rationale=rationale,
+            dispatch_result=cls._review_dispatch_result(findings),
+        )
+
+    @staticmethod
+    def _work_turn(fix_task_id: str) -> TurnReport:
+        """The ``/task-work`` turn that sits between two reviews."""
+        return TurnReport(
+            outcome=TurnOutcome.DISPATCHED,
+            build_id=BUILD_ID,
+            chosen_stage=StageClass.TASK_WORK,
+            rationale=f"MODE_C planner chose task-work for {fix_task_id}",
+            dispatch_result=StageDispatchResult(
+                status=StageDispatchStatus.SUCCESS,
+                stage=StageClass.TASK_WORK,
+                build_id=BUILD_ID,
+                feature_id=None,
+                correlation_id="corr-1",
+                artefact_paths=(),
+                rationale="task-work completed",
+                exit_code=0,
+                duration_secs=1.0,
+                subcommand="task-work",
+            ),
+        )
+
+    #: The 347/355 pair, as the ledger recorded it — one defect, two titles,
+    #: a drifting line number, the same file and severity.
+    _FINDINGS_347: list[dict[str, Any]] = [
+        {
+            "pattern": "UNGROUNDED",
+            "file": "src/core/config.py",
+            "line": 14,
+            "severity": "critical",
+            "evidence": "settings loaded twice",
+        },
+        {
+            "pattern": "PHANTOM",
+            "file": "src/api/routes.py",
+            "line": 88,
+            "severity": "high",
+            "evidence": "handler never registered",
+        },
+    ]
+    _FINDINGS_355: list[dict[str, Any]] = [
+        {
+            "pattern": "SCOPE_CREEP",
+            "file": "src/core/config.py",
+            "line": None,
+            "severity": "critical",
+            "evidence": "the same double load, retitled",
+        },
+        {
+            "pattern": "PHANTOM",
+            "file": "src/api/routes.py:36",
+            "severity": "high",
+            "evidence": "handler still never registered",
+        },
+    ]
+
+    def test_two_reviews_with_the_same_anchors_stop_at_the_second(self) -> None:
+        """(a) — the 347/355 pair, with a work turn between them."""
+        wait = ScriptedWait()
+        packs: list[dict[str, Any]] = []
+
+        def write_pack(**kwargs: Any) -> str:
+            packs.append(kwargs)
+            return "/packs/fix.json"
+
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 347"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(self._FINDINGS_355, rationale="review 355"),
+                # Would run if the stop failed — the ledger's 363 and 371.
+                self._work_turn("TASK-FIX007-002"),
+                self._review_turn(self._FINDINGS_347, rationale="review 363"),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(
+                BUILD_ID,
+                _deps(supervisor, wait=wait, write_failure_pack=write_pack),
+            )
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert report.turns == 3, "the stop must fire ON the second review"
+        # The anchors are NAMED — in the rationale and in the pack.
+        assert "src/core/config.py|critical" in report.rationale
+        assert "src/api/routes.py|high" in report.rationale
+        assert "src/core/config.py|critical" in packs[0]["reason"]
+        assert report.failure_pack == "/packs/fix.json"
+
+    def test_the_titles_and_line_numbers_are_not_the_identity(self) -> None:
+        """Same stop, and the reason proves WHY the two reviews matched.
+
+        Every title differs and every line differs between 347 and 355 —
+        88 distinct fix-task ids for ~5 defects was the measured failure.
+        Only the file+severity anchor survives, which is the whole design.
+        """
+        titles_347 = {f["pattern"] for f in self._FINDINGS_347}
+        titles_355 = {f["pattern"] for f in self._FINDINGS_355}
+        assert titles_347 != titles_355
+
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 347"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(self._FINDINGS_355, rationale="review 355"),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert "not one of them was resolved" in report.rationale
+
+    def test_a_review_that_resolves_an_anchor_resets_the_streak(self) -> None:
+        """(b) — one anchor gone is progress, and the journey continues."""
+        wait = ScriptedWait()
+        resolved_one = [self._FINDINGS_355[0]]  # routes.py|high is fixed
+
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(resolved_one, rationale="review 2"),
+                self._work_turn("TASK-FIX007-002"),
+                _report(TurnOutcome.TERMINAL),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert report.turns == 5
+
+    def test_new_findings_on_top_of_the_old_ones_are_still_no_progress(
+        self,
+    ) -> None:
+        """⊇, not ==: adding findings does not redeem fixing none."""
+        wait = ScriptedWait()
+        superset = self._FINDINGS_355 + [
+            {"file": "src/db/session.py", "severity": "medium", "pattern": "NEW"}
+        ]
+
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(superset, rationale="review 2"),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert "plus new: src/db/session.py|medium" in report.rationale
+
+    def test_a_missing_findings_block_counts_as_no_progress(self) -> None:
+        """(c) — fail closed: silence is never read as a fix."""
+        wait = ScriptedWait()
+
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(None, rationale="review 2 (no block)"),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert "no readable findings block" in report.rationale
+        # The baseline is NAMED even though the current review said nothing.
+        assert "src/core/config.py|critical" in report.rationale
+
+    def test_an_unparseable_findings_block_counts_as_no_progress(self) -> None:
+        """The parser answers None for malformed JSON — same fail-closed read."""
+        stdout = (
+            "## Artefacts\n- /w/tasks/TASK-FIX007-001.yaml\n\n"
+            "## Detection Findings\n```json\n[{'not': 'json'},\n```"
+        )
+        parsed = parse_guardkit_output(
+            subcommand="task-review",
+            stdout=stdout,
+            stderr="",
+            exit_code=0,
+            duration_secs=1.0,
+        )
+        assert parsed.detection_findings is None
+        assert parsed.warnings, "the parser records the shape warning"
+
+        broken = TurnReport(
+            outcome=TurnOutcome.DISPATCHED,
+            build_id=BUILD_ID,
+            chosen_stage=StageClass.TASK_REVIEW,
+            rationale="review 2 (bad json)",
+            dispatch_result=StageDispatchResult(
+                status=StageDispatchStatus.SUCCESS,
+                stage=StageClass.TASK_REVIEW,
+                build_id=BUILD_ID,
+                feature_id=None,
+                correlation_id="corr-1",
+                artefact_paths=(),
+                rationale="task-review completed",
+                exit_code=0,
+                duration_secs=1.0,
+                subcommand="task-review",
+                detection_findings=tuple(parsed.detection_findings or ()),
+                detection_findings_reported=parsed.detection_findings is not None,
+            ),
+        )
+
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                broken,
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert "no readable findings block" in report.rationale
+
+    def test_a_first_review_with_no_block_is_not_accused(self) -> None:
+        """No baseline, no verdict — a comparison needs two sides."""
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(None, rationale="review 1 (no block)"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(self._FINDINGS_347, rationale="review 2"),
+                _report(TurnOutcome.TERMINAL),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert report.turns == 4
+
+    def test_a_clean_review_is_the_success_path_not_a_stop(self) -> None:
+        """The empty block is NOT the missing block.
+
+        This is the journey's happy ending: findings → work → a review that
+        looks and finds nothing → CLEAN_REVIEW. Reading an empty findings
+        block as "no progress" would stop every journey exactly at the
+        review that was about to end it well.
+        """
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn([], rationale="review 2 (clean)"),
+                _report(TurnOutcome.TERMINAL),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert report.turns == 4
+
+    def test_a_clean_review_never_becomes_an_accusing_baseline(self) -> None:
+        """The empty set is a superset of nothing — it must not be carried.
+
+        Clean review, then a review that finds something: the second is new
+        information, not a repeat, and the journey must survive it.
+        """
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn([], rationale="review 1 (clean)"),
+                self._work_turn("TASK-FIX007-001"),
+                self._review_turn(self._FINDINGS_347, rationale="review 2"),
+                _report(TurnOutcome.TERMINAL),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert report.turns == 4
+
+    def test_work_turns_never_move_the_baseline(self) -> None:
+        """The rule advances on reviews and nothing else.
+
+        Two work turns between the pair, and the stop still fires on the
+        second review with the same anchors named.
+        """
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                self._review_turn(self._FINDINGS_347, rationale="review 1"),
+                self._work_turn("TASK-FIX007-001"),
+                self._work_turn("TASK-FIX007-002"),
+                self._review_turn(self._FINDINGS_355, rationale="review 2"),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert report.turns == 4
+
+    def test_the_turn_level_rule_is_still_intact(self) -> None:
+        """(d) — the review rule ADDS a stop; it replaces nothing.
+
+        Identical WAITING turns carry no dispatch result at all, so the
+        review-cycle rule never sees them. The turn-level fingerprint still
+        stops the wedge, at its own limit, with its own words.
+        """
+        wait = ScriptedWait()
+        supervisor = FakeSupervisor(
+            script=[
+                _report(TurnOutcome.WAITING, rationale="same"),
+                _report(TurnOutcome.WAITING, rationale="same"),
+                _report(TurnOutcome.WAITING, rationale="same"),
+                _report(TurnOutcome.WAITING, rationale="same"),
+                _report(TurnOutcome.TERMINAL),
+            ]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.NOTHING_CHANGED
+        assert report.turns == 4
+        assert "identical turns" in report.rationale
+        assert "review-cycle" not in report.rationale
+
+    def test_the_two_rules_do_not_share_a_counter(self) -> None:
+        """A journey whose reviews progress is not stopped by their count.
+
+        Four settled reviews, each resolving an anchor, interleaved with
+        work turns — more reviews than either limit, and no stop.
+        """
+        wait = ScriptedWait()
+        ladder = [
+            [
+                {"file": f"src/m{i}.py", "severity": "high"}
+                for i in range(depth)
+            ]
+            for depth in (4, 3, 2, 1)
+        ]
+        script: list[Any] = []
+        for index, findings in enumerate(ladder):
+            script.append(self._review_turn(findings, rationale=f"review {index}"))
+            script.append(self._work_turn(f"TASK-FIX007-{index:03d}"))
+        script.append(_report(TurnOutcome.TERMINAL))
+        supervisor = FakeSupervisor(script=script)
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait))
+        )
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert report.turns == 9

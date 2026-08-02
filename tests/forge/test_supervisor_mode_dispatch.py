@@ -41,6 +41,7 @@ Acceptance-criteria coverage map (TASK-MBC8-008):
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Iterable, Mapping, Sequence
 
@@ -1192,6 +1193,75 @@ def _review_entries(n: int) -> list[ModeCStageEntry]:
         ModeCStageEntry(stage_class=StageClass.TASK_REVIEW, status="approved")
         for _ in range(n)
     ]
+
+
+class TestTheCapsOffNoOpGoesLoud:
+    """The no-op that used to say nothing (stage-2 design §4).
+
+    A mode-c build whose guards are unwired — or whose profile carries no
+    caps at all — is not enforced by anything. That is *legal* on a
+    hand-wired or sandbox Supervisor, but it was also SILENT, which is
+    exactly what made the ~200-leg runaway look like a governed build in
+    the logs. The dispatch behaviour is unchanged (byte-for-byte the
+    ASSUM-010 no-op); what changed is that it now says so.
+    """
+
+    def _run_uncapped_turn(self, build_id: str, guards: Any, profile: str | None):
+        supervisor, doubles = _build_supervisor()
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+        supervisor.budget_guards = guards
+        if profile is not None:
+            supervisor.budget_profile_name = profile
+        doubles["mode_reader"].modes[build_id] = BuildMode.MODE_C
+        doubles["mode_c_history"].histories[build_id] = _review_entries(9)
+        return supervisor, doubles
+
+    def test_unwired_guards_warn_that_nothing_is_enforced(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        supervisor, doubles = self._run_uncapped_turn("build-LOUD1", None, None)
+
+        with caplog.at_level(logging.WARNING, logger="forge.pipeline.supervisor"):
+            report = _run(supervisor.next_turn("build-LOUD1"))
+
+        # Behaviour unchanged: still dispatched, still a no-op.
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert len(doubles["subprocess"].calls) == 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("NOTHING IS ENFORCED" in m for m in messages), messages
+        assert any("no budget guards wired at all" in m for m in messages)
+        assert any("build-LOUD1" in m for m in messages)
+
+    def test_a_caps_off_profile_warns_and_names_itself(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        supervisor, doubles = self._run_uncapped_turn(
+            "build-LOUD2", BudgetGuards(), "attended"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="forge.pipeline.supervisor"):
+            report = _run(supervisor.next_turn("build-LOUD2"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("NOTHING IS ENFORCED" in m for m in messages), messages
+        assert any("'attended'" in m for m in messages)
+
+    def test_a_capped_profile_does_not_cry_wolf(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning is for the uncapped case only."""
+        supervisor, doubles = self._run_uncapped_turn(
+            "build-LOUD3", BudgetGuards(max_review_cycles=99), "unattended"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="forge.pipeline.supervisor"):
+            report = _run(supervisor.next_turn("build-LOUD3"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert not any(
+            "NOTHING IS ENFORCED" in r.getMessage() for r in caplog.records
+        )
 
 
 class TestModeCBudgetEnforcement:

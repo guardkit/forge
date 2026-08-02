@@ -60,9 +60,22 @@ The shape is taken verbatim from the spec-writer chain's driver
 * **Anti-spin** — an instantly-returning waiter (a defective wire, an
   empty fake) backs off rather than hot-looping the daemon.
 
-The nothing-changed stop rule (the cure-then-retry ladder) governs the
-no-progress branch: identical turns with no durable change stop loudly
-with a pack rather than burning a slot forever.
+The two nothing-changed stop rules (the cure-then-retry ladder)
+--------------------------------------------------------------
+
+Both end the same way — a loud stop with a failure pack rather than a
+burnt slot — and each catches what the other structurally cannot:
+
+* **Turn-level** (original): consecutive turns with an identical
+  fingerprint. Catches a wedged planner.
+* **Review-cycle** (LI stage-2 §5): a settled ``/task-review`` whose
+  finding anchors still contain every anchor the previous review reported.
+  This exists because the turn-level rule is *unreachable* on a fix
+  journey — a ``/task-work`` turn sits between every pair of reviews, so
+  the fingerprints never repeat adjacently. Measured on the runaway
+  ledger: review rows 347 / 355 / 363 / 371 emitted byte-identical
+  fix-task lists four cycles running and the turn-level streak never
+  reached its limit. The anchor rule stops that journey at 355.
 
 Domain module, injected collaborators: no NATS, no SQLite, no git types
 are imported here. The composition root is :mod:`forge.cli.serve`.
@@ -78,11 +91,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
+from forge.pipeline.finding_anchors import derive_finding_anchors
+from forge.pipeline.stage_taxonomy import StageClass
 from forge.pipeline.supervisor import TurnOutcome
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "REVIEW_NO_PROGRESS_LIMIT",
     "ConductorDriverDeps",
     "ConductorRunOutcome",
     "ConductorRunReport",
@@ -113,6 +129,20 @@ NOTHING_CHANGED_LIMIT: int = 3
 #: handful of turns; this exists so a planner defect cannot spend a
 #: consumer slot indefinitely, not as a policy knob.
 DEFAULT_MAX_TURNS: int = 200
+
+#: Consecutive no-progress **comparisons** between settled reviews before the
+#: review-cycle rule stops the journey (LI stage-2 §5).
+#:
+#: ONE comparison spans TWO consecutive reviews — which is exactly the
+#: design's wording, "two consecutive no-progress reviews → the
+#: NOTHING_CHANGED stop", and exactly what the runaway ledger demands: rows
+#: 347 and 355 emitted byte-identical findings, and the journey must stop at
+#: 355 rather than run 363 and 371 to discover the same thing twice more.
+#:
+#: It is NOT the turn-level :data:`NOTHING_CHANGED_LIMIT`, and the two must
+#: not be collapsed: that one counts adjacent turns and a fix journey never
+#: repeats adjacently.
+REVIEW_NO_PROGRESS_LIMIT: int = 1
 
 
 #: Outcomes that mean "the conductor dispatched nothing and the build has
@@ -173,8 +203,14 @@ class ConductorRunOutcome(StrEnum):
             IS wired the loop-back stays a legitimate wait (the next
             review pass re-plans), so this member is reached only on the
             can't-arm path.
-        NOTHING_CHANGED: Consecutive identical turns with no durable
-            change — the cure-then-retry ladder's stop rung.
+        NOTHING_CHANGED: No durable change. Two rules produce it and both
+            are needed (LI stage-2 §5): the TURN-level rule (consecutive
+            identical turn fingerprints — catches a wedged planner) and the
+            REVIEW-CYCLE rule (a review that re-reported every anchor its
+            predecessor found — catches the fix journey the turn-level rule
+            structurally cannot, because a ``/task-work`` turn sits between
+            every pair of reviews and breaks the adjacency the fingerprint
+            needs).
         TURN_CAP: The hard turn ceiling was reached. A planner defect,
             not a legitimate journey.
         NOT_DRIVEN: The build is not one this loop drives (its mode is
@@ -351,6 +387,11 @@ class ConductorTurnLoop:
         last_report: Any = None
         unchanged_streak = 0
         last_fingerprint: tuple[Any, ...] | None = None
+        # The review-cycle rule's whole state: the anchor set the LAST
+        # readable review reported (``None`` = no baseline yet), and how many
+        # consecutive comparisons since have shown no progress.
+        review_baseline: frozenset[str] | None = None
+        no_progress_reviews = 0
 
         while turns < deps.max_turns:
             try:
@@ -387,6 +428,18 @@ class ConductorTurnLoop:
             else:
                 unchanged_streak = 0
                 last_fingerprint = fingerprint
+
+            # THE REVIEW-CYCLE RULE (LI stage-2 §5). Evaluated on every
+            # turn — it only *does* anything on a settled ``/task-review``
+            # — so the baseline advances in lock-step with the reviews
+            # themselves and no intervening ``/task-work`` turn can shift it.
+            review_verdict = _review_progress_verdict(report, review_baseline)
+            if review_verdict is not None:
+                review_baseline = review_verdict.baseline
+                if review_verdict.no_progress:
+                    no_progress_reviews += 1
+                else:
+                    no_progress_reviews = 0
 
             if outcome is TurnOutcome.TERMINAL:
                 await self._close_out(build_id, report)
@@ -467,22 +520,25 @@ class ConductorTurnLoop:
                     f"durable change (outcome={getattr(outcome, 'value', outcome)!r})"
                     " — the nothing-changed stop rule"
                 )
-                logger.error(
-                    "conductor: build_id=%s stopped — %s", build_id, reason
+                return await self._nothing_changed_stop(
+                    build_id, reason=reason, turns=turns, report=report
                 )
-                pack = await self._write_pack(
+
+            if (
+                review_verdict is not None
+                and no_progress_reviews >= REVIEW_NO_PROGRESS_LIMIT
+            ):
+                # THE REVIEW-CYCLE NOTHING-CHANGED STOP. Named anchors, not
+                # a count: "the same five things, again" is what a human
+                # needs to read, and it is what the failure pack records.
+                # Guarded on the verdict so the stop always fires ON the
+                # review that reached the limit — never on a later turn
+                # that has no anchors to name.
+                return await self._nothing_changed_stop(
                     build_id,
-                    reason=reason,
-                    outcome=ConductorRunOutcome.NOTHING_CHANGED,
-                )
-                return ConductorRunReport(
-                    outcome=ConductorRunOutcome.NOTHING_CHANGED,
-                    build_id=build_id,
+                    reason=review_verdict.reason,
                     turns=turns,
-                    last_report=report,
-                    stage_receipts=tuple(self._stage_receipts),
-                    rationale=reason,
-                    failure_pack=pack,
+                    report=report,
                 )
 
             if outcome is TurnOutcome.DISPATCHED or outcome in _WAITING_OUTCOMES:
@@ -778,6 +834,32 @@ class ConductorTurnLoop:
             getattr(report, "rationale", None),
         )
 
+    async def _nothing_changed_stop(
+        self, build_id: str, *, reason: str, turns: int, report: Any
+    ) -> "ConductorRunReport":
+        """The loud stop both nothing-changed rules end at.
+
+        One writer for one outcome: the turn-level rule and the
+        review-cycle rule differ in what they NOTICE, never in what they
+        DO. Stating the ending twice would let the two drift — one growing
+        a pack, the other not.
+        """
+        logger.error("conductor: build_id=%s stopped — %s", build_id, reason)
+        pack = await self._write_pack(
+            build_id,
+            reason=reason,
+            outcome=ConductorRunOutcome.NOTHING_CHANGED,
+        )
+        return ConductorRunReport(
+            outcome=ConductorRunOutcome.NOTHING_CHANGED,
+            build_id=build_id,
+            turns=turns,
+            last_report=report,
+            stage_receipts=tuple(self._stage_receipts),
+            rationale=reason,
+            failure_pack=pack,
+        )
+
     async def _export_receipts(self, build_id: str, report: Any) -> None:
         deps = self._deps
         if deps.export_stage_receipts is None:
@@ -905,6 +987,155 @@ def _dispatch_settled(report: Any) -> bool:
         return False
     token = str(getattr(status, "value", None) or status).strip().lower()
     return token in _SETTLED_DISPATCH_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewVerdict:
+    """One settled review's reading, for the review-cycle rule.
+
+    Attributes:
+        no_progress: Whether this review showed no progress against the
+            baseline it was compared to.
+        baseline: The anchor set the NEXT review is compared against.
+            Carried explicitly (rather than "the current review's anchors")
+            because an unreadable review must not overwrite a good
+            baseline with nothing.
+        reason: The plain-language stop text, anchors named. Always
+            populated — it costs nothing and it means the stop can never
+            fire with an empty sentence.
+    """
+
+    no_progress: bool
+    baseline: frozenset[str] | None
+    reason: str
+
+
+def _is_settled_review(report: Any) -> bool:
+    """``True`` when this turn is a ``/task-review`` whose dispatch settled.
+
+    The stage is read from the turn report's ``chosen_stage`` first and the
+    dispatch result's own ``stage`` second — a fix-journey turn sets both,
+    and reading either alone would make the rule depend on which collaborator
+    happened to be doubled in a test. Compared against
+    :class:`StageClass` rather than a re-spelled ``"task-review"`` literal:
+    one statement of what the stage is called.
+    """
+    if not _dispatch_settled(report):
+        return False
+    stage = getattr(report, "chosen_stage", None)
+    if stage is None:
+        stage = getattr(getattr(report, "dispatch_result", None), "stage", None)
+    token = str(getattr(stage, "value", None) or stage or "").strip().lower()
+    return token == StageClass.TASK_REVIEW.value
+
+
+def _review_progress_verdict(
+    report: Any, baseline: frozenset[str] | None
+) -> _ReviewVerdict | None:
+    """Read one turn for the review-cycle no-progress rule (LI stage-2 §5).
+
+    Returns ``None`` for any turn that is not a settled ``/task-review`` —
+    the rule advances on reviews and nothing else.
+
+    The rule, in the order the clauses are applied:
+
+    1. **The review reported no readable findings block → NO PROGRESS
+       (fail closed), if there is a baseline to fail against.** A leg that
+       stops stating what it found cannot show a single previously-named
+       anchor resolved, and reading its silence as a fix is exactly how a
+       broken leg launders itself as progress. The baseline is KEPT rather
+       than overwritten with nothing.
+    2. **No baseline → reset, no accusation.** The first review of a
+       journey, or one whose predecessor stated nothing readable, has
+       nothing to be compared against. This is where the design's two
+       clauses overlap ("a missing block on the current review is no
+       progress" vs "no anchors on the previous review = no baseline,
+       reset"), and the ranking is: a comparison needs two sides. With one
+       side there is no verdict to reach, so the journey is not accused.
+    3. **Current ⊇ previous → NO PROGRESS.** Every anchor the last review
+       named is named again. New findings on top do not redeem it: nothing
+       that was named got fixed.
+    4. **Otherwise → progress.** At least one anchor is gone. The streak
+       resets and the baseline advances.
+
+    **An empty REPORTED anchor set is progress, and never a baseline.** A
+    review that looked and found nothing is a clean review — the journey's
+    success path, and the planner's CLEAN_REVIEW terminal one turn later.
+    It resolves whatever the baseline held, so clause 3 cannot fire on it
+    (the empty set is a superset of nothing but the empty set). It is then
+    NOT carried forward as a baseline, because the empty set is a superset
+    of nothing at all: carrying it would make the very next review — the
+    one that finds something — read as "no progress".
+    """
+    if not _is_settled_review(report):
+        return None
+
+    dispatch = getattr(report, "dispatch_result", None)
+    reported = bool(getattr(dispatch, "detection_findings_reported", False))
+    anchors = derive_finding_anchors(getattr(dispatch, "detection_findings", ()))
+    current = frozenset(anchors)
+    # An empty set is a real answer but never an accusing baseline (above).
+    next_baseline: frozenset[str] | None = current if current else None
+
+    if not reported:
+        if baseline is None:
+            return _ReviewVerdict(
+                no_progress=False,
+                baseline=None,
+                reason=(
+                    "the review-cycle rule has no baseline: this /task-review "
+                    "reported no readable findings block and there was "
+                    "nothing to compare it against"
+                ),
+            )
+        return _ReviewVerdict(
+            no_progress=True,
+            baseline=baseline,
+            reason=(
+                "the review-cycle nothing-changed stop: this /task-review "
+                "reported no readable findings block, so it cannot show any "
+                "of the previous review's findings resolved — read as NO "
+                "PROGRESS (fail closed). Outstanding as of the last review "
+                f"that spoke: {_name_anchors(baseline)}"
+            ),
+        )
+
+    if baseline is None:
+        return _ReviewVerdict(
+            no_progress=False,
+            baseline=next_baseline,
+            reason=(
+                "the review-cycle rule opened its baseline with "
+                f"{_name_anchors(current)}"
+            ),
+        )
+
+    if current >= baseline:
+        added = current - baseline
+        return _ReviewVerdict(
+            no_progress=True,
+            baseline=next_baseline,
+            reason=(
+                "the review-cycle nothing-changed stop: two consecutive "
+                "/task-review legs reported the same findings and not one of "
+                f"them was resolved — {_name_anchors(baseline)}"
+                + (f" (plus new: {_name_anchors(added)})" if added else "")
+            ),
+        )
+
+    return _ReviewVerdict(
+        no_progress=False,
+        baseline=next_baseline,
+        reason=(
+            "the review-cycle rule saw progress — resolved: "
+            f"{_name_anchors(baseline - current)}"
+        ),
+    )
+
+
+def _name_anchors(anchors: "frozenset[str] | None") -> str:
+    """Anchors as a stable, readable list. Sorted so the text is diffable."""
+    return ", ".join(sorted(anchors or ())) or "none"
 
 
 def _classify_card_result(report: Any) -> ConductorRunOutcome:

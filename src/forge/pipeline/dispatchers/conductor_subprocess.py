@@ -110,6 +110,8 @@ def make_conductor_subprocess_dispatcher(
     repo_path_reader: Callable[[Any], Path | None] | None = None,
     correlation_id_minter: Callable[..., str] = mint_stage_correlation_id,
     timeout_seconds: int = 600,
+    timeout_seconds_by_stage: Mapping[StageClass, int] | None = None,
+    leg_model: str | None = None,
     with_nats_streaming: bool = True,
 ) -> Callable[..., Awaitable[Any]]:
     """Build the ``subprocess_dispatcher`` the conductor's Supervisor calls.
@@ -141,7 +143,28 @@ def make_conductor_subprocess_dispatcher(
             ``worktree_path`` — the build's own worktree, which is where a
             fix journey's stages must run.
         correlation_id_minter: See :func:`mint_stage_correlation_id`.
-        timeout_seconds / with_nats_streaming: Forwarded verbatim.
+        timeout_seconds: The default per-dispatch subprocess timeout, used
+            for any stage the mapping below does not name.
+        timeout_seconds_by_stage: Per-stage override, selected at the
+            dispatch site as
+            ``(timeout_seconds_by_stage or {}).get(stage, timeout_seconds)``
+            (LI stage-2 design §1). ONE scalar for both fix-journey legs
+            was the defect: raising it for the work leg would also
+            un-fence the review leg, whose inner budget (480s) sits under
+            its outer one (600s) on purpose. These numbers are
+            **tripwires**, not work budgets — see the composition site's
+            constants for the full statement of the rule.
+        leg_model: The fix journey's SEAT (LI stage-2 design §3.4). When
+            set, ``--model <leg_model>`` is appended to the argv of MODE_C
+            stages ONLY, through the dispatcher's existing ``extra_args``
+            seam. Unset (the default) the argv is byte-identical to the
+            argv this adapter has always produced — nothing is appended,
+            not even an empty extras list. The pipeline emitting no
+            ``--model`` at all is what let a leg fall through to a
+            frontier default; the builder-side chokepoint fence is the
+            other half of that cure, and this is the half that lets the
+            operator NAME the seat.
+        with_nats_streaming: Forwarded verbatim.
 
     Returns:
         ``async (**supervisor_kwargs) -> StageDispatchResult``.
@@ -250,13 +273,24 @@ def make_conductor_subprocess_dispatcher(
                 subcommand=getattr(stage, "value", str(stage)),
             )
 
+        stage_timeout = (timeout_seconds_by_stage or {}).get(stage, timeout_seconds)
+
+        # The seat rides ONLY on the fix journey's own stages, and only
+        # when an operator named one. ``None`` keeps the argv exactly as
+        # it was — the byte-identity the adapter's tests pin.
+        extra_args: list[str] | None = None
+        if leg_model and stage in MODE_C_STAGES:
+            extra_args = ["--model", leg_model]
+
         logger.info(
             "conductor dispatcher adapter: %s build_id=%s subject=%s "
-            "correlation_id=%s (planner rationale: %s)",
+            "correlation_id=%s timeout=%ss seat=%s (planner rationale: %s)",
             getattr(stage, "value", stage),
             build_id,
             subject or "none",
             correlation_id,
+            stage_timeout,
+            leg_model or "unset (the builder's own default)",
             rationale or "none",
         )
 
@@ -275,8 +309,9 @@ def make_conductor_subprocess_dispatcher(
             fix_task=fix_task,
             fix_task_yaml=str(fix_task_yaml) if fix_task_yaml else None,
             forward_context=forward_context,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=stage_timeout,
             with_nats_streaming=with_nats_streaming,
+            extra_args=extra_args,
         )
 
     return conductor_subprocess_dispatcher

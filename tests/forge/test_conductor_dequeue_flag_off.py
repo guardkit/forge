@@ -42,6 +42,7 @@ from forge.cli import _serve_deps
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli.serve import build_conductor_router
 from forge.config.models import (
+    FIX_JOURNEY_PROFILE_NAME,
     ConductorConfig,
     FilesystemPermissions,
     ForgeConfig,
@@ -391,8 +392,14 @@ class TestRouterModeBranch:
     ) -> None:
         from forge.lifecycle.modes import BuildMode
 
+        # The row carries the capped ``fix-journey`` profile: since the
+        # stage-2 cap law (§4) a mode-c build whose resolved profile has no
+        # review-cycle cap is refused before anything is spawned, so a test
+        # about the MODE branch has to clear the CAP belt first.
         build_id = persistence.record_pending_build(
-            _payload("FEAT-FJ01"), mode=BuildMode.MODE_C
+            _payload("FEAT-FJ01"),
+            mode=BuildMode.MODE_C,
+            profile=FIX_JOURNEY_PROFILE_NAME,
         )
         spawned: list[Any] = []
         made: list[str] = []
@@ -427,7 +434,9 @@ class TestRouterModeBranch:
         from forge.lifecycle.modes import BuildMode
 
         build_id = persistence.record_pending_build(
-            _payload("FEAT-FJ02"), mode=BuildMode.MODE_C
+            _payload("FEAT-FJ02"),
+            mode=BuildMode.MODE_C,
+            profile=FIX_JOURNEY_PROFILE_NAME,
         )
 
         def exploding_factory(bid: str) -> Any:

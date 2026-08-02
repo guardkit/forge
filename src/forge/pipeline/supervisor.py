@@ -1608,6 +1608,30 @@ class Supervisor:
         """
         guards = self.budget_guards
         if guards is None or not guards.caps_enabled:
+            # THE NO-OP GOES LOUD (leg-invocation stage-2 design §4). This
+            # branch used to say nothing at all, which is how the runaway
+            # crossing looked exactly like an enforced build: a mode-c
+            # journey resolved a profile whose every cap was None, the
+            # guard returned None on every cycle, and the logs recorded a
+            # guard that was never once enforcing anything. The daemon's
+            # cap-law belt now refuses to open such a journey; this line
+            # is the brace for every other path that constructs a
+            # Supervisor directly (sandbox drives, tests, an operator
+            # wiring one by hand).
+            logger.warning(
+                "supervisor.next_turn (MODE_C): the budget guard was "
+                "consulted for build_id=%s with %s — NOTHING IS ENFORCED on "
+                "this fix journey. No review-cycle cap, no wall-clock cap, "
+                "no stop of any kind comes from the budget guard; only the "
+                "planner's own terminals can end it. An uncapped fix "
+                "journey is the runaway shape (stage-2 design §4)",
+                build_id,
+                (
+                    "no budget guards wired at all"
+                    if guards is None
+                    else f"profile {self.budget_profile_name!r} carrying no caps"
+                ),
+            )
             return None
 
         # Idempotency: an already-PAUSED build has already been escalated —

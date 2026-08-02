@@ -42,18 +42,95 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Sequence
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.pipeline.conductor_driver import ConductorDriverDeps, WaitWindow
 from forge.pipeline.stage_taxonomy import StageClass
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# The two leg TRIPWIRES (LI stage-2 design §1)
+# ---------------------------------------------------------------------------
+#
+# READ THIS BEFORE CHANGING EITHER NUMBER.
+#
+# These two constants are **tripwires for "the leg itself is broken" —
+# never work-limiters.** They exist to catch a wedged spawn, a dead
+# harness, a process that will never return. They are NOT a statement
+# about how long real work is allowed to take, and no one may cite them as
+# one. Rich's ruling of 2026-07-30, quoted verbatim in
+# ``forge/subagents/build_monitor.py``:
+#
+#     "hardcoding kill time limits isn't the way — the forge should be
+#     able to monitor the autobuilds — it spews out enough diagnostics."
+#
+# The ledgered DESTINATION is therefore the **monitored-supervision path**:
+# BuildMonitor-class semantic liveness applied to this one-shot dispatch
+# seam, which replaces the blind clock with the leg's own diagnostics (and
+# brings with it the in-flight stage row and a TIMEOUT dispatch status
+# distinct from FAILED). Until that lands these two numbers are the only
+# ceiling a fix journey has, and a leg with NO ceiling is how the crossing
+# ran ~200 legs.
+#
+# Why 1800 for the work leg, specifically: the approval wait window anchors
+# on ``builds.started_at`` with ``approval.max_wait_seconds`` defaulting to
+# 3600, and the JetStream ``ack_wait`` is 3600. 1800 keeps a small journey
+# inside both. Anything larger MUST raise those two in the same change.
+#
+# Why the review leg keeps 600: its inner budget is 480s, and the
+# inner-under-outer discipline is load-bearing — on an outer timeout the
+# parser discards even a perfect marker block, so the leg dies silently.
+
+#: Outer tripwire for a ``task-review`` leg. Its inner budget is 480s.
+CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS: int = 600
+
+#: Outer tripwire for a ``task-work`` leg. The leg's own inner budget is
+#: 1620s (the builder venue's ``--leg-budget`` default) — the same
+#: inner-under-outer discipline the review leg already ships.
+CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS: int = 1800
+
+#: The per-stage mapping the dispatcher adapter selects from. Derived from
+#: the two constants above so there is exactly one place either number is
+#: written — and READ-ONLY (:class:`~types.MappingProxyType`) so that rule
+#: is structural rather than conventional: this object is handed straight
+#: to the dispatcher factory at composition time, and a plain dict would
+#: let any holder rewrite a tripwire in place, leaving the named constant
+#: above saying one thing and the live mapping doing another.
+CONDUCTOR_STAGE_TIMEOUT_SECONDS: "Mapping[StageClass, int]" = MappingProxyType(
+    {
+        StageClass.TASK_REVIEW: CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS,
+        StageClass.TASK_WORK: CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS,
+    }
+)
+
+#: Optional operator thread for the fix journey's SEAT — the local model a
+#: leg runs on (LI stage-2 design §3.4). Unset, the pipeline emits no
+#: ``--model`` at all, which is exactly the hole the crossing fell through:
+#: the builder then rides ``None`` down to a FRONTIER default and only a
+#: missing API key stops it. Set, every MODE_C dispatch names its seat on
+#: the wire.
+#:
+#: **This env var is a stopgap and is ledgered as one.** The config-as-code
+#: home for it is a seat field on ``ConductorConfig`` (which is
+#: ``extra=forbid``, so adding the field is a schema change) — and that is
+#: **Rich's ruling at conductor activation**, a plan-of-record decision,
+#: not something this lane may smuggle in. When that field lands, this env
+#: read is DELETED, not kept beside it: two statements of one rule is a
+#: future lie.
+CONDUCTOR_LEG_MODEL_ENV: str = "FORGE_CONDUCTOR_LEG_MODEL"
+
 __all__ = [
+    "CONDUCTOR_LEG_MODEL_ENV",
+    "CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS",
+    "CONDUCTOR_STAGE_TIMEOUT_SECONDS",
+    "CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS",
     "TOOLCHAIN_MODULE_CANDIDATES",
     "build_conductor_driver_deps_factory",
     "build_conductor_supervisor_factory",
@@ -699,6 +776,8 @@ def build_conductor_supervisor_factory(
     build_supervisor: Callable[..., Any] | None = None,
     mode_kwargs_builder: Callable[..., dict] | None = None,
     budget_kwargs_builder: Callable[..., dict] | None = None,
+    timeout_seconds_by_stage: "Mapping[StageClass, int] | None" = None,
+    leg_model: str | None = None,
 ) -> Callable[[str], Any]:
     """Return the ``(build_id) -> Supervisor`` factory the router injects.
 
@@ -725,6 +804,18 @@ def build_conductor_supervisor_factory(
     caps are per-build (they come off ``builds.profile``) and the merge
     card's latch is per-journey. Sharing one instance across builds would
     share both.
+
+    Args:
+        timeout_seconds_by_stage: Per-stage subprocess tripwires for the
+            dispatcher adapter. Defaults to
+            :data:`CONDUCTOR_STAGE_TIMEOUT_SECONDS` — read the comment
+            block above those constants before changing either number.
+            Injectable so a test can drive the selection without waiting
+            out half an hour.
+        leg_model: The fix journey's seat. Defaults to the
+            :data:`CONDUCTOR_LEG_MODEL_ENV` environment variable when it
+            is set and non-blank; ``None`` otherwise, which keeps the argv
+            byte-identical to the one this composition has always emitted.
     """
     from forge.cli.serve import (
         build_conductor_budget_kwargs,
@@ -751,6 +842,34 @@ def build_conductor_supervisor_factory(
 
     ordering_reader = _SqliteOrderingStageLogReader(pool)
 
+    stage_timeouts = (
+        CONDUCTOR_STAGE_TIMEOUT_SECONDS
+        if timeout_seconds_by_stage is None
+        else timeout_seconds_by_stage
+    )
+
+    # The composition root's ONE read of the stopgap seat env (see
+    # CONDUCTOR_LEG_MODEL_ENV — its config-as-code replacement is Rich's
+    # ruling at conductor activation, and this read is deleted then).
+    resolved_leg_model = leg_model
+    if resolved_leg_model is None:
+        resolved_leg_model = os.environ.get(CONDUCTOR_LEG_MODEL_ENV, "").strip() or None
+    if resolved_leg_model:
+        logger.info(
+            "conductor composition: fix-journey legs will name the seat "
+            "%r on every MODE_C dispatch (--model, from %s)",
+            resolved_leg_model,
+            CONDUCTOR_LEG_MODEL_ENV,
+        )
+    else:
+        logger.warning(
+            "conductor composition: no leg seat is named (%s unset) — the "
+            "pipeline emits NO --model and the builder picks its own "
+            "default. Zero-frontier then rests on the builder's own "
+            "chokepoint fence, not on anything this side says",
+            CONDUCTOR_LEG_MODEL_ENV,
+        )
+
     def supervisor_factory(build_id: str) -> Any:
         mode_kwargs = _mode_kwargs(
             pool=pool,
@@ -776,6 +895,8 @@ def build_conductor_supervisor_factory(
             forward_context_builder=forward_context_builder,
             stage_log_writer=stage_log_writer,
             subprocess_runner=subprocess_runner,
+            timeout_seconds_by_stage=stage_timeouts,
+            leg_model=resolved_leg_model,
         )
         checkpoint = make_merge_ready_checkpoint(
             pool=pool,

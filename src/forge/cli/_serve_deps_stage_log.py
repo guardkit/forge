@@ -366,6 +366,11 @@ def build_stage_log_recorder(sqlite_pool: _StageLogWriter) -> StageLogRecorder:
 #     dispatched against, so the planner's walk can tell dispatched work from
 #     outstanding work instead of dispatching the same fix twice.
 #
+# LI stage-2 §5 adds a third key on the review row: ``finding_anchors`` — the
+# location identities of what the review found. The fix-task list cannot serve
+# that purpose (its ids are prose+position-derived and re-mint every cycle);
+# the anchors are what the conductor's review-cycle no-progress stop compares.
+#
 # Round-trip, not two half-contracts: the reader's constants are imported here
 # rather than re-spelled, so a rename cannot leave the writer and the reader
 # disagreeing in silence.
@@ -487,11 +492,15 @@ class _FixJourneyStageLogWriter:
         rationale: str,
         exit_code: int,
         duration_secs: float,
+        detection_findings: "tuple[dict[str, Any], ...]" = (),
+        detection_findings_reported: bool = False,
     ) -> None:
         """Write the fix-journey dispatch row, with the projection's keys."""
         from forge.pipeline.mode_c_history_reader import (
+            FINDING_ANCHORS_DETAILS_KEY,
             FIX_TASK_ID_DETAILS_KEY,
             FIX_TASKS_DETAILS_KEY,
+            derive_finding_anchors,
         )
 
         status_value = str(getattr(status, "value", status)).lower()
@@ -536,12 +545,35 @@ class _FixJourneyStageLogWriter:
                 )
             )
             details[FIX_TASKS_DETAILS_KEY] = list(fix_tasks)
+            # THE ANCHORS RIDE BESIDE THE FIX TASKS (LI stage-2 §5).
+            # The fix-task id is prose+position-derived and re-mints itself
+            # every cycle; the finding's location anchor is the identity
+            # that survives, and it is what the review-cycle no-progress
+            # stop compares.
+            #
+            # Written only when the leg actually REPORTED a findings block.
+            # The key is three-valued by design and the writer must not
+            # forge the third value: an empty list means "the review looked
+            # and found nothing" (a clean review), while an ABSENT key means
+            # "this row says nothing about findings" — which covers both a
+            # leg that emitted no readable block and every row written
+            # before this key existed. The projection reads absent as "no
+            # baseline", never as "everything was resolved".
+            finding_anchors: tuple[str, ...] = ()
+            if detection_findings_reported:
+                finding_anchors = derive_finding_anchors(detection_findings)
+                details[FINDING_ANCHORS_DETAILS_KEY] = list(finding_anchors)
             logger.info(
                 "fix_journey_stage_log: task-review row for build_id=%s "
-                "records %d fix task(s): %s",
+                "records %d fix task(s): %s | finding anchors: %s",
                 build_id,
                 len(fix_tasks),
                 ", ".join(fix_tasks) or "none (clean review)",
+                (
+                    (", ".join(finding_anchors) or "none (the review found nothing)")
+                    if detection_findings_reported
+                    else "NOT RECORDED — the leg reported no readable findings block"
+                ),
             )
         elif stage is StageClass.TASK_WORK:
             if self._fix_task_id:
