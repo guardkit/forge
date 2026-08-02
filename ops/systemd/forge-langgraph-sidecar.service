@@ -88,6 +88,10 @@ Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
 # explicitly, and give the spawned guardkit subprocess a PATH rich enough
 # for its own tool calls (git, claude CLI, etc.).
 Environment=FORGE_GUARDKIT_PATH=%h/.agentecflow/bin/guardkit
+# The requeue sweep's prior-build LIVENESS guard reads the forge ledger here
+# (2026-08-02, the SW lane): without this line it resolves ~/.forge/forge.db —
+# a stale dev DB — and the guard silently checks nothing (fails open).
+Environment=FORGE_DB_PATH=%h/forge-prod-state/.forge/forge.db
 # The mission default harness. The 2026-07-26 e2e rehearsal
 # (build-FEAT-UPT1-20260726112342, merged api_test c5a04be) ran with
 # GUARDKIT_HARNESS UNSET, which resolves to the langgraph default; pin it
