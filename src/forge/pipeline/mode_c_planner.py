@@ -19,9 +19,15 @@ Two terminal outcomes are possible (ASSUM-005, ASSUM-007, ASSUM-017):
 * :attr:`ModeCTerminal.CLEAN_REVIEW` — a review (initial or follow-up)
   emitted no fix tasks and no commits were produced.
 * :attr:`ModeCTerminal.FAILED` — the most recent ``/task-review`` was
-  hard-stopped or rejected. Failed *fix tasks* do **not** terminate the
-  build — they are isolated to their own fix task per ASSUM-008 and the
-  planner returns the next fix task in line.
+  hard-stopped or rejected, **or every work leg of the current review
+  cycle failed** (ASSUM-008 as narrowed by Rich, 2026-08-02 — see
+  :data:`_TERMINAL_STATUSES`). A *single* failed fix task still does not
+  terminate the build: it is isolated to its own fix task per ASSUM-008
+  and the planner returns the next fix task in line. The 100%-failed case
+  also sets :attr:`ModeCPlan.total_work_failure` — the typed signal the
+  supervisor branches on, because that terminal fires while the cycle's own
+  review is still the latest one and the terminal handler has no branch for
+  that shape.
 
 When a follow-up review is clean and the build has produced commits, the
 planner advances to :attr:`StageClass.PULL_REQUEST_REVIEW` instead of
@@ -44,7 +50,9 @@ References:
     - FEAT-FORGE-008 ASSUM-007 — clean initial review terminates without
       dispatching ``/task-work``.
     - FEAT-FORGE-008 ASSUM-008 — failure isolation (failed ``/task-work``
-      does not auto-cancel sibling fix tasks).
+      does not auto-cancel sibling fix tasks), NARROWED 2026-08-02: the
+      isolation rule stops at 100% — a cycle whose every work leg failed
+      terminates FAILED instead of scheduling a follow-up review.
     - FEAT-FORGE-008 ASSUM-010 — termination is reviewer-driven; no
       numeric iteration cap.
     - FEAT-FORGE-008 ASSUM-017 — clean follow-up review with no commits
@@ -86,13 +94,34 @@ __all__ = [
 #: only status that allows downstream dispatch in Mode C.
 _STATUS_APPROVED: str = "approved"
 
+#: Status string indicating the work leg itself failed. Kept separate from
+#: :data:`_TERMINAL_STATUSES` because the 100%-failure rule below reads it
+#: STRICTLY: ``rejected`` is a gate's verdict on real work and ``cancelled``
+#: is a human's, and neither is evidence that the tooling is broken.
+_STATUS_FAILED: str = "failed"
+
 #: Status strings indicating a stage entry has reached a terminal outcome
 #: (positive or negative). For ``/task-work`` the planner treats every
 #: terminal status as "this fix task's slot is complete — advance" so
 #: ASSUM-008 isolation is honoured (a failed fix task does not block its
 #: siblings).
+#:
+#: **ASSUM-008, NARROWED — Rich's word, 2026-08-02.** The isolation rule
+#: above is right per fix task and wrong at 100%. Because a FAILED work leg
+#: closes its fix-task slot exactly like an approved one, a cycle in which
+#: every single leg failed read as "all fix tasks completed" and the planner
+#: scheduled a follow-up review — 42 times on the runaway ledger, with
+#: 158/158 legs failed. Total work failure is a TOOLING FAULT, not a fix
+#: outcome, and it is indistinguishable from total success only because
+#: nothing was looking. So:
+#:
+#: * every fix task of the cycle terminal AND every terminal work row
+#:   strictly ``"failed"`` → terminal FAILED, naming the class and the ids
+#:   (:meth:`ModeCCyclePlanner._total_work_failure`);
+#: * ANY ``approved`` / ``rejected`` / ``cancelled`` in the mix → today's
+#:   behaviour, unchanged. The isolate-ONE-failure rule is untouched.
 _TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {_STATUS_APPROVED, "failed", "rejected", "cancelled"}
+    {_STATUS_APPROVED, _STATUS_FAILED, "rejected", "cancelled"}
 )
 
 #: Status strings on a ``/task-review`` entry that terminate the whole
@@ -118,8 +147,9 @@ class ModeCTerminal(StrEnum):
         CLEAN_REVIEW: A ``/task-review`` returned no fix tasks and no
             commits were produced. The build is "done" — nothing to fix,
             nothing to push.
-        FAILED: A ``/task-review`` was hard-stopped or rejected. The
-            build cannot proceed.
+        FAILED: A ``/task-review`` was hard-stopped or rejected, or every
+            work leg of the current review cycle failed (ASSUM-008 as
+            narrowed 2026-08-02). The build cannot proceed.
     """
 
     CLEAN_REVIEW = "clean-review"
@@ -301,6 +331,17 @@ class ModeCPlan:
             ``next_stage`` and ``terminal`` are ``None``.
         rationale: A short human-readable string explaining the decision.
             The supervisor logs this against the build's stage history.
+        total_work_failure: The failed fix-task ids, in dispatch order, when
+            this terminal is the ASSUM-008 narrowing's 100%-failed-cycle
+            ruling (Rich's word, 2026-08-02); ``None`` on every other plan.
+            **This is a typed discriminator, not decoration.** The terminal
+            handler classifies a cycle by the ``/task-work`` rows that ran
+            *before* the latest review, and this terminal fires while that
+            review is still the current one with its fix-task list intact —
+            a shape the handler has no branch for, and whose defensive
+            branch accuses its caller of a wiring bug. The supervisor reads
+            this field to know the ruling is already made, so the rule is
+            stated once, here, and never re-derived downstream.
     """
 
     permitted_stages: frozenset[StageClass]
@@ -309,6 +350,7 @@ class ModeCPlan:
     terminal: ModeCTerminal | None = None
     wait: ModeCWait | None = None
     rationale: str = ""
+    total_work_failure: tuple[str, ...] | None = None
 
     @property
     def is_waiting(self) -> bool:
@@ -474,7 +516,32 @@ class ModeCCyclePlanner:
                 ),
             )
 
-        # All fix tasks reached terminal status — schedule a follow-up
+        # Every fix task reached a terminal status. Before reading that as
+        # "the cycle did its work", ask the ASSUM-008 narrowing's question:
+        # did ANY leg actually run? A cycle whose every leg failed is a
+        # broken tool reporting completeness, and scheduling a follow-up
+        # review over it burns another cycle to rediscover the same
+        # findings (the runaway's 42 repetitions).
+        all_failed = self._total_work_failure(
+            history=history,
+            latest_review_idx=latest_review_idx,
+            fix_tasks=fix_tasks,
+        )
+        if all_failed is not None:
+            return ModeCPlan(
+                permitted_stages=permitted,
+                next_stage=None,
+                terminal=ModeCTerminal.FAILED,
+                rationale=(
+                    "every work leg in this cycle failed — a tooling fault, "
+                    "not a fix outcome; no follow-up review is scheduled "
+                    f"(fix tasks: {', '.join(all_failed)})"
+                ),
+                total_work_failure=all_failed,
+            )
+
+        # All fix tasks reached terminal status and at least one leg was
+        # something other than a bare failure — schedule a follow-up
         # /task-review per ASSUM-010 (no numeric cap).
         return ModeCPlan(
             permitted_stages=permitted,
@@ -559,6 +626,82 @@ class ModeCCyclePlanner:
         # Every fix task in this review's list has a terminal
         # ``/task-work`` slot — the cycle's fan-out is exhausted.
         return FixTaskLookup()
+
+    @staticmethod
+    def _total_work_failure(
+        *,
+        history: Sequence[StageEntry],
+        latest_review_idx: int,
+        fix_tasks: tuple[str, ...],
+    ) -> tuple[str, ...] | None:
+        """Fix-task ids of a 100%-failed cycle, or ``None``.
+
+        The ASSUM-008 narrowing (Rich's word, 2026-08-02). Called only from
+        the exhausted branch of the fix-task walk, so "every fix task of
+        this cycle is terminal" is already established; this answers the
+        second half — **was every one of those terminal rows strictly a
+        failure?**
+
+        Returns:
+            The failed fix-task ids in dispatch order, de-duplicated, when
+            the cycle recorded at least one terminal ``/task-work`` row and
+            EVERY terminal ``/task-work`` row in it carries the status
+            ``"failed"``. ``None`` otherwise — and ``None`` means "keep
+            today's behaviour", which is the answer for:
+
+            * any ``approved`` in the mix (some work landed);
+            * any ``rejected`` or ``cancelled`` in the mix (a gate's or a
+              human's verdict on work that RAN — the strictness is the
+              whole point, because a tooling fault is what the rule
+              claims and a rejection is not one);
+            * a cycle with no terminal work rows at all (nothing to
+              accuse — an empty review's clean-review branch handles it
+              before the walk ever reaches here).
+
+        Args:
+            history: The build's stage entries in dispatch order.
+            latest_review_idx: Index of the review whose cycle is judged.
+            fix_tasks: That review's fix-task list. **Rows whose
+                ``fix_task_id`` is not in it are not this cycle's evidence
+                and are skipped** — the same window
+                :meth:`_next_undispatched_fix_task` uses when it decides the
+                fan-out is exhausted, so the two cannot disagree about which
+                rows exist. Without the filter a foreign or stale row got
+                named in the operator-facing rationale as one of this
+                cycle's fix tasks.
+
+        In-flight rows are ignored rather than treated as counter-evidence:
+        the caller cannot reach this method while one exists (the walk
+        returns a WAIT first), and skipping them keeps the rule readable as
+        "of the legs that finished, every one failed".
+        """
+        wanted = frozenset(fix_tasks)
+        failed: list[str] = []
+        for entry in history[latest_review_idx + 1 :]:
+            if entry.stage_class != StageClass.TASK_WORK:
+                continue
+            if entry.fix_task_id is None:
+                # Same defensive skip the fix-task walk makes: an
+                # unattributable row is an upstream invariant violation and
+                # is not evidence either way.
+                continue
+            if entry.fix_task_id not in wanted:
+                continue
+            if entry.status not in _TERMINAL_STATUSES:
+                continue
+            if entry.status != _STATUS_FAILED:
+                return None
+            if entry.fix_task_id not in failed:
+                failed.append(entry.fix_task_id)
+
+        # An empty list is the "no terminal work rows in this cycle" answer:
+        # every row that could have set it also appends to it (a terminal row
+        # is either strictly failed and appended, or returns above), so the
+        # list IS the saw-a-terminal-row flag. A separate boolean would have
+        # been a second statement of the same fact.
+        if not failed:
+            return None
+        return tuple(failed)
 
     @staticmethod
     def _decide_clean_review(

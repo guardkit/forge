@@ -73,6 +73,7 @@ __all__ = [
     "CommitProbeResult",
     "ModeCTerminal",
     "ModeCTerminalDecision",
+    "RATIONALE_FAILED_ALL_WORK_FAILED",
     "build_session_outcome_payload",
     "build_task_work_attribution",
     "evaluate_terminal",
@@ -128,7 +129,13 @@ _RATIONALE_FAILED_REVIEW_REJECTED: str = "mode-c-task-review-rejected"
 
 #: Rationale string recorded when every dispatched ``/task-work``
 #: ended in a failed terminal lifecycle (AC-005).
-_RATIONALE_FAILED_ALL_WORK_FAILED: str = "mode-c-all-task-work-failed"
+#:
+#: PUBLIC because the supervisor records the very same word for the
+#: planner-side 100%-failed-cycle terminal (ASSUM-008 as narrowed, Rich's
+#: word 2026-08-02), which stops the journey one turn EARLIER than this
+#: handler's branch 5a can see. Two constants spelling the same operator
+#: sentence would be one edit away from a lie, so there is one.
+RATIONALE_FAILED_ALL_WORK_FAILED: str = "mode-c-all-task-work-failed"
 
 #: Rationale string recorded when the ``git rev-list base..HEAD --count``
 #: probe itself failed. Defence in depth: the probe error is treated
@@ -299,7 +306,7 @@ async def evaluate_terminal(
        entries:
 
        a. If every prior ``/task-work`` ended in failure → FAILED
-          with ``_RATIONALE_FAILED_ALL_WORK_FAILED`` (AC-005 part 2).
+          with ``RATIONALE_FAILED_ALL_WORK_FAILED`` (AC-005 part 2).
        b. Otherwise probe the worktree via ``commit_probe``:
 
           * Probe failed → FAILED with
@@ -436,7 +443,7 @@ async def evaluate_terminal(
         return ModeCTerminalDecision(
             outcome=ModeCTerminal.FAILED,
             has_commits=False,
-            rationale=_RATIONALE_FAILED_ALL_WORK_FAILED,
+            rationale=RATIONALE_FAILED_ALL_WORK_FAILED,
             failure_reason=(
                 f"every dispatched /task-work failed "
                 f"({failed_count} of {len(work_before)})"

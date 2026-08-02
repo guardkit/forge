@@ -1783,14 +1783,58 @@ class Supervisor:
         PR_REVIEW / FAILED) and converts the decision into a
         :class:`TurnReport`. PR_REVIEW yields a DISPATCHED outcome via
         the constitutional gate; every other outcome is TERMINAL.
+
+        **One exception, typed:** a plan carrying ``total_work_failure``
+        is the planner's own 100%-failed-cycle ruling (ASSUM-008 as
+        narrowed, Rich's word 2026-08-02) and the handler is not asked.
+        See the branch's comment for why asking it produces a false
+        accusation rather than a second opinion.
         """
         permitted = frozenset(MODE_C_CHAIN)
 
         # Local import — see TYPE_CHECKING note at top of module.
         from forge.pipeline.terminal_handlers.mode_c import (
+            RATIONALE_FAILED_ALL_WORK_FAILED,
             ModeCTerminal as _ModeCHandlerTerminal,
+            ModeCTerminalDecision as _ModeCTerminalDecision,
             evaluate_terminal as _default_mode_c_evaluate_terminal,
         )
+
+        if plan.total_work_failure is not None:
+            # THE PLANNER'S RULING IS THE RECORD — the handler is not a
+            # second opinion here, it is a wrong one.
+            #
+            # ``evaluate_terminal`` classifies a cycle from the
+            # ``/task-work`` rows recorded BEFORE the latest review, which
+            # assumes the journey reached its terminal on a settled
+            # FOLLOW-UP review. This terminal is the one that refuses to
+            # schedule that follow-up, so the latest review is still the
+            # cycle's own and still carries its fix-task list — and the
+            # handler's branch for that shape is a DEFENSIVE one whose only
+            # job is to accuse its caller of having been invoked mid-cycle.
+            # Nothing of the sort happened: the supervisor is on its routine
+            # path. Recording that accusation would send a diagnoser
+            # arriving at a tooling-fault build hunting a supervisor
+            # invariant violation that never occurred, durably, in the run
+            # report and in both stage_log rows.
+            #
+            # The word is the handler's own public constant (one sentence,
+            # one place) and the detail is the planner's rationale verbatim
+            # — the rule that minted this terminal is the only thing that
+            # gets to describe it. No commit probe: a cycle whose every leg
+            # failed produced no fix, so commits on the branch came from
+            # somewhere else and must never route to a merge card.
+            decision = _ModeCTerminalDecision(
+                outcome=_ModeCHandlerTerminal.FAILED,
+                has_commits=False,
+                rationale=RATIONALE_FAILED_ALL_WORK_FAILED,
+                failure_reason=plan.rationale or None,
+            )
+            return self._mode_c_terminal_report(
+                build_id=build_id,
+                permitted=permitted,
+                decision=decision,
+            )
 
         # If the planner already classified the cycle as a planner-side
         # terminal (CLEAN_REVIEW or FAILED), prefer the handler's view
@@ -1853,6 +1897,27 @@ class Supervisor:
         # finds nothing to fix, or produces no commits, ends with a
         # receipt, never a card. The owner hears about work only when
         # there is a merge word to say.
+        return self._mode_c_terminal_report(
+            build_id=build_id,
+            permitted=permitted,
+            decision=decision,
+        )
+
+    def _mode_c_terminal_report(
+        self,
+        *,
+        build_id: str,
+        permitted: frozenset[StageClass],
+        decision: ModeCTerminalDecision,
+    ) -> TurnReport:
+        """Record one Mode C terminal decision as a TERMINAL turn report.
+
+        The operator-facing sentence — ``"<outcome>: <rationale>"`` plus a
+        parenthesised failure reason when there is one — is composed HERE
+        and nowhere else, so the planner-side ruling and the terminal
+        handler's own outcomes read identically to whoever finds them in a
+        run report or a ``stage_log`` row.
+        """
         report = TurnReport(
             outcome=TurnOutcome.TERMINAL,
             build_id=build_id,

@@ -235,3 +235,14 @@ __marimo__/
 # tracked nats-core symlink above predates this and stays)
 .guardkit/worktrees/FEAT-*
 .claude/worktrees/
+
+# Secrets: the whole .env family, not just the exact name. A timestamped backup
+# (.env.bak-pre-brief-20260717) once leaked live credentials because the single
+# line '.env' matches only itself, so the backup rode along in a commit.
+# The '!' lines keep the checked-in example/sample files working.
+.env.*
+*.env
+!.env.example
+!.env.sample
+!*.env.example
+!*.env.sample
