@@ -78,6 +78,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -2479,11 +2480,101 @@ async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
 # existing honest refusal (a failed terminal naming the prior build) — never a
 # silent half-state, and never a fresh dispatch onto residue we could not clear.
 #
+# THE SECOND SHAPE — FEATURE-MODE RESIDUE (register find, 2026-08-02, three
+# real dispatches). Everything above describes guardkit's TASK-mode residue.
+# guardkit also runs in FEATURE mode, and there the inner worktree is
+# ``<outer>/.guardkit/worktrees/<FEATURE_ID>`` on branch
+# ``autobuild/<FEATURE_ID>`` — the ref is named after the FEATURE, not any task
+# id. The ownership test above ("is the branch suffix one of this feature's
+# task ids?") therefore reads FALSE for it, and the pass logged its own miss —
+# "prior build build-FEAT-FLV1-20260802161215 holds no task branch of feature
+# FEAT-FLV1; left untouched" — while ``branch autobuild/FEAT-FLV1 already
+# exists and automatic cleanup failed`` killed two consecutive fresh
+# dispatches at worktree creation.
+#
+# The feature-branch shape is SELF-PROVING and needs no task graph at all: a
+# registered worktree under a prior build's root whose branch is exactly
+# ``autobuild/<this feature id>`` can only belong to this feature. So it is
+# swept even when ``.guardkit/features/<FEAT>.yaml`` is unreadable in both the
+# shared checkout and the kept tree — the case that leaves the task shape
+# ownership-unproven. Both shapes then travel the SAME laws below: export
+# first, each act loud and named, git itself the authority on whether a branch
+# is still checked out somewhere (a ``branch -D`` it refuses is a refusal, not
+# a silent skip).
+#
 # SCOPE FENCE. Only registered worktrees living UNDER the per-build worktree
 # base (``<base>/<build_id>/...``), whose outer build id is NOT this build's,
-# and whose checked-out branch is ``autobuild/<T>`` for a task id T declared by
-# THIS feature. Another feature's refs, and worktrees outside the base, are
-# never touched.
+# whose prior build's ledger row is not still live, and whose checked-out
+# branch is either ``autobuild/<FEATURE_ID>`` for THIS feature or
+# ``autobuild/<T>`` for a task id T declared by THIS feature. Another feature's
+# refs, worktrees outside the base, the source repo's own main/HEAD checkout
+# (its branch is not an ``autobuild/`` ref), and every scrap of residue
+# belonging to a build that is still RUNNING are never touched — the RUNNING
+# half only when the forge ledger is readable here (``$FORGE_DB_PATH``); with
+# no ledger the guard says so out loud and fails OPEN, which is the pre-cure
+# behaviour exactly (see ``_prior_build_status``).
+
+
+#: Ledger statuses that mean a build has NOT reached a terminal state, so its
+#: worktrees and branches are still IN USE. ``builds.status`` is the ledger's
+#: own vocabulary (``forge/lifecycle/schema.sql``); the terminal half —
+#: COMPLETE / FAILED / INTERRUPTED / CANCELLED / SKIPPED — is what makes
+#: residue sweepable.
+_LIVE_BUILD_STATUSES: frozenset[str] = frozenset(
+    {"QUEUED", "PREPARING", "RUNNING", "PAUSED", "FINALISING"}
+)
+
+
+def _prior_build_status(build_id: str) -> str | None:
+    """The prior build's ``builds.status`` from the forge ledger, or ``None``.
+
+    Read-only, best-effort, and never raises: the canonical
+    ``$FORGE_DB_PATH`` → ``~/.forge/forge.db`` path is opened ``mode=ro`` and
+    a single row looked up by primary key. ``None`` means "unknowable here"
+    (no ledger on this host, no row, a schema that predates the table, any
+    error) — NOT "terminal".
+
+    The liveness guard below only ever *withholds* destruction, so an
+    unknowable status leaves the pre-cure behaviour exactly: the residue is
+    swept, and a genuinely concurrent build would collide loudly the way it
+    always did. A row that positively says the prior build is live is the one
+    thing that stops the sweep.
+    """
+    try:
+        from forge.cli._db_resolve import resolve_db_path
+
+        db_path = resolve_db_path()
+        if not db_path.exists():
+            # LOUD on purpose (the SW coach's find): an absent ledger means the
+            # liveness guard checked NOTHING — an operator must be able to tell
+            # that apart from "the prior build is terminal". The guard still
+            # fails OPEN (sweep proceeds, pre-cure behaviour).
+            logger.info(
+                "requeue sweep: no forge ledger at %s — the prior-build "
+                "liveness guard has nothing to read and withholds nothing",
+                db_path,
+            )
+            return None
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT status FROM builds WHERE build_id = ?", (build_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — a ledger read never blocks a build
+        logger.debug(
+            "autobuild_runner: requeue sweep — could not read the ledger "
+            "status of prior build %s (%s: %s); treating it as unknown",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not row or not isinstance(row[0], str):
+        return None
+    return row[0]
 
 
 class PriorBuildSweepError(RuntimeError):
@@ -2667,30 +2758,82 @@ async def _sweep_prior_build_residue_impl(
     if not prior:
         return
 
+    feature_branch = f"autobuild/{feature_id}"
     for outer_root, entries in sorted(prior.items()):
         prior_build_id = outer_root.name
-        task_ids = _feature_task_ids_any(repo_path, outer_root, feature_id)
-        if task_ids is None:
+
+        # LIVENESS. A build that has not reached a terminal ledger state is
+        # still USING this worktree and this branch; sweeping it would pull
+        # the tree out from under a running guardkit. Only a row that
+        # positively says "live" withholds the sweep (see
+        # :func:`_prior_build_status`).
+        status = _prior_build_status(prior_build_id)
+        if status in _LIVE_BUILD_STATUSES:
             logger.warning(
-                "autobuild_runner: requeue sweep — prior build %s holds "
-                "autobuild branches but this feature's task ids are unreadable "
-                "in %s and in the kept tree; ownership UNPROVEN, leaving it "
-                "alone (the fresh dispatch may still fail loudly on the "
-                "claimed branch)",
+                "autobuild_runner: requeue sweep — prior build %s is still "
+                "LIVE (ledger status=%s); its residue at %s is left ENTIRELY "
+                "untouched. This fresh dispatch of feature %s may collide "
+                "loudly on the claimed branch — that is correct: a running "
+                "build's worktree is never swept out from under it.",
                 prior_build_id,
-                repo_path,
+                status,
+                outer_root,
+                feature_id,
             )
             continue
+
+        # OWNERSHIP, shape 1 — FEATURE mode. guardkit's feature-mode inner
+        # worktree is ``.guardkit/worktrees/<FEATURE_ID>`` on
+        # ``autobuild/<FEATURE_ID>``: the ref NAMES this feature, so ownership
+        # is self-proving and needs no task graph (the 2026-08-02 find — the
+        # task-graph gate below is exactly what let FEAT-FLV1's residue
+        # through).
         owned = [
-            (inner, branch)
-            for inner, branch in entries
-            if branch[len("autobuild/") :] in set(task_ids)
+            (inner, branch) for inner, branch in entries
+            if branch == feature_branch
         ]
+
+        # OWNERSHIP, shape 2 — TASK mode. ``autobuild/<task_id>`` proves
+        # nothing by its name alone, so it needs this feature's declared task
+        # graph.
+        task_ids = _feature_task_ids_any(repo_path, outer_root, feature_id)
+        if task_ids is None:
+            if not owned:
+                logger.warning(
+                    "autobuild_runner: requeue sweep — prior build %s holds "
+                    "autobuild branches but this feature's task ids are "
+                    "unreadable in %s and in the kept tree; ownership "
+                    "UNPROVEN, leaving it alone (the fresh dispatch may still "
+                    "fail loudly on the claimed branch)",
+                    prior_build_id,
+                    repo_path,
+                )
+                continue
+            logger.warning(
+                "autobuild_runner: requeue sweep — prior build %s: this "
+                "feature's task ids are unreadable in %s and in the kept "
+                "tree, so no TASK branch can be swept; the FEATURE branch %s "
+                "names feature %s itself and is swept on that proof alone",
+                prior_build_id,
+                repo_path,
+                feature_branch,
+                feature_id,
+            )
+        else:
+            known = set(task_ids)
+            owned += [
+                (inner, branch)
+                for inner, branch in entries
+                if branch != feature_branch
+                and branch[len("autobuild/") :] in known
+            ]
         if not owned:
             logger.info(
-                "autobuild_runner: requeue sweep — prior build %s holds no "
-                "task branch of feature %s; left untouched",
+                "autobuild_runner: requeue sweep — prior build %s holds "
+                "neither the feature branch %s nor any task branch of feature "
+                "%s; left untouched",
                 prior_build_id,
+                feature_branch,
                 feature_id,
             )
             continue
@@ -2739,6 +2882,7 @@ async def _sweep_prior_build_residue_impl(
 
         # (2) Sweep — each step loud, each step naming the prior build.
         for inner, branch in owned:
+            was_stale = not inner.exists()
             code, output = await _run_git(
                 ["worktree", "remove", "--force", str(inner)], cwd=repo_path
             )
@@ -2749,10 +2893,16 @@ async def _sweep_prior_build_residue_impl(
                 )
             logger.info(
                 "autobuild_runner: requeue sweep — prior build %s: removed "
-                "inner worktree %s (branch %s)",
+                "inner worktree %s (branch %s)%s",
                 prior_build_id,
                 inner,
                 branch,
+                (
+                    " — the registration was already STALE (its directory was "
+                    "gone); only the shared-repo registration was cleared"
+                    if was_stale
+                    else ""
+                ),
             )
 
         code, output = await _run_git(["worktree", "prune"], cwd=repo_path)
