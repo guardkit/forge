@@ -23,12 +23,18 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import serve as serve_mod
+from forge.cli import _serve_conductor as serve_conductor_mod
 from forge.cli._serve_conductor import (
+    CONDUCTOR_LEG_MODEL_ENV,
+    CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS,
+    CONDUCTOR_STAGE_TIMEOUT_SECONDS,
+    CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS,
     _ModeAOnlySeam,
     build_conductor_driver_deps_factory,
     build_conductor_supervisor_factory,
     make_conductor_wait_window_reader,
 )
+from forge.pipeline.mode_c_planner import FixTaskRef
 from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -156,6 +162,105 @@ class TestSupervisorFactory:
             supervisor.subprocess_dispatcher.__name__
             == "conductor_subprocess_dispatcher"
         )
+
+
+def _runner():
+    """The recording runner both drive-tests below dispatch into."""
+    from tests.forge.pipeline.dispatchers.test_subprocess import FakeSubprocessRunner
+
+    return FakeSubprocessRunner()
+
+
+def _drive(supervisor: Any, stage: StageClass) -> None:
+    """Run ONE real fix-journey dispatch through the composed adapter."""
+    kwargs: dict[str, Any] = {"stage": stage, "build_id": BUILD_ID}
+    if stage is StageClass.TASK_WORK:
+        kwargs["fix_task"] = FixTaskRef(
+            fix_task_id="TASK-FIX007-A", review_history_index=0
+        )
+    asyncio.run(supervisor.subprocess_dispatcher(**kwargs))
+
+
+class TestTheLegTripwires:
+    """LI stage-2 §1 — two NAMED tripwires, wired at the composition site."""
+
+    def test_the_two_constants_carry_the_ruled_numbers(self) -> None:
+        assert CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS == 600
+        assert CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS == 1800
+        assert CONDUCTOR_STAGE_TIMEOUT_SECONDS == {
+            StageClass.TASK_REVIEW: 600,
+            StageClass.TASK_WORK: 1800,
+        }
+
+    def test_the_constants_state_their_own_law_where_they_live(self) -> None:
+        """Rich's 2026-07-30 ruling, kept beside the numbers it governs.
+
+        A bare number grows into a work budget the first time somebody
+        reads it in a hurry. The words are the fence, so pin the words —
+        including the ledgered destination that makes these two temporary.
+        """
+        source = Path(serve_conductor_mod.__file__).read_text(encoding="utf-8")
+
+        assert 'tripwires for "the leg itself is broken"' in source
+        assert "never work-limiters" in source
+        assert "monitored-supervision path" in source
+
+    def test_a_review_dispatch_gets_600_and_a_work_dispatch_1800(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The composed production path, driven — not the constants re-read."""
+        runner = _runner()
+        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+        _drive(supervisor, StageClass.TASK_WORK)
+
+        assert [call["timeout_seconds"] for call in runner.calls] == [600, 1800]
+
+
+class TestTheLegSeatEnvThread:
+    """LI stage-2 §3.4 — the operator's stopgap seat thread.
+
+    Ledgered, not smuggled: the config-as-code field on ``ConductorConfig``
+    is Rich's ruling at conductor activation. Until then this env var is
+    the ONE way the pipeline can name the seat a leg runs on.
+    """
+
+    def test_no_env_means_the_argv_names_no_model_at_all(
+        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(CONDUCTOR_LEG_MODEL_ENV, raising=False)
+        runner = _runner()
+        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        assert "--model" not in runner.calls[0]["args"]
+
+    def test_the_env_names_the_seat_on_a_fix_journey_dispatch(
+        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(CONDUCTOR_LEG_MODEL_ENV, "qwen3-coder-30b")
+        runner = _runner()
+        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+        _drive(supervisor, StageClass.TASK_WORK)
+
+        for call in runner.calls:
+            assert call["args"][-2:] == ["--model", "qwen3-coder-30b"]
+
+    def test_a_blank_env_is_read_as_unset_not_as_an_empty_seat(
+        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--model ''`` would be worse than no flag: a named nothing."""
+        monkeypatch.setenv(CONDUCTOR_LEG_MODEL_ENV, "   ")
+        runner = _runner()
+        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        assert "--model" not in runner.calls[0]["args"]
 
 
 class TestTheM0Guard:

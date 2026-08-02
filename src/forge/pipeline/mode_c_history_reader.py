@@ -92,18 +92,24 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
+from forge.pipeline.finding_anchors import (
+    FINDING_ANCHORS_DETAILS_KEY,
+    derive_finding_anchors,
+)
 from forge.pipeline.mode_c_planner import StageEntry
 from forge.pipeline.stage_taxonomy import StageClass
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "FINDING_ANCHORS_DETAILS_KEY",
     "FIX_TASKS_DETAILS_KEY",
     "FIX_TASK_ID_DETAILS_KEY",
     "LIFECYCLE_STATE_DETAILS_KEY",
     "MODE_C_STAGE_LABELS",
     "ProjectionError",
     "SqliteModeCHistoryReader",
+    "derive_finding_anchors",
     "project_mode_c_history",
 ]
 
@@ -118,6 +124,14 @@ FIX_TASKS_DETAILS_KEY: str = "fix_tasks"
 #: row was dispatched against. The audit anchor that lets the planner tell
 #: a dispatched fix task from an outstanding one.
 FIX_TASK_ID_DETAILS_KEY: str = "fix_task_id"
+
+#: ``FINDING_ANCHORS_DETAILS_KEY`` and :func:`derive_finding_anchors` are
+#: re-exported from :mod:`forge.pipeline.finding_anchors` (LI stage-2 §5).
+#: They live there because the conductor's turn loop needs the same
+#: vocabulary and must not take an import edge onto the planner/persistence
+#: side; they are re-exported HERE so the fix journey's writer keeps
+#: importing every ``details_json`` key it writes from one place, and a
+#: rename cannot leave writer and reader disagreeing in silence.
 
 #: ``details_json`` key marking a dispatch-attempt row (written by
 #: :mod:`forge.cli._serve_deps_stage_log`, whose value is ``"running"``).
@@ -257,6 +271,7 @@ def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | No
             stage_class=stage_class,
             status=status,
             fix_tasks=_project_fix_tasks(details, status=status, subject_task_id=subject_task_id),
+            finding_anchors=_project_finding_anchors(details),
             hard_stop=hard_stop,
         )
 
@@ -362,6 +377,63 @@ def _project_fix_tasks(
         fix_tasks = [t for t in fix_tasks if t != subject_task_id]
 
     return tuple(fix_tasks)
+
+
+def _project_finding_anchors(details: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Recover a review row's finding anchors (LI stage-2 §5).
+
+    Deliberately NOT strict, and deliberately three-valued — the opposite
+    posture to :func:`_project_fix_tasks`, for a reason worth stating:
+
+    * ``fix_tasks`` drives a FAN-OUT. Reading it wrong dispatches work at
+      the wrong thing, so anything malformed hard-stops the journey.
+    * ``finding_anchors`` drives a STOP. Reading it wrong at worst costs a
+      journey one extra review cycle (the cap still bounds it), and a
+      hard-stop here would take down every legacy row ever written — every
+      review row that predates this key.
+
+    So:
+
+    * key absent → ``None`` — "this row states nothing about anchors".
+      The no-progress rule reads that as *no baseline* and resets, which
+      is the only honest reading: a row that never recorded its findings
+      cannot testify that they went unresolved.
+    * key present and readable → the tuple, order-preserved, de-duplicated.
+      An EMPTY tuple is a real answer ("the review reported no findings"),
+      not the same thing as ``None``.
+    * key present but malformed → ``None`` with a loud warning. Same
+      reading as absent, because a row we cannot parse states nothing
+      either — but it is a defect, so it is logged rather than shrugged at.
+    """
+    if FINDING_ANCHORS_DETAILS_KEY not in details:
+        return None
+
+    raw = details[FINDING_ANCHORS_DETAILS_KEY]
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "mode_c_history_projection: %r is %s, expected a JSON array of "
+            "anchor strings — projecting 'no anchors recorded' (the "
+            "no-progress rule resets rather than accuse the journey)",
+            FINDING_ANCHORS_DETAILS_KEY,
+            type(raw).__name__,
+        )
+        return None
+
+    anchors: list[str] = []
+    for element in raw:
+        if not isinstance(element, str) or not element.strip():
+            logger.warning(
+                "mode_c_history_projection: %r contains %r, expected "
+                "non-empty anchor strings — projecting 'no anchors "
+                "recorded' for the whole row",
+                FINDING_ANCHORS_DETAILS_KEY,
+                element,
+            )
+            return None
+        text = element.strip()
+        if text not in anchors:
+            anchors.append(text)
+    return tuple(anchors)
 
 
 def _project_fix_task_id(details: Mapping[str, Any]) -> str:

@@ -27,8 +27,16 @@ Behaviour contract (per ADR-ARCH-025 and the task acceptance criteria):
   :class:`asyncio.CancelledError` is re-raised so the surrounding async
   context unwinds cleanly (Implementation Notes, TASK-GCI-008);
 - a 600 second default timeout (ASSUM-001) caps every invocation; on
-  expiry the in-flight subprocess is terminated, the parser is told
-  ``timed_out=True``, and the result carries ``status="timeout"``;
+  expiry the in-flight subprocess's whole PROCESS GROUP is terminated
+  (SIGTERM → grace → SIGKILL), the parser is told ``timed_out=True``, and
+  the result carries ``status="timeout"``. The post-kill read is bounded
+  (:data:`_POST_KILL_READ_SECONDS`); past that window the stdout/stderr
+  tails are surrendered as EMPTY, and the loss is NAMED — in the log and,
+  load-bearingly, as a ``post_kill_output_surrendered`` warning ON THE
+  RESULT, because the dispatcher threads warnings verbatim into the
+  stage rationale. The alternative is an await with no ceiling, because a
+  pipe holder that outlived the kill means EOF never comes (LI stage-2
+  design §1);
 - ``cwd`` is enforced to be absolute and to resolve to a path inside the
   caller's ``read_allowlist`` (worktree confinement —
   defence-in-depth atop DeepAgents' own enforcement);
@@ -57,8 +65,10 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 import time
 from pathlib import Path
+from typing import Any
 
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
@@ -99,6 +109,20 @@ _GUARDKIT_BINARY: str = "/usr/local/bin/guardkit"
 _DEFAULT_TIMEOUT_SECONDS: int = 600  # ASSUM-001
 _KILL_GRACE_SECONDS: float = 5.0  # SIGTERM → SIGKILL grace window
 _GRAPHITI_PREFIX: str = "graphiti"
+
+#: Ceiling on the post-kill ``communicate()`` (LI stage-2 design §1, the
+#: kill fix). After SIGKILL the child is gone, but any pipe holder it left
+#: behind — a grandchild the group kill could not reach — keeps the read
+#: end open, so EOF never arrives and an unbounded await never returns.
+#: There is no watchdog above this call (the conductor's turn is a bare
+#: await), so an unbounded read here is an unbounded stage. Past this
+#: window the tails are surrendered as EMPTY and the loss is NAMED twice:
+#: in the log, and as a ``post_kill_output_surrendered`` warning on the
+#: :class:`GuardKitResult` — which the dispatcher folds verbatim into the
+#: stage rationale, so a leg that LOST its output can never be read as a
+#: leg that produced none. A degraded read that ends beats a perfect read
+#: that does not.
+_POST_KILL_READ_SECONDS: float = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +250,104 @@ def _resolve_guardkit_binary() -> tuple[str | None, list[str]]:
 # ---------------------------------------------------------------------------
 
 
+def _signal_process_group(proc: Any, sig: int) -> None:
+    """Signal the child's whole process group, never just the child.
+
+    The spawn runs with ``start_new_session=True``, so the child LEADS a
+    group of its own and this call cannot reach the forge daemon. That
+    pairing is the point: a ``guardkit`` leg spawns its own children (a
+    test runner, a harness), and ``Process.terminate()`` reaches exactly
+    one pid — the grandchildren survive, keep working, and keep the
+    child's pipes open.
+
+    **The pgid is the child's pid, and it is NOT read back from the
+    kernel.** ``start_new_session=True`` makes the child both session and
+    group leader, so ``pgid == pid`` by construction — and a process
+    group outlives its dead leader. The escalation step depends on
+    exactly that: by the time SIGKILL runs, the child is usually already
+    dead from the group SIGTERM *and reaped* by asyncio's child watcher,
+    so ``os.getpgid(pid)`` raises :class:`ProcessLookupError` and a
+    getpgid-first implementation signals NOTHING — not the group, not
+    even the child. That is the one case the SIGTERM → grace → SIGKILL
+    ladder exists for (a grandchild that ignored SIGTERM), so reading the
+    pgid back would disarm the ladder precisely when it matters.
+
+    A :class:`ProcessLookupError` from :func:`os.killpg` therefore means
+    what it says: **no process remains in the group** — nothing to signal.
+    (The pid is not reused while the child is unreaped, and after that the
+    window is the kill ladder's few seconds; the estate accepts that
+    residual over an escalation that never fires.) The child-alone
+    fallback is for the cases where a *group* signal is impossible but a
+    process may still be there: a platform with no :func:`os.killpg`, or a
+    permission/OS error from the group call. A failure to signal is
+    logged, never raised: this is the teardown half of a boundary whose
+    contract is "never raises".
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is None:  # pragma: no cover — asyncio always sets pid
+        return
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            # The whole group is gone — nothing to signal, nothing to say.
+            return
+        except OSError as exc:
+            # PermissionError is an OSError subclass; one clause covers
+            # both, and the group signal failing is the only thing that
+            # makes the child-alone fallback below worth trying.
+            logger.warning(
+                "guardkit adapter: could not signal process group of pid=%s "
+                "(%s: %s) — falling back to the child alone; any "
+                "grandchildren it started may survive",
+                pid,
+                type(exc).__name__,
+                exc,
+            )
+    try:
+        proc.send_signal(sig)
+    except (ProcessLookupError, OSError):  # pragma: no cover — race only
+        return
+
+
+async def _bounded_post_kill_read(proc: Any) -> tuple[bytes, bytes, bool]:
+    """Read the killed child's tails, but never wait forever for EOF.
+
+    Returns ``(stdout, stderr, surrendered)``. On expiry the tails are
+    ``(b"", b"")`` and ``surrendered`` is ``True`` — the honest degraded
+    answer, and the flag :func:`run` turns into a
+    ``post_kill_output_surrendered`` warning so the LOSS RIDES THE
+    RESULT, not just the daemon log. The alternative is the defect this
+    replaces: an orphaned pipe holder means EOF never comes, so the await
+    never returns and the stage has no ceiling at all.
+    """
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=_POST_KILL_READ_SECONDS
+        )
+        return stdout_b, stderr_b, False
+    except asyncio.TimeoutError:
+        logger.warning(
+            "guardkit adapter: post-kill read of pid=%s did not reach EOF "
+            "within %.1fs — a pipe holder outlived the process group kill. "
+            "SURRENDERING stdout/stderr as EMPTY: the timeout result loses "
+            "its output tails, and the parser sees nothing to parse. A pipe "
+            "holder this read could not outlast may still be RUNNING — the "
+            "group kill reaches the child's group, not a process that "
+            "escaped into a session of its own",
+            getattr(proc, "pid", "?"),
+            _POST_KILL_READ_SECONDS,
+        )
+        return b"", b"", True
+
+
 async def _execute_subprocess(
     *,
     command: list[str],
     cwd: str,
     timeout: int,
-) -> tuple[str, str, int, float, bool]:
+) -> tuple[str, str, int, float, bool, bool]:
     """Execute a command via :func:`asyncio.create_subprocess_exec`.
 
     This is the **stubbable seam** standing in for DeepAgents' ``execute``
@@ -243,14 +359,36 @@ async def _execute_subprocess(
     The command is passed as a *list* (never a shell string) — this is
     the contract ``run()`` enforces for shell-injection safety.
 
-    Returns ``(stdout, stderr, exit_code, duration_secs, timed_out)``.
+    Returns ``(stdout, stderr, exit_code, duration_secs, timed_out,
+    output_surrendered)``. ``run()`` unpacks the trailing flag
+    *tolerantly*, so a stub that answers the historical 5-tuple still
+    works and reads as ``output_surrendered=False`` — which is the truth
+    for any stub: a seam that kills nothing surrenders nothing.
+
+    The kill path (LI stage-2 design §1)
+    ------------------------------------
+
+    The spawn takes ``start_new_session=True`` so the child leads its own
+    process group, and every kill signals the GROUP. A ``guardkit`` leg is
+    not a leaf process — it starts a harness and a test runner — and the
+    old ``terminate()``/``kill()`` pair reached only the child, leaving
+    working grandchildren behind (POSIX; the estate's daemon is Linux).
+    The post-kill read is then bounded at
+    :data:`_POST_KILL_READ_SECONDS`, because a pipe holder that outlives
+    the kill means EOF never comes.
     """
     started_at = time.monotonic()
+    output_surrendered = False
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # The child LEADS its own process group — the precondition that
+        # makes the group kill below safe (it can never reach the forge
+        # daemon) and necessary (nothing else will reap the leg's own
+        # children).
+        start_new_session=True,
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -258,23 +396,27 @@ async def _execute_subprocess(
         )
         timed_out = False
     except asyncio.TimeoutError:
-        # Terminate; escalate to SIGKILL after a grace window.
-        proc.terminate()
+        # Terminate the GROUP; escalate to SIGKILL after a grace window.
+        _signal_process_group(proc, signal.SIGTERM)
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=_KILL_GRACE_SECONDS
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            stdout_b, stderr_b = await proc.communicate()
+            _signal_process_group(proc, signal.SIGKILL)
+            stdout_b, stderr_b, output_surrendered = (
+                await _bounded_post_kill_read(proc)
+            )
         timed_out = True
     except asyncio.CancelledError:
-        # Caller cancelled — terminate the child and re-raise.
-        proc.terminate()
+        # Caller cancelled — tear the group down and re-raise. The same
+        # group law applies: with the child in a session of its own,
+        # signalling the child alone would strand every grandchild.
+        _signal_process_group(proc, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=_KILL_GRACE_SECONDS)
         except asyncio.TimeoutError:
-            proc.kill()
+            _signal_process_group(proc, signal.SIGKILL)
             await proc.wait()
         raise
 
@@ -286,6 +428,7 @@ async def _execute_subprocess(
         exit_code,
         duration,
         timed_out,
+        output_surrendered,
     )
 
 
@@ -434,13 +577,23 @@ async def run(
         ]
 
         try:
-            stdout, stderr, exit_code, duration, timed_out = (
-                await _execute_subprocess(
-                    command=command,
-                    cwd=str(resolved_repo),
-                    timeout=timeout_seconds,
-                )
+            # Tolerant unpack: the production seam answers a 6-tuple whose
+            # last element is the post-kill surrender flag; a stub that
+            # answers the historical 5-tuple reads as "nothing surrendered",
+            # which is the truth for a seam that kills nothing.
+            (
+                stdout,
+                stderr,
+                exit_code,
+                duration,
+                timed_out,
+                *_surrender,
+            ) = await _execute_subprocess(
+                command=command,
+                cwd=str(resolved_repo),
+                timeout=timeout_seconds,
             )
+            output_surrendered = bool(_surrender[0]) if _surrender else False
         except PermissionError as exc:
             # Binary not in DeepAgents' shell allowlist — convert to a
             # structured failed result with the canonical warning code.
@@ -465,6 +618,35 @@ async def run(
                 stderr=str(exc),
                 exit_code=-1,
                 warnings=warnings,
+            )
+
+        if output_surrendered:
+            # The log is NOT the only channel, and pretending it was is
+            # how a leg that lost 30 minutes of output became
+            # byte-indistinguishable from a leg that produced none. This
+            # warning rides the result, and the dispatcher threads every
+            # warning verbatim into the stage's rationale
+            # (``pipeline/dispatchers/subprocess.py``), so the stage_log
+            # row and the receipt both NAME the loss.
+            warnings.append(
+                GuardKitWarning(
+                    code="post_kill_output_surrendered",
+                    message=(
+                        f"stdout/stderr were SURRENDERED as empty: the "
+                        f"post-kill read did not reach EOF within "
+                        f"{_POST_KILL_READ_SECONDS:.0f}s after the timeout "
+                        f"kill. A pipe holder outlived the process-group "
+                        f"kill (a grandchild in a session of its own) and "
+                        f"may still be running. The tails below are EMPTY "
+                        f"because they were LOST, not because the leg was "
+                        f"silent"
+                    ),
+                    details={
+                        "subcommand": subcommand,
+                        "post_kill_read_seconds": _POST_KILL_READ_SECONDS,
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
             )
 
         result = parse_guardkit_output(

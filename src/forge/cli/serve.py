@@ -1522,10 +1522,21 @@ def build_conductor_router(
       (:class:`SqliteBuildModeReader`). Anything that is not the fix
       journey answers ``False`` immediately, so a routine build under an
       ON flag still takes the routine path untouched.
-    * A fix journey gets a per-build :class:`Supervisor` (its budget
-      collaborators from :func:`build_conductor_budget_kwargs`) and a
-      turn loop, spawned as a supervised background task so the consumer
-      fetch loop is never blocked by a whole journey.
+    * A fix journey's budget profile is resolved through
+      :func:`resolve_budget_for_build` and put to THE CAP LAW
+      (:func:`forge.config.conductor.mode_c_cap_refusal`, stage-2 design
+      §4) **before** anything is spawned. An uncapped or unresolvable
+      profile does not open the journey — and, critically, it does NOT
+      answer ``False``: ``False`` means "not a fix journey, launch it the
+      routine way", so returning it here would silently run a fix task
+      through the routine autobuild path. The build is marked FAILED with
+      the reason recorded on ``builds.error`` and the router answers
+      ``True`` (taken, and terminated loudly).
+    * A fix journey that clears the cap law gets a per-build
+      :class:`Supervisor` (its budget collaborators from
+      :func:`build_conductor_budget_kwargs`) and a turn loop, spawned as a
+      supervised background task so the consumer fetch loop is never
+      blocked by a whole journey.
 
     ``supervisor_factory`` is injected rather than composed here on
     purpose. ``build_supervisor`` needs thirteen routine-path
@@ -1594,6 +1605,28 @@ def build_conductor_router(
         if mode is not BuildMode.MODE_C:
             return False
 
+        # THE CAP LAW, belt at the daemon (stage-2 design §4). Mode-c is
+        # confirmed; the profile is resolved through the production
+        # resolver and put to the ONE rule before a single thing is
+        # spawned. NEVER ``return False`` from here: False is the routine
+        # path, and running a fix task through the routine autobuild
+        # launch is precisely the silent downgrade this belt exists to
+        # prevent. The build fails loudly instead, with the reason on the
+        # row, and the router reports the build as taken.
+        cap_refusal = _mode_c_cap_refusal_for_build(pool, config, build_id)
+        if cap_refusal is not None:
+            logger.error(
+                "conductor: build_id=%s is a fix journey but %s — refusing "
+                "to open it. The build is marked FAILED with the reason "
+                "recorded; it is NOT downgraded onto the routine autobuild "
+                "path. %s",
+                build_id,
+                cap_refusal.summary,
+                cap_refusal.message,
+            )
+            _fail_uncapped_mode_c_build(pool, build_id, cap_refusal)
+            return True
+
         try:
             supervisor = await _maybe_await_value(supervisor_factory(build_id))
             if driver_deps_factory is not None:
@@ -1621,6 +1654,120 @@ def build_conductor_router(
         return True
 
     return conductor_router
+
+
+def _mode_c_cap_refusal_for_build(
+    pool: Any,
+    config: Any,
+    build_id: str,
+) -> "Any | None":
+    """Put ``build_id``'s resolved budget profile to THE CAP LAW.
+
+    Resolution goes through :func:`resolve_budget_for_build` — the same
+    production reader the supervisor's budget wiring uses, so the caps the
+    law judges are exactly the caps that would have been enforced. The
+    verdict comes from :func:`forge.config.conductor.mode_c_cap_refusal`,
+    the single statement of the rule that ``forge queue`` also reads.
+
+    Every failure mode is a refusal, never an exception and never a
+    ``None`` that would let the journey open:
+
+    * ``KeyError`` — the profile named on the row is not defined in this
+      config (the shipped ``forge.yaml`` spells out ``budget.profiles``
+      and shadows the in-code defaults, so a ``fix-journey`` row on a
+      config without that block lands here).
+    * anything else — an unreadable pool or a broken config is not
+      evidence that a cap exists.
+
+    Returns:
+        ``None`` when the journey may open, else the
+        :class:`~forge.config.conductor.ModeCCapRefusal`.
+    """
+    from forge.config.conductor import mode_c_cap_refusal
+
+    try:
+        guards, profile_name = resolve_budget_for_build(pool, config, build_id)
+    except KeyError as exc:
+        detail = exc.args[0] if exc.args else str(exc)
+        return mode_c_cap_refusal(
+            profile_name=None,
+            guards=None,
+            resolve_error=str(detail),
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed, never open
+        return mode_c_cap_refusal(
+            profile_name=None,
+            guards=None,
+            resolve_error=f"{type(exc).__name__}: {exc}",
+        )
+    # ``uncapped_acknowledged`` is deliberately NOT threaded: the honest
+    # sandbox escape is a queue-side door, and the daemon refuses an
+    # uncapped fix journey outright (stage-2 design §4).
+    return mode_c_cap_refusal(profile_name=profile_name, guards=guards)
+
+
+def _fail_uncapped_mode_c_build(
+    pool: Any,
+    build_id: str,
+    refusal: Any,
+) -> None:
+    """Mark ``build_id`` FAILED with the cap-law refusal on ``builds.error``.
+
+    The same never-silent posture ``_enforce_mode_c_budget`` takes: the
+    build stops with the reason on the row, so ``forge history`` and every
+    other reader can say WHY. Composed through
+    :func:`~forge.lifecycle.state_machine.transition_chain` so
+    ``apply_transition`` stays the sole writer of ``builds.status`` (a
+    ``QUEUED`` row reaches ``FAILED`` via the legal ``PREPARING`` hop).
+
+    Never raises. A row that cannot be transitioned is logged loudly — the
+    router still reports the build as taken, because the one thing that
+    must not happen is the fix task quietly running as a routine build.
+    """
+    from forge.lifecycle.persistence import Build
+    from forge.lifecycle.state_machine import BuildState, transition_chain
+
+    terminal = (
+        BuildState.COMPLETE,
+        BuildState.FAILED,
+        BuildState.CANCELLED,
+        BuildState.SKIPPED,
+    )
+    try:
+        row = pool.get_build_row(build_id)
+        if row is None:
+            logger.error(
+                "conductor: cap-law refusal for build_id=%s but no build row "
+                "exists to mark FAILED; the refusal stands (nothing was "
+                "spawned) but it is recorded only in this log",
+                build_id,
+            )
+            return
+        current = row.status
+        if current in terminal:
+            logger.warning(
+                "conductor: cap-law refusal for build_id=%s whose row is "
+                "already terminal (%s); leaving it alone",
+                build_id,
+                current.value,
+            )
+            return
+        for hop in transition_chain(
+            Build(build_id=build_id, status=current),
+            BuildState.FAILED,
+            error=refusal.summary,
+        ):
+            pool.apply_transition(hop)
+    except Exception as exc:  # noqa: BLE001 — the refusal must still hold
+        logger.error(
+            "conductor: could not mark build_id=%s FAILED after the cap-law "
+            "refusal (%s: %s). The journey was NOT opened and the build was "
+            "NOT downgraded onto the routine path; the row may be left "
+            "mid-flight and needs a hand",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
 
 
 #: Strong references to the per-build conductor tasks. ``asyncio`` keeps

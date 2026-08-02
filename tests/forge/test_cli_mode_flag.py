@@ -112,14 +112,21 @@ def config_path(tmp_path: Path, repo_dir: Path) -> Path:
 
 @pytest.fixture
 def conductor_config_path(tmp_path: Path, repo_dir: Path) -> Path:
-    """``config_path`` with the conductor switched ON.
+    """``config_path`` with the conductor switched ON *and* a capped default.
 
     The fix journey (``--mode c``) is refused at queue time while the
     conductor is off (revival design pass §h.8) — a build nothing drives
-    must never become a queue row. The Mode C *identifier* tests below
-    are about what rides on the wire, not about activation, so they run
-    against an activated config; the refusal itself is covered in
-    ``tests/forge/test_cli_queue_mode_refusal.py``.
+    must never become a queue row. Since the stage-2 cap law (§4) it is
+    refused a second way: a fix journey whose resolved budget profile
+    carries no review-cycle cap does not open either, so the default
+    profile here is the capped ``fix-journey`` one rather than the
+    reserved (uncapped) ``attended``.
+
+    The Mode C *identifier* tests below are about what rides on the wire,
+    not about either gate, so they run against a config that clears both;
+    the refusals themselves are covered in
+    ``tests/forge/test_cli_queue_mode_refusal.py`` and
+    ``tests/forge/test_mode_c_cap_law.py``.
     """
     return _write_yaml(
         tmp_path / "forge-conductor.yaml",
@@ -131,6 +138,7 @@ def conductor_config_path(tmp_path: Path, repo_dir: Path) -> Path:
                 "repo_allowlist": [str(repo_dir)],
             },
             "conductor": {"enabled": True},
+            "budget": {"default_profile": "fix-journey"},
             "permissions": {
                 "filesystem": {"allowlist": [str(tmp_path)]},
             },

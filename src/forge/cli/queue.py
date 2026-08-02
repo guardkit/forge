@@ -76,7 +76,12 @@ from typing import Any, Protocol
 
 import click
 
-from forge.config.conductor import mode_refusal_reason
+from forge.config.conductor import (
+    UNCAPPED_ESCAPE_PROFILE_NAME,
+    mode_c_cap_refusal_from_config,
+    mode_refusal_reason,
+    uncapped_escape_applies,
+)
 from forge.config.models import ForgeConfig
 from forge.lifecycle.identifiers import (
     InvalidIdentifierError,
@@ -594,6 +599,18 @@ def _require_forge_config(config: Any) -> ForgeConfig:
         "Attended (the default) = caps off (ASSUM-010)."
     ),
 )
+@click.option(
+    "--acknowledge-uncapped",
+    "uncapped_acknowledged",
+    is_flag=True,
+    default=False,
+    help=(
+        "Say out loud that this fix journey runs with NO review-cycle cap. "
+        f"Only opens the profile named '{UNCAPPED_ESCAPE_PROFILE_NAME}', and "
+        "the daemon refuses an uncapped fix journey regardless — this is a "
+        "sandbox-drive door, not a production one."
+    ),
+)
 @click.pass_obj
 def queue_cmd(
     config_obj: Any,
@@ -606,6 +623,7 @@ def queue_cmd(
     sdk_timeout_seconds: int | None,
     correlation_id: str | None,
     profile_name: str | None,
+    uncapped_acknowledged: bool,
 ) -> None:
     """Enqueue a build for ``feature_id`` (write-then-publish).
 
@@ -656,6 +674,53 @@ def queue_cmd(
     if refusal is not None:
         click.echo(refusal, err=True)
         sys.exit(EXIT_MODE_USAGE)
+
+    # 0b. THE CAP LAW, belt at queue time (stage-2 design §4). The refusal
+    #     sees the mode AND the profile, and it fires here — before the
+    #     budget echo, before the duplicate check, before any row is
+    #     written. A fix journey whose resolved profile carries no
+    #     review-cycle cap is the runaway, so it does not open; an unknown
+    #     profile (``resolve()``'s KeyError, which is what a production
+    #     ``forge.yaml`` that spells out ``budget.profiles`` without a
+    #     ``fix-journey`` block gives you) surfaces as the SAME readable
+    #     refusal rather than a traceback. The rule is read from the one
+    #     module the daemon's router reads, so the CLI and the daemon can
+    #     never disagree about whether a journey may open.
+    if build_mode is BuildMode.MODE_C:
+        cap_refusal = mode_c_cap_refusal_from_config(
+            config,
+            profile_name,
+            uncapped_acknowledged=uncapped_acknowledged,
+        )
+        if cap_refusal is not None:
+            click.echo(
+                f"{cap_refusal.message}\nNothing was queued.",
+                err=True,
+            )
+            sys.exit(EXIT_MODE_USAGE)
+        if uncapped_escape_applies(profile_name, uncapped_acknowledged):
+            # The escape is honest only if it is LOUD. Say what was asked
+            # for, and say where it stops.
+            click.echo(
+                f"UNCAPPED: this fix journey is going to the queue under "
+                f"the {UNCAPPED_ESCAPE_PROFILE_NAME!r} profile with the "
+                "acknowledgment given — NOTHING caps its review cycles. "
+                "The daemon's conductor refuses an uncapped fix journey "
+                "outright, so this row is for a sandbox drive only.",
+                err=True,
+            )
+    elif uncapped_acknowledged:
+        # The flag is a MODE-C door only: outside a fix journey nothing reads
+        # it, so accepting it in silence lets an operator believe they said
+        # something the machine heard. Say plainly that it did nothing. This
+        # is a notice, never a refusal — the build is unaffected, so the exit
+        # code and every side effect below stay exactly as they were.
+        click.echo(
+            "NOTICE: --acknowledge-uncapped does nothing outside '--mode c' "
+            "(the review-cycle cap law applies to fix journeys only); this "
+            f"is a --mode {mode_flag} build and the flag was ignored.",
+            err=True,
+        )
 
     # 0. FEAT-UBS-002 — resolve + validate the budget-guard profile BEFORE any
     #    side effect (mirrors the mode-resolution discipline). An unknown name

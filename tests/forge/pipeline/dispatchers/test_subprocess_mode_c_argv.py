@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+from forge.adapters.guardkit.models import GuardKitResult
+from forge.adapters.guardkit.parser import parse_guardkit_output
 from forge.pipeline.dispatchers.subprocess import (
     MODE_C_STAGES,
     SUBPROCESS_STAGE_COMMANDS,
@@ -693,3 +695,206 @@ class TestCorrelationIdAndNoRegression:
         )
         argv = runner.calls[0]["args"]
         assert argv == ["--build-id", BUILD_ID, "--correlation-id", CORRELATION_ID]
+
+
+# ---------------------------------------------------------------------------
+# The findings survive the dispatch (LI stage-2 §5, FB3)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectionFindingsThreading:
+    """The parsed ``## Detection Findings`` block reaches the result.
+
+    Before FB3 the dispatcher parsed the block and dropped it: the fix
+    journey's only stable dedup key existed on one side of this seam and
+    nowhere on the other. Driven through the REAL parser
+    (:func:`parse_guardkit_output`) on REAL marker-block stdout, because
+    the distinction the rule turns on — a missing block versus an empty one
+    — is made by the parser, not by the dispatcher.
+    """
+
+    @staticmethod
+    def _parse(stdout: str) -> GuardKitResult:
+        return parse_guardkit_output(
+            subcommand="task-review",
+            stdout=stdout,
+            stderr="",
+            exit_code=0,
+            duration_secs=0.5,
+        )
+
+    _FINDINGS_BLOCK = (
+        "## Artefacts\n"
+        f"- {WORKTREE_ROOT}/tasks/TASK-FIX007-001.yaml\n\n"
+        "## Detection Findings\n"
+        "```json\n"
+        '[{"pattern": "UNGROUNDED", "file": "src/core/config.py", '
+        '"line": 14, "severity": "critical", '
+        '"anchor": "src/core/config.py|critical"}]\n'
+        "```"
+    )
+
+    @pytest.mark.asyncio
+    async def test_findings_reach_the_result_and_the_stage_log_writer(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        runner = FakeSubprocessRunner(result=self._parse(self._FINDINGS_BLOCK))
+
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=runner,
+            task_id="TASK-FIX007",
+        )
+
+        assert result.status is StageDispatchStatus.SUCCESS
+        assert result.detection_findings_reported is True
+        assert result.detection_findings == (
+            {
+                "pattern": "UNGROUNDED",
+                "file": "src/core/config.py",
+                "line": 14,
+                "severity": "critical",
+                "anchor": "src/core/config.py|critical",
+            },
+        )
+        # …and the writer is told, so the row can carry the anchors.
+        assert writer.calls[0]["detection_findings"] == result.detection_findings
+        assert writer.calls[0]["detection_findings_reported"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_empty_block_is_reported_as_empty_not_as_absent(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        """A clean review. The journey's success path, not a silence."""
+        runner = FakeSubprocessRunner(
+            result=self._parse(
+                "## Artefacts\n- (none)\n\n"
+                "## Detection Findings\n```json\n[]\n```"
+            )
+        )
+
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=runner,
+            task_id="TASK-FIX007",
+        )
+
+        assert result.detection_findings == ()
+        assert result.detection_findings_reported is True
+
+    @pytest.mark.asyncio
+    async def test_an_absent_block_is_not_reported(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        runner = FakeSubprocessRunner(
+            result=self._parse("## Artefacts\n- (none)\n")
+        )
+
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=runner,
+            task_id="TASK-FIX007",
+        )
+
+        assert result.detection_findings == ()
+        assert result.detection_findings_reported is False
+        assert writer.calls[0]["detection_findings_reported"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_block_is_not_reported(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        """The parser folds bad JSON into a warning and answers None."""
+        parsed = self._parse(
+            "## Artefacts\n- (none)\n\n"
+            "## Detection Findings\n```json\n[{'nope': ,}\n```"
+        )
+        assert parsed.warnings
+
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=FakeSubprocessRunner(result=parsed),
+            task_id="TASK-FIX007",
+        )
+
+        assert result.detection_findings_reported is False
+
+    @pytest.mark.asyncio
+    async def test_the_result_holds_a_copy_not_the_runners_own_list(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        """A dispatch result is frozen; its contents must not be a back door."""
+        parsed = self._parse(self._FINDINGS_BLOCK)
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=FakeSubprocessRunner(result=parsed),
+            task_id="TASK-FIX007",
+        )
+
+        assert parsed.detection_findings is not None
+        parsed.detection_findings[0]["severity"] = "low"
+        assert result.detection_findings[0]["severity"] == "critical"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_dispatch_reports_no_findings(
+        self,
+        builder: ForwardContextBuilder,
+        allowlist: FakeWorktreeAllowlist,
+        writer: FakeStageLogWriter,
+    ) -> None:
+        """The parser skips extraction on a non-success exit — fail closed.
+
+        A review leg that crashed states nothing about what it found, and
+        the driver's rule must read that as "nothing shown resolved", not
+        as a clean review.
+        """
+        parsed = parse_guardkit_output(
+            subcommand="task-review",
+            stdout=self._FINDINGS_BLOCK,
+            stderr="boom",
+            exit_code=1,
+            duration_secs=0.5,
+        )
+
+        result = await _dispatch(
+            stage=StageClass.TASK_REVIEW,
+            builder=builder,
+            allowlist=allowlist,
+            writer=writer,
+            runner=FakeSubprocessRunner(result=parsed),
+            task_id="TASK-FIX007",
+        )
+
+        assert result.status is StageDispatchStatus.FAILED
+        assert result.detection_findings == ()
+        assert result.detection_findings_reported is False

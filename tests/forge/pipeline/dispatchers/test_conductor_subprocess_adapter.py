@@ -57,7 +57,9 @@ class _RecordingDispatch:
         return "dispatched"
 
 
-def _adapter(dispatch: Any, *, row: Any = None, writer: Any = None) -> Any:
+def _adapter(
+    dispatch: Any, *, row: Any = None, writer: Any = None, **extra: Any
+) -> Any:
     return make_conductor_subprocess_dispatcher(
         build_row_reader=lambda _bid: row if row is not None else _Row(),
         read_allowlist=[Path("/work")],
@@ -67,6 +69,7 @@ def _adapter(dispatch: Any, *, row: Any = None, writer: Any = None) -> Any:
         subprocess_runner=object(),
         dispatch=dispatch,
         correlation_id_minter=lambda **kw: "corr-fixed",
+        **extra,
     )
 
 
@@ -250,6 +253,165 @@ class TestWorktreeRefusal:
         assert result.status is StageDispatchStatus.FAILED
         assert "inferred directory" in result.rationale
         assert dispatch.calls == []
+
+
+class TestPerStageTimeouts:
+    """LI stage-2 §1 — ONE scalar for both legs was the defect.
+
+    A work leg needs a far longer tripwire than a review leg, and the naive
+    one-line raise would have lifted BOTH — un-fencing the review leg's
+    480 < 600 inner-under-outer margin, which is the margin that keeps a
+    timed-out review from silently discarding a perfect marker block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_leg_selects_its_own_tripwire(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            timeout_seconds_by_stage={
+                StageClass.TASK_REVIEW: 600,
+                StageClass.TASK_WORK: 1800,
+            },
+        )
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["timeout_seconds"] == 600
+        assert dispatch.calls[1]["timeout_seconds"] == 1800
+
+    @pytest.mark.asyncio
+    async def test_a_stage_the_mapping_does_not_name_keeps_the_scalar(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            timeout_seconds=600,
+            timeout_seconds_by_stage={StageClass.TASK_WORK: 1800},
+        )
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+
+        assert dispatch.calls[0]["timeout_seconds"] == 600
+
+    @pytest.mark.asyncio
+    async def test_no_mapping_at_all_is_exactly_todays_behaviour(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch)
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert [c["timeout_seconds"] for c in dispatch.calls] == [600, 600]
+
+
+class TestTheLegSeat:
+    """LI stage-2 §3.4 — the pipeline must be able to NAME the seat."""
+
+    @pytest.mark.asyncio
+    async def test_a_named_seat_rides_on_both_fix_journey_stages(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, leg_model="qwen3-coder-30b")
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["extra_args"] == ["--model", "qwen3-coder-30b"]
+        assert dispatch.calls[1]["extra_args"] == ["--model", "qwen3-coder-30b"]
+
+    @pytest.mark.asyncio
+    async def test_a_non_mode_c_stage_never_carries_the_leg_seat(self) -> None:
+        """The seat is the FIX JOURNEY's, not the routine path's.
+
+        ``FEATURE_PLAN`` is dispatched by this adapter only when the
+        conductor is driving a planning stage; appending the leg's seat
+        there would silently re-point a routine build's model.
+        """
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, leg_model="qwen3-coder-30b")
+
+        await adapter(
+            stage=StageClass.FEATURE_PLAN, build_id=BUILD_ID, feature_id="FEAT-FIX007"
+        )
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unset_seat_appends_nothing_at_all(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch)
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+
+class TestArgvByteIdentityWithNoSeat:
+    """The contract the seat may not break: unset changes NO byte of argv.
+
+    Driven through the REAL dispatcher (and its real argv builder) rather
+    than a recording double — the claim is about the command line that
+    reaches the runner, and only the real builder produces one.
+    """
+
+    @staticmethod
+    async def _argv(**adapter_kwargs: Any) -> list[str]:
+        from forge.pipeline.forward_context_builder import ForwardContextBuilder
+
+        from tests.forge.pipeline.dispatchers.test_subprocess import (
+            FakeStageLogReader,
+            FakeStageLogWriter,
+            FakeSubprocessRunner,
+            FakeWorktreeAllowlist,
+        )
+
+        runner = FakeSubprocessRunner()
+        allowlist = FakeWorktreeAllowlist(
+            roots_by_build={BUILD_ID: "/work/build-FEAT-FIX007"}
+        )
+        adapter = make_conductor_subprocess_dispatcher(
+            build_row_reader=lambda _bid: _Row(),
+            read_allowlist=[Path("/work")],
+            worktree_allowlist=allowlist,
+            forward_context_builder=ForwardContextBuilder(
+                FakeStageLogReader(), allowlist
+            ),
+            stage_log_writer=FakeStageLogWriter(),
+            subprocess_runner=runner,
+            correlation_id_minter=lambda **kw: "corr-fixed",
+            **adapter_kwargs,
+        )
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        return list(runner.calls[0]["args"])
+
+    @pytest.mark.asyncio
+    async def test_the_argv_is_unchanged_when_no_seat_is_named(self) -> None:
+        without_the_parameter = await self._argv()
+        with_an_explicit_none = await self._argv(leg_model=None)
+
+        assert with_an_explicit_none == without_the_parameter
+        assert "--model" not in without_the_parameter
+
+    @pytest.mark.asyncio
+    async def test_a_named_seat_appends_exactly_two_tokens_and_moves_nothing(
+        self,
+    ) -> None:
+        baseline = await self._argv()
+        seated = await self._argv(leg_model="qwen3-coder-30b")
+
+        assert seated == baseline + ["--model", "qwen3-coder-30b"]
 
 
 class TestStageLogWriterBinding:

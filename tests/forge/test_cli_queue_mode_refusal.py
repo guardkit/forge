@@ -307,13 +307,19 @@ class TestFixJourneyGatedOnTheConductor:
         persistence: _RecordingPersistence,
         published: list,
     ) -> None:
-        """The gate opens — the refusal is a gate, not a removal."""
+        """The gate opens — the refusal is a gate, not a removal.
+
+        ``--profile fix-journey`` is not decoration: since the stage-2 cap
+        law (§4) a fix journey must name a profile carrying an explicit
+        review-cycle cap, so the activated path names the capped profile.
+        """
         result = _queue(
             config_on,
             positional="TASK-FIX007",
             repo_dir=repo_dir,
             feature_yaml=fix_task_yaml,
             mode="c",
+            extra=["--profile", "fix-journey"],
         )
         assert result.exit_code == 0, result.output
         assert len(persistence.rows) == 1

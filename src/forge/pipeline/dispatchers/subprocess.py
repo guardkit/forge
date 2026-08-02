@@ -213,6 +213,40 @@ class StageDispatchResult:
         subcommand: The GuardKit subcommand token that was invoked
             (e.g. ``"feature-spec"``). Stored for trace-ability without
             forcing callers to re-derive it from ``stage``.
+        detection_findings: The parsed ``## Detection Findings`` block, as
+            the subprocess emitted it (LI stage-2 design §5). The parser
+            has always recovered this block
+            (:func:`forge.adapters.guardkit.parser.parse_stdout`) and the
+            dispatcher has always dropped it on the floor — so the fix
+            journey's only stable dedup key never reached the code that
+            needs it. Empty tuple when the block was absent, unparseable,
+            or genuinely empty — read
+            :attr:`detection_findings_reported` to tell those apart.
+        detection_findings_reported: Whether the subprocess actually
+            emitted a ``## Detection Findings`` block the parser could
+            read. ``True`` alongside an EMPTY
+            :attr:`detection_findings` is the honest "the review looked
+            and found nothing" — a clean review, which is the fix
+            journey's SUCCESS path. ``False`` is "no block at all, or one
+            that would not parse".
+
+            The two must not be collapsed. The review-cycle no-progress
+            stop fails closed on the second (a leg that stops emitting its
+            findings cannot be read as having fixed them); collapsing them
+            would fire that stop on the first, which would kill every
+            journey at precisely the clean review that was about to end it
+            well. The design (§5) states the fail-closed rule for a
+            "missing/unparseable findings block" — this flag is what makes
+            *missing* mean missing.
+
+    .. note::
+       ``detection_findings`` holds ``dict`` elements, so a result carrying
+       findings is NOT hashable. Nothing in the pipeline hashes a
+       :class:`StageDispatchResult` (the frozen+slots docstring line above
+       predates this field and describes the *mutation* guarantee, which is
+       unchanged); a caller that wants a set key should use
+       :func:`forge.pipeline.finding_anchors.derive_finding_anchors`, which
+       is what the driver does.
 
     Convenience class attributes :attr:`SUCCESS`, :attr:`FAILED`, and
     :attr:`DEGRADED` mirror the :class:`StageDispatchStatus` enum so
@@ -230,6 +264,8 @@ class StageDispatchResult:
     exit_code: int
     duration_secs: float
     subcommand: str
+    detection_findings: tuple[dict[str, Any], ...] = ()
+    detection_findings_reported: bool = False
 
     # Class-level mirrors of StageDispatchStatus members. These are NOT
     # frozen-dataclass instance fields — they are populated below the
@@ -283,8 +319,19 @@ class StageLogWriter(Protocol):
         rationale: str,
         exit_code: int,
         duration_secs: float,
+        detection_findings: tuple[dict[str, Any], ...] = (),
+        detection_findings_reported: bool = False,
     ) -> None:  # pragma: no cover - protocol stub
-        """Record a stage_log row for the just-completed dispatch."""
+        """Record a stage_log row for the just-completed dispatch.
+
+        ``detection_findings`` carries the parsed ``## Detection Findings``
+        block and ``detection_findings_reported`` says whether there WAS
+        one (LI stage-2 §5) — see :class:`StageDispatchResult` for why the
+        second is not redundant. The dispatcher ALWAYS passes both, so an
+        implementation has to accept them; the defaults are here so a
+        writer with no use for the block can ignore them without restating
+        a value, not as licence to omit the parameters.
+        """
         ...
 
 
@@ -515,6 +562,8 @@ def _record_safely(
     rationale: str,
     exit_code: int,
     duration_secs: float,
+    detection_findings: tuple[dict[str, Any], ...] = (),
+    detection_findings_reported: bool = False,
 ) -> None:
     """Call the writer; log + swallow any exception.
 
@@ -537,6 +586,8 @@ def _record_safely(
             rationale=rationale,
             exit_code=exit_code,
             duration_secs=duration_secs,
+            detection_findings=detection_findings,
+            detection_findings_reported=detection_findings_reported,
         )
     except Exception as exc:  # noqa: BLE001 — by design, see docstring
         logger.error(
@@ -1083,6 +1134,25 @@ async def dispatch_subprocess_stage(
             f"with {len(kept)} artefact path(s)"
         )
 
+    # THE FINDINGS SURVIVE THE DISPATCH (LI stage-2 §5). The parser has
+    # always recovered the ``## Detection Findings`` block; every consumer
+    # of a dispatch result has always received a result that had thrown it
+    # away. That is the whole reason the fix journey had no dedup key.
+    # Copied into plain dicts so a runner double cannot hand back a live
+    # mutable view into its own state.
+    #
+    # ``guardkit_result.detection_findings`` is three-valued and stays that
+    # way across this seam: ``None`` = the block was absent or would not
+    # parse (the parser folds a JSONDecodeError into a warning and answers
+    # None), ``[]`` = the block was there and empty, which is a CLEAN
+    # REVIEW. Flattening those two into "no findings" is what would turn
+    # the journey's success path into a no-progress stop.
+    raw_findings = guardkit_result.detection_findings
+    detection_findings_reported = raw_findings is not None
+    detection_findings = tuple(
+        dict(item) for item in (raw_findings or ()) if isinstance(item, Mapping)
+    )
+
     result = StageDispatchResult(
         status=status,
         stage=stage,
@@ -1094,6 +1164,8 @@ async def dispatch_subprocess_stage(
         exit_code=guardkit_result.exit_code,
         duration_secs=duration_secs,
         subcommand=plan.subcommand,
+        detection_findings=detection_findings,
+        detection_findings_reported=detection_findings_reported,
     )
 
     _record_safely(
@@ -1107,6 +1179,8 @@ async def dispatch_subprocess_stage(
         rationale=result.rationale,
         exit_code=result.exit_code,
         duration_secs=result.duration_secs,
+        detection_findings=result.detection_findings,
+        detection_findings_reported=result.detection_findings_reported,
     )
 
     return result
