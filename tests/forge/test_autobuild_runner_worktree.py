@@ -32,6 +32,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sqlite3
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +43,7 @@ from unittest.mock import patch
 import pytest
 from langchain_core.messages import HumanMessage
 
+from forge.cli._db_resolve import FORGE_DB_PATH_ENV
 from forge.subagents import autobuild_runner as ar
 
 FIXTURE = (
@@ -65,6 +68,26 @@ def _git(repo: Path, *args: str) -> str:
         text=True,
         check=True,
     ).stdout.strip()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_forge_ledger(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point ``$FORGE_DB_PATH`` at a path that does not exist.
+
+    The requeue sweep's liveness guard reads the canonical forge ledger
+    (``$FORGE_DB_PATH`` → ``~/.forge/forge.db``) to ask whether a prior build
+    is still RUNNING. Left unset, these tests would consult the DEVELOPER'S
+    REAL ledger — which really does carry ``build-FEAT-A058-*`` rows — and the
+    suite's verdict would depend on the host. Every test here therefore starts
+    from "no ledger ⇒ status unknown"; the one test that needs a live row
+    builds its own DB and overrides this.
+    """
+    monkeypatch.setenv(
+        FORGE_DB_PATH_ENV,
+        str(tmp_path_factory.mktemp("no-ledger") / "absent-forge.db"),
+    )
 
 
 @pytest.fixture()
@@ -2174,3 +2197,628 @@ class TestManifestIsNotTheReceipts:
             "manifest presence was treated as the receipts — the only copy "
             "was destroyed un-exported (the SL1 blocker resurfacing)"
         )
+
+
+# ---------------------------------------------------------------------------
+# FEATURE-MODE RESIDUE (register find, 2026-08-02 — three real dispatches)
+# ---------------------------------------------------------------------------
+#
+# THE FIND: guardkit's FEATURE mode nests its inner worktree at
+# ``<outer>/.guardkit/worktrees/<FEATURE_ID>`` on branch
+# ``autobuild/<FEATURE_ID>`` — a ref named after the FEATURE, not after any
+# task. The requeue sweep above only knew the TASK shape, so it logged its own
+# miss verbatim — "prior build build-FEAT-FLV1-20260802161215 holds no task
+# branch of feature FEAT-FLV1; left untouched" — and then "branch
+# autobuild/FEAT-FLV1 already exists and automatic cleanup failed" killed two
+# consecutive fresh dispatches at worktree creation.
+#
+# FIXTURE POSTURE. The live killer is not a log line, it is a git call: the
+# guardkit stub in this section performs guardkit's OWN feature-mode
+# ``git worktree add -b autobuild/<FEAT>`` in its cwd, for real, and exits 2
+# when that add fails (the live exit code). So "the sweep worked" is proven by
+# the add that died three times now succeeding — and
+# :meth:`TestFeatureModeSweepFences.test_a_running_prior_builds_residue_is_left_loudly`
+# drives the same stub over residue deliberately LEFT and asserts the add
+# FAILS, which is what keeps every other assertion here from being vacuous.
+
+FLV1_FEATURE_ID = "FEAT-FLV1"
+FLV1_PRIOR_BUILD_ID = "build-FEAT-FLV1-20260802161215"
+FLV1_REQUEUE_BUILD_ID = "build-FEAT-FLV1-20260802173044"
+FLV1_BRANCH = f"autobuild/{FLV1_FEATURE_ID}"
+OTHER_FEATURE_ID = "FEAT-OTHER9"
+OTHER_PRIOR_BUILD_ID = "build-FEAT-OTHER9-20260802090000"
+OTHER_BRANCH = f"autobuild/{OTHER_FEATURE_ID}"
+
+
+def _stage_prior_feature_mode_build(
+    repo: Path,
+    wt_base: Path,
+    *,
+    feature_id: str = FLV1_FEATURE_ID,
+    build_id: str = FLV1_PRIOR_BUILD_ID,
+    stale: bool = False,
+) -> tuple[Path, Path]:
+    """Reproduce a FEATURE-mode build's kept residue as the live estate leaves it.
+
+    ``<wt_base>/<build_id>`` is the kept OUTER worktree (detached, per F2);
+    ``<outer>/.guardkit/worktrees/<FEATURE_ID>`` is guardkit's FEATURE-mode
+    INNER worktree holding ``autobuild/<FEATURE_ID>`` — registered in the
+    SOURCE repo's shared common gitdir, which is why it outlives the failed
+    build and claims the branch the next dispatch needs.
+
+    No ``.guardkit/features/<FEAT>.yaml`` is written by DEFAULT — the case in
+    which the task-shape ownership test can prove nothing and the feature
+    branch must be swept on its own name. **The register find's ACTUAL live
+    shape had the yaml READABLE in the outer tree** (it rides the planning
+    branch, and the outer worktree checks that branch out — the SW coach drove
+    main on both shapes: without the yaml main logs ``ownership UNPROVEN``,
+    WITH it main logs the find's verbatim ``holds no task branch … left
+    untouched``). Tests cover both; seed the yaml via
+    ``_write_guardkit_feature`` on the OUTER tree for the live shape.
+
+    ``stale=True`` deletes the inner directory after registering it, leaving
+    the shared repo holding a registration whose dir is gone.
+    """
+    outer = (wt_base / build_id).resolve()
+    outer.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "--detach", str(outer), PLANNING_BRANCH)
+    inner = outer / ".guardkit" / "worktrees" / feature_id
+    inner.parent.mkdir(parents=True, exist_ok=True)
+    _git(outer, "worktree", "add", "-b", f"autobuild/{feature_id}", str(inner), "main")
+    (inner / "forensic.txt").write_text("evidence")
+    _make_receipt_tree(outer)
+    if stale:
+        shutil.rmtree(inner)
+    assert _branch_exists(repo, f"autobuild/{feature_id}")
+    return outer, inner
+
+
+def _registered_worktrees(repo: Path) -> list[str]:
+    """Every worktree path the SOURCE repo still has registered."""
+    return [
+        line[len("worktree ") :]
+        for line in _git(repo, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _flv1_fresh_launch() -> str:
+    """The SAME feature, a NEW build id, carrying a branch — the fresh path."""
+    return _launch(
+        '{"build_id": "%s", "feature_id": "%s", "correlation_id": "%s", '
+        '"branch": "%s", "repo": "appmilla/api_test"}'
+        % (FLV1_REQUEUE_BUILD_ID, FLV1_FEATURE_ID, ROUND17_CORR, PLANNING_BRANCH)
+    )
+
+
+def _flv1_relaunch_launch() -> str:
+    """The runner's only NON-fresh path: a launch with no ``branch``.
+
+    A relaunch is ``guardkit --resume`` in the build's KEPT worktree
+    (:func:`forge.subagents.build_monitor.plan_relaunch`), so it materialises
+    nothing and must sweep nothing — the residue it would destroy is the very
+    tree it is resuming in. In the runner that shape arrives as a payload
+    without ``branch`` (the shared-checkout path), carrying the
+    ``resume_attempt`` stamp.
+    """
+    return _launch(
+        '{"build_id": "%s", "feature_id": "%s", "correlation_id": "%s", '
+        '"resume_attempt": 1, "repo": "appmilla/api_test"}'
+        % (FLV1_REQUEUE_BUILD_ID, FLV1_FEATURE_ID, ROUND17_CORR)
+    )
+
+
+def _make_feature_mode_exec_stub(
+    recorded: dict[str, Any], *, feature_id: str = FLV1_FEATURE_ID
+):
+    """guardkit stub that performs guardkit's REAL feature-mode worktree add.
+
+    Records ``inner_add_rc`` / ``inner_add_stderr`` and reports exit 2 — the
+    live exit code — when the add fails, exactly as the two dead FLV1
+    dispatches did. Every non-guardkit argv (the runner's own git verbs) runs
+    for real against the throwaway repo.
+    """
+    real_exec = asyncio.create_subprocess_exec
+    branch = f"autobuild/{feature_id}"
+
+    async def _stub(*args: Any, **kwargs: Any) -> Any:
+        prog = str(args[0]) if args else ""
+        if prog.endswith("guardkit"):
+            cwd = Path(kwargs["cwd"])
+            recorded["cwd"] = str(cwd)
+            recorded["argv"] = list(args)
+            inner = cwd / ".guardkit" / "worktrees" / feature_id
+            inner.parent.mkdir(parents=True, exist_ok=True)
+            proc = subprocess.run(
+                ["git", "-C", str(cwd), "worktree", "add", "-b", branch,
+                 str(inner), "main"],
+                capture_output=True,
+                text=True,
+            )
+            recorded["inner_add_rc"] = proc.returncode
+            recorded["inner_add_stderr"] = proc.stderr
+            return _FakeProc(0 if proc.returncode == 0 else 2, [b"guardkit\n"])
+        return await real_exec(*args, **kwargs)
+
+    return _stub
+
+
+def _invoke_with(description: str, repo: Path, stub: Any) -> dict[str, Any]:
+    with patch.object(ar, "_resolve_repo_path", lambda payload: repo), patch.object(
+        ar, "_resolve_guardkit_path", lambda: Path("/usr/bin/guardkit")
+    ), patch.object(asyncio, "create_subprocess_exec", stub):
+        graph = ar._build_runner_graph()
+        return asyncio.run(
+            graph.ainvoke({"messages": [HumanMessage(content=description)]})
+        )
+
+
+def _write_ledger(db_path: Path, build_id: str, status: str) -> None:
+    """A real forge ledger carrying ONE ``builds`` row at ``status``.
+
+    Built from the production ``forge/lifecycle/schema.sql`` — not a hand-rolled
+    table — so the fixture cannot drift away from the shape the sweep reads.
+    """
+    schema = (
+        Path(ar.__file__).resolve().parents[1] / "lifecycle" / "schema.sql"
+    ).read_text()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(schema)
+        conn.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, "
+            "feature_yaml_path, status, triggered_by, correlation_id, "
+            "queued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                build_id,
+                FLV1_FEATURE_ID,
+                "appmilla/api_test",
+                PLANNING_BRANCH,
+                ".guardkit/features/FEAT-FLV1.yaml",
+                status,
+                "cli",
+                ROUND17_CORR,
+                "2026-08-02T16:12:15Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestFeatureModeResidueIsSwept:
+    """The FLV1 shape: the exact residue three real dispatches died on."""
+
+    def test_the_flv1_shape_is_swept_and_the_inner_add_now_succeeds(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        # (1) THE POINT: guardkit's own feature-mode worktree add — the call
+        # that failed three times — succeeded this time.
+        assert recorded.get("inner_add_rc") == 0, (
+            "guardkit's feature-mode `git worktree add -b "
+            f"{FLV1_BRANCH}` still fails after the sweep: "
+            f"{recorded.get('inner_add_stderr')!r}"
+        )
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert recorded["cwd"] == str((wt_base / FLV1_REQUEUE_BUILD_ID).resolve())
+
+        # (2) The prior build's registration and outer tree are gone.
+        assert not inner.exists()
+        assert not outer.exists()
+        assert str(inner) not in _registered_worktrees(throwaway_repo)
+        assert str(outer) not in _registered_worktrees(throwaway_repo)
+
+        # (3) EXPORT BEFORE DESTROY: the kept tree's receipts are durable.
+        pack = receipts / FLV1_PRIOR_BUILD_ID
+        assert (pack / ar.FAILURE_MANIFEST_NAME).is_file()
+        assert (pack / ".guardkit" / "qav-shadow" / "queue.jsonl").is_file()
+
+        # (4) Every act is loud and names the prior build id + the ref.
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert f"prior build {FLV1_PRIOR_BUILD_ID} kept worktree found" in joined
+        assert FLV1_BRANCH in joined
+        assert f"prior build {FLV1_PRIOR_BUILD_ID} evidence exported" in joined
+        assert (
+            f"prior build {FLV1_PRIOR_BUILD_ID}: removed inner worktree" in joined
+        )
+        assert (
+            f"prior build {FLV1_PRIOR_BUILD_ID}: deleted branch {FLV1_BRANCH}"
+            in joined
+        )
+        assert f"prior build {FLV1_PRIOR_BUILD_ID} swept" in joined
+        # (The 'holds no task branch' pre-cure miss is asserted GONE in
+        # test_the_registers_exact_live_shape below — the line is only
+        # reachable when the feature yaml is READABLE, which this fixture
+        # deliberately omits; asserting its absence HERE pinned nothing.)
+
+    def test_the_registers_exact_live_shape_yaml_readable_is_swept(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The 2026-08-02 register find's EXACT shape, pinned load-bearingly.
+
+        The feature yaml rides the planning branch, so the kept OUTER tree has
+        it READABLE — the shape on which pre-cure main logged, verbatim,
+        ``prior build … holds no task branch of feature FEAT-FLV1; left
+        untouched`` and the fresh dispatch then died ``branch
+        'autobuild/FEAT-FLV1' already exists``. With the cure the feature
+        branch is swept on its own name and that miss-line never fires — the
+        assertion is load-bearing here because this is the one fixture where
+        the line is reachable at all (the SW coach drove main to produce it).
+        """
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        _write_guardkit_feature(outer, FLV1_FEATURE_ID, ["TASK-FLV1-001"])
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        assert recorded.get("inner_add_rc") == 0, (
+            "guardkit's feature-mode worktree add still fails on the "
+            f"register's exact shape: {recorded.get('inner_add_stderr')!r}"
+        )
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert not outer.exists()
+        assert str(inner) not in _registered_worktrees(throwaway_repo)
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert f"prior build {FLV1_PRIOR_BUILD_ID} swept" in joined
+        # The pre-cure miss must be GONE — that line was the whole defect,
+        # and THIS fixture is the one where it could fire.
+        assert "holds no task branch of feature FEAT-FLV1" not in joined
+
+    def test_evidence_is_exported_before_the_branch_is_destroyed(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F11 holds for the feature shape too: an export that fails stops it dead."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        monkeypatch.setattr(
+            ar, "_export_receipts", lambda wt, bid: ar.ReceiptExport(ok=False)
+        )
+
+        recorded: dict[str, Any] = {}
+        result = _invoke_with(
+            _flv1_fresh_launch(),
+            throwaway_repo,
+            _make_feature_mode_exec_stub(recorded),
+        )
+
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"]
+        assert "refusing the fresh dispatch" in message
+        assert "F11 forensics law" in message
+        # Nothing destroyed, and guardkit never ran.
+        assert inner.is_dir()
+        assert (inner / "forensic.txt").read_text() == "evidence"
+        assert outer.is_dir()
+        assert _branch_exists(throwaway_repo, FLV1_BRANCH)
+        assert "cwd" not in recorded
+
+    def test_a_stale_registration_whose_directory_is_gone_is_pruned(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The dir was deleted by hand; the SOURCE repo still holds the branch."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        outer, inner = _stage_prior_feature_mode_build(
+            throwaway_repo, wt_base, stale=True
+        )
+        assert not inner.exists()
+        assert str(inner) in _registered_worktrees(throwaway_repo), (
+            "the stale registration must still be there — otherwise this test "
+            "proves nothing"
+        )
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        assert recorded.get("inner_add_rc") == 0, recorded.get("inner_add_stderr")
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert str(inner) not in _registered_worktrees(throwaway_repo)
+        assert not outer.exists()
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "the registration was already STALE" in joined
+        assert (
+            f"prior build {FLV1_PRIOR_BUILD_ID}: deleted branch {FLV1_BRANCH}"
+            in joined
+        )
+
+
+class TestFeatureModeSweepFences:
+    """What the feature-shape sweep must NEVER touch."""
+
+    def test_another_features_feature_branch_survives_untouched(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent build of ANOTHER feature owns its own worktree + branch."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        mine_outer, mine_inner = _stage_prior_feature_mode_build(
+            throwaway_repo, wt_base
+        )
+        other_outer, other_inner = _stage_prior_feature_mode_build(
+            throwaway_repo,
+            wt_base,
+            feature_id=OTHER_FEATURE_ID,
+            build_id=OTHER_PRIOR_BUILD_ID,
+        )
+
+        recorded: dict[str, Any] = {}
+        result = _invoke_with(
+            _flv1_fresh_launch(),
+            throwaway_repo,
+            _make_feature_mode_exec_stub(recorded),
+        )
+
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        # Mine: gone — and the freed branch was reclaimed by the FRESH build's
+        # own inner add (which is why ``autobuild/FEAT-FLV1`` exists again).
+        assert not mine_inner.exists()
+        assert not mine_outer.exists()
+        assert recorded.get("inner_add_rc") == 0, recorded.get("inner_add_stderr")
+        # Theirs: every scrap intact, registration included.
+        assert other_inner.is_dir()
+        assert (other_inner / "forensic.txt").read_text() == "evidence"
+        assert other_outer.is_dir()
+        assert _branch_exists(throwaway_repo, OTHER_BRANCH)
+        assert str(other_inner) in _registered_worktrees(throwaway_repo)
+
+    def test_the_source_repos_own_checkout_and_head_are_untouched(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The shared checkout's branch is not an ``autobuild/`` ref — never a target."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+
+        head_before = _git(throwaway_repo, "rev-parse", "HEAD")
+        branch_before = _git(throwaway_repo, "rev-parse", "--abbrev-ref", "HEAD")
+        status_before = _git(throwaway_repo, "status", "--porcelain")
+
+        recorded: dict[str, Any] = {}
+        _invoke_with(
+            _flv1_fresh_launch(),
+            throwaway_repo,
+            _make_feature_mode_exec_stub(recorded),
+        )
+
+        assert _git(throwaway_repo, "rev-parse", "HEAD") == head_before
+        assert (
+            _git(throwaway_repo, "rev-parse", "--abbrev-ref", "HEAD")
+            == branch_before == "main"
+        )
+        assert _git(throwaway_repo, "status", "--porcelain") == status_before
+        assert _branch_exists(throwaway_repo, PLANNING_BRANCH)
+        assert str(throwaway_repo) in _registered_worktrees(throwaway_repo)
+
+    def test_the_resume_path_sweeps_nothing(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No ``branch`` ⇒ no fresh worktree ⇒ no sweep. Not one destructive verb."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+
+        seq: list[list[str]] = []
+        real_run_git = ar._run_git
+
+        async def _rec(args: list[str], *, cwd: Path):
+            seq.append(list(args))
+            return await real_run_git(args, cwd=cwd)
+
+        monkeypatch.setattr(ar, "_run_git", _rec)
+        recorded: dict[str, Any] = {}
+        result = _invoke_with(
+            _flv1_relaunch_launch(),
+            throwaway_repo,
+            _make_feature_mode_exec_stub(recorded),
+        )
+
+        # The relaunch ran in the SHARED checkout (the non-fresh path).
+        assert _lifecycle(result, FLV1_FEATURE_ID) in {"completed", "failed"}
+        assert recorded.get("cwd") == str(throwaway_repo)
+        # And the prior build's residue is byte-for-byte still there.
+        assert inner.is_dir()
+        assert (inner / "forensic.txt").read_text() == "evidence"
+        assert outer.is_dir()
+        assert _branch_exists(throwaway_repo, FLV1_BRANCH)
+        assert str(inner) in _registered_worktrees(throwaway_repo)
+        assert not [
+            c for c in seq if c[:3] == ["worktree", "remove", "--force"]
+        ], f"the non-fresh path issued a destructive verb: {seq!r}"
+        assert not [c for c in seq if c[:2] == ["branch", "-D"]]
+        assert not [c for c in seq if c[:2] == ["worktree", "prune"]]
+
+    def test_a_running_prior_builds_residue_is_left_loudly(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A live ledger row withholds the sweep — and the dispatch then dies.
+
+        This is also the anti-vacuity control for the whole section: the SAME
+        stub, over residue deliberately LEFT, reproduces the live killer
+        ("branch ... already exists") — so a sweep that silently did nothing
+        could never pass the tests above.
+        """
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        db_path = tmp_path / "ledger" / "forge.db"
+        _write_ledger(db_path, FLV1_PRIOR_BUILD_ID, "RUNNING")
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(db_path))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.WARNING, logger="forge.subagents.autobuild_runner"
+        ):
+            _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        # NOTHING of the running build's residue was touched.
+        assert inner.is_dir()
+        assert (inner / "forensic.txt").read_text() == "evidence"
+        assert outer.is_dir()
+        assert _branch_exists(throwaway_repo, FLV1_BRANCH)
+        assert str(inner) in _registered_worktrees(throwaway_repo)
+        assert not (tmp_path / "receipts" / FLV1_PRIOR_BUILD_ID).exists(), (
+            "a RUNNING build's tree must not even be exported out from under it"
+        )
+
+        # Loudly, naming the build and its status.
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert f"prior build {FLV1_PRIOR_BUILD_ID} is still LIVE" in joined
+        assert "status=RUNNING" in joined
+
+        # CONTROL: leaving the residue really does kill the dispatch.
+        assert recorded.get("inner_add_rc") not in (0, None)
+        assert "already exists" in (recorded.get("inner_add_stderr") or "")
+
+    def test_a_terminal_prior_build_row_does_not_withhold_the_sweep(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FAILED is the shape a requeue actually follows — it must sweep."""
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        db_path = tmp_path / "ledger" / "forge.db"
+        _write_ledger(db_path, FLV1_PRIOR_BUILD_ID, "FAILED")
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(db_path))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+
+        recorded: dict[str, Any] = {}
+        result = _invoke_with(
+            _flv1_fresh_launch(),
+            throwaway_repo,
+            _make_feature_mode_exec_stub(recorded),
+        )
+
+        assert recorded.get("inner_add_rc") == 0, recorded.get("inner_add_stderr")
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert not inner.exists()
+        assert not outer.exists()
+
+
+class TestPriorBuildStatus:
+    """The liveness read itself: honest, read-only, never raising."""
+
+    def test_no_ledger_on_this_host_reads_as_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(tmp_path / "nope.db"))
+        assert ar._prior_build_status(FLV1_PRIOR_BUILD_ID) is None
+
+    def test_a_ledger_without_this_build_reads_as_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_path = tmp_path / "forge.db"
+        _write_ledger(db_path, "build-SOMETHING-ELSE-1", "RUNNING")
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(db_path))
+        assert ar._prior_build_status(FLV1_PRIOR_BUILD_ID) is None
+
+    def test_a_garbage_ledger_reads_as_unknown_not_an_exception(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_path = tmp_path / "forge.db"
+        db_path.write_bytes(b"this is not a sqlite database at all")
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(db_path))
+        assert ar._prior_build_status(FLV1_PRIOR_BUILD_ID) is None
+
+    def test_the_read_never_writes_to_the_ledger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``mode=ro``: the sweep is a reader of the ledger, never an author."""
+        db_path = tmp_path / "forge.db"
+        _write_ledger(db_path, FLV1_PRIOR_BUILD_ID, "RUNNING")
+        monkeypatch.setenv(FORGE_DB_PATH_ENV, str(db_path))
+        before = db_path.read_bytes()
+        assert ar._prior_build_status(FLV1_PRIOR_BUILD_ID) == "RUNNING"
+        assert db_path.read_bytes() == before
+
+    def test_every_live_status_is_a_non_terminal_one(self) -> None:
+        """The guard's vocabulary is the ledger's own, and only its live half."""
+        assert ar._LIVE_BUILD_STATUSES == frozenset(
+            {"QUEUED", "PREPARING", "RUNNING", "PAUSED", "FINALISING"}
+        )
+        assert not ar._LIVE_BUILD_STATUSES & {
+            "COMPLETE", "FAILED", "INTERRUPTED", "CANCELLED", "SKIPPED"
+        }
