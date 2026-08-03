@@ -45,8 +45,11 @@ from typing import Any
 import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
-from forge.cli import _serve_deps_gating, _serve_gate_activation
-from forge.cli._serve_deps import build_pipeline_consumer_deps
+from forge.cli import _serve_deps, _serve_deps_gating, _serve_gate_activation
+from forge.cli._serve_deps import (
+    build_pipeline_consumer_deps,
+    build_serve_resume_launcher,
+)
 from forge.cli._serve_deps_gating import build_approval_gate_parts
 from forge.cli._serve_gate_activation import maybe_gate_build, rearm_paused_gates
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
@@ -56,6 +59,7 @@ from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
 from forge.gating.wrappers import GateOutcome
 from forge.lifecycle import migrations
 from forge.lifecycle.identifiers import derive_build_id
+from forge.lifecycle.modes import BuildMode
 from forge.lifecycle.persistence import Build, SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import (
     BuildState,
@@ -127,8 +131,10 @@ def _make_payload(
     feature_id: str = FEATURE_ID,
     correlation_id: str = CORRELATION_ID,
     queued_at: datetime = QUEUED_AT,
+    mode: Any = None,
+    task_id: str | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    payload = SimpleNamespace(
         feature_id=feature_id,
         repo="guardkit/forge",
         branch="main",
@@ -143,6 +149,14 @@ def _make_payload(
         queued_at=queued_at,
         requested_at=queued_at,
     )
+    # ``mode`` / ``task_id`` ride the wire only for a fix journey; leaving
+    # them OFF the namespace (rather than None) keeps every pre-existing
+    # scenario's payload byte-identical to what it was.
+    if mode is not None:
+        payload.mode = mode
+    if task_id is not None:
+        payload.task_id = task_id
+    return payload
 
 
 def _forge_config(**approval_overrides: Any) -> ForgeConfig:
@@ -254,6 +268,8 @@ async def _seed_paused_via_first_session(
     forge_config: ForgeConfig | None = None,
     feature_id: str = FEATURE_ID,
     correlation_id: str = CORRELATION_ID,
+    mode: Any = None,
+    task_id: str | None = None,
 ) -> str:
     """Run the live gate to a genuine PAUSED row, then kill the frame.
 
@@ -262,7 +278,12 @@ async def _seed_paused_via_first_session(
     request_id + the gate decision snapshot.
     """
     build_id = pool.record_pending_build(
-        _make_payload(feature_id=feature_id, correlation_id=correlation_id)
+        _make_payload(
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            mode=mode,
+            task_id=task_id,
+        )
     )
     repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
     parts = _build_parts(nats, forge_config=forge_config)
@@ -851,3 +872,164 @@ class TestRearmSubscribeFailureDoesNotWedgeSweep:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Activation design §4.2 — SILENT-DOWNGRADE SEAM 2: the boot rearm sweep's
+# approve path uses the ROUTINE resume launcher and consults no router.
+# ---------------------------------------------------------------------------
+
+
+class _RearmGuardStarter:
+    """Stands in for the Supervisor's AsyncSubAgentMiddleware starter.
+
+    Named apart from the module's earlier ``_FakeStarter`` on purpose —
+    that one records ``launches`` for the redispatch scenarios; this one
+    only needs to exist so the REAL resume launcher composes.
+    """
+
+    def __init__(self) -> None:
+        self.started: list[tuple[str, dict[str, Any]]] = []
+
+    def start_async_task(self, subagent_name: str, context: dict) -> str:
+        self.started.append((subagent_name, context))
+        return "task-rearm"
+
+    async def astart_async_task(self, subagent_name: str, context: dict) -> str:
+        return self.start_async_task(subagent_name, context)
+
+
+class TestRearmNeverResumesAFixJourneyRoutine:
+    """A mode-c row carded, restarted, then approved must NOT run routine.
+
+    The sweep's approve path holds only the resume launcher — no router
+    is consulted anywhere on it — so before this lane a fix journey that
+    met a daemon restart came back as a ROUTINE autobuild driven against
+    a TASK-xxx subject: the wrong machinery, silently. The launcher is
+    guarded now (``build_serve_resume_launcher``): a mode-c row is
+    refused loudly instead. Journey RE-ENTRY proper stays ledgered.
+
+    Both halves are pinned — the refusal AND its mutation guard (a
+    routine build on the very same launcher still launches), because a
+    guard that refused everything would pass the first half and brick the
+    whole rearm path in production.
+    """
+
+    async def _rearm_and_approve(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        build_id: str,
+        launcher: Any,
+    ) -> Any:
+        nats.reset_wire()
+        parts2 = _build_parts(nats)
+        _serve_deps_gating.bind_gate_parts(parts2)
+        repo2, sm2 = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        tasks = await rearm_paused_gates(
+            parts=parts2,
+            sqlite_pool=pool,
+            gate_repository=repo2,
+            gate_state_machine=sm2,
+            resume_launcher=launcher,
+            client=nats,
+            clock=FixedClock(),
+        )
+        await nats.deliver_response(
+            build_id=build_id,
+            request_id=_request_id(build_id, 0),
+            decision="approve",
+        )
+        return await asyncio.wait_for(tasks[0], timeout=5.0)
+
+    def _real_launcher(
+        self, nats: EventLogNats, pool: SqliteLifecyclePersistence
+    ) -> Any:
+        _publisher, emitter = build_publisher_and_emitter(nats)
+        return build_serve_resume_launcher(
+            pool,
+            _forge_config(),
+            lifecycle_emitter=emitter,
+            async_task_starter=_RearmGuardStarter(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_approved_fix_journey_is_refused_not_routine_launched(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        launched: list[dict[str, Any]] = []
+
+        async def _recording_dispatch(**kwargs: Any) -> Any:
+            launched.append(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            _serve_deps, "dispatch_autobuild_async", _recording_dispatch
+        )
+
+        build_id = await _seed_paused_via_first_session(
+            nats,
+            pool,
+            feature_id="FEAT-REARMC",
+            mode=BuildMode.MODE_C,
+            task_id="TASK-REARMC",
+        )
+        assert pool.get_build_row(build_id).mode is BuildMode.MODE_C
+
+        outcome = await self._rearm_and_approve(
+            nats, pool, build_id, self._real_launcher(nats, pool)
+        )
+
+        assert outcome is GateOutcome.RESUMED  # the gate itself is untouched
+        assert launched == [], (
+            "an approved fix journey was resumed as a ROUTINE autobuild — "
+            "the boot-rearm silent downgrade (design §4.2)"
+        )
+        row = pool.get_build_row(build_id)
+        assert row is not None
+        assert row.status is BuildState.FAILED
+        assert row.error is not None and "\n" not in row.error
+        assert "mode-c" in row.error
+        # The terminal reaches the wire, so the still-held build-queued
+        # message's redelivery finds a terminal row and self-heals the ack.
+        failed = _payloads(nats, "pipeline.build-failed.FEAT-REARMC")
+        assert len(failed) == 1
+        assert failed[0]["recoverable"] is False
+        assert failed[0]["failed_task_id"] == "TASK-REARMC"
+
+    @pytest.mark.asyncio
+    async def test_an_approved_routine_build_still_resumes_and_launches(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The mutation guard: the guard must only bite mode-c."""
+        launched: list[dict[str, Any]] = []
+
+        async def _recording_dispatch(**kwargs: Any) -> Any:
+            launched.append(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            _serve_deps, "dispatch_autobuild_async", _recording_dispatch
+        )
+
+        build_id = await _seed_paused_via_first_session(
+            nats, pool, feature_id="FEAT-REARMA"
+        )
+
+        outcome = await self._rearm_and_approve(
+            nats, pool, build_id, self._real_launcher(nats, pool)
+        )
+
+        assert outcome is GateOutcome.RESUMED
+        assert len(launched) == 1
+        assert launched[0]["build_id"] == build_id
+        # SECOND-REPO LAW: the repo still rides the resumed launch.
+        assert launched[0]["repo"] == "guardkit/forge"
+        assert _row(pool, build_id) == (BuildState.RUNNING.value, None)
+        assert _payloads(nats, "pipeline.build-failed.FEAT-REARMA") == []

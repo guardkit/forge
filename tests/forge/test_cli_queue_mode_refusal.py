@@ -119,7 +119,13 @@ def _write_config(
         "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
     }
     if conductor is not None:
+        # An activated conductor must name its SEAT (conductor-activation
+        # design pass §2) — ``enabled: true`` alone refuses at config load,
+        # so a switched-on fixture carries one. Switched off it needs none,
+        # which is every deployed forge.yaml today.
         body["conductor"] = {"enabled": conductor}
+        if conductor:
+            body["conductor"]["seat"] = "qwen3-coder-30b"
     path = tmp_path / name
     path.write_text(yaml.safe_dump(body), encoding="utf-8")
     return path

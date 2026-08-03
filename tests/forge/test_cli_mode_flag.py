@@ -137,7 +137,7 @@ def conductor_config_path(tmp_path: Path, repo_dir: Path) -> Path:
                 "default_history_limit": 50,
                 "repo_allowlist": [str(repo_dir)],
             },
-            "conductor": {"enabled": True},
+            "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
             "budget": {"default_profile": "fix-journey"},
             "permissions": {
                 "filesystem": {"allowlist": [str(tmp_path)]},
