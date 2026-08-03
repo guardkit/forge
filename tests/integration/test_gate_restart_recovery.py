@@ -54,6 +54,7 @@ from forge.cli._serve_deps_gating import build_approval_gate_parts
 from forge.cli._serve_gate_activation import maybe_gate_build, rearm_paused_gates
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.config.models import ForgeConfig
+from forge.gating.degraded import EmptyPriorsReader
 from forge.gating.identity import derive_request_id
 from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
 from forge.gating.wrappers import GateOutcome
@@ -228,6 +229,7 @@ def _build_parts(
     return build_approval_gate_parts(
         nats,
         cfg,
+        priors_reader=EmptyPriorsReader(),
         emitter=emitter,
         repository=None,
         bridge_registry=None,

@@ -40,6 +40,7 @@ BUILD_SCRIPT_PATH = REPO_ROOT / "scripts" / "build-image.sh"
 CONTRACT_A_INVOCATION = (
     "docker buildx build --build-context nats-core=../nats-core "
     "--build-context guardkit=../guardkit "
+    "--build-context fleet-memory=../fleet-memory "
     "-t forge:production-validation -f Dockerfile ."
 )
 
@@ -199,20 +200,22 @@ class TestBuilderStageNatsCoreContext:
         # leading comments/docstrings.
         gate_idx = dockerfile_text.find(NATS_CORE_LAYOUT_GATE)
         pip_match = re.search(
-            r"^RUN\s+pip\s+install\s+\.\[providers\]\s*$",
+            r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
             dockerfile_text,
             re.MULTILINE,
         )
         assert gate_idx != -1
-        assert pip_match, "Dockerfile must declare ``RUN pip install .[providers]``"
+        assert pip_match, (
+            "Dockerfile must declare ``RUN pip install .[providers,memory]``"
+        )
         assert gate_idx < pip_match.start(), (
             "Layout-validation gate must appear before the "
-            "``RUN pip install .[providers]`` directive so it fails fast"
+            "``RUN pip install .[providers,memory]`` directive so it fails fast"
         )
 
 
 class TestBuilderStageInstallLayer:
-    """AC-E: ``pip install .[providers]`` literal-matches runbook §0.4 / §6.1."""
+    """AC-E: ``pip install .[providers,memory]`` literal-matches runbook §0.4 / §6.1."""
 
     def test_pip_install_providers_literal_match(
         self, dockerfile_text: str
@@ -220,9 +223,38 @@ class TestBuilderStageInstallLayer:
         # B3 scenario: the runbook validation steps and the Dockerfile
         # share this exact install command. Drift here breaks the
         # equivalence claim of FEAT-FORGE-008.
-        assert "pip install .[providers]" in dockerfile_text, (
-            "Builder stage must run ``pip install .[providers]`` "
+        assert "pip install .[providers,memory]" in dockerfile_text, (
+            "Builder stage must run ``pip install .[providers,memory]`` "
             "(literal-match to runbook §0.4 and §6.1)"
+        )
+
+    def test_fleet_memory_installed_from_buildkit_context(
+        self, dockerfile_text: str
+    ) -> None:
+        # fleet-memory has no PyPI distribution at all, so the ``memory``
+        # extra can only resolve from the COPYed BuildKit context — the
+        # same posture nats-core takes against its malformed 0.2.0 wheel.
+        assert re.search(
+            r"^COPY\s+--from=fleet-memory\s+/\s+/tmp/fleet-memory\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        ), (
+            "Builder stage must contain "
+            "``COPY --from=fleet-memory / /tmp/fleet-memory``"
+        )
+        assert re.search(
+            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/fleet-memory\b",
+            dockerfile_text,
+        ), (
+            "Builder stage must install fleet-memory from the BuildKit "
+            "context at /tmp/fleet-memory (not from PyPI)"
+        )
+        assert (
+            'RUN test -d /tmp/fleet-memory/src/fleet_memory '
+            '|| (echo "fleet-memory layout invalid" >&2; exit 1)'
+        ) in dockerfile_text, (
+            "Builder stage must carry the fleet-memory layout-validation "
+            "gate (mirrors the nats-core gate)"
         )
 
     def test_nats_core_installed_from_buildkit_context(

@@ -41,6 +41,7 @@ from forge.cli._serve_deps_gating import (
 )
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.config.models import ForgeConfig
+from forge.gating.degraded import EmptyPriorsReader
 from forge.gating.identity import derive_request_id
 from forge.gating.models import GateMode
 from forge.gating.wrappers import (
@@ -115,6 +116,7 @@ def _production_deps(
     parts = build_approval_gate_parts(
         nats,
         cfg,
+        priors_reader=EmptyPriorsReader(),
         emitter=emitter,
         repository=refresh_repository,
         subscriber_clock=subscriber_clock,
