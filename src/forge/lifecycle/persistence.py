@@ -966,6 +966,73 @@ class SqliteLifecyclePersistence:
             raise
 
     # ------------------------------------------------------------------
+    # Write API — record_worktree_path (conductor activation §1)
+    # ------------------------------------------------------------------
+
+    def record_worktree_path(self, build_id: str, path: str) -> None:
+        """Persist the materialised worktree onto the ``builds`` row.
+
+        ``builds.worktree_path`` had ZERO write sites before this method
+        (the one INSERT omits the column and none of the UPDATEs touched
+        it), which is why every production fix-journey dispatch refused
+        pre-spawn: the conductor dispatcher, the commit probe and the
+        gates reader all read this column and all three correctly refuse
+        to guess when it is NULL. The daemon's worktree writer
+        (:mod:`forge.cli._conductor_worktree`) calls this the moment the
+        tree exists, before the journey is spawned.
+
+        This is a **status-preserving** UPDATE of ``worktree_path``
+        alone, deliberately narrow: ``apply_transition`` remains the sole
+        writer of ``builds.status`` and its column set stays closed (the
+        activation design's explicit ruling — the pattern here is
+        :meth:`record_last_coach_score`, not a widened transition). A
+        missing ``build_id`` matches zero rows and is a quiet no-op,
+        consistent with this module's other concurrent-race handling; the
+        caller proves the row exists before it materialises anything.
+
+        Last write wins. The reuse arm re-records the same path on a
+        redelivery, which is a no-op in value terms and keeps the column
+        true if a partially-written row ever lost it.
+
+        Args:
+            build_id: The build whose worktree was materialised.
+            path: Absolute path of the worktree. Non-blank — recording an
+                empty string would read back exactly like the NULL the
+                consumers refuse on, but without the honesty.
+
+        Raises:
+            ValueError: If ``build_id`` or ``path`` is empty.
+            sqlite3.Error: For any database error. The transaction is
+                rolled back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("record_worktree_path: build_id must be non-empty")
+        if not path or not path.strip():
+            raise ValueError(
+                "record_worktree_path: path must be a non-blank absolute path "
+                "— a blank worktree_path reads back exactly like the NULL the "
+                "dispatch refuses on"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET worktree_path = ?
+                 WHERE build_id = ?
+                """,
+                (path, build_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
     # Write API — record_budget_breach (FEAT-UBS-002 stage 2, DETECT)
     # ------------------------------------------------------------------
 

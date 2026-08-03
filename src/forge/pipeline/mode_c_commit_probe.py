@@ -17,8 +17,20 @@ What it is
 One ``git rev-list --count <base>..HEAD`` against the build's recorded
 worktree, and nothing else. No network (``rev-list`` reads local refs
 only — there is no fetch, no remote, no ``gh``), no writes, no new path
-resolver: the worktree comes from ``builds.worktree_path``, the column the
-build state machine already writes when it materialises the worktree.
+resolver: the worktree comes from ``builds.worktree_path``.
+
+**Correction (conductor activation §1).** This docstring used to claim
+the column was one "the build state machine already writes when it
+materialises the worktree". It did not. ``builds.worktree_path`` had ZERO
+write sites — the one INSERT omitted it and no UPDATE touched it — which
+is why this probe, the conductor dispatcher's pre-spawn check and the
+gates reader all refused on every production fix journey. The writer now
+exists and is named: :mod:`forge.cli._conductor_worktree` materialises
+the tree at the router seam (after the cap-law belt, before the spawn)
+and records it through
+:meth:`~forge.lifecycle.persistence.SqliteLifecyclePersistence.record_worktree_path`
+— a narrow, status-preserving UPDATE, NOT ``apply_transition``, whose
+column set stays closed on purpose.
 
 Failure is loud, never quiet
 ----------------------------

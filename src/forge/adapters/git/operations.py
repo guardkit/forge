@@ -7,7 +7,9 @@ raise past the adapter boundary (ADR-ARCH-025).
 
 Four operations:
 
-- :func:`prepare_worktree` — ``git worktree add`` for the build's path.
+- :func:`prepare_worktree` — ``git worktree add`` for the build's path,
+  optionally ``-b <branch> <path> <base>`` when the branch must be
+  CREATED (the fix journey's per-build branch, conductor activation §1).
 - :func:`commit_all` — ``git add -A`` + ``git commit -m`` + ``git rev-parse HEAD``.
 - :func:`push` — ``git push origin <branch>``.
 - :func:`cleanup_worktree` — ``git worktree remove --force``; **best-effort**:
@@ -207,6 +209,8 @@ async def prepare_worktree(
     *,
     execute: ExecuteCallable = _default_execute,
     builds_root: Path = _DEFAULT_BUILDS_ROOT,
+    create_branch: bool = False,
+    base_ref: str | None = None,
 ) -> GitOpResult:
     """Create a build's ephemeral worktree (ADR-ARCH-028).
 
@@ -218,14 +222,64 @@ async def prepare_worktree(
     On success returns ``GitOpResult.worktree_path`` populated with the
     absolute path of the created worktree. On any non-zero exit or
     raised exception returns ``status="failed"`` with stderr preserved.
+
+    Creating the branch (conductor activation §1)
+    ---------------------------------------------
+
+    As originally built this operation could only check out a branch that
+    ALREADY EXISTS: ``git worktree add <path> <branch>`` hard-fails
+    (exit 128, "invalid reference") on a name git has never seen. The fix
+    journey needs the opposite — a NEW per-journey branch cut from the
+    trunk — so the operation grew two explicit parameters:
+
+    * ``create_branch=True`` emits ``-b <branch>``, i.e.
+      ``git worktree add -b <branch> <path> [<base_ref>]``.
+    * ``base_ref`` names the commit-ish the new branch is cut from
+      (``"main"`` for the fix journey). Omitted, git cuts from ``HEAD``
+      — legal, but the caller is then trusting whatever the source
+      checkout happens to have checked out, so production passes it.
+
+    ``base_ref`` WITHOUT ``create_branch`` is a caller bug, not a git
+    invocation: ``git worktree add <path> <branch> <base>`` is not a
+    valid form, and silently dropping the base would materialise a tree
+    off the wrong commit. It returns ``status="failed"`` (adapter
+    boundary — never raises) rather than guessing.
+
+    Args:
+        build_id: The build whose worktree this is; the leaf directory
+            name under ``builds_root``.
+        repo: The source checkout the worktree is registered against.
+        branch: Branch to check out, or — with ``create_branch`` — the
+            branch to CREATE.
+        execute: Injected subprocess primitive.
+        builds_root: Parent directory of the per-build worktree.
+        create_branch: Emit ``-b <branch>`` so git creates the branch.
+        base_ref: Commit-ish the created branch is cut from. Requires
+            ``create_branch``.
     """
     operation = "prepare_worktree"
     worktree_path = builds_root / build_id
-    try:
-        result = await execute(
-            command=["git", "worktree", "add", str(worktree_path), branch],
-            cwd=str(repo),
+    if base_ref is not None and not create_branch:
+        return GitOpResult(
+            status="failed",
+            operation=operation,
+            stderr=(
+                f"prepare_worktree: base_ref={base_ref!r} was given without "
+                "create_branch=True. 'git worktree add <path> <branch> <base>' "
+                "is not a valid invocation, and dropping the base would "
+                "materialise the tree off the wrong commit — refusing rather "
+                "than guessing."
+            ),
+            exit_code=-1,
         )
+    if create_branch:
+        command = ["git", "worktree", "add", "-b", branch, str(worktree_path)]
+        if base_ref is not None:
+            command.append(base_ref)
+    else:
+        command = ["git", "worktree", "add", str(worktree_path), branch]
+    try:
+        result = await execute(command=command, cwd=str(repo))
         if result.exit_code == 0:
             return GitOpResult(
                 status="success",

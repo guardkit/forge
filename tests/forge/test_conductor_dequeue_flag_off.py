@@ -44,6 +44,7 @@ from forge.cli._conductor_outcome import (
     TAKEN_RUNNING,
     TakenTerminal,
 )
+from forge.cli._conductor_worktree import WorktreeReady
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli.serve import build_conductor_router
 from forge.config.models import (
@@ -136,6 +137,18 @@ def _payload(feature_id: str = "FEAT-CR01") -> SimpleNamespace:
 
 async def _noop_ack() -> None:
     return None
+
+
+async def _writer_ok(_pool: Any, _config: Any, build_id: str) -> Any:
+    """A worktree writer that always succeeds (activation design §1).
+
+    The router materialises the journey's worktree between the cap-law
+    belt and the spawn. These tests are about the MODE branch and the
+    setup seam, so a satisfied writer keeps them on their own subject;
+    the writer's arms are driven against a real scratch git checkout in
+    ``tests/forge/test_conductor_worktree.py``.
+    """
+    return WorktreeReady(path=f"/srv/forge/{build_id}", branch="fix/TASK-FJ-0000")
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +436,7 @@ class TestRouterModeBranch:
             config=self._config(tmp_path),
             supervisor_factory=factory,
             spawn=spawn,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 
@@ -451,6 +465,7 @@ class TestRouterModeBranch:
             pool=persistence,
             config=self._config(tmp_path),
             supervisor_factory=exploding_factory,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 

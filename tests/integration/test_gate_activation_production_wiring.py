@@ -811,6 +811,59 @@ class TestDispatchWiring:
         assert error in failed[0]["failure_reason"]
 
     @pytest.mark.asyncio
+    async def test_mode_c_with_no_router_refuses_on_the_gate_approved_arm(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """SEAM 3's regression pin (activation design §4.3).
+
+        The closure had no test of its own: ``dispatch_build`` has no mode
+        check outside the router, so a flag-off boot — or a router whose
+        composition failed, or one that raised into the degrade rail —
+        plus a runless mode-c redelivery ran a FIX TASK as a routine
+        autobuild, the wrong machinery against a TASK-xxx subject. The
+        queue-time belt already refuses mode-c queues while the flag is
+        off, so this arm should be unreachable; unreachable-but-guarded is
+        the posture, and an unpinned guard is one refactor from gone.
+
+        Driven through the GATE-APPROVED arm (the router is ``None``, the
+        gate says approve, and dispatch falls through to the launch arm),
+        asserting all four: the row is FAILED, the slot is acked, the
+        ``build-failed`` names the arm, and NOTHING launched.
+        """
+        starter = _FakeStarter()
+        deps = _bound_dispatch_deps(nats, pool, starter, conductor_router=None)
+        payload = _make_payload(feature_id="FEAT-FIXJ3")
+        payload.mode = BuildMode.MODE_C
+        payload.task_id = "TASK-FIXJ3"
+        build_id = derive_build_id("FEAT-FIXJ3", QUEUED_AT)
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        task = asyncio.create_task(deps.dispatch_build(payload, _ack))
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id),
+            decision="approve",
+        )
+        await asyncio.wait_for(task, timeout=5.0)
+
+        assert starter.launches == [], (
+            "a fix task launched down the ROUTINE autobuild path with no "
+            "conductor driving it — the silent downgrade §4.3 closes"
+        )
+        assert acked == [True]
+        failed = _payloads(nats, _failed_subject("FEAT-FIXJ3"))
+        assert len(failed) == 1, failed
+        assert "routine launch arm" in failed[0]["failure_reason"]
+        assert failed[0]["recoverable"] is False
+        assert failed[0]["failed_task_id"] == "TASK-FIXJ3"
+        assert _row(pool, build_id)[0] == BuildState.FAILED.value
+
+    @pytest.mark.asyncio
     async def test_a_taken_running_journey_neither_acks_nor_launches(
         self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
     ) -> None:
