@@ -62,6 +62,7 @@ from forge.cli._conductor_outcome import (
     ConductorOutcomeContractError,
     TakenTerminal,
 )
+from forge.cli._conductor_worktree import WorktreeReady
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli.serve import build_conductor_router
 from forge.config.conductor import (
@@ -762,6 +763,19 @@ def _payload(feature_id: str) -> SimpleNamespace:
     )
 
 
+async def _writer_ok(_pool: Any, _config: Any, build_id: str) -> Any:
+    """A worktree writer that always succeeds (activation design §1).
+
+    The router materialises the journey's worktree between the cap-law
+    belt and the spawn. These are CAP-LAW and SETUP-SEAM tests: injecting
+    a satisfied writer keeps each one on the seam it is actually about.
+    The writer's own arms — reuse, collision, allowlist, materialise
+    failure, the gitignore guard — are driven against a real scratch git
+    checkout in ``tests/forge/test_conductor_worktree.py``.
+    """
+    return WorktreeReady(path=f"/srv/forge/{build_id}", branch="fix/TASK-CAP-0000")
+
+
 def _router_config(tmp_path: Path, **budget: Any) -> ForgeConfig:
     return ForgeConfig(
         permissions=PermissionsConfig(
@@ -877,6 +891,7 @@ class TestRouterBelt:
             config=_router_config(tmp_path),
             supervisor_factory=lambda bid: object(),
             spawn=spawn,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 
@@ -1044,6 +1059,7 @@ class TestTheSetupExceptionSeam:
             pool=persistence,
             config=_router_config(tmp_path),
             supervisor_factory=exploding_factory,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 
@@ -1086,6 +1102,7 @@ class TestTheSetupExceptionSeam:
             supervisor_factory=lambda bid: object(),
             driver_deps_factory=exploding_deps,
             spawn=lambda coro: pytest.fail("a journey was spawned"),
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 

@@ -72,6 +72,10 @@ from forge.cli._conductor_outcome import (
     TakenTerminal,
     fail_mode_c_build,
 )
+from forge.cli._conductor_worktree import (
+    WorktreeRefused,
+    prepare_journey_worktree,
+)
 from forge.cli._serve_config import (
     DEFAULT_DURABLE_NAME,
     DEFAULT_HEALTHZ_PORT,
@@ -1508,6 +1512,7 @@ def build_conductor_router(
     supervisor_factory: "Callable[..., Any] | None" = None,
     driver_deps_factory: "Callable[..., Any] | None" = None,
     spawn: "Callable[..., Any] | None" = None,
+    worktree_writer: "Callable[..., Any] | None" = None,
 ) -> "Callable[..., Any] | None":
     """Build the daemon seam that hands a fix journey to the conductor.
 
@@ -1539,6 +1544,14 @@ def build_conductor_router(
       with the reason recorded on ``builds.error`` and the router answers
       a :class:`TakenTerminal` CARRYING that reason — the dispatch caller
       then acks the queue slot and emits ``build-failed``.
+    * A fix journey that clears the cap law is given its WORKTREE
+      (:func:`~forge.cli._conductor_worktree.prepare_journey_worktree`,
+      activation design §1) before anything is spawned — materialised
+      under the registered checkout on ``fix/<task_id>-<build8>`` off
+      ``main`` and recorded on ``builds.worktree_path``, the column three
+      downstream consumers refuse on when it is NULL. A materialise
+      failure is taken-and-terminal for exactly the same reason the cap
+      refusal is: never a routine launch.
     * A fix journey that clears the cap law gets a per-build
       :class:`Supervisor` (its budget collaborators from
       :func:`build_conductor_budget_kwargs`) and a turn loop, spawned as a
@@ -1571,6 +1584,11 @@ def build_conductor_router(
             not yet wired.
         spawn: ``(coro) -> Any`` task starter; defaults to a tracked
             :func:`asyncio.create_task`.
+        worktree_writer: ``(pool, config, build_id) -> WorktreeReady |
+            WorktreeRefused`` (awaitable). Defaults to
+            :func:`~forge.cli._conductor_worktree.prepare_journey_worktree`
+            — the production writer. Injected only so a test can drive the
+            refusal arm without a git checkout.
     """
     from forge.config.conductor import conductor_enabled
 
@@ -1599,6 +1617,9 @@ def build_conductor_router(
 
     mode_reader = SqliteBuildModeReader(pool)
     spawn_task = spawn if spawn is not None else _spawn_conductor_task
+    _write_worktree = (
+        worktree_writer if worktree_writer is not None else prepare_journey_worktree
+    )
 
     async def conductor_router(**launch_kwargs: Any) -> Any:
         """Answer the taken-and-terminal vocabulary for one dequeued build.
@@ -1650,6 +1671,43 @@ def build_conductor_router(
             return TakenTerminal(
                 reason=_fail_uncapped_mode_c_build(pool, build_id, cap_refusal)
             )
+
+        # THE WORKTREE WRITER (activation design §1). The cap law has
+        # passed; nothing is spawned yet. ``builds.worktree_path`` had ZERO
+        # write sites before this seam, which is why every production fix
+        # journey refused pre-spawn — the dispatcher, the commit probe and
+        # the gates reader all read the column and all three correctly
+        # refuse to guess. The daemon — the component that owns the spawn —
+        # materialises the tree at the moment it is needed rather than
+        # trusting a path some earlier process inferred. A refusal here is
+        # taken-and-terminal like every other: FAILED with the reason on
+        # the row, slot acked, terminal emitted, NEVER a routine launch.
+        worktree = await _maybe_await_value(_write_worktree(pool, config, build_id))
+        if isinstance(worktree, WorktreeRefused):
+            logger.error(
+                "conductor: build_id=%s could not be given a worktree — %s; "
+                "the build is REFUSED (marked FAILED, slot acked, terminal "
+                "emitted), NOT downgraded onto the routine path",
+                build_id,
+                worktree.reason,
+            )
+            return TakenTerminal(
+                reason=fail_mode_c_build(
+                    pool,
+                    build_id,
+                    summary=worktree.reason,
+                    what="the fix journey's worktree could not be materialised",
+                    log=logger,
+                )
+            )
+        logger.info(
+            "conductor: build_id=%s has its worktree at %s on branch %s "
+            "(reused=%s)",
+            build_id,
+            worktree.path,
+            worktree.branch,
+            worktree.reused,
+        )
 
         try:
             supervisor = await _maybe_await_value(supervisor_factory(build_id))
