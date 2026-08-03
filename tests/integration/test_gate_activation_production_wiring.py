@@ -41,6 +41,7 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import _serve_deps_gating
+from forge.cli._conductor_outcome import TAKEN_RUNNING
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli._serve_deps_gating import build_approval_gate_parts
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
@@ -48,7 +49,9 @@ from forge.cli._serve_gate_activation import (
     ALREADY_PAUSED,
     maybe_gate_build,
 )
+from forge.cli.serve import build_conductor_router
 from forge.config.models import ForgeConfig
+from forge.lifecycle.modes import BuildMode
 from forge.gating.identity import derive_request_id
 from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
 from forge.gating.wrappers import REASON_MAX_WAIT, GateOutcome
@@ -597,6 +600,7 @@ def _bound_dispatch_deps(
     starter: _FakeStarter,
     *,
     forge_config: ForgeConfig | None = None,
+    conductor_router: Any = None,
 ):
     """Bind real gate parts + build production consumer deps over ``nats``."""
     cfg = forge_config or _forge_config()
@@ -611,6 +615,7 @@ def _bound_dispatch_deps(
         gate_repository=repo,
         gate_state_machine=sm,
         gate_clock=FixedClock(),
+        conductor_router=conductor_router,
     )
     return deps
 
@@ -712,6 +717,191 @@ class TestDispatchWiring:
         assert starter.launches == []
         assert registered == []
         assert _row(pool, build_id)[0] == BuildState.CANCELLED.value
+
+    @pytest.mark.asyncio
+    async def test_conductor_taken_terminal_acks_slot_and_emits_build_failed(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The activation lane's ack cure, at the seam it would have wedged.
+
+        Twin of the gate-reject pin above, for the OTHER terminal a
+        dispatch can reach: the gate APPROVES, the build goes to the
+        conductor, and the conductor refuses it (here through the REAL
+        router meeting the REAL cap law — the row carries no budget
+        profile, so ``attended`` resolves with every cap ``None`` and the
+        fix journey does not open).
+
+        Before the taken-and-terminal vocabulary this refusal wrote its
+        FAILED row and stopped: no ack and no event. With
+        ``max_ack_pending=1`` on the pipeline consumer that ONE refusal
+        held the only in-flight slot for the full 1h ``ack_wait``, so no
+        other queued build dequeued for an hour, and no terminal envelope
+        was ever published, so a correlation-id-following observer waited
+        forever.
+
+        What must now be true, all four:
+
+        1. the slot is acked IN-LINE (the consumer is not wedged);
+        2. ``pipeline.build-failed`` is on the wire with the refusal's own
+           reason, ``recoverable=False``, and ``failed_task_id`` =
+           ``builds.task_id`` (the fix journey's durable subject);
+        3. nothing was launched down the routine autobuild path;
+        4. the row is FAILED with the one-line reason on ``builds.error``.
+        """
+        starter = _FakeStarter()
+        cfg = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
+            }
+        )
+        router = build_conductor_router(
+            pool=pool,
+            config=cfg,
+            supervisor_factory=lambda _bid: pytest.fail(
+                "a supervisor was built for a cap-refused fix journey"
+            ),
+            spawn=lambda coro: pytest.fail("a fix journey was spawned"),
+        )
+        assert router is not None
+
+        deps = _bound_dispatch_deps(
+            nats, pool, starter, forge_config=cfg, conductor_router=router
+        )
+        payload = _make_payload(feature_id="FEAT-FIXJ1")
+        payload.mode = BuildMode.MODE_C
+        payload.task_id = "TASK-FIXJ1"
+        build_id = derive_build_id("FEAT-FIXJ1", QUEUED_AT)
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        task = asyncio.create_task(deps.dispatch_build(payload, _ack))
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id),
+            decision="approve",
+        )
+        await asyncio.wait_for(task, timeout=5.0)
+
+        # 1 — the slot is released in-line, exactly as the gate-terminal
+        #     arm above releases it.
+        assert acked == [True], (
+            "a conductor-refused build did not ack its slot — under "
+            "max_ack_pending=1 that wedges the whole consumer for an hour"
+        )
+        # 2 — the terminal is on the wire, carrying the refusal's reason.
+        failed = _payloads(nats, _failed_subject("FEAT-FIXJ1"))
+        assert len(failed) == 1
+        assert failed[0]["recoverable"] is False
+        assert failed[0]["failed_task_id"] == "TASK-FIXJ1"
+        assert "sets no cap" in failed[0]["failure_reason"]
+        # 3 — nothing routine ran for a TASK-xxx subject.
+        assert starter.launches == []
+        # 4 — the row says WHY, in one line.
+        status, _pending = _row(pool, build_id)
+        assert status == BuildState.FAILED.value
+        error = pool.connection.execute(
+            "SELECT error FROM builds WHERE build_id = ?", (build_id,)
+        ).fetchone()["error"]
+        assert error and "\n" not in error
+        assert error in failed[0]["failure_reason"]
+
+    @pytest.mark.asyncio
+    async def test_mode_c_with_no_router_refuses_on_the_gate_approved_arm(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """SEAM 3's regression pin (activation design §4.3).
+
+        The closure had no test of its own: ``dispatch_build`` has no mode
+        check outside the router, so a flag-off boot — or a router whose
+        composition failed, or one that raised into the degrade rail —
+        plus a runless mode-c redelivery ran a FIX TASK as a routine
+        autobuild, the wrong machinery against a TASK-xxx subject. The
+        queue-time belt already refuses mode-c queues while the flag is
+        off, so this arm should be unreachable; unreachable-but-guarded is
+        the posture, and an unpinned guard is one refactor from gone.
+
+        Driven through the GATE-APPROVED arm (the router is ``None``, the
+        gate says approve, and dispatch falls through to the launch arm),
+        asserting all four: the row is FAILED, the slot is acked, the
+        ``build-failed`` names the arm, and NOTHING launched.
+        """
+        starter = _FakeStarter()
+        deps = _bound_dispatch_deps(nats, pool, starter, conductor_router=None)
+        payload = _make_payload(feature_id="FEAT-FIXJ3")
+        payload.mode = BuildMode.MODE_C
+        payload.task_id = "TASK-FIXJ3"
+        build_id = derive_build_id("FEAT-FIXJ3", QUEUED_AT)
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        task = asyncio.create_task(deps.dispatch_build(payload, _ack))
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id),
+            decision="approve",
+        )
+        await asyncio.wait_for(task, timeout=5.0)
+
+        assert starter.launches == [], (
+            "a fix task launched down the ROUTINE autobuild path with no "
+            "conductor driving it — the silent downgrade §4.3 closes"
+        )
+        assert acked == [True]
+        failed = _payloads(nats, _failed_subject("FEAT-FIXJ3"))
+        assert len(failed) == 1, failed
+        assert "routine launch arm" in failed[0]["failure_reason"]
+        assert failed[0]["recoverable"] is False
+        assert failed[0]["failed_task_id"] == "TASK-FIXJ3"
+        assert _row(pool, build_id)[0] == BuildState.FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_a_taken_running_journey_neither_acks_nor_launches(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The mutation guard for the arm above.
+
+        A guard that acked on EVERY taken build would pass the terminal
+        test and break the running case: a live fix journey owns its own
+        terminal, so acking here would release the slot under a build
+        that is still going.
+        """
+        starter = _FakeStarter()
+
+        async def running_router(**_kwargs: Any) -> Any:
+            return TAKEN_RUNNING
+
+        deps = _bound_dispatch_deps(
+            nats, pool, starter, conductor_router=running_router
+        )
+        payload = _make_payload(feature_id="FEAT-FIXJ2")
+        build_id = derive_build_id("FEAT-FIXJ2", QUEUED_AT)
+
+        acked: list[bool] = []
+
+        async def _ack() -> None:
+            acked.append(True)
+
+        task = asyncio.create_task(deps.dispatch_build(payload, _ack))
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id),
+            decision="approve",
+        )
+        await asyncio.wait_for(task, timeout=5.0)
+
+        assert acked == []
+        assert starter.launches == []
+        assert _payloads(nats, _failed_subject("FEAT-FIXJ2")) == []
 
     @pytest.mark.asyncio
     async def test_duplicate_delivery_mid_pause_skipped_without_ack(

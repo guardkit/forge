@@ -39,6 +39,12 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import _serve_deps
+from forge.cli._conductor_outcome import (
+    DECLINED,
+    TAKEN_RUNNING,
+    TakenTerminal,
+)
+from forge.cli._conductor_worktree import WorktreeReady
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli.serve import build_conductor_router
 from forge.config.models import (
@@ -133,6 +139,18 @@ async def _noop_ack() -> None:
     return None
 
 
+async def _writer_ok(_pool: Any, _config: Any, build_id: str) -> Any:
+    """A worktree writer that always succeeds (activation design §1).
+
+    The router materialises the journey's worktree between the cap-law
+    belt and the spawn. These tests are about the MODE branch and the
+    setup seam, so a satisfied writer keeps them on their own subject;
+    the writer's arms are driven against a real scratch git checkout in
+    ``tests/forge/test_conductor_worktree.py``.
+    """
+    return WorktreeReady(path=f"/srv/forge/{build_id}", branch="fix/TASK-FJ-0000")
+
+
 # ---------------------------------------------------------------------------
 # 1. The router itself is None while the flag is off
 # ---------------------------------------------------------------------------
@@ -167,7 +185,7 @@ class TestRouterIsNoneWhileTheFlagIsOff:
             permissions=PermissionsConfig(
                 filesystem=FilesystemPermissions(allowlist=[tmp_path]),
             ),
-            conductor=ConductorConfig(enabled=True),
+            conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
         )
         assert build_conductor_router(pool=persistence, config=config) is None
 
@@ -265,9 +283,9 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def declining_router(**kwargs: Any) -> bool:
+        async def declining_router(**kwargs: Any) -> Any:
             asked.append(dict(kwargs))
-            return False
+            return DECLINED
 
         deps = build_pipeline_consumer_deps(
             _StubNatsClient(),
@@ -300,8 +318,8 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def taking_router(**kwargs: Any) -> bool:
-            return True
+        async def taking_router(**kwargs: Any) -> Any:
+            return TAKEN_RUNNING
 
         deps = build_pipeline_consumer_deps(
             _StubNatsClient(),
@@ -332,7 +350,7 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def exploding_router(**kwargs: Any) -> bool:
+        async def exploding_router(**kwargs: Any) -> Any:
             raise RuntimeError("conductor composition blew up")
 
         deps = build_pipeline_consumer_deps(
@@ -358,7 +376,7 @@ class TestRouterModeBranch:
             permissions=PermissionsConfig(
                 filesystem=FilesystemPermissions(allowlist=[tmp_path]),
             ),
-            conductor=ConductorConfig(enabled=True),
+            conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
         )
 
     @pytest.mark.asyncio
@@ -381,7 +399,7 @@ class TestRouterModeBranch:
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is False
+        assert await router(build_id=build_id) is DECLINED
         assert made == []  # no supervisor was ever constructed
 
     @pytest.mark.asyncio
@@ -418,15 +436,16 @@ class TestRouterModeBranch:
             config=self._config(tmp_path),
             supervisor_factory=factory,
             spawn=spawn,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is True
+        assert await router(build_id=build_id) is TAKEN_RUNNING
         assert made == [build_id]
         assert len(spawned) == 1
 
     @pytest.mark.asyncio
-    async def test_a_failing_setup_declines_rather_than_stranding_the_build(
+    async def test_a_failing_setup_is_terminal_rather_than_downgraded(
         self,
         persistence: SqliteLifecyclePersistence,
         tmp_path: Path,
@@ -446,7 +465,12 @@ class TestRouterModeBranch:
             pool=persistence,
             config=self._config(tmp_path),
             supervisor_factory=exploding_factory,
+            worktree_writer=_writer_ok,
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is False
+        # Activation design §4.1 — this arm used to answer ``False`` (the
+        # routine path) for a FIX TASK. It is taken-and-terminal now.
+        outcome = await router(build_id=build_id)
+        assert isinstance(outcome, TakenTerminal)
+        assert "RuntimeError" in outcome.reason
