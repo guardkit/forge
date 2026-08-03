@@ -1204,15 +1204,18 @@ def _then_slice_size_matches_tail_limit(gci_world: dict[str, Any]) -> None:
 # TASK-GCI-008 — subprocess wrapper scenarios (10 scenarios)
 # TASK-GCI-003 — context resolver scenarios (8 scenarios)
 # TASK-GCI-009 — generic wrapper error contract (1 scenario)
-# TASK-GCI-010 — Graphiti resolver-bypass (1 scenario)
+# (TASK-GCI-010's Graphiti resolver-bypass scenario was retired
+# 2026-08-03 with ``forge.tools.graphiti`` — the wrapped ``guardkit
+# graphiti`` CLI group was deleted from GuardKit on 2026-07-02. The
+# adapter-level bypass in ``forge.adapters.guardkit.run`` is still
+# covered directly by tests/forge/adapters/guardkit/test_run.py.)
 # ---------------------------------------------------------------------------
 #
-# The bindings below activate the remaining 20 of the 32 BDD scenarios
-# in the GCI feature file (R2 oracle activation per TASK-GCI-011).
+# The bindings below activate the remaining BDD scenarios in the GCI
+# feature file (R2 oracle activation per TASK-GCI-011).
 #
 # Step bindings exercise the **public** tool layer surface
-# (``forge.tools.guardkit.guardkit_*`` and
-# ``forge.tools.graphiti.guardkit_graphiti_*``) plus the run() seam
+# (``forge.tools.guardkit.guardkit_*``) plus the run() seam
 # directly when a tool wrapper would obscure the contract under test
 # (e.g. the cwd-confinement and parallel scenarios assert directly on
 # ``run()``'s post-conditions). DeepAgents' subprocess seam
@@ -1229,7 +1232,6 @@ from forge.adapters.guardkit.context_resolver import (  # noqa: E402
     resolve_context_flags,
 )
 from forge.adapters.guardkit.run import run as gk_run  # noqa: E402
-from forge.tools.graphiti import guardkit_graphiti_query  # noqa: E402
 from forge.tools.guardkit import (  # noqa: E402
     _invoke as guardkit_tools_invoke,
     guardkit_feature_spec,
@@ -2702,90 +2704,6 @@ def _then_no_exception_propagates_to_model(gci_world: dict[str, Any]) -> None:
     # Same invariant restated: the JSON is observable, so no exception
     # propagated past the wrapper boundary.
     assert isinstance(gci_world["raw_json"], str)
-
-
-# ---------------------------------------------------------------------------
-# TASK-GCI-010 — Graphiti resolver-bypass scenario
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.key_example
-@scenario(
-    FEATURE_FILE,
-    "Graphiti GuardKit subcommands skip context-manifest resolution entirely",
-)
-def test_key_example_graphiti_skips_resolver() -> None:
-    """@key-example — TASK-GCI-010 Graphiti resolver-bypass."""
-
-
-@when("Forge invokes a Graphiti GuardKit wrapper")
-def _when_invokes_graphiti_wrapper(
-    gci_world: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    worktree = tmp_path / "builds" / "B-bdd-010"
-    worktree.mkdir(parents=True)
-    # Seed a manifest in the repo to PROVE the resolver would have
-    # picked up flags if it had been invoked. The Graphiti wrapper
-    # must NOT consult it.
-    _gci_seed_manifest(
-        worktree,
-        always_include=["docs/internal/AGENTS.md"],
-        key_docs=[{"path": "docs/specs/manifest.md", "category": "specs"}],
-    )
-    gci_world["worktree"] = worktree
-
-    captured: dict[str, Any] = {}
-
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
-        captured["command"] = list(command)
-        captured["cwd"] = cwd
-        return ("", "", 0, 0.05, False)
-
-    monkeypatch.setattr(gk_run_module, "_execute_subprocess", _fake_execute)
-
-    # Resolver must NEVER be reached for Graphiti subcommands. Spy via
-    # monkeypatch — the test fails loudly if the wrapper ever calls it.
-    resolver_called = {"called": False}
-
-    def _spy_resolver(*args: Any, **kwargs: Any) -> Any:
-        resolver_called["called"] = True
-        raise AssertionError(
-            "Graphiti wrapper must not call resolve_context_flags "
-            "(DDR-005 / TASK-GCI-010)"
-        )
-
-    monkeypatch.setattr(
-        "forge.adapters.guardkit.run.resolve_context_flags", _spy_resolver
-    )
-
-    gci_world["captured_call"] = captured
-    gci_world["resolver_called"] = resolver_called
-
-    async def _drive() -> str:
-        return await guardkit_graphiti_query.ainvoke(
-            {
-                "query": "BDD oracle: bypass test",
-                "group": "guardkit__feature_specs",
-                "repo": str(worktree),
-            }
-        )
-
-    gci_world["raw_json"] = asyncio.run(_drive())
-
-
-@then("no context flags should be assembled")
-def _then_no_context_flags_assembled(gci_world: dict[str, Any]) -> None:
-    cmd: list[str] = gci_world["captured_call"]["command"]
-    assert "--context" not in cmd, cmd
-
-
-@then("no manifest lookup should be performed for this invocation")
-def _then_no_manifest_lookup(gci_world: dict[str, Any]) -> None:
-    assert gci_world["resolver_called"]["called"] is False
-    # Sanity: the wrapper still produced an observable structured
-    # result (success path), not an exception.
-    payload = json.loads(gci_world["raw_json"])
-    assert payload["status"] in {"success", "failed", "timeout"}
 
 
 # Re-export for static analysis: the ``guardkit_tools_invoke`` symbol is

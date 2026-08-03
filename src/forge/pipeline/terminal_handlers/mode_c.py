@@ -34,11 +34,13 @@ The handler also exposes two small helpers for the supervisor wiring:
   ``artefact_paths`` list filtered to only paths produced by *that* fix
   task (Group G "no artefact path attributed to more than one fix
   task" + Group L lineage).
-* :func:`build_session_outcome_payload` — builds the
-  :class:`forge.memory.models.SessionOutcome` payload for the
-  decision; CLEAN_REVIEW_* outcomes carry no ``pull_request_url`` and
-  no PR-review gate decision (Group N "session outcome reflects mode
-  terminal").
+* :func:`build_session_outcome_payload` — builds the session-outcome
+  payload ``dict`` for the decision; CLEAN_REVIEW_* outcomes carry no
+  ``pull_request_url`` and no PR-review gate decision (Group N "session
+  outcome reflects mode terminal"). Its former consumer,
+  ``forge.memory.session_outcome``, was retired 2026-08-03 (dead
+  Graphiti tier); the factory-built fleet-memory writer is its queued
+  successor.
 
 References:
     - FEAT-FORGE-008 ASSUM-005 — PR review when fixes change the
@@ -574,9 +576,10 @@ def build_session_outcome_payload(
             :func:`evaluate_terminal`.
 
     Returns:
-        A ``dict`` with the keys downstream
-        :func:`forge.memory.session_outcome.write_session_outcome`
-        consumes. Specifically:
+        A ``dict`` with the keys a session-outcome writer consumes
+        (the retired ``forge.memory.session_outcome`` tier was the
+        original consumer; the factory-built fleet-memory writer is
+        its queued successor). Specifically:
 
         * ``outcome`` — the :class:`ModeCTerminal` enum's string
           value.
