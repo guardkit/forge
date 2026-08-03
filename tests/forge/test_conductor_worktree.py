@@ -13,7 +13,10 @@ What is pinned:
   probe, the gates reader's directory check);
 * the embedded-gitlink hazard — a repo-root ``git add -A`` stages nothing
   from ``.forge/``, because the writer plants the guard file itself;
-* the reuse arm and its three collision refusals;
+* the reuse arm and its three collision refusals — plus the two ways a
+  MATCH is still not a tree (the registration outlived the directory; the
+  directory is a hollow shell) and the symlinked registered checkout that
+  would otherwise defeat the match entirely;
 * two journeys for the SAME task not colliding (the branch suffix);
 * the allowlist trap, at write time, before anything lands on disk;
 * materialise failure, an unregistered repo, a missing task id, a missing
@@ -401,6 +404,100 @@ class TestReuseAndCollisions:
         # Still exactly one registration for this build.
         listing = _git(checkout, "worktree", "list", "--porcelain")
         assert listing.count(f"worktree {first.path}\n") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_registration_whose_tree_was_deleted_refuses_loudly(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """A REGISTRATION is not a tree — and the writer proves the tree.
+
+        git keeps ``.git/worktrees/<id>`` long after the directory itself
+        is gone (deleted by hand, wiped by a cleanup script, lost with a
+        tmpfs): ``git worktree list`` still names the path AND the branch,
+        so the reuse arm matches on both. Believing the listing would put a
+        path on ``builds.worktree_path`` that nothing is at, and the journey
+        would die stages later inside a leg with the cause out of sight.
+        Nor can the writer quietly re-materialise — ``git worktree add``
+        refuses a path git still has registered. So: refuse, loudly, naming
+        the missing path and the prune that recovers it.
+        """
+        build_id = _queue_mode_c(pool, "FEAT-WTWL")
+        config = _config(checkout)
+        first = await prepare_journey_worktree(pool, config, build_id)
+        assert isinstance(first, WorktreeReady), first
+
+        shutil.rmtree(first.path)
+
+        second = await prepare_journey_worktree(pool, config, build_id)
+
+        assert isinstance(second, WorktreeRefused), second
+        assert first.path in second.reason
+        assert "no such directory" in second.reason
+        assert "prune" in second.reason
+        # Still registered, still on this build's own branch — i.e. the
+        # match really did fire and the proof is what stopped it.
+        listing = _git(checkout, "worktree", "list", "--porcelain")
+        assert journey_branch_name(TASK_ID, build_id) in listing
+
+    @pytest.mark.asyncio
+    async def test_a_hollow_registered_directory_refuses_loudly(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """The half-way case: the directory survives, the checkout does not.
+
+        An empty shell at the registered path passes an ``is_dir`` check
+        and fails at everything else — git cannot work in a directory with
+        no ``.git`` entry (for a linked worktree that entry is a FILE
+        holding ``gitdir: …``, which is why existence is the test).
+        """
+        build_id = _queue_mode_c(pool, "FEAT-WTWM")
+        config = _config(checkout)
+        first = await prepare_journey_worktree(pool, config, build_id)
+        assert isinstance(first, WorktreeReady), first
+
+        shutil.rmtree(first.path)
+        Path(first.path).mkdir(parents=True)
+
+        second = await prepare_journey_worktree(pool, config, build_id)
+
+        assert isinstance(second, WorktreeRefused), second
+        assert first.path in second.reason
+        assert "hollow" in second.reason
+        assert "prune" in second.reason
+
+    @pytest.mark.asyncio
+    async def test_a_symlinked_registered_checkout_still_reuses_its_own_tree(
+        self, pool: SqliteLifecyclePersistence, checkout: Path, tmp_path: Path
+    ) -> None:
+        """A symlinked checkout must not turn every redelivery into a refusal.
+
+        ``git worktree list --porcelain`` reports the REALPATH of a
+        registration, always. Register the checkout through a symlink — an
+        entirely ordinary estate shape — and the writer's own target path
+        and git's answer become two spellings of ONE directory. Compared
+        textually the reuse arm misses, the BRANCH match fires instead, and
+        the build's own tree is refused as a stranger's ("branch busy at
+        another path"): a redelivery of an in-flight journey would be
+        killed by the writer meant to serve it.
+        """
+        linked = tmp_path / "registered-via-symlink"
+        linked.symlink_to(checkout, target_is_directory=True)
+        config = _config(
+            checkout, allowlist=[linked], repo_paths={REPO_KEY: str(linked)}
+        )
+        build_id = _queue_mode_c(pool, "FEAT-WTWN")
+
+        first = await prepare_journey_worktree(pool, config, build_id)
+        assert isinstance(first, WorktreeReady), first
+        assert first.reused is False
+        assert Path(first.path).is_dir()
+
+        second = await prepare_journey_worktree(pool, config, build_id)
+
+        assert isinstance(second, WorktreeReady), second
+        assert second.reused is True, "the symlinked checkout defeated the reuse arm"
+        assert second.path == first.path
+        assert second.branch == first.branch
 
     @pytest.mark.asyncio
     async def test_the_path_taken_on_another_branch_refuses_loudly(
