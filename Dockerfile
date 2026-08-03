@@ -98,6 +98,28 @@ RUN test -d /tmp/nats-core/src/nats_core || (echo "nats-core layout invalid" >&2
 # runtime stage.
 RUN pip install /tmp/nats-core
 
+# Pull the BuildKit-named ``fleet-memory`` context — the gate's priors
+# read (forge.adapters.fleet_memory, the ``memory`` extra). fleet-memory
+# is not on PyPI; like nats-core it resolves from the sibling working
+# tree, supplied by ``scripts/build-image.sh`` via
+# ``--build-context fleet-memory=../fleet-memory``.
+COPY --from=fleet-memory / /tmp/fleet-memory
+
+# R3-style layout gate (mirrors the nats-core gate above): refuse to
+# proceed if the COPYed working tree is missing the expected
+# ``src/fleet_memory`` package layout, so a stale or empty sibling
+# checkout fails fast with a named diagnostic instead of a confusing
+# pip resolution error several layers down.
+RUN test -d /tmp/fleet-memory/src/fleet_memory || (echo "fleet-memory layout invalid" >&2; exit 1)
+
+# Install fleet-memory from the BuildKit context BEFORE forge so pip's
+# resolver treats fleet-memory>=0.1,<1 (the ``memory`` extra) as
+# already-satisfied and never reaches PyPI, where no fleet-memory
+# distribution exists. Non-editable for the same reason as nats-core:
+# the runtime stage must not depend on a ``.pth`` pointer to a builder
+# path.
+RUN pip install /tmp/fleet-memory
+
 # Copy the forge sources late so changes to forge code don't bust the
 # nats-core install cache layer above. ``pyproject.toml`` is NOT
 # mutated — scoping §11.4 mandates preserving dev-host editable
@@ -112,7 +134,7 @@ COPY src ./src
 # the equivalence claim that FEAT-FORGE-008 relies on. forge installs
 # as a regular distribution (no ``-e``); the C4 scenario asserts the
 # runtime venv contains forge with no ``.pth`` editable pointer.
-RUN pip install .[providers]
+RUN pip install .[providers,memory]
 
 # ---------------------------------------------------------------------------
 # guardkit oracle payload + CLI — forge-side mirror of the specialist's

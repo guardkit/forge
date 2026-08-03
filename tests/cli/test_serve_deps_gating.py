@@ -39,6 +39,7 @@ from forge.cli._serve_deps_gating import (
     make_gate_check_deps,
 )
 from forge.config.models import ForgeConfig
+from forge.gating.degraded import EmptyPriorsReader
 from forge.gating.wrappers import GateCheckDeps
 from forge.pipeline import BuildContext
 
@@ -65,6 +66,17 @@ def _forge_config(**approval_overrides: Any) -> ForgeConfig:
     return ForgeConfig.model_validate(doc)
 
 
+def _build_parts(client: Any, config: ForgeConfig, **kwargs: Any) -> ApprovalGateParts:
+    """Call the real factory with the required ``priors_reader`` pinned.
+
+    The field is required-with-no-default by design (the no-silent-
+    fallback seam); unit fixtures pin ``EmptyPriorsReader()`` — never a
+    real fleet-memory reader.
+    """
+    kwargs.setdefault("priors_reader", EmptyPriorsReader())
+    return build_approval_gate_parts(client, config, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_bound_parts() -> Any:
     _serve_deps_gating._reset_for_tests()
@@ -76,7 +88,7 @@ class TestFactoryShape:
     """The factory constructs the real production adapter types."""
 
     def test_constructs_real_adapter_types(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert isinstance(parts, ApprovalGateParts)
         assert isinstance(parts.publisher, ApprovalPublisher)
         assert isinstance(parts.subscriber, ApprovalSubscriber)
@@ -84,20 +96,20 @@ class TestFactoryShape:
 
     def test_approval_config_slice_is_threaded(self) -> None:
         cfg = _forge_config(default_wait_seconds=7, max_wait_seconds=11)
-        parts = build_approval_gate_parts(_StubClient(), cfg)
+        parts = _build_parts(_StubClient(), cfg)
         assert parts.approval_config is cfg.approval
         assert parts.subscriber._deps.config is cfg.approval
 
     def test_parts_are_frozen(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         with pytest.raises(FrozenInstanceError):
             parts.expected_approver = "other"  # type: ignore[misc]
 
     def test_emitter_defaults_to_none_and_is_carried(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert parts.emitter is None
         sentinel = object()
-        parts2 = build_approval_gate_parts(
+        parts2 = _build_parts(
             _StubClient(),
             _forge_config(),
             emitter=sentinel,  # type: ignore[arg-type]
@@ -116,18 +128,18 @@ class TestExpectedApproverThreading:
     """
 
     def test_config_default_rich_reaches_subscriber_deps(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert parts.expected_approver == "rich"
         assert parts.subscriber._deps.expected_approver == "rich"
 
     def test_custom_value_reaches_subscriber_deps(self) -> None:
         cfg = _forge_config(expected_approver="someone-else")
-        parts = build_approval_gate_parts(_StubClient(), cfg)
+        parts = _build_parts(_StubClient(), cfg)
         assert parts.subscriber._deps.expected_approver == "someone-else"
 
     def test_explicit_none_is_permissive_mode(self) -> None:
         cfg = _forge_config(expected_approver=None)
-        parts = build_approval_gate_parts(_StubClient(), cfg)
+        parts = _build_parts(_StubClient(), cfg)
         assert parts.expected_approver is None
         assert parts.subscriber._deps.expected_approver is None
 
@@ -136,7 +148,7 @@ class TestRefreshAndBridgeWiring:
     """Optional collaborators wire the refresh + PEB-006 probes."""
 
     def test_no_repository_disables_refresh(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert parts.subscriber._deps.publish_refresh is None
 
     def test_repository_enables_refresh_callback(self) -> None:
@@ -146,13 +158,13 @@ class TestRefreshAndBridgeWiring:
 
             async def record_paused_build(self, **_: Any) -> None: ...
 
-        parts = build_approval_gate_parts(
+        parts = _build_parts(
             _StubClient(), _forge_config(), repository=_Repo()
         )
         assert callable(parts.subscriber._deps.publish_refresh)
 
     def test_no_bridge_registry_leaves_lookup_absent(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert parts.subscriber._deps.bridge_registry_lookup is None
 
     def test_bridge_lookup_requires_matching_correlation_id(self) -> None:
@@ -172,7 +184,7 @@ class TestRefreshAndBridgeWiring:
                 return self.entry
 
         registry = _Registry()
-        parts = build_approval_gate_parts(
+        parts = _build_parts(
             _StubClient(),
             _forge_config(),
             bridge_registry=registry,  # type: ignore[arg-type]
@@ -199,7 +211,7 @@ class TestRefreshAndBridgeWiring:
                 return 42.0
 
         clock = _Clock()
-        parts = build_approval_gate_parts(
+        parts = _build_parts(
             _StubClient(),
             _forge_config(),
             subscriber_clock=clock,
@@ -216,19 +228,19 @@ class TestBindGateParts:
         assert bound_gate_parts() is None
 
     def test_bind_then_bound_round_trips(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         assert bind_gate_parts(parts) is parts
         assert bound_gate_parts() is parts
 
     def test_rebind_replaces_previous(self) -> None:
-        first = build_approval_gate_parts(_StubClient(), _forge_config())
-        second = build_approval_gate_parts(_StubClient(), _forge_config())
+        first = _build_parts(_StubClient(), _forge_config())
+        second = _build_parts(_StubClient(), _forge_config())
         bind_gate_parts(first)
         bind_gate_parts(second)
         assert bound_gate_parts() is second
 
     def test_reset_for_tests_clears_binding(self) -> None:
-        bind_gate_parts(build_approval_gate_parts(_StubClient(), _forge_config()))
+        bind_gate_parts(_build_parts(_StubClient(), _forge_config()))
         _serve_deps_gating._reset_for_tests()
         assert bound_gate_parts() is None
 
@@ -307,20 +319,20 @@ class TestMakeGateCheckDeps:
         }
 
     def test_returns_typed_gate_check_deps(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         deps = make_gate_check_deps(parts, **self._deps_kwargs())
         assert isinstance(deps, GateCheckDeps)
         assert deps.publisher is parts.publisher
         assert deps.injector is parts.injector
 
     def test_without_ctx_injects_raw_subscriber(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         deps = make_gate_check_deps(parts, **self._deps_kwargs())
         assert deps.subscriber is parts.subscriber
 
     def test_with_ctx_and_emitter_binds_per_build_context(self) -> None:
         emitter = object()
-        parts = build_approval_gate_parts(
+        parts = _build_parts(
             _StubClient(),
             _forge_config(),
             emitter=emitter,  # type: ignore[arg-type]
@@ -337,7 +349,7 @@ class TestMakeGateCheckDeps:
         assert deps.subscriber._expected_correlation_id == "corr-X"
 
     def test_with_ctx_but_no_emitter_stays_raw(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         ctx = BuildContext(
             feature_id="FEAT-X",
             build_id="build-X",
@@ -348,7 +360,7 @@ class TestMakeGateCheckDeps:
         assert deps.subscriber is parts.subscriber
 
     def test_per_attempt_wait_seconds_is_threaded(self) -> None:
-        parts = build_approval_gate_parts(_StubClient(), _forge_config())
+        parts = _build_parts(_StubClient(), _forge_config())
         deps = make_gate_check_deps(
             parts, per_attempt_wait_seconds=13, **self._deps_kwargs()
         )
@@ -401,7 +413,7 @@ class TestPublishRefreshClosure:
     @pytest.mark.asyncio
     async def test_missing_row_skips_publish_and_record(self) -> None:
         repo, client, order = self._make_ordered_repo_and_client([])
-        parts = build_approval_gate_parts(client, _forge_config(), repository=repo)
+        parts = _build_parts(client, _forge_config(), repository=repo)
         refresh = parts.subscriber._deps.publish_refresh
         assert refresh is not None
 
@@ -428,7 +440,7 @@ class TestPublishRefreshClosure:
             correlation_id="corr-X",
         )
         repo, client, order = self._make_ordered_repo_and_client([row])
-        parts = build_approval_gate_parts(client, _forge_config(), repository=repo)
+        parts = _build_parts(client, _forge_config(), repository=repo)
         refresh = parts.subscriber._deps.publish_refresh
         assert refresh is not None
 
@@ -475,7 +487,7 @@ class TestPublishRefreshClosure:
             correlation_id="corr-new",
         )
         repo, client, _order = self._make_ordered_repo_and_client([old, new])
-        parts = build_approval_gate_parts(client, _forge_config(), repository=repo)
+        parts = _build_parts(client, _forge_config(), repository=repo)
         refresh = parts.subscriber._deps.publish_refresh
         assert refresh is not None
 
