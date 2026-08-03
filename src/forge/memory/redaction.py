@@ -1,8 +1,13 @@
-"""Credential redaction for entity payloads written to Graphiti.
+"""Credential redaction — the surviving tier of ``forge.memory``.
 
-This module exposes a single pure function — :func:`redact_credentials` —
-which scrubs credential-shaped substrings from free-text fields before any
-entity is constructed for a Graphiti write (TASK-IC-001).
+This module exposes a pure function — :func:`redact_credentials` —
+which scrubs credential-shaped substrings from free text. Originally
+written for entity payloads bound for Graphiti (TASK-IC-001); that
+backend was retired 2026-08-03 (dead Graphiti tiers deleted; successor =
+the factory-built fleet-memory PriorsReader, queued). The redactor
+stayed because it is live at other boundaries: ``forge.cli.runbook``
+and ``forge.executor.shell_steps`` scrub process output with it before
+logging or persistence.
 
 The function MUST be applied to every ``rationale``,
 ``operator_rationale``, ``question``, and ``answer`` field at the call
