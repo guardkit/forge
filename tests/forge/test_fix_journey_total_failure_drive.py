@@ -114,6 +114,16 @@ class FakeGuardKitTheRunawayShape:
     leg never got far enough to write anything), and it keeps the fixture
     from minting fresh fix tasks out of the failure itself.
 
+    Each review also emits a readable findings block, because since the
+    leg-result-honesty rule (2026-08-03) a review that emits none is a
+    FAILED leg — and a review leg that fell over is a different fault from
+    the one this module measures. The anchors are made PER CYCLE on
+    purpose: the review-cycle no-progress rule (which stops a journey whose
+    reviews re-report the same anchors) has its own pins in
+    ``test_conductor_driver``, and letting it fire here would stop the
+    runaway for a reason this fixture is not about, silently gutting the
+    control drive below.
+
     Nothing here is aware of the narrowing. The same object drives both the
     ruled path and the neutered one; only the planner differs.
     """
@@ -137,6 +147,14 @@ class FakeGuardKitTheRunawayShape:
                 duration_secs=1.0,
                 artefacts=[
                     str(self.worktree / "tasks" / f"{t}.yaml")
+                    for t in cycle_fix_tasks(self.reviews)
+                ],
+                detection_findings=[
+                    {
+                        "file": f"src/runaway/cycle{self.reviews:03d}/{t.lower()}.py",
+                        "severity": "high",
+                        "summary": f"the defect {t} names",
+                    }
                     for t in cycle_fix_tasks(self.reviews)
                 ],
                 warnings=[],

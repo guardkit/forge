@@ -302,6 +302,81 @@ class TestStatusProjection:
         assert project_mode_c_history([]) == ()
 
 
+class TestTheFailedRowsOwnWordsSurvive:
+    """Leg-result honesty, 2026-08-03.
+
+    The terminal that stops a journey has to be able to SAY what stopped
+    it, and by the time the handler runs, the leg's banner survives only in
+    the row's own ``rationale``. Carried, never parsed.
+    """
+
+    _BANNER = (
+        "subprocess task-review returned status='failed' exit_code=2\n"
+        "stderr: REFUSED (Phase 0, ad-hoc task creation): the review leg "
+        "is id-form only and no task file exists for TASK-TST1FIX1"
+    )
+
+    def test_a_failed_review_rows_rationale_is_carried(self) -> None:
+        history = project_mode_c_history(
+            [_review(fix_tasks=[], status="FAILED", extra={"rationale": self._BANNER})]
+        )
+
+        assert history[0].failure_reason is not None
+        assert "REFUSED (Phase 0" in history[0].failure_reason
+
+    def test_a_multi_line_banner_is_collapsed_to_one_line(self) -> None:
+        """``builds.error`` is a one-line column downstream."""
+        history = project_mode_c_history(
+            [_review(fix_tasks=[], status="FAILED", extra={"rationale": self._BANNER})]
+        )
+
+        assert "\n" not in (history[0].failure_reason or "")
+
+    def test_an_over_long_banner_is_trimmed(self) -> None:
+        history = project_mode_c_history(
+            [_review(fix_tasks=[], status="FAILED", extra={"rationale": "x" * 5000})]
+        )
+
+        reason = history[0].failure_reason or ""
+        assert len(reason) < 5000
+        assert reason.endswith("…")
+
+    def test_an_approved_rows_cheerful_rationale_is_not_carried(self) -> None:
+        """A success sentence has no business on a terminal."""
+        history = project_mode_c_history(
+            [
+                _review(
+                    fix_tasks=[],
+                    extra={"rationale": "task-review completed in 1.2s"},
+                )
+            ]
+        )
+
+        assert history[0].failure_reason is None
+
+    def test_a_row_with_no_rationale_carries_nothing(self) -> None:
+        history = project_mode_c_history([_review(fix_tasks=[], status="FAILED")])
+
+        assert history[0].failure_reason is None
+
+    def test_a_failed_work_rows_reason_is_carried_too(self) -> None:
+        """Not only reviews: the field is on every projected row."""
+        history = project_mode_c_history(
+            [
+                _row(
+                    stage_label=StageClass.TASK_WORK.value,
+                    status="FAILED",
+                    details={
+                        FIX_TASK_ID_DETAILS_KEY: "FIX-001",
+                        "rationale": "the harness refused the seat",
+                    },
+                )
+            ]
+        )
+
+        assert history[0].failure_reason == "the harness refused the seat"
+
+
 # ---------------------------------------------------------------------------
 # Garbage is loud (risk §h.3)
 # ---------------------------------------------------------------------------

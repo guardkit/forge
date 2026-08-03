@@ -39,6 +39,7 @@ from forge.pipeline.fix_journey_receipts import (
     read_failure_pack,
     write_fix_journey_failure_pack,
 )
+from forge.subagents import autobuild_runner
 from forge.subagents.autobuild_runner import (
     _RECEIPT_FAMILIES,
     FAILURE_MANIFEST_NAME,
@@ -93,6 +94,86 @@ class TestRootInjection:
         """One path law in the tree — this module never disagrees with it."""
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "elsewhere"))
         assert fix_journey_receipts_root(None) == tmp_path / "elsewhere"
+
+
+class TestTheBoundStateRootWinsOverHome:
+    """2026-08-03: the fix journey wrote its receipts into thin air.
+
+    Inside forge-prod the host's ``~/forge-state`` is bound at
+    ``/var/forge`` and the mount is NOT same-path, so ``~/forge-state/...``
+    names a container-local directory bound to nothing. The first
+    production fix journey exported to ``/home/forge/forge-state/receipts``
+    and the pack died with the container, while the routine path's receipts
+    — written host-side, where ``~`` IS the durable tree — landed correctly
+    all along.
+
+    :data:`BOUND_STATE_ROOT` is monkeypatched at a ``tmp_path`` so these
+    tests never depend on whether the machine running them has the mount.
+    """
+
+    @staticmethod
+    def _bind(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(autobuild_runner, "BOUND_STATE_ROOT", root)
+        return root
+
+    def test_the_configured_env_var_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The estate's knob outranks the mount — an operator can still move it."""
+        self._bind(monkeypatch, tmp_path / "var-forge")
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "elsewhere"))
+
+        assert fix_journey_receipts_root(None) == tmp_path / "elsewhere"
+
+    def test_the_bound_root_is_used_instead_of_a_home_derived_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bound = self._bind(monkeypatch, tmp_path / "var-forge")
+        monkeypatch.delenv("FORGE_RECEIPTS_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "unbound-home"))
+
+        resolved = fix_journey_receipts_root(None)
+
+        assert resolved == bound / "receipts"
+        assert str(tmp_path / "unbound-home") not in str(resolved)
+
+    def test_stage_receipts_actually_land_under_the_bound_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The write, not just the arithmetic — layout preserved."""
+        bound = self._bind(monkeypatch, tmp_path / "var-forge")
+        monkeypatch.delenv("FORGE_RECEIPTS_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "unbound-home"))
+        worktree = tmp_path / "worktree"
+        (worktree / ".guardkit" / "autobuild").mkdir(parents=True)
+        (worktree / ".guardkit" / "autobuild" / "summary.md").write_text(
+            "reviewed\n", encoding="utf-8"
+        )
+
+        export = export_stage_receipts(
+            build_id=FIX_BUILD, stage="task-review", worktree_path=worktree
+        )
+
+        assert export.ok
+        assert export.dest == (
+            bound / "receipts" / FIX_BUILD / STAGES_DIRNAME / export.stage_key
+        )
+        assert (export.dest / ".guardkit" / "autobuild" / "summary.md").is_file()
+
+    def test_without_the_mount_the_host_side_default_still_holds(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The build half runs host-side, where ``~/forge-state`` IS durable."""
+        monkeypatch.setattr(
+            autobuild_runner, "BOUND_STATE_ROOT", tmp_path / "no-such-mount"
+        )
+        monkeypatch.delenv("FORGE_RECEIPTS_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        assert fix_journey_receipts_root(None) == (
+            tmp_path / "home" / "forge-state" / "receipts"
+        )
 
 
 # ---------------------------------------------------------------------------

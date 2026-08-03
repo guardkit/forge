@@ -538,12 +538,33 @@ class _FixJourneyStageLogWriter:
             # absent key on an approved review as malformed and hard-stops
             # the journey — correctly: "an approved review must state its
             # finding, even when the finding is 'nothing'."
-            fix_tasks = tuple(
-                self._extractor(
-                    artefact_paths=tuple(artefact_paths or ()),
-                    rationale=rationale,
+            #
+            # LEG-RESULT HONESTY (2026-08-03): a FAILED review leg has no
+            # findings to state, so its artefact list is DEBRIS, not a
+            # fix-task list. The live refusal exited 2 in a second; a leg
+            # that dies mid-run having already touched ``tasks/`` would
+            # otherwise have its leftovers fanned out as the review's
+            # verdict. The key still rides (the row shape is one shape,
+            # whatever the outcome) — it just rides EMPTY, and the log
+            # below says "the leg failed", never "clean review".
+            leg_failed = row_status != _STAGE_LOG_PASSED
+            fix_tasks: tuple[str, ...] = ()
+            if not leg_failed:
+                fix_tasks = tuple(
+                    self._extractor(
+                        artefact_paths=tuple(artefact_paths or ()),
+                        rationale=rationale,
+                    )
                 )
-            )
+            elif artefact_paths:
+                logger.error(
+                    "fix_journey_stage_log: task-review row for build_id=%s "
+                    "is a FAILED leg carrying %d artefact path(s) — DISCARDED "
+                    "rather than read as fix tasks; a leg that fell over "
+                    "stated no finding",
+                    build_id,
+                    len(artefact_paths),
+                )
             details[FIX_TASKS_DETAILS_KEY] = list(fix_tasks)
             # THE ANCHORS RIDE BESIDE THE FIX TASKS (LI stage-2 §5).
             # The fix-task id is prose+position-derived and re-mints itself
@@ -563,12 +584,20 @@ class _FixJourneyStageLogWriter:
             if detection_findings_reported:
                 finding_anchors = derive_finding_anchors(detection_findings)
                 details[FINDING_ANCHORS_DETAILS_KEY] = list(finding_anchors)
-            logger.info(
+            logger.log(
+                logging.ERROR if leg_failed else logging.INFO,
                 "fix_journey_stage_log: task-review row for build_id=%s "
                 "records %d fix task(s): %s | finding anchors: %s",
                 build_id,
                 len(fix_tasks),
-                ", ".join(fix_tasks) or "none (clean review)",
+                (
+                    ", ".join(fix_tasks)
+                    or (
+                        "none — THE LEG FAILED, this is not a clean review"
+                        if leg_failed
+                        else "none (clean review)"
+                    )
+                ),
                 (
                     (", ".join(finding_anchors) or "none (the review found nothing)")
                     if detection_findings_reported

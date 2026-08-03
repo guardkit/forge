@@ -283,6 +283,15 @@ class StageEntry:
         hard_stop: Whether the gate decision was a hard-stop. A hard-stop
             on ``/task-review`` terminates the build with FAILED regardless
             of the ``status`` string (gate vocabularies vary).
+        failure_reason: The row's OWN account of why it failed — the
+            dispatch rationale, which for a subprocess leg carries the
+            leg's banner and output tail verbatim. ``None`` on every row
+            that did not fail, and on legacy rows that recorded nothing.
+            Leg-result honesty (2026-08-03): the terminal that stops a
+            journey has to be able to SAY what stopped it, and by the time
+            the handler runs, the leg's own words survive only here.
+            Neither the planner nor the handler branches on this field's
+            content — it is carried, never parsed.
     """
 
     stage_class: StageClass
@@ -291,6 +300,7 @@ class StageEntry:
     fix_task_id: str | None = None
     finding_anchors: tuple[str, ...] | None = None
     hard_stop: bool = False
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,7 +459,18 @@ class ModeCCyclePlanner:
                 rationale=(
                     "hard-stop on /task-review"
                     if latest_review.hard_stop
-                    else f"/task-review {latest_review.status} — terminal FAILED"
+                    else (
+                        f"/task-review {latest_review.status} — terminal FAILED"
+                        # The leg's own words, when it left any. This
+                        # rationale is the FALLBACK the supervisor records
+                        # if the terminal handler cannot be reached, so it
+                        # must be able to say what stopped the journey too.
+                        + (
+                            f" ({latest_review.failure_reason})"
+                            if latest_review.failure_reason
+                            else ""
+                        )
+                    )
                 ),
             )
 

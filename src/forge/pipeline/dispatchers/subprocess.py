@@ -1082,11 +1082,54 @@ async def dispatch_subprocess_stage(
         subcommand=plan.subcommand,
     )
 
+    # THE FINDINGS SURVIVE THE DISPATCH (LI stage-2 §5). The parser has
+    # always recovered the ``## Detection Findings`` block; every consumer
+    # of a dispatch result has always received a result that had thrown it
+    # away. That is the whole reason the fix journey had no dedup key.
+    # Copied into plain dicts so a runner double cannot hand back a live
+    # mutable view into its own state.
+    #
+    # ``guardkit_result.detection_findings`` is three-valued and stays that
+    # way across this seam: ``None`` = the block was absent or would not
+    # parse (the parser folds a JSONDecodeError into a warning and answers
+    # None), ``[]`` = the block was there and empty, which is a CLEAN
+    # REVIEW. Flattening those two into "no findings" is what would turn
+    # the journey's success path into a no-progress stop.
+    #
+    # Read BEFORE the status decision, because on a review leg the absence
+    # of the block is now part of that decision (see ``markers_missing``).
+    raw_findings = guardkit_result.detection_findings
+    detection_findings_reported = raw_findings is not None
+    detection_findings = tuple(
+        dict(item) for item in (raw_findings or ()) if isinstance(item, Mapping)
+    )
+
     # Decide the final status.
     runner_failed = guardkit_result.status != "success"
     allowlist_failure = bool(rejected)
 
-    if runner_failed or allowlist_failure:
+    # LEG-RESULT HONESTY (2026-08-03, the first production fix journey).
+    # A ``/task-review`` that exits 0 having emitted NO readable markers
+    # block has not conducted a clean review — it has said nothing, and
+    # "nothing" is not "zero findings". The live leg refused at Phase 0,
+    # printed a banner and exited 2; its quieter twin exits 0 and is
+    # indistinguishable from a clean review to anything reading only the
+    # exit code. Both are TOOLING FAULTS and both must fail the leg here,
+    # where the leg's own output is still in hand, rather than downstream
+    # where only a bare status survives.
+    #
+    # Scoped to the review stage on purpose: the ``## Detection Findings``
+    # block is the review's own contract (the three-valued key the fix
+    # journey's writer and the no-progress rule both read). No other
+    # stage promises it, and inventing a markers contract for stages that
+    # never had one would fail healthy legs.
+    markers_missing = (
+        stage is StageClass.TASK_REVIEW
+        and not runner_failed
+        and not detection_findings_reported
+    )
+
+    if runner_failed or allowlist_failure or markers_missing:
         status = StageDispatchStatus.FAILED
         rationale_parts: list[str] = []
 
@@ -1117,6 +1160,28 @@ async def dispatch_subprocess_stage(
                 detail_blocks.append(f"warning[{w.code}]: {w.message}")
             rationale_parts.append("\n".join(detail_blocks))
 
+        if markers_missing:
+            blocks = [
+                f"{plan.subcommand} exited 0 but emitted NO readable "
+                "findings block — a review that states nothing found is "
+                "not a clean review, and its silence is not zero findings"
+            ]
+            tail = (guardkit_result.stderr or "").strip() or (
+                guardkit_result.stdout_tail or ""
+            ).strip()
+            if tail:
+                blocks.append(f"leg output tail: {tail}")
+            for w in guardkit_result.warnings:
+                blocks.append(f"warning[{w.code}]: {w.message}")
+            rationale_parts.append("\n".join(blocks))
+            logger.error(
+                "dispatch_subprocess_stage: %s exited 0 with no readable "
+                "findings block for build_id=%s — recording the leg FAILED "
+                "rather than letting its silence be read as a clean review",
+                plan.subcommand,
+                build_id,
+            )
+
         if allowlist_failure:
             rationale_parts.append(
                 "rejected artefact paths outside worktree allowlist: "
@@ -1133,25 +1198,6 @@ async def dispatch_subprocess_stage(
             f"{plan.subcommand} completed in {duration_secs:.2f}s "
             f"with {len(kept)} artefact path(s)"
         )
-
-    # THE FINDINGS SURVIVE THE DISPATCH (LI stage-2 §5). The parser has
-    # always recovered the ``## Detection Findings`` block; every consumer
-    # of a dispatch result has always received a result that had thrown it
-    # away. That is the whole reason the fix journey had no dedup key.
-    # Copied into plain dicts so a runner double cannot hand back a live
-    # mutable view into its own state.
-    #
-    # ``guardkit_result.detection_findings`` is three-valued and stays that
-    # way across this seam: ``None`` = the block was absent or would not
-    # parse (the parser folds a JSONDecodeError into a warning and answers
-    # None), ``[]`` = the block was there and empty, which is a CLEAN
-    # REVIEW. Flattening those two into "no findings" is what would turn
-    # the journey's success path into a no-progress stop.
-    raw_findings = guardkit_result.detection_findings
-    detection_findings_reported = raw_findings is not None
-    detection_findings = tuple(
-        dict(item) for item in (raw_findings or ()) if isinstance(item, Mapping)
-    )
 
     result = StageDispatchResult(
         status=status,

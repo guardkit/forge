@@ -15,6 +15,7 @@ exactly how the gap opened.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -185,6 +186,62 @@ class TestTheRoundTrip:
 
         history = SqliteModeCHistoryReader(pool).get_mode_c_history(BUILD_ID)
         assert history[0].status == "failed"
+
+
+class TestAFailedLegsDebrisIsNotAFixTaskList:
+    """Leg-result honesty, 2026-08-03.
+
+    A review leg that fell over stated no finding. Its artefact list is
+    debris — a partially-written task file, a leftover from a previous
+    run — and reading it as the review's verdict is the same lie as
+    reading the leg's silence as zero findings, one layer down.
+    """
+
+    def test_a_failed_review_records_an_empty_fix_task_list(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        writer = build_fix_journey_stage_log_writer(pool)
+        _record(
+            writer,
+            stage=StageClass.TASK_REVIEW,
+            status=StageDispatchStatus.FAILED,
+            artefact_paths=("/w/tasks/TASK-FIX007-001.yaml",),
+            rationale="REFUSED (Phase 0, ad-hoc task creation)",
+        )
+
+        row = pool.read_stages(BUILD_ID)[0]
+        assert row.status == "FAILED"
+        assert row.details[FIX_TASKS_DETAILS_KEY] == []
+
+    def test_the_discard_is_loud(
+        self, pool: SqliteLifecyclePersistence, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        writer = build_fix_journey_stage_log_writer(pool)
+        with caplog.at_level(logging.ERROR):
+            _record(
+                writer,
+                stage=StageClass.TASK_REVIEW,
+                status=StageDispatchStatus.FAILED,
+                artefact_paths=("/w/tasks/TASK-FIX007-001.yaml",),
+                rationale="REFUSED (Phase 0, ad-hoc task creation)",
+            )
+
+        assert "DISCARDED" in caplog.text
+        assert "THE LEG FAILED, this is not a clean review" in caplog.text
+
+    def test_a_successful_review_still_reads_its_artefacts(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The rule bites on failure only — the success path is untouched."""
+        writer = build_fix_journey_stage_log_writer(pool)
+        _record(
+            writer,
+            stage=StageClass.TASK_REVIEW,
+            artefact_paths=("/w/tasks/TASK-FIX007-001.yaml",),
+        )
+
+        row = pool.read_stages(BUILD_ID)[0]
+        assert row.details[FIX_TASKS_DETAILS_KEY] == ["TASK-FIX007-001"]
 
 
 class TestThePlannerPlansFromIt:
