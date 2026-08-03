@@ -18,8 +18,9 @@ What remains, and why:
   :class:`forge.gating.wrappers.PriorsReader` protocol, and both are
   untouched by this retirement.
 
-Successor: a factory-built, fleet-memory-backed ``PriorsReader``
-(queued; do not hand-build it here).
+Successor: landed at :mod:`forge.adapters.fleet_memory`
+(fleet-memory-backed ``PriorsReader``, wired env-gated at serve
+compose).
 """
 
 from __future__ import annotations

@@ -128,6 +128,14 @@ class ApprovalGateParts:
         emitter: The daemon's :class:`PipelineLifecycleEmitter`, used by
             :func:`make_gate_check_deps` to bind the FW10-010 resume
             emit. ``None`` leaves the resume emit dormant (unit tiers).
+        priors_reader: The boot-scoped :class:`PriorsReader` every gate
+            activation path reads through
+            (:mod:`forge.cli._serve_gate_activation`). REQUIRED with no
+            default — the no-silent-fallback seam, deliberate: the
+            composition root must decide explicitly between the
+            fleet-memory reader and the degraded
+            :class:`~forge.gating.degraded.EmptyPriorsReader`; omitting
+            it is a ``TypeError``, never a quiet empty read.
     """
 
     publisher: ApprovalPublisher
@@ -136,6 +144,7 @@ class ApprovalGateParts:
     approval_config: "ApprovalConfig"
     expected_approver: str | None
     emitter: "PipelineLifecycleEmitter | None"
+    priors_reader: "PriorsReader"
 
 
 _bound_gate_parts: ApprovalGateParts | None = None
@@ -174,6 +183,7 @@ def build_approval_gate_parts(
     client: Any,
     forge_config: "ForgeConfig",
     *,
+    priors_reader: "PriorsReader",
     emitter: "PipelineLifecycleEmitter | None" = None,
     bridge_registry: "BridgeRegistry | None" = None,
     repository: "GateRepository | None" = None,
@@ -188,6 +198,12 @@ def build_approval_gate_parts(
             ``_run_serve``; ASSUM-011 single-client).
         forge_config: Validated :class:`ForgeConfig`; supplies the
             ``approval`` slice including ``expected_approver``.
+        priors_reader: The boot-scoped :class:`PriorsReader` threaded
+            onto the parts for every gate activation path. Production
+            composes it via
+            :func:`forge.adapters.fleet_memory.build_priors_reader_from_env`
+            (env-gated; ``EmptyPriorsReader`` when memory is OFF); unit
+            tiers pin ``EmptyPriorsReader()`` or a sentinel double.
         emitter: The compose closure's :class:`PipelineLifecycleEmitter`
             (same publisher instance as the bridge wireup). Threaded to
             :func:`make_gate_check_deps` for the resume emit.
@@ -278,6 +294,7 @@ def build_approval_gate_parts(
         approval_config=approval_config,
         expected_approver=expected_approver,
         emitter=emitter,
+        priors_reader=priors_reader,
     )
 
 

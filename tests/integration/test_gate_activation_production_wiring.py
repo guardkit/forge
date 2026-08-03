@@ -52,6 +52,7 @@ from forge.cli._serve_gate_activation import (
 from forge.cli.serve import build_conductor_router
 from forge.config.models import ForgeConfig
 from forge.lifecycle.modes import BuildMode
+from forge.gating.degraded import EmptyPriorsReader
 from forge.gating.identity import derive_request_id
 from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
 from forge.gating.wrappers import REASON_MAX_WAIT, GateOutcome
@@ -259,6 +260,7 @@ def _build_parts(
     parts = build_approval_gate_parts(
         nats,
         cfg,
+        priors_reader=EmptyPriorsReader(),
         emitter=emitter,
         repository=None,
         bridge_registry=None,

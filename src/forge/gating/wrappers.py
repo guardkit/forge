@@ -219,10 +219,13 @@ class PausedBuildSnapshot:
 
 @runtime_checkable
 class PriorsReader(Protocol):
-    """Reads priors from Graphiti for a given target.
+    """Reads priors from the memory store for a given target.
 
-    Production wiring: ``forge.adapters.graphiti.read_priors``. Tests
-    inject a coroutine that returns a deterministic list.
+    Production wiring:
+    :class:`forge.adapters.fleet_memory.FleetMemoryPriorsReader`
+    (env-gated at serve compose; degraded composition injects
+    :class:`forge.gating.degraded.EmptyPriorsReader`). Tests inject a
+    coroutine that returns a deterministic list.
     """
 
     async def read_priors(  # pragma: no cover - protocol stub
