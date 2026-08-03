@@ -76,6 +76,7 @@ __all__ = [
     "ModeCTerminal",
     "ModeCTerminalDecision",
     "RATIONALE_FAILED_ALL_WORK_FAILED",
+    "RATIONALE_FAILED_REVIEW_LEG",
     "build_session_outcome_payload",
     "build_task_work_attribution",
     "evaluate_terminal",
@@ -104,6 +105,13 @@ _FAILED_STATUSES: frozenset[str] = frozenset({"failed", "rejected", "cancelled"}
 #: ``hard_stop`` from a generic ``rejected``.
 _REVIEW_FAILURE_STATUSES: frozenset[str] = frozenset({"failed", "rejected"})
 
+#: The one status in :data:`_REVIEW_FAILURE_STATUSES` that means THE LEG
+#: ITSELF fell over, as opposed to a gate's verdict on a review that ran.
+#: The projection maps a ``FAILED`` ``stage_log`` row here and a
+#: ``GATED``/``HARD_STOP`` row to ``rejected``, so the split is already
+#: recorded durably — this constant is where it is finally read.
+_STATUS_LEG_FAILED: str = "failed"
+
 
 # ---------------------------------------------------------------------------
 # Stage-log rationale strings
@@ -128,6 +136,24 @@ _RATIONALE_FAILED_HARD_STOP: str = "mode-c-task-review-hard-stop"
 #: Rationale string recorded on a ``/task-review`` reject/failure
 #: terminal status that is **not** a hard-stop (AC-005).
 _RATIONALE_FAILED_REVIEW_REJECTED: str = "mode-c-task-review-rejected"
+
+#: Rationale string recorded when the latest ``/task-review`` LEG ITSELF
+#: failed — the leg-result-honesty terminal (2026-08-03).
+#:
+#: The TOOLING-FAULT TWIN of :data:`RATIONALE_FAILED_ALL_WORK_FAILED`, and
+#: named for the same reason that one is: a reviewer that exited non-zero,
+#: or that emitted no readable findings block, did not *reject* anything.
+#: It never spoke. Recording that as ``mode-c-task-review-rejected`` sends
+#: a diagnoser hunting a review verdict that was never reached, and — worse
+#: — it reads identically to a review that ran and found the work wanting.
+#: ``rejected`` remains the word for a gate's verdict on a review that DID
+#: run (``stage_log`` ``GATED`` + ``HARD_STOP``, projected as ``rejected``);
+#: this is the word for the leg falling over.
+#:
+#: PUBLIC because the operator-facing sentence has to be greppable from a
+#: run report, a ``stage_log`` row and ``builds.error`` alike — one
+#: sentence, one place.
+RATIONALE_FAILED_REVIEW_LEG: str = "mode-c-task-review-leg-failed"
 
 #: Rationale string recorded when every dispatched ``/task-work``
 #: ended in a failed terminal lifecycle (AC-005).
@@ -374,12 +400,29 @@ async def evaluate_terminal(
         )
 
     # 3 — rejected / failed review without hard-stop flag.
+    #
+    # TWO OUTCOMES, NOT ONE (leg-result honesty, 2026-08-03). ``rejected``
+    # is a gate's verdict on a review that RAN. ``failed`` is the leg
+    # falling over — a refusal banner, a non-zero exit, or no readable
+    # findings block at all — and that is a TOOLING FAULT, the twin of the
+    # all-work-failed terminal. Naming both "rejected" sent a diagnoser
+    # hunting a review verdict that was never reached. The reason carried
+    # is the row's own — the leg's banner and output tail — because the
+    # journey's stop has to say what stopped it.
     if latest_review.status in _REVIEW_FAILURE_STATUSES:
+        leg_failed = latest_review.status == _STATUS_LEG_FAILED
+        reason = f"/task-review {latest_review.status}"
+        if latest_review.failure_reason:
+            reason = f"{reason}: {latest_review.failure_reason}"
         return ModeCTerminalDecision(
             outcome=ModeCTerminal.FAILED,
             has_commits=False,
-            rationale=_RATIONALE_FAILED_REVIEW_REJECTED,
-            failure_reason=f"/task-review {latest_review.status}",
+            rationale=(
+                RATIONALE_FAILED_REVIEW_LEG
+                if leg_failed
+                else _RATIONALE_FAILED_REVIEW_REJECTED
+            ),
+            failure_reason=reason,
         )
 
     # The review is approved (non-terminal statuses like "pending" /

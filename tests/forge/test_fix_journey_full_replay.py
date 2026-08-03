@@ -106,6 +106,14 @@ class FakeGuardKit:
     (a clean review). Those artefact paths are what the real ``fix_tasks``
     producer reads, so the fan-out under test is driven by the same signal
     production reads.
+
+    **Every review also emits its findings block** — populated on the
+    first, EMPTY on the follow-up. That is not decoration: since the
+    leg-result-honesty rule (2026-08-03) a review leg that emits no
+    readable ``## Detection Findings`` block is a FAILED leg, because a
+    reviewer that says nothing has not conducted a clean review. An empty
+    block IS the clean review, and it is what a real leg emits when it
+    looked and found nothing.
     """
 
     def __init__(self, worktree: Path) -> None:
@@ -117,11 +125,21 @@ class FakeGuardKit:
         self.calls.append(kwargs)
         subcommand = kwargs["subcommand"]
         artefacts: list[str] = []
+        findings: list[dict[str, Any]] | None = None
         if subcommand == "task-review":
             self._reviews += 1
+            findings = []
             if self._reviews == 1:
                 artefacts = [
                     str(self.worktree / "tasks" / f"{t}.yaml") for t in FIX_TASKS
+                ]
+                findings = [
+                    {
+                        "file": f"src/drf/{t.lower()}.py",
+                        "severity": "high",
+                        "summary": f"the defect {t} names",
+                    }
+                    for t in FIX_TASKS
                 ]
         elif subcommand == "task-work":
             argv = kwargs["args"]
@@ -135,6 +153,7 @@ class FakeGuardKit:
             stderr="",
             duration_secs=1.0,
             artefacts=artefacts,
+            detection_findings=findings,
             warnings=[],
         )
 

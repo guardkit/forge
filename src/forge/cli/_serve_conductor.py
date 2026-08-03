@@ -1088,20 +1088,99 @@ def make_conductor_failure_pack_writer(
     return write
 
 
+#: ``ModeCTerminalDecision.outcome`` token meaning the journey FAILED. The
+#: handler's other terminal tokens all begin ``clean-review-``; matched on
+#: the lowercased word so this composition seam keeps no import edge to the
+#: terminal-handler package (the same duck-typing the driver uses).
+_TERMINAL_TOKEN_FAILED: str = "failed"
+
+#: Prefix of the handler's two SUCCESS terminals
+#: (``clean-review-no-fixes`` / ``clean-review-no-commits``): the journey
+#: finished, there is nothing to merge, and the row is COMPLETE.
+_TERMINAL_TOKEN_CLEAN_PREFIX: str = "clean-review"
+
+
+#: The turn outcome that says "this journey is over". Read as a word for
+#: the same no-import-edge reason as the tokens above.
+_TURN_OUTCOME_TERMINAL: str = "terminal"
+
+#: What the close-out returns when the report carries a terminal turn whose
+#: decision it cannot read. Not a real handler outcome — it is the word the
+#: unknown branch NAMES, so the stuck row becomes a legible failure rather
+#: than an invisible one.
+TERMINAL_TOKEN_UNREADABLE: str = "unreadable-terminal"
+
+
+def _terminal_decision_token(report: Any) -> str | None:
+    """The journey's terminal outcome as a word, or ``None`` to leave the row.
+
+    ``None`` means "not this seam's to adjudicate" — chiefly the merge-card
+    path, whose row is written by the gate's own state machine. Racing that
+    writer is how a healthy build gets a false terminal (the FTR lesson),
+    so the close-out declines to guess there.
+
+    A TERMINAL turn whose decision is missing or shapeless answers
+    :data:`TERMINAL_TOKEN_UNREADABLE` rather than ``None``: the journey IS
+    over (the supervisor's own fallback path produces exactly this when the
+    terminal handler raises), and leaving that row RUNNING is the defect
+    this whole seam exists to end.
+    """
+    decision = getattr(report, "dispatch_result", None)
+    if decision is not None and hasattr(decision, "card_published"):
+        return None
+
+    raw = getattr(decision, "outcome", None) if decision is not None else None
+    token = (
+        str(getattr(raw, "value", None) or raw).strip().lower()
+        if raw is not None
+        else ""
+    )
+    if token:
+        return token
+
+    turn = getattr(report, "outcome", None)
+    turn_token = str(getattr(turn, "value", None) or turn or "").strip().lower()
+    if turn_token == _TURN_OUTCOME_TERMINAL:
+        return TERMINAL_TOKEN_UNREADABLE
+    return None
+
+
 def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
     """Build the driver's ``close_out`` seam — the journey's last write.
 
-    Records one ``conductor-close-out`` ``stage_log`` row naming how the
-    journey ended. Deliberately does NOT transition the build row: the
-    terminal transitions on this estate are owned by the lifecycle bridge
-    and the gate's own state machine, and a second writer racing them is
-    how a healthy build gets a false terminal (the FTR lesson). The
-    conductor records; it does not adjudicate.
+    Two writes, in this order:
+
+    1. One ``conductor-close-out`` ``stage_log`` row naming how the journey
+       ended (unchanged).
+    2. **The build row's terminal transition.** COMPLETE on the journey's
+       success terminals, FAILED with the reason on every other one.
+
+    The second write is the 2026-08-03 correction. The seam previously
+    recorded and stopped, on the reasoning that "terminal transitions on
+    this estate are owned by the lifecycle bridge and the gate's own state
+    machine". True of the merge-card path — and false of every terminal the
+    conductor reaches WITHOUT publishing a card, which is all three of the
+    silent ones (§c.6: a clean review, a no-commit ending, a tooling
+    fault). Nobody owned those, so nobody wrote them: the first production
+    fix journey reached its terminal, logged "closed out", and left
+    ``builds.status = RUNNING`` with an empty ``error`` forever.
+
+    The card path is still left alone — :func:`_terminal_decision_token`
+    answers ``None`` for it — so the FTR lesson keeps its force exactly
+    where it applies.
+
+    The transition goes through :func:`forge.cli._conductor_outcome.finish_mode_c_build`,
+    the one careful writer: it refuses to touch an already-terminal row,
+    never raises, and composes legal hops so ``apply_transition`` stays the
+    sole writer of ``builds.status``.
     """
+    from forge.cli._conductor_outcome import finish_mode_c_build
     from forge.lifecycle.persistence import StageLogEntry
+    from forge.lifecycle.state_machine import BuildState
 
     def close_out(*, build_id: str, report: Any) -> None:
         now = datetime.now(timezone.utc)
+        rationale = getattr(report, "rationale", "") or ""
         try:
             pool.record_stage(
                 StageLogEntry(
@@ -1120,7 +1199,7 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
                         "outcome": getattr(
                             getattr(report, "outcome", None), "value", None
                         ),
-                        "rationale": getattr(report, "rationale", "") or "",
+                        "rationale": rationale,
                     },
                 )
             )
@@ -1133,7 +1212,58 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
                 build_id,
             )
 
+        token = _terminal_decision_token(report)
+        if token is None:
+            logger.info(
+                "conductor close-out: build_id=%s ended on an outcome this "
+                "seam does not adjudicate (no Mode C terminal decision on the "
+                "report) — leaving builds.status to its own writer",
+                build_id,
+            )
+            return
+
+        if token.startswith(_TERMINAL_TOKEN_CLEAN_PREFIX):
+            to_state = BuildState.COMPLETE
+        elif token == _TERMINAL_TOKEN_FAILED:
+            to_state = BuildState.FAILED
+        else:
+            # An outcome word this seam has never seen. Leaving the row
+            # RUNNING is the failure this whole change exists to end, and
+            # guessing COMPLETE would claim a delivery — so it is FAILED,
+            # and the reason names the unknown word rather than hiding it.
+            logger.error(
+                "conductor close-out: build_id=%s reached terminal outcome "
+                "%r, which this seam does not recognise — marking the row "
+                "FAILED and naming the word rather than leaving it RUNNING",
+                build_id,
+                token,
+            )
+            to_state = BuildState.FAILED
+
+        summary = _one_line(rationale) or f"fix journey terminal: {token}"
+        finish_mode_c_build(
+            pool,
+            build_id,
+            to_state=to_state,
+            summary=summary,
+            what="the fix journey's terminal close-out",
+            log=logger,
+        )
+
     return close_out
+
+
+#: ``builds.error`` is a one-line column and ``forge status`` renders it in
+#: a table cell. The terminal rationale can carry a multi-line leg banner.
+_ERROR_COLUMN_LIMIT: int = 500
+
+
+def _one_line(text: str) -> str:
+    """Collapse ``text`` to one trimmed line for ``builds.error``."""
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) > _ERROR_COLUMN_LIMIT:
+        return collapsed[: _ERROR_COLUMN_LIMIT - 1] + "…"
+    return collapsed
 
 
 def make_conductor_subscribe_resume(

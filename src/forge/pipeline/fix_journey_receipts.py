@@ -89,16 +89,28 @@ def fix_journey_receipts_root(receipts_root: "Path | str | None" = None) -> Path
     """Resolve the durable receipts root, with the root injectable.
 
     Args:
-        receipts_root: Explicit root. ``None`` (production) defers to the
-            routine path's own resolution
+        receipts_root: Explicit root, for tests and for an operator who
+            wants this journey's pack somewhere specific. ``None``
+            (production) defers to the routine path's own resolution
             (:func:`forge.subagents.autobuild_runner._receipts_root` —
-            ``$FORGE_RECEIPTS_DIR`` else ``~/forge-state/receipts``), so
-            there is exactly ONE path law in the tree and this module
-            does not get to disagree with it.
+            ``$FORGE_RECEIPTS_DIR``, else the bound state root when that
+            mount is present, else ``~/forge-state/receipts``), so there is
+            exactly ONE path law in the tree and this module does not get
+            to disagree with it.
+
+            **The deferral is load-bearing, and 2026-08-03 proved it in the
+            wrong direction.** The fix journey runs INSIDE forge-prod,
+            where the host's ``~/forge-state`` is bound at ``/var/forge``
+            and NOT same-path; the home-derived default therefore resolved
+            to a container-local directory bound to nothing, and the first
+            production journey's receipts were written there and lost. The
+            cure went into the shared resolver rather than into a second
+            rule here — a fix journey writing its receipts somewhere the
+            routine path does not read would be the same defect wearing a
+            different path.
 
     Returns:
-        The receipts root as a :class:`~pathlib.Path`. Path arithmetic
-        only — never touches disk, never raises.
+        The receipts root as a :class:`~pathlib.Path`. Never raises.
     """
     if receipts_root is not None:
         return Path(receipts_root).expanduser()

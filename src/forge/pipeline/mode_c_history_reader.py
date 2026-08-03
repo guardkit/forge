@@ -107,6 +107,7 @@ __all__ = [
     "FIX_TASK_ID_DETAILS_KEY",
     "LIFECYCLE_STATE_DETAILS_KEY",
     "MODE_C_STAGE_LABELS",
+    "RATIONALE_DETAILS_KEY",
     "ProjectionError",
     "SqliteModeCHistoryReader",
     "derive_finding_anchors",
@@ -265,6 +266,7 @@ def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | No
         )
 
     status, hard_stop = _project_status(row, details)
+    failure_reason = _project_failure_reason(details, status=status)
 
     if stage_class is StageClass.TASK_REVIEW:
         return StageEntry(
@@ -273,6 +275,7 @@ def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | No
             fix_tasks=_project_fix_tasks(details, status=status, subject_task_id=subject_task_id),
             finding_anchors=_project_finding_anchors(details),
             hard_stop=hard_stop,
+            failure_reason=failure_reason,
         )
 
     return StageEntry(
@@ -280,6 +283,7 @@ def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | No
         status=status,
         fix_task_id=_project_fix_task_id(details),
         hard_stop=hard_stop,
+        failure_reason=failure_reason,
     )
 
 
@@ -434,6 +438,44 @@ def _project_finding_anchors(details: Mapping[str, Any]) -> tuple[str, ...] | No
         if text not in anchors:
             anchors.append(text)
     return tuple(anchors)
+
+
+#: ``details_json`` key carrying a dispatch's own account of itself. On a
+#: failed subprocess leg it holds the leg's banner and output tail verbatim
+#: (composed by ``dispatchers/subprocess.py``), which is the only durable
+#: place the leg's own words survive to the terminal.
+RATIONALE_DETAILS_KEY: str = "rationale"
+
+#: Upper bound on the carried reason. ``builds.error`` is a one-line column
+#: and a run report is read by a human; a 4 KB output tail belongs in the
+#: row it was written on, not smeared across every downstream sentence.
+_FAILURE_REASON_LIMIT: int = 600
+
+
+def _project_failure_reason(
+    details: Mapping[str, Any], *, status: str
+) -> str | None:
+    """Carry a FAILED row's own reason forward (leg-result honesty).
+
+    Only for rows the planner reads as failed — an approved row's rationale
+    is a success sentence ("task-review completed in 1.2s with 0 artefact
+    path(s)") and carrying it would put cheerful text on a terminal.
+
+    Never parsed, never branched on: the reason is threaded through to the
+    terminal handler so the stop can NAME what stopped it. Trimmed to
+    :data:`_FAILURE_REASON_LIMIT` because ``builds.error`` is one line.
+    """
+    if status != _FAILED:
+        return None
+    raw = details.get(RATIONALE_DETAILS_KEY)
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.split())
+    if not text:
+        return None
+    if len(text) > _FAILURE_REASON_LIMIT:
+        return text[: _FAILURE_REASON_LIMIT - 1] + "…"
+    return text
 
 
 def _project_fix_task_id(details: Mapping[str, Any]) -> str:

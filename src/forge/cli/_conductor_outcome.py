@@ -50,11 +50,21 @@ smaller, safer diff.
 One rule, one writer
 --------------------
 
-:func:`fail_mode_c_build` is the ONE writer of "this mode-c build is
-refused: mark it FAILED with the reason on the row". The router's cap
-belt, the router's per-build setup arm, the dispatch launch arm and the
-boot-rearm resume launcher all go through it, each passing its own logger
-so the message still names the seam it came from.
+:func:`finish_mode_c_build` is the ONE writer that moves a mode-c row to a
+terminal state, and :func:`fail_mode_c_build` is its FAILED-shaped face —
+the phrasing four callers already use ("this mode-c build is refused: mark
+it FAILED with the reason on the row"). The router's cap belt, the
+router's per-build setup arm, the dispatch launch arm and the boot-rearm
+resume launcher all go through it, each passing its own logger so the
+message still names the seam it came from.
+
+The journey's own close-out (:func:`forge.cli._serve_conductor.make_conductor_close_out`)
+is the fifth caller and the reason the general form exists: a journey that
+ends CLEAN needs the same careful writer pointed at ``COMPLETE``. Before
+it, the close-out wrote a ``stage_log`` row and nothing else, so a fix
+journey that reached its terminal left ``builds.status = RUNNING`` with an
+empty ``error`` — forever (observed on the first production journey,
+2026-08-03).
 """
 
 from __future__ import annotations
@@ -72,6 +82,7 @@ __all__ = [
     "TakenTerminal",
     "check_router_outcome",
     "fail_mode_c_build",
+    "finish_mode_c_build",
     "is_mode_c_build",
 ]
 
@@ -219,38 +230,44 @@ def is_mode_c_build(pool: Any, build_id: str, *, log: logging.Logger) -> bool:
     return getattr(row, "mode", None) is BuildMode.MODE_C
 
 
-def fail_mode_c_build(
+def finish_mode_c_build(
     pool: Any,
     build_id: str,
     *,
+    to_state: Any,
     summary: str,
     what: str,
     log: logging.Logger,
 ) -> str:
-    """Mark ``build_id`` FAILED with ``summary`` and return the terminal reason.
+    """Move ``build_id`` to ``to_state`` and return the terminal reason.
 
-    THE one writer of the refusal (see the module docstring). Composed
-    through
+    THE one writer that takes a mode-c row terminal (see the module
+    docstring). Composed through
     :func:`~forge.lifecycle.state_machine.transition_chain` so
     ``apply_transition`` stays the sole writer of ``builds.status`` (a
-    ``QUEUED`` row reaches ``FAILED`` via the legal ``PREPARING`` hop).
+    ``QUEUED`` row reaches ``FAILED`` via the legal ``PREPARING`` hop, a
+    ``RUNNING`` one reaches ``COMPLETE`` via ``FINALISING``).
 
     Never raises. Each degraded arm — no row, an already-terminal row, an
     unwritable row — is logged loudly AND named in the returned reason,
-    so the ``build-failed`` the caller emits says exactly what happened
-    rather than claiming a clean refusal that did not land.
+    so the event the caller emits says exactly what happened rather than
+    claiming a transition that did not land.
 
     Args:
         pool: The lifecycle persistence facade.
-        build_id: The build being refused.
-        summary: The ONE-LINE refusal that goes on ``builds.error``
+        build_id: The build being finished.
+        to_state: Target :class:`~forge.lifecycle.state_machine.BuildState`.
+        summary: The ONE-LINE sentence that goes on ``builds.error``
             (multi-line essays belong in the log, not a database column).
-        what: Short phrase naming the refusing seam, for the log.
+            NOT written when ``to_state`` is ``COMPLETE``: the column is
+            what ``forge status`` renders as the failure text, and a
+            successful row carrying prose there reads as a failure to
+            every human and every dashboard. It is still logged.
+        what: Short phrase naming the calling seam, for the log.
         log: The caller's logger.
 
     Returns:
-        The reason to carry on the :class:`TakenTerminal` — ``summary``,
-        annotated when the row write degraded.
+        ``summary``, annotated when the row write degraded.
     """
     from forge.lifecycle.persistence import Build
     from forge.lifecycle.state_machine import BuildState, transition_chain
@@ -261,17 +278,19 @@ def fail_mode_c_build(
         BuildState.CANCELLED,
         BuildState.SKIPPED,
     )
+    target = getattr(to_state, "value", to_state)
     try:
         row = pool.get_build_row(build_id)
         if row is None:
             log.error(
                 "conductor: %s for build_id=%s but no build row exists to "
-                "mark FAILED; the refusal stands (nothing was spawned) but "
-                "it is recorded only in this log",
+                "mark %s; the outcome stands but it is recorded only in "
+                "this log",
                 what,
                 build_id,
+                target,
             )
-            return f"{summary} (no builds row existed to mark FAILED)"
+            return f"{summary} (no builds row existed to mark {target})"
         current = row.status
         if current in terminal:
             log.warning(
@@ -282,22 +301,60 @@ def fail_mode_c_build(
                 current.value,
             )
             return f"{summary} (the row was already terminal: {current.value})"
+        fields: dict[str, Any] = (
+            {} if to_state is BuildState.COMPLETE else {"error": summary}
+        )
         for hop in transition_chain(
-            Build(build_id=build_id, status=current),
-            BuildState.FAILED,
-            error=summary,
+            Build(build_id=build_id, status=current), to_state, **fields
         ):
             pool.apply_transition(hop)
-    except Exception as exc:  # noqa: BLE001 — the refusal must still hold
-        log.error(
-            "conductor: could not mark build_id=%s FAILED after %s (%s: %s). "
-            "The journey was NOT opened and the build was NOT downgraded "
-            "onto the routine path; the row may be left mid-flight and "
-            "needs a hand",
+        log.info(
+            "conductor: build_id=%s marked %s after %s — %s",
             build_id,
+            target,
+            what,
+            summary,
+        )
+    except Exception as exc:  # noqa: BLE001 — the outcome must still hold
+        log.error(
+            "conductor: could not mark build_id=%s %s after %s (%s: %s). "
+            "The row may be left mid-flight and needs a hand",
+            build_id,
+            target,
             what,
             type(exc).__name__,
             exc,
         )
-        return f"{summary} (the row could NOT be marked FAILED and needs a hand)"
+        return f"{summary} (the row could NOT be marked {target} and needs a hand)"
     return summary
+
+
+def fail_mode_c_build(
+    pool: Any,
+    build_id: str,
+    *,
+    summary: str,
+    what: str,
+    log: logging.Logger,
+) -> str:
+    """Mark ``build_id`` FAILED with ``summary`` and return the terminal reason.
+
+    The refusal-shaped face of :func:`finish_mode_c_build`. Kept as its own
+    name because four call sites read as refusals, and "fail this build"
+    is what they mean; the FAILED target is not a parameter they should
+    have to spell.
+
+    Returns:
+        The reason to carry on the :class:`TakenTerminal` — ``summary``,
+        annotated when the row write degraded.
+    """
+    from forge.lifecycle.state_machine import BuildState
+
+    return finish_mode_c_build(
+        pool,
+        build_id,
+        to_state=BuildState.FAILED,
+        summary=summary,
+        what=what,
+        log=log,
+    )
