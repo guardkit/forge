@@ -26,7 +26,6 @@ from forge.cli import serve as serve_mod
 from forge.cli import _serve_conductor as serve_conductor_mod
 from forge.cli._conductor_outcome import DECLINED, TakenTerminal
 from forge.cli._serve_conductor import (
-    CONDUCTOR_LEG_MODEL_ENV,
     CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS,
     CONDUCTOR_STAGE_TIMEOUT_SECONDS,
     CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS,
@@ -43,6 +42,11 @@ from forge.pipeline.stage_taxonomy import StageClass
 
 BUILD_ID = "build-FEAT-FIX007-20260731"
 
+#: The fix journey's seat, config-as-code (conductor-activation design
+#: pass §2). ``conductor.enabled: true`` with no seat REFUSES at config
+#: load, so every switched-on config in this module names one.
+SEAT = "qwen3-coder-30b"
+
 
 def _config(*, conductor_on: bool) -> ForgeConfig:
     raw: dict[str, Any] = {
@@ -53,7 +57,7 @@ def _config(*, conductor_on: bool) -> ForgeConfig:
         "permissions": {"filesystem": {"allowlist": ["/work"]}},
     }
     if conductor_on:
-        raw["conductor"] = {"enabled": True}
+        raw["conductor"] = {"enabled": True, "seat": SEAT}
     return ForgeConfig.model_validate(raw)
 
 
@@ -219,18 +223,35 @@ class TestTheLegTripwires:
         assert [call["timeout_seconds"] for call in runner.calls] == [600, 1800]
 
 
-class TestTheLegSeatEnvThread:
-    """LI stage-2 §3.4 — the operator's stopgap seat thread.
+class TestTheLegSeatIsConfigAsCode:
+    """Conductor-activation design pass §2 — the seat, and the env DELETED.
 
-    Ledgered, not smuggled: the config-as-code field on ``ConductorConfig``
-    is Rich's ruling at conductor activation. Until then this env var is
-    the ONE way the pipeline can name the seat a leg runs on.
+    LI stage-2 landed the seat as a stopgap operator env var and ledgered
+    its own replacement: "When that field lands, this env read is DELETED,
+    not kept beside it: two statements of one rule is a future lie." The
+    field landed as ``conductor.seat``; these are the env thread's
+    config-sourced equivalents, plus the pin that the env is gone.
     """
 
-    def test_no_env_means_the_argv_names_no_model_at_all(
+    def test_the_env_thread_is_gone_not_kept_beside_the_field(self) -> None:
+        """The ledger comment's own law, enforced structurally.
+
+        Two statements of one rule is a future lie — so the constant, the
+        export and the read must all be absent, and a stale
+        ``FORGE_CONDUCTOR_LEG_MODEL`` in an operator's environment must
+        change NOTHING.
+        """
+        source = Path(serve_conductor_mod.__file__).read_text(encoding="utf-8")
+
+        assert not hasattr(serve_conductor_mod, "CONDUCTOR_LEG_MODEL_ENV")
+        assert "CONDUCTOR_LEG_MODEL_ENV" not in serve_conductor_mod.__all__
+        assert "os.environ" not in source
+
+    def test_a_stale_env_var_no_longer_seats_a_leg(
         self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(CONDUCTOR_LEG_MODEL_ENV, raising=False)
+        """The deleted thread, driven — an operator's leftover export is inert."""
+        monkeypatch.setenv("FORGE_CONDUCTOR_LEG_MODEL", "some-stale-seat")
         runner = _runner()
         supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
 
@@ -238,30 +259,115 @@ class TestTheLegSeatEnvThread:
 
         assert "--model" not in runner.calls[0]["args"]
 
-    def test_the_env_names_the_seat_on_a_fix_journey_dispatch(
-        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    def test_no_seat_means_the_argv_names_no_model_at_all(
+        self, pool: SqliteLifecyclePersistence
     ) -> None:
-        monkeypatch.setenv(CONDUCTOR_LEG_MODEL_ENV, "qwen3-coder-30b")
+        """The disabled-conductor argv, byte-identical to what it always was."""
         runner = _runner()
-        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+        supervisor = _supervisor_factory(
+            pool, subprocess_runner=runner, leg_model=None
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        assert "--model" not in runner.calls[0]["args"]
+
+    def test_the_config_seat_names_the_seat_on_both_legs(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """One seat serves both legs — today's reality, pinned."""
+        config = _config(conductor_on=True)
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool,
+            config=config,
+            subprocess_runner=runner,
+            leg_model=config.conductor.seat,
+        )(BUILD_ID)
 
         _drive(supervisor, StageClass.TASK_REVIEW)
         _drive(supervisor, StageClass.TASK_WORK)
 
+        assert len(runner.calls) == 2
         for call in runner.calls:
-            assert call["args"][-2:] == ["--model", "qwen3-coder-30b"]
+            assert call["args"][-2:] == ["--model", SEAT]
 
-    def test_a_blank_env_is_read_as_unset_not_as_an_empty_seat(
-        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    def test_a_blank_seat_is_read_as_unset_not_as_an_empty_seat(
+        self, pool: SqliteLifecyclePersistence
     ) -> None:
-        """``--model ''`` would be worse than no flag: a named nothing."""
-        monkeypatch.setenv(CONDUCTOR_LEG_MODEL_ENV, "   ")
+        """``--model ''`` would be worse than no flag: a named nothing.
+
+        The config model already normalises blank to ``None``; the factory
+        keeps the same posture so an injected blank cannot reach the argv.
+        """
         runner = _runner()
-        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+        supervisor = _supervisor_factory(
+            pool, subprocess_runner=runner, leg_model="   "
+        )(BUILD_ID)
 
         _drive(supervisor, StageClass.TASK_REVIEW)
 
         assert "--model" not in runner.calls[0]["args"]
+
+    def test_the_production_composition_root_threads_the_config_seat(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The edited call site itself — not a re-statement of the wiring.
+
+        This is the seam the whole field exists for: the daemon's own
+        ``_compose_conductor_router`` must hand the factory
+        ``config.conductor.seat``. Capture the factory's kwargs at the
+        real production call.
+        """
+        captured: dict[str, Any] = {}
+        original = serve_conductor_mod.build_conductor_supervisor_factory
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        serve_conductor_mod.build_conductor_supervisor_factory = _capture  # type: ignore[assignment]
+        try:
+            serve_mod._compose_conductor_router(
+                sqlite_pool=pool,
+                forge_config=_config(conductor_on=True),
+                lifecycle_emitter=None,
+                gate_parts=None,
+                gate_repository=None,
+                gate_state_machine=None,
+                clock=lambda: None,
+            )
+        finally:
+            serve_conductor_mod.build_conductor_supervisor_factory = original  # type: ignore[assignment]
+
+        assert captured["leg_model"] == SEAT
+
+    def test_a_disabled_boot_threads_no_seat(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Flag off = no seat on the wire, so the argv cannot drift."""
+        captured: dict[str, Any] = {}
+        original = serve_conductor_mod.build_conductor_supervisor_factory
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        serve_conductor_mod.build_conductor_supervisor_factory = _capture  # type: ignore[assignment]
+        try:
+            serve_mod._compose_conductor_router(
+                sqlite_pool=pool,
+                forge_config=_config(conductor_on=False),
+                lifecycle_emitter=None,
+                gate_parts=None,
+                gate_repository=None,
+                gate_state_machine=None,
+                clock=lambda: None,
+            )
+        finally:
+            serve_conductor_mod.build_conductor_supervisor_factory = original  # type: ignore[assignment]
+
+        assert captured["leg_model"] is None
 
 
 class TestTheM0Guard:
@@ -673,7 +779,7 @@ def _gates_config(repo_paths: "dict[str, str] | None" = None) -> ForgeConfig:
             "approved_originators": ["terminal"],
         },
         "permissions": {"filesystem": {"allowlist": ["/work"]}},
-        "conductor": {"enabled": True},
+        "conductor": {"enabled": True, "seat": SEAT},
     }
     if repo_paths is not None:
         raw["planning"] = {"target_repo_paths": repo_paths}

@@ -752,7 +752,7 @@ class TestDispatchWiring:
         cfg = ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
-                "conductor": {"enabled": True},
+                "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
             }
         )
         router = build_conductor_router(

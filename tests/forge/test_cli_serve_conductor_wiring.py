@@ -113,9 +113,14 @@ def _permissions() -> PermissionsConfig:
 
 
 def _config(*, enabled: bool) -> ForgeConfig:
+    # The seat is REQUIRED whenever the flag is on (conductor-activation
+    # design pass §2): ``ConductorConfig(enabled=True)`` with no seat
+    # refuses at config load, so an activated conductor here names one.
     return ForgeConfig(
         permissions=_permissions(),
-        conductor=ConductorConfig(enabled=enabled),
+        conductor=ConductorConfig(
+            enabled=enabled, seat="qwen3-coder-30b" if enabled else None
+        ),
     )
 
 

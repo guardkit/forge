@@ -185,7 +185,7 @@ class TestRouterIsNoneWhileTheFlagIsOff:
             permissions=PermissionsConfig(
                 filesystem=FilesystemPermissions(allowlist=[tmp_path]),
             ),
-            conductor=ConductorConfig(enabled=True),
+            conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
         )
         assert build_conductor_router(pool=persistence, config=config) is None
 
@@ -376,7 +376,7 @@ class TestRouterModeBranch:
             permissions=PermissionsConfig(
                 filesystem=FilesystemPermissions(allowlist=[tmp_path]),
             ),
-            conductor=ConductorConfig(enabled=True),
+            conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
         )
 
     @pytest.mark.asyncio

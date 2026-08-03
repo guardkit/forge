@@ -1481,6 +1481,11 @@ def _compose_conductor_router(
             "(never spin-poll), and a red gate stops as RED_GATE_STOP"
         )
 
+    # The SEAT, config-as-code (conductor-activation design pass §2). The
+    # env stopgap this used to fall through to is DELETED: the seat is a
+    # field on ``ConductorConfig``, and ``conductor.enabled: true`` with no
+    # seat refuses at config load — so a composed conductor always names
+    # its seat on every fix-journey leg's argv.
     supervisor_factory = build_conductor_supervisor_factory(
         pool=sqlite_pool,
         config=forge_config,
@@ -1491,6 +1496,7 @@ def _compose_conductor_router(
         lifecycle_emitter=lifecycle_emitter,
         publish_card=publish_card,
         gates_green_reader=gates_green_reader,
+        leg_model=forge_config.conductor.seat,
     )
     driver_deps_factory = build_conductor_driver_deps_factory(
         pool=sqlite_pool,
