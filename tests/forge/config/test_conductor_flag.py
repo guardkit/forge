@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from forge.config.conductor import (
     CONDUCTOR_FLAG_PATH,
@@ -164,21 +165,34 @@ class TestTheSeatIsRequired:
         assert ConductorConfig().seat is None
 
     def test_enabled_with_no_seat_refuses(self) -> None:
-        with pytest.raises(Exception):
+        """And the refusal is the VALIDATOR's, at the conductor section.
+
+        The shape matters as much as the raising: ``value_error`` located
+        at ``('conductor',)`` is the model validator speaking. A test that
+        accepted any ``Exception`` would still pass if the seat rule
+        vanished and some unrelated failure — a typo'd key, a yaml parse
+        error — took its place.
+        """
+        with pytest.raises(ValidationError) as excinfo:
             _config(_MINIMAL + "\nconductor:\n  enabled: true\n")
+
+        error = excinfo.value.errors()[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ("conductor",)
+        assert "conductor.seat" in str(excinfo.value)
 
     def test_enabled_with_a_blank_seat_refuses(self) -> None:
         """A named nothing is worse than no name: ``--model ''``."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _config(_MINIMAL + '\nconductor:\n  enabled: true\n  seat: "   "\n')
 
     def test_enabled_with_an_explicitly_null_seat_refuses(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _config(_MINIMAL + "\nconductor:\n  enabled: true\n  seat: null\n")
 
     def test_the_refusal_names_the_key_and_the_way_out(self) -> None:
         """An operator must not have to grep the source to fix their yaml."""
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(ValidationError) as excinfo:
             ConductorConfig(enabled=True)
         message = str(excinfo.value)
         assert "conductor.seat" in message
@@ -209,9 +223,53 @@ class TestTheSeatIsRequired:
             "qwen3-coder-30b"
         )
 
+    @pytest.mark.parametrize(
+        "option_shaped", ["--model", "-m", "--dangerously-skip-permissions", "  -x  "]
+    )
+    def test_an_option_shaped_seat_refuses_at_load(self, option_shaped: str) -> None:
+        """A seat starting with a dash is not a seat — it is another flag.
+
+        The value goes onto the leg's argv verbatim as ``--model <seat>``,
+        so ``seat: -m`` makes the build system's parser read the NEXT token
+        as an option's value, and ``seat: --dangerously-skip-permissions``
+        would pass a real flag nobody typed. Caught at config load, where a
+        malformed activation costs a boot refusal, rather than at the first
+        leg of a journey an owner already approved.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            ConductorConfig(enabled=True, seat=option_shaped)
+
+        error = excinfo.value.errors()[0]
+        assert error["type"] == "value_error"
+        message = str(excinfo.value)
+        assert "dash" in message
+        assert "--model" in message
+
+    def test_an_option_shaped_seat_refuses_even_while_disabled(self) -> None:
+        """Pre-loading the seat is supported, so the typo is caught THERE.
+
+        Flipping ``enabled`` must not be the moment an operator discovers
+        their seat was never a model name.
+        """
+        with pytest.raises(ValidationError):
+            ConductorConfig(enabled=False, seat="--model")
+        with pytest.raises(ValidationError):
+            _config(
+                _MINIMAL + "\nconductor:\n  enabled: false\n  seat: '-m'\n"
+            )
+
+    @pytest.mark.parametrize(
+        "seat", ["qwen3-coder-30b", "gpt-oss-120b", "a-b-c", "seat_with_underscores"]
+    )
+    def test_a_seat_with_dashes_inside_it_is_still_perfectly_valid(
+        self, seat: str
+    ) -> None:
+        """Only a LEADING dash is the problem — real fleet aliases carry them."""
+        assert ConductorConfig(enabled=True, seat=seat).seat == seat
+
     def test_the_section_still_rejects_unknown_fields_beside_the_seat(self) -> None:
         """The seat is a NEW key, not a hole in ``extra='forbid'``."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _config(
                 _MINIMAL
                 + "\nconductor:\n  enabled: true\n  seat: qwen3-coder-30b\n"
@@ -220,7 +278,7 @@ class TestTheSeatIsRequired:
 
     def test_a_seat_typo_refuses_rather_than_reading_as_unseated(self) -> None:
         """``seat_name:`` must not look like a working switch that does nothing."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _config(
                 _MINIMAL + "\nconductor:\n  enabled: true\n  seat_name: qwen3\n"
             )
@@ -248,16 +306,24 @@ class TestTheSeatIsRequired:
 
             conductor: _OldConductorConfig = _OldConductorConfig()
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError) as excinfo:
             _OldForgeConfig.model_validate(
                 yaml.safe_load(_ON)  # {"conductor": {"enabled": ..., "seat": ...}}
             )
+
+        # The shape IS the hazard: an ``extra_forbidden`` on the seat key
+        # itself. Accepting any exception would let this pass on a config
+        # that failed for some entirely different reason, and the runbook's
+        # deploy order rests on knowing exactly which key refuses.
+        error = excinfo.value.errors()[0]
+        assert error["type"] == "extra_forbidden"
+        assert error["loc"] == ("conductor", "seat")
 
     def test_the_loader_refuses_an_enabled_yaml_with_no_seat(self, tmp_path) -> None:
         """The daemon's own boot path, not just the model."""
         path = tmp_path / "forge.yaml"
         path.write_text(_MINIMAL + "\nconductor:\n  enabled: true\n")
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             load_config(path)
 
 

@@ -186,8 +186,31 @@ def _refuse(reason: str, *, log: logging.Logger) -> WorktreeRefused:
 
 
 def _normalise(path: Any) -> str:
-    """Absolute, ``..``-free string form — the containment comparison unit."""
+    """Absolute, ``..``-free string form — the CONTAINMENT comparison unit.
+
+    Deliberately does NOT resolve symlinks: this is the same spelling the
+    estate's own ``_normalise_root`` uses for the filesystem allowlist, and
+    the two must agree or a path this writer clears would be a path the
+    leg's cwd check then refuses (or vice versa). Identity comparisons use
+    :func:`_realpath` instead.
+    """
     return os.path.normpath(os.path.abspath(str(path)))
+
+
+def _realpath(path: Any) -> str:
+    """Symlink-resolved string form — the IDENTITY comparison unit.
+
+    ``git worktree list --porcelain`` reports the REALPATH of every
+    registration. So when a registered checkout is reached through a
+    symlink (a very ordinary estate shape — ``~/repos/x`` pointing at a
+    volume), the writer's own target path and git's answer are two
+    spellings of ONE directory, and a textual comparison calls them
+    different: the reuse arm then misses, the branch match fires, and every
+    redelivery of a build refuses as "branch busy at another path" — its
+    own tree mistaken for a stranger's. Both sides resolve here; the
+    allowlist check above stays on :func:`_normalise`.
+    """
+    return os.path.realpath(str(path))
 
 
 def _is_inside_allowlist(path: Path, allowlist: "list[Any]") -> bool:
@@ -261,6 +284,45 @@ def _ensure_forge_gitignore(forge_dir: Path) -> str | None:
     return None
 
 
+def _hollow_worktree_reason(
+    path: str, build_id: str, branch: str, checkout: Path
+) -> str | None:
+    """Is the reuse candidate a REAL checkout on disk, or only a record?
+
+    The reuse arm's match is made against ``git worktree list``, which
+    answers from the administrative records under ``.git/worktrees/`` —
+    records that outlive the directory they describe. Deleted by hand,
+    wiped by a cleanup script, lost with a tmpfs: the listing still names
+    the path, and this writer would hand back
+    :class:`WorktreeReady` for a tree that is not there.
+
+    Returns:
+        ``None`` when ``path`` is a directory containing a ``.git`` entry
+        (a linked worktree's ``.git`` is a FILE holding ``gitdir: …``, so
+        existence is the test, not directory-ness), else a one-line reason
+        naming the missing or hollow path and the recovery.
+    """
+    recovery = (
+        f"recover with 'git worktree prune' in {checkout} (and 'git branch -D "
+        f"{branch}' if the branch survives), then re-queue"
+    )
+    if not os.path.isdir(path):
+        return (
+            f"git still registers {path} as build_id={build_id}'s worktree on "
+            f"branch {branch}, but there is no such directory on disk — the "
+            "registration outlived the tree. Refusing rather than reporting a "
+            f"ready worktree the journey's first leg would not find; {recovery}"
+        )
+    if not os.path.exists(os.path.join(path, ".git")):
+        return (
+            f"git still registers {path} as build_id={build_id}'s worktree on "
+            f"branch {branch}, but that directory is hollow — it carries no "
+            "'.git' entry, so it is not a checkout git can work in. Refusing "
+            f"rather than reusing an empty shell of an earlier tree; {recovery}"
+        )
+    return None
+
+
 def _parse_worktree_list(porcelain: str) -> "list[tuple[str, str | None]]":
     """Parse ``git worktree list --porcelain`` into ``(path, branch)`` pairs.
 
@@ -311,8 +373,10 @@ async def prepare_journey_worktree(
     3. **Allowlist-check the target path at write time.**
     4. **The reuse arm** — ``git worktree list --porcelain`` in the
        canonical checkout, matched on path AND branch for THIS build.
-       A clean match is reuse (a redelivery must not fail on its own
-       earlier work); ANY other collision refuses loudly.
+       The path match resolves symlinks on BOTH sides (git reports
+       realpaths), and a match is only REUSE once the tree is proven on
+       disk — a directory carrying a ``.git`` entry. A registration
+       without its tree refuses loudly. ANY other collision refuses too.
     5. **The gitignore guard**, then ``prepare_worktree`` with
        ``create_branch=True`` off :data:`JOURNEY_BASE_REF`.
     6. **Record** through ``pool.record_worktree_path``. A recorded path
@@ -437,10 +501,25 @@ async def prepare_journey_worktree(
         )
 
     target_str = _normalise(target)
+    target_real = _realpath(target)
     for entry_path, entry_branch in _parse_worktree_list(listing.stdout or ""):
-        same_path = _normalise(entry_path) == target_str
+        # Identity, not containment: both sides symlink-resolved because
+        # git's porcelain always reports the realpath (see _realpath).
+        same_path = _realpath(entry_path) == target_real
         same_branch = entry_branch == branch
         if same_path and same_branch:
+            hollow = _hollow_worktree_reason(target_str, build_id, branch, checkout)
+            if hollow is not None:
+                # A REGISTRATION is not a tree. git keeps the administrative
+                # record in .git/worktrees/<id> long after the directory is
+                # deleted (or emptied) by hand, by a cleanup script, or by a
+                # tmpfs reboot — and 'git worktree add' then refuses the path
+                # as already registered, so re-materialising is not even
+                # available. Handing back reused=True here would report a
+                # ready tree onto builds.worktree_path and the journey would
+                # die several stages later, in the leg, with the real cause
+                # out of sight. Refuse loudly instead, in the lane's posture.
+                return _refuse(hollow, log=_log)
             _log.info(
                 "conductor worktree: build_id=%s already has its own worktree "
                 "at %s on %s — REUSING it (this is a redelivery of the same "

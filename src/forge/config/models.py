@@ -1020,13 +1020,15 @@ class ConductorConfig(BaseModel):
             "fleet alias (the workhorse seat is the evidenced default). "
             "REQUIRED whenever enabled is true — an unnamed seat would ride "
             "None down to a frontier default, and only the build system's "
-            "own chokepoint would stop it. Blank is read as absent."
+            "own chokepoint would stop it. Blank is read as absent, and a "
+            "value starting with '-' is refused (it would land on the leg's "
+            "argv as an option, not as a model name)."
         ),
     )
 
     @model_validator(mode="after")
     def _enabled_requires_a_seat(self) -> ConductorConfig:
-        """Refuse an activated conductor that names no seat.
+        """Refuse an activated conductor that names no seat — or a bad one.
 
         The cap law's posture, applied to the seat: an unset seat is
         REFUSED, never silently read as "the leg picks its own". The build
@@ -1042,6 +1044,20 @@ class ConductorConfig(BaseModel):
         composition root's long-standing strip-to-None posture — so
         ``config.conductor.seat`` is either absent or a real name, never a
         named nothing.
+
+        **And the seat must be SHAPED like a name.** The value lands
+        verbatim on the leg's argv as ``--model <seat>``, so a seat that
+        starts with ``-`` is not a seat at all: the build system's own
+        argument parser reads the next token as another OPTION, and the
+        result is either an unknown-flag error deep inside a spawned leg or
+        — worse — a real flag the operator never meant to pass. That is a
+        config mistake, and it is refused HERE, at load, for the same
+        reason the missing seat is: the daemon should refuse to boot on a
+        malformed activation rather than die on the first leg of a journey
+        an owner already approved. The check runs whenever a seat is named,
+        enabled or not, because pre-loading the seat and flipping the flag
+        later is a supported order and the flip must not be the moment the
+        typo is discovered.
         """
         normalised = (self.seat or "").strip() or None
         if normalised != self.seat:
@@ -1053,6 +1069,15 @@ class ConductorConfig(BaseModel):
                 "must name it on every dispatch; an unnamed seat falls through "
                 "to a frontier default. Add 'seat: <local model>' to the "
                 "conductor section, or set 'enabled: false'."
+            )
+        if normalised is not None and normalised.startswith("-"):
+            raise ValueError(
+                f"conductor.seat is {normalised!r}, which starts with a dash. "
+                "The seat is passed to every fix-journey leg as "
+                "'--model <seat>', so a leading dash makes it read as another "
+                "command-line option rather than as the name of a model. Name "
+                "the local model with no leading dash (for example "
+                "'seat: qwen3-coder-30b')."
             )
         return self
 

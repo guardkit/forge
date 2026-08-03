@@ -240,12 +240,36 @@ class TestTheLegSeatIsConfigAsCode:
         export and the read must all be absent, and a stale
         ``FORGE_CONDUCTOR_LEG_MODEL`` in an operator's environment must
         change NOTHING.
+
+        Pinned by NAME, not by banning ``os.environ`` module-wide: this
+        module has no business reading the seat from the environment ever
+        again, but it may perfectly well grow an unrelated environment read
+        one day, and a blanket ban would make that a test failure with
+        nothing to say. The names are hunted in the parsed AST rather than
+        in the raw text so the ledger COMMENT recording the deletion — the
+        note that exists to stop anyone re-introducing it — is not itself
+        read as a re-introduction.
         """
+        import ast
+
         source = Path(serve_conductor_mod.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        code_literals = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        code_names = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        } | {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
 
         assert not hasattr(serve_conductor_mod, "CONDUCTOR_LEG_MODEL_ENV")
         assert "CONDUCTOR_LEG_MODEL_ENV" not in serve_conductor_mod.__all__
-        assert "os.environ" not in source
+        assert "CONDUCTOR_LEG_MODEL_ENV" not in code_names
+        assert "CONDUCTOR_LEG_MODEL_ENV" not in code_literals
+        assert "FORGE_CONDUCTOR_LEG_MODEL" not in code_literals
 
     def test_a_stale_env_var_no_longer_seats_a_leg(
         self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
