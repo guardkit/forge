@@ -151,6 +151,7 @@ class TestBuildGateReplyPathOverRawClient:
     async def test_await_response_resolves_through_gate_parts(self) -> None:
         from forge.cli._serve_deps_gating import build_approval_gate_parts
         from forge.config.models import ForgeConfig
+        from forge.gating.degraded import EmptyPriorsReader
 
         raw = RawNatsClientFake()
         raw.published: list[Any] = []  # type: ignore[attr-defined]
@@ -163,7 +164,9 @@ class TestBuildGateReplyPathOverRawClient:
         config = ForgeConfig.model_validate(
             {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
         )
-        parts = build_approval_gate_parts(raw, config)
+        parts = build_approval_gate_parts(
+            raw, config, priors_reader=EmptyPriorsReader()
+        )
 
         wait = asyncio.create_task(
             parts.subscriber.await_response(

@@ -90,8 +90,10 @@ which uv || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 
-# 2. Editable install with all extras (uv reads [tool.uv.sources])
-uv pip install -e ".[providers,dev]" 2>&1 | tail -5
+# 2. Editable install with all extras (uv reads [tool.uv.sources];
+#    `memory` resolves the sibling ../fleet-memory editable install —
+#    the gate's priors read, matching the image's .[providers,memory])
+uv pip install -e ".[providers,memory,dev]" 2>&1 | tail -5
 ```
 
 **Pass:** Install succeeds.
@@ -102,7 +104,7 @@ uv pip install -e ".[providers,dev]" 2>&1 | tail -5
 `nats-core` is already importable on the host):
 
 ```bash
-pip install --user --break-system-packages -e '.[providers,dev]'
+pip install --user --break-system-packages -e '.[providers,memory,dev]'
 ```
 
 **Stale-editable-install rewire (the FEAT-FORGE-005 trap):** if a previous
@@ -777,19 +779,22 @@ Build the forge production container, run `forge serve` inside it, publish one r
 ```bash
 ssh promaxgb10-41b1
 # Run from inside forge/ so that the BuildKit named contexts
-# `--build-context nats-core=../nats-core` and
-# `--build-context guardkit=../guardkit` resolve to the sibling
-# `nats-core` / `guardkit` working trees (one level up from forge/,
-# alongside it). This is the canonical invocation — no host-side
-# mutation. Fixed in TASK-FORGE-FRR-003 after the GB10 first-real-run
-# revealed the previous "cd to forge's parent" form pointed
-# `../nats-core` at the wrong directory. The `guardkit` context was
-# added after B4 run 4b3b0893 caught the target-terminal oracles
+# `--build-context nats-core=../nats-core`,
+# `--build-context guardkit=../guardkit` and
+# `--build-context fleet-memory=../fleet-memory` resolve to the sibling
+# `nats-core` / `guardkit` / `fleet-memory` working trees (one level up
+# from forge/, alongside it). This is the canonical invocation — no
+# host-side mutation. Fixed in TASK-FORGE-FRR-003 after the GB10
+# first-real-run revealed the previous "cd to forge's parent" form
+# pointed `../nats-core` at the wrong directory. The `guardkit` context
+# was added after B4 run 4b3b0893 caught the target-terminal oracles
 # (normalizer + `guardkit feature validate`) missing from the image.
+# The `fleet-memory` context supplies the gate's priors read (the forge
+# `memory` extra; fleet-memory has no PyPI distribution).
 cd ~/Projects/appmilla_github/forge
 
 # Build the production image (Contract A — canonical BuildKit invocation)
-docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit -t forge:production-validation -f Dockerfile .
+docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit --build-context fleet-memory=../fleet-memory -t forge:production-validation -f Dockerfile .
 
 # Run forge serve inside it, with NATS pointing at the GB10 host
 docker run -d --name forge-cmdw \

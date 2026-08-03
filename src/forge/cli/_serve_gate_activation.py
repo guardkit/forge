@@ -8,12 +8,15 @@ observer-lifecycle repair). Approve → the caller registers the observer and
 launches; reject / expiry / hard-stop → terminal before any runner exists.
 
 Honesty posture (ADR-ARCH-019 / ADR-ARCH-026, plan "Gate mechanics"): the
-gate runs against the honest degraded collaborators in
-:mod:`forge.gating.degraded` — three empty readers plus
-:func:`degraded_dispatch_gate_model`, which returns a static
-``MANDATORY_HUMAN_APPROVAL`` decision. Consequence: **every dispatched build
-pauses for phone approval** until evidence-based gating lands (DF-009 "v1
-never auto-approves" ratchet) — exactly what JNB-107 needs.
+gate runs against :mod:`forge.gating.degraded`'s empty adjustments/rules
+readers plus :func:`degraded_dispatch_gate_model`, which returns a static
+``MANDATORY_HUMAN_APPROVAL`` decision. Priors are the exception: every
+activation path reads ``parts.priors_reader`` (composed env-gated at serve
+boot — the fleet-memory reader when memory is ON, ``EmptyPriorsReader``
+otherwise), and retrieved priors ride the decision as *evidence* only.
+Consequence: **every dispatched build pauses for phone approval** until
+evidence-based gating lands (DF-009 "v1 never auto-approves" ratchet) —
+exactly what JNB-107 needs.
 
 Envelope contract (plan §D2): :class:`_MirroredApprovalPublisher` wraps the
 publish step of :func:`forge.gating.wrappers._atomic_pause_and_publish` so the
@@ -43,7 +46,6 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from forge.gating.degraded import (
     EmptyAdjustmentsReader,
-    EmptyPriorsReader,
     EmptyRulesReader,
     degraded_dispatch_gate_model,
 )
@@ -356,7 +358,7 @@ async def maybe_gate_build(
     )
     deps = make_gate_check_deps(
         parts,
-        priors_reader=EmptyPriorsReader(),
+        priors_reader=parts.priors_reader,
         adjustments_reader=EmptyAdjustmentsReader(),
         rules_reader=EmptyRulesReader(),
         repository=gate_repository,
@@ -485,7 +487,7 @@ def make_merge_card_publisher(
         )
         deps = make_gate_check_deps(
             parts,
-            priors_reader=EmptyPriorsReader(),
+            priors_reader=parts.priors_reader,
             adjustments_reader=EmptyAdjustmentsReader(),
             rules_reader=EmptyRulesReader(),
             repository=gate_repository,
@@ -703,7 +705,7 @@ async def rearm_paused_gates(
 
             deps = make_gate_check_deps(
                 parts,
-                priors_reader=EmptyPriorsReader(),
+                priors_reader=parts.priors_reader,
                 adjustments_reader=EmptyAdjustmentsReader(),
                 rules_reader=EmptyRulesReader(),
                 repository=gate_repository,

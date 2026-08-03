@@ -439,10 +439,19 @@ def bind_production_dispatch_chain(
 
         gate_parts: Any = None
         try:
+            # Fleet-memory priors wire — env-gated at this one seam. The
+            # factory NEVER raises: OFF or a missing `memory` extra composes
+            # the degraded EmptyPriorsReader and says so loudly, so the gate
+            # path below is identical either way (priors ride as evidence
+            # only; the degraded model still mandates human approval).
+            from forge.adapters.fleet_memory import build_priors_reader_from_env
+
+            priors_reader = build_priors_reader_from_env()
             gate_parts = _serve_deps_gating.bind_gate_parts(
                 _serve_deps_gating.build_approval_gate_parts(
                     client,
                     forge_config,
+                    priors_reader=priors_reader,
                     emitter=emitter,
                     # TASK-GATE-D659 R1 — static exactly-one-resume-emit
                     # owner: the daemon subscriber owns the build-resumed
@@ -1916,6 +1925,28 @@ def _configure_logging(level_name: str) -> None:
     )
 
 
+async def _close_priors_reader_quietly() -> None:
+    """Close the bound gate parts' priors store, swallowing errors.
+
+    Best-effort shutdown mirror of :func:`_close_client_quietly`: when
+    the fleet-memory reader is composed (memory ON) its lazily-opened
+    Postgres pool is released here; the degraded ``EmptyPriorsReader``
+    exposes no ``aclose`` and is skipped via the getattr guard.
+    """
+    from forge.cli import _serve_deps_gating
+
+    parts = _serve_deps_gating.bound_gate_parts()
+    if parts is None:
+        return
+    aclose = getattr(parts.priors_reader, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("forge-serve: priors reader close error (%s)", exc)
+
+
 async def _close_client_quietly(client: Any) -> None:
     """Close a NATS client, swallowing close errors.
 
@@ -2323,6 +2354,10 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         # no-op by design.
         await deregister(fleet_client, reason="shutdown")
         await _close_client_quietly(fleet_client)
+
+        # Release the fleet-memory priors store (if the memory wire is
+        # ON) alongside the other transports.
+        await _close_priors_reader_quietly()
 
         # ``run_daemon`` already closes the client on its own
         # iteration's ``finally`` block. This second close is

@@ -93,6 +93,9 @@ class _Parts:
         self.subscriber = None
         self.injector = None
         self.expected_approver = "rich"
+        # Sentinel double — the activation paths read parts.priors_reader
+        # (never a real reader in the unit tier).
+        self.priors_reader = "the-priors-reader"
 
 
 @pytest.mark.asyncio
