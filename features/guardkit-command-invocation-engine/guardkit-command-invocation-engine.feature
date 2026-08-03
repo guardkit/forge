@@ -80,13 +80,10 @@ Feature: GuardKit Command Invocation Engine
     Then the adapter should create the pull request against the configured base branch
     And the invocation should return the pull-request URL as a structured result
 
-  # Why: Graphiti subcommands bypass manifest resolution — they don't take --context
-  @task:TASK-GCI-010
-  @key-example
-  Scenario: Graphiti GuardKit subcommands skip context-manifest resolution entirely
-    When Forge invokes a Graphiti GuardKit wrapper
-    Then no context flags should be assembled
-    And no manifest lookup should be performed for this invocation
+  # (TASK-GCI-010's Graphiti resolver-bypass scenario retired 2026-08-03:
+  # forge.tools.graphiti wrapped GuardKit's `graphiti` CLI group, deleted
+  # from GuardKit 2026-07-02. The adapter-level bypass remains covered by
+  # tests/forge/adapters/guardkit/test_run.py.)
 
   # ─────────────────────────────────────────────────────────────────────────
   # GROUP B — Boundary Conditions
