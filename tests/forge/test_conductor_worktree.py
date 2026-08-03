@@ -166,7 +166,7 @@ def _config(
                 repo_paths if repo_paths is not None else {REPO_KEY: str(checkout)}
             )
         ),
-        conductor=ConductorConfig(enabled=True),
+        conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
     )
 
 

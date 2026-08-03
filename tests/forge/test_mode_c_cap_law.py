@@ -353,7 +353,7 @@ def _write_config(
     body: dict[str, Any] = {
         "queue": {"repo_allowlist": [str(repo_dir)]},
         "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
-        "conductor": {"enabled": True},
+        "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
     }
     if budget is not None:
         body["budget"] = budget
@@ -781,7 +781,7 @@ def _router_config(tmp_path: Path, **budget: Any) -> ForgeConfig:
         permissions=PermissionsConfig(
             filesystem=FilesystemPermissions(allowlist=[tmp_path]),
         ),
-        conductor=ConductorConfig(enabled=True),
+        conductor=ConductorConfig(enabled=True, seat="qwen3-coder-30b"),
         budget=BudgetConfig(**budget) if budget else BudgetConfig(),
     )
 

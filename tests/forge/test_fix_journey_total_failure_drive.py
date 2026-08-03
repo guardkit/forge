@@ -174,7 +174,7 @@ def _config() -> ForgeConfig:
                 "approved_originators": ["terminal"],
             },
             "permissions": {"filesystem": {"allowlist": ["/"]}},
-            "conductor": {"enabled": True},
+            "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
         }
     )
 

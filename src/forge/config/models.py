@@ -984,6 +984,21 @@ class ConductorConfig(BaseModel):
     Deliberately its own section rather than a field on ``PipelineConfig``:
     activation is a plan-of-record decision reserved to the owner, and it
     must be readable at a glance in ``forge.yaml``.
+
+    ``seat`` is the fix journey's SEAT — the local model every fix-journey
+    leg runs on (conductor-activation design pass §2). It landed here as
+    config-as-code and DELETED the ``FORGE_CONDUCTOR_LEG_MODEL`` stopgap
+    env read the composition root used to carry: two statements of one
+    rule is a future lie. Switching the conductor on without naming a seat
+    is REFUSED at config load — see :meth:`_enabled_requires_a_seat`.
+
+    **Deploy-order law** (this model is ``extra=forbid`` and the loader
+    propagates the ValidationError unwrapped): writing ``conductor.seat``
+    into a deployed ``forge.yaml`` before the image that defines the field
+    is running refuses the WHOLE config at load — and that binds the
+    langgraph sidecar too, which lazily re-reads the same file and
+    degrades to a permissive filesystem check on any load failure. Merge
+    and redeploy BOTH surfaces first, then add the ``conductor:`` section.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -997,6 +1012,49 @@ class ConductorConfig(BaseModel):
             "time. True = the fix journey is activated."
         ),
     )
+    seat: str | None = Field(
+        default=None,
+        description=(
+            "The fix journey's seat: the local model every fix-journey leg "
+            "runs on, named on the leg's argv as '--model <seat>'. A bare "
+            "fleet alias (the workhorse seat is the evidenced default). "
+            "REQUIRED whenever enabled is true — an unnamed seat would ride "
+            "None down to a frontier default, and only the build system's "
+            "own chokepoint would stop it. Blank is read as absent."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _enabled_requires_a_seat(self) -> ConductorConfig:
+        """Refuse an activated conductor that names no seat.
+
+        The cap law's posture, applied to the seat: an unset seat is
+        REFUSED, never silently read as "the leg picks its own". The build
+        system's chokepoint refuses ``model=None`` AND the empty string at
+        leg runtime anyway (``m0_fence``) — failing here means the daemon
+        refuses to BOOT on a half-activated config rather than dying on
+        the first leg of a journey an owner already approved.
+
+        A DISABLED conductor with no seat stays valid: that is every
+        deployed ``forge.yaml`` today.
+
+        Blank normalises to ``None`` before the check, matching the
+        composition root's long-standing strip-to-None posture — so
+        ``config.conductor.seat`` is either absent or a real name, never a
+        named nothing.
+        """
+        normalised = (self.seat or "").strip() or None
+        if normalised != self.seat:
+            self.seat = normalised
+        if self.enabled and normalised is None:
+            raise ValueError(
+                "conductor.enabled is true but conductor.seat names no seat. "
+                "The fix journey's legs run on a local model and the pipeline "
+                "must name it on every dispatch; an unnamed seat falls through "
+                "to a frontier default. Add 'seat: <local model>' to the "
+                "conductor section, or set 'enabled: false'."
+            )
+        return self
 
 
 class ForgeConfig(BaseModel):

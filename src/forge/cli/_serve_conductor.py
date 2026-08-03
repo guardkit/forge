@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import subprocess
 from datetime import datetime, timezone
 from importlib import import_module
@@ -110,24 +109,24 @@ CONDUCTOR_STAGE_TIMEOUT_SECONDS: "Mapping[StageClass, int]" = MappingProxyType(
     }
 )
 
-#: Optional operator thread for the fix journey's SEAT — the local model a
-#: leg runs on (LI stage-2 design §3.4). Unset, the pipeline emits no
-#: ``--model`` at all, which is exactly the hole the crossing fell through:
-#: the builder then rides ``None`` down to a FRONTIER default and only a
-#: missing API key stops it. Set, every MODE_C dispatch names its seat on
-#: the wire.
-#:
-#: **This env var is a stopgap and is ledgered as one.** The config-as-code
-#: home for it is a seat field on ``ConductorConfig`` (which is
-#: ``extra=forbid``, so adding the field is a schema change) — and that is
-#: **Rich's ruling at conductor activation**, a plan-of-record decision,
-#: not something this lane may smuggle in. When that field lands, this env
+#: **The seat's env stopgap is GONE — landed as config-as-code, 2026-08-03.**
+#: The fix journey's SEAT (the local model a leg runs on, LI stage-2 design
+#: §3.4) used to ride an operator env var, ``FORGE_CONDUCTOR_LEG_MODEL``,
+#: read exactly once in :func:`build_conductor_supervisor_factory`. That
+#: read's own ledger comment promised: "When that field lands, this env
 #: read is DELETED, not kept beside it: two statements of one rule is a
-#: future lie.
-CONDUCTOR_LEG_MODEL_ENV: str = "FORGE_CONDUCTOR_LEG_MODEL"
+#: future lie."
+#:
+#: The field landed (conductor-activation design pass §2 / FA3): the seat
+#: is :attr:`forge.config.models.ConductorConfig.seat`, threaded from the
+#: production composition root (``serve.py``'s ``_compose_conductor_router``)
+#: as this factory's ``leg_model`` argument. ``conductor.enabled: true``
+#: with no seat now REFUSES at config load, so the daemon cannot boot
+#: half-activated and no leg can ride ``None`` down to a frontier default.
+#: There is nothing to read from the environment any more, and this note
+#: exists so nobody re-introduces the second statement.
 
 __all__ = [
-    "CONDUCTOR_LEG_MODEL_ENV",
     "CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS",
     "CONDUCTOR_STAGE_TIMEOUT_SECONDS",
     "CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS",
@@ -812,10 +811,13 @@ def build_conductor_supervisor_factory(
             block above those constants before changing either number.
             Injectable so a test can drive the selection without waiting
             out half an hour.
-        leg_model: The fix journey's seat. Defaults to the
-            :data:`CONDUCTOR_LEG_MODEL_ENV` environment variable when it
-            is set and non-blank; ``None`` otherwise, which keeps the argv
-            byte-identical to the one this composition has always emitted.
+        leg_model: The fix journey's seat — the local model every MODE_C
+            leg runs on, appended to its argv as ``--model <seat>``. The
+            production composition root passes
+            ``config.conductor.seat`` (design pass §2); there is no env
+            fallback any more. ``None`` (or blank) emits no ``--model`` at
+            all, keeping the argv byte-identical to the one this
+            composition has always emitted with the conductor disabled.
     """
     from forge.cli.serve import (
         build_conductor_budget_kwargs,
@@ -848,26 +850,25 @@ def build_conductor_supervisor_factory(
         else timeout_seconds_by_stage
     )
 
-    # The composition root's ONE read of the stopgap seat env (see
-    # CONDUCTOR_LEG_MODEL_ENV — its config-as-code replacement is Rich's
-    # ruling at conductor activation, and this read is deleted then).
-    resolved_leg_model = leg_model
-    if resolved_leg_model is None:
-        resolved_leg_model = os.environ.get(CONDUCTOR_LEG_MODEL_ENV, "").strip() or None
+    # The seat, config-as-code: the production composition root passes
+    # ``config.conductor.seat`` (design pass §2). The env stopgap that used
+    # to be read here is DELETED — see the note above the stage-timeout
+    # constants. A blank seat is already normalised to None by the config
+    # model, and an ENABLED conductor with no seat never reaches this
+    # function: it refuses at config load.
+    resolved_leg_model = (leg_model or "").strip() or None
     if resolved_leg_model:
         logger.info(
             "conductor composition: fix-journey legs will name the seat "
-            "%r on every MODE_C dispatch (--model, from %s)",
+            "%r on every MODE_C dispatch (--model, from conductor.seat)",
             resolved_leg_model,
-            CONDUCTOR_LEG_MODEL_ENV,
         )
     else:
         logger.warning(
-            "conductor composition: no leg seat is named (%s unset) — the "
-            "pipeline emits NO --model and the builder picks its own "
-            "default. Zero-frontier then rests on the builder's own "
-            "chokepoint fence, not on anything this side says",
-            CONDUCTOR_LEG_MODEL_ENV,
+            "conductor composition: no leg seat is named (conductor.seat "
+            "unset) — the pipeline emits NO --model and the builder picks "
+            "its own default. Zero-frontier then rests on the builder's own "
+            "chokepoint fence, not on anything this side says"
         )
 
     def supervisor_factory(build_id: str) -> Any:
