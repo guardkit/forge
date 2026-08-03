@@ -190,6 +190,122 @@ class TestPrepareWorktree:
         assert result.exit_code == -1
 
 
+class TestPrepareWorktreeCreateBranch:
+    """Conductor activation §1 — the create-branch extension.
+
+    As originally built the operation could only check out an EXISTING
+    ref, which is the opposite of what the fix journey needs (a new
+    per-journey branch cut from the trunk). These pin the invocation the
+    extension has to emit, and the one caller mistake it refuses.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_branch_with_base_emits_dash_b_and_the_base(
+        self, tmp_path: Path
+    ) -> None:
+        fake = FakeExecute(responses=[_ok()])
+        repo = tmp_path / "repo"
+        builds_root = tmp_path / "builds"
+
+        result = await prepare_worktree(
+            "b1",
+            repo,
+            "fix/TASK-X-03142530",
+            execute=fake,
+            builds_root=builds_root,
+            create_branch=True,
+            base_ref="main",
+        )
+
+        assert result.status == "success"
+        assert result.worktree_path == str(builds_root / "b1")
+        # The ORDER matters: git wants ``-b <branch> <path> [<base>]``.
+        assert fake.calls[0].command == [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "fix/TASK-X-03142530",
+            str(builds_root / "b1"),
+            "main",
+        ]
+        assert fake.calls[0].cwd == str(repo)
+
+    @pytest.mark.asyncio
+    async def test_create_branch_without_base_omits_the_trailing_commitish(
+        self, tmp_path: Path
+    ) -> None:
+        """No base = git cuts from HEAD. Legal, and the token must not appear."""
+        fake = FakeExecute(responses=[_ok()])
+        builds_root = tmp_path / "builds"
+
+        await prepare_worktree(
+            "b2",
+            tmp_path / "repo",
+            "wip",
+            execute=fake,
+            builds_root=builds_root,
+            create_branch=True,
+        )
+
+        assert fake.calls[0].command == [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            "wip",
+            str(builds_root / "b2"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_defaults_are_byte_identical_to_the_pre_extension_argv(
+        self, tmp_path: Path
+    ) -> None:
+        """The extension is opt-in: every existing caller's argv is untouched."""
+        fake = FakeExecute(responses=[_ok()])
+        builds_root = tmp_path / "builds"
+
+        await prepare_worktree(
+            "b3", tmp_path / "repo", "existing", execute=fake, builds_root=builds_root
+        )
+
+        assert fake.calls[0].command == [
+            "git",
+            "worktree",
+            "add",
+            str(builds_root / "b3"),
+            "existing",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_base_ref_without_create_branch_refuses_and_runs_no_git(
+        self, tmp_path: Path
+    ) -> None:
+        """``git worktree add <path> <branch> <base>`` is not a valid form.
+
+        Dropping the base silently would materialise the tree off the
+        wrong commit, so the adapter refuses at its own boundary —
+        ``status="failed"``, never a raise, and crucially without having
+        run anything.
+        """
+        fake = FakeExecute(responses=[_ok()])
+
+        result = await prepare_worktree(
+            "b4",
+            tmp_path / "repo",
+            "some-branch",
+            execute=fake,
+            builds_root=tmp_path / "builds",
+            base_ref="main",
+        )
+
+        assert result.status == "failed"
+        assert result.operation == "prepare_worktree"
+        assert result.exit_code == -1
+        assert result.stderr is not None and "create_branch" in result.stderr
+        assert fake.calls == [], "a refused invocation still shelled out to git"
+
+
 # --------------------------------------------------------------------------- #
 # commit_all
 # --------------------------------------------------------------------------- #
@@ -566,6 +682,69 @@ async def test_seam_prepare_worktree_and_commit_against_real_git(
     commit = await commit_all(worktree, "seam: add newfile", execute=_default_execute)
     assert commit.status == "success", commit
     assert commit.sha and len(commit.sha) >= 7
+
+
+@pytest.mark.seam
+@pytest.mark.integration_contract("git_adapter_subprocess_contract")
+@pytest.mark.skipif(not _HAS_GIT, reason="git binary not available")
+@pytest.mark.asyncio
+async def test_seam_nonexistent_branch_without_create_hard_fails(
+    seeded_repo: Path, tmp_path: Path
+) -> None:
+    """The defect the extension exists to cure, proven against real git.
+
+    ``git worktree add <path> <branch>`` on a name git has never seen is
+    exit 128 — which is why "wire the orphan as-is" could never have
+    given a fix journey its tree.
+    """
+    result = await prepare_worktree(
+        "build-nobranch",
+        seeded_repo,
+        "fix/TASK-SEAM-00000001",
+        builds_root=tmp_path / "builds-a",
+    )
+
+    assert result.status == "failed", result
+    assert result.exit_code != 0
+    assert not (tmp_path / "builds-a" / "build-nobranch").exists()
+
+
+@pytest.mark.seam
+@pytest.mark.integration_contract("git_adapter_subprocess_contract")
+@pytest.mark.skipif(not _HAS_GIT, reason="git binary not available")
+@pytest.mark.asyncio
+async def test_seam_create_branch_off_main_materialises_a_named_branch(
+    seeded_repo: Path, tmp_path: Path
+) -> None:
+    """The cure: the same call with ``create_branch`` + ``base_ref`` works.
+
+    And the branch is NAMED, not detached — the build system's work leg
+    detects the HEAD branch, and a detached HEAD degrades that detection
+    to a ``'main'`` fallback.
+    """
+    import subprocess  # noqa: S404 — seam-only.
+
+    builds_root = tmp_path / "builds-b"
+    result = await prepare_worktree(
+        "build-newbranch",
+        seeded_repo,
+        "fix/TASK-SEAM-00000002",
+        builds_root=builds_root,
+        create_branch=True,
+        base_ref="main",
+    )
+
+    assert result.status == "success", result
+    worktree = Path(result.worktree_path or "")
+    assert worktree.is_dir()
+    head = subprocess.run(  # noqa: S603 — seam fixture only.
+        [_GIT, "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == "fix/TASK-SEAM-00000002"
 
 
 @pytest.mark.seam

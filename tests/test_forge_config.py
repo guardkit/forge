@@ -291,11 +291,15 @@ class TestYamlRoundTrip:
                 "working_path": None,
             },
             # ``conductor`` — the fix journey's activation flag (the conductor
-            # revival). Default-OFF: the flag is what reserves activation, and
-            # OFF is byte-for-byte the routine path. It is a first-class config
-            # section, so the unfiltered round-trip dump always includes it and
-            # this exhaustive fixture must declare it.
-            "conductor": {"enabled": False},
+            # revival) plus its SEAT (the local model every fix-journey leg
+            # runs on; conductor-activation design pass §2). Default-OFF with
+            # no seat: the flag is what reserves activation, OFF is
+            # byte-for-byte the routine path, and a DISABLED conductor needs
+            # no seat (``enabled: true`` with no seat refuses at load). It is
+            # a first-class config section, so the unfiltered round-trip dump
+            # always includes both keys and this exhaustive fixture must
+            # declare them.
+            "conductor": {"enabled": False, "seat": None},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],
