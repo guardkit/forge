@@ -511,23 +511,161 @@ class TestDriverDepsFactory:
 
         assert path is not None and Path(path).exists()
 
-    def test_close_out_records_a_row_and_never_transitions_the_build(
-        self, pool: SqliteLifecyclePersistence
-    ) -> None:
-        """The conductor records; it does not adjudicate (the FTR lesson)."""
+    def test_close_out_records_a_row(self, pool: SqliteLifecyclePersistence) -> None:
         deps = build_conductor_driver_deps_factory(
             pool=pool, config=_config(conductor_on=True)
         )(BUILD_ID, supervisor=object())
 
-        class _R:
-            outcome = None
-            rationale = "terminal"
-
-        deps.close_out(build_id=BUILD_ID, report=_R())
+        deps.close_out(build_id=BUILD_ID, report=_TurnReportDouble())
 
         labels = [r.stage_label for r in pool.read_stages(BUILD_ID)]
         assert "conductor-close-out" in labels
+
+
+class _Decision:
+    """Duck-typed stand-in for a ``ModeCTerminalDecision``."""
+
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+
+
+class _TurnReportDouble:
+    """Duck-typed stand-in for a ``TurnReport`` at close-out time."""
+
+    def __init__(
+        self,
+        *,
+        outcome: str | None = None,
+        rationale: str = "terminal",
+        dispatch_result: object | None = None,
+    ) -> None:
+        self.outcome = outcome
+        self.rationale = rationale
+        self.dispatch_result = dispatch_result
+
+
+class TestTheTerminalRowTransition:
+    """The stuck row, 2026-08-03.
+
+    The first production fix journey reached its terminal, logged "closed
+    out" — and left ``builds.status = RUNNING`` with an empty ``error``,
+    forever, because this seam recorded a ``stage_log`` row and stopped.
+    The FTR lesson it cited ("terminal transitions are owned by the
+    lifecycle bridge and the gate's own state machine") is true of the
+    merge-card path and of nothing else the conductor reaches.
+    """
+
+    @staticmethod
+    def _close_out(pool: SqliteLifecyclePersistence):
+        return build_conductor_driver_deps_factory(
+            pool=pool, config=_config(conductor_on=True)
+        )(BUILD_ID, supervisor=object()).close_out
+
+    def test_a_clean_review_terminal_completes_the_row(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        self._close_out(pool)(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="terminal",
+                rationale="clean-review-no-fixes: mode-c-task-review-empty",
+                dispatch_result=_Decision("clean-review-no-fixes"),
+            ),
+        )
+
+        row = pool.get_build_row(BUILD_ID)
+        assert row.status.value == "COMPLETE"
+        assert row.completed_at is not None
+        # ``forge status`` renders this column as the failure text; a
+        # successful journey must not leave prose in it.
+        assert not row.error
+
+    def test_a_failed_terminal_fails_the_row_with_the_reason(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        self._close_out(pool)(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="terminal",
+                rationale=(
+                    "failed: mode-c-task-review-leg-failed (/task-review "
+                    "failed: REFUSED (Phase 0, ad-hoc task creation))"
+                ),
+                dispatch_result=_Decision("failed"),
+            ),
+        )
+
+        row = pool.get_build_row(BUILD_ID)
+        assert row.status.value == "FAILED"
+        assert "mode-c-task-review-leg-failed" in (row.error or "")
+        assert "REFUSED (Phase 0" in (row.error or "")
+
+    def test_a_terminal_with_an_unreadable_decision_still_leaves_running(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The supervisor's own handler-raised fallback reaches here.
+
+        It carries no decision at all. Guessing COMPLETE would claim a
+        delivery, so the row fails — and the reason names the gap.
+        """
+        self._close_out(pool)(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="terminal", rationale="MODE_C planner halted cycle"
+            ),
+        )
+
+        row = pool.get_build_row(BUILD_ID)
+        assert row.status.value == "FAILED"
+        assert row.error
+
+    def test_the_merge_card_path_is_left_to_its_own_writer(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The FTR lesson, kept exactly where it applies."""
+
+        class _Card:
+            card_published = True
+            card_result = "RESUMED"
+
+        self._close_out(pool)(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="dispatched",
+                rationale="the merge card was published",
+                dispatch_result=_Card(),
+            ),
+        )
+
         assert pool.get_build_row(BUILD_ID).status.value == "RUNNING"
+
+    def test_an_already_terminal_row_is_left_alone(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Never resurrect, never overwrite: the one careful writer's rule."""
+        close_out = self._close_out(pool)
+        close_out(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="terminal",
+                rationale="failed: mode-c-task-review-leg-failed",
+                dispatch_result=_Decision("failed"),
+            ),
+        )
+        first = pool.get_build_row(BUILD_ID)
+
+        close_out(
+            build_id=BUILD_ID,
+            report=_TurnReportDouble(
+                outcome="terminal",
+                rationale="clean-review-no-fixes: mode-c-task-review-empty",
+                dispatch_result=_Decision("clean-review-no-fixes"),
+            ),
+        )
+
+        after = pool.get_build_row(BUILD_ID)
+        assert after.status.value == "FAILED"
+        assert after.error == first.error
 
 
 class TestTheWaitWindow:

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -84,9 +85,33 @@ def writer() -> FakeStageLogWriter:
     return FakeStageLogWriter()
 
 
+class FixJourneyRunner(FakeSubprocessRunner):
+    """A fake leg that behaves like a leg that RAN.
+
+    The sibling module's default returns ``detection_findings=None`` — the
+    parser's answer for "no ``## Detection Findings`` block in the output".
+    That is a real shape, and since 2026-08-03 it is a FAILED review leg:
+    a reviewer that emitted no markers block said nothing, and its silence
+    is not "zero findings" (the first production fix journey's refusal was
+    read as a clean review precisely because nothing made that
+    distinction).
+
+    So the argv fixtures — whose subject is the ARGV, not the verdict —
+    return an empty-but-PRESENT block for a review, which is a genuine
+    clean review. The absent-block and unparseable-block shapes are pinned
+    deliberately in :class:`TestFindingsSurviveTheDispatch` below.
+    """
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        result = await super().__call__(**kwargs)
+        if kwargs.get("subcommand") == "task-review" and self.result is None:
+            return result.model_copy(update={"detection_findings": []})
+        return result
+
+
 @pytest.fixture
-def runner() -> FakeSubprocessRunner:
-    return FakeSubprocessRunner()
+def runner() -> FixJourneyRunner:
+    return FixJourneyRunner()
 
 
 async def _dispatch(
@@ -817,6 +842,10 @@ class TestDetectionFindingsThreading:
         assert result.detection_findings == ()
         assert result.detection_findings_reported is False
         assert writer.calls[0]["detection_findings_reported"] is False
+        # Leg-result honesty (2026-08-03): rc=0 with no markers block is a
+        # FAILED leg, not a clean review with an empty verdict.
+        assert result.status is StageDispatchStatus.FAILED
+        assert "NO readable findings block" in result.rationale
 
     @pytest.mark.asyncio
     async def test_an_unparseable_block_is_not_reported(
@@ -842,6 +871,9 @@ class TestDetectionFindingsThreading:
         )
 
         assert result.detection_findings_reported is False
+        # An unreadable block is no block: the leg fails rather than
+        # having its garbage read as zero findings.
+        assert result.status is StageDispatchStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_the_result_holds_a_copy_not_the_runners_own_list(
