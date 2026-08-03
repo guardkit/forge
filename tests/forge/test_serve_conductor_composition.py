@@ -24,6 +24,7 @@ import pytest
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import serve as serve_mod
 from forge.cli import _serve_conductor as serve_conductor_mod
+from forge.cli._conductor_outcome import DECLINED, TakenTerminal
 from forge.cli._serve_conductor import (
     CONDUCTOR_LEG_MODEL_ENV,
     CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS,
@@ -579,6 +580,47 @@ class TestFlagOffIsALiteralPassThrough:
             spawn=lambda coro: coro.close(),
         )
         assert router is not None
+
+    @pytest.mark.asyncio
+    async def test_the_composed_router_speaks_the_vocabulary(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The PRODUCTION composition answers the widened contract.
+
+        Activation design §3: the bool is REPLACED. The seeded row is
+        mode-c with no budget profile, so it meets the cap law and comes
+        back taken-and-terminal with the reason carried — never ``True``,
+        which could not say whether a slot still had a journey behind it.
+        """
+        router = serve_mod.build_conductor_router(
+            pool=pool,
+            config=_config(conductor_on=True),
+            supervisor_factory=lambda _bid: pytest.fail("supervisor built"),
+            spawn=lambda coro: coro.close(),
+        )
+        assert router is not None
+
+        outcome = await router(build_id=BUILD_ID)
+        assert isinstance(outcome, TakenTerminal)
+        assert outcome.reason
+        assert outcome is not DECLINED
+
+    @pytest.mark.asyncio
+    async def test_the_composed_router_declines_a_routine_build(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The mutation guard: DECLINED still means the routine path."""
+        pool.connection.execute(
+            "UPDATE builds SET mode = 'mode-a' WHERE build_id = ?", (BUILD_ID,)
+        )
+        pool.connection.commit()
+        router = serve_mod.build_conductor_router(
+            pool=pool,
+            config=_config(conductor_on=True),
+            supervisor_factory=lambda _bid: pytest.fail("supervisor built"),
+        )
+        assert router is not None
+        assert await router(build_id=BUILD_ID) is DECLINED
 
     def test_the_composer_wires_both_factories(
         self, pool: SqliteLifecyclePersistence

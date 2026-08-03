@@ -39,6 +39,11 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import _serve_deps
+from forge.cli._conductor_outcome import (
+    DECLINED,
+    TAKEN_RUNNING,
+    TakenTerminal,
+)
 from forge.cli._serve_deps import build_pipeline_consumer_deps
 from forge.cli.serve import build_conductor_router
 from forge.config.models import (
@@ -265,9 +270,9 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def declining_router(**kwargs: Any) -> bool:
+        async def declining_router(**kwargs: Any) -> Any:
             asked.append(dict(kwargs))
-            return False
+            return DECLINED
 
         deps = build_pipeline_consumer_deps(
             _StubNatsClient(),
@@ -300,8 +305,8 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def taking_router(**kwargs: Any) -> bool:
-            return True
+        async def taking_router(**kwargs: Any) -> Any:
+            return TAKEN_RUNNING
 
         deps = build_pipeline_consumer_deps(
             _StubNatsClient(),
@@ -332,7 +337,7 @@ class TestDequeueCallSequenceIdentity:
             _serve_deps, "dispatch_autobuild_async", _recording_dispatch
         )
 
-        async def exploding_router(**kwargs: Any) -> bool:
+        async def exploding_router(**kwargs: Any) -> Any:
             raise RuntimeError("conductor composition blew up")
 
         deps = build_pipeline_consumer_deps(
@@ -381,7 +386,7 @@ class TestRouterModeBranch:
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is False
+        assert await router(build_id=build_id) is DECLINED
         assert made == []  # no supervisor was ever constructed
 
     @pytest.mark.asyncio
@@ -421,12 +426,12 @@ class TestRouterModeBranch:
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is True
+        assert await router(build_id=build_id) is TAKEN_RUNNING
         assert made == [build_id]
         assert len(spawned) == 1
 
     @pytest.mark.asyncio
-    async def test_a_failing_setup_declines_rather_than_stranding_the_build(
+    async def test_a_failing_setup_is_terminal_rather_than_downgraded(
         self,
         persistence: SqliteLifecyclePersistence,
         tmp_path: Path,
@@ -449,4 +454,8 @@ class TestRouterModeBranch:
         )
         assert router is not None
 
-        assert await router(build_id=build_id) is False
+        # Activation design §4.1 — this arm used to answer ``False`` (the
+        # routine path) for a FIX TASK. It is taken-and-terminal now.
+        outcome = await router(build_id=build_id)
+        assert isinstance(outcome, TakenTerminal)
+        assert "RuntimeError" in outcome.reason
