@@ -61,6 +61,7 @@ def _review_entry(
     fix_tasks: tuple[str, ...] = (),
     status: str = "approved",
     hard_stop: bool = False,
+    failure_reason: str | None = None,
 ) -> StageEntry:
     """Construct a ``StageEntry`` representing one ``/task-review``."""
     return StageEntry(
@@ -69,6 +70,7 @@ def _review_entry(
         fix_tasks=fix_tasks,
         fix_task_id=None,
         hard_stop=hard_stop,
+        failure_reason=failure_reason,
     )
 
 
@@ -286,6 +288,48 @@ class TestFailedPaths:
         decision = _run(evaluate_terminal(_build(), history))
         assert decision.outcome == ModeCTerminal.FAILED
         assert decision.rationale == "mode-c-task-review-rejected"
+
+    def test_a_failed_review_LEG_is_named_a_tooling_fault_not_a_rejection(
+        self,
+    ) -> None:
+        """Leg-result honesty, 2026-08-03.
+
+        ``rejected`` is a gate's verdict on a review that RAN. ``failed``
+        is the leg falling over — the twin of the all-work-failed terminal
+        — and calling it "rejected" sent a diagnoser hunting a review
+        verdict that was never reached.
+        """
+        history = [_review_entry(fix_tasks=("FIX-1",), status="failed")]
+
+        decision = _run(evaluate_terminal(_build(), history))
+
+        assert decision.outcome == ModeCTerminal.FAILED
+        assert decision.rationale == terminal_mode_c.RATIONALE_FAILED_REVIEW_LEG
+        assert decision.rationale != "mode-c-task-review-rejected"
+
+    def test_the_failed_legs_own_words_ride_the_terminal(self) -> None:
+        """A stop that cannot say what stopped it is half a stop."""
+        banner = (
+            "REFUSED (Phase 0, ad-hoc task creation): the review leg is "
+            "id-form only and no task file exists for TASK-TST1FIX1"
+        )
+        history = [
+            _review_entry(fix_tasks=(), status="failed", failure_reason=banner)
+        ]
+
+        decision = _run(evaluate_terminal(_build(), history))
+
+        assert decision.failure_reason is not None
+        assert banner in decision.failure_reason
+
+    def test_a_rejection_with_no_recorded_reason_reads_as_it_always_did(
+        self,
+    ) -> None:
+        history = [_review_entry(fix_tasks=("FIX-1",), status="rejected")]
+
+        decision = _run(evaluate_terminal(_build(), history))
+
+        assert decision.failure_reason == "/task-review rejected"
 
     def test_all_task_work_failed_returns_failed(self) -> None:
         history = [
