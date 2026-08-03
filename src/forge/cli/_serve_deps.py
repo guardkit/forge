@@ -85,6 +85,14 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
 from forge.adapters.nats.pipeline_publisher import PipelinePublisher
+from forge.cli._conductor_outcome import (
+    DECLINED,
+    TAKEN_RUNNING,
+    TakenTerminal,
+    check_router_outcome,
+    fail_mode_c_build,
+    is_mode_c_build,
+)
 from forge.cli._serve_deps_forward_context import (
     build_forward_context_builder,
     build_stage_log_reader,
@@ -359,6 +367,22 @@ def build_serve_resume_launcher(
     Kept as a thin public seam (rather than reaching into the private
     ``dispatch_build`` composition) so ``serve.py::_compose`` can build the
     launcher at the rearm spawn site without re-deriving the deps graph.
+
+    **SILENT-DOWNGRADE SEAM 2 (activation design §4.2).** The returned
+    closure is GUARDED. The rearm sweep's approve path consults no router
+    at all — it holds only this launcher — so a mode-c build that was
+    carded, then met a daemon restart, then got approved, launched down
+    the ROUTINE autobuild path against a TASK-xxx subject. The guard reads
+    the same ``builds.mode`` the router reads and refuses a mode-c row
+    loudly (FAILED with the reason on the row + a ``build-failed`` emit)
+    instead of routine-launching it. Journey RE-ENTRY proper — resuming
+    the interrupted fix journey rather than refusing it — stays ledgered
+    (design §7: a restart mid-journey orphans it; the monitored-
+    supervision lane's first production item). The ack rides the FAILED
+    row: the still-held build-queued message redelivers, the consumer's
+    duplicate-terminal filter sees a terminal row and acks (the
+    self-healing arm ``_rearm_dispatch`` already relies on for a gate
+    reject).
     """
     stage_log_reader = build_stage_log_reader(sqlite_pool)
     forward_context_builder = build_forward_context_builder(
@@ -366,13 +390,84 @@ def build_serve_resume_launcher(
     )
     stage_log_recorder = build_stage_log_recorder(sqlite_pool)
     state_channel = build_autobuild_state_initialiser(sqlite_pool)
-    return _build_resume_launcher(
+    launch = _build_resume_launcher(
         forward_context_builder,
         stage_log_recorder,
         state_channel,
         lifecycle_emitter,
         async_task_starter,
     )
+
+    async def guarded_launch(
+        *,
+        build_id: str,
+        feature_id: str,
+        correlation_id: str | None,
+        **launch_kwargs: Any,
+    ) -> Any:
+        if is_mode_c_build(sqlite_pool, build_id, log=logger):
+            summary = (
+                "a fix-journey (mode-c) build was approved on the boot-rearm "
+                "path, which has no conductor to hand it to — refused, never "
+                "downgraded onto the routine autobuild path"
+            )
+            logger.error(
+                "rearm resume: build_id=%s feature_id=%s is a fix journey; "
+                "REFUSING the routine resume launch (the rearm path consults "
+                "no router — running a fix task as a routine autobuild is the "
+                "silent downgrade). Journey re-entry is ledgered, not built.",
+                build_id,
+                feature_id,
+            )
+            reason = fail_mode_c_build(
+                sqlite_pool,
+                build_id,
+                summary=summary,
+                what="a mode-c row on the boot-rearm resume path",
+                log=logger,
+            )
+            if lifecycle_emitter is not None:
+                from forge.pipeline import BuildContext
+
+                await lifecycle_emitter.emit_failed(
+                    BuildContext(
+                        feature_id=feature_id or "",
+                        build_id=build_id or "",
+                        correlation_id=correlation_id or "",
+                        wave_total=1,
+                    ),
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_task_id=_read_task_id(sqlite_pool, build_id),
+                )
+            return None
+        return await launch(
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            **launch_kwargs,
+        )
+
+    return guarded_launch
+
+
+def _read_task_id(
+    sqlite_pool: SqliteLifecyclePersistence, build_id: str
+) -> str | None:
+    """Return ``builds.task_id`` for ``build_id`` — the journey's subject.
+
+    ``None`` for every mode-a / mode-b row, for a missing row, and for an
+    unreadable pool: the identifier is an ANNOTATION on the terminal, so a
+    read fault must never stop the terminal from being emitted.
+    """
+    try:
+        row = sqlite_pool.get_build_row(build_id)
+    except Exception as exc:  # noqa: BLE001 — an annotation, never a blocker
+        logger.warning(
+            "could not read builds.task_id for build_id=%s (%s)", build_id, exc
+        )
+        return None
+    return getattr(row, "task_id", None) if row is not None else None
 
 
 def _read_build_status(
@@ -488,9 +583,23 @@ def _build_dispatch_build(
     ``conductor_router`` (conductor revival, Stage 1c — design pass §a.2)
     is the ONE seam through which a dequeued fix-journey build is handed
     to the conductor's turn loop **instead of** the direct autobuild
-    launch. It is an ``async (**launch_kwargs) -> bool`` predicate:
-    ``True`` means "the conductor took this build", ``False`` means "not
-    mine — launch it the routine way".
+    launch. Since the activation lane (design §3) it answers the
+    taken-and-terminal VOCABULARY, not a bool — ``async (**launch_kwargs)
+    -> ConductorOutcome | TakenTerminal``:
+
+    * ``DECLINED`` — "not mine, launch it the routine way";
+    * ``TAKEN_RUNNING`` — the turn loop is driving it (no launch, no ack:
+      the journey owns its own terminal);
+    * ``TakenTerminal(reason=...)`` — taken AND already over. This closure
+      acks the slot and emits ``build-failed`` carrying the reason, on
+      BOTH launch arms. Before the vocabulary this case was a bare
+      ``True``: the row went FAILED, nothing acked, and under
+      ``max_ack_pending=1`` the whole consumer wedged until the 1h
+      ``ack_wait`` redelivery.
+
+    A legacy bare bool reaching this seam REFUSES loudly
+    (:func:`~forge.cli._conductor_outcome.check_router_outcome`) — the
+    contract is replaced, not dual-shaped.
 
     **The prime invariant of this lane lives on this parameter.** ``None``
     — which is what the composition root passes whenever
@@ -499,6 +608,8 @@ def _build_dispatch_build(
     byte-identical order. The router is consulted only when it exists, so
     the flag-off dequeue path is not merely equivalent to today's, it is
     the same call sequence (asserted by the flag-off call-sequence test).
+    The one addition is the §4.3 mode-c guard on the launch arm, which
+    reads ``builds.mode`` and changes no launch byte for a routine build.
     """
     launch = _build_resume_launcher(
         forward_context_builder,
@@ -509,15 +620,107 @@ def _build_dispatch_build(
     )
     clock = gate_clock or _utc_now
 
-    async def launch_or_conduct(**launch_kwargs: Any) -> Any:
+    async def _conductor_terminal(
+        terminal: TakenTerminal,
+        *,
+        build_id: str | None,
+        feature_id: str | None,
+        correlation_id: str | None,
+        ack_callback: Any,
+    ) -> None:
+        """Close a taken-and-terminal build: emit ``build-failed``, then ack.
+
+        Activation design §3 — the ack cure. Before the vocabulary a
+        cap-refused fix journey wrote its FAILED row and stopped there:
+        nothing reached the daemon's event stream, so the bridge observer
+        (the consumer's terminal-follower) never fired and the slot healed
+        only at the 1h ``ack_wait`` redelivery. With
+        ``max_ack_pending=1`` that ONE refusal wedged the entire consumer
+        for the whole hour, and no terminal envelope was ever published
+        for the build, so a correlation-id-following observer waited
+        forever.
+
+        Two acts, in this order:
+
+        1. **Emit** ``pipeline.build-failed.{feature_id}`` through the
+           ``lifecycle_emitter`` in closure scope, on a SYNTHESIZED
+           :class:`BuildContext` — the in-repo precedent is the gate
+           machinery, which builds one the same way with ``wave_total=1``
+           (``_serve_gate_activation.maybe_gate_build``). The reason rides
+           the :class:`TakenTerminal` itself (no ``builds.error`` re-read),
+           ``recoverable=False`` (a refused journey is not retried by
+           anyone downstream), and ``failed_task_id`` comes off the row —
+           ``builds.task_id`` is the fix journey's durable subject.
+        2. **Ack** the JetStream slot exactly as the gate-terminal arm
+           does, so the next queued build dequeues immediately.
+
+        The emit goes FIRST: releasing the slot before the terminal is on
+        the wire would let the next build's envelopes overtake this one's
+        terminal. ``emit_failed`` is itself publish-safe (the emitter
+        swallows transport faults), so a dead broker cannot leave the slot
+        un-acked.
+        """
+        from forge.pipeline import BuildContext
+
+        failed_task_id = _read_task_id(sqlite_pool, build_id) if build_id else None
+
+        logger.error(
+            "dispatch_build: the conductor REFUSED build_id=%s and it is "
+            "already terminal (%s); emitting build-failed and acking the "
+            "queue slot — NOT launching the routine autobuild",
+            build_id,
+            terminal.reason,
+        )
+        if lifecycle_emitter is not None:
+            await lifecycle_emitter.emit_failed(
+                BuildContext(
+                    feature_id=feature_id or "",
+                    build_id=build_id or "",
+                    # correlation_id is required on the payload; the
+                    # None → "" coercion mirrors the gate machinery's.
+                    correlation_id=correlation_id or "",
+                    wave_total=1,
+                ),
+                failure_reason=terminal.reason,
+                recoverable=False,
+                failed_task_id=failed_task_id,
+            )
+        else:  # pragma: no cover - production always wires the emitter
+            logger.error(
+                "dispatch_build: no lifecycle_emitter is wired — the "
+                "conductor terminal for build_id=%s reaches no observer; "
+                "acking anyway so the consumer is not wedged",
+                build_id,
+            )
+        if ack_callback is not None:
+            await ack_callback()
+        else:  # pragma: no cover - both call sites thread it
+            logger.error(
+                "dispatch_build: no ack_callback threaded to the conductor "
+                "terminal for build_id=%s; the slot will heal only at the "
+                "JetStream ack_wait expiry",
+                build_id,
+            )
+
+    async def launch_or_conduct(
+        *, ack_callback: Any = None, **launch_kwargs: Any
+    ) -> Any:
         """Route one accepted build: conductor first (if wired), else launch.
 
         With no router wired this is a straight pass-through to
-        ``launch`` — the flag-off byte-equivalence guarantee.
+        ``launch`` — the flag-off byte-equivalence guarantee — except for
+        the mode-c guard on the launch arm (below), which reads the row
+        but changes no launch byte.
+
+        The router speaks the taken-and-terminal vocabulary
+        (:mod:`forge.cli._conductor_outcome`); this closure is where it is
+        MAPPED, so BOTH call sites — the gate-approved arm and the no-gate
+        soft-fail arm — ack and emit identically on a terminal.
         """
+        build_id = launch_kwargs.get("build_id")
         if conductor_router is not None:
             try:
-                taken = await conductor_router(**launch_kwargs)
+                outcome: Any = await conductor_router(**launch_kwargs)
             except Exception as exc:  # noqa: BLE001 — never brick the routine path
                 logger.error(
                     "dispatch_build: conductor_router raised (%s) for "
@@ -525,16 +728,64 @@ def _build_dispatch_build(
                     "build still runs (the conductor earns jobs, it never "
                     "blocks one)",
                     exc,
-                    launch_kwargs.get("build_id"),
+                    build_id,
                 )
-                taken = False
-            if taken:
+                outcome = DECLINED
+            # The contract check sits OUTSIDE the try on purpose: a
+            # ``ConductorOutcomeContractError`` raised inside it would be
+            # caught by the degrade rail above and read as DECLINED —
+            # exactly the silent downgrade the widened contract exists to
+            # abolish. Out here it propagates, and the consumer's
+            # raise-before-transition convention turns it into a loud
+            # terminal + ack.
+            outcome = check_router_outcome(outcome, build_id=build_id)
+            if isinstance(outcome, TakenTerminal):
+                await _conductor_terminal(
+                    outcome,
+                    build_id=build_id,
+                    feature_id=launch_kwargs.get("feature_id"),
+                    correlation_id=launch_kwargs.get("correlation_id"),
+                    ack_callback=ack_callback,
+                )
+                return None
+            if outcome is TAKEN_RUNNING:
                 logger.info(
                     "dispatch_build: build_id=%s handed to the conductor's "
                     "turn loop; NOT launching the routine autobuild",
-                    launch_kwargs.get("build_id"),
+                    build_id,
                 )
                 return None
+
+        # SILENT-DOWNGRADE SEAM 3 (activation design §4.3): dispatch has no
+        # mode check outside the router, so a flag-off boot (or a router
+        # whose composition failed, or one that raised into the degrade rail
+        # above) plus a runless mode-c redelivery would launch a FIX TASK as
+        # a routine autobuild — the wrong machinery against a TASK-xxx
+        # subject. The queue-time belt already refuses mode-c queues while
+        # the flag is off, so this arm should be unreachable;
+        # unreachable-but-guarded is the posture. Reading the row costs one
+        # indexed SELECT and changes no launch byte for a routine build.
+        if is_mode_c_build(sqlite_pool, build_id or "", log=logger):
+            summary = (
+                "a fix-journey (mode-c) build reached the routine launch arm "
+                "with no conductor driving it — refused, never downgraded"
+            )
+            await _conductor_terminal(
+                TakenTerminal(
+                    reason=fail_mode_c_build(
+                        sqlite_pool,
+                        build_id or "",
+                        summary=summary,
+                        what="a mode-c row reaching the routine launch arm",
+                        log=logger,
+                    )
+                ),
+                build_id=build_id,
+                feature_id=launch_kwargs.get("feature_id"),
+                correlation_id=launch_kwargs.get("correlation_id"),
+                ack_callback=ack_callback,
+            )
+            return None
         return await launch(**launch_kwargs)
 
     async def dispatch_build(
@@ -725,6 +976,51 @@ def _build_dispatch_build(
             # Soft-fail: the approval seam is not wired (a v1.1 gate defect
             # must never brick v1 dispatch — see serve.py _compose). Fall
             # back to legacy no-gate launch so the build still runs.
+            #
+            # SILENT-DOWNGRADE SEAM 4 (activation design §4.4) — checked
+            # FIRST, before every other refusal on this arm. The DDR-007
+            # posture ("gate composition must never brick v1 dispatch") is
+            # the RULED posture for ROUTINE builds and stays exactly as it
+            # is. It is NOT the posture for a fix journey: the fix
+            # journey's whole safety story is the pre-dispatch card
+            # (DF-009, "v1 never auto-approves"), so on a boot where the
+            # gate soft-failed to compose, letting the router take a mode-c
+            # build would open an UNATTENDED journey. For mode-c the gate
+            # is load-bearing, not best-effort — refuse loudly instead.
+            if is_mode_c_build(sqlite_pool, build_id, log=logger):
+                summary = (
+                    "a fix-journey (mode-c) build reached dispatch on a boot "
+                    "where the pre-dispatch approval gate is NOT wired — "
+                    "refused rather than opening an UNATTENDED journey"
+                )
+                logger.error(
+                    "dispatch_build: build_id=%s feature_id=%s is a fix "
+                    "journey but the approval gate is NOT wired this boot "
+                    "(parts=%s repo=%s sm=%s); REFUSING — the fix journey's "
+                    "safety story is the pre-dispatch card, so for mode-c the "
+                    "gate is load-bearing, not best-effort",
+                    build_id,
+                    payload.feature_id,
+                    parts is not None,
+                    gate_repository is not None,
+                    gate_state_machine is not None,
+                )
+                await _conductor_terminal(
+                    TakenTerminal(
+                        reason=fail_mode_c_build(
+                            sqlite_pool,
+                            build_id,
+                            summary=summary,
+                            what="a mode-c dispatch with no approval gate wired",
+                            log=logger,
+                        )
+                    ),
+                    build_id=build_id,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                    ack_callback=ack_callback,
+                )
+                return
             if prior_breach is not None:
                 prior_build_id, breach_detail = prior_breach
                 # Stage-3 GATE, no-gate arm: the one seam where PAUSED is honest
@@ -761,6 +1057,10 @@ def _build_dispatch_build(
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
             await launch_or_conduct(
+                # Threaded so a TAKEN_TERMINAL on THIS arm acks and emits
+                # exactly as it does on the gate-approved arm (§3: "both
+                # launch_or_conduct call sites consume the outcome").
+                ack_callback=ack_callback,
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
@@ -826,6 +1126,7 @@ def _build_dispatch_build(
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
             await launch_or_conduct(
+                ack_callback=ack_callback,
                 build_id=build_id,
                 feature_id=payload.feature_id,
                 correlation_id=payload.correlation_id,
@@ -1049,8 +1350,10 @@ def build_pipeline_consumer_deps(
             ``deps.dispatch_build`` raises :class:`RuntimeError` so a
             missing wiring surfaces during the first dispatch rather
             than silently dropping the build.
-        conductor_router: Optional ``async (**launch_kwargs) -> bool``
-            seam (conductor revival Stage 1c). ``None`` — the default,
+        conductor_router: Optional ``async (**launch_kwargs) ->
+            ConductorOutcome | TakenTerminal`` seam (conductor revival
+            Stage 1c; widened to the taken-and-terminal vocabulary by the
+            activation lane, design §3). ``None`` — the default,
             and what the composition root passes while
             ``conductor.enabled`` is off — leaves the dequeue path
             byte-for-byte today's: every accepted build goes straight to

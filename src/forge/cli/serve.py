@@ -66,6 +66,12 @@ from forge.adapters.nats.fleet_publisher import (
     register_on_boot,
 )
 from forge.cli import _serve_daemon
+from forge.cli._conductor_outcome import (
+    DECLINED,
+    TAKEN_RUNNING,
+    TakenTerminal,
+    fail_mode_c_build,
+)
 from forge.cli._serve_config import (
     DEFAULT_DURABLE_NAME,
     DEFAULT_HEALTHZ_PORT,
@@ -1520,23 +1526,31 @@ def build_conductor_router(
 
     * The build's mode is read through the SAME reader Stage 1b wired
       (:class:`SqliteBuildModeReader`). Anything that is not the fix
-      journey answers ``False`` immediately, so a routine build under an
-      ON flag still takes the routine path untouched.
+      journey answers :data:`DECLINED` immediately, so a routine build
+      under an ON flag still takes the routine path untouched.
     * A fix journey's budget profile is resolved through
       :func:`resolve_budget_for_build` and put to THE CAP LAW
       (:func:`forge.config.conductor.mode_c_cap_refusal`, stage-2 design
       §4) **before** anything is spawned. An uncapped or unresolvable
       profile does not open the journey — and, critically, it does NOT
-      answer ``False``: ``False`` means "not a fix journey, launch it the
-      routine way", so returning it here would silently run a fix task
-      through the routine autobuild path. The build is marked FAILED with
-      the reason recorded on ``builds.error`` and the router answers
-      ``True`` (taken, and terminated loudly).
+      answer :data:`DECLINED`: DECLINED means "not a fix journey, launch
+      it the routine way", so returning it here would silently run a fix
+      task through the routine autobuild path. The build is marked FAILED
+      with the reason recorded on ``builds.error`` and the router answers
+      a :class:`TakenTerminal` CARRYING that reason — the dispatch caller
+      then acks the queue slot and emits ``build-failed``.
     * A fix journey that clears the cap law gets a per-build
       :class:`Supervisor` (its budget collaborators from
       :func:`build_conductor_budget_kwargs`) and a turn loop, spawned as a
       supervised background task so the consumer fetch loop is never
-      blocked by a whole journey.
+      blocked by a whole journey — answered :data:`TAKEN_RUNNING`.
+
+    **The contract is the taken-and-terminal vocabulary**
+    (:mod:`forge.cli._conductor_outcome`, activation design §3), which
+    REPLACES the Stage-1c bare bool outright: ``DECLINED`` /
+    ``TAKEN_RUNNING`` / ``TakenTerminal(reason=...)``. A legacy bare bool
+    reaching the dispatch seam refuses loudly rather than being read as
+    "not mine" — see :func:`check_router_outcome`.
 
     ``supervisor_factory`` is injected rather than composed here on
     purpose. ``build_supervisor`` needs thirteen routine-path
@@ -1586,11 +1600,16 @@ def build_conductor_router(
     mode_reader = SqliteBuildModeReader(pool)
     spawn_task = spawn if spawn is not None else _spawn_conductor_task
 
-    async def conductor_router(**launch_kwargs: Any) -> bool:
-        """Return ``True`` iff the conductor took this build."""
+    async def conductor_router(**launch_kwargs: Any) -> Any:
+        """Answer the taken-and-terminal vocabulary for one dequeued build.
+
+        Returns one of :data:`DECLINED` (not mine — routine launch),
+        :data:`TAKEN_RUNNING` (turn loop spawned) or a
+        :class:`TakenTerminal` (taken and already over, reason carried).
+        """
         build_id = launch_kwargs.get("build_id")
         if not build_id:  # pragma: no cover - defensive
-            return False
+            return DECLINED
         try:
             mode = mode_reader.get_build_mode(build_id)
         except Exception as exc:  # noqa: BLE001 — degrade to the routine path
@@ -1601,18 +1620,22 @@ def build_conductor_router(
                 exc,
                 build_id,
             )
-            return False
+            return DECLINED
         if mode is not BuildMode.MODE_C:
-            return False
+            return DECLINED
 
         # THE CAP LAW, belt at the daemon (stage-2 design §4). Mode-c is
         # confirmed; the profile is resolved through the production
         # resolver and put to the ONE rule before a single thing is
-        # spawned. NEVER ``return False`` from here: False is the routine
-        # path, and running a fix task through the routine autobuild
-        # launch is precisely the silent downgrade this belt exists to
-        # prevent. The build fails loudly instead, with the reason on the
-        # row, and the router reports the build as taken.
+        # spawned. NEVER ``return DECLINED`` from here: DECLINED is the
+        # routine path, and running a fix task through the routine
+        # autobuild launch is precisely the silent downgrade this belt
+        # exists to prevent. The build fails loudly instead, with the
+        # reason on the row, and the router answers TakenTerminal —
+        # which is what gets the slot acked and a build-failed emitted
+        # (activation design §3; before the vocabulary the refusal wrote
+        # DB-only and wedged the whole consumer for an hour under
+        # ``max_ack_pending=1``).
         cap_refusal = _mode_c_cap_refusal_for_build(pool, config, build_id)
         if cap_refusal is not None:
             logger.error(
@@ -1624,8 +1647,9 @@ def build_conductor_router(
                 cap_refusal.summary,
                 cap_refusal.message,
             )
-            _fail_uncapped_mode_c_build(pool, build_id, cap_refusal)
-            return True
+            return TakenTerminal(
+                reason=_fail_uncapped_mode_c_build(pool, build_id, cap_refusal)
+            )
 
         try:
             supervisor = await _maybe_await_value(supervisor_factory(build_id))
@@ -1635,15 +1659,33 @@ def build_conductor_router(
                 )
             else:
                 deps = ConductorDriverDeps(supervisor=supervisor)
-        except Exception as exc:  # noqa: BLE001 — never brick the routine path
+        except Exception as exc:  # noqa: BLE001 — fail loud, never sideways
+            # SILENT-DOWNGRADE SEAM 1 (activation design §4.1). This arm
+            # used to ``return False`` — below the very comment forbidding
+            # it — so a mode-c build whose supervisor/deps factory threw
+            # ran as a ROUTINE autobuild against a TASK-xxx subject. It is
+            # now taken-and-terminal with the exception NAMED.
+            summary = (
+                f"the conductor's per-build setup raised "
+                f"{type(exc).__name__}: {exc}"
+            )
             logger.error(
                 "conductor: per-build setup raised %s: %s for build_id=%s; "
-                "the build takes the routine path",
+                "the build is REFUSED (marked FAILED, slot acked, terminal "
+                "emitted) — it is NOT downgraded onto the routine path",
                 type(exc).__name__,
                 exc,
                 build_id,
             )
-            return False
+            return TakenTerminal(
+                reason=fail_mode_c_build(
+                    pool,
+                    build_id,
+                    summary=summary,
+                    what="a per-build conductor setup failure",
+                    log=logger,
+                )
+            )
 
         logger.info(
             "conductor: build_id=%s is a fix journey — handing it to the "
@@ -1651,7 +1693,7 @@ def build_conductor_router(
             build_id,
         )
         spawn_task(drive_fix_journey(build_id, deps))
-        return True
+        return TAKEN_RUNNING
 
     return conductor_router
 
@@ -1710,64 +1752,34 @@ def _fail_uncapped_mode_c_build(
     pool: Any,
     build_id: str,
     refusal: Any,
-) -> None:
+) -> str:
     """Mark ``build_id`` FAILED with the cap-law refusal on ``builds.error``.
 
     The same never-silent posture ``_enforce_mode_c_budget`` takes: the
     build stops with the reason on the row, so ``forge history`` and every
-    other reader can say WHY. Composed through
-    :func:`~forge.lifecycle.state_machine.transition_chain` so
-    ``apply_transition`` stays the sole writer of ``builds.status`` (a
-    ``QUEUED`` row reaches ``FAILED`` via the legal ``PREPARING`` hop).
+    other reader can say WHY.
 
-    Never raises. A row that cannot be transitioned is logged loudly — the
-    router still reports the build as taken, because the one thing that
-    must not happen is the fix task quietly running as a routine build.
+    Delegates to :func:`~forge.cli._conductor_outcome.fail_mode_c_build` —
+    the ONE writer of "a refused mode-c build is marked FAILED with the
+    reason" (the boot-rearm and dispatch seams refuse through the same
+    function). ``logger`` is threaded so the message still names this
+    module.
+
+    Never raises. Every degraded arm (no row, an already-terminal row, an
+    unwritable row) is logged loudly AND named in the returned reason, so
+    the ``build-failed`` the dispatch caller emits describes what actually
+    happened.
+
+    Returns:
+        The reason to carry on the :class:`TakenTerminal`.
     """
-    from forge.lifecycle.persistence import Build
-    from forge.lifecycle.state_machine import BuildState, transition_chain
-
-    terminal = (
-        BuildState.COMPLETE,
-        BuildState.FAILED,
-        BuildState.CANCELLED,
-        BuildState.SKIPPED,
+    return fail_mode_c_build(
+        pool,
+        build_id,
+        summary=refusal.summary,
+        what="the cap-law refusal",
+        log=logger,
     )
-    try:
-        row = pool.get_build_row(build_id)
-        if row is None:
-            logger.error(
-                "conductor: cap-law refusal for build_id=%s but no build row "
-                "exists to mark FAILED; the refusal stands (nothing was "
-                "spawned) but it is recorded only in this log",
-                build_id,
-            )
-            return
-        current = row.status
-        if current in terminal:
-            logger.warning(
-                "conductor: cap-law refusal for build_id=%s whose row is "
-                "already terminal (%s); leaving it alone",
-                build_id,
-                current.value,
-            )
-            return
-        for hop in transition_chain(
-            Build(build_id=build_id, status=current),
-            BuildState.FAILED,
-            error=refusal.summary,
-        ):
-            pool.apply_transition(hop)
-    except Exception as exc:  # noqa: BLE001 — the refusal must still hold
-        logger.error(
-            "conductor: could not mark build_id=%s FAILED after the cap-law "
-            "refusal (%s: %s). The journey was NOT opened and the build was "
-            "NOT downgraded onto the routine path; the row may be left "
-            "mid-flight and needs a hand",
-            build_id,
-            type(exc).__name__,
-            exc,
-        )
 
 
 #: Strong references to the per-build conductor tasks. ``asyncio`` keeps
