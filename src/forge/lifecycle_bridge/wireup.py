@@ -112,6 +112,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
         BudgetBreachObserver,
         BudgetObserverSession,
     )
+    from forge.pipeline.supervisor import BuildModeReader
 
 
 def _build_transient_stream_errors() -> tuple[type[BaseException], ...]:
@@ -154,6 +155,7 @@ __all__ = [
     "DEFAULT_DEADLINE_SECONDS",
     "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS",
     "LifecycleBridgeWireup",
+    "MODE_C_WATCHDOG_STAND_DOWN",
     "RunStateFetcher",
     "RunStateSnapshot",
     "StreamSource",
@@ -204,6 +206,15 @@ STREAM_NO_TERMINAL_FAILURE_REASON: str = "stream-ended-without-terminal"
 #: write hits the right row (un-wedging dispatch). Production wires a
 #: SQLite reader; unit tiers omit it and fall back to ``feature_id``.
 BuildIdResolver = Callable[[str, str], Awaitable["str | None"]]
+
+#: FWD-002 mode learning (2026-08-04, drive-5 defect harvest) — the log
+#: phrase emitted when the identity watchdog stands down for a fix
+#: journey. ONE line, at INFO, so a reader of the daemon log can tell
+#: "the watchdog chose not to fire" apart from "the watchdog never ran".
+MODE_C_WATCHDOG_STAND_DOWN: str = (
+    "mode-c build: journey liveness is the conductor's; "
+    "FWD-002 identity watchdog stands down"
+)
 
 
 #: Tuple of typed payload classes that mark a terminal lifecycle. When
@@ -442,6 +453,13 @@ class LifecycleBridgeWireup:
             inject a deterministic clock so the registry's
             ``deadline_at`` column is reproducible. Defaults to
             :func:`datetime.now`.
+        build_mode_reader: Optional
+            :class:`~forge.pipeline.supervisor.BuildModeReader` consulted
+            ONLY on the identity-unresolved branch (FWD-002 mode
+            learning). Production wires
+            :class:`~forge.lifecycle.persistence.SqliteBuildModeReader`.
+            ``None`` — the default — arms the identity watchdog for every
+            build exactly as before this lane.
     """
 
     def __init__(
@@ -461,6 +479,7 @@ class LifecycleBridgeWireup:
         clock: Callable[[], datetime] | None = None,
         build_id_resolver: "BuildIdResolver | None" = None,
         budget_observer: "BudgetBreachObserver | None" = None,
+        build_mode_reader: "BuildModeReader | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -510,6 +529,11 @@ class LifecycleBridgeWireup:
         # identity-unresolved build-failed. ``None`` (unit tiers) falls back
         # to feature_id; production wires a SQLite reader.
         self._build_id_resolver = build_id_resolver
+        # FWD-002 mode learning — the read-side that lets the identity
+        # watchdog tell a fix journey from a routine build. ``None`` (unit
+        # tiers, and any caller that has not opted in) keeps the watchdog
+        # armed for EVERY build: the pre-lane behaviour, byte for byte.
+        self._build_mode_reader = build_mode_reader
         # FEAT-UBS-002 stage 2 (DETECT) — mid-run budget-breach detector.
         # ``None`` (the default, and every attended / caps-off deployment) makes
         # the observer's budget hook a strict no-op: zero extra DB / publish
@@ -718,9 +742,39 @@ class LifecycleBridgeWireup:
                 # the per-build deadline (a slow dispatch may still surface
                 # the run); if identity STILL never resolves, publish a
                 # synthetic build-failed and ack — never spin silently.
+                #
+                # FWD-002 MODE LEARNING (2026-08-04 drive-5 harvest): that
+                # protection is written for a ROUTINE build, whose only
+                # liveness signal IS the identity the langgraph sidecar
+                # publishes — no identity, no evidence anyone is driving,
+                # so silence means stuck. A mode-c build is never silent:
+                # the conductor's turn loop owns it (journey wallclock cap,
+                # per-stage timeouts, the taken-and-terminal vocabulary,
+                # the leg-honesty terminal), and the fix journey never
+                # touches the sidecar path at all — so identity NEVER
+                # resolves for it and the deadline below terminalises a
+                # perfectly healthy journey (drive 5: the first production
+                # work leg killed ~90s into an 1800s budget, row stamped
+                # FAILED|identity-unresolved). Consult the row's mode and
+                # stand the watchdog down for a fix journey: no deadline
+                # arm, no synthetic terminal, no ack, no detach — the
+                # conductor acks at ITS terminal.
+                build_id = await self._resolve_watchdog_build_id(context)
+                if self._is_mode_c_build(build_id):
+                    logger.info(
+                        "wireup._observer_loop: feature_id=%s build_id=%s — %s "
+                        "(no identity deadline armed, no synthetic "
+                        "build-failed; the row is left to the conductor)",
+                        feature_id,
+                        build_id,
+                        MODE_C_WATCHDOG_STAND_DOWN,
+                    )
+                    return
                 identity = await self._await_identity_until_deadline(context)
                 if identity is None:
-                    await self._publish_identity_unresolved_failure(context, handle)
+                    await self._publish_identity_unresolved_failure(
+                        context, handle, build_id=build_id
+                    )
                     return
             thread_id, run_id = identity
 
@@ -1675,8 +1729,63 @@ class LifecycleBridgeWireup:
                 return identity
         return None
 
+    async def _resolve_watchdog_build_id(self, context: BuildContext) -> str | None:
+        """Resolve the ``builds.build_id`` the watchdog decision hangs on.
+
+        Called ONCE on the identity-unresolved branch and threaded into
+        both consumers — the mode read below and (on the routine path) the
+        synthetic terminal's payload — so a routine build pays exactly one
+        resolver call, as it did before this lane.
+
+        Returns ``None`` when no mode reader is wired: with nothing to ask
+        about the mode there is no decision to make, so the resolve is
+        skipped entirely and :meth:`_publish_identity_unresolved_failure`
+        resolves its own build_id exactly as it always has.
+        """
+        if self._build_mode_reader is None:
+            return None
+        return await self._resolve_build_id(context.feature_id, context.correlation_id)
+
+    def _is_mode_c_build(self, build_id: str | None) -> bool:
+        """Return ``True`` iff ``build_id``'s row is a fix journey (mode-c).
+
+        The §4 degrade posture, inverted for this seam: the established
+        consumer-side read (``forge.cli._conductor_outcome.is_mode_c_build``)
+        answers ``False`` on an unreadable row so a routine build is never
+        stranded on a database hiccup, and the same answer is the safe one
+        here for the opposite reason — ``False`` KEEPS the FWD-002 watchdog
+        armed. An unreadable row must never silently disarm a routine
+        build's protection, so every degraded arm (no reader, no build_id,
+        a raising read) fails TOWARD watching, and the raising arm says so
+        at ERROR rather than passing quietly.
+        """
+        reader = self._build_mode_reader
+        if reader is None or not build_id:
+            return False
+        from forge.lifecycle.modes import BuildMode
+
+        try:
+            mode = reader.get_build_mode(build_id)
+        except Exception as exc:  # noqa: BLE001 — fail toward watching
+            logger.error(
+                "wireup._is_mode_c_build: mode read raised %s: %s for "
+                "build_id=%s; KEEPING the FWD-002 identity watchdog armed "
+                "(an unreadable row is not evidence of a fix journey, and "
+                "disarming a routine build's stuck-build protection on a "
+                "read failure is the silent downgrade this seam forbids)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return False
+        return mode is BuildMode.MODE_C
+
     async def _publish_identity_unresolved_failure(
-        self, context: BuildContext, handle: BuildAckHandle
+        self,
+        context: BuildContext,
+        handle: BuildAckHandle,
+        *,
+        build_id: str | None = None,
     ) -> None:
         """Publish a synthetic ``build-failed`` for an unresolved identity.
 
@@ -1692,9 +1801,18 @@ class LifecycleBridgeWireup:
         successful publish. On a publish failure the inbound message is left
         un-acked so JetStream redelivery / the next boot's recovery retries —
         never a silent drop.
+
+        Args:
+            context: The build's :class:`BuildContext`.
+            handle: The inbound ack handle.
+            build_id: Optional pre-resolved durable build_id, threaded in by
+                the observer when the mode gate already resolved it (one
+                resolver call per build, not two). ``None`` resolves here,
+                the pre-lane path.
         """
         feature_id = context.feature_id
-        build_id = await self._resolve_build_id(feature_id, context.correlation_id)
+        if build_id is None:
+            build_id = await self._resolve_build_id(feature_id, context.correlation_id)
         # AC-2: payload construction is the translator's job — the wireup
         # never constructs pipeline payloads. The translator's public
         # synthetic factory also attaches the correlation_id (T3 AC-6).

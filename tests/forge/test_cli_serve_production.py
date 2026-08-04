@@ -855,6 +855,12 @@ class TestLifecycleBridgeWireupComposition:
         # stream_source / identity_provider are callables.
         assert callable(parts.stream_source)
         assert callable(parts.identity_provider)
+        # FWD-002 mode learning — the boot must build a real mode reader,
+        # not leave it None (which arms the identity watchdog against fix
+        # journeys the conductor is actively driving).
+        from forge.lifecycle.persistence import SqliteBuildModeReader
+
+        assert isinstance(parts.build_mode_reader, SqliteBuildModeReader)
 
     def test_bind_production_serve_logs_wired_not_deferred(
         self,
@@ -1001,6 +1007,7 @@ class TestLifecycleBridgeWireupComposition:
                 run_state_fetcher=object(),
                 build_state_recorder=object(),
                 build_id_resolver=object(),
+                build_mode_reader=object(),
                 terminal_publish_ledger=object(),
             )
 
@@ -1033,6 +1040,12 @@ class TestLifecycleBridgeWireupComposition:
             assert callable(observer._resolve_budget)
             assert callable(observer._elapsed_seconds)
             assert callable(observer._clock)
+            # FWD-002 mode learning — the parts' mode reader must reach the
+            # wireup. Dropped here, the identity watchdog cannot tell a fix
+            # journey from a routine build and terminalises every mode-c
+            # build that outlives the per-build deadline (drive-5,
+            # 2026-08-04: a live work leg killed 90s into an 1800s budget).
+            assert captured["build_mode_reader"] is parts.build_mode_reader
         finally:
             cx.close()
 
