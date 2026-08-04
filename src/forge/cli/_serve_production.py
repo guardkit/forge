@@ -70,6 +70,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
         BuildStateRecorder,
         IdentityProvider,
     )
+    from forge.pipeline.supervisor import BuildModeReader
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,13 @@ class LifecycleBridgeWireupParts:
     # the real queued row. Optional so unit-tier parts constructions (which
     # never publish a synthetic terminal) need not supply it.
     build_id_resolver: "BuildIdResolver | None" = None
+    # FWD-002 mode learning (2026-08-04) — lets the bridge's identity
+    # watchdog tell a fix journey from a routine build, so a mode-c build
+    # (whose liveness the conductor owns, and which never touches the
+    # sidecar path identity resolution reads) is never terminalised as a
+    # silent stuck build. Optional for the same reason as the resolver:
+    # unit-tier parts constructions never reach the watchdog branch.
+    build_mode_reader: "BuildModeReader | None" = None
 
 
 def _build_async_tasks_identity_provider(
@@ -401,6 +409,14 @@ def _build_lifecycle_bridge_wireup_parts(
     # identity-unresolved build-failed the observer publishes at the
     # per-build deadline.
     build_id_resolver = _build_build_id_resolver(sqlite_pool=sqlite_pool)
+    # FWD-002 mode learning — the SAME reader the conductor's seams hold
+    # (no second connection: it reads through the shared facade). Consulted
+    # only on the identity-unresolved branch, so a routine build pays one
+    # indexed SELECT at the moment it was about to be declared stuck, and
+    # nothing at all on the healthy path.
+    from forge.lifecycle.persistence import SqliteBuildModeReader
+
+    build_mode_reader = SqliteBuildModeReader(sqlite_pool)
 
     return LifecycleBridgeWireupParts(
         bridge=bridge,
@@ -412,6 +428,7 @@ def _build_lifecycle_bridge_wireup_parts(
         build_state_recorder=build_state_recorder,
         registry=registry,
         build_id_resolver=build_id_resolver,
+        build_mode_reader=build_mode_reader,
     )
 
 
