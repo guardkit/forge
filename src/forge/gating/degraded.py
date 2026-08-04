@@ -48,12 +48,18 @@ __all__ = [
 ]
 
 #: Human-readable rationale stamped on every degraded-mode decision so the
-#: gate history is honest about *why* the build paused: no evidence was
-#: available at dispatch, so v1 never auto-approves (DF-009 ratchet).
+#: gate history is honest about *why* the build paused: no coach score is
+#: available at dispatch and v1 never auto-approves (DF-009 ratchet). The
+#: wording is deliberately TRUE whether the priors read matched 0 or N —
+#: this static callable never sees the priors, so it must not claim their
+#: absence (the 2026-08-04 activation sitting caught the old text lying on
+#: the card while the daemon logged 5 matched; count-aware rationale rides
+#: the real-reasoning-model lane, not this constant).
 DEGRADED_RATIONALE: str = (
-    "Degraded/training mode: no coach score or priors are available at "
-    "dispatch, so the gate mandates human approval before the build starts "
-    "(ADR-ARCH-019 honesty posture; v1 never auto-approves)."
+    "Degraded/training mode: no coach score is available at dispatch and "
+    "v1 never auto-approves, so the gate mandates human approval before "
+    "the build starts; any retrieved priors ride the decision as evidence "
+    "(ADR-ARCH-019 honesty posture)."
 )
 
 #: Static reasoning-model response body. Matches the JSON contract that
