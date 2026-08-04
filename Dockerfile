@@ -160,29 +160,75 @@ RUN test -d /tmp/guardkitfactory/src/guardkitfactory || (echo "guardkitfactory l
 # unlike nats-core / fleet-memory which install BEFORE it. Two facts decide
 # it, and both were checked against the pyprojects rather than assumed:
 #
-#   1. Dependency direction. guardkitfactory declares NOTHING from this
-#      estate (its deps are deepagents / langgraph / langchain /
-#      langchain-core / langchain-openai / tree-sitter, all on PyPI).
-#      guardkit is the one that declares guardkitfactory —
-#      ``guardkit-py[autobuild]`` -> ``guardkitfactory>=0.2.0,<1``. forge
-#      itself never names it. So the "sibling before its dependant" rule
-#      only requires guardkitfactory to precede the guardkit block below,
-#      which it does; nothing forge installs can reach PyPI looking for
-#      guardkitfactory (there is no distribution there to find).
+#   1. Dependency direction. guardkitfactory declares nothing from this
+#      estate in its DEPENDENCIES (deepagents / langgraph / langchain /
+#      langchain-core / langchain-openai / tree-sitter, all on PyPI), and
+#      guardkit is the one that declares IT —
+#      ``guardkit-py[autobuild]`` -> ``guardkitfactory>=0.2.0,<1``, an extra
+#      this image never installs, so nothing forge installs can reach PyPI
+#      looking for a guardkitfactory distribution (there is none to find).
+#      forge itself never names it.
 #
-#   2. The deepagents floor decides the rest. forge pins
-#      ``deepagents>=0.5.3,<0.6``; guardkitfactory requires
-#      ``deepagents>=0.6.7,<1``. That pair is UNSATISFIABLE in one venv,
-#      and pip's sequential installs make the LAST install the winner.
+#      DO NOT read that as "guardkitfactory is independent of guardkit". Its
+#      runtime IMPORT graph runs the other way:
+#      guardkitfactory/harness/langgraph_harness.py does a module-level
+#      ``from guardkit.orchestrator.harness import ...`` and
+#      ``import guardkitfactory`` reaches it eagerly via ``__init__`` ->
+#      ``.harness``. The two are mutually importing. That is harmless here
+#      only because installation never imports, and both are present in the
+#      final venv before anything imports either (the oracles run
+#      post-build) — but by import direction guardkitfactory would more
+#      properly FOLLOW the guardkit block, not precede it. Placement here is
+#      the deepagents decision below, nothing more.
+#
+#   2. The deepagents band decides the rest, and it is PINNED here on
+#      purpose. forge pins ``deepagents>=0.5.3,<0.6``; guardkitfactory
+#      requires ``deepagents>=0.6.7,<1``. That pair is UNSATISFIABLE in one
+#      venv, and pip's sequential installs make the LAST install the winner.
 #      Installing guardkitfactory first would let forge's install DOWNGRADE
 #      deepagents to 0.5.x, where ``create_deep_agent`` has no
 #      ``state_schema`` keyword (added upstream in 0.6.6 and passed by
 #      guardkitfactory's harness). ``import guardkitfactory`` would still
 #      succeed and the leg would then die at call time — the false-green
-#      class this bake exists to kill. So guardkitfactory installs LAST and
-#      its floor stands.
+#      class this bake exists to kill. So guardkitfactory installs LAST.
 #
-#      Why the daemon tolerates the newer deepagents: forge's ENTIRE
+#      But LAST alone is not enough, and the bare install is a TRAP: pip
+#      resolves ``deepagents>=0.6.7,<1`` to the NEWEST match on PyPI, and
+#      that band today runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
+#      ``pip install /tmp/guardkitfactory`` lands 0.7.3, NOT the 0.6.7 this
+#      estate is developed against (guardkitfactory's own .venv carries
+#      0.6.7 and its floor comment stops there). 0.7.x is a SILENT
+#      regression for the daemon on two counts:
+#
+#        (a) deepagents 0.7.x DELETED the module constant
+#            ``ASYNC_TASK_SYSTEM_PROMPT`` and changed
+#            ``AsyncSubAgentMiddleware.__init__``'s ``system_prompt``
+#            default from that constant to ``None``.
+#            src/forge/cli/serve.py constructs
+#            ``AsyncSubAgentMiddleware(async_subagents=[spec])`` with no
+#            ``system_prompt``, so under 0.7.x the supervisor silently loses
+#            the entire async-subagent operating protocol (start / check /
+#            update / cancel / list rules plus the stale-status rules) it
+#            carries today. NOTHING RAISES — the leg just gets a dumber
+#            supervisor.
+#
+#        (b) 0.7.3 cascade-upgrades the daemon's whole LLM stack unreviewed:
+#            langchain>=1.3.14, langchain-core>=1.5.0,
+#            langchain-anthropic>=1.5.3, langchain-google-genai>=4.3.1,
+#            langsmith>=0.10.9. All sit inside forge's declared ranges so
+#            pip refuses nothing — but forge's SSE contract fixtures
+#            (tests/forge/lifecycle_bridge/test_translation_contract.py)
+#            were recorded against the current set, and forge pins
+#            langgraph-sdk~=0.3.13 / langgraph-api~=0.8.0 around them.
+#
+#      The ``state_schema`` oracle CANNOT catch either: the keyword exists
+#      in 0.6.7 and 0.7.3 alike — it is a FLOOR probe, not a version probe.
+#      Hence the explicit ``deepagents>=0.6.7,<0.7`` on the install line
+#      below, and the version-band assertion in the oracle. Widening that
+#      band is a deliberate act: re-check serve.py's middleware construction
+#      and the SSE contract fixtures first.
+#
+#      Why the daemon tolerates the newer deepagents at all: forge's ENTIRE
 #      deepagents surface is one import —
 #      ``deepagents.middleware.async_subagents.AsyncSubAgentMiddleware``
 #      (src/forge/cli/serve.py) — and that module is identical between
@@ -194,9 +240,10 @@ RUN test -d /tmp/guardkitfactory/src/guardkitfactory || (echo "guardkitfactory l
 #
 # scripts/verify-forge-oracles.sh proves the result inside the built image:
 # ``import guardkitfactory`` (which eagerly imports guardkitfactory.harness,
-# hence the whole deepagents/langchain/langgraph stack), the ``state_schema``
-# capability itself, and ``guardkit task-review --help``.
-RUN pip install /tmp/guardkitfactory
+# hence the whole deepagents/langchain/langgraph stack), the resolved
+# deepagents version band, the ``state_schema`` capability itself, and
+# ``guardkit task-review --help``.
+RUN pip install /tmp/guardkitfactory 'deepagents>=0.6.7,<0.7'
 
 # ---------------------------------------------------------------------------
 # guardkit oracle payload + CLI — forge-side mirror of the specialist's
