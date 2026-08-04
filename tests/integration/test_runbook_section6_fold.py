@@ -31,6 +31,7 @@ CANONICAL_BUILDKIT = (
     "docker buildx build --build-context nats-core=../nats-core "
     "--build-context guardkit=../guardkit "
     "--build-context fleet-memory=../fleet-memory "
+    "--build-context guardkitfactory=../guardkitfactory "
     "-t forge:production-validation -f Dockerfile ."
 )
 PRE_FOLD_BUILD = "docker build -t forge:production-validation -f Dockerfile ."
