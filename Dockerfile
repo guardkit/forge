@@ -137,6 +137,68 @@ COPY src ./src
 RUN pip install .[providers,memory]
 
 # ---------------------------------------------------------------------------
+# guardkitfactory — the LangGraph leg-harness runtime.
+#
+# LIVE INCIDENT (the conductor's first real leg, 2026-08-03): the leg died
+# in-container with ``GUARDKIT_HARNESS=langgraph but guardkitfactory is not
+# importable`` (guardkit/orchestrator/harness/selector.py:425). This image
+# baked guardkit but never the harness runtime guardkit's langgraph path
+# imports, so NO langgraph-harness leg could run at all.
+#
+# Wired exactly like nats-core / fleet-memory: a BuildKit named context
+# supplied by ``scripts/build-image.sh`` via
+# ``--build-context guardkitfactory=../guardkitfactory``. guardkitfactory has
+# no PyPI distribution, so the sibling working tree is the only source.
+COPY --from=guardkitfactory / /tmp/guardkitfactory
+
+# R3-style layout gate (mirrors the nats-core / fleet-memory gates above): a
+# stale or empty sibling checkout fails fast with a named diagnostic instead
+# of a confusing pip resolution error several layers down.
+RUN test -d /tmp/guardkitfactory/src/guardkitfactory || (echo "guardkitfactory layout invalid" >&2; exit 1)
+
+# INSTALL ORDER — deliberately AFTER ``pip install .[providers,memory]``,
+# unlike nats-core / fleet-memory which install BEFORE it. Two facts decide
+# it, and both were checked against the pyprojects rather than assumed:
+#
+#   1. Dependency direction. guardkitfactory declares NOTHING from this
+#      estate (its deps are deepagents / langgraph / langchain /
+#      langchain-core / langchain-openai / tree-sitter, all on PyPI).
+#      guardkit is the one that declares guardkitfactory —
+#      ``guardkit-py[autobuild]`` -> ``guardkitfactory>=0.2.0,<1``. forge
+#      itself never names it. So the "sibling before its dependant" rule
+#      only requires guardkitfactory to precede the guardkit block below,
+#      which it does; nothing forge installs can reach PyPI looking for
+#      guardkitfactory (there is no distribution there to find).
+#
+#   2. The deepagents floor decides the rest. forge pins
+#      ``deepagents>=0.5.3,<0.6``; guardkitfactory requires
+#      ``deepagents>=0.6.7,<1``. That pair is UNSATISFIABLE in one venv,
+#      and pip's sequential installs make the LAST install the winner.
+#      Installing guardkitfactory first would let forge's install DOWNGRADE
+#      deepagents to 0.5.x, where ``create_deep_agent`` has no
+#      ``state_schema`` keyword (added upstream in 0.6.6 and passed by
+#      guardkitfactory's harness). ``import guardkitfactory`` would still
+#      succeed and the leg would then die at call time — the false-green
+#      class this bake exists to kill. So guardkitfactory installs LAST and
+#      its floor stands.
+#
+#      Why the daemon tolerates the newer deepagents: forge's ENTIRE
+#      deepagents surface is one import —
+#      ``deepagents.middleware.async_subagents.AsyncSubAgentMiddleware``
+#      (src/forge/cli/serve.py) — and that module is identical between
+#      0.5.9 and 0.6.7 apart from prompt-text markdown formatting.
+#      pip WILL print a ``forge 0.1.0 requires deepagents<0.6`` conflict
+#      line at this layer: expected, and loud by design. Reconciling forge's
+#      DECLARED pin with the harness floor is a pyproject ruling, not an
+#      image change — raise it before the next pin edit.
+#
+# scripts/verify-forge-oracles.sh proves the result inside the built image:
+# ``import guardkitfactory`` (which eagerly imports guardkitfactory.harness,
+# hence the whole deepagents/langchain/langgraph stack), the ``state_schema``
+# capability itself, and ``guardkit task-review --help``.
+RUN pip install /tmp/guardkitfactory
+
+# ---------------------------------------------------------------------------
 # guardkit oracle payload + CLI — forge-side mirror of the specialist's
 # template-payload fix (specialist-agent 2708d0a).
 #

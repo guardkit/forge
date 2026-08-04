@@ -41,6 +41,7 @@ CONTRACT_A_INVOCATION = (
     "docker buildx build --build-context nats-core=../nats-core "
     "--build-context guardkit=../guardkit "
     "--build-context fleet-memory=../fleet-memory "
+    "--build-context guardkitfactory=../guardkitfactory "
     "-t forge:production-validation -f Dockerfile ."
 )
 
@@ -255,6 +256,75 @@ class TestBuilderStageInstallLayer:
         ) in dockerfile_text, (
             "Builder stage must carry the fleet-memory layout-validation "
             "gate (mirrors the nats-core gate)"
+        )
+
+    def test_guardkitfactory_installed_from_buildkit_context(
+        self, dockerfile_text: str
+    ) -> None:
+        # guardkitfactory is the LangGraph leg harness that guardkit's
+        # ``GUARDKIT_HARNESS=langgraph`` path imports at runtime. The
+        # conductor's first real leg died in-container with
+        # ``GUARDKIT_HARNESS=langgraph but guardkitfactory is not importable``
+        # because the image baked guardkit but not its harness runtime. Like
+        # fleet-memory it has no PyPI distribution, so the COPYed BuildKit
+        # context is the only source.
+        assert re.search(
+            r"^COPY\s+--from=guardkitfactory\s+/\s+/tmp/guardkitfactory\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        ), (
+            "Builder stage must contain "
+            "``COPY --from=guardkitfactory / /tmp/guardkitfactory``"
+        )
+        assert re.search(
+            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/guardkitfactory\b",
+            dockerfile_text,
+        ), (
+            "Builder stage must install guardkitfactory from the BuildKit "
+            "context at /tmp/guardkitfactory (not from PyPI)"
+        )
+        assert (
+            'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
+            '|| (echo "guardkitfactory layout invalid" >&2; exit 1)'
+        ) in dockerfile_text, (
+            "Builder stage must carry the guardkitfactory layout-validation "
+            "gate (mirrors the nats-core gate)"
+        )
+
+    def test_guardkitfactory_installs_after_forge(
+        self, dockerfile_text: str
+    ) -> None:
+        # ORDER IS LOAD-BEARING and the reverse of the nats-core /
+        # fleet-memory posture. forge pins ``deepagents>=0.5.3,<0.6``;
+        # guardkitfactory requires ``deepagents>=0.6.7,<1``. The pair is
+        # unsatisfiable in one venv and pip's sequential installs make the
+        # LAST install the winner, so guardkitfactory MUST come after
+        # ``pip install .[providers,memory]`` — otherwise forge's install
+        # downgrades deepagents to 0.5.x, where ``create_deep_agent`` has no
+        # ``state_schema`` keyword (upstream 0.6.6) and the harness imports
+        # cleanly but dies at call time. See the Dockerfile comment block for
+        # the full reasoning.
+        forge_match = re.search(
+            r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
+        gkf_match = re.search(
+            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
+        assert forge_match, (
+            "Dockerfile must declare ``RUN pip install .[providers,memory]``"
+        )
+        assert gkf_match, (
+            "Dockerfile must declare ``RUN pip install /tmp/guardkitfactory``"
+        )
+        assert forge_match.start() < gkf_match.start(), (
+            "``RUN pip install /tmp/guardkitfactory`` must come AFTER "
+            "``RUN pip install .[providers,memory]`` so guardkitfactory's "
+            "deepagents>=0.6.7 floor wins the venv (forge's declared "
+            "deepagents<0.6 pin cannot be honoured at the same time)"
         )
 
     def test_nats_core_installed_from_buildkit_context(

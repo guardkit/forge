@@ -18,6 +18,13 @@
 #         (``guardkit feature validate --help``);
 #   (iii) forge's own resolver (resolve_normalizer_command) picks an importable
 #         candidate rather than raising NormalizerModuleUnresolved.
+#   (iv)  the LangGraph leg harness is real: ``import guardkitfactory`` (which
+#         eagerly imports guardkitfactory.harness, hence the whole
+#         deepagents/langchain/langgraph stack) AND the ``guardkit task-review``
+#         CLI leg answers. Added after the conductor's first real leg died
+#         in-container with ``GUARDKIT_HARNESS=langgraph but guardkitfactory is
+#         not importable`` — the image baked guardkit but not its harness
+#         runtime, and nothing at build time noticed.
 # Every future forge build proves its oracles before it can ship.
 #
 # The Python program is passed via ``python -c`` (NOT a stdin heredoc): a heredoc
@@ -76,12 +83,49 @@ assert cmd[:2] == ("python", "-m"), cmd
 print(f"  OK  resolver    resolve_normalizer_command() -> {cmd[2]}")
 PY
 
+# --- seam 3: the LangGraph leg harness is installed AND usable ----------------
+# ``import guardkitfactory`` is not a token check: guardkitfactory/__init__.py
+# eagerly imports guardkitfactory.harness, which imports create_deep_agent,
+# deepagents.backends.composite/local_shell/protocol and langchain-core. A
+# harness-less image (the first-real-leg failure mode) dies here.
+#
+# The state_schema probe is the second half of the same oracle. forge pins
+# deepagents<0.6 and guardkitfactory requires >=0.6.7 — an unsatisfiable pair,
+# so the Dockerfile installs guardkitfactory LAST to make its floor win. If a
+# future edit reorders those installs, the import above still SUCCEEDS (0.5.x
+# has create_deep_agent, just without the keyword) and the leg would fail at
+# call time instead. Proving the keyword exists turns that silent reorder into
+# a build-time failure.
+read -r -d '' HARNESS_PROG <<'PY' || true
+import inspect
+
+import guardkitfactory
+from deepagents import create_deep_agent
+
+params = inspect.signature(create_deep_agent).parameters
+if "state_schema" not in params:
+    raise SystemExit(
+        "deepagents.create_deep_agent has no 'state_schema' keyword — the "
+        "installed deepagents is below guardkitfactory's >=0.6.7 floor "
+        "(check the Dockerfile install order: guardkitfactory must be "
+        "installed AFTER pip install .[providers,memory])"
+    )
+print(f"  OK  harness     import guardkitfactory {guardkitfactory.__version__} + state_schema")
+PY
+
 docker run --rm --entrypoint python "${IMAGE}" -c "${NORMALIZER_PROG}"
 docker run --rm --entrypoint python "${IMAGE}" -c "${RESOLVER_PROG}"
+docker run --rm --entrypoint python "${IMAGE}" -c "${HARNESS_PROG}"
 
 # --- seam 2: the guardkit CLI binary answers at the frozen absolute path ------
 # forge.adapters.guardkit.run._GUARDKIT_BINARY == /usr/local/bin/guardkit.
 docker run --rm --entrypoint /usr/local/bin/guardkit "${IMAGE}" feature validate --help >/dev/null
 echo "  OK  cli         /usr/local/bin/guardkit feature validate --help"
+
+# The headless review leg the conductor spawns as ``task-review`` — same binary,
+# the subcommand a real leg actually invokes. Its --help import chain reaches
+# guardkit.cli.task_review, so a broken review-leg install fails here.
+docker run --rm --entrypoint /usr/local/bin/guardkit "${IMAGE}" task-review --help >/dev/null
+echo "  OK  cli         /usr/local/bin/guardkit task-review --help"
 
 echo "forge oracle verification PASSED for ${IMAGE}"
