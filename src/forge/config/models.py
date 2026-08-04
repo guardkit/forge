@@ -376,7 +376,7 @@ class QueueConfig(BaseModel):
 
 
 class BudgetGuards(BaseModel):
-    """Per-profile build budget caps (FEAT-UBS-002).
+    """Per-profile build budget caps (FEAT-UBS-002) — and the leg knobs.
 
     Every cap is optional. ``None`` means *no cap* — the attended-mode
     semantics preserved from FEAT-FORGE-008 ASSUM-010 (reviewer-driven Mode C
@@ -385,6 +385,48 @@ class BudgetGuards(BaseModel):
     declarative half; enforcement lives in
     :mod:`forge.pipeline.budget_guard` (a profile layered *on top* of the Mode C
     planner, never a rewrite of it).
+
+    The ``leg_*`` fields: budgets that are NOT caps
+    -----------------------------------------------
+
+    The four caps above bound a **build**. The ``leg_*`` fields bound one
+    **leg** — a single ``guardkit task-review`` / ``guardkit task-work``
+    subprocess — and the pipeline threads them onto that subprocess's argv
+    (``--max-turns`` / ``--sdk-timeout`` / ``--leg-budget``). Until this
+    field group existed the pipeline could not name them at all: the
+    conductor dispatcher's only extra argv was ``--model <seat>``, so the
+    build system's hardcoded defaults (2 turns / 420s / 1620s) governed
+    production and moving them was an image-level change. The experiment
+    round needs them turnable from ``forge.yaml``, so here they are.
+
+    They are deliberately **not** members of :attr:`caps_enabled`. That
+    property answers one question — "is this an unattended-style profile,
+    so the budget guard and the lifecycle budget observer arm?" — and a
+    per-leg turn budget does not make a journey unattended. Folding them in
+    would (a) arm the whole guard/observer machinery for a profile whose
+    every *build* cap is ``None``, and (b) make the reserved ``attended``
+    profile unable to carry a leg budget at all, since ``BudgetConfig``
+    rejects an armed ``attended`` (ASSUM-010). The cap law's posture —
+    including :func:`forge.config.conductor.mode_c_cap_refusal`, which reads
+    ``max_review_cycles`` and nothing else — is untouched by this group.
+
+    **Absent means byte-identical.** Every ``leg_*`` field defaults to
+    ``None``, and ``None`` emits no argv token whatsoever; the leg's own
+    default then governs, exactly as it did before this group existed.
+
+    **Deploy-order law, reverse direction** (the conductor-activation design
+    pass states the forward one for ``conductor.seat``, §"the deploy-order
+    law"). Adding OPTIONAL fields to an ``extra=forbid`` model is safe in
+    ONE direction only: an old ``forge.yaml`` stays valid against this new
+    schema. The reverse is the hazard — a ``forge.yaml`` that has grown a
+    ``leg_max_turns:`` key, read by a process still running the OLD schema,
+    is refused **whole**, because the loader propagates the
+    ``ValidationError`` unwrapped. That binds the langgraph sidecar too: it
+    lazily re-reads the SAME yaml per invocation and degrades to a
+    PERMISSIVE base-dir-only filesystem check on any load failure, so a
+    pre-schema sidecar meeting a new key silently weakens the routine path's
+    worktree confinement. Order is: merge → daemon image rebuild + recreate
+    AND sidecar stop-wait-start → THEN the yaml gains the ``leg_*`` keys.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -426,6 +468,42 @@ class BudgetGuards(BaseModel):
             "so the guard activates automatically once the score flows."
         ),
     )
+    leg_max_turns: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Player-Coach turns for ONE fix-journey work leg, threaded as "
+            "'--max-turns <n>'. ``None`` (the default) emits nothing and the "
+            "leg keeps its own default of 2. WORK LEGS ONLY: 'guardkit "
+            "task-review' does not declare --max-turns, and an undeclared "
+            "flag is a parse-time exit 2 — a dead journey, not a slow one."
+        ),
+    )
+    leg_sdk_timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Per-invocation model budget for ONE fix-journey leg (seconds), "
+            "threaded as '--sdk-timeout <n>'. ``None`` (the default) emits "
+            "nothing and each leg keeps its own default (480s review / 420s "
+            "work). BOTH leg kinds declare this flag. Keep it under the "
+            "leg's outer subprocess tripwire (600s review / 1800s work) or "
+            "the inner-under-outer margin that lets a timed-out leg write an "
+            "honest receipt instead of being SIGKILLed is gone."
+        ),
+    )
+    leg_budget_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "The loop-level clock for ONE fix-journey work leg (seconds), "
+            "threaded as '--leg-budget <n>'. ``None`` (the default) emits "
+            "nothing and the leg keeps its own default of 1620s. WORK LEGS "
+            "ONLY — 'guardkit task-review' does not declare --leg-budget. "
+            "Keep it under the 1800s work-stage tripwire for the same "
+            "inner-under-outer reason as the SDK timeout."
+        ),
+    )
 
     @property
     def caps_enabled(self) -> bool:
@@ -438,6 +516,12 @@ class BudgetGuards(BaseModel):
         dormant when it echoes the caps, so an inert stub is not misrepresented as
         an active cap. Do not drop ``min_coach_score`` here without also moving the
         attended-arming guard, or ASSUM-010 leaks.
+
+        And deliberately EXCLUDES the ``leg_*`` group: those bound one
+        subprocess, not the build, and nothing this property gates — the
+        budget guard, the lifecycle budget observer, the attended-arming
+        validator — has any business firing because a leg was given fewer
+        turns. See the class docstring for the full statement.
         """
         return any(
             value is not None

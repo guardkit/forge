@@ -75,9 +75,95 @@ from forge.pipeline.stage_taxonomy import StageClass
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "LEG_BUDGET_ARGV",
+    "leg_budget_args",
     "make_conductor_subprocess_dispatcher",
     "mint_stage_correlation_id",
 ]
+
+
+#: THE LEG-BUDGET ACCEPTANCE TABLE: ``(profile field, flag, stages that
+#: declare it)``.
+#:
+#: The third element is the load-bearing one and it is not symmetric. Only
+#: ``--sdk-timeout`` is declared by BOTH fix-journey legs
+#: (``guardkit/cli/task_review.py`` and ``guardkit/cli/task_work.py``);
+#: ``--max-turns`` and ``--leg-budget`` are declared by the WORK leg alone.
+#: Click rejects an undeclared option with exit 2 *before* the command body
+#: runs, so threading ``--max-turns`` onto a review dispatch would not make
+#: the review shorter — it would kill the journey at its opening leg, with
+#: no receipt. This is the same class of defect as the ``--parent-feature``
+#: pair the dispatcher used to emit and nothing accepted (see
+#: ``_build_argv_for_stage``'s docstring); it is stated as a table here so
+#: it is checkable rather than remembered.
+LEG_BUDGET_ARGV: tuple[tuple[str, str, frozenset[StageClass]], ...] = (
+    ("leg_max_turns", "--max-turns", frozenset({StageClass.TASK_WORK})),
+    (
+        "leg_sdk_timeout_seconds",
+        "--sdk-timeout",
+        frozenset({StageClass.TASK_REVIEW, StageClass.TASK_WORK}),
+    ),
+    ("leg_budget_seconds", "--leg-budget", frozenset({StageClass.TASK_WORK})),
+)
+
+
+def leg_budget_args(*, stage: StageClass, leg_budgets: Any) -> list[str]:
+    """Render the leg-budget flags ``stage`` accepts from ``leg_budgets``.
+
+    Args:
+        stage: The stage being dispatched. Consulted against
+            :data:`LEG_BUDGET_ARGV`; a stage that does not declare a flag
+            never receives it, however the profile is written.
+        leg_budgets: Anything exposing the ``leg_*`` attributes — in
+            production the build's resolved
+            :class:`~forge.config.models.BudgetGuards`. ``None`` yields
+            ``[]``. Duck-typed on purpose: this module is domain-adjacent
+            and does not import the config package.
+
+    Returns:
+        The flag/value tokens, in table order. **Empty whenever the
+        profile carries nothing** — which is the whole byte-identity
+        contract: a profile written before this field group existed
+        resolves to all-``None`` and emits not one token, so the leg runs
+        on its own hardcoded default exactly as it always has.
+
+    A value that is not a positive int is DROPPED with an error rather
+    than threaded. Pydantic already refuses such a value at config load
+    (``ge=1``), so reaching here means an injected stand-in — and putting
+    ``--max-turns None`` on a real argv would trade a config mistake for a
+    dead leg. Degrading to the leg's own default is the safe direction.
+    ``bool`` is excluded explicitly: it *is* an int, and ``--max-turns
+    True`` is not a number.
+    """
+    if leg_budgets is None:
+        return []
+    args: list[str] = []
+    for field_name, flag, accepting_stages in LEG_BUDGET_ARGV:
+        value = getattr(leg_budgets, field_name, None)
+        if value is None:
+            continue
+        if stage not in accepting_stages:
+            logger.info(
+                "leg budgets: profile sets %s=%r but the %s leg does not "
+                "declare %s — not threaded (an undeclared flag is a "
+                "parse-time exit 2, not a shorter leg)",
+                field_name,
+                value,
+                getattr(stage, "value", stage),
+                flag,
+            )
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            logger.error(
+                "leg budgets: profile sets %s=%r, which is not a positive "
+                "whole number — DROPPING it rather than putting it on the "
+                "leg's argv. The leg keeps its own default",
+                field_name,
+                value,
+            )
+            continue
+        args.extend([flag, str(value)])
+    return args
 
 
 def mint_stage_correlation_id(
@@ -112,6 +198,7 @@ def make_conductor_subprocess_dispatcher(
     timeout_seconds: int = 600,
     timeout_seconds_by_stage: Mapping[StageClass, int] | None = None,
     leg_model: str | None = None,
+    leg_budgets: Any = None,
     with_nats_streaming: bool = True,
 ) -> Callable[..., Awaitable[Any]]:
     """Build the ``subprocess_dispatcher`` the conductor's Supervisor calls.
@@ -164,6 +251,17 @@ def make_conductor_subprocess_dispatcher(
             frontier default; the builder-side chokepoint fence is the
             other half of that cure, and this is the half that lets the
             operator NAME the seat.
+        leg_budgets: The build's resolved budget profile, consulted for its
+            optional ``leg_*`` fields and rendered by :func:`leg_budget_args`
+            onto the argv of MODE_C stages ONLY, through the same
+            ``extra_args`` seam the seat rides. In production this is the
+            :class:`~forge.config.models.BudgetGuards` the composition root
+            already resolved off ``builds.profile`` — the SAME object the
+            supervisor's budget guard enforces, resolved once, so the caps
+            a build is judged against and the budgets its legs are given can
+            never come from two different profiles. ``None`` (the default),
+            or a profile carrying no ``leg_*`` value, appends nothing at
+            all — the byte-identity this factory's golden pins hold it to.
         with_nats_streaming: Forwarded verbatim.
 
     Returns:
@@ -275,22 +373,31 @@ def make_conductor_subprocess_dispatcher(
 
         stage_timeout = (timeout_seconds_by_stage or {}).get(stage, timeout_seconds)
 
-        # The seat rides ONLY on the fix journey's own stages, and only
-        # when an operator named one. ``None`` keeps the argv exactly as
-        # it was — the byte-identity the adapter's tests pin.
-        extra_args: list[str] | None = None
-        if leg_model and stage in MODE_C_STAGES:
-            extra_args = ["--model", leg_model]
+        # The seat and the leg budgets ride ONLY on the fix journey's own
+        # stages, and only when an operator named them. Both unset keeps
+        # the argv exactly as it was — the byte-identity the adapter's
+        # tests pin. The seat stays FIRST so the pin on its two tokens
+        # ("appends exactly two tokens and moves nothing") still reads.
+        extras: list[str] = []
+        budget_args: list[str] = []
+        if stage in MODE_C_STAGES:
+            if leg_model:
+                extras.extend(["--model", leg_model])
+            budget_args = leg_budget_args(stage=stage, leg_budgets=leg_budgets)
+            extras.extend(budget_args)
+        extra_args: list[str] | None = extras or None
 
         logger.info(
             "conductor dispatcher adapter: %s build_id=%s subject=%s "
-            "correlation_id=%s timeout=%ss seat=%s (planner rationale: %s)",
+            "correlation_id=%s timeout=%ss seat=%s leg budgets=%s "
+            "(planner rationale: %s)",
             getattr(stage, "value", stage),
             build_id,
             subject or "none",
             correlation_id,
             stage_timeout,
             leg_model or "unset (the builder's own default)",
+            " ".join(budget_args) or "unset (the leg's own defaults)",
             rationale or "none",
         )
 

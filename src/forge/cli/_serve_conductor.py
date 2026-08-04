@@ -818,6 +818,17 @@ def build_conductor_supervisor_factory(
             fallback any more. ``None`` (or blank) emits no ``--model`` at
             all, keeping the argv byte-identical to the one this
             composition has always emitted with the conductor disabled.
+
+    The **leg budgets** are deliberately NOT an argument here. They ride on
+    the build's resolved budget profile — the object
+    ``build_conductor_budget_kwargs`` already produces per build — and this
+    factory hands that same object to the dispatcher adapter. So an
+    operator turns ``--max-turns`` / ``--sdk-timeout`` / ``--leg-budget``
+    by editing the profile in ``forge.yaml`` the build was queued under,
+    and the caps the build is judged against and the budgets its legs are
+    given are the same profile by construction rather than by care. A
+    profile carrying no ``leg_*`` fields — which is every profile written
+    before they existed — emits no budget tokens at all.
     """
     from forge.cli.serve import (
         build_conductor_budget_kwargs,
@@ -889,6 +900,16 @@ def build_conductor_supervisor_factory(
             lifecycle_emitter=lifecycle_emitter,
             coach_score_reader=coach_score_reader,
         )
+        # The leg budgets come off the SAME resolved profile the supervisor
+        # is about to be judged against — read out of the budget kwargs
+        # rather than resolved a second time. Two resolutions of one
+        # ``builds.profile`` is two statements of one rule, and the day
+        # they disagree the caps a build is held to and the budgets its
+        # legs were given come from different profiles. ``.get`` because
+        # ``budget_kwargs_builder`` is injectable and a test's stand-in
+        # need not supply guards; absent simply means no leg budgets, and
+        # no leg budgets means the argv this composition always emitted.
+        leg_budgets = budget_kwargs.get("budget_guards")
         dispatcher = make_conductor_subprocess_dispatcher(
             build_row_reader=pool.get_build_row,
             read_allowlist=read_allowlist,
@@ -898,6 +919,7 @@ def build_conductor_supervisor_factory(
             subprocess_runner=subprocess_runner,
             timeout_seconds_by_stage=stage_timeouts,
             leg_model=resolved_leg_model,
+            leg_budgets=leg_budgets,
         )
         checkpoint = make_merge_ready_checkpoint(
             pool=pool,
