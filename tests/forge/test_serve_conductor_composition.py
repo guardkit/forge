@@ -48,7 +48,9 @@ BUILD_ID = "build-FEAT-FIX007-20260731"
 SEAT = "qwen3-coder-30b"
 
 
-def _config(*, conductor_on: bool) -> ForgeConfig:
+def _config(
+    *, conductor_on: bool, leg_budgets: dict[str, int] | None = None
+) -> ForgeConfig:
     raw: dict[str, Any] = {
         "pipeline": {
             "build_queue_subject": "pipeline.build-queued.team-a",
@@ -58,6 +60,12 @@ def _config(*, conductor_on: bool) -> ForgeConfig:
     }
     if conductor_on:
         raw["conductor"] = {"enabled": True, "seat": SEAT}
+    if leg_budgets is not None:
+        # On the reserved ``attended`` profile deliberately: the build row
+        # this module inserts requests no profile, so ``attended`` is what
+        # it resolves — and leg budgets are NOT caps, so arming it with
+        # them is legal where arming it with a cap is not (ASSUM-010).
+        raw["budget"] = {"profiles": {"attended": dict(leg_budgets)}}
     return ForgeConfig.model_validate(raw)
 
 
@@ -392,6 +400,138 @@ class TestTheLegSeatIsConfigAsCode:
             serve_conductor_mod.build_conductor_supervisor_factory = original  # type: ignore[assignment]
 
         assert captured["leg_model"] is None
+
+
+class TestTheLegBudgetsAreYamlKnobs:
+    """The experiment round's knobs, wired at the composition site.
+
+    Forge threaded NO leg budgets: the dispatcher's only extra argv was
+    ``--model <seat>``, so the build system's hardcoded 2 turns / 420s /
+    1620s governed production and moving them was an image-level change.
+    These drive the COMPOSED production path — the argv that reaches the
+    runner — rather than re-reading the schema.
+    """
+
+    def test_a_profile_with_no_leg_budgets_is_todays_argv_exactly(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Every profile deployed today resolves here."""
+        runner = _runner()
+        supervisor = _supervisor_factory(pool, subprocess_runner=runner)(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+        _drive(supervisor, StageClass.TASK_WORK)
+
+        for call in runner.calls:
+            for flag in ("--max-turns", "--sdk-timeout", "--leg-budget"):
+                assert flag not in call["args"]
+
+    def test_the_profiles_leg_budgets_reach_the_legs_argv(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Both leg kinds are threaded — each with the flags it declares.
+
+        ``--sdk-timeout`` is declared by BOTH ``guardkit task-review`` and
+        ``guardkit task-work``; ``--max-turns`` and ``--leg-budget`` by the
+        work leg alone, and Click exits 2 on an undeclared option before
+        the command body runs, so threading them onto a review would kill
+        the journey at its opening leg rather than shorten it.
+        """
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool,
+            subprocess_runner=runner,
+            config=_config(
+                conductor_on=True,
+                leg_budgets={
+                    "leg_max_turns": 4,
+                    "leg_sdk_timeout_seconds": 300,
+                    "leg_budget_seconds": 900,
+                },
+            ),
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+        _drive(supervisor, StageClass.TASK_WORK)
+
+        review, work = runner.calls[0]["args"], runner.calls[1]["args"]
+
+        assert review[-2:] == ["--sdk-timeout", "300"]
+        assert "--max-turns" not in review
+        assert "--leg-budget" not in review
+        assert work[-6:] == [
+            "--max-turns",
+            "4",
+            "--sdk-timeout",
+            "300",
+            "--leg-budget",
+            "900",
+        ]
+
+    def test_the_seat_and_the_budgets_ride_the_same_argv(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool,
+            subprocess_runner=runner,
+            leg_model=SEAT,
+            config=_config(
+                conductor_on=True, leg_budgets={"leg_sdk_timeout_seconds": 300}
+            ),
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        assert runner.calls[0]["args"][-4:] == [
+            "--model",
+            SEAT,
+            "--sdk-timeout",
+            "300",
+        ]
+
+    def test_the_legs_budgets_come_off_the_SAME_resolved_profile(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """One resolution of ``builds.profile``, not two.
+
+        The caps the supervisor judges the build against and the budgets
+        its legs are handed must be the same profile by construction. The
+        factory reads the guards out of the budget kwargs it already
+        built; substituting the builder proves it does not resolve a
+        second time behind its own back.
+        """
+        from forge.config.models import BudgetGuards
+
+        guards = BudgetGuards(leg_sdk_timeout_seconds=111)
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool,
+            subprocess_runner=runner,
+            budget_kwargs_builder=lambda **_kw: {
+                "budget_guards": guards,
+                "budget_profile_name": "substituted",
+            },
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        assert supervisor.budget_guards is guards
+        assert runner.calls[0]["args"][-2:] == ["--sdk-timeout", "111"]
+
+    def test_a_budget_builder_that_supplies_no_guards_appends_nothing(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """``budget_kwargs_builder`` is injectable; absent guards are inert."""
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool, subprocess_runner=runner, budget_kwargs_builder=lambda **_kw: {}
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+
+        for flag in ("--max-turns", "--sdk-timeout", "--leg-budget"):
+            assert flag not in runner.calls[0]["args"]
 
 
 class TestTheM0Guard:
