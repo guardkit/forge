@@ -27,6 +27,16 @@
 #         in-container with ``GUARDKIT_HARNESS=langgraph but guardkitfactory is
 #         not importable`` — the image baked guardkit but not its harness
 #         runtime, and nothing at build time noticed.
+#   (v)   the fix-task PRODUCER imports, under the leg's REAL binding order:
+#         bind guardkitfactory's modules first (as select_harness does), then
+#         require ``guardkit.orchestrator.review_runner._import_producer()`` to
+#         hand back a callable. Added after the lib-shadow bake: clauses (i)-(iv)
+#         probe imports / the deepagents band / the protocol prompt / the CLI —
+#         NONE of them imports the producer, so a top-level ``lib`` distribution
+#         package shipped by guardkitfactory shadowed the producer's
+#         ``from lib.review_parser import …`` and baked undetected. Exactly ONE
+#         receipt in the estate records ``producer.called: true`` and it died at
+#         that import.
 # Every future forge build proves its oracles before it can ship.
 #
 # The Python program is passed via ``python -c`` (NOT a stdin heredoc): a heredoc
@@ -159,9 +169,87 @@ print(
 )
 PY
 
+# --- seam 4: the fix-task PRODUCER imports, in the leg's real binding order ---
+# THE FOUR CLAUSES ABOVE ARE ALL IMPORT/VERSION PROBES OF THINGS THAT ARE NOT THE
+# PRODUCER. None of them imports guardkit's fix-task producer
+# (``installer/core/lib/implement_orchestrator.handle_implement_option_sync``,
+# reached via ``review_runner._import_producer()``), so the lib shadow baked and
+# SHIPPED green: the review leg wrote both artefacts, the deterministic mint step
+# ran, and ``produce_fix_tasks`` recorded ``producer unimportable:
+# ModuleNotFoundError: No module named 'lib.review_parser'``. Exactly one receipt
+# in the whole estate records ``producer.called: true`` and that is how it died.
+#
+# ORDER IS THE WHOLE ORACLE. A clean interpreter imports the producer fine — the
+# shadow only exists once guardkitfactory has bound the bare top-level name
+# ``lib`` in ``sys.modules``. The real leg always binds it first:
+# ``guardkit.orchestrator.harness.selector.select_harness`` takes the langgraph
+# branch and does ``from guardkitfactory.harness import LangGraphHarness,
+# build_autobuild_backend, build_autobuild_permissions`` long before the review
+# runner reaches the mint step. So this probe imports the selector, performs that
+# exact harness import, and ONLY THEN calls ``_import_producer()``. Probing the
+# producer first would be a false green.
+#
+# ``_import_producer`` is private on purpose: it is the seam the leg itself
+# calls (review_runner.produce_fix_tasks), and produce_fix_tasks SWALLOWS its
+# failure into ``info['error']`` rather than raising — which is exactly why the
+# defect was invisible to every green build. The oracle calls the same private
+# seam so build time sees what the leg sees.
+read -r -d '' PRODUCER_PROG <<'PY' || true
+import importlib
+
+# (i) bind in the leg's order: the selector module, then the harness import its
+#     langgraph branch performs. This is what puts guardkitfactory's top-level
+#     ``lib`` into sys.modules ahead of the producer.
+importlib.import_module("guardkit.orchestrator.harness.selector")
+importlib.import_module("guardkitfactory.harness")
+
+from guardkit.orchestrator import review_runner
+
+SHADOW_DIAGNOSIS = (
+    "This is the EXTERNALLY-DEFINED-NAMESPACE SHADOW class — instance #3 of a "
+    "written guardkit rule (.claude/rules/namespace-hygiene.md; 04-18 editable "
+    "lib/ vs template lib/, 04-24 installer/core/lib/mcp/ vs the PyPI 'mcp' "
+    "distribution). guardkitfactory ships a BARE TOP-LEVEL 'lib' package "
+    "(pyproject.toml packages=[..., 'lib']); in this image venv it shadows the "
+    "producer's 'from lib.review_parser import ...' "
+    "(installer/core/lib/implement_orchestrator.py:43). The binding is early "
+    "and HARD: selector.py imports guardkitfactory before _import_producer ever "
+    "runs, so sys.modules['lib'] is already taken and every sys.path remedy is "
+    "dead by construction; the shadow is also bidirectional, so neither side can "
+    "steal the name back at runtime. The cure is structural and UPSTREAM — "
+    "guardkitfactory renames its top-level 'lib' into its own namespace "
+    "(guardkitfactory.lib / gkf_lib). Never a bare junk name in an installed "
+    "distribution."
+)
+
+try:
+    producer = review_runner._import_producer()
+except Exception as exc:  # noqa: BLE001 — any import failure is the defect
+    raise SystemExit(
+        "guardkit review_runner._import_producer() raised "
+        f"{type(exc).__name__}: {exc} once the harness had bound its modules — "
+        "this image cannot mint fix tasks, and produce_fix_tasks would swallow "
+        f"it into info['error'] with the leg still reporting green. "
+        f"{SHADOW_DIAGNOSIS}"
+    )
+
+if not callable(producer):
+    raise SystemExit(
+        "guardkit review_runner._import_producer() returned a non-callable "
+        f"{type(producer).__name__!r} — handle_implement_option_sync is not the "
+        f"object the mint step calls. {SHADOW_DIAGNOSIS}"
+    )
+
+print(
+    f"  OK  producer    _import_producer() -> {producer.__name__} "
+    "(callable, AFTER guardkitfactory bound its modules)"
+)
+PY
+
 docker run --rm --entrypoint python "${IMAGE}" -c "${NORMALIZER_PROG}"
 docker run --rm --entrypoint python "${IMAGE}" -c "${RESOLVER_PROG}"
 docker run --rm --entrypoint python "${IMAGE}" -c "${HARNESS_PROG}"
+docker run --rm --entrypoint python "${IMAGE}" -c "${PRODUCER_PROG}"
 
 # --- seam 2: the guardkit CLI binary answers at the frozen absolute path ------
 # forge.adapters.guardkit.run._GUARDKIT_BINARY == /usr/local/bin/guardkit.
