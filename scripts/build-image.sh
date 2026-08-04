@@ -19,6 +19,7 @@
 #   …/appmilla_github/nats-core/            ← sibling working tree
 #   …/appmilla_github/guardkit/             ← sibling working tree (oracle payload)
 #   …/appmilla_github/fleet-memory/         ← sibling working tree (priors read)
+#   …/appmilla_github/guardkitfactory/      ← sibling working tree (leg harness)
 #
 # guardkit is wired the SAME way as nats-core — a BuildKit named context
 # ``--build-context guardkit=../guardkit`` — so the Dockerfile can pip-install
@@ -112,6 +113,27 @@ if [[ ! -d "../fleet-memory/src/fleet_memory" ]]; then
     exit 1
 fi
 
+# Sanity check the sibling guardkitfactory working tree — the fourth named
+# context (the LangGraph leg harness guardkit's ``GUARDKIT_HARNESS=langgraph``
+# path imports at runtime). guardkitfactory is not on PyPI, so the Dockerfile
+# installs it from the BuildKit named context
+# ``--build-context guardkitfactory=../guardkitfactory``; a missing sibling
+# here is the same class of deep-in-the-COPY-layer failure the checks above
+# prevent — and the failure the conductor's first real leg actually hit
+# in-container ("guardkitfactory is not importable").
+if [[ ! -d "../guardkitfactory" ]]; then
+    echo "ERROR: sibling working tree ../guardkitfactory not found relative to ${FORGE_DIR}" >&2
+    echo "       The BuildKit named context --build-context guardkitfactory=../guardkitfactory" >&2
+    echo "       requires guardkitfactory to be checked out as a sibling of forge/." >&2
+    exit 1
+fi
+
+if [[ ! -d "../guardkitfactory/src/guardkitfactory" ]]; then
+    echo "ERROR: ../guardkitfactory does not contain src/guardkitfactory — layout invalid" >&2
+    echo "       Expected the guardkitfactory source checkout (src/ layout)." >&2
+    exit 1
+fi
+
 # Receipt line: record the guardkit commit sha being installed into the image.
 # guardkit-py has no VCS-derived version (hatch version reads a static
 # __version__), so the sibling checkout's HEAD sha is the honest provenance of
@@ -124,8 +146,10 @@ echo "RECEIPT: installing guardkit oracle payload from ../guardkit @ ${GUARDKIT_
 # literal-match test in lockstep. The whitespace and argument order
 # are part of the contract. The ``guardkit`` named context (added for the
 # target-terminal oracle payload, B4 run 4b3b0893) sits alongside nats-core;
-# the ``fleet-memory`` named context (the gate's priors read) sits third.
-docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit --build-context fleet-memory=../fleet-memory -t forge:production-validation -f Dockerfile .
+# the ``fleet-memory`` named context (the gate's priors read) sits third; the
+# ``guardkitfactory`` named context (the LangGraph leg harness, missing from
+# the image when the conductor's first real leg ran) sits fourth.
+docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit --build-context fleet-memory=../fleet-memory --build-context guardkitfactory=../guardkitfactory -t forge:production-validation -f Dockerfile .
 
 # In-container oracle smokes — every build proves its target-terminal oracles
 # resolve before it can ship (the specialist verify-template-payload.sh pattern).

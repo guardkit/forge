@@ -41,6 +41,7 @@ CONTRACT_A_INVOCATION = (
     "docker buildx build --build-context nats-core=../nats-core "
     "--build-context guardkit=../guardkit "
     "--build-context fleet-memory=../fleet-memory "
+    "--build-context guardkitfactory=../guardkitfactory "
     "-t forge:production-validation -f Dockerfile ."
 )
 
@@ -255,6 +256,121 @@ class TestBuilderStageInstallLayer:
         ) in dockerfile_text, (
             "Builder stage must carry the fleet-memory layout-validation "
             "gate (mirrors the nats-core gate)"
+        )
+
+    def test_guardkitfactory_installed_from_buildkit_context(
+        self, dockerfile_text: str
+    ) -> None:
+        # guardkitfactory is the LangGraph leg harness that guardkit's
+        # ``GUARDKIT_HARNESS=langgraph`` path imports at runtime. The
+        # conductor's first real leg died in-container with
+        # ``GUARDKIT_HARNESS=langgraph but guardkitfactory is not importable``
+        # because the image baked guardkit but not its harness runtime. Like
+        # fleet-memory it has no PyPI distribution, so the COPYed BuildKit
+        # context is the only source.
+        assert re.search(
+            r"^COPY\s+--from=guardkitfactory\s+/\s+/tmp/guardkitfactory\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        ), (
+            "Builder stage must contain "
+            "``COPY --from=guardkitfactory / /tmp/guardkitfactory``"
+        )
+        assert re.search(
+            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/guardkitfactory\b",
+            dockerfile_text,
+        ), (
+            "Builder stage must install guardkitfactory from the BuildKit "
+            "context at /tmp/guardkitfactory (not from PyPI)"
+        )
+        assert (
+            'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
+            '|| (echo "guardkitfactory layout invalid" >&2; exit 1)'
+        ) in dockerfile_text, (
+            "Builder stage must carry the guardkitfactory layout-validation "
+            "gate (mirrors the nats-core gate)"
+        )
+
+    def test_guardkitfactory_installs_after_forge(
+        self, dockerfile_text: str
+    ) -> None:
+        # ORDER IS LOAD-BEARING and the reverse of the nats-core /
+        # fleet-memory posture. forge pins ``deepagents>=0.5.3,<0.6``;
+        # guardkitfactory requires ``deepagents>=0.6.7,<1``. The pair is
+        # unsatisfiable in one venv and pip's sequential installs make the
+        # LAST install the winner, so guardkitfactory MUST come after
+        # ``pip install .[providers,memory]`` — otherwise forge's install
+        # downgrades deepagents to 0.5.x, where ``create_deep_agent`` has no
+        # ``state_schema`` keyword (upstream 0.6.6) and the harness imports
+        # cleanly but dies at call time. See the Dockerfile comment block for
+        # the full reasoning.
+        #
+        # Ordering alone does NOT determine which deepagents lands — that is
+        # the band pin asserted by ``test_guardkitfactory_install_pins_
+        # deepagents_band`` below. Keep the two facts separate: this test
+        # says "guardkitfactory's floor wins"; that one says "and the winner
+        # is the 0.6.x the estate is actually developed against".
+        forge_match = re.search(
+            r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
+        gkf_match = re.search(
+            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\b.*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
+        assert forge_match, (
+            "Dockerfile must declare ``RUN pip install .[providers,memory]``"
+        )
+        assert gkf_match, (
+            "Dockerfile must declare ``RUN pip install /tmp/guardkitfactory``"
+        )
+        assert forge_match.start() < gkf_match.start(), (
+            "``RUN pip install /tmp/guardkitfactory`` must come AFTER "
+            "``RUN pip install .[providers,memory]`` so guardkitfactory's "
+            "deepagents>=0.6.7 floor wins the venv (forge's declared "
+            "deepagents<0.6 pin cannot be honoured at the same time)"
+        )
+
+    def test_guardkitfactory_install_pins_deepagents_band(
+        self, dockerfile_text: str
+    ) -> None:
+        # THE BARE INSTALL IS A TRAP. guardkitfactory declares
+        # ``deepagents>=0.6.7,<1``; pip resolves that to the NEWEST match on
+        # PyPI, and the band runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
+        # ``pip install /tmp/guardkitfactory`` lands 0.7.3, not the 0.6.7 the
+        # estate is developed against (guardkitfactory's own .venv carries
+        # 0.6.7).
+        #
+        # 0.7.x is a SILENT regression for the daemon: it deleted the module
+        # constant ``ASYNC_TASK_SYSTEM_PROMPT`` and changed
+        # ``AsyncSubAgentMiddleware.__init__``'s ``system_prompt`` default
+        # from that constant to ``None``. src/forge/cli/serve.py constructs
+        # ``AsyncSubAgentMiddleware(async_subagents=[spec])`` with no
+        # ``system_prompt``, so under 0.7.x the supervisor silently loses the
+        # whole async-subagent operating protocol. Nothing raises. It also
+        # cascade-upgrades langchain / langchain-core / langchain-anthropic
+        # under forge's recorded SSE contract fixtures.
+        #
+        # The image's ``state_schema`` oracle cannot catch it — that keyword
+        # exists in 0.6.7 and 0.7.3 alike (a floor probe, not a version
+        # probe). The band pin on the install line is the control; the oracle
+        # asserts it took.
+        assert re.search(
+            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\s+"
+            r"'deepagents>=0\.6\.7,<0\.7'\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        ), (
+            "The guardkitfactory install must pin the deepagents band "
+            "explicitly — ``RUN pip install /tmp/guardkitfactory "
+            "'deepagents>=0.6.7,<0.7'``. Without it pip resolves "
+            "guardkitfactory's own ``deepagents>=0.6.7,<1`` to the newest "
+            "release (0.7.x), which silently strips the supervisor's "
+            "async-task system prompt in src/forge/cli/serve.py and "
+            "cascade-upgrades the langchain stack under forge's recorded SSE "
+            "contract fixtures"
         )
 
     def test_nats_core_installed_from_buildkit_context(
