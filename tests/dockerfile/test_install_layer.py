@@ -304,13 +304,19 @@ class TestBuilderStageInstallLayer:
         # ``state_schema`` keyword (upstream 0.6.6) and the harness imports
         # cleanly but dies at call time. See the Dockerfile comment block for
         # the full reasoning.
+        #
+        # Ordering alone does NOT determine which deepagents lands — that is
+        # the band pin asserted by ``test_guardkitfactory_install_pins_
+        # deepagents_band`` below. Keep the two facts separate: this test
+        # says "guardkitfactory's floor wins"; that one says "and the winner
+        # is the 0.6.x the estate is actually developed against".
         forge_match = re.search(
             r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
             dockerfile_text,
             re.MULTILINE,
         )
         gkf_match = re.search(
-            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\s*$",
+            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\b.*$",
             dockerfile_text,
             re.MULTILINE,
         )
@@ -325,6 +331,46 @@ class TestBuilderStageInstallLayer:
             "``RUN pip install .[providers,memory]`` so guardkitfactory's "
             "deepagents>=0.6.7 floor wins the venv (forge's declared "
             "deepagents<0.6 pin cannot be honoured at the same time)"
+        )
+
+    def test_guardkitfactory_install_pins_deepagents_band(
+        self, dockerfile_text: str
+    ) -> None:
+        # THE BARE INSTALL IS A TRAP. guardkitfactory declares
+        # ``deepagents>=0.6.7,<1``; pip resolves that to the NEWEST match on
+        # PyPI, and the band runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
+        # ``pip install /tmp/guardkitfactory`` lands 0.7.3, not the 0.6.7 the
+        # estate is developed against (guardkitfactory's own .venv carries
+        # 0.6.7).
+        #
+        # 0.7.x is a SILENT regression for the daemon: it deleted the module
+        # constant ``ASYNC_TASK_SYSTEM_PROMPT`` and changed
+        # ``AsyncSubAgentMiddleware.__init__``'s ``system_prompt`` default
+        # from that constant to ``None``. src/forge/cli/serve.py constructs
+        # ``AsyncSubAgentMiddleware(async_subagents=[spec])`` with no
+        # ``system_prompt``, so under 0.7.x the supervisor silently loses the
+        # whole async-subagent operating protocol. Nothing raises. It also
+        # cascade-upgrades langchain / langchain-core / langchain-anthropic
+        # under forge's recorded SSE contract fixtures.
+        #
+        # The image's ``state_schema`` oracle cannot catch it — that keyword
+        # exists in 0.6.7 and 0.7.3 alike (a floor probe, not a version
+        # probe). The band pin on the install line is the control; the oracle
+        # asserts it took.
+        assert re.search(
+            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\s+"
+            r"'deepagents>=0\.6\.7,<0\.7'\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        ), (
+            "The guardkitfactory install must pin the deepagents band "
+            "explicitly — ``RUN pip install /tmp/guardkitfactory "
+            "'deepagents>=0.6.7,<0.7'``. Without it pip resolves "
+            "guardkitfactory's own ``deepagents>=0.6.7,<1`` to the newest "
+            "release (0.7.x), which silently strips the supervisor's "
+            "async-task system prompt in src/forge/cli/serve.py and "
+            "cascade-upgrades the langchain stack under forge's recorded SSE "
+            "contract fixtures"
         )
 
     def test_nats_core_installed_from_buildkit_context(
