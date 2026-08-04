@@ -358,8 +358,11 @@ class FleetMemoryPriorsReader:
         )
         results = await backend.search(request, store)
         if not results:
-            # Empty is NORMAL — a young corpus, not a failure.
-            logger.debug(
+            # Empty is NORMAL — a young corpus, not a failure. INFO, not
+            # debug: a gate-time read must be visible in the daemon log at
+            # the production level (the ruling-3 receipt bar), and silence
+            # here is indistinguishable from the read never running.
+            logger.info(
                 "fleet-memory priors: 0 priors matched for %s %s at %s",
                 target_kind,
                 target_identifier,
@@ -373,6 +376,13 @@ class FleetMemoryPriorsReader:
             prior = _to_prior_reference(item)
             if prior is not None:
                 priors.append(prior)
+        logger.info(
+            "fleet-memory priors: %d prior(s) matched for %s %s at %s",
+            len(priors),
+            target_kind,
+            target_identifier,
+            stage_label,
+        )
         return priors
 
     async def _open_store(self) -> Any:
