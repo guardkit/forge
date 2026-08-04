@@ -742,20 +742,28 @@ def queue_cmd(
         # repr-quoting so the operator sees a clean sentence.
         raise click.UsageError(exc.args[0])
     effective_profile = profile_name or config.budget.default_profile
-    if guards.caps_enabled:
-        # Render only the caps that are set, derived from the model so a new cap
-        # field needs no edit here. The coach-score floor is flagged dormant
-        # (ADR-ARCH-033) so an inert stub is not shown as an active cap.
-        rendered = ", ".join(
-            f"{name}={value}"
-            + (
-                " (dormant — coach-score feed pending, ADR-ARCH-033)"
-                if name == "min_coach_score"
-                else ""
-            )
-            for name, value in guards.model_dump().items()
-            if value is not None
+    # Render only the fields that are set, derived from the model so a new
+    # field needs no edit here. The coach-score floor is flagged dormant
+    # (ADR-ARCH-033) so an inert stub is not shown as an active cap.
+    #
+    # Gated on "anything set" rather than on ``caps_enabled``, because the
+    # ``leg_*`` group is deliberately NOT a cap (see ``BudgetGuards``): a
+    # profile that only turns the leg budgets has ``caps_enabled`` False,
+    # and gating on it would have made the experiment round's one knob
+    # surface invisible at the moment the operator uses it. No existing
+    # profile can change shape here — every profile that renders today has
+    # a cap set, and its line is byte-identical.
+    rendered = ", ".join(
+        f"{name}={value}"
+        + (
+            " (dormant — coach-score feed pending, ADR-ARCH-033)"
+            if name == "min_coach_score"
+            else ""
         )
+        for name, value in guards.model_dump().items()
+        if value is not None
+    )
+    if rendered:
         click.echo(f"budget profile {effective_profile!r}: {rendered}")
     # Honest-status note: the profile is carried to the daemon on the
     # ``builds.profile`` row (TASK-UBS-002-integration §2(a)) and resolved via

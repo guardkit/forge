@@ -212,3 +212,63 @@ class TestAttendedOverrideAgainstCappedDefault:
         # AC-04 carriage: the override is persisted so the daemon honours it.
         assert fake_persistence.profiles == ["attended"]
         assert len(fake_persistence.records) == 1
+
+
+class TestLegBudgetsAreVisibleAtQueueTime:
+    """A knob the operator cannot see is a knob they cannot trust.
+
+    The leg budgets are deliberately NOT caps (``caps_enabled`` stays
+    False for a profile that only turns them), so the banner is gated on
+    "anything set" rather than on ``caps_enabled`` — otherwise the one
+    surface that echoes a profile would go silent for exactly the profile
+    the experiment round is built to use.
+    """
+
+    def test_a_leg_only_profile_still_echoes_what_it_turns(
+        self,
+        tmp_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fake_persistence: _FakePersistence,
+    ) -> None:
+        doc = {
+            "queue": {"repo_allowlist": [str(repo_dir)]},
+            "budget": {
+                "default_profile": "attended",
+                "profiles": {
+                    "attended": {},
+                    "experiment": {
+                        "leg_max_turns": 4,
+                        "leg_sdk_timeout_seconds": 300,
+                        "leg_budget_seconds": 900,
+                    },
+                },
+            },
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+        }
+        cfg = tmp_path / "forge.yaml"
+        cfg.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+        result = _invoke(cfg, repo_dir, feature_yaml, "--profile", "experiment")
+
+        assert result.exit_code == 0, result.output
+        assert "budget profile 'experiment'" in result.output
+        assert "leg_max_turns=4" in result.output
+        assert "leg_sdk_timeout_seconds=300" in result.output
+        assert "leg_budget_seconds=900" in result.output
+        # Leg budgets are not caps, so the cap-enforcement NOTE stays silent.
+        assert "not yet activated" not in result.output
+        assert fake_persistence.profiles == ["experiment"]
+
+    def test_a_profile_that_turns_nothing_is_still_silent(
+        self,
+        config_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fake_persistence: _FakePersistence,
+    ) -> None:
+        """The gate change moves no existing line."""
+        result = _invoke(config_path, repo_dir, feature_yaml, "--profile", "attended")
+
+        assert result.exit_code == 0, result.output
+        assert "budget profile" not in result.output

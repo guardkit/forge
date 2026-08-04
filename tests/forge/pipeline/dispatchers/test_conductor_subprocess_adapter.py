@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from forge.pipeline.dispatchers.conductor_subprocess import (
+    LEG_BUDGET_ARGV,
     make_conductor_subprocess_dispatcher,
     mint_stage_correlation_id,
 )
@@ -367,7 +368,9 @@ class TestArgvByteIdentityWithNoSeat:
     """
 
     @staticmethod
-    async def _argv(**adapter_kwargs: Any) -> list[str]:
+    async def _argv(
+        *, stage: StageClass = StageClass.TASK_REVIEW, **adapter_kwargs: Any
+    ) -> list[str]:
         from forge.pipeline.forward_context_builder import ForwardContextBuilder
 
         from tests.forge.pipeline.dispatchers.test_subprocess import (
@@ -393,7 +396,12 @@ class TestArgvByteIdentityWithNoSeat:
             correlation_id_minter=lambda **kw: "corr-fixed",
             **adapter_kwargs,
         )
-        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        extra: dict[str, Any] = {}
+        if stage is StageClass.TASK_WORK:
+            extra["fix_task"] = FixTaskRef(
+                fix_task_id="TASK-FIX007-A", review_history_index=0
+            )
+        await adapter(stage=stage, build_id=BUILD_ID, **extra)
         return list(runner.calls[0]["args"])
 
     @pytest.mark.asyncio
@@ -412,6 +420,257 @@ class TestArgvByteIdentityWithNoSeat:
         seated = await self._argv(leg_model="qwen3-coder-30b")
 
         assert seated == baseline + ["--model", "qwen3-coder-30b"]
+
+
+@dataclass
+class _Budgets:
+    """A budget profile's leg knobs, duck-typed as the adapter reads them."""
+
+    leg_max_turns: int | None = None
+    leg_sdk_timeout_seconds: int | None = None
+    leg_budget_seconds: int | None = None
+
+
+class TestLegBudgetsBecomeYamlKnobs:
+    """The pipeline could not name a leg budget at all until this group.
+
+    The dispatcher's only extra argv was ``--model <seat>``; the build
+    system's hardcoded 2 turns / 420s / 1620s therefore governed
+    production and moving them was an image-level change. These pin the
+    two halves of the cure: absent changes nothing, present is threaded —
+    and threaded only where the leg actually declares the flag.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_sdk_timeout_rides_on_both_fix_journey_legs(self) -> None:
+        """The one flag BOTH leg kinds declare."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch, leg_budgets=_Budgets(leg_sdk_timeout_seconds=300)
+        )
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["extra_args"] == ["--sdk-timeout", "300"]
+        assert dispatch.calls[1]["extra_args"] == ["--sdk-timeout", "300"]
+
+    @pytest.mark.asyncio
+    async def test_a_full_profile_gives_each_leg_the_flags_it_declares(self) -> None:
+        """BOTH leg kinds are threaded — with their own accepted flags.
+
+        ``--max-turns`` and ``--leg-budget`` are declared by ``guardkit
+        task-work`` and NOT by ``guardkit task-review``. Click rejects an
+        undeclared option with exit 2 before the command body runs, so
+        threading them onto a review would not shorten the review — it
+        would kill the journey at its opening leg, with no receipt. Same
+        class of defect as the ``--parent-feature`` pair the dispatcher
+        used to emit and nothing accepted.
+        """
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            leg_budgets=_Budgets(
+                leg_max_turns=4,
+                leg_sdk_timeout_seconds=300,
+                leg_budget_seconds=900,
+            ),
+        )
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["extra_args"] == ["--sdk-timeout", "300"]
+        assert dispatch.calls[1]["extra_args"] == [
+            "--max-turns",
+            "4",
+            "--sdk-timeout",
+            "300",
+            "--leg-budget",
+            "900",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_seat_and_the_budgets_ride_together_seat_first(self) -> None:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            leg_model="qwen3-coder-30b",
+            leg_budgets=_Budgets(leg_max_turns=4),
+        )
+
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["extra_args"] == [
+            "--model",
+            "qwen3-coder-30b",
+            "--max-turns",
+            "4",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_non_mode_c_stage_never_carries_a_leg_budget(self) -> None:
+        """These are the FIX JOURNEY's knobs, not the routine path's."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, leg_budgets=_Budgets(leg_sdk_timeout_seconds=300))
+
+        await adapter(
+            stage=StageClass.FEATURE_PLAN, build_id=BUILD_ID, feature_id="FEAT-FIX007"
+        )
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_profile_with_no_leg_fields_appends_nothing(self) -> None:
+        """Every profile written before this group existed resolves here."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, leg_budgets=_Budgets())
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_profile_object_that_lacks_the_fields_entirely_is_fine(
+        self,
+    ) -> None:
+        """An old ``BudgetGuards``-shaped stand-in must not crash the leg."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, leg_budgets=object())
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_value_that_is_not_a_positive_int_is_dropped_not_threaded(
+        self,
+    ) -> None:
+        """Degrade to the leg's own default; never mint ``--max-turns None``.
+
+        Pydantic refuses these at config load (``ge=1``), so arriving here
+        means an injected stand-in — and a malformed argv trades a config
+        mistake for a dead leg, which is the worse of the two.
+        """
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            leg_budgets=_Budgets(
+                leg_max_turns=True,  # a bool IS an int — and is not a number
+                leg_sdk_timeout_seconds="300",  # type: ignore[arg-type]
+                leg_budget_seconds=0,
+            ),
+        )
+
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+
+        assert dispatch.calls[0]["extra_args"] is None
+
+    def test_the_acceptance_table_matches_what_guardkit_declares(self) -> None:
+        """The table is the checkable form of "which leg accepts which flag".
+
+        Stated as data so a future flag is added to ONE place. If guardkit
+        ever teaches ``task-review`` ``--max-turns``, this is the row to
+        widen — and this assertion is what will be sitting there when
+        somebody widens it by accident instead.
+        """
+        table = {
+            field: (flag, stages) for field, flag, stages in LEG_BUDGET_ARGV
+        }
+
+        assert table["leg_max_turns"] == (
+            "--max-turns",
+            frozenset({StageClass.TASK_WORK}),
+        )
+        assert table["leg_budget_seconds"] == (
+            "--leg-budget",
+            frozenset({StageClass.TASK_WORK}),
+        )
+        assert table["leg_sdk_timeout_seconds"] == (
+            "--sdk-timeout",
+            frozenset({StageClass.TASK_REVIEW, StageClass.TASK_WORK}),
+        )
+
+
+class TestArgvByteIdentityWithNoLegBudgets:
+    """The contract the knobs may not break, through the REAL argv builder.
+
+    ``absent = byte-identical`` is the whole reason this group could land
+    on an ``extra=forbid`` schema without a migration, so it is proven on
+    the command line that actually reaches the runner — not on a recording
+    double's kwargs.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stage", [StageClass.TASK_REVIEW, StageClass.TASK_WORK]
+    )
+    async def test_the_argv_is_unchanged_when_no_budgets_are_carried(
+        self, stage: StageClass
+    ) -> None:
+        _argv = TestArgvByteIdentityWithNoSeat._argv
+
+        without_the_parameter = await _argv(stage=stage)
+        with_an_explicit_none = await _argv(stage=stage, leg_budgets=None)
+        with_an_empty_profile = await _argv(stage=stage, leg_budgets=_Budgets())
+
+        assert with_an_explicit_none == without_the_parameter
+        assert with_an_empty_profile == without_the_parameter
+        for flag in ("--max-turns", "--sdk-timeout", "--leg-budget"):
+            assert flag not in without_the_parameter
+
+    @pytest.mark.asyncio
+    async def test_a_work_leg_appends_the_budget_tokens_and_moves_nothing(
+        self,
+    ) -> None:
+        _argv = TestArgvByteIdentityWithNoSeat._argv
+
+        baseline = await _argv(stage=StageClass.TASK_WORK)
+        budgeted = await _argv(
+            stage=StageClass.TASK_WORK,
+            leg_budgets=_Budgets(
+                leg_max_turns=4, leg_sdk_timeout_seconds=300, leg_budget_seconds=900
+            ),
+        )
+
+        assert budgeted == baseline + [
+            "--max-turns",
+            "4",
+            "--sdk-timeout",
+            "300",
+            "--leg-budget",
+            "900",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_review_leg_appends_only_the_flag_it_declares(self) -> None:
+        _argv = TestArgvByteIdentityWithNoSeat._argv
+
+        baseline = await _argv(stage=StageClass.TASK_REVIEW)
+        budgeted = await _argv(
+            stage=StageClass.TASK_REVIEW,
+            leg_budgets=_Budgets(
+                leg_max_turns=4, leg_sdk_timeout_seconds=300, leg_budget_seconds=900
+            ),
+        )
+
+        assert budgeted == baseline + ["--sdk-timeout", "300"]
 
 
 class TestStageLogWriterBinding:

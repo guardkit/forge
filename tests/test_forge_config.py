@@ -223,12 +223,21 @@ class TestYamlRoundTrip:
                         "max_build_wallclock_seconds": None,
                         "max_build_tokens": None,
                         "min_coach_score": None,
+                        # The ``leg_*`` group (leg budgets become yaml knobs)
+                        # is optional and defaults to None, so the dump now
+                        # carries it too.
+                        "leg_max_turns": None,
+                        "leg_sdk_timeout_seconds": None,
+                        "leg_budget_seconds": None,
                     },
                     "unattended": {
                         "max_review_cycles": 2,
                         "max_build_wallclock_seconds": 5400,
                         "max_build_tokens": None,
                         "min_coach_score": None,
+                        "leg_max_turns": None,
+                        "leg_sdk_timeout_seconds": None,
+                        "leg_budget_seconds": None,
                     },
                 },
             },
