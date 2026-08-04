@@ -27,6 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE_PATH = REPO_ROOT / "Dockerfile"
 BUILD_SCRIPT_PATH = REPO_ROOT / "scripts" / "build-image.sh"
+ORACLE_SCRIPT_PATH = REPO_ROOT / "scripts" / "verify-forge-oracles.sh"
 
 # Canonical BuildKit invocation per Contract A (TASK-F009-005,
 # updated by TASK-FORGE-FRR-003). The exact string must literal-match
@@ -74,6 +75,38 @@ def build_script_text() -> str:
             "TASK-F009-005 introduces this canonical Contract A producer."
         )
     return BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def oracle_script_text() -> str:
+    """Return scripts/verify-forge-oracles.sh contents, failing fast if missing."""
+    if not ORACLE_SCRIPT_PATH.is_file():
+        pytest.fail(
+            f"scripts/verify-forge-oracles.sh not found at {ORACLE_SCRIPT_PATH}. "
+            "Every build must prove its in-image oracles before it can ship."
+        )
+    return ORACLE_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def _oracle_prog_body(oracle_script_text: str, name: str) -> str:
+    """Slice one ``read -r -d '' <NAME>_PROG <<'PY' … PY`` heredoc body out.
+
+    The oracle script carries each in-image probe as a heredoc-captured Python
+    program which is then handed to ``docker run … python -c``. Tests that pin a
+    clause's *content* slice its own body first so a string present in a
+    neighbouring clause cannot produce a false match.
+    """
+    match = re.search(
+        rf"^read\s+-r\s+-d\s+''\s+{re.escape(name)}\s+<<'PY'[^\n]*\n"
+        r"(?P<body>.*?)\n^PY$",
+        oracle_script_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match, (
+        f"scripts/verify-forge-oracles.sh must declare the {name} probe using "
+        f"the established heredoc idiom: ``read -r -d '' {name} <<'PY'`` … ``PY``"
+    )
+    return match.group("body")
 
 
 def _runtime_stage_body(dockerfile_text: str) -> str:
@@ -405,6 +438,151 @@ class TestBuilderStageInstallLayer:
                 f"Dockerfile must not mutate pyproject.toml in-place "
                 f"(pattern matched: {pattern!r})"
             )
+
+
+class TestOracleProducerClause:
+    """AC: the fifth oracle clause — the fix-task producer must import in-image.
+
+    THE PRECEDING FOUR CLAUSES PROBE EVERYTHING EXCEPT THE PRODUCER. They cover
+    the normalizer module, forge's resolver, the guardkit CLI binary, and the
+    guardkitfactory / deepagents-band / protocol-prompt trio — none of which
+    imports guardkit's fix-task producer. That gap is how the ``lib`` namespace
+    shadow baked into a shipped image and stayed green: guardkitfactory ships a
+    BARE TOP-LEVEL ``lib`` distribution package, which shadows the producer's
+    ``from lib.review_parser import …`` in
+    ``installer/core/lib/implement_orchestrator.py``. The review leg wrote both
+    artefacts, the deterministic mint step ran, and ``produce_fix_tasks``
+    SWALLOWED ``ModuleNotFoundError: No module named 'lib.review_parser'`` into
+    ``info['error']`` — exactly one receipt in the estate records
+    ``producer.called: true``, and that is how it died.
+
+    These tests pin the clause the same way
+    ``test_guardkitfactory_install_pins_deepagents_band`` pins the band string:
+    the guard cannot be dropped by edit the way the four clauses' blind spot was
+    left open by omission.
+    """
+
+    def test_oracle_script_declares_producer_prog(
+        self, oracle_script_text: str
+    ) -> None:
+        # Mirrors the NORMALIZER_PROG / RESOLVER_PROG / HARNESS_PROG idiom.
+        body = _oracle_prog_body(oracle_script_text, "PRODUCER_PROG")
+        assert body.strip(), "PRODUCER_PROG heredoc must not be empty"
+
+    def test_producer_prog_binds_harness_before_importing_producer(
+        self, oracle_script_text: str
+    ) -> None:
+        # ORDER IS THE WHOLE ORACLE. A clean interpreter imports the producer
+        # fine — the shadow only exists once guardkitfactory has bound the bare
+        # name ``lib`` in sys.modules, which the real leg always does first
+        # (``select_harness``'s langgraph branch imports guardkitfactory.harness
+        # long before the review runner reaches the mint step). A probe that
+        # called _import_producer() on a clean interpreter would be a FALSE
+        # GREEN, so the binding order is pinned, not merely the two imports.
+        body = _oracle_prog_body(oracle_script_text, "PRODUCER_PROG")
+
+        selector_match = re.search(
+            r"guardkit\.orchestrator\.harness\.selector", body
+        )
+        harness_match = re.search(r"guardkitfactory\.harness", body)
+        producer_match = re.search(r"_import_producer\s*\(\s*\)", body)
+
+        assert selector_match, (
+            "PRODUCER_PROG must import guardkit's harness selector — the "
+            "module whose langgraph branch performs the guardkitfactory import "
+            "that binds the shadowing top-level ``lib``"
+        )
+        assert harness_match, (
+            "PRODUCER_PROG must import ``guardkitfactory.harness`` — the exact "
+            "import select_harness performs, and the one that puts "
+            "guardkitfactory's top-level ``lib`` into sys.modules"
+        )
+        assert producer_match, (
+            "PRODUCER_PROG must call ``review_runner._import_producer()`` — the "
+            "private seam ``produce_fix_tasks`` itself calls, whose failure the "
+            "leg swallows into info['error']"
+        )
+        assert harness_match.start() < producer_match.start(), (
+            "PRODUCER_PROG must bind guardkitfactory's modules BEFORE calling "
+            "_import_producer(). Reversed, the probe runs on a clean "
+            "interpreter where the producer imports fine — a false green that "
+            "reproduces the blind spot this clause exists to close"
+        )
+
+    def test_producer_prog_requires_a_callable_back(
+        self, oracle_script_text: str
+    ) -> None:
+        # "Did not raise" is not the bar — the mint step CALLS what comes back.
+        body = _oracle_prog_body(oracle_script_text, "PRODUCER_PROG")
+        assert re.search(r"\bcallable\s*\(", body), (
+            "PRODUCER_PROG must require a CALLABLE back from "
+            "_import_producer(), not merely that the import did not raise"
+        )
+        assert re.search(r"\bSystemExit\b", body), (
+            "PRODUCER_PROG must raise SystemExit on failure so the "
+            "``docker run`` exits non-zero and ``set -e`` fails the build"
+        )
+
+    def test_producer_prog_names_the_namespace_shadow_class(
+        self, oracle_script_text: str
+    ) -> None:
+        # The message is the handover. A bare traceback would send the next
+        # reader hunting sys.path remedies, all of which are dead by
+        # construction (the name is already bound, and the shadow is
+        # bidirectional). Name the class and the upstream cure.
+        body = _oracle_prog_body(oracle_script_text, "PRODUCER_PROG")
+        for needle in (
+            "namespace-hygiene",
+            "lib.review_parser",
+            "guardkitfactory",
+        ):
+            assert needle in body, (
+                f"PRODUCER_PROG's failure message must name {needle!r} so the "
+                "diagnosis ships with the failure — this is the "
+                "externally-defined-namespace shadow class, and the cure is "
+                "structural and upstream"
+            )
+        assert re.search(r"SHADOW|shadow", body), (
+            "PRODUCER_PROG's failure message must name the namespace-SHADOW "
+            "class explicitly"
+        )
+
+    def test_producer_prog_is_actually_run_in_the_image(
+        self, oracle_script_text: str
+    ) -> None:
+        # Declaring a probe and never running it is the same false-pass class
+        # the script's own header warns about for stdin heredocs.
+        assert re.search(
+            r'^docker\s+run\s+--rm\s+--entrypoint\s+python\s+"\$\{IMAGE\}"\s+'
+            r'-c\s+"\$\{PRODUCER_PROG\}"\s*$',
+            oracle_script_text,
+            re.MULTILINE,
+        ), (
+            "verify-forge-oracles.sh must execute the fifth clause in-image: "
+            '``docker run --rm --entrypoint python "${IMAGE}" -c '
+            '"${PRODUCER_PROG}"``'
+        )
+
+    def test_every_declared_prog_is_executed(
+        self, oracle_script_text: str
+    ) -> None:
+        # Generic guard over ALL clauses, present and future: a heredoc-captured
+        # program that no ``docker run`` ever consumes proves nothing while
+        # reading like coverage.
+        declared = set(
+            re.findall(
+                r"^read\s+-r\s+-d\s+''\s+(\w+_PROG)\s+<<'PY'",
+                oracle_script_text,
+                re.MULTILINE,
+            )
+        )
+        executed = set(re.findall(r'-c\s+"\$\{(\w+_PROG)\}"', oracle_script_text))
+        assert declared, "verify-forge-oracles.sh declares no *_PROG probes"
+        assert declared <= executed, (
+            "every *_PROG probe declared in verify-forge-oracles.sh must be run "
+            f"by a ``docker run … -c`` line; never executed: "
+            f"{sorted(declared - executed)}"
+        )
 
 
 class TestRuntimeVenvHandover:
