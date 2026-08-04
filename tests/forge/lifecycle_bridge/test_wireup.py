@@ -31,6 +31,7 @@ sibling :mod:`tests.forge.lifecycle_bridge.test_wireup_seam` file.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -54,10 +55,12 @@ from forge.lifecycle_bridge.translation import (
     StreamEventTranslator,
     VALUES_STREAM_EVENT,
 )
+from forge.lifecycle.modes import BuildMode
 from forge.lifecycle_bridge.wireup import (
     DEFAULT_DEADLINE_SECONDS,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
     IDENTITY_UNRESOLVED_FAILURE_REASON,
+    MODE_C_WATCHDOG_STAND_DOWN,
     STREAM_NO_TERMINAL_FAILURE_REASON,
     LifecycleBridgeWireup,
     TERMINAL_PAYLOAD_TYPES,
@@ -943,4 +946,239 @@ class TestIdentityUnresolvedPublishesBuildFailed:
         await _drain_observer(wireup, "FEAT-PFAIL", timeout=2.0)
 
         handle.ack.assert_not_awaited()
+        await wireup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# FWD-002 mode learning (2026-08-04 drive-5 harvest) — a fix journey is never
+# a silent stuck build, so the identity watchdog stands down for mode-c
+# ---------------------------------------------------------------------------
+
+
+class _StubModeReader:
+    """In-memory :class:`BuildModeReader` — the §4 read, minus SQLite."""
+
+    def __init__(self, modes: dict[str, BuildMode], *, raises: bool = False) -> None:
+        self._modes = modes
+        self._raises = raises
+        self.calls: list[str] = []
+
+    def get_build_mode(self, build_id: str) -> BuildMode:
+        self.calls.append(build_id)
+        if self._raises:
+            raise sqlite3.OperationalError("database is locked")
+        return self._modes.get(build_id, BuildMode.MODE_A)
+
+
+def _build_mode_aware_wireup(
+    bridge,
+    translator,
+    fake_publisher,
+    *,
+    mode_reader,
+    resolved_build_id: str = "build-FEAT-TST1-20260804102430",
+    deadline_seconds: float = 0.15,
+):
+    async def _resolver(_feature_id: str, _correlation_id: str) -> str:
+        return resolved_build_id
+
+    return LifecycleBridgeWireup(
+        bridge=bridge,
+        translator=translator,
+        publisher=fake_publisher,
+        stream_source=_make_stream_source([]),
+        identity_provider=_never_resolves(),
+        deadline_seconds=deadline_seconds,  # type: ignore[arg-type]
+        identity_resolution_attempts=1,
+        identity_poll_interval_seconds=0.01,
+        build_id_resolver=_resolver,
+        build_mode_reader=mode_reader,
+    )
+
+
+class TestModeCStandsDownTheIdentityWatchdog:
+    """The drive-5 shape: a live fix journey must survive the deadline."""
+
+    @pytest.mark.asyncio
+    async def test_mode_c_publishes_no_synthetic_terminal(
+        self, bridge, translator, fake_publisher, caplog
+    ) -> None:
+        # Drive 5 (build-FEAT-TST1-20260804102430): the conductor took the
+        # build, dispatched a work leg on an 1800s budget, and the bridge
+        # killed it ~90s in because identity — which ONLY the routine
+        # sidecar path publishes — never resolved. After the fix the
+        # watchdog stands down: no synthetic build-failed, no ack, no
+        # terminal write-back, and one loud INFO line saying so.
+        recorder = MagicMock()
+        mode_reader = _StubModeReader(
+            {"build-FEAT-TST1-20260804102430": BuildMode.MODE_C}
+        )
+        wireup = _build_mode_aware_wireup(
+            bridge, translator, fake_publisher, mode_reader=mode_reader
+        )
+        wireup._build_state_recorder = recorder
+        handle = _make_handle()
+
+        with caplog.at_level(logging.INFO, logger="forge.lifecycle_bridge.wireup"):
+            await wireup.register_ack_handle("FEAT-TST1", "corr-tst1", handle)
+            await _drain_observer(wireup, "FEAT-TST1", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_not_awaited()
+        handle.ack.assert_not_awaited()
+        handle.nak.assert_not_awaited()
+        recorder.assert_not_called()
+        assert mode_reader.calls == ["build-FEAT-TST1-20260804102430"]
+        assert MODE_C_WATCHDOG_STAND_DOWN in caplog.text
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_mode_c_never_arms_the_identity_deadline(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # The stand-down happens BEFORE the deadline extension, so a
+        # mode-c observer exits promptly instead of burning the per-build
+        # deadline polling for an identity that can never arrive.
+        polls = {"n": 0}
+
+        async def _counting_provider(
+            _feature_id: str, _correlation_id: str = ""
+        ) -> tuple[str, str] | None:
+            polls["n"] += 1
+            return None
+
+        async def _resolver(_feature_id: str, _correlation_id: str) -> str:
+            return "build-mode-c-deadline"
+
+        wireup = LifecycleBridgeWireup(
+            bridge=bridge,
+            translator=translator,
+            publisher=fake_publisher,
+            stream_source=_make_stream_source([]),
+            identity_provider=_counting_provider,
+            deadline_seconds=30,
+            identity_resolution_attempts=1,
+            identity_poll_interval_seconds=0.01,
+            build_id_resolver=_resolver,
+            build_mode_reader=_StubModeReader(
+                {"build-mode-c-deadline": BuildMode.MODE_C}
+            ),
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-MCD", "corr-mcd", handle)
+        # A 30s deadline would wedge this drain if the extension were armed.
+        await _drain_observer(wireup, "FEAT-MCD", timeout=2.0)
+
+        assert polls["n"] == 1
+        fake_publisher.publish_build_failed.assert_not_awaited()
+        await wireup.shutdown()
+
+
+class TestRoutinePathIdentityWatchdogUnchanged:
+    """FWD-002's protection is load-bearing for routine builds — pin it."""
+
+    @pytest.mark.asyncio
+    async def test_mode_a_still_terminalises_at_the_deadline(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        mode_reader = _StubModeReader({"build-routine-1": BuildMode.MODE_A})
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=mode_reader,
+            resolved_build_id="build-routine-1",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-RTN", "corr-rtn", handle)
+        await _drain_observer(wireup, "FEAT-RTN", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == IDENTITY_UNRESOLVED_FAILURE_REASON
+        assert sent.build_id == "build-routine-1"
+        handle.ack.assert_awaited_once()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_no_mode_reader_is_pre_lane_behaviour(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # An un-migrated caller (mode_reader=None) keeps the watchdog armed
+        # for every build — byte-identical to before this lane.
+        wireup = _build_identity_unresolved_wireup(
+            bridge, translator, fake_publisher, build_id_resolver=None
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-NMR", "corr-nmr", handle)
+        await _drain_observer(wireup, "FEAT-NMR", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == IDENTITY_UNRESOLVED_FAILURE_REASON
+        assert sent.build_id == "FEAT-NMR"
+        handle.ack.assert_awaited_once()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_row_keeps_the_watchdog_armed(
+        self, bridge, translator, fake_publisher, caplog
+    ) -> None:
+        # §4 posture: an unreadable row must NOT silently disarm a routine
+        # build's protection. Fail toward watching, and say so loudly.
+        mode_reader = _StubModeReader({}, raises=True)
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=mode_reader,
+            resolved_build_id="build-unreadable",
+        )
+        handle = _make_handle()
+
+        with caplog.at_level(logging.ERROR, logger="forge.lifecycle_bridge.wireup"):
+            await wireup.register_ack_handle("FEAT-URD", "corr-urd", handle)
+            await _drain_observer(wireup, "FEAT-URD", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == IDENTITY_UNRESOLVED_FAILURE_REASON
+        assert "KEEPING the FWD-002 identity watchdog armed" in caplog.text
+        handle.ack.assert_awaited_once()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_mode_read_is_off_the_healthy_path(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # A build whose identity resolves normally never reaches the
+        # watchdog branch, so the mode reader is never consulted — zero
+        # extra reads on the healthy path.
+        mode_reader = _StubModeReader({})
+
+        async def _resolves(
+            _feature_id: str, _correlation_id: str = ""
+        ) -> tuple[str, str] | None:
+            return ("thread-ok", "run-ok")
+
+        wireup = LifecycleBridgeWireup(
+            bridge=bridge,
+            translator=translator,
+            publisher=fake_publisher,
+            stream_source=_make_stream_source([]),
+            identity_provider=_resolves,
+            deadline_seconds=1,
+            identity_resolution_attempts=1,
+            identity_poll_interval_seconds=0.01,
+            build_mode_reader=mode_reader,
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-HLT", "corr-hlt", handle)
+        await _drain_observer(wireup, "FEAT-HLT", timeout=2.0)
+
+        assert mode_reader.calls == []
         await wireup.shutdown()

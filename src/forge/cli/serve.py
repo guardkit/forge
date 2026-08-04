@@ -414,6 +414,11 @@ def bind_production_dispatch_chain(
                 build_state_recorder=bridge_wireup_parts.build_state_recorder,
                 build_id_resolver=bridge_wireup_parts.build_id_resolver,
                 budget_observer=budget_observer,
+                # FWD-002 mode learning — without this the identity
+                # watchdog cannot tell a fix journey from a routine build
+                # and terminalises every mode-c build that outlives the
+                # per-build deadline (drive-5, 2026-08-04).
+                build_mode_reader=bridge_wireup_parts.build_mode_reader,
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
