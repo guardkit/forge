@@ -197,7 +197,11 @@ RUN test -d /tmp/guardkitfactory/src/guardkitfactory || (echo "guardkitfactory l
 #      that band today runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
 #      ``pip install /tmp/guardkitfactory`` lands 0.7.3, NOT the 0.6.7 this
 #      estate is developed against (guardkitfactory's own .venv carries
-#      0.6.7 and its floor comment stops there). 0.7.x is a SILENT
+#      0.6.7 and its floor comment stops there). NOTE the ``<0.7`` pin
+#      below bakes the NEWEST 0.6.x — today that is 0.6.12, not 0.6.7;
+#      the reviewed band is what the pin holds, and the oracle's
+#      protocol-prompt probe (not this comment) is what makes any 0.6.x
+#      safe. 0.7.x is a SILENT
 #      regression for the daemon on two counts:
 #
 #        (a) deepagents 0.7.x DELETED the module constant
