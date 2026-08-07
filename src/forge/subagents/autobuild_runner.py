@@ -2204,6 +2204,8 @@ def _write_failure_manifest(
     task_counts: build_monitor.TaskCounts | None = None,
     terminal: str = TERMINAL_RUNNING_WAVE,
     stdout_log: Path | None = None,
+    terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
+    terminal_class_evidence: str | None = None,
 ) -> Path | None:
     """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
 
@@ -2252,6 +2254,25 @@ def _write_failure_manifest(
       collect at all. A pre-launch failure has no stdout and no receipts;
       the pack says so out loud instead of looking like an empty success.
 
+    The timeout-truth lane (2026-08-07) adds two more, so the pack itself
+    answers the question a status table could not:
+
+    * ``terminal_class`` — WHICH of the five deaths this was, from
+      :data:`build_monitor.TERMINAL_CLASSES`. Unlike the snapshot and the
+      row (where ``error`` is deliberately absent-by-default), the manifest
+      ALWAYS states it: a pack is a forensic record read by a human, and
+      "no timeout fired, this build is simply broken" is a real answer that
+      is worth writing down.
+    * ``terminal_class_evidence`` — one plain-language sentence saying WHY
+      forge believes that, readable without knowing any of the vocabulary.
+
+    Note the deliberate difference between ``terminal_class`` and the older
+    ``timed_out`` flag beside it: ``timed_out`` keeps its EXACT pre-lane
+    meaning — the runner's own ``asyncio.wait_for`` arm fired — so it is
+    ``False`` for a monitor wedge kill and ``False`` for a guardkit in-band
+    timeout, both of which ``terminal_class`` names correctly. Nothing already
+    reading ``timed_out`` shifts.
+
     ``exit_code`` is ``None`` when the guardkit subprocess never ran (a
     pre-launch refusal). ``null`` on the wire is the honest answer there;
     ``-1`` would read as a signal kill that never happened.
@@ -2276,6 +2297,7 @@ def _write_failure_manifest(
             exit_code=exit_code,
             stdout_log=stdout_log,
             semantic_state=semantic_state,
+            terminal_class=terminal_class,
         )
         missing: list[str] = evidence["missing"]
         manifest = {
@@ -2329,6 +2351,13 @@ def _write_failure_manifest(
             # --- FAILED-terminal lane (2026-08-07) ----------------------
             "terminal": terminal,
             "evidence": evidence,
+            # --- timeout-truth lane (2026-08-07) ------------------------
+            # WHICH death this was, and the one sentence that justifies the
+            # claim. Always written here (unlike the snapshot/row, where
+            # ``error`` is absent-by-default) — a pack is a forensic record,
+            # and "no clock fired at all" is worth stating out loud.
+            "terminal_class": terminal_class,
+            "terminal_class_evidence": terminal_class_evidence,
         }
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -2372,6 +2401,7 @@ def _pack_evidence(
     exit_code: int | None,
     stdout_log: Path | None,
     semantic_state: Mapping[str, Any] | None,
+    terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
 ) -> dict[str, Any]:
     """Enumerate what this pack actually holds — and what it does not.
 
@@ -2424,6 +2454,10 @@ def _pack_evidence(
         "worktree_kept": worktree_kept,
         "receipt_families": families,
         "subprocess_ran": exit_code is not None,
+        # Timeout-truth lane: the inventory names the class too, so even a
+        # THIN pack — one with no stdout, no worktree and no receipts — still
+        # tells its reader whether this build ran out of time or broke.
+        "terminal_class": terminal_class,
         "missing": missing,
         "not_observable": [_UNAVAILABLE_EVIDENCE],
     }
@@ -3204,6 +3238,7 @@ def _build_failed_snapshot(
     task_counts: build_monitor.TaskCounts | None = None,
     failure_pack: Path | None = None,
     worktree_path: Path | None = None,
+    terminal_class: str | None = None,
 ) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
@@ -3257,6 +3292,19 @@ def _build_failed_snapshot(
         worktree_path: The build's worktree when one was materialised,
             so the terminal can export its receipts before writing the
             pack. Rides the snapshot as the flat ``worktree_path`` marker.
+        terminal_class: WHICH of the five deaths this was, from
+            :data:`build_monitor.TERMINAL_CLASSES` (timeout-truth lane,
+            2026-08-07). Rides the snapshot as the flat ``terminal_class``
+            marker, on the same shape as ``budget_cap_killed``, so the
+            translator can put it on the wire and the daemon can land it on
+            ``builds.terminal_class``.
+
+            **Stamped only when it says something.**
+            :data:`build_monitor.TERMINAL_CLASS_ERROR` — "the build failed on
+            its own terms", which is the overwhelming majority — is treated
+            exactly like ``None`` and writes NO key. That is what keeps every
+            failure route this lane did not teach anything new emitting a
+            byte-identical snapshot dict.
 
     Returns:
         A snapshot dict suitable for :func:`_snapshot_update`.
@@ -3280,6 +3328,8 @@ def _build_failed_snapshot(
     snapshot["error_message"] = reason
     if budget_cap_killed:
         snapshot["budget_cap_killed"] = True
+    if terminal_class and terminal_class != build_monitor.TERMINAL_CLASS_ERROR:
+        snapshot["terminal_class"] = terminal_class
     if task_counts is not None:
         snapshot["tasks_completed_source"] = task_counts.source
     if failure_pack is not None:
@@ -3745,6 +3795,32 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         else:
             reason = f"guardkit autobuild exit={exit_code}"
 
+        # TIMEOUT TRUTH (2026-08-07). The reason strings above are UNCHANGED,
+        # byte for byte — prose is what an operator reads, and rewriting it
+        # would break every consumer that greps it. What was missing is a
+        # MACHINE-READABLE answer to "was this a timeout, and whose?", because
+        # five structurally different deaths all left as ``FAILED``. The class
+        # rides BESIDE the reason, never instead of it.
+        #
+        # The progress read is deliberately module-level rather than
+        # ``monitor.``-anything: a build launched with the monitor disabled
+        # still has a wall clock and still deserves an honest class.
+        terminal_class, terminal_class_evidence = build_monitor.classify_terminal(
+            wedged=wedge_verdict is not None,
+            timed_out=timed_out,
+            budget_bound=budget_bound,
+            exit_code=exit_code,
+            progress=build_monitor.read_task_progress(run_cwd),
+            last_event=build_monitor.read_last_event(run_cwd, feature_id),
+        )
+        if terminal_class != build_monitor.TERMINAL_CLASS_ERROR:
+            logger.warning(
+                "autobuild_runner: feature_id=%s terminal_class=%s — %s",
+                feature_id,
+                terminal_class,
+                terminal_class_evidence,
+            )
+
         # Honest attribution at exit (design §c): the build's own ledger, else
         # the task ids stdout showed STARTING — never a turn count, and never
         # the max(count, 1) that made a wedged build claim one completed task.
@@ -3810,6 +3886,8 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             task_counts=task_counts,
             terminal=TERMINAL_RUNNING_WAVE,
             stdout_log=stdout_tee.path,
+            terminal_class=terminal_class,
+            terminal_class_evidence=terminal_class_evidence,
         )
         return _snapshot_update(
             _build_failed_snapshot(
@@ -3826,6 +3904,11 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 # env-default timeout or a plain non-zero exit is NOT a
                 # budget breach and must not arm the gate.
                 budget_cap_killed=timed_out and budget_bound,
+                # TIMEOUT TRUTH: the machine-readable cause. ``error`` is
+                # never stamped (see build_monitor.TERMINAL_CLASS_ERROR), so
+                # an ordinary failed build's snapshot is byte-identical to
+                # what it was before this lane.
+                terminal_class=terminal_class,
             )
         )
 
@@ -4051,6 +4134,16 @@ def _write_terminal_failure_pack(
             receipts=receipts,
             wedged=False,
             terminal=terminal,
+            # No subprocess ran on ANY route that reaches here (that is the
+            # defining property of this writer), so no clock — forge-side or
+            # guardkit-side — can have fired. ``error`` is the honest class,
+            # and it is exactly what the default already is; naming it
+            # explicitly is a statement, not a change.
+            terminal_class=build_monitor.TERMINAL_CLASS_ERROR,
+            terminal_class_evidence=(
+                "the guardkit subprocess never ran on this route, so no "
+                "timeout of any kind can have fired"
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — a pack must never mask the failure
         logger.warning(
@@ -4113,6 +4206,12 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
         snapshot["error_message"] = error_message
     if existing.get("budget_cap_killed"):
         snapshot["budget_cap_killed"] = True
+    # Timeout truth rides forward for the SAME reason as the cap-kill marker:
+    # on the fast-failure path this refreshed snapshot is the one a
+    # fetch-on-empty replay translates, so dropping the class here would put a
+    # timeout on the wire as an unclassified FAILED.
+    if existing.get("terminal_class"):
+        snapshot["terminal_class"] = existing["terminal_class"]
     # Same reasoning for the build monitor's attribution provenance: the
     # terminal must say WHERE its task counts came from.
     if existing.get("tasks_completed_source"):

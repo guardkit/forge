@@ -907,6 +907,13 @@ class TaskProgress:
     ``files_changed`` and ``phase`` are the STATE-MOVEMENT signals; the number
     of ``SNAPSHOT`` heartbeats is deliberately absent — counting it would let a
     task spinning in a retry loop look alive forever.
+
+    ``last_marker`` (timeout-truth lane, 2026-08-07) is the KIND of the last
+    non-heartbeat record — ``START`` / ``COMPLETE`` / ``TIMEOUT``. The parser
+    always matched all three, but only ever COUNTED them, so guardkit's own
+    in-band task timeout — the one announcement forge gets that says "the SDK
+    call died on its own clock" — was thrown away at the point of reading.
+    :func:`classify_terminal` is the reader that needed it.
     """
 
     task_id: str
@@ -915,8 +922,22 @@ class TaskProgress:
     markers: int  # START / COMPLETE / TIMEOUT records — semantic, not heartbeat
     decision: str | None
     mtime: float
+    #: The last marker KIND seen (``START`` / ``COMPLETE`` / ``TIMEOUT``), or
+    #: ``None`` when the log held only heartbeats. Defaulted so every existing
+    #: positional construction keeps working unchanged.
+    last_marker: str | None = None
 
     def fingerprint(self) -> tuple[Any, ...]:
+        """The WEDGE DETECTOR's movement signal — deliberately unchanged.
+
+        ``last_marker`` is NOT a member of this tuple and must never become
+        one. The detector treats any fingerprint change as state movement; a
+        marker kind flipping ``START`` → ``TIMEOUT`` without a single file
+        changing is not movement, it is a task dying in place. Folding it in
+        would hand a wedged build a fresh liveness heartbeat at exactly the
+        moment it stopped being alive. ``tests/forge/test_build_monitor.py``
+        pins this tuple's identity against that mutation.
+        """
         return (self.task_id, self.files_changed, self.phase, self.markers)
 
 
@@ -962,6 +983,7 @@ def _parse_progress_log(
     phase = ""
     markers = 0
     decision: str | None = None
+    last_marker: str | None = None
     seen = False
     for line in text.splitlines():
         snapshot = _PROGRESS_SNAPSHOT_RE.search(line)
@@ -977,7 +999,8 @@ def _parse_progress_log(
         if marker is not None:
             seen = True
             markers += 1
-            if marker.group("marker").upper() == "START":
+            last_marker = marker.group("marker").upper()
+            if last_marker == "START":
                 # A new SDK call: guardkit restarts the file-change count.
                 files_changed = 0
             found = _PROGRESS_DECISION_RE.search(line)
@@ -992,6 +1015,7 @@ def _parse_progress_log(
         markers=markers,
         decision=decision,
         mtime=mtime,
+        last_marker=last_marker,
     )
 
 
@@ -1074,6 +1098,180 @@ def read_last_event(root: Path, feature_id: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+# ---------------------------------------------------------------------------
+# TERMINAL TRUTH — which of the five deaths this failure actually was
+# ---------------------------------------------------------------------------
+#
+# THE RESIDUE THIS CLOSES (Sunday handoff §4.4, "a TIMEOUT status distinct from
+# FAILED"). Five structurally different terminal causes used to arrive at the
+# runner's one classification point and leave as the SAME thing: a ``failed``
+# snapshot whose only distinguishing carrier was a PROSE STRING. On the wire and
+# in ``builds.status`` a build killed by the semantic monitor, a build killed at
+# its budget cap, a build whose wall clock expired, a build whose guardkit SDK
+# call timed out in-band, and a build that simply failed to compile were all
+# five spelled ``FAILED``. An operator reading a status table — or a fix-journey
+# router deciding whether to retry — could not tell "this ran out of time" from
+# "this is broken", which are opposite verdicts with opposite next actions.
+#
+# THE SHAPE OF THE FIX IS ADDITIVE, NOT A RENAME. ``builds.status`` still reads
+# ``FAILED`` for all five; no status value, wire field or manifest key changes
+# meaning. The distinction rides beside them as a new closed vocabulary,
+# ``terminal_class``. And :data:`TERMINAL_CLASS_ERROR` — "everything else" — is
+# NEVER WRITTEN anywhere: it is the absent-by-default value, exactly the posture
+# ``budget_cap_killed`` already holds. So every failure route this lane did not
+# teach anything new emits a byte-identical snapshot, payload and row.
+
+#: The monitor's semantic kill: no state movement for the whole window.
+TERMINAL_CLASS_WEDGE: str = "timeout-wedge"
+#: FEAT-UBS-002's per-build budget wall-clock cap fired.
+TERMINAL_CLASS_BUDGET_CAP: str = "timeout-budget-cap"
+#: The runner's OWN wall-clock arm expired (the insanity bound, or an
+#: operator-set ``FORGE_AUTOBUILD_TIMEOUT_SECONDS``).
+TERMINAL_CLASS_WALL_CLOCK: str = "timeout-wall-clock"
+#: guardkit's own task/SDK timeout fired INSIDE the subprocess; forge saw only
+#: a non-zero exit, and the evidence for the distinction is on disk (a
+#: ``TIMEOUT`` progress marker, or an events.jsonl ``failure_category``).
+TERMINAL_CLASS_IN_BAND: str = "timeout-in-band"
+#: Everything else — a compile error, a failed gate, a refused precondition.
+#: NEVER WRITTEN: its absence IS the value (see the note above).
+TERMINAL_CLASS_ERROR: str = "error"
+
+#: The closed vocabulary, in precedence order. Readers that want to know
+#: "was this a timeout of any kind?" test membership in the first four.
+TERMINAL_CLASSES: tuple[str, ...] = (
+    TERMINAL_CLASS_WEDGE,
+    TERMINAL_CLASS_BUDGET_CAP,
+    TERMINAL_CLASS_WALL_CLOCK,
+    TERMINAL_CLASS_IN_BAND,
+    TERMINAL_CLASS_ERROR,
+)
+
+#: The ``TaskProgress`` marker kind that means guardkit's own clock fired.
+_IN_BAND_TIMEOUT_MARKER: str = "TIMEOUT"
+
+#: Substrings that mark an ``events.jsonl`` ``failure_category`` as a timeout.
+#: Matched case-insensitively against the raw category so guardkit is free to
+#: spell it ``timeout`` / ``task_timeout`` / ``sdk-timeout`` without forge
+#: needing a release.
+_IN_BAND_FAILURE_CATEGORIES: tuple[str, ...] = ("timeout", "timed_out", "timed out")
+
+
+def _in_band_timeout_evidence(
+    progress: "tuple[TaskProgress, ...] | None",
+    last_event: Mapping[str, Any] | None,
+) -> str | None:
+    """Name the on-disk proof that guardkit's OWN clock fired, else ``None``.
+
+    Two independent witnesses, either of which is sufficient:
+
+    1. a task's ``progress.log`` whose last non-heartbeat record is a
+       ``TIMEOUT`` marker — guardkit writes it the moment the SDK call is
+       abandoned;
+    2. the last ``events.jsonl`` record carrying a timeout-flavoured
+       ``failure_category``.
+
+    Pure; never raises; ``None`` means NO EVIDENCE, which is deliberately not
+    the same as "not a timeout" — the caller degrades to the honest
+    :data:`TERMINAL_CLASS_ERROR` rather than guessing.
+    """
+    for item in progress or ():
+        if (item.last_marker or "").upper() == _IN_BAND_TIMEOUT_MARKER:
+            return (
+                f"{item.task_id}'s progress.log ends on a TIMEOUT marker — "
+                "guardkit abandoned the SDK call on its own clock"
+            )
+    if isinstance(last_event, Mapping):
+        raw = last_event.get("failure_category")
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if any(token in lowered for token in _IN_BAND_FAILURE_CATEGORIES):
+                task = last_event.get("task_id")
+                subject = f" for {task}" if task else ""
+                return (
+                    f"the last events.jsonl record{subject} carries "
+                    f"failure_category={raw!r} — a guardkit-side timeout"
+                )
+    return None
+
+
+def classify_terminal(
+    *,
+    wedged: bool,
+    timed_out: bool,
+    budget_bound: bool,
+    exit_code: int | None,
+    progress: "tuple[TaskProgress, ...] | None" = None,
+    last_event: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Which of the five deaths this was, and the evidence for saying so.
+
+    PRECEDENCE (first match wins, and the order is the point):
+
+    1. **wedge** — the monitor killed it. Its verdict outranks every clock,
+       because the non-zero exit that follows is OUR signal, not guardkit's.
+    2. **budget cap** — the per-build cap was the binding bound, so the kill
+       belongs to the budget, not to the env default.
+    3. **wall clock** — the runner's own arm expired with no budget bound.
+    4. **in-band** — no forge-side clock fired, the exit was non-zero, and
+       there is ON-DISK EVIDENCE that guardkit's own timeout did. Evidence is
+       required: without it this degrades to ``error`` rather than guessing a
+       timeout from an exit code that a compile failure produces too.
+    5. **error** — everything else, which is the overwhelming majority and is
+       never written anywhere.
+
+    Deliberately a PURE FUNCTION over already-read facts rather than a method
+    on :class:`BuildMonitor`: a build launched with the monitor disabled
+    (``FORGE_BUILD_MONITOR=0``) still has a wall clock, still exits non-zero,
+    and still deserves an honest class. The caller reads ``progress`` /
+    ``last_event`` with the module-level readers, which work either way.
+
+    Args:
+        wedged: The monitor returned a wedged verdict and killed the child.
+        timed_out: The runner's ``asyncio.wait_for`` arm fired.
+        budget_bound: The per-build budget cap was the strictly-binding bound
+            for that arm (FEAT-UBS-002).
+        exit_code: The child's exit status; ``None`` when it never ran.
+        progress: ``read_task_progress`` output, or ``None`` for no evidence.
+        last_event: ``read_last_event`` output, or ``None``.
+
+    Returns:
+        ``(terminal_class, evidence)`` — the class from
+        :data:`TERMINAL_CLASSES`, and one plain-language sentence a human can
+        read without knowing any of this vocabulary.
+    """
+    if wedged:
+        return (
+            TERMINAL_CLASS_WEDGE,
+            "the build monitor saw no semantic progress or state movement for "
+            "the whole window and killed the build; no clock fired",
+        )
+    if timed_out and budget_bound:
+        return (
+            TERMINAL_CLASS_BUDGET_CAP,
+            "the build ran past the wall-clock cap its budget profile sets, "
+            "and was killed at the cap",
+        )
+    if timed_out:
+        return (
+            TERMINAL_CLASS_WALL_CLOCK,
+            "the runner's own wall-clock bound expired and killed the build; "
+            "this bound is an insanity backstop, so an expiry here also means "
+            "the semantic monitor failed to call it first",
+        )
+    evidence = _in_band_timeout_evidence(progress, last_event)
+    if evidence is not None and exit_code not in (None, 0):
+        return (
+            TERMINAL_CLASS_IN_BAND,
+            f"no forge-side clock fired, but {evidence}; forge saw only "
+            f"exit={exit_code}",
+        )
+    return (
+        TERMINAL_CLASS_ERROR,
+        "the build failed on its own terms — no clock, forge-side or "
+        "guardkit-side, is known to have fired",
+    )
 
 
 #: The three on-disk signal families, in digest order.
@@ -1689,9 +1887,19 @@ class BuildMonitor:
             }
         if event is not None:
             # Attribution only — events never voted on liveness.
+            # ``failure_category`` joined the projection in the timeout-truth
+            # lane: guardkit writes it when its OWN task clock fires, and
+            # dropping it here was the reason an in-band timeout was
+            # indistinguishable from a compile error one hop later.
             state["last_event"] = {
                 key: event.get(key)
-                for key in ("task_id", "timestamp", "turn_count", "verification_status")
+                for key in (
+                    "task_id",
+                    "timestamp",
+                    "turn_count",
+                    "verification_status",
+                    "failure_category",
+                )
                 if key in event
             }
         return state

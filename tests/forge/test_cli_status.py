@@ -937,3 +937,139 @@ class TestInFlightSurface:
         assert "_read_in_flight_entries" in src
         assert "read_only_connect" in src
         assert "connect_writer" not in src
+
+
+# ---------------------------------------------------------------------------
+# TIMEOUT TRUTH — the CLASS column (schema_v9)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalClassColumn:
+    """``FAILED`` is one word for five deaths; CLASS is the difference.
+
+    STATUS is untouched by every test here — that is the point. An operator
+    reading the table can now tell "this ran out of time" from "this is
+    broken" without opening the failure pack, and nothing that already reads
+    STATUS sees anything change.
+    """
+
+    def _failed_build(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        *,
+        feature_id: str = "FEAT-CLASS",
+        terminal_class: str | None = None,
+    ) -> str:
+        build_id = _seed_build(
+            persistence,
+            feature_id=feature_id,
+            correlation_id=f"corr-{feature_id}",
+            target_state=BuildState.FAILED,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        if terminal_class is not None:
+            persistence.record_terminal_class(build_id, terminal_class)
+        return build_id
+
+    def test_a_classified_build_renders_its_class(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        self._failed_build(persistence, terminal_class="timeout-wedge")
+        result = CliRunner().invoke(status_cmd, ["--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert "CLASS" in result.output
+        assert "timeout-wedge" in result.output
+
+    def test_the_STATUS_cell_still_reads_exactly_FAILED(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        """No new status value. Not now, not ever, on this lane."""
+        self._failed_build(persistence, terminal_class="timeout-budget-cap")
+        result = CliRunner().invoke(status_cmd, ["--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert BuildState.FAILED.value in result.output
+        views = _read_status_views(db_path, feature_id=None)
+        assert views[0].status is BuildState.FAILED
+
+    def test_an_unclassified_build_renders_a_dash(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        """The byte-identity control: an ordinary failure looks like before."""
+        self._failed_build(persistence)
+        views = _read_status_views(db_path, feature_id=None)
+        assert views[0].terminal_class is None
+        result = CliRunner().invoke(status_cmd, ["--db-path", str(db_path)])
+        assert result.exit_code == 0, result.output
+        assert "timeout-" not in result.output
+
+    def test_a_healthy_build_is_never_classified(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        _seed_build(
+            persistence,
+            feature_id="FEAT-HEALTHY",
+            correlation_id="corr-healthy",
+            target_state=BuildState.RUNNING,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        views = _read_status_views(db_path, feature_id=None)
+        assert views[0].terminal_class is None
+
+    def test_the_class_reaches_json_output(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        self._failed_build(persistence, terminal_class="timeout-in-band")
+        result = CliRunner().invoke(
+            status_cmd, ["--json", "--db-path", str(db_path)]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)
+        assert len(rows) == 1
+        view = BuildStatusView.model_validate(rows[0])
+        assert view.terminal_class == "timeout-in-band"
+        assert view.status is BuildState.FAILED
+
+    def test_the_feature_filtered_projection_carries_it_too(
+        self, persistence: SqliteLifecyclePersistence, db_path: Path
+    ) -> None:
+        """Both SELECT branches must name the column, not just the default one."""
+        self._failed_build(
+            persistence, feature_id="FEAT-FILT", terminal_class="timeout-wall-clock"
+        )
+        views = _read_status_views(db_path, feature_id="FEAT-FILT")
+        assert len(views) == 1
+        assert views[0].terminal_class == "timeout-wall-clock"
+
+    def test_a_pre_v9_database_still_renders(
+        self, tmp_path: Path
+    ) -> None:
+        """The upgrade window: the column may simply not exist yet.
+
+        ``forge status`` must not crash against a database the daemon has not
+        yet migrated — "not classified" is the honest read.
+        """
+        from forge.lifecycle import migrations as lifecycle_migrations
+
+        legacy = tmp_path / "legacy.db"
+        cx = sqlite_connect.connect_writer(legacy)
+        original = lifecycle_migrations._MIGRATIONS
+        lifecycle_migrations._MIGRATIONS = tuple(
+            m for m in original if m[0] <= 8
+        )
+        try:
+            lifecycle_migrations.apply_at_boot(cx)
+        finally:
+            lifecycle_migrations._MIGRATIONS = original
+        persistence = SqliteLifecyclePersistence(connection=cx, db_path=legacy)
+        _seed_build(
+            persistence,
+            feature_id="FEAT-LEGACY",
+            correlation_id="corr-legacy",
+            target_state=BuildState.FAILED,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        cx.close()
+
+        result = CliRunner().invoke(status_cmd, ["--db-path", str(legacy)])
+        assert result.exit_code == 0, result.output
+        assert "FEAT-LEGACY" in result.output

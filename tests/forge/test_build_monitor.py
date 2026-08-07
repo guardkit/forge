@@ -1515,3 +1515,332 @@ class TestMonitorKillSwitch:
         assert bm.resolve_poll_interval_seconds() == 60.0
         monkeypatch.setenv(bm.BUILD_MONITOR_POLL_ENV, "-3")
         assert bm.resolve_poll_interval_seconds() == 60.0
+
+
+# ---------------------------------------------------------------------------
+# TIMEOUT TRUTH — which of the five deaths this was
+# ---------------------------------------------------------------------------
+#
+# Before this lane a monitor kill, a budget-cap kill, a wall-clock expiry, a
+# guardkit in-band SDK timeout and an ordinary broken build were five different
+# things that all left the runner as one thing: ``FAILED``, distinguished only
+# by a prose string. These tests pin the closed vocabulary that tells them
+# apart — and, just as load-bearing, pin that ``error`` (the overwhelming
+# majority) still says nothing at all.
+
+
+class TestTaskProgressLastMarker:
+    """The parser always MATCHED the marker kind; it used to throw it away."""
+
+    def test_the_last_marker_kind_is_kept(self, tmp_path: Path) -> None:
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [
+                "[2026-07-31T10:00:00] START TASK-A: Player invocation",
+                _snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="Player"),
+                "[2026-07-31T10:40:00] TIMEOUT TASK-A: elapsed=2400s",
+            ],
+        )
+        progress = bm.read_task_progress(tmp_path)
+        assert progress is not None
+        assert progress[0].last_marker == "TIMEOUT"
+
+    def test_a_log_of_pure_heartbeats_has_no_marker(self, tmp_path: Path) -> None:
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [_snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="Player")],
+        )
+        progress = bm.read_task_progress(tmp_path)
+        assert progress is not None
+        assert progress[0].last_marker is None, (
+            "no marker record means NO EVIDENCE, which is not the same as "
+            "'not a timeout'"
+        )
+
+    def test_the_last_marker_wins_not_the_first(self, tmp_path: Path) -> None:
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [
+                "[2026-07-31T10:00:00] START TASK-A: attempt 1",
+                "[2026-07-31T10:40:00] TIMEOUT TASK-A: elapsed=2400s",
+                "[2026-07-31T10:41:00] START TASK-A: attempt 2",
+                "[2026-07-31T10:50:00] COMPLETE TASK-A: decision=approved",
+            ],
+        )
+        progress = bm.read_task_progress(tmp_path)
+        assert progress is not None
+        assert progress[0].last_marker == "COMPLETE", (
+            "a task that timed out and then RECOVERED did not die of a timeout"
+        )
+
+
+class TestFingerprintIsUnchangedByTheNewField:
+    """MUTATION PROOF: ``last_marker`` must never enter the movement signal.
+
+    The wedge detector treats any fingerprint change as state movement. A
+    marker kind flipping START → TIMEOUT without a single file changing is not
+    movement — it is a task dying in place — so folding it in would hand a
+    wedged build a fresh liveness heartbeat at exactly the wrong moment. These
+    two tests fail the instant somebody adds it to the tuple.
+    """
+
+    def test_the_tuple_is_exactly_the_four_movement_fields(self) -> None:
+        progress = bm.TaskProgress(
+            task_id="TASK-A",
+            files_changed=3,
+            phase="Player",
+            markers=2,
+            decision="feedback",
+            mtime=1000.0,
+            last_marker="TIMEOUT",
+        )
+        assert progress.fingerprint() == ("TASK-A", 3, "Player", 2)
+
+    def test_only_the_marker_kind_changing_is_NOT_movement(self) -> None:
+        common = {
+            "task_id": "TASK-A",
+            "files_changed": 3,
+            "phase": "Player",
+            "markers": 2,
+            "decision": None,
+            "mtime": 1000.0,
+        }
+        started = bm.TaskProgress(**common, last_marker="START")
+        timed_out = bm.TaskProgress(**common, last_marker="TIMEOUT")
+        assert started.fingerprint() == timed_out.fingerprint(), (
+            "a task announcing its own death must not read as a heartbeat"
+        )
+
+    def test_a_wedge_verdict_is_unchanged_by_a_timeout_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """The golden: the detector's answer with and without the marker."""
+        _write_feature(
+            tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"}, tasks_completed=0
+        )
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [
+                "[2026-07-31T10:00:00] START TASK-A: Player invocation",
+                _snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="Player"),
+            ],
+        )
+        clock = _Clock()
+        monitor = _make_monitor(tmp_path, clock)
+        clock.advance(monitor.window_seconds + 1.0)
+        assert monitor.poll(now=clock.now).wedged is True
+
+        # Now the SAME state plus a TIMEOUT marker. It must still be wedged:
+        # the marker changes the CLASS, never the movement verdict.
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [
+                "[2026-07-31T10:00:00] START TASK-A: Player invocation",
+                _snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="Player"),
+                "[2026-07-31T10:40:00] TIMEOUT TASK-A: elapsed=2400s",
+            ],
+        )
+        clock2 = _Clock()
+        monitor2 = _make_monitor(tmp_path, clock2)
+        clock2.advance(monitor2.window_seconds + 1.0)
+        assert monitor2.poll(now=clock2.now).wedged is True
+
+
+class TestClassifyTerminal:
+    """The truth table — all five causes, in precedence order."""
+
+    def test_a_wedge_outranks_every_clock(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=True,
+            timed_out=True,
+            budget_bound=True,
+            exit_code=-9,
+        )
+        assert klass == bm.TERMINAL_CLASS_WEDGE
+        assert "monitor" in evidence
+        assert "no clock fired" in evidence
+
+    def test_a_budget_bound_expiry_is_the_cap(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=False, timed_out=True, budget_bound=True, exit_code=-9
+        )
+        assert klass == bm.TERMINAL_CLASS_BUDGET_CAP
+        assert "budget profile" in evidence
+
+    def test_an_unbounded_expiry_is_the_runners_own_wall_clock(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=False, timed_out=True, budget_bound=False, exit_code=-9
+        )
+        assert klass == bm.TERMINAL_CLASS_WALL_CLOCK
+        assert "insanity backstop" in evidence
+
+    def test_a_progress_TIMEOUT_marker_plus_nonzero_exit_is_in_band(self) -> None:
+        progress = (
+            bm.TaskProgress(
+                task_id="TASK-A",
+                files_changed=3,
+                phase="Player",
+                markers=2,
+                decision=None,
+                mtime=1000.0,
+                last_marker="TIMEOUT",
+            ),
+        )
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=progress,
+        )
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-A" in evidence
+        assert "exit=2" in evidence
+
+    def test_an_events_failure_category_is_the_second_witness(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=1,
+            last_event={"task_id": "TASK-B", "failure_category": "task_timeout"},
+        )
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-B" in evidence
+
+    @pytest.mark.parametrize(
+        "category", ["timeout", "TIMEOUT", "sdk-timeout", "timed_out", "timed out"]
+    )
+    def test_the_category_match_is_generous_and_case_blind(
+        self, category: str
+    ) -> None:
+        """guardkit must be free to re-spell this without a forge release."""
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=1,
+            last_event={"failure_category": category},
+        )
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+
+    def test_an_ordinary_failure_is_error(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=False, timed_out=False, budget_bound=False, exit_code=1
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+        assert "no clock" in evidence
+
+    def test_a_timeout_marker_with_a_ZERO_exit_is_not_a_failure_class(self) -> None:
+        """A task that timed out and then recovered exits clean."""
+        progress = (
+            bm.TaskProgress(
+                task_id="TASK-A",
+                files_changed=3,
+                phase="Player",
+                markers=2,
+                decision=None,
+                mtime=1000.0,
+                last_marker="TIMEOUT",
+            ),
+        )
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=0,
+            progress=progress,
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_a_non_timeout_failure_category_never_claims_a_timeout(self) -> None:
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=1,
+            last_event={"failure_category": "verification_failed"},
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_no_evidence_degrades_to_error_rather_than_guessing(self) -> None:
+        """An exit code alone can never prove a timeout: a compile error
+        produces exactly the same one."""
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=(),
+            last_event=None,
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_it_classifies_with_the_monitor_DISABLED(self, tmp_path: Path) -> None:
+        """A pure function over already-read facts, not a monitor method.
+
+        A build launched with ``FORGE_BUILD_MONITOR=0`` still has a wall clock
+        and still deserves an honest class.
+        """
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=True,
+            budget_bound=False,
+            exit_code=-9,
+            progress=bm.read_task_progress(tmp_path),
+            last_event=bm.read_last_event(tmp_path, "FEAT-BM"),
+        )
+        assert klass == bm.TERMINAL_CLASS_WALL_CLOCK
+
+    def test_the_vocabulary_is_closed(self) -> None:
+        assert bm.TERMINAL_CLASSES == (
+            "timeout-wedge",
+            "timeout-budget-cap",
+            "timeout-wall-clock",
+            "timeout-in-band",
+            "error",
+        )
+
+
+class TestSemanticStateCarriesTheFailureCategory:
+    def test_failure_category_reaches_the_pack(self, tmp_path: Path) -> None:
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        events = tmp_path / bm.AUTOBUILD_DIR / "FEAT-BM" / bm.EVENTS_LOG_NAME
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(
+            json.dumps(
+                {
+                    "task_id": "TASK-A",
+                    "timestamp": "2026-07-31T10:40:00",
+                    "turn_count": 5,
+                    "verification_status": "failed",
+                    "failure_category": "task_timeout",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monitor = _make_monitor(tmp_path, _Clock())
+        state = monitor.semantic_state()
+        assert state["last_event"]["failure_category"] == "task_timeout", (
+            "the projection used to drop the one field that names an in-band "
+            "timeout"
+        )
+
+    def test_an_event_without_the_field_does_not_invent_it(
+        self, tmp_path: Path
+    ) -> None:
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        events = tmp_path / bm.AUTOBUILD_DIR / "FEAT-BM" / bm.EVENTS_LOG_NAME
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(
+            json.dumps({"task_id": "TASK-A", "turn_count": 5}) + "\n",
+            encoding="utf-8",
+        )
+        monitor = _make_monitor(tmp_path, _Clock())
+        assert "failure_category" not in monitor.semantic_state()["last_event"]
