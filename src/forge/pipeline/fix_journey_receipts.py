@@ -153,6 +153,14 @@ class FailurePackIndex:
         failed_at: ISO timestamp the manifest was written.
         receipt_families_exported: Families THIS run actually copied.
         semantic_state_at_kill / resume: The build-monitor additions.
+        terminal: Which terminal wrote the pack — ``running_wave`` when the
+            guardkit subprocess ran and failed, else the guard that caught
+            the build before it ever ran (FAILED-terminal lane, 2026-08-07).
+        evidence: The pack's own honest inventory: what is in it,
+            ``missing`` — the plain-language list of what is NOT and why —
+            and ``not_observable``, the evidence forge cannot collect at
+            all. A reviewer reads this FIRST so it never mistakes a thin
+            pre-launch pack for a complete record.
         present_families: Families that actually exist on disk now (the
             honest read — the manifest records intent at write time).
         stdout_log: The tee'd narrative, when present.
@@ -175,6 +183,8 @@ class FailurePackIndex:
     receipt_families_exported: tuple[str, ...] = ()
     semantic_state_at_kill: Mapping[str, Any] | None = None
     resume: Mapping[str, Any] | None = None
+    terminal: str | None = None
+    evidence: Mapping[str, Any] | None = None
     present_families: tuple[str, ...] = ()
     stdout_log: Path | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
@@ -206,6 +216,8 @@ class FailurePackIndex:
             "branch": self.branch,
             "failed_at": self.failed_at,
             "receipt_families_exported": list(self.receipt_families_exported),
+            "terminal": self.terminal,
+            "evidence": dict(self.evidence) if self.evidence is not None else None,
             "present_families": list(self.present_families),
             "stdout_log": (
                 str(self.stdout_log) if self.stdout_log is not None else None
@@ -306,6 +318,10 @@ def read_failure_pack(
                 else None
             ),
             resume=(raw.get("resume") if isinstance(raw.get("resume"), dict) else None),
+            terminal=_opt_str(raw.get("terminal")),
+            evidence=(
+                raw.get("evidence") if isinstance(raw.get("evidence"), dict) else None
+            ),
             present_families=present,
             stdout_log=stdout_log if stdout_log.is_file() else None,
             raw=raw,
