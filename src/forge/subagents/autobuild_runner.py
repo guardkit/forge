@@ -3127,7 +3127,19 @@ async def _sweep_prior_build_residue_impl(
 
         try:
             shutil.rmtree(outer_root, ignore_errors=False)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            if outer_root.exists():
+                # A FileNotFoundError with the root STILL PRESENT is a
+                # mid-walk race — something else deleting entries inside the
+                # tree while rmtree walks it — not an already-swept tree:
+                # files may remain. Refuse loudly like any other OSError
+                # instead of logging a false "ALREADY GONE".
+                raise PriorBuildSweepError(
+                    f"prior build {prior_build_id!r}: rmtree hit a vanishing "
+                    f"entry inside {outer_root} but the tree is still "
+                    f"present — a concurrent-deletion race, not an "
+                    f"already-swept tree ({type(exc).__name__}: {exc})"
+                ) from exc
             # ALREADY SWEPT IS NOT A FAILURE (ledgered 2026-08-03, cured
             # 2026-08-07). The kept tree can already be gone — an operator
             # cleaned it up, or an earlier pass removed it — while the SOURCE

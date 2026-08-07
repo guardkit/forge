@@ -1810,9 +1810,13 @@ class LifecycleBridgeWireup:
           live bridge build, stuck at ``queued``, forever — one phantom
           per journey, accumulating.
         * The approval subscriber's PEB-006 probe reads exactly this row
-          to decide "the bridge is canonical for ``build-resumed``". With
-          a phantom present it stands its own emit down in favour of an
-          observer that exited — the resume envelope reaches nobody.
+          to decide "the bridge is canonical for ``build-resumed``" —
+          LATENT today, not live: ``serve.py`` wires
+          ``bridge_registry=None`` unconditionally (the TASK-GATE-D659 R1
+          posture), so the probe is disabled in the running daemon. The
+          day it is re-wired, a phantom would stand the subscriber's own
+          emit down in favour of an observer that exited — the resume
+          envelope would reach nobody.
         * Operator cancel found the phantom and drove
           ``runs.cancel("pending-<feature_id>", ...)`` at the sidecar
           instead of answering the honest ``no-registry-row`` /
