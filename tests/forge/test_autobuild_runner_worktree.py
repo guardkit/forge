@@ -2578,6 +2578,57 @@ class TestFeatureModeResidueIsSwept:
             in joined
         )
 
+    def test_an_already_deleted_outer_tree_counts_as_already_swept(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The kept tree is already GONE — that is a done sweep, not a failure.
+
+        The live shape (ledgered 2026-08-03): an operator — or an earlier
+        clean-up — deletes the prior build's kept worktree directory, but the
+        SOURCE repo still carries its registration and its
+        ``autobuild/<FEAT>`` branch. The sweep cleared both and then died on
+        ``shutil.rmtree`` of a path that no longer existed, so the fresh
+        dispatch was REFUSED over residue that was already gone (the workaround
+        was to hand-create a decoy directory at the path). An already-cleaned
+        path must read as already-swept: the registration and the branch are
+        still cleared, and the dispatch proceeds.
+        """
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        shutil.rmtree(outer)  # the whole kept tree deleted by hand
+        assert not outer.exists()
+        assert str(inner) in _registered_worktrees(throwaway_repo), (
+            "the registration must outlive the directory — otherwise this "
+            "test proves nothing"
+        )
+        assert _branch_exists(throwaway_repo, FLV1_BRANCH)
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        # The dispatch is not refused: guardkit's own feature-mode add works.
+        assert recorded.get("inner_add_rc") == 0, recorded.get("inner_add_stderr")
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert str(inner) not in _registered_worktrees(throwaway_repo)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "was ALREADY GONE" in joined
+        assert "already-swept" in joined
+        assert "could not remove its kept outer worktree" not in joined
+
 
 class TestFeatureModeSweepFences:
     """What the feature-shape sweep must NEVER touch."""
