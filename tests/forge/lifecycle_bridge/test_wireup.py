@@ -1182,3 +1182,204 @@ class TestRoutinePathIdentityWatchdogUnchanged:
 
         assert mode_reader.calls == []
         await wireup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# FWD-002 stand-down residue (ledgered 2026-08-04, built 2026-08-07) —
+# DETACH-WITHOUT-ACK: the stand-down took the watchdog off the journey but
+# left the bridge's registry row behind, so the estate went on believing a
+# finished fix journey was still in flight.
+# ---------------------------------------------------------------------------
+
+
+class TestStandDownDetachesWithoutAcking:
+    """The stand-down drops its own row and touches nothing it does not own."""
+
+    @pytest.mark.asyncio
+    async def test_stand_down_deletes_the_registry_row_and_acks_nothing(
+        self, bridge, registry, translator, fake_publisher
+    ) -> None:
+        # THE LEAK: register_ack_handle wrote a row (placeholder
+        # thread/run ids, lifecycle "queued"); the mode-c observer stands
+        # down and exits, and nothing else in the estate deletes it — the
+        # conductor's terminal path does not know the bridge exists. Cured:
+        # the stand-down detaches. WITHOUT-ACK is the other half — the
+        # journey is still running, so the inbound message, the builds row
+        # and the wire stay exactly as the conductor left them.
+        recorder = MagicMock()
+        mode_reader = _StubModeReader({"build-standdown-row": BuildMode.MODE_C})
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=mode_reader,
+            resolved_build_id="build-standdown-row",
+        )
+        wireup._build_state_recorder = recorder
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-SDR", "corr-sdr", handle)
+        assert registry.get("FEAT-SDR", correlation_id="corr-sdr") is not None
+        await _drain_observer(wireup, "FEAT-SDR", timeout=2.0)
+
+        # The row is gone: `forge status --in-flight` shows no phantom, and
+        # the approval subscriber's PEB-006 probe no longer defers its
+        # build-resumed emit to an observer that has exited.
+        assert registry.get("FEAT-SDR", correlation_id="corr-sdr") is None
+        # Nothing the bridge does not own was moved.
+        handle.ack.assert_not_awaited()
+        handle.nak.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_not_awaited()
+        fake_publisher.publish_build_complete.assert_not_awaited()
+        fake_publisher.publish_build_cancelled.assert_not_awaited()
+        recorder.assert_not_called()
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_stand_down_disarms_the_bridges_own_deadline_timer(
+        self, registry, translator, fake_publisher
+    ) -> None:
+        # The leaked row also left the bridge's per-build deadline timer
+        # armed. Any deployment that wires a deadline_handler would have
+        # fired the FWD-002 kill a second way — through the bridge's own
+        # clock, after the observer had already stood down. detach cancels
+        # the timer, so the handler never runs for a fix journey.
+        deadline_handler = AsyncMock(name="deadline_handler")
+        timer_bridge = LifecycleBridge(
+            registry=registry,
+            deadline_handler=deadline_handler,
+            deadline_seconds=0.05,
+        )
+        wireup = _build_mode_aware_wireup(
+            timer_bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-standdown-timer": BuildMode.MODE_C}),
+            resolved_build_id="build-standdown-timer",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-SDT", "corr-sdt", handle)
+        await _drain_observer(wireup, "FEAT-SDT", timeout=2.0)
+        # Well past the 0.05s timer: on the leaking path it has fired by now.
+        await asyncio.sleep(0.2)
+
+        deadline_handler.assert_not_awaited()
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_stand_down_leaves_operator_cancel_honest(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # With the phantom row in place, an operator cancel for a finished
+        # fix journey found a row holding placeholder ids and tried to
+        # drive runs.cancel("pending-FEAT-SDC", ...) at the sidecar. After
+        # the detach the bridge answers the truth instead: no row here.
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-standdown-cancel": BuildMode.MODE_C}),
+            resolved_build_id="build-standdown-cancel",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-SDC", "corr-sdc", handle)
+        await _drain_observer(wireup, "FEAT-SDC", timeout=2.0)
+
+        result = await bridge.request_cancel("FEAT-SDC")
+
+        assert result.invoked is False
+        assert result.reason == "no-registry-row"
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_detach_failure_is_logged_not_raised(
+        self, bridge, translator, fake_publisher, monkeypatch, caplog
+    ) -> None:
+        # A failing detach degrades to exactly the pre-cure leak — never to
+        # a crashed observer, and never to an ack the bridge has no right
+        # to make.
+        failing_detach = MagicMock(side_effect=sqlite3.OperationalError("locked"))
+        monkeypatch.setattr(bridge, "detach", failing_detach)
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-standdown-boom": BuildMode.MODE_C}),
+            resolved_build_id="build-standdown-boom",
+        )
+        handle = _make_handle()
+
+        with caplog.at_level(logging.WARNING, logger="forge.lifecycle_bridge.wireup"):
+            await wireup.register_ack_handle("FEAT-SDB", "corr-sdb", handle)
+            await _drain_observer(wireup, "FEAT-SDB", timeout=2.0)
+
+        task = wireup.get_observer_task("FEAT-SDB")
+        assert task is None or task.exception() is None
+        assert "bridge.detach raised" in caplog.text
+        handle.ack.assert_not_awaited()
+        handle.nak.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_not_awaited()
+        await wireup.shutdown()
+
+
+class TestRoutineDetachPathUnchangedByStandDown:
+    """The routine watchdog's publish → ack → detach order is untouched."""
+
+    @pytest.mark.asyncio
+    async def test_mode_a_still_publishes_acks_and_detaches_exactly_once(
+        self, bridge, registry, translator, fake_publisher
+    ) -> None:
+        # The no-change proof for the detach half: a routine build whose
+        # identity never resolves still terminalises through _on_terminal —
+        # synthetic build-failed FIRST, then ack, then one detach — and the
+        # stand-down's detach never fires on this path.
+        real_detach = bridge.detach
+        detach_calls: list[tuple[str, str]] = []
+
+        def _spy_detach(feature_id: str, *, correlation_id: str) -> None:
+            detach_calls.append((feature_id, correlation_id))
+            real_detach(feature_id, correlation_id=correlation_id)
+
+        bridge.detach = _spy_detach  # type: ignore[method-assign]
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-routine-detach": BuildMode.MODE_A}),
+            resolved_build_id="build-routine-detach",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-RDT", "corr-rdt", handle)
+        await _drain_observer(wireup, "FEAT-RDT", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        sent = fake_publisher.publish_build_failed.await_args.args[0]
+        assert sent.failure_reason == IDENTITY_UNRESOLVED_FAILURE_REASON
+        handle.ack.assert_awaited_once()
+        assert detach_calls == [("FEAT-RDT", "corr-rdt")]
+        assert registry.get("FEAT-RDT", correlation_id="corr-rdt") is None
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_no_mode_reader_still_detaches_only_at_the_terminal(
+        self, bridge, registry, translator, fake_publisher
+    ) -> None:
+        # An un-migrated caller (no mode reader) never reaches the
+        # stand-down at all: same publish + ack + detach as before the lane.
+        wireup = _build_identity_unresolved_wireup(
+            bridge, translator, fake_publisher, build_id_resolver=None
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-NMD", "corr-nmd", handle)
+        await _drain_observer(wireup, "FEAT-NMD", timeout=2.0)
+
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        handle.ack.assert_awaited_once()
+        assert registry.get("FEAT-NMD", correlation_id="corr-nmd") is None
+        await wireup.shutdown()

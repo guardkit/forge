@@ -757,18 +757,30 @@ class LifecycleBridgeWireup:
                 # work leg killed ~90s into an 1800s budget, row stamped
                 # FAILED|identity-unresolved). Consult the row's mode and
                 # stand the watchdog down for a fix journey: no deadline
-                # arm, no synthetic terminal, no ack, no detach — the
-                # conductor acks at ITS terminal.
+                # arm, no synthetic terminal, no ack — the conductor acks
+                # at ITS terminal.
+                #
+                # DETACH-WITHOUT-ACK (2026-08-07, the stand-down's own
+                # ledgered residue): the first cut also skipped the
+                # detach, which left the bridge's registry row behind for
+                # a build nothing was observing any more — a phantom
+                # in-flight entry, one per fix journey, forever. Stand-down
+                # now DETACHES: the row goes, and nothing else moves. See
+                # :meth:`_detach_on_stand_down` for what "nothing else"
+                # buys and why the ack stays where it belongs.
                 build_id = await self._resolve_watchdog_build_id(context)
                 if self._is_mode_c_build(build_id):
                     logger.info(
                         "wireup._observer_loop: feature_id=%s build_id=%s — %s "
                         "(no identity deadline armed, no synthetic "
-                        "build-failed; the row is left to the conductor)",
+                        "build-failed, nothing acked; the bridge's registry "
+                        "row is detached because nothing observes it any "
+                        "more — the conductor owns the ack and the terminal)",
                         feature_id,
                         build_id,
                         MODE_C_WATCHDOG_STAND_DOWN,
                     )
+                    self._detach_on_stand_down(context)
                     return
                 identity = await self._await_identity_until_deadline(context)
                 if identity is None:
@@ -1779,6 +1791,70 @@ class LifecycleBridgeWireup:
             )
             return False
         return mode is BuildMode.MODE_C
+
+    def _detach_on_stand_down(self, context: BuildContext) -> None:
+        """Drop the bridge's registry row when the watchdog stands down.
+
+        THE CURE IS NAMED ``detach-without-ack`` (ledgered 2026-08-04,
+        built 2026-08-07). ``register_ack_handle`` wrote a
+        ``lifecycle_bridge_registry`` row before dispatch — placeholder
+        ``thread_id``/``run_id`` of ``pending-<feature_id>``, lifecycle
+        ``queued`` — because a routine build's observer rewrites that row
+        the moment identity resolves. A mode-c fix journey never touches
+        the sidecar, so identity never resolves, the observer stands down
+        and exits, and nothing in the estate deletes that row afterwards
+        (the conductor's terminal path does not know the bridge exists).
+        The row therefore outlived the journey, and cost four things:
+
+        * ``forge status --in-flight`` listed a finished fix journey as a
+          live bridge build, stuck at ``queued``, forever — one phantom
+          per journey, accumulating.
+        * The approval subscriber's PEB-006 probe reads exactly this row
+          to decide "the bridge is canonical for ``build-resumed``" —
+          LATENT today, not live: ``serve.py`` wires
+          ``bridge_registry=None`` unconditionally (the TASK-GATE-D659 R1
+          posture), so the probe is disabled in the running daemon. The
+          day it is re-wired, a phantom would stand the subscriber's own
+          emit down in favour of an observer that exited — the resume
+          envelope would reach nobody.
+        * Operator cancel found the phantom and drove
+          ``runs.cancel("pending-<feature_id>", ...)`` at the sidecar
+          instead of answering the honest ``no-registry-row`` /
+          "unknown-build".
+        * Any deployment that wires a ``deadline_handler`` into the
+          bridge left that per-build timer armed — the FWD-002 kill the
+          stand-down exists to prevent, coming back through the bridge's
+          own clock. ``detach`` cancels it.
+
+        WITHOUT-ACK is the load-bearing half. :meth:`_on_terminal` — the
+        routine terminal path — publishes, acks the inbound message and
+        detaches. Here we detach ONLY: no publish, no ``builds`` write,
+        no ``ack``/``nak``. The journey is alive and the conductor owns
+        both its terminal and its ack; a detach that also acked would
+        release the JetStream slot for work still in flight, which is the
+        very over-claim this lane is closing. Detaching what the bridge
+        itself wrote is not a claim about the build — it is the bridge
+        saying, truthfully, "I am not watching this".
+
+        A raising detach is logged at WARNING and swallowed: the failure
+        mode is exactly the leak we had before, so it must never also
+        crash the observer or reach the daemon.
+        """
+        try:
+            self._bridge.detach(
+                context.feature_id, correlation_id=context.correlation_id
+            )
+        except Exception as exc:  # noqa: BLE001 — a leak, never a crash
+            logger.warning(
+                "wireup._detach_on_stand_down: bridge.detach raised (%s) for "
+                "feature_id=%s correlation_id=%s; the registry row stays "
+                "behind as a phantom in-flight entry (pre-cure behaviour) "
+                "— nothing was acked or terminalised, the journey is "
+                "unaffected",
+                exc,
+                context.feature_id,
+                context.correlation_id,
+            )
 
     async def _publish_identity_unresolved_failure(
         self,
