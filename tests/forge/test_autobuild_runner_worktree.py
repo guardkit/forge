@@ -1489,6 +1489,31 @@ class TestRunScopedStdoutLog:
             "must still leave no file"
         )
 
+    def test_one_tee_writes_its_header_once_even_after_a_close(
+        self, tmp_path: Path
+    ) -> None:
+        """TAIL LOSS (2026-08-07): the header belongs to the TEE, not the open.
+
+        The bounded post-kill tail read writes through a tee the drain's
+        ``finally`` has already closed. Before the latch that re-emitted the
+        run header MID-FILE, and a reader could not tell the recovered tail
+        from a whole second run.
+        """
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        payload = {"build_id": "build-T-1", "correlation_id": "corr-t"}
+        tee = ar._StdoutTee(log, run_header=ar._stdout_run_header(payload, "FEAT-T"))
+
+        tee.write("line before the kill")
+        tee.close()
+        tee.write("the recovered tail")  # the post-kill read
+        tee.close()
+
+        lines = log.read_text().splitlines()
+        assert [
+            line for line in lines if line.startswith(ar.STDOUT_RUN_HEADER_PREFIX)
+        ] == [lines[0]], "one tee, one header — and it is the FIRST line"
+        assert lines[1:] == ["line before the kill", "the recovered tail"]
+
     def test_headerless_tee_is_byte_identical_legacy(self, tmp_path: Path) -> None:
         log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
         tee = ar._StdoutTee(log)

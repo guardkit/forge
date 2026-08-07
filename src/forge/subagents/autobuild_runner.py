@@ -1161,6 +1161,25 @@ FORGE_AUTOBUILD_TIMEOUT_ENV: str = "FORGE_AUTOBUILD_TIMEOUT_SECONDS"
 #: arms the D659 breach gate.
 DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 86400
 
+#: How long the ORDINARY-TIMEOUT path may spend reading the subprocess's last
+#: words after the kill, in seconds (TAIL LOSS, 2026-08-07).
+#:
+#: The wedge path has always kept the tail for free: the monitor kills the
+#: process and simply returns, so the drain loop reaches EOF and reads every
+#: buffered line before closing. The wall-clock/budget-cap path did not:
+#: ``asyncio.wait_for`` CANCELS the drain first and kills second, so whatever
+#: was sitting in the pipe buffer at the cancel — on a dying build, exactly the
+#: last guardkit output, tracebacks and its own ``TIMEOUT`` announcement — was
+#: never read, never teed and never seen by the monitor. This budget bounds the
+#: bounded post-kill read that closes that gap.
+#:
+#: Named rather than folklore, and deliberately small: the process is already
+#: reaped when the read starts, so ``readline()`` returns buffered bytes and
+#: then EOF. The budget only ever matters when the kill itself did not take
+#: (the leaked-pid branch below), and in that case it expires into one WARNING
+#: and changes nothing about the build's outcome.
+TAIL_READ_BUDGET_SECONDS: float = 5.0
+
 #: Default base directory for repo checkouts when
 #: :data:`FORGE_REPO_BASE_ENV` is unset. Resolved at call time via
 #: :meth:`Path.expanduser` so a different ``$HOME`` in the sidecar still
@@ -2046,6 +2065,13 @@ class _StdoutTee:
     silent build still leaves no file) — distinct runs are then explicitly
     delimited instead of silently interleaved. A header-less construction
     behaves byte-identically to the pre-finding tee.
+
+    Header LATCHING (TAIL LOSS, 2026-08-07): the header belongs to the TEE, not
+    to each lazy open. Before this, a tee that was closed and then written to
+    again re-emitted the run header in the MIDDLE of its own file, and a reader
+    could not tell that from a second run's segment. The bounded post-kill tail
+    read does exactly that — the drain's ``finally`` closes, then the tail
+    writes — so the latch is load-bearing, not tidiness.
     """
 
     def __init__(self, path: Path, *, run_header: str | None = None) -> None:
@@ -2053,6 +2079,7 @@ class _StdoutTee:
         self._run_header = run_header
         self._handle: TextIO | None = None
         self._disabled = False
+        self._header_written = False
 
     @property
     def path(self) -> Path:
@@ -2072,8 +2099,9 @@ class _StdoutTee:
                     "a", encoding="utf-8", errors="replace", buffering=1
                 )
                 _harden_pack_permissions(self._path.parent)
-                if self._run_header is not None:
+                if self._run_header is not None and not self._header_written:
                     self._handle.write(f"{self._run_header}\n")
+                    self._header_written = True
                 logger.info(
                     "autobuild_runner: teeing subprocess stdout -> %s", self._path
                 )
@@ -2110,6 +2138,94 @@ class _StdoutTee:
                 type(exc).__name__,
                 exc,
             )
+
+
+async def _drain_tail(
+    proc: Any,
+    tee: _StdoutTee,
+    monitor: build_monitor.BuildMonitor | None,
+    *,
+    budget: float = TAIL_READ_BUDGET_SECONDS,
+    feature_id: str = "",
+) -> int:
+    """Read the subprocess's LAST WORDS after an ordinary-timeout kill.
+
+    TAIL LOSS (Sunday handoff §4.4), 2026-08-07. Two kill paths, two very
+    different outcomes, and only one of them was honest:
+
+    * the WEDGE path kills and returns (``_watch_for_wedge``), so the main
+      drain runs on to EOF and reads every buffered line before its ``finally``
+      closes the tee — the tail survives for free;
+    * the ORDINARY-TIMEOUT path (wall clock, or the FEAT-UBS-002 budget cap)
+      goes through ``asyncio.wait_for``, which CANCELS the gathered drain
+      BEFORE the kill. The drain dies inside ``await proc.stdout.readline()``,
+      its ``finally`` closes the tee, and only then is the process killed.
+      Everything in the pipe buffer at that moment was read by nobody. On a
+      dying build that is precisely the interesting part: the last guardkit
+      output, the orchestrator traceback, and guardkit's OWN ``TIMEOUT``
+      announcement — the evidence the terminal-class in-band detection wants.
+
+    This gives the ordinary-timeout path the same bounded post-kill read the
+    wedge path gets by accident, with an explicit budget instead of luck.
+
+    Safe by construction:
+
+    * ``wait_for`` awaits the cancelled gather before raising, so the original
+      drain has FINISHED — there is never a second concurrent reader;
+    * the process is already reaped, so ``readline()`` returns the buffered
+      bytes and then EOF. A kill that did not take means this read simply
+      expires into the WARNING below;
+    * it can never change the outcome. Blanket ``except Exception`` and one
+      WARNING — the standing tee posture (see :class:`_StdoutTee`).
+      ``CancelledError`` is a ``BaseException`` and is deliberately NOT caught,
+      so a FEAT-FCT interrupt still propagates instantly.
+
+    Evidence only: unlike the main drain this does NOT feed
+    ``stage_complete_count`` or the coach-score turns, because both are read on
+    the SUCCESS path alone and this coroutine runs only after a kill.
+
+    Returns the number of tail lines recovered (0 on any fault).
+    """
+    stdout = getattr(proc, "stdout", None)
+    if stdout is None:  # defensive — PIPE was requested at spawn
+        return 0
+    recovered = 0
+
+    async def _read() -> None:
+        nonlocal recovered
+        while True:
+            line = await stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            # The identical treatment every other line gets, in the same
+            # order: liveness first, then the durable narrative.
+            if monitor is not None:
+                monitor.note_stdout_line(decoded)
+            tee.write(decoded)
+            logger.debug("autobuild_runner[stdout-tail]: %s", decoded)
+            recovered += 1
+
+    try:
+        await asyncio.wait_for(_read(), timeout=budget)
+    except Exception as exc:  # noqa: BLE001 — best-effort: never alter a terminal
+        logger.warning(
+            "autobuild_runner: post-kill tail read stopped after %s line(s) "
+            "for feature_id=%s (%s: %s) — the build's terminal is unaffected",
+            recovered,
+            feature_id,
+            type(exc).__name__,
+            exc,
+        )
+        return recovered
+    if recovered:
+        logger.info(
+            "autobuild_runner: recovered %s line(s) of subprocess tail after "
+            "the timeout kill for feature_id=%s — these would have been lost",
+            recovered,
+            feature_id,
+        )
+    return recovered
 
 
 def _archive_prior_manifest(manifest_path: Path) -> None:
@@ -3730,6 +3846,17 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         raise
     except asyncio.TimeoutError:
         timed_out = True
+        # WHICH DEATH THIS WAS is decided HERE, and nothing after this line may
+        # revise it. Stop the wedge watch first (the ``finally`` below still
+        # retrieves it — cancelling a cancelled task is a no-op). Without this
+        # the watch keeps polling through the kill, the reap and the tail read;
+        # if the kill does not take, ``proc.returncode`` stays None, a poll
+        # lands, and a wall-clock/budget-cap death is stamped WEDGED — a lie
+        # about the cause, and one the terminal class now carries onto the row.
+        # The window was the 5s reap; this lane's tail read would have made it
+        # 10s, so it is closed instead of widened.
+        if watch_task is not None and not watch_task.done():
+            watch_task.cancel()
         logger.warning(
             "autobuild_runner: subprocess timeout after %.1fs feature_id=%s "
             "— killing process",
@@ -3749,6 +3876,24 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 proc.pid,
                 feature_id,
             )
+        # TAIL LOSS (2026-08-07). ``wait_for`` cancelled the drain BEFORE the
+        # kill above, so the drain died mid-``readline()`` and its ``finally``
+        # already closed the tee — every byte still sitting in the pipe was
+        # read by nobody. The wedge path never had this hole (its kill leaves
+        # the drain running to EOF); this gives the ordinary-timeout path the
+        # same bounded post-kill read, explicitly budgeted. It runs AFTER the
+        # reap (so there is no concurrent reader and readline() cannot block on
+        # a live writer) and BEFORE the terminal is classified below, so the
+        # recovered lines actually reach the monitor's semantic state and the
+        # in-band timeout evidence. Best-effort; it cannot alter the outcome.
+        await _drain_tail(
+            proc,
+            stdout_tee,
+            monitor,
+            budget=TAIL_READ_BUDGET_SECONDS,
+            feature_id=feature_id,
+        )
+        stdout_tee.close()
     finally:
         # The subprocess is reaped (or the node is being cancelled): stop the
         # watch AND retrieve it. Cancelling an already-finished task is a
@@ -4532,6 +4677,7 @@ __all__ = [
     "FORGE_GUARDKIT_PATH_ENV",
     "FORGE_REPO_BASE_ENV",
     "RUNNER_CODE_VERSION",
+    "TAIL_READ_BUDGET_SECONDS",
     "AutobuildLifecycle",
     "AutobuildRunnerState",
     "AutobuildState",
