@@ -2163,13 +2163,38 @@ def _archive_prior_manifest(manifest_path: Path) -> None:
         )
 
 
+#: The terminal that wrote a failure pack, stamped on the manifest as
+#: ``terminal``. One writer (:func:`_write_failure_manifest`) serves every
+#: one of them — the ONE-RULE law: a second pack writer would be a second
+#: statement of the same rule, and therefore a future lie.
+TERMINAL_RUNNING_WAVE: str = "running_wave"
+TERMINAL_FAILED_NODE: str = "failed"
+TERMINAL_FINALIZE_GUARD: str = "finalize-guard"
+TERMINAL_GRAPH_CONSTRUCTION: str = "graph-construction"
+
+#: Evidence forge cannot see from here, named in every pack's
+#: ``evidence.missing`` list so a reader knows the silence is a KNOWN gap
+#: rather than an omission. guardkit's orchestrator carries a
+#: ``player_result.error`` on a stalled player invocation; nothing in that
+#: object crosses the subprocess boundary (forge reads stdout + the on-disk
+#: ledger only), and the guardkit-side defect "player-invocation stall
+#: misnamed at final summary layer" means even guardkit's own final summary
+#: does not consult it. Naming it here is the honest posture: the pack says
+#: what it could not look at.
+_UNAVAILABLE_EVIDENCE: str = (
+    "player_result.error — guardkit's in-process orchestrator field; not "
+    "observable across the subprocess boundary from forge (guardkit-side "
+    "residue: the stall is misnamed at the final summary layer)"
+)
+
+
 def _write_failure_manifest(
     *,
     build_id: str,
     payload: Mapping[str, Any],
     reason: str,
     timed_out: bool,
-    exit_code: int,
+    exit_code: int | None,
     worktree_path: Path | None,
     branch: str | None,
     receipts: "ReceiptExport | None" = None,
@@ -2177,7 +2202,9 @@ def _write_failure_manifest(
     semantic_state: Mapping[str, Any] | None = None,
     resume: Mapping[str, Any] | None = None,
     task_counts: build_monitor.TaskCounts | None = None,
-) -> None:
+    terminal: str = TERMINAL_RUNNING_WAVE,
+    stdout_log: Path | None = None,
+) -> Path | None:
     """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
 
     The only cross-layer pointer a failed build left before this lane was the
@@ -2209,8 +2236,30 @@ def _write_failure_manifest(
     * ``tasks_completed`` / ``tasks_failed`` / ``tasks_completed_source`` —
       the honest ledger-derived counts at the moment of failure.
 
+    The FAILED-terminal lane (2026-08-07) adds two more, and widens the
+    writer so EVERY failed build gets a pack — not only the ones whose
+    guardkit subprocess actually ran:
+
+    * ``terminal`` — which terminal wrote this pack
+      (:data:`TERMINAL_RUNNING_WAVE` when the subprocess ran and failed,
+      else the guard that caught the build before/after it).
+    * ``evidence`` — the honest enumeration of what a diagnoser will
+      actually find in this pack: the stdout narrative, whether the failed
+      worktree is still on disk, which receipt families landed, whether the
+      subprocess ran at all, ``missing`` — a plain-language list naming
+      every piece of evidence that is NOT here and why — and
+      ``not_observable``, the standing list of evidence forge cannot
+      collect at all. A pre-launch failure has no stdout and no receipts;
+      the pack says so out loud instead of looking like an empty success.
+
+    ``exit_code`` is ``None`` when the guardkit subprocess never ran (a
+    pre-launch refusal). ``null`` on the wire is the honest answer there;
+    ``-1`` would read as a signal kill that never happened.
+
     Best-effort by the same principle as everything else in the pack: it never
-    raises and never alters the build's outcome.
+    raises and never alters the build's outcome. Returns the manifest path on
+    a successful write, else ``None`` — the caller uses that to decide whether
+    a later terminal still owes the build a pack.
     """
     try:
         dest_root = _receipts_root() / build_id
@@ -2220,6 +2269,15 @@ def _write_failure_manifest(
             _archive_prior_manifest(manifest_path)
         feature_id = payload.get("feature_id")
         correlation_id = payload.get("correlation_id")
+        evidence = _pack_evidence(
+            build_id=build_id,
+            worktree_path=worktree_path,
+            receipts=receipts,
+            exit_code=exit_code,
+            stdout_log=stdout_log,
+            semantic_state=semantic_state,
+        )
+        missing: list[str] = evidence["missing"]
         manifest = {
             "build_id": build_id,
             "feature_id": str(feature_id) if feature_id is not None else None,
@@ -2268,16 +2326,33 @@ def _write_failure_manifest(
             "tasks_completed_source": (
                 task_counts.source if task_counts is not None else None
             ),
+            # --- FAILED-terminal lane (2026-08-07) ----------------------
+            "terminal": terminal,
+            "evidence": evidence,
         }
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         _harden_pack_permissions(dest_root)
         logger.info(
-            "autobuild_runner: failure manifest written for %s -> %s",
+            "autobuild_runner: failure manifest written for %s -> %s "
+            "(terminal=%s)",
             build_id,
             manifest_path,
+            terminal,
         )
+        if missing:
+            # Degrade LOUDLY: a thin pack is still a pack, but the operator
+            # must be able to see from the log alone that the fix loop is
+            # being fed less than a full plate.
+            logger.warning(
+                "autobuild_runner: failure pack for %s is THIN (terminal=%s) "
+                "— missing evidence: %s",
+                build_id,
+                terminal,
+                "; ".join(missing),
+            )
+        return manifest_path
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
             "autobuild_runner: failure manifest NOT written for %s (%s: %s) — "
@@ -2286,6 +2361,80 @@ def _write_failure_manifest(
             type(exc).__name__,
             exc,
         )
+        return None
+
+
+def _pack_evidence(
+    *,
+    build_id: str,
+    worktree_path: Path | None,
+    receipts: "ReceiptExport | None",
+    exit_code: int | None,
+    stdout_log: Path | None,
+    semantic_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Enumerate what this pack actually holds — and what it does not.
+
+    The fix-and-re-verify law feeds on evidence, so a pack that quietly
+    carries nothing is worse than no pack: it looks like a complete record
+    of a failure nobody can reproduce. This block is the pack's own honest
+    inventory. ``missing`` names, in plain language, each item this
+    particular pack does not carry — the caller logs it at WARNING, so a
+    thin pack is visible from the log alone. ``not_observable`` is the
+    separate, permanent list of evidence forge structurally cannot collect
+    (:data:`_UNAVAILABLE_EVIDENCE`); keeping the two apart is what stops a
+    COMPLETE pack from being reported as thin every time.
+
+    Pure inspection of paths already resolved; never raises.
+    """
+    log_path = stdout_log if stdout_log is not None else _stdout_log_path(build_id)
+    try:
+        log_present = log_path is not None and log_path.is_file()
+    except OSError:  # pragma: no cover — unreadable receipts root
+        log_present = False
+    try:
+        worktree_kept = worktree_path is not None and worktree_path.is_dir()
+    except OSError:  # pragma: no cover — unreadable worktree parent
+        worktree_kept = False
+    families = list(receipts.exported) if receipts is not None else []
+
+    missing: list[str] = []
+    if not log_present:
+        missing.append(
+            "autobuild-stdout.log — the guardkit narrative (the build "
+            "printed nothing, or it never ran)"
+        )
+    if not worktree_kept:
+        missing.append(
+            "worktree — the failed tree is not on disk, so the exact "
+            "sources cannot be re-read"
+        )
+    if not families:
+        missing.append(
+            "receipt families — no coach verdict, evidence dossier, "
+            "qav-shadow queue or dcl-capture corpus landed in this pack"
+        )
+    if semantic_state is None:
+        missing.append(
+            "semantic_state_at_kill — no build monitor reading, so there "
+            "is no named task/turn/phase at the moment of failure"
+        )
+    return {
+        "stdout_log": str(log_path) if log_present and log_path else None,
+        "worktree_kept": worktree_kept,
+        "receipt_families": families,
+        "subprocess_ran": exit_code is not None,
+        "missing": missing,
+        "not_observable": [_UNAVAILABLE_EVIDENCE],
+    }
+
+
+def _stdout_log_path(build_id: str) -> Path | None:
+    """``<receipts>/<build_id>/autobuild-stdout.log``, or ``None``."""
+    try:
+        return _receipts_root() / build_id / STDOUT_LOG_NAME
+    except OSError:  # pragma: no cover — unresolvable receipts root
+        return None
 
 
 @dataclass(frozen=True)
@@ -3018,6 +3167,8 @@ def _build_failed_snapshot(
     reason: str,
     budget_cap_killed: bool = False,
     task_counts: build_monitor.TaskCounts | None = None,
+    failure_pack: Path | None = None,
+    worktree_path: Path | None = None,
 ) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
@@ -3061,6 +3212,16 @@ def _build_failed_snapshot(
             2. When ``None`` (every pre-subprocess validation failure — no
             build ran, so there is nothing to attribute) the historical
             ``0 completed / 1 failed`` shape is preserved byte-for-byte.
+        failure_pack: The manifest path when THIS call site already wrote
+            the build's failure pack (the subprocess-failure path). It
+            rides the snapshot as the flat ``failure_pack`` marker so the
+            FAILED terminal (:func:`_node_failed`) knows the debt is
+            settled and leaves the richer pack — wedge state, resume
+            block, receipts — exactly as written. ``None`` means "no pack
+            yet": the terminal writes one.
+        worktree_path: The build's worktree when one was materialised,
+            so the terminal can export its receipts before writing the
+            pack. Rides the snapshot as the flat ``worktree_path`` marker.
 
     Returns:
         A snapshot dict suitable for :func:`_snapshot_update`.
@@ -3086,6 +3247,10 @@ def _build_failed_snapshot(
         snapshot["budget_cap_killed"] = True
     if task_counts is not None:
         snapshot["tasks_completed_source"] = task_counts.source
+    if failure_pack is not None:
+        snapshot["failure_pack"] = str(failure_pack)
+    if worktree_path is not None:
+        snapshot["worktree_path"] = str(worktree_path)
     return snapshot
 
 
@@ -3328,6 +3493,9 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                     f"failed to spawn guardkit subprocess: {exc!r}",
                     worktree_path,
                 ),
+                # No pack yet — the FAILED terminal writes it, and needs the
+                # kept tree to export whatever receipts it holds.
+                worktree_path=worktree_path,
             )
         )
 
@@ -3590,7 +3758,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         receipts_result: ReceiptExport | None = None
         if worktree_path is not None:
             receipts_result = _export_receipts(worktree_path, receipt_build_id)
-        _write_failure_manifest(
+        manifest_path = _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,
             reason=reason,
@@ -3605,12 +3773,19 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             ),
             resume=relaunch.to_manifest(),
             task_counts=task_counts,
+            terminal=TERMINAL_RUNNING_WAVE,
+            stdout_log=stdout_tee.path,
         )
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,
                 reason=_with_worktree_forensics(reason, worktree_path),
                 task_counts=task_counts,
+                # The debt is settled here (or honestly not, when the write
+                # failed): the FAILED terminal reads this marker and never
+                # overwrites the richer pack this path just wrote.
+                failure_pack=manifest_path,
+                worktree_path=worktree_path,
                 # Rich's 2026-07-30 ruling: a budget-cap KILL arms the D659
                 # breach gate. Only the budget-bound timeout qualifies — an
                 # env-default timeout or a plain non-zero exit is NOT a
@@ -3747,6 +3922,114 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
     return _snapshot_update(snapshot)
 
 
+def _write_terminal_failure_pack(
+    payload: Mapping[str, Any],
+    existing: Mapping[str, Any],
+    *,
+    terminal: str,
+) -> Path | None:
+    """Settle the FAILED terminal's failure-pack debt (2026-08-07 lane).
+
+    THE RESIDUE THIS CLOSES. Before this lane exactly ONE failure path
+    left a durable pack: the one where the guardkit subprocess actually
+    ran and then failed, timed out or was killed by the build monitor
+    (:func:`_node_running_wave`'s subprocess branch). Every OTHER route to
+    the FAILED terminal — a missing ``feature_id``, an unresolvable repo,
+    a missing guardkit binary, a branch that does not exist locally, a
+    prior-build residue sweep that refused, a worktree that would not
+    materialise, a subprocess that would not spawn, and the two
+    structural loud-no-op guards — wrote NOTHING under the receipts root.
+    The fix-and-re-verify law feeds on evidence; for that whole class of
+    ordinary failures there was no plate to eat from, only a reason string
+    on the wire.
+
+    ONE MECHANISM, never a second. This does not write a pack of its own
+    shape: it calls the SAME :func:`_write_failure_manifest` the wedge
+    kill calls, into the SAME ``<receipts_root>/<build_id>/`` directory,
+    with the SAME hardening and the SAME archive-the-prior-manifest rule.
+    A second writer would be a second statement of the pack rule, and a
+    second statement of a rule is a future lie.
+
+    EXPORT FIRST. When the failed build left a worktree on disk, its
+    receipt families are copied out BEFORE the manifest is written, so the
+    manifest indexes a pack that already exists rather than promising one.
+
+    THE WEDGE PATH IS UNTOUCHED. ``existing["failure_pack"]`` is the
+    marker :func:`_build_failed_snapshot` stamps when the subprocess
+    branch already wrote the richer pack (wedge verdict, semantic state,
+    resume block, task counts). When it is present this returns
+    immediately: the terminal never overwrites, never archives aside, and
+    never thins that pack.
+
+    NEVER FATAL. Everything here is wrapped: a pack that cannot be written
+    logs a WARNING and the build still fails exactly as it failed. A
+    failure-pack failure masking the build failure would be the worse
+    defect of the two.
+
+    Args:
+        payload: The parsed launch payload.
+        existing: The failed snapshot already on the ``async_tasks``
+            channel — the source of the reason, the worktree marker and
+            the already-written-pack marker.
+        terminal: Which terminal is writing (see
+            :data:`TERMINAL_FAILED_NODE` and its siblings).
+
+    Returns:
+        The manifest path, or ``None`` when nothing was written (debt
+        already settled, or the write failed).
+    """
+    try:
+        if existing.get("failure_pack"):
+            return None
+        feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
+        raw_worktree = existing.get("worktree_path")
+        worktree_path = (
+            Path(str(raw_worktree))
+            if isinstance(raw_worktree, str) and raw_worktree
+            else None
+        )
+        build_id = _resolve_receipt_build_id(payload, worktree_path, feature_id)
+        reason = str(
+            existing.get("error_message")
+            or f"{feature_id} reached the failed terminal without a reason"
+        )
+        # Export first: the manifest must index a pack that is already on
+        # disk, never promise one it did not write.
+        receipts: ReceiptExport | None = None
+        if worktree_path is not None and worktree_path.is_dir():
+            receipts = _export_receipts(worktree_path, build_id)
+        return _write_failure_manifest(
+            build_id=build_id,
+            payload=payload,
+            reason=reason,
+            timed_out=False,
+            # The subprocess never ran (or never reported) on any route
+            # that reaches here: `null` is the honest answer, and the
+            # pack's `evidence.subprocess_ran` says so in words.
+            exit_code=None,
+            worktree_path=worktree_path,
+            branch=(
+                str(payload.get("branch"))
+                if isinstance(payload.get("branch"), str) and payload.get("branch")
+                else None
+            ),
+            receipts=receipts,
+            wedged=False,
+            terminal=terminal,
+        )
+    except Exception as exc:  # noqa: BLE001 — a pack must never mask the failure
+        logger.warning(
+            "autobuild_runner: FAILED-terminal failure pack NOT written "
+            "(terminal=%s, feature_id=%s, %s: %s) — the build's failure "
+            "stands exactly as it was",
+            terminal,
+            payload.get("feature_id"),
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
     """Terminal ``failed`` node (TASK-ABW-001).
 
@@ -3757,6 +4040,12 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
     already ``failed`` from :func:`_node_running_wave`'s return value,
     so this node simply ensures the channel carries a terminal-shaped
     snapshot with ``tasks_failed >= 1``.
+
+    Since the 2026-08-07 FAILED-terminal lane it also settles the build's
+    failure-pack debt (:func:`_write_terminal_failure_pack`): every route
+    that reaches this node now leaves a durable pack under the receipts
+    root, not only the route whose subprocess ran. The write is
+    best-effort and cannot change the terminal.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     # Preserve any tasks_failed already on the channel; default to 1 so
@@ -3793,6 +4082,19 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
     # terminal must say WHERE its task counts came from.
     if existing.get("tasks_completed_source"):
         snapshot["tasks_completed_source"] = existing["tasks_completed_source"]
+    # The FAILED terminal's own pack. Written AFTER the snapshot is built so
+    # nothing about the terminal depends on it; the marker rides forward so a
+    # later replay of this snapshot never mints a second pack.
+    manifest_path = _write_terminal_failure_pack(
+        payload, existing, terminal=TERMINAL_FAILED_NODE
+    )
+    pack_marker = existing.get("failure_pack") or (
+        str(manifest_path) if manifest_path is not None else None
+    )
+    if pack_marker:
+        snapshot["failure_pack"] = pack_marker
+    if existing.get("worktree_path"):
+        snapshot["worktree_path"] = existing["worktree_path"]
     return _snapshot_update(snapshot)
 
 
@@ -3810,6 +4112,11 @@ def _node_finalize(state: AutobuildRunnerState) -> dict[str, Any]:
     rather than letting the graph end clean. The check is centralised here (not
     scattered per node) so it holds regardless of payload shape or any future
     node body.
+
+    A forced failure here is a FAILED terminal like any other, so since the
+    2026-08-07 lane it leaves a failure pack too — through the same one
+    writer. The honest-terminal branch returns early and writes nothing:
+    ``_node_failed`` has already settled that build's pack.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     feature_id = str(payload.get("feature_id") or "FEAT-UNKNOWN")
@@ -3829,17 +4136,25 @@ def _node_finalize(state: AutobuildRunnerState) -> dict[str, Any]:
         feature_id,
         lifecycle,
     )
-    return _snapshot_update(
-        _build_failed_snapshot(
-            payload,
-            reason=(
-                "autobuild_runner ended without reaching a terminal lifecycle "
-                f"(observed lifecycle={lifecycle!r}); forced failure by the "
-                "DEFECT #18b silent-no-op guard so the run fails LOUD instead "
-                "of ending 'success' silently"
-            ),
-        )
+    forced = _build_failed_snapshot(
+        payload,
+        reason=(
+            "autobuild_runner ended without reaching a terminal lifecycle "
+            f"(observed lifecycle={lifecycle!r}); forced failure by the "
+            "DEFECT #18b silent-no-op guard so the run fails LOUD instead "
+            "of ending 'success' silently"
+        ),
     )
+    # The forced reason is the honest one; anything the stalled snapshot
+    # already knew (a kept worktree, a pack written earlier) rides with it.
+    carried = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+    carried.update(forced)
+    manifest_path = _write_terminal_failure_pack(
+        payload, carried, terminal=TERMINAL_FINALIZE_GUARD
+    )
+    if manifest_path is not None:
+        forced["failure_pack"] = str(manifest_path)
+    return _snapshot_update(forced)
 
 
 def _route_after_running_wave(state: AutobuildRunnerState) -> str:
@@ -3963,6 +4278,13 @@ def _node_graph_construction_failed(state: AutobuildRunnerState) -> dict[str, An
     :data:`_RUNNER_GRAPH_CONSTRUCTION_ERROR`. The bridge translator publishes
     that reason on ``pipeline.build-failed.<feature_id>`` so the failure is
     visible on the wire, not inferred from a truncated stream.
+
+    This is a FAILED terminal too, so it leaves a pack through the same one
+    writer (2026-08-07 lane). The pack is necessarily thin — no build ran,
+    so there is no stdout, no worktree and no receipt family — and its
+    ``evidence.missing`` list says exactly that, which is the point: a
+    diagnoser reading the receipts root learns "the sidecar could not build
+    its graph" instead of finding nothing at all.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     exc = _RUNNER_GRAPH_CONSTRUCTION_ERROR
@@ -3974,7 +4296,13 @@ def _node_graph_construction_failed(state: AutobuildRunnerState) -> dict[str, An
         payload.get("feature_id"),
         exc,
     )
-    return _snapshot_update(_build_failed_snapshot(payload, reason=reason))
+    snapshot = _build_failed_snapshot(payload, reason=reason)
+    manifest_path = _write_terminal_failure_pack(
+        payload, snapshot, terminal=TERMINAL_GRAPH_CONSTRUCTION
+    )
+    if manifest_path is not None:
+        snapshot["failure_pack"] = str(manifest_path)
+    return _snapshot_update(snapshot)
 
 
 def _build_placeholder_graph() -> Any:
