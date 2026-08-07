@@ -1545,3 +1545,203 @@ class TestTheClassSurvivesTheFailedTerminal:
         }
         refreshed = ar._node_failed(state)["async_tasks"][FEATURE_ID]  # type: ignore[arg-type]
         assert "terminal_class" not in refreshed
+
+
+# ---------------------------------------------------------------------------
+# THE IN-FLIGHT STAGE ROW (design §h stage 1) — published mid-build, gone after
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightHeartbeatLifecycle:
+    """The runner publishes the monitor's state WHILE the build runs.
+
+    ``tests/forge/test_build_monitor.py`` proves the payload and the write as
+    units. What this class proves is the lifecycle the runner owns: the file
+    exists while the subprocess is alive, it is gone the moment the build
+    reaches a terminal, and a build running without the monitor writes nothing
+    at all.
+
+    Existence is captured at the CLEAR call rather than by racing the loop from
+    the test: that is the last instant the file is legitimately there, so a
+    False reading is unambiguous evidence it was never published.
+    """
+
+    @staticmethod
+    def _watch_the_clear(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        """Record whether the heartbeat existed when the terminal cleared it."""
+        seen: dict[str, Any] = {"existed": None, "path": None, "payload": None}
+        real_clear = bm.clear_in_flight
+
+        def _recording_clear(path: Path) -> None:
+            seen["path"] = Path(path)
+            seen["existed"] = Path(path).exists()
+            if seen["existed"]:
+                seen["payload"] = json.loads(Path(path).read_text(encoding="utf-8"))
+            real_clear(path)
+
+        monkeypatch.setattr(ar.build_monitor, "clear_in_flight", _recording_clear)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_a_running_build_publishes_its_stage_and_the_terminal_clears_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree,
+            statuses={
+                "TASK-BMW-001": "completed",
+                "TASK-BMW-002": "completed",
+                "TASK-BMW-003": "in_progress",
+            },
+            tasks_completed=2,
+            current_wave=2,
+        )
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc(
+            [
+                b"Starting Wave Execution (task timeout: 40 min)\n",
+                b"Wave 2/2: TASK-BMW-003\n",
+                b"\xe2\x96\xb6 Executing TASK-BMW-003: the live one\n",
+                b"INFO:guardkit.orchestrator.progress:[t] Completed turn 4: "
+                b"feedback - still red\n",
+            ]
+        )
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.2)  # ~20 poll ticks at the 0.01s cadence
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "running_wave"
+        expected = tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME
+        assert seen["path"] == expected, (
+            "the heartbeat must live in the pack directory the tee already owns"
+        )
+        assert seen["existed"] is True, (
+            "a RUNNING build published nothing — the STAGE cell would still "
+            "read '—', which is the defect this lane closes"
+        )
+        assert seen["payload"]["build_id"] == BUILD_ID
+        assert seen["payload"]["feature_id"] == FEATURE_ID
+        assert seen["payload"]["last_task_id"] == "TASK-BMW-003"
+        assert seen["payload"]["last_turn"] == 4
+        assert seen["payload"]["current_wave"] == 2
+        assert not expected.exists(), (
+            "a heartbeat that outlives its build claims a liveness nobody has"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_heartbeat_appears_before_the_first_poll_tick(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At the 60s production cadence, waiting for tick one would leave the
+        operator staring at ``—`` for exactly the minute they look."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0)
+        monkeypatch.setenv(bm.BUILD_MONITOR_POLL_ENV, "3600")  # tick one never lands
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([b"Starting Wave Execution (task timeout: 40 min)\n"])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.1)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+        await finisher
+
+        assert seen["existed"] is True
+        assert seen["payload"]["feature_id"] == FEATURE_ID
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_build_leaves_no_heartbeat_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kill path is a terminal like any other."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        _force_wedge(monkeypatch)
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([b"Starting Wave Execution (task timeout: 40 min)\n"])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "failed"
+        assert seen["existed"] is True, "the last live state is worth publishing"
+        assert not (tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_monitor_disabled_build_writes_no_heartbeat_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kill switch turns off the whole lane, publishing included."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "completed"}, tasks_completed=1)
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+        await finisher
+
+        assert seen["existed"] is False
+        assert not (tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_receipts_root_never_regresses_the_build(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A status decoration must never be able to fail a build."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "completed"}, tasks_completed=1)
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(blocked))
+        proc = _LiveFakeProc([])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.1)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        try:
+            result = await _run_node(
+                _launch_state(), proc=proc, worktree=worktree, repo=repo
+            )
+        finally:
+            blocked.chmod(0o700)
+        await finisher
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "running_wave"
+        assert proc.killed is False

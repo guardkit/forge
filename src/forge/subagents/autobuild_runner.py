@@ -101,6 +101,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
 
+from forge import receipts as _receipts
 from forge.subagents import build_monitor
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
@@ -1868,28 +1869,26 @@ async def _materialise_worktree(
     return worktree_path
 
 
-#: Env var naming the durable receipts root (FEAT-DRC). Default rides
-#: ``~/forge-state`` (bind-mounted at ``/var/forge`` in forge-prod, so the
-#: daemon and accrual counters can read ``/var/forge/receipts/<build_id>/``).
-RECEIPTS_DIR_ENV: str = "FORGE_RECEIPTS_DIR"
-DEFAULT_RECEIPTS_DIR: str = "~/forge-state/receipts"
+#: THE RECEIPTS PATH RULES NOW LIVE IN :mod:`forge.receipts` — a stdlib-only
+#: leaf — and are re-exported here so every existing caller, every import and
+#: every test that reaches for ``autobuild_runner.RECEIPTS_DIR_ENV`` keeps
+#: working byte-identically. The split exists because a READ side appeared:
+#: ``forge status`` must resolve the same root to find a running build's
+#: in-flight heartbeat, and it cannot import this module (which imports
+#: langgraph) without dragging the whole graph stack into a SQLite-only CLI.
+#:
+#: :data:`BOUND_STATE_ROOT` stays a MODULE-LEVEL name here on purpose: tests
+#: steer the bound-mount tier by patching this global, and a re-export cannot
+#: carry a patch — so :func:`_receipts_root` reads it at call time and passes
+#: it down. There is still exactly one implementation of the resolution order.
+RECEIPTS_DIR_ENV: str = _receipts.RECEIPTS_DIR_ENV
+DEFAULT_RECEIPTS_DIR: str = _receipts.DEFAULT_RECEIPTS_DIR
+BOUND_STATE_ROOT: Path = _receipts.BOUND_STATE_ROOT
+RECEIPTS_DIRNAME: str = _receipts.RECEIPTS_DIRNAME
 
-#: Where the host's ``~/forge-state`` is bind-mounted inside forge-prod
-#: (``docker run … -v ~/forge-state:/var/forge``, ops/README.md §a). The
-#: mount is NOT same-path, and that asymmetry is the whole defect this
-#: constant closes: the build half of the estate runs host-side, where
-#: ``~/forge-state/receipts`` IS the durable tree, while the daemon runs in
-#: here, where the very same expression resolves to ``/home/forge/...`` —
-#: a directory bound to nothing, wiped with the container. The first
-#: production fix journey exported its receipts there and lost them
-#: (2026-08-03). Path arithmetic plus one cheap ``is_dir()``; the mount is
-#: either present or it is not.
-BOUND_STATE_ROOT: Path = Path("/var/forge")
-
-#: Sub-directory of the durable state root holding the receipts tree. One
-#: spelling, so :data:`DEFAULT_RECEIPTS_DIR` and the bound root below
-#: cannot drift into naming two different directories.
-RECEIPTS_DIRNAME: str = "receipts"
+#: The in-flight heartbeat's filename (design §h stage 1) — see
+#: :data:`forge.receipts.IN_FLIGHT_STATE_NAME`.
+IN_FLIGHT_STATE_NAME: str = _receipts.IN_FLIGHT_STATE_NAME
 
 #: The receipt families exported before the success-path worktree removal
 #: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
@@ -1952,42 +1951,14 @@ def _stdout_run_header(payload: Mapping[str, Any], feature_id: str) -> str:
 def _receipts_root() -> Path:
     """Resolve the durable receipts root (FEAT-DRC / FEAT-DRF).
 
-    Resolution order, first wins:
-
-    1. ``$FORGE_RECEIPTS_DIR`` — the estate's configured knob. Unchanged,
-       and still the only thing an operator has to set to move the tree.
-    2. :data:`BOUND_STATE_ROOT` ``/receipts``, when that mount is present.
-       This is the arm added 2026-08-03. Inside forge-prod the host's
-       ``~/forge-state`` is bound at ``/var/forge``, NOT same-path, so
-       ``~`` here names a container-local directory that dies with the
-       container — which is exactly where the first production fix
-       journey's receipts went. When the mount is there, it is the durable
-       tree by definition, and a home-derived default would be a lie about
-       a path that exists.
-    3. ``~/forge-state/receipts`` — the host-side default, which is right
-       for every process that runs outside the container (the build half)
-       and for local development.
-
-    One ``is_dir()`` and otherwise path arithmetic; never raises (a
-    home-less environment falls back to the literal default).
+    The resolution order — env knob, then the ``/var/forge`` bind mount, then
+    ``~/forge-state/receipts`` — is documented and implemented ONCE, in
+    :func:`forge.receipts.receipts_root`. This is the runner's door onto it,
+    kept so every existing caller and every test that patches
+    :data:`BOUND_STATE_ROOT` on THIS module keeps working unchanged: the global
+    is read here, at call time, and handed down.
     """
-    raw = os.environ.get(RECEIPTS_DIR_ENV)
-    if raw and raw.strip():
-        try:
-            return Path(raw).expanduser()
-        except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
-            return Path(raw)
-
-    try:
-        if BOUND_STATE_ROOT.is_dir():
-            return BOUND_STATE_ROOT / RECEIPTS_DIRNAME
-    except OSError:  # pragma: no cover — an unreadable mount point
-        pass
-
-    try:
-        return Path(DEFAULT_RECEIPTS_DIR).expanduser()
-    except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
-        return Path(DEFAULT_RECEIPTS_DIR)
+    return _receipts.receipts_root(bound_state_root=BOUND_STATE_ROOT)
 
 
 def _harden_pack_permissions(root: Path) -> None:
@@ -3708,10 +3679,20 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
     # handle is created lazily on the first line) so a build that prints
     # nothing leaves no empty file.
+    receipt_pack_dir = _receipts_root() / receipt_build_id
     stdout_tee = _StdoutTee(
-        _receipts_root() / receipt_build_id / STDOUT_LOG_NAME,
+        receipt_pack_dir / STDOUT_LOG_NAME,
         run_header=_stdout_run_header(payload, feature_id),
     )
+    # THE IN-FLIGHT STAGE ROW (design §h stage 1, 2026-08-07). ``forge status``
+    # showed ``—`` in the STAGE cell for every RUNNING build: the monitor
+    # derived the answer on every poll and threw it away, keeping it only for
+    # the failure pack at exit. The heartbeat is that same state, published
+    # each tick into the pack directory the tee already owns — same path
+    # arithmetic, same permissions, no schema change, no new wire envelope and
+    # no new process. Removed at the terminal (below), so it can never describe
+    # a build that has stopped.
+    in_flight_path = receipt_pack_dir / IN_FLIGHT_STATE_NAME
 
     # THE BUILD MONITOR — semantic liveness over the stream this loop already
     # drains, plus the build's own on-disk ledger. Rooted at the build's cwd so
@@ -3774,6 +3755,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         if monitor is None:
             return
         interval = monitor.poll_interval_seconds
+        # One heartbeat BEFORE the first sleep, so a build is visible in
+        # ``forge status`` from its first second rather than from its first
+        # poll tick — at the 60s default cadence, waiting would leave the
+        # operator staring at ``—`` for exactly the minute they are most likely
+        # to look. The state it names is thin at t=0 ("task=unknown"), and thin
+        # is the honest report of a build that has not said anything yet.
+        monitor.write_in_flight(in_flight_path, build_id=receipt_build_id)
         while proc.returncode is None:
             await asyncio.sleep(interval)
             if proc.returncode is not None:
@@ -3789,6 +3777,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                     exc,
                 )
                 continue
+            # Republish AFTER the poll, so the heartbeat carries the state the
+            # verdict was formed on. Wedged or not: a build about to be killed
+            # is still a build whose last live state an operator wants to see.
+            monitor.write_in_flight(in_flight_path, build_id=receipt_build_id)
             if not verdict.wedged:
                 continue
             wedge_verdict = verdict
@@ -3906,6 +3898,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             if not watch_task.done():
                 watch_task.cancel()
             await asyncio.gather(watch_task, return_exceptions=True)
+        # The heartbeat dies with the build it describes. Inside the ``finally``
+        # so it runs on EVERY exit — success, wedge, timeout and the FEAT-FCT
+        # interrupt that re-raises — because an in-flight file that outlives
+        # its build is the pipeline claiming a liveness it no longer has. The
+        # reader's staleness fence would eventually catch it; this means it
+        # never has to. Never raises (see build_monitor.clear_in_flight).
+        build_monitor.clear_in_flight(in_flight_path)
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 

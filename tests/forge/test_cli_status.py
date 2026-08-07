@@ -1073,3 +1073,319 @@ class TestTerminalClassColumn:
         result = CliRunner().invoke(status_cmd, ["--db-path", str(legacy)])
         assert result.exit_code == 0, result.output
         assert "FEAT-LEGACY" in result.output
+
+
+# ---------------------------------------------------------------------------
+# THE IN-FLIGHT STAGE ROW (design §h stage 1) — the STAGE cell speaks
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightStageCell:
+    """The STAGE cell was ``—`` for every running build.
+
+    The one question an operator asks of a running build — what is it doing
+    right now? — was the one the table could not answer. It is now filled from
+    the build monitor's heartbeat, under three rules these tests hold to:
+    absent reads exactly as before, stale never reads as live, and a terminal
+    row never consults the file at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fenced_receipts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge import receipts as forge_receipts
+
+        monkeypatch.setenv(
+            forge_receipts.RECEIPTS_DIR_ENV, str(tmp_path / "receipts")
+        )
+        monkeypatch.delenv("FORGE_BUILD_MONITOR_POLL_SECONDS", raising=False)
+
+    def _running_build(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        *,
+        feature_id: str = "FEAT-LIVE",
+    ) -> str:
+        return _seed_build(
+            persistence,
+            feature_id=feature_id,
+            correlation_id=f"corr-{feature_id}",
+            target_state=BuildState.RUNNING,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+
+    @staticmethod
+    def _seed_heartbeat(
+        tmp_path: Path,
+        build_id: str,
+        *,
+        age_seconds: float = 0.0,
+        **overrides: Any,
+    ) -> Path:
+        from forge import receipts as forge_receipts
+
+        payload: dict[str, Any] = {
+            "build_id": build_id,
+            "feature_id": "FEAT-LIVE",
+            "updated_at": (
+                datetime.now(UTC) - timedelta(seconds=age_seconds)
+            ).isoformat(),
+            "description": "task=TASK-LIVE-007 turn=4",
+            "last_task_id": "TASK-LIVE-007",
+            "last_turn": 4,
+            "last_decision": "feedback",
+            "last_wave": 2,
+            "tasks_completed": 1,
+            "tasks_failed": 0,
+            "current_wave": 2,
+            "window_seconds": 3120.0,
+            "window_source": "wave-execution-banner",
+        }
+        payload.update(overrides)
+        path = (
+            tmp_path
+            / "receipts"
+            / build_id
+            / forge_receipts.IN_FLIGHT_STATE_NAME
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    # -- the cell renderer, as a unit -------------------------------------
+
+    def test_the_cell_names_the_task_the_turn_and_the_wave(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.cli.status import _in_flight_stage_cell
+
+        self._seed_heartbeat(tmp_path, "build-x")
+        payload = json.loads(
+            (tmp_path / "receipts" / "build-x" / "in-flight.json").read_text()
+        )
+        assert _in_flight_stage_cell(payload) == "TASK-LIVE-007 turn 4 wave 2"
+
+    def test_a_build_that_has_not_named_a_task_reads_starting(self) -> None:
+        from forge.cli.status import _in_flight_stage_cell
+
+        cell = _in_flight_stage_cell(
+            {"updated_at": datetime.now(UTC).isoformat(), "last_task_id": None}
+        )
+        assert cell == "starting"
+
+    def test_a_stale_heartbeat_says_so_and_never_reads_as_live(self) -> None:
+        """THE FENCE. A dead sidecar must not leave the table claiming a
+        liveness nobody can see."""
+        from forge.cli.status import _in_flight_stage_cell
+
+        cell = _in_flight_stage_cell(
+            {
+                "updated_at": (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                "last_task_id": "TASK-LIVE-007",
+                "last_turn": 4,
+            }
+        )
+        assert cell.endswith("(stale)")
+
+    def test_an_unstamped_heartbeat_is_stale_by_definition(self) -> None:
+        from forge.cli.status import _in_flight_is_stale
+
+        assert _in_flight_is_stale({}) is True
+        assert _in_flight_is_stale({"updated_at": "not-a-timestamp"}) is True
+        assert _in_flight_is_stale({"updated_at": 1754500000}) is True
+
+    def test_a_naive_timestamp_is_read_as_utc_not_rejected(self) -> None:
+        """The writer always stamps a zone; a hand-edited file might not."""
+        from forge.cli.status import _in_flight_is_stale
+
+        naive = datetime.now(UTC).replace(tzinfo=None).isoformat()
+        assert _in_flight_is_stale({"updated_at": naive}) is False
+
+    # -- the reader --------------------------------------------------------
+
+    def test_an_absent_file_reads_as_absent(self, tmp_path: Path) -> None:
+        from forge.cli.status import _read_in_flight
+
+        assert _read_in_flight("build-nothing-here") is None
+
+    def test_a_malformed_file_reads_as_absent_rather_than_raising(
+        self, tmp_path: Path
+    ) -> None:
+        """A status table must never fail over a decoration."""
+        from forge.cli.status import _read_in_flight
+
+        path = tmp_path / "receipts" / "build-broken" / "in-flight.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{ this is not json", encoding="utf-8")
+        assert _read_in_flight("build-broken") is None
+
+    def test_a_json_scalar_reads_as_absent(self, tmp_path: Path) -> None:
+        from forge.cli.status import _read_in_flight
+
+        path = tmp_path / "receipts" / "build-scalar" / "in-flight.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('"a string"', encoding="utf-8")
+        assert _read_in_flight("build-scalar") is None
+
+    # -- the table ---------------------------------------------------------
+
+    def test_a_running_build_renders_its_live_stage(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        build_id = self._running_build(persistence)
+        self._seed_heartbeat(tmp_path, build_id)
+        result = CliRunner().invoke(
+            status_cmd, ["--db-path", str(db_path)], terminal_width=200
+        )
+        assert result.exit_code == 0, result.output
+        assert "TASK-LIVE-007" in result.output
+        assert "turn 4" in result.output
+
+    def test_with_no_heartbeat_the_cell_is_the_dash_it_always_was(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+    ) -> None:
+        """The byte-identity control for every build that predates this lane."""
+        self._running_build(persistence)
+        result = CliRunner().invoke(
+            status_cmd, ["--db-path", str(db_path)], terminal_width=200
+        )
+        assert result.exit_code == 0, result.output
+        assert "TASK-" not in result.output
+        assert "—" in result.output
+
+    def test_a_stale_heartbeat_renders_stale_in_the_table(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        build_id = self._running_build(persistence)
+        self._seed_heartbeat(tmp_path, build_id, age_seconds=3600)
+        result = CliRunner().invoke(
+            status_cmd, ["--db-path", str(db_path)], terminal_width=200
+        )
+        assert result.exit_code == 0, result.output
+        assert "stale" in result.output
+
+    def test_a_terminal_row_never_consults_the_file(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A stray heartbeat must not resurrect a finished build's stage."""
+        build_id = _seed_build(
+            persistence,
+            feature_id="FEAT-DONE",
+            correlation_id="corr-done",
+            target_state=BuildState.COMPLETE,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        self._seed_heartbeat(tmp_path, build_id)
+        result = CliRunner().invoke(
+            status_cmd, ["--db-path", str(db_path)], terminal_width=200
+        )
+        assert result.exit_code == 0, result.output
+        assert "TASK-LIVE-007" not in result.output
+
+    def test_a_completed_stage_log_entry_still_wins_under_full(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A recorded stage is a fact; a heartbeat must not overwrite one."""
+        build_id = self._running_build(persistence)
+        _seed_stage_log(
+            persistence,
+            build_id=build_id,
+            count=1,
+            base_time=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        self._seed_heartbeat(tmp_path, build_id)
+        result = CliRunner().invoke(
+            status_cmd, ["--full", "--db-path", str(db_path)], terminal_width=200
+        )
+        assert result.exit_code == 0, result.output
+        assert "stage-00" in result.output
+        assert "TASK-LIVE-007" not in result.output
+
+    # -- --json ------------------------------------------------------------
+
+    def test_json_carries_the_heartbeat_with_an_explicit_stale_flag(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        build_id = self._running_build(persistence)
+        self._seed_heartbeat(tmp_path, build_id)
+        result = CliRunner().invoke(
+            status_cmd, ["--json", "--db-path", str(db_path)]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)
+        assert rows[0]["in_flight"]["last_task_id"] == "TASK-LIVE-007"
+        # An explicit flag, so a machine consumer never has to parse an
+        # adjective out of a rendered string.
+        assert rows[0]["in_flight"]["stale"] is False
+        # ``in_flight`` sits BESIDE the model's own fields, exactly as
+        # ``--full``'s ``stages`` key already does: strip it and the row is
+        # still a whole BuildStatusView, unchanged in every field.
+        row = {k: v for k, v in rows[0].items() if k != "in_flight"}
+        assert BuildStatusView.model_validate(row).status is BuildState.RUNNING
+
+    def test_json_is_byte_identical_when_there_is_no_heartbeat(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+    ) -> None:
+        """Strictly additive: no heartbeat, no key."""
+        self._running_build(persistence)
+        result = CliRunner().invoke(
+            status_cmd, ["--json", "--db-path", str(db_path)]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)
+        assert "in_flight" not in rows[0]
+
+    def test_json_never_attaches_a_heartbeat_to_a_terminal_row(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        build_id = _seed_build(
+            persistence,
+            feature_id="FEAT-DONE-JSON",
+            correlation_id="corr-done-json",
+            target_state=BuildState.FAILED,
+            queued_at=datetime(2026, 8, 7, 12, 0, 0, tzinfo=UTC),
+        )
+        self._seed_heartbeat(tmp_path, build_id)
+        result = CliRunner().invoke(
+            status_cmd, ["--json", "--db-path", str(db_path)]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)
+        assert "in_flight" not in rows[0]
+
+    def test_the_staleness_fence_follows_the_configured_poll_cadence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An operator who slows the monitor must not get spurious "stale"."""
+        from forge.cli.status import _in_flight_is_stale
+
+        payload = {
+            "updated_at": (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        }
+        monkeypatch.setenv("FORGE_BUILD_MONITOR_POLL_SECONDS", "60")
+        assert _in_flight_is_stale(payload) is True
+        monkeypatch.setenv("FORGE_BUILD_MONITOR_POLL_SECONDS", "600")
+        assert _in_flight_is_stale(payload) is False
