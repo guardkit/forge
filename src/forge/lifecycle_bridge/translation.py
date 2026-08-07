@@ -216,6 +216,16 @@ class _Snapshot:
     #: the typed payload so the wireup can ARM the TASK-GATE-D659 pre-dispatch
     #: breach gate for the feature's next re-queue.
     budget_cap_killed: bool = False
+    #: WHICH of the five terminal causes killed this build — the runner's flat
+    #: ``terminal_class`` marker (``autobuild_runner._build_failed_snapshot``,
+    #: timeout-truth lane 2026-08-07), one of
+    #: ``forge.subagents.build_monitor.TERMINAL_CLASSES``. ``None`` for every
+    #: non-failed snapshot AND for an ordinary failure — the runner never
+    #: stamps the ``error`` class, so its absence is its value.
+    #: :meth:`StreamEventTranslator._build_failed` threads it onto the typed
+    #: payload the same post-construction way ``budget_cap_killed`` rides, so
+    #: ``model_dump`` output — the wire bytes — is unchanged.
+    terminal_class: str | None = None
 
 
 def _extract_error_metadata(
@@ -310,6 +320,11 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
             error_class=error_class,
             error_message=error_message,
             budget_cap_killed=bool(snap.get("budget_cap_killed", False)),
+            terminal_class=(
+                str(snap["terminal_class"])
+                if snap.get("terminal_class") is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.debug(
@@ -615,6 +630,17 @@ class StreamEventTranslator:
             # pre-dispatch gate. Readers use
             # ``getattr(payload, "budget_cap_killed", False)``.
             object.__setattr__(payload, "budget_cap_killed", True)
+        if snap.terminal_class:
+            # Timeout truth (2026-08-07) — the same post-construction
+            # attachment: ``model_dump`` is untouched, so the v1 wire bytes
+            # of ``pipeline.build-failed`` are byte-identical to what they
+            # were, and the wireup reads it with
+            # ``getattr(payload, "terminal_class", None)`` to land the
+            # durable ``builds.terminal_class``. An ordinary failure never
+            # reaches this branch (the runner does not stamp ``error``), so
+            # the overwhelming majority of failed builds pass through
+            # untouched.
+            object.__setattr__(payload, "terminal_class", snap.terminal_class)
         return payload
 
     def _build_cancelled(

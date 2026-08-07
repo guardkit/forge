@@ -39,12 +39,17 @@ from typing import Final
 # score survives the run for the ``min_coach_score`` budget floor; bumped to 7
 # in FEAT-UBS-002 stage 2 (DETECT) to add the additive ``builds.budget_breach``
 # column — the serve-daemon observer's HONEST record of a mid-run budget cap
-# breach (first-write-wins; never a status change). Future
+# breach (first-write-wins; never a status change); bumped to 9 in the
+# monitored-supervision lane (timeout truth) to add the additive
+# ``builds.terminal_class`` column, which tells a MONITOR kill, a BUDGET-cap
+# kill, a WALL-CLOCK expiry and a guardkit IN-BAND timeout apart from an
+# ordinary broken build — all four of which ``status`` still spells FAILED.
+# Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 8
+_SCHEMA_VERSION: Final[int] = 9
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -59,6 +64,12 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # it, so a fix-journey dispatch had no subject to name and the
     # subprocess dispatcher refused it.
     (8, "schema_v8.sql"),
+    # v9 (monitored-supervision, timeout truth) — the additive
+    # ``builds.terminal_class`` column: WHICH of the five deaths a FAILED
+    # build actually died. ``status`` still reads FAILED for all five; the
+    # distinction rides beside it, NULL-able, and an ordinary failure never
+    # writes it.
+    (9, "schema_v9.sql"),
 )
 
 

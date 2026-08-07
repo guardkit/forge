@@ -101,6 +101,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
 
+from forge import receipts as _receipts
 from forge.subagents import build_monitor
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
@@ -1161,6 +1162,25 @@ FORGE_AUTOBUILD_TIMEOUT_ENV: str = "FORGE_AUTOBUILD_TIMEOUT_SECONDS"
 #: arms the D659 breach gate.
 DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 86400
 
+#: How long the ORDINARY-TIMEOUT path may spend reading the subprocess's last
+#: words after the kill, in seconds (TAIL LOSS, 2026-08-07).
+#:
+#: The wedge path has always kept the tail for free: the monitor kills the
+#: process and simply returns, so the drain loop reaches EOF and reads every
+#: buffered line before closing. The wall-clock/budget-cap path did not:
+#: ``asyncio.wait_for`` CANCELS the drain first and kills second, so whatever
+#: was sitting in the pipe buffer at the cancel — on a dying build, exactly the
+#: last guardkit output, tracebacks and its own ``TIMEOUT`` announcement — was
+#: never read, never teed and never seen by the monitor. This budget bounds the
+#: bounded post-kill read that closes that gap.
+#:
+#: Named rather than folklore, and deliberately small: the process is already
+#: reaped when the read starts, so ``readline()`` returns buffered bytes and
+#: then EOF. The budget only ever matters when the kill itself did not take
+#: (the leaked-pid branch below), and in that case it expires into one WARNING
+#: and changes nothing about the build's outcome.
+TAIL_READ_BUDGET_SECONDS: float = 5.0
+
 #: Default base directory for repo checkouts when
 #: :data:`FORGE_REPO_BASE_ENV` is unset. Resolved at call time via
 #: :meth:`Path.expanduser` so a different ``$HOME`` in the sidecar still
@@ -1849,28 +1869,26 @@ async def _materialise_worktree(
     return worktree_path
 
 
-#: Env var naming the durable receipts root (FEAT-DRC). Default rides
-#: ``~/forge-state`` (bind-mounted at ``/var/forge`` in forge-prod, so the
-#: daemon and accrual counters can read ``/var/forge/receipts/<build_id>/``).
-RECEIPTS_DIR_ENV: str = "FORGE_RECEIPTS_DIR"
-DEFAULT_RECEIPTS_DIR: str = "~/forge-state/receipts"
+#: THE RECEIPTS PATH RULES NOW LIVE IN :mod:`forge.receipts` — a stdlib-only
+#: leaf — and are re-exported here so every existing caller, every import and
+#: every test that reaches for ``autobuild_runner.RECEIPTS_DIR_ENV`` keeps
+#: working byte-identically. The split exists because a READ side appeared:
+#: ``forge status`` must resolve the same root to find a running build's
+#: in-flight heartbeat, and it cannot import this module (which imports
+#: langgraph) without dragging the whole graph stack into a SQLite-only CLI.
+#:
+#: :data:`BOUND_STATE_ROOT` stays a MODULE-LEVEL name here on purpose: tests
+#: steer the bound-mount tier by patching this global, and a re-export cannot
+#: carry a patch — so :func:`_receipts_root` reads it at call time and passes
+#: it down. There is still exactly one implementation of the resolution order.
+RECEIPTS_DIR_ENV: str = _receipts.RECEIPTS_DIR_ENV
+DEFAULT_RECEIPTS_DIR: str = _receipts.DEFAULT_RECEIPTS_DIR
+BOUND_STATE_ROOT: Path = _receipts.BOUND_STATE_ROOT
+RECEIPTS_DIRNAME: str = _receipts.RECEIPTS_DIRNAME
 
-#: Where the host's ``~/forge-state`` is bind-mounted inside forge-prod
-#: (``docker run … -v ~/forge-state:/var/forge``, ops/README.md §a). The
-#: mount is NOT same-path, and that asymmetry is the whole defect this
-#: constant closes: the build half of the estate runs host-side, where
-#: ``~/forge-state/receipts`` IS the durable tree, while the daemon runs in
-#: here, where the very same expression resolves to ``/home/forge/...`` —
-#: a directory bound to nothing, wiped with the container. The first
-#: production fix journey exported its receipts there and lost them
-#: (2026-08-03). Path arithmetic plus one cheap ``is_dir()``; the mount is
-#: either present or it is not.
-BOUND_STATE_ROOT: Path = Path("/var/forge")
-
-#: Sub-directory of the durable state root holding the receipts tree. One
-#: spelling, so :data:`DEFAULT_RECEIPTS_DIR` and the bound root below
-#: cannot drift into naming two different directories.
-RECEIPTS_DIRNAME: str = "receipts"
+#: The in-flight heartbeat's filename (design §h stage 1) — see
+#: :data:`forge.receipts.IN_FLIGHT_STATE_NAME`.
+IN_FLIGHT_STATE_NAME: str = _receipts.IN_FLIGHT_STATE_NAME
 
 #: The receipt families exported before the success-path worktree removal
 #: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
@@ -1933,42 +1951,14 @@ def _stdout_run_header(payload: Mapping[str, Any], feature_id: str) -> str:
 def _receipts_root() -> Path:
     """Resolve the durable receipts root (FEAT-DRC / FEAT-DRF).
 
-    Resolution order, first wins:
-
-    1. ``$FORGE_RECEIPTS_DIR`` — the estate's configured knob. Unchanged,
-       and still the only thing an operator has to set to move the tree.
-    2. :data:`BOUND_STATE_ROOT` ``/receipts``, when that mount is present.
-       This is the arm added 2026-08-03. Inside forge-prod the host's
-       ``~/forge-state`` is bound at ``/var/forge``, NOT same-path, so
-       ``~`` here names a container-local directory that dies with the
-       container — which is exactly where the first production fix
-       journey's receipts went. When the mount is there, it is the durable
-       tree by definition, and a home-derived default would be a lie about
-       a path that exists.
-    3. ``~/forge-state/receipts`` — the host-side default, which is right
-       for every process that runs outside the container (the build half)
-       and for local development.
-
-    One ``is_dir()`` and otherwise path arithmetic; never raises (a
-    home-less environment falls back to the literal default).
+    The resolution order — env knob, then the ``/var/forge`` bind mount, then
+    ``~/forge-state/receipts`` — is documented and implemented ONCE, in
+    :func:`forge.receipts.receipts_root`. This is the runner's door onto it,
+    kept so every existing caller and every test that patches
+    :data:`BOUND_STATE_ROOT` on THIS module keeps working unchanged: the global
+    is read here, at call time, and handed down.
     """
-    raw = os.environ.get(RECEIPTS_DIR_ENV)
-    if raw and raw.strip():
-        try:
-            return Path(raw).expanduser()
-        except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
-            return Path(raw)
-
-    try:
-        if BOUND_STATE_ROOT.is_dir():
-            return BOUND_STATE_ROOT / RECEIPTS_DIRNAME
-    except OSError:  # pragma: no cover — an unreadable mount point
-        pass
-
-    try:
-        return Path(DEFAULT_RECEIPTS_DIR).expanduser()
-    except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
-        return Path(DEFAULT_RECEIPTS_DIR)
+    return _receipts.receipts_root(bound_state_root=BOUND_STATE_ROOT)
 
 
 def _harden_pack_permissions(root: Path) -> None:
@@ -2046,6 +2036,13 @@ class _StdoutTee:
     silent build still leaves no file) — distinct runs are then explicitly
     delimited instead of silently interleaved. A header-less construction
     behaves byte-identically to the pre-finding tee.
+
+    Header LATCHING (TAIL LOSS, 2026-08-07): the header belongs to the TEE, not
+    to each lazy open. Before this, a tee that was closed and then written to
+    again re-emitted the run header in the MIDDLE of its own file, and a reader
+    could not tell that from a second run's segment. The bounded post-kill tail
+    read does exactly that — the drain's ``finally`` closes, then the tail
+    writes — so the latch is load-bearing, not tidiness.
     """
 
     def __init__(self, path: Path, *, run_header: str | None = None) -> None:
@@ -2053,6 +2050,7 @@ class _StdoutTee:
         self._run_header = run_header
         self._handle: TextIO | None = None
         self._disabled = False
+        self._header_written = False
 
     @property
     def path(self) -> Path:
@@ -2072,8 +2070,9 @@ class _StdoutTee:
                     "a", encoding="utf-8", errors="replace", buffering=1
                 )
                 _harden_pack_permissions(self._path.parent)
-                if self._run_header is not None:
+                if self._run_header is not None and not self._header_written:
                     self._handle.write(f"{self._run_header}\n")
+                    self._header_written = True
                 logger.info(
                     "autobuild_runner: teeing subprocess stdout -> %s", self._path
                 )
@@ -2110,6 +2109,94 @@ class _StdoutTee:
                 type(exc).__name__,
                 exc,
             )
+
+
+async def _drain_tail(
+    proc: Any,
+    tee: _StdoutTee,
+    monitor: build_monitor.BuildMonitor | None,
+    *,
+    budget: float = TAIL_READ_BUDGET_SECONDS,
+    feature_id: str = "",
+) -> int:
+    """Read the subprocess's LAST WORDS after an ordinary-timeout kill.
+
+    TAIL LOSS (Sunday handoff §4.4), 2026-08-07. Two kill paths, two very
+    different outcomes, and only one of them was honest:
+
+    * the WEDGE path kills and returns (``_watch_for_wedge``), so the main
+      drain runs on to EOF and reads every buffered line before its ``finally``
+      closes the tee — the tail survives for free;
+    * the ORDINARY-TIMEOUT path (wall clock, or the FEAT-UBS-002 budget cap)
+      goes through ``asyncio.wait_for``, which CANCELS the gathered drain
+      BEFORE the kill. The drain dies inside ``await proc.stdout.readline()``,
+      its ``finally`` closes the tee, and only then is the process killed.
+      Everything in the pipe buffer at that moment was read by nobody. On a
+      dying build that is precisely the interesting part: the last guardkit
+      output, the orchestrator traceback, and guardkit's OWN ``TIMEOUT``
+      announcement — the evidence the terminal-class in-band detection wants.
+
+    This gives the ordinary-timeout path the same bounded post-kill read the
+    wedge path gets by accident, with an explicit budget instead of luck.
+
+    Safe by construction:
+
+    * ``wait_for`` awaits the cancelled gather before raising, so the original
+      drain has FINISHED — there is never a second concurrent reader;
+    * the process is already reaped, so ``readline()`` returns the buffered
+      bytes and then EOF. A kill that did not take means this read simply
+      expires into the WARNING below;
+    * it can never change the outcome. Blanket ``except Exception`` and one
+      WARNING — the standing tee posture (see :class:`_StdoutTee`).
+      ``CancelledError`` is a ``BaseException`` and is deliberately NOT caught,
+      so a FEAT-FCT interrupt still propagates instantly.
+
+    Evidence only: unlike the main drain this does NOT feed
+    ``stage_complete_count`` or the coach-score turns, because both are read on
+    the SUCCESS path alone and this coroutine runs only after a kill.
+
+    Returns the number of tail lines recovered (0 on any fault).
+    """
+    stdout = getattr(proc, "stdout", None)
+    if stdout is None:  # defensive — PIPE was requested at spawn
+        return 0
+    recovered = 0
+
+    async def _read() -> None:
+        nonlocal recovered
+        while True:
+            line = await stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            # The identical treatment every other line gets, in the same
+            # order: liveness first, then the durable narrative.
+            if monitor is not None:
+                monitor.note_stdout_line(decoded)
+            tee.write(decoded)
+            logger.debug("autobuild_runner[stdout-tail]: %s", decoded)
+            recovered += 1
+
+    try:
+        await asyncio.wait_for(_read(), timeout=budget)
+    except Exception as exc:  # noqa: BLE001 — best-effort: never alter a terminal
+        logger.warning(
+            "autobuild_runner: post-kill tail read stopped after %s line(s) "
+            "for feature_id=%s (%s: %s) — the build's terminal is unaffected",
+            recovered,
+            feature_id,
+            type(exc).__name__,
+            exc,
+        )
+        return recovered
+    if recovered:
+        logger.info(
+            "autobuild_runner: recovered %s line(s) of subprocess tail after "
+            "the timeout kill for feature_id=%s — these would have been lost",
+            recovered,
+            feature_id,
+        )
+    return recovered
 
 
 def _archive_prior_manifest(manifest_path: Path) -> None:
@@ -2204,6 +2291,8 @@ def _write_failure_manifest(
     task_counts: build_monitor.TaskCounts | None = None,
     terminal: str = TERMINAL_RUNNING_WAVE,
     stdout_log: Path | None = None,
+    terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
+    terminal_class_evidence: str | None = None,
 ) -> Path | None:
     """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
 
@@ -2252,6 +2341,25 @@ def _write_failure_manifest(
       collect at all. A pre-launch failure has no stdout and no receipts;
       the pack says so out loud instead of looking like an empty success.
 
+    The timeout-truth lane (2026-08-07) adds two more, so the pack itself
+    answers the question a status table could not:
+
+    * ``terminal_class`` — WHICH of the five deaths this was, from
+      :data:`build_monitor.TERMINAL_CLASSES`. Unlike the snapshot and the
+      row (where ``error`` is deliberately absent-by-default), the manifest
+      ALWAYS states it: a pack is a forensic record read by a human, and
+      "no timeout fired, this build is simply broken" is a real answer that
+      is worth writing down.
+    * ``terminal_class_evidence`` — one plain-language sentence saying WHY
+      forge believes that, readable without knowing any of the vocabulary.
+
+    Note the deliberate difference between ``terminal_class`` and the older
+    ``timed_out`` flag beside it: ``timed_out`` keeps its EXACT pre-lane
+    meaning — the runner's own ``asyncio.wait_for`` arm fired — so it is
+    ``False`` for a monitor wedge kill and ``False`` for a guardkit in-band
+    timeout, both of which ``terminal_class`` names correctly. Nothing already
+    reading ``timed_out`` shifts.
+
     ``exit_code`` is ``None`` when the guardkit subprocess never ran (a
     pre-launch refusal). ``null`` on the wire is the honest answer there;
     ``-1`` would read as a signal kill that never happened.
@@ -2276,6 +2384,7 @@ def _write_failure_manifest(
             exit_code=exit_code,
             stdout_log=stdout_log,
             semantic_state=semantic_state,
+            terminal_class=terminal_class,
         )
         missing: list[str] = evidence["missing"]
         manifest = {
@@ -2329,6 +2438,13 @@ def _write_failure_manifest(
             # --- FAILED-terminal lane (2026-08-07) ----------------------
             "terminal": terminal,
             "evidence": evidence,
+            # --- timeout-truth lane (2026-08-07) ------------------------
+            # WHICH death this was, and the one sentence that justifies the
+            # claim. Always written here (unlike the snapshot/row, where
+            # ``error`` is absent-by-default) — a pack is a forensic record,
+            # and "no clock fired at all" is worth stating out loud.
+            "terminal_class": terminal_class,
+            "terminal_class_evidence": terminal_class_evidence,
         }
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -2372,6 +2488,7 @@ def _pack_evidence(
     exit_code: int | None,
     stdout_log: Path | None,
     semantic_state: Mapping[str, Any] | None,
+    terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
 ) -> dict[str, Any]:
     """Enumerate what this pack actually holds — and what it does not.
 
@@ -2424,6 +2541,10 @@ def _pack_evidence(
         "worktree_kept": worktree_kept,
         "receipt_families": families,
         "subprocess_ran": exit_code is not None,
+        # Timeout-truth lane: the inventory names the class too, so even a
+        # THIN pack — one with no stdout, no worktree and no receipts — still
+        # tells its reader whether this build ran out of time or broke.
+        "terminal_class": terminal_class,
         "missing": missing,
         "not_observable": [_UNAVAILABLE_EVIDENCE],
     }
@@ -3204,6 +3325,7 @@ def _build_failed_snapshot(
     task_counts: build_monitor.TaskCounts | None = None,
     failure_pack: Path | None = None,
     worktree_path: Path | None = None,
+    terminal_class: str | None = None,
 ) -> dict[str, Any]:
     """Construct a ``failed`` snapshot carrying a structured reason.
 
@@ -3257,6 +3379,19 @@ def _build_failed_snapshot(
         worktree_path: The build's worktree when one was materialised,
             so the terminal can export its receipts before writing the
             pack. Rides the snapshot as the flat ``worktree_path`` marker.
+        terminal_class: WHICH of the five deaths this was, from
+            :data:`build_monitor.TERMINAL_CLASSES` (timeout-truth lane,
+            2026-08-07). Rides the snapshot as the flat ``terminal_class``
+            marker, on the same shape as ``budget_cap_killed``, so the
+            translator can put it on the wire and the daemon can land it on
+            ``builds.terminal_class``.
+
+            **Stamped only when it says something.**
+            :data:`build_monitor.TERMINAL_CLASS_ERROR` — "the build failed on
+            its own terms", which is the overwhelming majority — is treated
+            exactly like ``None`` and writes NO key. That is what keeps every
+            failure route this lane did not teach anything new emitting a
+            byte-identical snapshot dict.
 
     Returns:
         A snapshot dict suitable for :func:`_snapshot_update`.
@@ -3280,6 +3415,8 @@ def _build_failed_snapshot(
     snapshot["error_message"] = reason
     if budget_cap_killed:
         snapshot["budget_cap_killed"] = True
+    if terminal_class and terminal_class != build_monitor.TERMINAL_CLASS_ERROR:
+        snapshot["terminal_class"] = terminal_class
     if task_counts is not None:
         snapshot["tasks_completed_source"] = task_counts.source
     if failure_pack is not None:
@@ -3542,10 +3679,20 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
     # handle is created lazily on the first line) so a build that prints
     # nothing leaves no empty file.
+    receipt_pack_dir = _receipts_root() / receipt_build_id
     stdout_tee = _StdoutTee(
-        _receipts_root() / receipt_build_id / STDOUT_LOG_NAME,
+        receipt_pack_dir / STDOUT_LOG_NAME,
         run_header=_stdout_run_header(payload, feature_id),
     )
+    # THE IN-FLIGHT STAGE ROW (design §h stage 1, 2026-08-07). ``forge status``
+    # showed ``—`` in the STAGE cell for every RUNNING build: the monitor
+    # derived the answer on every poll and threw it away, keeping it only for
+    # the failure pack at exit. The heartbeat is that same state, published
+    # each tick into the pack directory the tee already owns — same path
+    # arithmetic, same permissions, no schema change, no new wire envelope and
+    # no new process. Removed at the terminal (below), so it can never describe
+    # a build that has stopped.
+    in_flight_path = receipt_pack_dir / IN_FLIGHT_STATE_NAME
 
     # THE BUILD MONITOR — semantic liveness over the stream this loop already
     # drains, plus the build's own on-disk ledger. Rooted at the build's cwd so
@@ -3608,6 +3755,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         if monitor is None:
             return
         interval = monitor.poll_interval_seconds
+        # One heartbeat BEFORE the first sleep, so a build is visible in
+        # ``forge status`` from its first second rather than from its first
+        # poll tick — at the 60s default cadence, waiting would leave the
+        # operator staring at ``—`` for exactly the minute they are most likely
+        # to look. The state it names is thin at t=0 ("task=unknown"), and thin
+        # is the honest report of a build that has not said anything yet.
+        monitor.write_in_flight(in_flight_path, build_id=receipt_build_id)
         while proc.returncode is None:
             await asyncio.sleep(interval)
             if proc.returncode is not None:
@@ -3623,6 +3777,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                     exc,
                 )
                 continue
+            # Republish AFTER the poll, so the heartbeat carries the state the
+            # verdict was formed on. Wedged or not: a build about to be killed
+            # is still a build whose last live state an operator wants to see.
+            monitor.write_in_flight(in_flight_path, build_id=receipt_build_id)
             if not verdict.wedged:
                 continue
             wedge_verdict = verdict
@@ -3680,6 +3838,17 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         raise
     except asyncio.TimeoutError:
         timed_out = True
+        # WHICH DEATH THIS WAS is decided HERE, and nothing after this line may
+        # revise it. Stop the wedge watch first (the ``finally`` below still
+        # retrieves it — cancelling a cancelled task is a no-op). Without this
+        # the watch keeps polling through the kill, the reap and the tail read;
+        # if the kill does not take, ``proc.returncode`` stays None, a poll
+        # lands, and a wall-clock/budget-cap death is stamped WEDGED — a lie
+        # about the cause, and one the terminal class now carries onto the row.
+        # The window was the 5s reap; this lane's tail read would have made it
+        # 10s, so it is closed instead of widened.
+        if watch_task is not None and not watch_task.done():
+            watch_task.cancel()
         logger.warning(
             "autobuild_runner: subprocess timeout after %.1fs feature_id=%s "
             "— killing process",
@@ -3699,6 +3868,24 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 proc.pid,
                 feature_id,
             )
+        # TAIL LOSS (2026-08-07). ``wait_for`` cancelled the drain BEFORE the
+        # kill above, so the drain died mid-``readline()`` and its ``finally``
+        # already closed the tee — every byte still sitting in the pipe was
+        # read by nobody. The wedge path never had this hole (its kill leaves
+        # the drain running to EOF); this gives the ordinary-timeout path the
+        # same bounded post-kill read, explicitly budgeted. It runs AFTER the
+        # reap (so there is no concurrent reader and readline() cannot block on
+        # a live writer) and BEFORE the terminal is classified below, so the
+        # recovered lines actually reach the monitor's semantic state and the
+        # in-band timeout evidence. Best-effort; it cannot alter the outcome.
+        await _drain_tail(
+            proc,
+            stdout_tee,
+            monitor,
+            budget=TAIL_READ_BUDGET_SECONDS,
+            feature_id=feature_id,
+        )
+        stdout_tee.close()
     finally:
         # The subprocess is reaped (or the node is being cancelled): stop the
         # watch AND retrieve it. Cancelling an already-finished task is a
@@ -3711,6 +3898,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             if not watch_task.done():
                 watch_task.cancel()
             await asyncio.gather(watch_task, return_exceptions=True)
+        # The heartbeat dies with the build it describes. Inside the ``finally``
+        # so it runs on EVERY exit — success, wedge, timeout and the FEAT-FCT
+        # interrupt that re-raises — because an in-flight file that outlives
+        # its build is the pipeline claiming a liveness it no longer has. The
+        # reader's staleness fence would eventually catch it; this means it
+        # never has to. Never raises (see build_monitor.clear_in_flight).
+        build_monitor.clear_in_flight(in_flight_path)
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 
@@ -3744,6 +3938,32 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         else:
             reason = f"guardkit autobuild exit={exit_code}"
+
+        # TIMEOUT TRUTH (2026-08-07). The reason strings above are UNCHANGED,
+        # byte for byte — prose is what an operator reads, and rewriting it
+        # would break every consumer that greps it. What was missing is a
+        # MACHINE-READABLE answer to "was this a timeout, and whose?", because
+        # five structurally different deaths all left as ``FAILED``. The class
+        # rides BESIDE the reason, never instead of it.
+        #
+        # The progress read is deliberately module-level rather than
+        # ``monitor.``-anything: a build launched with the monitor disabled
+        # still has a wall clock and still deserves an honest class.
+        terminal_class, terminal_class_evidence = build_monitor.classify_terminal(
+            wedged=wedge_verdict is not None,
+            timed_out=timed_out,
+            budget_bound=budget_bound,
+            exit_code=exit_code,
+            progress=build_monitor.read_task_progress(run_cwd),
+            last_event=build_monitor.read_last_event(run_cwd, feature_id),
+        )
+        if terminal_class != build_monitor.TERMINAL_CLASS_ERROR:
+            logger.warning(
+                "autobuild_runner: feature_id=%s terminal_class=%s — %s",
+                feature_id,
+                terminal_class,
+                terminal_class_evidence,
+            )
 
         # Honest attribution at exit (design §c): the build's own ledger, else
         # the task ids stdout showed STARTING — never a turn count, and never
@@ -3810,6 +4030,8 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             task_counts=task_counts,
             terminal=TERMINAL_RUNNING_WAVE,
             stdout_log=stdout_tee.path,
+            terminal_class=terminal_class,
+            terminal_class_evidence=terminal_class_evidence,
         )
         return _snapshot_update(
             _build_failed_snapshot(
@@ -3826,6 +4048,11 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 # env-default timeout or a plain non-zero exit is NOT a
                 # budget breach and must not arm the gate.
                 budget_cap_killed=timed_out and budget_bound,
+                # TIMEOUT TRUTH: the machine-readable cause. ``error`` is
+                # never stamped (see build_monitor.TERMINAL_CLASS_ERROR), so
+                # an ordinary failed build's snapshot is byte-identical to
+                # what it was before this lane.
+                terminal_class=terminal_class,
             )
         )
 
@@ -4051,6 +4278,16 @@ def _write_terminal_failure_pack(
             receipts=receipts,
             wedged=False,
             terminal=terminal,
+            # No subprocess ran on ANY route that reaches here (that is the
+            # defining property of this writer), so no clock — forge-side or
+            # guardkit-side — can have fired. ``error`` is the honest class,
+            # and it is exactly what the default already is; naming it
+            # explicitly is a statement, not a change.
+            terminal_class=build_monitor.TERMINAL_CLASS_ERROR,
+            terminal_class_evidence=(
+                "the guardkit subprocess never ran on this route, so no "
+                "timeout of any kind can have fired"
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — a pack must never mask the failure
         logger.warning(
@@ -4113,6 +4350,12 @@ def _node_failed(state: AutobuildRunnerState) -> dict[str, Any]:
         snapshot["error_message"] = error_message
     if existing.get("budget_cap_killed"):
         snapshot["budget_cap_killed"] = True
+    # Timeout truth rides forward for the SAME reason as the cap-kill marker:
+    # on the fast-failure path this refreshed snapshot is the one a
+    # fetch-on-empty replay translates, so dropping the class here would put a
+    # timeout on the wire as an unclassified FAILED.
+    if existing.get("terminal_class"):
+        snapshot["terminal_class"] = existing["terminal_class"]
     # Same reasoning for the build monitor's attribution provenance: the
     # terminal must say WHERE its task counts came from.
     if existing.get("tasks_completed_source"):
@@ -4433,6 +4676,7 @@ __all__ = [
     "FORGE_GUARDKIT_PATH_ENV",
     "FORGE_REPO_BASE_ENV",
     "RUNNER_CODE_VERSION",
+    "TAIL_READ_BUDGET_SECONDS",
     "AutobuildLifecycle",
     "AutobuildRunnerState",
     "AutobuildState",

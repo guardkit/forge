@@ -336,6 +336,18 @@ IdentityProvider = Callable[[str, str], Awaitable[tuple[str, str] | None]]
 #: a successful publish into a failed one.
 BuildStateRecorder = Callable[[PipelineEvent], Awaitable[None]]
 
+#: Durable sink for the timeout-truth class (``schema_v9.sql``, 2026-08-07).
+#: Called as ``(build_id, terminal_class)`` — synchronously, and BEFORE the
+#: publish — for a ``build-failed`` payload that arrived carrying the runner's
+#: class marker, so the truth about WHICH death this was survives even when the
+#: publish itself fails. ``None`` (the default, and every unit tier) makes the
+#: hook a strict no-op: zero extra DB calls, byte-identical to the pre-lane
+#: observer. Production wires
+#: :meth:`forge.lifecycle.persistence.SqliteLifecyclePersistence.record_terminal_class`,
+#: whose SQL is first-write-wins and status-preserving, so a JetStream
+#: redelivery re-recording the same verdict is a no-op.
+TerminalClassRecorder = Callable[[str, str], None]
+
 
 def _default_identity_provider() -> IdentityProvider:
     """Return an identity provider that always reports "no identity yet".
@@ -460,6 +472,12 @@ class LifecycleBridgeWireup:
             :class:`~forge.lifecycle.persistence.SqliteBuildModeReader`.
             ``None`` — the default — arms the identity watchdog for every
             build exactly as before this lane.
+        terminal_class_recorder: Optional :data:`TerminalClassRecorder`
+            that lands the runner's timeout-truth class on
+            ``builds.terminal_class`` (``schema_v9.sql``). ``None`` — the
+            default — makes the hook a strict no-op, byte-identical to the
+            pre-lane observer. Production wires
+            ``persistence.record_terminal_class``.
     """
 
     def __init__(
@@ -480,6 +498,7 @@ class LifecycleBridgeWireup:
         build_id_resolver: "BuildIdResolver | None" = None,
         budget_observer: "BudgetBreachObserver | None" = None,
         build_mode_reader: "BuildModeReader | None" = None,
+        terminal_class_recorder: "TerminalClassRecorder | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -542,6 +561,11 @@ class LifecycleBridgeWireup:
         # the first breach, RECORDS + ESCALATES without ever pausing / cancelling
         # / rewriting ``builds.status`` (the honesty law of this lane).
         self._budget_observer = budget_observer
+        # Timeout truth (2026-08-07) — the durable sink for WHICH of the five
+        # deaths a FAILED build died. ``None`` (unit tiers, and any caller
+        # that has not opted in) makes the hook a strict no-op: the observer
+        # behaves byte-for-byte as it did before this lane.
+        self._terminal_class_recorder = terminal_class_recorder
         # Per-feature budget-detection state (one session per observer task).
         # Created at observer start when a detector is wired, dropped in the
         # observer's ``finally`` — so the review-cycle count resets on bridge
@@ -1485,6 +1509,17 @@ class LifecycleBridgeWireup:
             event, "budget_cap_killed", False
         ):
             self._record_cap_kill_breach(event, feature_id)
+        # TIMEOUT TRUTH (2026-08-07) — same seam, same ordering, same reason.
+        # The runner classifies WHICH of the five deaths this was; the
+        # translator threads the class onto the typed payload; here the
+        # durable ``builds.terminal_class`` is written BEFORE the publish, so
+        # a publish that fails still leaves the truth on the row (the SQL is
+        # first-write-wins, which makes the redelivery's re-record a no-op).
+        # A build with no class — every ordinary failure — never enters.
+        if isinstance(event, BuildFailedPayload) and getattr(
+            event, "terminal_class", None
+        ):
+            self._record_terminal_class(event, feature_id)
         method_name = _PUBLISH_METHOD_TABLE.get(type(event))
         if method_name is None:
             logger.warning(
@@ -1572,6 +1607,52 @@ class LifecycleBridgeWireup:
                 exc,
                 event.build_id,
                 feature_id,
+            )
+
+    def _record_terminal_class(
+        self, event: BuildFailedPayload, feature_id: str
+    ) -> None:
+        """Record ``builds.terminal_class`` for a classified failed build.
+
+        Fully exception-guarded on the same posture as
+        :meth:`_record_cap_kill_breach`: the lifecycle stream is more
+        load-bearing than the classification, so a recorder fault logs loudly
+        and the publish proceeds unchanged. The build still fails exactly as
+        it failed; all that is lost is the machine-readable name for HOW.
+
+        When no recorder is wired — every unit tier, and any deployment that
+        has not opted in — this is a quiet no-op at DEBUG rather than the
+        ERROR its cap-kill sibling raises. The difference is deliberate: a
+        cap-kill with no observer means a budget GATE will silently not arm,
+        which is an enforcement hole; an unrecorded terminal class costs a
+        column in a status table and nothing else.
+        """
+        terminal_class = getattr(event, "terminal_class", None)
+        if not terminal_class:  # pragma: no cover — guarded at the call site
+            return
+        recorder = self._terminal_class_recorder
+        if recorder is None:
+            logger.debug(
+                "wireup._record_terminal_class: build_id=%s feature_id=%s "
+                "arrived classified as %s but no recorder is wired — the "
+                "class stays on the wire only",
+                event.build_id,
+                feature_id,
+                terminal_class,
+            )
+            return
+        try:
+            recorder(event.build_id, str(terminal_class))
+        except Exception as exc:  # noqa: BLE001 — never break the stream
+            logger.error(
+                "wireup._record_terminal_class: recorder raised (%s) for "
+                "build_id=%s feature_id=%s terminal_class=%s; the build's "
+                "failure stands and the observer continues, but the row will "
+                "not name WHICH death this was",
+                exc,
+                event.build_id,
+                feature_id,
+                terminal_class,
             )
 
     async def _record_build_state(self, event: PipelineEvent, feature_id: str) -> None:

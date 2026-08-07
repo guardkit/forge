@@ -1148,3 +1148,167 @@ class TestFindActiveOrRecent:
     ) -> None:
         with pytest.raises(ValueError):
             persistence.find_active_or_recent("")
+
+
+# ---------------------------------------------------------------------------
+# TIMEOUT TRUTH — ``builds.terminal_class`` (schema_v9)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordTerminalClass:
+    """The durable answer to "WHICH of the five deaths was this?".
+
+    ``builds.status`` spells all five ``FAILED``; this column is the machine-
+    readable difference, and it never touches ``status``.
+    """
+
+    def test_a_classified_build_reads_back(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        build_id, _payload = seeded_build
+        persistence.record_terminal_class(build_id, "timeout-wedge")
+        assert persistence.read_terminal_class(build_id) == "timeout-wedge"
+
+    def test_an_unclassified_build_reads_back_NULL(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        """The common case: every ordinary failure and every historical row."""
+        build_id, _payload = seeded_build
+        assert persistence.read_terminal_class(build_id) is None
+
+    def test_first_write_wins(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        """A redelivery or replay re-presents the SAME verdict; a later write
+        could only be a duplicate or a degradation."""
+        build_id, _payload = seeded_build
+        persistence.record_terminal_class(build_id, "timeout-in-band")
+        persistence.record_terminal_class(build_id, "timeout-wall-clock")
+        assert persistence.read_terminal_class(build_id) == "timeout-in-band"
+
+    def test_it_never_touches_status(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        """THE HONESTY LAW: a recorder records, it never mints a state."""
+        build_id, _payload = seeded_build
+        persistence.apply_transition(
+            compose_transition(
+                Build(build_id=build_id, status=BuildState.QUEUED),
+                BuildState.PREPARING,
+            )
+        )
+        persistence.record_terminal_class(build_id, "timeout-budget-cap")
+        assert persistence.read_status()[0].status is BuildState.PREPARING
+
+    def test_an_unknown_build_is_a_quiet_noop(
+        self, persistence: SqliteLifecyclePersistence
+    ) -> None:
+        persistence.record_terminal_class("build-does-not-exist", "timeout-wedge")
+        assert persistence.read_terminal_class("build-does-not-exist") is None
+
+    def test_empty_arguments_are_refused(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        build_id, _payload = seeded_build
+        with pytest.raises(ValueError):
+            persistence.record_terminal_class("", "timeout-wedge")
+        with pytest.raises(ValueError):
+            persistence.record_terminal_class(build_id, "")
+        with pytest.raises(ValueError):
+            persistence.read_terminal_class("")
+
+    def test_it_reaches_the_status_projection(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        build_id, _payload = seeded_build
+        persistence.record_terminal_class(build_id, "timeout-wedge")
+        view = persistence.read_status()[0]
+        assert view.terminal_class == "timeout-wedge"
+
+    def test_the_projection_says_None_when_unclassified(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        assert persistence.read_status()[0].terminal_class is None
+
+    def test_it_reaches_the_full_build_row(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        build_id, _payload = seeded_build
+        persistence.record_terminal_class(build_id, "timeout-in-band")
+        rows = persistence.read_history(limit=5)
+        assert rows[0].terminal_class == "timeout-in-band"
+
+
+class TestPositionalFallbackOrdering:
+    """THE LANDMINE this file's own comment records.
+
+    ``_row_to_build_row``'s tuple fallback maps ``SELECT *`` BY POSITION. v8
+    was nearly shifted onto ``last_coach_score``'s value by an omission in
+    exactly this tuple; v9's ``terminal_class`` is appended for the same
+    reason. This test reads a real row both ways and demands they agree — so
+    any future ALTER TABLE that forgets the tuple fails here rather than
+    silently returning the WRONG COLUMN'S value.
+    """
+
+    def test_a_positional_row_hydrates_identically_to_a_named_row(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        from forge.lifecycle.persistence import _row_to_build_row
+
+        build_id, _payload = seeded_build
+        persistence.record_terminal_class(build_id, "timeout-wall-clock")
+        persistence.record_budget_breach(build_id, "wall_clock: 10s > 5s")
+        persistence.record_last_coach_score(build_id, 0.75)
+
+        with persistence._reader() as cx:
+            named = cx.execute(
+                "SELECT * FROM builds WHERE build_id = ?", (build_id,)
+            ).fetchone()
+        by_name = _row_to_build_row(named)
+        by_position = _row_to_build_row(tuple(named))
+
+        assert by_position == by_name
+        assert by_position.terminal_class == "timeout-wall-clock"
+        assert by_position.task_id is None
+
+    def test_the_fallback_tuple_covers_every_builds_column(
+        self, persistence: SqliteLifecyclePersistence, seeded_build
+    ) -> None:
+        """A structural guard: the tuple must be the table, in table order.
+
+        Read the literal ``keys = (...)`` tuple out of the function's own
+        source and compare it to ``PRAGMA table_info`` — the exact order
+        SQLite returns for ``SELECT *``. Any future ALTER TABLE that forgets
+        this tuple fails HERE, loudly, instead of silently reading one column
+        into another's field.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from forge.lifecycle import persistence as persistence_module
+
+        with persistence._reader() as cx:
+            columns = [row[1] for row in cx.execute("PRAGMA table_info(builds)")]
+
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(persistence_module._row_to_build_row))
+        )
+        keys: list[str] | None = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "keys" for t in node.targets
+                )
+                and isinstance(node.value, ast.Tuple)
+            ):
+                keys = [ast.literal_eval(elt) for elt in node.value.elts]
+                break
+
+        assert keys is not None, "_row_to_build_row no longer has a `keys` tuple"
+        assert keys == columns, (
+            "the positional fallback tuple has drifted from the builds table: "
+            f"tuple={keys!r} vs table={columns!r}. A SELECT * read would take "
+            "the WRONG column's value."
+        )
