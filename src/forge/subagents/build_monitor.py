@@ -135,6 +135,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1489,6 +1490,12 @@ class BuildMonitor:
         self._last_wave: int | None = None
         self._semantic_ticks = 0
 
+        #: Latched OFF after the first in-flight heartbeat write fault. A
+        #: read-only receipts root must cost ONE warning for the life of the
+        #: build, not one per poll — and the heartbeat is a convenience for the
+        #: operator's status table, never a thing the build depends on.
+        self._in_flight_disabled = False
+
     # -- inputs -----------------------------------------------------------
 
     def note_stdout_line(self, line: str, *, now: float | None = None) -> str | None:
@@ -1903,6 +1910,108 @@ class BuildMonitor:
                 if key in event
             }
         return state
+
+    # -- the in-flight heartbeat (design §h stage 1) -----------------------
+
+    def in_flight_state(self, *, build_id: str) -> dict[str, Any]:
+        """The flat, operator-facing projection written to ``in-flight.json``.
+
+        Deliberately FLAT and deliberately small: its only consumer is the
+        ``forge status`` STAGE cell, which needs a task, a turn and a wave, and
+        a reader that has to walk a nested structure to render one cell will
+        eventually walk it wrong. Every value here is already computed by
+        :meth:`semantic_state` — this adds no new reads and no new derivation,
+        it only chooses.
+
+        ``updated_at`` is the whole liveness story on the read side: the reader
+        compares it against the poll cadence and refuses to present a stale
+        file as live. So it is stamped HERE, at the moment the state was
+        sampled, never inferred later from a file mtime.
+        """
+        state = self.semantic_state()
+        ledger = state.get("ledger") or {}
+        return {
+            "build_id": build_id,
+            "feature_id": self._feature_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "description": state.get("description"),
+            "last_task_id": state.get("last_task_id"),
+            "last_turn": state.get("last_turn"),
+            "last_decision": state.get("last_decision"),
+            "last_wave": state.get("last_wave"),
+            "tasks_completed": ledger.get("tasks_completed"),
+            "tasks_failed": ledger.get("tasks_failed"),
+            "current_wave": ledger.get("current_wave"),
+            "window_seconds": state.get("window_seconds"),
+            "window_source": state.get("window_source"),
+        }
+
+    def write_in_flight(self, path: Path, *, build_id: str) -> bool:
+        """Publish the heartbeat to ``path``. Returns True when it landed.
+
+        Best-effort on exactly the tee's standing posture: this method can
+        never raise into the poll loop and can never change a build's outcome.
+        A write fault logs ONE warning and latches the heartbeat off for the
+        rest of the build — an operator losing a status cell is a nuisance, an
+        operator losing a build is not.
+
+        The write is atomic (temp file + :func:`os.replace`) because the reader
+        is a CLI that can land mid-write at any moment: a torn JSON read would
+        render as "no stage", which is a small lie told often. It is also
+        owner-only (0600), matching the pack hardening the rest of this
+        directory already gets — the heartbeat names tasks and features, and
+        ``~/forge-state`` is bind-mounted into a container.
+        """
+        if self._in_flight_disabled:
+            return False
+        target = Path(path)
+        tmp = target.with_name(f"{target.name}.tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload = self.in_flight_state(build_id=build_id)
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:  # pragma: no cover — mode is a nicety, not the file
+                pass
+            os.replace(tmp, target)
+            return True
+        except Exception as exc:  # noqa: BLE001 — see the docstring: a
+            # heartbeat fault must cost a warning, never a build.
+            self._in_flight_disabled = True
+            logger.warning(
+                "build_monitor: could not write the in-flight heartbeat to %s "
+                "(%s: %s) — the build is unaffected and `forge status` will "
+                "simply show no live stage for it; no further attempts",
+                target,
+                type(exc).__name__,
+                exc,
+            )
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover — best-effort litter removal
+                pass
+            return False
+
+
+def clear_in_flight(path: Path) -> None:
+    """Remove a build's in-flight heartbeat. Never raises.
+
+    Called when the runner reaches a terminal, so a stale file can never
+    outlive the build it describes — the read side has a staleness fence, but a
+    fence is a second line of defence, not a licence to leave litter. A
+    module-level function on purpose: the terminal path must be able to clear
+    the file even when the monitor was disabled and no instance exists.
+    """
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "build_monitor: could not remove the in-flight heartbeat at %s "
+            "(%s) — `forge status` will fall back to its staleness fence",
+            path,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1844,3 +1844,202 @@ class TestSemanticStateCarriesTheFailureCategory:
         )
         monitor = _make_monitor(tmp_path, _Clock())
         assert "failure_category" not in monitor.semantic_state()["last_event"]
+
+
+# ---------------------------------------------------------------------------
+# (h) The in-flight heartbeat — what a RUNNING build is doing, on disk
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightHeartbeat:
+    """``forge status`` showed ``—`` for every running build.
+
+    The monitor derived the answer on every poll and kept it only for the
+    failure pack at exit. These tests prove the same state is now PUBLISHED
+    mid-build, in a shape a status table can render, and that publishing it can
+    never cost a build.
+    """
+
+    def _monitor_with_a_live_task(self, root: Path) -> bm.BuildMonitor:
+        _write_feature(
+            root,
+            "FEAT-BM",
+            statuses={
+                "TASK-A": "completed",
+                "TASK-B": "in_progress",
+            },
+            tasks_completed=1,
+            tasks_failed=0,
+            current_wave=2,
+        )
+        _write_progress(
+            root,
+            "TASK-B",
+            [
+                "[2026-07-31T10:00:00] START TASK-B: Player invocation",
+                _snapshot_line("TASK-B", elapsed=60, files_changed=4, phase="Player"),
+            ],
+        )
+        monitor = _make_monitor(root, _Clock())
+        monitor.note_stdout_line("Wave 2/2: TASK-B")
+        monitor.note_stdout_line("▶ Executing TASK-B: the live one")
+        monitor.note_stdout_line(
+            "INFO:guardkit.orchestrator.progress:[t] Completed turn 4: "
+            "feedback - still red"
+        )
+        return monitor
+
+    def test_the_payload_names_the_task_the_turn_and_the_wave(
+        self, tmp_path: Path
+    ) -> None:
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        state = monitor.in_flight_state(build_id="build-FEAT-BM-1")
+
+        assert state["build_id"] == "build-FEAT-BM-1"
+        assert state["feature_id"] == "FEAT-BM"
+        assert state["last_task_id"] == "TASK-B"
+        assert state["last_turn"] == 4
+        assert state["last_decision"] == "feedback"
+        assert state["last_wave"] == 2
+        assert state["tasks_completed"] == 1
+        assert state["tasks_failed"] == 0
+        assert state["current_wave"] == 2
+        assert state["window_seconds"] == monitor.window_seconds
+        assert state["window_source"] == monitor.window_source
+        assert "task=TASK-B" in state["description"]
+
+    def test_the_payload_is_flat_and_json_serialisable(self, tmp_path: Path) -> None:
+        """Its only consumer renders one table cell; nesting would invite a
+        reader to walk a structure it does not need."""
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        state = monitor.in_flight_state(build_id="build-FEAT-BM-1")
+        round_tripped = json.loads(json.dumps(state))
+        assert round_tripped == state
+        assert all(
+            not isinstance(value, (dict, list)) for value in state.values()
+        ), f"the heartbeat must stay flat: {state}"
+
+    def test_updated_at_is_stamped_when_the_state_was_sampled(
+        self, tmp_path: Path
+    ) -> None:
+        """The read side's whole liveness story hangs off this field."""
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        state = monitor.in_flight_state(build_id="build-FEAT-BM-1")
+        stamped = datetime.fromisoformat(state["updated_at"])
+        assert stamped.tzinfo is not None, "an unstamped zone reads as stale"
+        assert before <= stamped <= datetime.now(timezone.utc)
+
+    def test_write_in_flight_lands_the_payload_on_disk(self, tmp_path: Path) -> None:
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+
+        assert monitor.write_in_flight(target, build_id="build-FEAT-BM-1") is True
+        assert target.exists(), "the parent directory must be created"
+        written = json.loads(target.read_text(encoding="utf-8"))
+        assert written["last_task_id"] == "TASK-B"
+        assert written["build_id"] == "build-FEAT-BM-1"
+
+    def test_the_file_is_owner_only(self, tmp_path: Path) -> None:
+        """It names tasks and features, and ~/forge-state is bind-mounted."""
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        assert target.stat().st_mode & 0o077 == 0, oct(target.stat().st_mode)
+
+    def test_a_republish_leaves_no_temp_file_behind(self, tmp_path: Path) -> None:
+        """The write is atomic; the temp file must not survive it."""
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        assert sorted(p.name for p in target.parent.iterdir()) == ["in-flight.json"]
+
+    def test_a_reader_never_sees_a_half_written_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation-proof for the atomic rename: a plain in-place write would
+        let a CLI landing mid-write read broken JSON and report NO stage.
+
+        The probe fires at the last instant BEFORE the rename lands. At that
+        moment the destination must still hold the PREVIOUS heartbeat, whole —
+        which is only true if the new bytes went somewhere else first.
+        """
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        first = json.loads(target.read_text(encoding="utf-8"))
+
+        seen: list[dict] = []
+        real_replace = bm.os.replace
+
+        def _peek(src, dst):  # type: ignore[no-untyped-def]
+            seen.append(json.loads(Path(dst).read_text(encoding="utf-8")))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(bm.os, "replace", _peek)
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        assert seen == [first]
+
+    def test_an_unwritable_destination_warns_ONCE_and_never_raises(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A build must never die because a status decoration could not be
+        written — and a read-only receipts root must not shout once per poll."""
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        target = blocked / "build-FEAT-BM-1" / "in-flight.json"
+        try:
+            with caplog.at_level(logging.WARNING, logger="forge.subagents.build_monitor"):
+                assert monitor.write_in_flight(target, build_id="b") is False
+                assert monitor.write_in_flight(target, build_id="b") is False
+                assert monitor.write_in_flight(target, build_id="b") is False
+        finally:
+            blocked.chmod(0o700)
+        warnings = [
+            r for r in caplog.records if "in-flight heartbeat" in r.getMessage()
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    def test_clear_in_flight_removes_the_file(self, tmp_path: Path) -> None:
+        monitor = self._monitor_with_a_live_task(tmp_path)
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        bm.clear_in_flight(target)
+        assert not target.exists()
+
+    def test_clear_in_flight_on_an_absent_file_is_silent(self, tmp_path: Path) -> None:
+        """Every terminal calls it, including the ones that never wrote."""
+        bm.clear_in_flight(tmp_path / "never" / "written.json")
+
+    def test_the_heartbeat_is_not_a_liveness_signal(self, tmp_path: Path) -> None:
+        """Writing it must not touch the wedge detector's memory.
+
+        The monitor's own artifacts are not the build's progress. If publishing
+        a heartbeat counted as movement the monitor would be resetting its own
+        silence clock and could never call a wedge again.
+        """
+        clock = _Clock()
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [_snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="Player")],
+        )
+        monitor = _make_monitor(tmp_path, clock)
+        monitor.poll()
+        before = dict(monitor._observed)
+
+        target = tmp_path / "receipts" / "build-FEAT-BM-1" / "in-flight.json"
+        monitor.write_in_flight(target, build_id="build-FEAT-BM-1")
+        clock.advance(monitor.window_seconds + 1)
+        verdict = monitor.poll()
+
+        assert dict(monitor._observed) == before
+        assert verdict.wedged is True, (
+            "a heartbeat must not have reset the silence clock"
+        )
