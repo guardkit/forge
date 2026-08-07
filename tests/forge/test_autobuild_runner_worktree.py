@@ -2578,6 +2578,108 @@ class TestFeatureModeResidueIsSwept:
             in joined
         )
 
+    def test_an_already_deleted_outer_tree_counts_as_already_swept(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The kept tree is already GONE — that is a done sweep, not a failure.
+
+        The live shape (ledgered 2026-08-03): an operator — or an earlier
+        clean-up — deletes the prior build's kept worktree directory, but the
+        SOURCE repo still carries its registration and its
+        ``autobuild/<FEAT>`` branch. The sweep cleared both and then died on
+        ``shutil.rmtree`` of a path that no longer existed, so the fresh
+        dispatch was REFUSED over residue that was already gone (the workaround
+        was to hand-create a decoy directory at the path). An already-cleaned
+        path must read as already-swept: the registration and the branch are
+        still cleared, and the dispatch proceeds.
+        """
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        shutil.rmtree(outer)  # the whole kept tree deleted by hand
+        assert not outer.exists()
+        assert str(inner) in _registered_worktrees(throwaway_repo), (
+            "the registration must outlive the directory — otherwise this "
+            "test proves nothing"
+        )
+        assert _branch_exists(throwaway_repo, FLV1_BRANCH)
+
+        recorded: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub(recorded),
+            )
+
+        # The dispatch is not refused: guardkit's own feature-mode add works.
+        assert recorded.get("inner_add_rc") == 0, recorded.get("inner_add_stderr")
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "completed"
+        assert str(inner) not in _registered_worktrees(throwaway_repo)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "was ALREADY GONE" in joined
+        assert "already-swept" in joined
+        assert "could not remove its kept outer worktree" not in joined
+
+    def test_a_mid_walk_race_is_refused_not_misread_as_already_swept(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """rmtree dying on a vanishing ENTRY while the tree remains = REFUSE.
+
+        The already-swept branch keys on FileNotFoundError, but rmtree also
+        raises it when a concurrent deletion removes an entry mid-walk — and
+        then the tree, with files still in it, is NOT swept. Logging "ALREADY
+        GONE" there is a false line in an honesty lane (coach residue,
+        2026-08-07): the branch must re-check the root and refuse loudly.
+        """
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        assert outer.exists()
+
+        real_rmtree = shutil.rmtree
+
+        def racing_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(str(path)) == outer:
+                raise FileNotFoundError(
+                    2, "vanishing entry mid-walk", str(outer / "ghost.txt")
+                )
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(ar.shutil, "rmtree", racing_rmtree)
+
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub({}),
+            )
+
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"]
+        assert "concurrent-deletion race" in message
+        assert "already-swept" not in message.split("not an ")[0]
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "was ALREADY GONE" not in joined
+        # The tree is left in place for forensics — refusal destroys nothing.
+        assert outer.exists()
+
 
 class TestFeatureModeSweepFences:
     """What the feature-shape sweep must NEVER touch."""

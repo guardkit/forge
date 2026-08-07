@@ -48,7 +48,7 @@ How W is derived (design §b)
 
 ``W = task-budget + slack``, where ``slack = max(2 × task_log_interval, 120s)``
 and the task budget is the **largest budget guardkit could still be enforcing
-for a task that has not finished** (design §b). It is the MAX over four
+for a task that has not finished** (design §b). It is the MAX over five
 sources, because every one of them can be the binding constraint and
 under-deriving W kills a healthy build while over-deriving it only delays a
 wedge call (design §j risk 6):
@@ -87,7 +87,21 @@ wedge call (design §j risk 6):
    ``feature_orchestrator.py:2283-2286``) it is every not-yet-terminal task.
    forge's own shipped features carry estimates up to 240 minutes (25 tasks at
    113, nine at 170) → an enforced 10170s–21600s at multiplier 1.0 alone; a W
-   that ignored this would fire 3.3× early on the 113-minute class.
+   that ignored this would fire 3.3× early on the 113-minute class;
+5. a task's **own declared budget** — ``autobuild.task_timeout`` in the task
+   markdown's frontmatter, ``× multiplier`` (``_resolve_task_timeout``). The
+   2026-08-01 wedge rehearsal banked the gap verbatim: "the
+   ``autobuild.task_timeout`` frontmatter override never reached the window
+   derivation (W stayed on the 3000s default)". It cannot come from tier 3,
+   because an explicit override REPLACES the feature-level number and its
+   floor; and tier 1 sees it only once guardkit dispatches that task, so the
+   whole prelude before that ran on a window the operator had already declared
+   too small. Same scope as tier 4 (the tasks that could still be running),
+   read from the same markdown guardkit reads. NOT mirrored: guardkit's
+   ``GUARDKIT_MIN_TURN_BUDGET × --max-turns`` floor on top of an override —
+   ``--max-turns`` is invisible to the monitor, and at guardkit's defaults that
+   floor (3000s) is already tier 3's floor (see
+   :func:`frontmatter_task_budget`).
 
 Because W is therefore never below guardkit's own per-task budget, guardkit's
 in-band timeout machinery fires FIRST whenever it is healthy — and an orderly
@@ -198,6 +212,7 @@ WINDOW_SOURCE_TASK_BUDGET_LOG: str = "per-task-budget-log"
 WINDOW_SOURCE_BANNER: str = "wave-execution-banner"
 WINDOW_SOURCE_RECONSTRUCTED: str = "reconstructed-from-feature-yaml"
 WINDOW_SOURCE_ESTIMATE_FLOOR: str = "feature-yaml-estimate-floor"
+WINDOW_SOURCE_FRONTMATTER_OVERRIDE: str = "task-frontmatter-override"
 
 #: Relative paths, inside the build's cwd, of the artifacts the monitor reads.
 FEATURES_DIR: str = ".guardkit/features"
@@ -205,6 +220,20 @@ AUTOBUILD_DIR: str = ".guardkit/autobuild"
 INNER_WORKTREES_DIR: str = ".guardkit/worktrees"
 PROGRESS_LOG_NAME: str = "progress.log"
 EVENTS_LOG_NAME: str = "events.jsonl"
+
+#: Where a task's markdown lives, and the order guardkit's own ``TaskLoader``
+#: searches (``guardkit/tasks/task_loader.py``: ``tasks/<state>/**/<id>*.md``).
+#: ``completed`` is deliberately absent from the search — a finished task
+#: cannot still be burning a budget, and the monitor only ever asks about tasks
+#: that are still in flight.
+TASKS_DIR: str = "tasks"
+TASK_SEARCH_DIRS: tuple[str, ...] = (
+    "backlog",
+    "in_progress",
+    "design_approved",
+    "in_review",
+    "blocked",
+)
 
 
 def monitor_enabled() -> bool:
@@ -370,6 +399,102 @@ def reconstruct_guardkit_task_budget(
     return max(resolve_task_timeout_floor(env), float(raw)) * resolve_timeout_multiplier(
         env
     )
+
+
+def frontmatter_task_budget(
+    override_seconds: float, *, env: Mapping[str, str] | None = None
+) -> float:
+    """The budget guardkit enforces for a task that DECLARES its own timeout.
+
+    ``frontmatter.autobuild.task_timeout × multiplier``
+    (``_resolve_task_timeout``, ``feature_orchestrator.py``): an explicit
+    per-task override REPLACES the feature-level number and the feature-level
+    floor — the whole reconstruction tier — so a task declaring 7200s on a
+    local backend is enforced at 28800s while the reconstruction tier still
+    reads 12000s.
+
+    NOT mirrored: guardkit then raises this to ``GUARDKIT_MIN_TURN_BUDGET
+    (600s) × --max-turns``, and ``--max-turns`` is a CLI flag of the subprocess
+    that the monitor cannot see. That floor only ever RAISES guardkit's budget,
+    and at guardkit's own defaults it is 600 × 5 = 3000s — exactly the
+    reconstruction tier's floor, which is already in the max. So the gap is a
+    non-default ``--max-turns`` on a multiplier-1.0 seat, where W can sit below
+    guardkit's own budget; the honest fix for that is a budgets manifest
+    (design §h stage 3), not a guess here.
+    """
+    return float(override_seconds) * resolve_timeout_multiplier(env)
+
+
+def parse_frontmatter_task_timeout(text: str) -> float | None:
+    """``autobuild.task_timeout`` from a task markdown's YAML frontmatter.
+
+    ``None`` for anything that is not a declared, usable override — no
+    frontmatter block, no ``autobuild`` mapping, no ``task_timeout``, a value
+    guardkit itself would reject. guardkit reads the same field through
+    ``TaskLoader`` and coerces with ``int()``, warning and falling back to the
+    feature-level budget on a non-integer or non-positive value
+    (``feature_orchestrator.py``); the mirror rejects exactly those, so a
+    malformed override never inflates W.
+    """
+    body = text.lstrip("﻿")  # a BOM must not hide the frontmatter fence
+    if not body.startswith("---"):
+        return None
+    lines = body.splitlines()
+    end: int | None = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() in {"---", "..."}:
+            end = index
+            break
+    if end is None:  # an unterminated block is not a frontmatter block
+        return None
+    try:
+        data = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    autobuild = data.get("autobuild")
+    if not isinstance(autobuild, Mapping):
+        return None
+    try:
+        declared = int(autobuild.get("task_timeout"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return float(declared) if declared > 0 else None
+
+
+def find_task_file(
+    root: Path, task_id: str, declared_path: str | None = None
+) -> Path | None:
+    """The task's markdown file under ``root``, or ``None``.
+
+    ``declared_path`` is the feature YAML's own ``file_path`` for the task and
+    is tried first because it is exact. It goes STALE by design, though —
+    guardkit moves a task's file between ``tasks/<state>/`` directories as the
+    task progresses — so the fallback is guardkit's own discovery: the first
+    ``tasks/<state>/**/<task_id>*.md`` in ``TaskLoader``'s search order.
+    Never raises: an unreadable tree is no evidence.
+    """
+    root = Path(root)
+    if declared_path:
+        candidate = Path(declared_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+    for dir_name in TASK_SEARCH_DIRS:
+        search_dir = root / TASKS_DIR / dir_name
+        try:
+            if not search_dir.is_dir():
+                continue
+            for path in sorted(search_dir.rglob(f"{task_id}*.md")):
+                return path
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +762,12 @@ class FeatureLedger:
     #: input to guardkit's estimate-derived per-task floor, which it applies
     #: silently — so the monitor must compute it rather than wait to be told.
     task_estimates: tuple[tuple[str, float], ...] = ()
+    #: ``(task_id, file_path)`` as the feature YAML declares it — the exact
+    #: first guess at where a task's markdown (and therefore its
+    #: ``autobuild.task_timeout`` frontmatter override) lives. Advisory only:
+    #: guardkit moves task files between state directories as they run, so
+    #: :func:`find_task_file` falls back to guardkit's own search.
+    task_files: tuple[tuple[str, str], ...] = ()
 
     def fingerprint(self) -> tuple[Any, ...]:
         """The content-bearing view compared across polls."""
@@ -703,6 +834,7 @@ def read_feature_ledger(root: Path, feature_id: str) -> FeatureLedger | None:
     statuses: list[tuple[str, str]] = []
     in_progress: list[str] = []
     estimates: list[tuple[str, float]] = []
+    files: list[tuple[str, str]] = []
     tasks = data.get("tasks")
     if isinstance(tasks, list):
         for entry in tasks:
@@ -718,6 +850,9 @@ def read_feature_ledger(root: Path, feature_id: str) -> FeatureLedger | None:
             estimate = _as_optional_float(entry.get("estimated_minutes"))
             if estimate is not None:
                 estimates.append((task_id, estimate))
+            file_path = entry.get("file_path")
+            if isinstance(file_path, str) and file_path.strip():
+                files.append((task_id, file_path.strip()))
 
     completed_waves = execution.get("completed_waves")
     completed_wave_count = (
@@ -733,6 +868,7 @@ def read_feature_ledger(root: Path, feature_id: str) -> FeatureLedger | None:
         in_progress_task_ids=tuple(sorted(in_progress)),
         raw_task_timeout_seconds=_as_optional_float(data.get("task_timeout")),
         task_estimates=tuple(sorted(estimates)),
+        task_files=tuple(sorted(files)),
     )
 
 
@@ -1136,6 +1272,14 @@ class BuildMonitor:
         self._task_budgets: dict[str, float] = {}
         self._ledger_raw_task_timeout: float | None = None
         self._last_ledger: FeatureLedger | None = None
+        #: Per-task ``autobuild.task_timeout`` overrides already resolved from
+        #: the task markdown, and the ids whose file was actually READ. A
+        #: frontmatter budget is fixed before the build starts, so one
+        #: successful read settles it; a task whose file could not be read is
+        #: deliberately NOT remembered, so a file mid-move is retried rather
+        #: than cached as "no override".
+        self._frontmatter_budgets: dict[str, float] = {}
+        self._frontmatter_read: set[str] = set()
         self._warned_default_window = False
         self._warned_no_disk_evidence = False
 
@@ -1300,7 +1444,7 @@ class BuildMonitor:
     def _resolve_task_budget(self) -> tuple[float, str]:
         """The largest budget guardkit could still be enforcing, and its source.
 
-        The MAX is the guardkit-fires-first invariant in one line. Four
+        The MAX is the guardkit-fires-first invariant in one line. Five
         candidates, and any of them can be the binding one:
 
         1. a live task's declared budget (the gather line / the per-task INFO
@@ -1312,7 +1456,14 @@ class BuildMonitor:
            printed only after the whole prelude has already run;
         4. the estimate-derived floor guardkit applies per task, computed from
            the ledger's ``estimated_minutes`` — guardkit raises a task to this
-           silently, so waiting to be told would leave W below the real budget.
+           silently, so waiting to be told would leave W below the real budget;
+        5. a live task's own ``autobuild.task_timeout`` frontmatter override,
+           read from its markdown (register find, 2026-08-01 wedge rehearsal:
+           the override "never reached the window derivation — W stayed on the
+           3000s default"). An override REPLACES the feature-level budget in
+           guardkit, so the reconstruction tier cannot cover it, and the
+           per-task INFO line that announces it is printed only when the task
+           is dispatched — the whole prelude before that ran on the wrong W.
 
         Under-deriving W kills a healthy build; over-deriving it only delays a
         wedge call. The max is therefore the honest direction (design §j risk 6).
@@ -1351,6 +1502,16 @@ class BuildMonitor:
         if estimate_floor > 0:
             candidates.append((estimate_floor, WINDOW_SOURCE_ESTIMATE_FLOOR))
 
+        # (5) a live task's OWN declared budget, read from its markdown. Last
+        # in the list on purpose: `max` keeps the FIRST of equal candidates, so
+        # a build with no override — or one that only ties an existing tier —
+        # keeps today's window AND today's window_source byte-identically.
+        frontmatter_budget = self._live_frontmatter_budget()
+        if frontmatter_budget > 0:
+            candidates.append(
+                (frontmatter_budget, WINDOW_SOURCE_FRONTMATTER_OVERRIDE)
+            )
+
         if not declared_stream and not self._warned_default_window:
             self._warned_default_window = True
             logger.warning(
@@ -1381,6 +1542,56 @@ class BuildMonitor:
             if task_id in live
         ]
         return max(floors, default=0.0)
+
+    def _live_frontmatter_budget(self) -> float:
+        """The largest DECLARED per-task override still possibly in force.
+
+        Scoped exactly like the estimate floor: the tasks the ledger says could
+        still be burning a budget. Each task's markdown is read at most once —
+        an override is authored before the build starts and cannot change under
+        it — and a file that could not be read is retried next poll rather than
+        remembered as "no override" (a task file being moved between state
+        directories must not silently shrink W).
+        """
+        ledger = self._last_ledger
+        if ledger is None:
+            return 0.0
+        declared = dict(ledger.task_files)
+        budgets = [
+            self._frontmatter_budget_for(task_id, declared.get(task_id))
+            for task_id in ledger.live_task_ids()
+        ]
+        return max(budgets, default=0.0)
+
+    def _frontmatter_budget_for(
+        self, task_id: str, declared_path: str | None
+    ) -> float:
+        """One task's frontmatter-derived budget (``0.0`` = none declared)."""
+        if task_id in self._frontmatter_read:
+            return self._frontmatter_budgets.get(task_id, 0.0)
+        path = find_task_file(self._root, task_id, declared_path)
+        if path is None:
+            return 0.0  # not found (yet) — no evidence, and nothing remembered
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return 0.0  # a torn/unreadable read is no evidence either
+        self._frontmatter_read.add(task_id)
+        declared_seconds = parse_frontmatter_task_timeout(text)
+        if declared_seconds is None:
+            return 0.0
+        budget = frontmatter_task_budget(declared_seconds, env=self._env)
+        self._frontmatter_budgets[task_id] = budget
+        logger.info(
+            "build_monitor: %s declares its own task_timeout in %s: %ss × "
+            "multiplier %s = %ss → the wedge window honours it",
+            task_id,
+            path,
+            declared_seconds,
+            resolve_timeout_multiplier(self._env),
+            budget,
+        )
+        return budget
 
     @property
     def observed_signals(self) -> tuple[str, ...]:
