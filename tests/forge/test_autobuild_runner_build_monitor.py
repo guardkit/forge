@@ -49,17 +49,35 @@ BRANCH = "lane/build-monitor"
 
 
 class _BlockingStdout:
-    """Yields canned lines, then blocks until the process is reaped."""
+    """Yields canned lines, then blocks until the process is reaped.
 
-    def __init__(self, done: asyncio.Event, lines: list[bytes]) -> None:
+    ``tail_lines`` model the real pipe buffer: bytes the child had already
+    written but nobody had read when the kill landed. They become readable only
+    AFTER the reap, exactly like a real ``asyncio.StreamReader`` draining a
+    dead child's pipe, and then the stream reaches EOF. With no ``tail_lines``
+    this double behaves byte-identically to the pre-lane one.
+    """
+
+    def __init__(
+        self,
+        done: asyncio.Event,
+        lines: list[bytes],
+        tail_lines: list[bytes] | None = None,
+    ) -> None:
         self._done = done
         self._lines = list(lines)
+        self._tail = list(tail_lines or [])
+        self.reads_after_eof = 0
 
     async def readline(self) -> bytes:
         if self._lines:
             await asyncio.sleep(0)
             return self._lines.pop(0)
         await self._done.wait()
+        if self._tail:
+            await asyncio.sleep(0)
+            return self._tail.pop(0)
+        self.reads_after_eof += 1
         return b""
 
 
@@ -71,12 +89,14 @@ class _LiveFakeProc:
     wedge kills the build and that a healthy build is never killed.
     """
 
-    def __init__(self, lines: list[bytes]) -> None:
+    def __init__(
+        self, lines: list[bytes], tail_lines: list[bytes] | None = None
+    ) -> None:
         self.pid = 9911
         self.returncode: int | None = None
         self.killed = False
         self._done = asyncio.Event()
-        self.stdout = _BlockingStdout(self._done, lines)
+        self.stdout = _BlockingStdout(self._done, lines, tail_lines)
 
     async def wait(self) -> int:
         await self._done.wait()
@@ -901,3 +921,827 @@ class TestTimerDemotion:
         assert proc.killed is False
         assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "running_wave"
         assert any("build monitor DISABLED" in message for message in records)
+
+
+# ---------------------------------------------------------------------------
+# TAIL LOSS — the ordinary timeout keeps the subprocess's last words
+# ---------------------------------------------------------------------------
+#
+# The residue (Sunday handoff §4.4). Two kill paths, asymmetric honesty:
+#
+#   * the WEDGE path kills and returns, so the drain runs on to EOF and reads
+#     every buffered line — the tail survives for free;
+#   * the ORDINARY-TIMEOUT path goes through ``asyncio.wait_for``, which
+#     CANCELS the drain before the kill. Whatever sat in the pipe buffer was
+#     read by nobody, teed nowhere, and never reached the monitor. On a dying
+#     build that is exactly the interesting part.
+#
+# Every test below drives the REAL node. The lines named ``tail`` are readable
+# only after the reap, which is what a real pipe buffer does.
+
+
+class TestTailLossOnTheOrdinaryTimeout:
+    """The bounded post-kill read the wedge path got by accident."""
+
+    @staticmethod
+    def _stdout_log(tmp_path: Path) -> Path:
+        return tmp_path / "receipts" / BUILD_ID / ar.STDOUT_LOG_NAME
+
+    @pytest.mark.asyncio
+    async def test_the_wall_clock_kill_recovers_the_buffered_tail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTATION PROOF: this test fails on the pre-lane tree.
+
+        Before the bounded tail read, the ``wait_for`` cancel closed the tee
+        first and killed second, so neither of these lines existed anywhere.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, "0.05")
+        proc = _LiveFakeProc(
+            [b"Starting Wave Execution (task timeout: 40 min)\n"],
+            tail_lines=[
+                b"TIMEOUT TASK-BMW-001: guardkit task clock fired\n",
+                b"Traceback (most recent call last):\n",
+                b'  File "orchestrator.py", line 1, in run\n',
+            ],
+        )
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "failed"
+        log = self._stdout_log(tmp_path).read_text(encoding="utf-8")
+        assert "Starting Wave Execution" in log, "the pre-kill narrative survives"
+        assert "TIMEOUT TASK-BMW-001: guardkit task clock fired" in log, (
+            "the killed build's LAST WORDS are the evidence this lane exists "
+            "for — they used to be dropped on the floor"
+        )
+        assert "Traceback (most recent call last):" in log
+        assert 'File "orchestrator.py", line 1, in run' in log
+
+    @pytest.mark.asyncio
+    async def test_the_tail_reaches_the_monitor_not_just_the_log(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recovered lines are LIVENESS input, not just bytes on disk."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-007": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, "0.05")
+        proc = _LiveFakeProc(
+            [],
+            tail_lines=[
+                b"\xe2\x96\xb6 Executing TASK-BMW-007: the one that died\n",
+                b"INFO:guardkit.orchestrator.progress:[t] Completed turn 9: "
+                b"feedback - still red\n",
+            ],
+        )
+
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+
+        manifest = json.loads(
+            (
+                tmp_path / "receipts" / BUILD_ID / ar.FAILURE_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+        state = manifest["semantic_state_at_kill"]
+        assert state["last_turn"] == 9, (
+            "turn 9 was announced ONLY in the post-kill tail — without the "
+            "bounded read the pack would say turn=?"
+        )
+        assert state["last_decision"] == "feedback"
+        assert "turn=9" in state["description"]
+        assert "TASK-BMW-007" in state["stdout_task_ids"]
+
+    @pytest.mark.asyncio
+    async def test_the_budget_cap_kill_keeps_its_tail_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FEAT-UBS-002's cap takes the SAME branch — and the D659 gate holds."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.delenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, raising=False)
+        proc = _LiveFakeProc(
+            [], tail_lines=[b"the last thing the capped build ever said\n"]
+        )
+
+        result = await _run_node(
+            _launch_state(
+                budget={"max_wallclock_seconds": 0.05, "profile_name": "unattended"}
+            ),
+            proc=proc,
+            worktree=worktree,
+            repo=repo,
+        )
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["budget_cap_killed"] is True, (
+            "the tail read must not disturb the D659 breach gate"
+        )
+        assert "the last thing the capped build ever said" in self._stdout_log(
+            tmp_path
+        ).read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_the_wedge_path_is_not_double_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NEGATIVE CONTROL: the wedge already drained to EOF — leave it alone.
+
+        Its kill does not go through ``wait_for``, so no tail read runs; the
+        drain reads these lines itself, exactly once each, exactly as before.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        _force_wedge(monkeypatch)
+        proc = _LiveFakeProc([], tail_lines=[b"post-kill line\n"])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        assert proc.killed is True
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "failed"
+        lines = self._stdout_log(tmp_path).read_text(encoding="utf-8").splitlines()
+        assert lines.count("post-kill line") == 1, (
+            "the wedge path must read its tail once — not twice"
+        )
+        assert (
+            len([line for line in lines if line.startswith(ar.STDOUT_RUN_HEADER_PREFIX)])
+            == 1
+        ), "one run, one header"
+
+    @pytest.mark.asyncio
+    async def test_a_silent_tail_leaves_the_log_exactly_as_before(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BYTE-IDENTITY control: nothing buffered, nothing new written."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, "0.05")
+        proc = _LiveFakeProc([b"only line the build ever printed\n"])
+
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+
+        lines = self._stdout_log(tmp_path).read_text(encoding="utf-8").splitlines()
+        assert lines[0].startswith(ar.STDOUT_RUN_HEADER_PREFIX)
+        assert lines[1:] == ["only line the build ever printed"]
+        assert len(lines) == 2, "the tail read must add nothing when there is none"
+
+
+class TestTailReadCannotAlterTheTerminal:
+    """The tee's standing posture: best-effort, never load-bearing."""
+
+    @pytest.mark.asyncio
+    async def test_a_hung_tail_expires_into_one_warning(self, tmp_path: Path) -> None:
+        """A kill that did not take must not hold the terminal for ever."""
+
+        class _NeverEnds:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(3600)
+                return b""
+
+        class _Proc:
+            stdout = _NeverEnds()
+
+        tee = ar._StdoutTee(tmp_path / "pack" / ar.STDOUT_LOG_NAME)
+        with caplog_at_warning() as records:
+            recovered = await ar._drain_tail(
+                _Proc(), tee, None, budget=0.01, feature_id=FEATURE_ID
+            )
+
+        assert recovered == 0
+        assert any("post-kill tail read stopped" in message for message in records)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_monitor_stops_the_tail_without_raising(
+        self, tmp_path: Path
+    ) -> None:
+        class _OneLine:
+            def __init__(self) -> None:
+                self._lines = [b"a line\n"]
+
+            async def readline(self) -> bytes:
+                return self._lines.pop(0) if self._lines else b""
+
+        class _Proc:
+            stdout = _OneLine()
+
+        class _AngryMonitor:
+            def note_stdout_line(self, line: str) -> None:
+                raise RuntimeError("monitor defect")
+
+        tee = ar._StdoutTee(tmp_path / "pack" / ar.STDOUT_LOG_NAME)
+        with caplog_at_warning() as records:
+            recovered = await ar._drain_tail(
+                _Proc(),
+                tee,
+                _AngryMonitor(),  # type: ignore[arg-type]
+                feature_id=FEATURE_ID,
+            )
+
+        assert recovered == 0
+        assert any("post-kill tail read stopped" in message for message in records)
+
+    @pytest.mark.asyncio
+    async def test_a_process_without_a_pipe_is_a_no_op(self, tmp_path: Path) -> None:
+        class _Proc:
+            stdout = None
+
+        tee = ar._StdoutTee(tmp_path / "pack" / ar.STDOUT_LOG_NAME)
+        assert await ar._drain_tail(_Proc(), tee, None) == 0
+        assert not (tmp_path / "pack" / ar.STDOUT_LOG_NAME).exists()
+
+    def test_the_budget_is_named_not_folklore(self) -> None:
+        assert ar.TAIL_READ_BUDGET_SECONDS == 5.0
+        assert "TAIL_READ_BUDGET_SECONDS" in ar.__all__
+
+    @pytest.mark.asyncio
+    async def test_a_slow_tail_cannot_relabel_a_timeout_as_a_wedge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tail read must not WIDEN the leaked-pid race — it closes it.
+
+        If the kill does not take, ``returncode`` stays None and the wedge
+        watch keeps polling. A poll landing during the tail read would stamp a
+        wall-clock death as a WEDGE — a lie about which death this was, and
+        one the timeout-truth lane would then carry onto the row. The watch is
+        therefore stopped BEFORE the tail read.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        # The clock must fire FIRST and the poll must land during the reap /
+        # tail read — so the wall clock is short and the poll interval is long.
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, "0.01")
+        monkeypatch.setenv(bm.BUILD_MONITOR_POLL_ENV, "0.05")
+        _force_wedge(monkeypatch)  # every poll tick says WEDGED
+
+        class _LeakyFakeProc(_LiveFakeProc):
+            """A kill that does not take: the reap returns, returncode stays None."""
+
+            def kill(self) -> None:
+                self.killed = True
+                self._done.set()  # the reap completes...
+                # ...but returncode is deliberately NOT set, so the watch loop
+                # still believes the process is alive.
+
+        async def _slow_tail(*_args: Any, **_kwargs: Any) -> int:
+            await asyncio.sleep(0.2)  # ~20 poll ticks at the fixture's 0.01s
+            return 0
+
+        monkeypatch.setattr(ar, "_drain_tail", _slow_tail)
+        proc = _LeakyFakeProc([])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        reason = result["async_tasks"][FEATURE_ID]["error_message"]
+        assert "insanity bound" in reason, (
+            "the wall clock fired — the terminal must say so"
+        )
+        assert not reason.startswith("wedged:"), (
+            "a poll landing during the tail read must not relabel this death"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TIMEOUT TRUTH — the runner stamps WHICH death this was
+# ---------------------------------------------------------------------------
+#
+# The residue (Sunday handoff §4.4): five structurally different terminal
+# causes all left this node as one thing — a ``failed`` snapshot whose only
+# distinguishing carrier was a prose string. These tests drive all five through
+# the real node and pin what each one now leaves behind, including the one that
+# must leave NOTHING new.
+
+
+def _append_progress_line(worktree: Path, task_id: str, line: str) -> None:
+    """Append a raw record to a task's progress.log inside the worktree."""
+    path = worktree / ".guardkit" / "autobuild" / task_id / "progress.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def _read_manifest(tmp_path: Path) -> dict[str, Any]:
+    return json.loads(
+        (tmp_path / "receipts" / BUILD_ID / ar.FAILURE_MANIFEST_NAME).read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+class TestTerminalClass:
+    @pytest.mark.asyncio
+    async def test_a_monitor_kill_is_classed_timeout_wedge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        _force_wedge(monkeypatch)
+        proc = _LiveFakeProc([])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["terminal_class"] == bm.TERMINAL_CLASS_WEDGE
+        manifest = _read_manifest(tmp_path)
+        assert manifest["terminal_class"] == bm.TERMINAL_CLASS_WEDGE
+        assert "monitor" in manifest["terminal_class_evidence"]
+        assert manifest["evidence"]["terminal_class"] == bm.TERMINAL_CLASS_WEDGE
+        # The pre-lane fields keep their EXACT meanings beside the new one.
+        assert manifest["timed_out"] is False, (
+            "``timed_out`` still means 'the runner's own arm fired' — a wedge "
+            "kill is not that, and nothing already reading it may shift"
+        )
+        assert manifest["wedged"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_budget_cap_kill_is_classed_AND_still_arms_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The D659 gate is load-bearing: the new class must not displace it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.delenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, raising=False)
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        result = await _run_node(
+            _launch_state(
+                budget={"max_wallclock_seconds": 0.05, "profile_name": "unattended"}
+            ),
+            proc=proc,
+            worktree=worktree,
+            repo=repo,
+        )
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["terminal_class"] == bm.TERMINAL_CLASS_BUDGET_CAP
+        assert snap["budget_cap_killed"] is True, (
+            "TASK-GATE-D659 must still arm — the class rides BESIDE the "
+            "cap-kill marker, never instead of it"
+        )
+        assert _read_manifest(tmp_path)["terminal_class"] == (
+            bm.TERMINAL_CLASS_BUDGET_CAP
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_insanity_bound_expiry_is_classed_wall_clock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_TIMEOUT_ENV, "0.05")
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["terminal_class"] == bm.TERMINAL_CLASS_WALL_CLOCK
+        assert "budget_cap_killed" not in snap
+        manifest = _read_manifest(tmp_path)
+        assert manifest["terminal_class"] == bm.TERMINAL_CLASS_WALL_CLOCK
+        assert manifest["timed_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_guardkit_in_band_timeout_is_no_longer_a_plain_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """THE ONE THAT USED TO BE INVISIBLE.
+
+        No forge-side clock fires. guardkit's own task clock does, writes a
+        TIMEOUT marker to the task's progress.log, and exits non-zero. Before
+        this lane that was byte-indistinguishable from a compile error.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        _append_progress_line(
+            worktree,
+            "TASK-BMW-003",
+            "[2026-08-07T10:40:00] TIMEOUT TASK-BMW-003: elapsed=2400s",
+        )
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        async def _exit_nonzero_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(2)
+
+        finisher = asyncio.ensure_future(_exit_nonzero_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["lifecycle"] == "failed"
+        assert snap["terminal_class"] == bm.TERMINAL_CLASS_IN_BAND
+        # The prose the operator reads is UNCHANGED, byte for byte.
+        assert snap["error_message"].startswith("guardkit autobuild exit=2")
+        manifest = _read_manifest(tmp_path)
+        assert manifest["terminal_class"] == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-BMW-003" in manifest["terminal_class_evidence"]
+        assert manifest["timed_out"] is False, (
+            "no FORGE-side clock fired; the flag keeps its exact old meaning"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_events_jsonl_failure_category_also_proves_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        events = worktree / ".guardkit" / "autobuild" / FEATURE_ID / "events.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(
+            json.dumps(
+                {"task_id": "TASK-BMW-003", "failure_category": "sdk_timeout"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        async def _exit_nonzero_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(1)
+
+        finisher = asyncio.ensure_future(_exit_nonzero_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        assert result["async_tasks"][FEATURE_ID]["terminal_class"] == (
+            bm.TERMINAL_CLASS_IN_BAND
+        )
+
+
+class TestOrdinaryFailuresAreBYTE_IDENTICAL:
+    """THE CONTROL. ``error`` is never written — its absence IS its value.
+
+    Every failure route this lane did not teach anything new must emit exactly
+    the snapshot it emitted before. If this test ever needs relaxing, the lane
+    stopped being additive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_plain_nonzero_exit_stamps_no_class_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0
+        )
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        async def _exit_nonzero_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(1)
+
+        finisher = asyncio.ensure_future(_exit_nonzero_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["lifecycle"] == "failed"
+        assert "terminal_class" not in snap, (
+            "an ordinary broken build gets a byte-identical snapshot: the "
+            "class vocabulary never writes 'error'"
+        )
+        assert snap["error_message"].startswith("guardkit autobuild exit=1")
+        # The PACK, unlike the snapshot, always states it — a forensic record
+        # read by a human is exactly where "no clock fired at all" is worth
+        # writing down.
+        manifest = _read_manifest(tmp_path)
+        assert manifest["terminal_class"] == bm.TERMINAL_CLASS_ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_build_snapshot_is_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-001": "completed"}, tasks_completed=1
+        )
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["lifecycle"] == "running_wave"
+        assert "terminal_class" not in snap
+
+
+class TestTheClassSurvivesTheFailedTerminal:
+    """The fast-failure replay path — where the cap-kill marker was lost once."""
+
+    def test_the_terminal_carries_the_class_forward(self) -> None:
+        state = {
+            "messages": _launch_state()["messages"],
+            "async_tasks": {
+                FEATURE_ID: {
+                    "error_message": "guardkit autobuild exit=2",
+                    "terminal_class": bm.TERMINAL_CLASS_IN_BAND,
+                    "tasks_failed": 1,
+                }
+            },
+        }
+        refreshed = ar._node_failed(state)["async_tasks"][FEATURE_ID]  # type: ignore[arg-type]
+        assert refreshed["terminal_class"] == bm.TERMINAL_CLASS_IN_BAND
+
+    def test_an_unclassified_terminal_stays_unclassified(self) -> None:
+        state = {
+            "messages": _launch_state()["messages"],
+            "async_tasks": {
+                FEATURE_ID: {
+                    "error_message": "guardkit autobuild exit=1",
+                    "tasks_failed": 1,
+                }
+            },
+        }
+        refreshed = ar._node_failed(state)["async_tasks"][FEATURE_ID]  # type: ignore[arg-type]
+        assert "terminal_class" not in refreshed
+
+
+# ---------------------------------------------------------------------------
+# THE IN-FLIGHT STAGE ROW (design §h stage 1) — published mid-build, gone after
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightHeartbeatLifecycle:
+    """The runner publishes the monitor's state WHILE the build runs.
+
+    ``tests/forge/test_build_monitor.py`` proves the payload and the write as
+    units. What this class proves is the lifecycle the runner owns: the file
+    exists while the subprocess is alive, it is gone the moment the build
+    reaches a terminal, and a build running without the monitor writes nothing
+    at all.
+
+    Existence is captured at the CLEAR call rather than by racing the loop from
+    the test: that is the last instant the file is legitimately there, so a
+    False reading is unambiguous evidence it was never published.
+    """
+
+    @staticmethod
+    def _watch_the_clear(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        """Record whether the heartbeat existed when the terminal cleared it."""
+        seen: dict[str, Any] = {"existed": None, "path": None, "payload": None}
+        real_clear = bm.clear_in_flight
+
+        def _recording_clear(path: Path) -> None:
+            seen["path"] = Path(path)
+            seen["existed"] = Path(path).exists()
+            if seen["existed"]:
+                seen["payload"] = json.loads(Path(path).read_text(encoding="utf-8"))
+            real_clear(path)
+
+        monkeypatch.setattr(ar.build_monitor, "clear_in_flight", _recording_clear)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_a_running_build_publishes_its_stage_and_the_terminal_clears_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree,
+            statuses={
+                "TASK-BMW-001": "completed",
+                "TASK-BMW-002": "completed",
+                "TASK-BMW-003": "in_progress",
+            },
+            tasks_completed=2,
+            current_wave=2,
+        )
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc(
+            [
+                b"Starting Wave Execution (task timeout: 40 min)\n",
+                b"Wave 2/2: TASK-BMW-003\n",
+                b"\xe2\x96\xb6 Executing TASK-BMW-003: the live one\n",
+                b"INFO:guardkit.orchestrator.progress:[t] Completed turn 4: "
+                b"feedback - still red\n",
+            ]
+        )
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.2)  # ~20 poll ticks at the 0.01s cadence
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "running_wave"
+        expected = tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME
+        assert seen["path"] == expected, (
+            "the heartbeat must live in the pack directory the tee already owns"
+        )
+        assert seen["existed"] is True, (
+            "a RUNNING build published nothing — the STAGE cell would still "
+            "read '—', which is the defect this lane closes"
+        )
+        assert seen["payload"]["build_id"] == BUILD_ID
+        assert seen["payload"]["feature_id"] == FEATURE_ID
+        assert seen["payload"]["last_task_id"] == "TASK-BMW-003"
+        assert seen["payload"]["last_turn"] == 4
+        assert seen["payload"]["current_wave"] == 2
+        assert not expected.exists(), (
+            "a heartbeat that outlives its build claims a liveness nobody has"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_heartbeat_appears_before_the_first_poll_tick(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At the 60s production cadence, waiting for tick one would leave the
+        operator staring at ``—`` for exactly the minute they look."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "in_progress"}, tasks_completed=0)
+        monkeypatch.setenv(bm.BUILD_MONITOR_POLL_ENV, "3600")  # tick one never lands
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([b"Starting Wave Execution (task timeout: 40 min)\n"])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.1)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+        await finisher
+
+        assert seen["existed"] is True
+        assert seen["payload"]["feature_id"] == FEATURE_ID
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_build_leaves_no_heartbeat_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kill path is a terminal like any other."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        _force_wedge(monkeypatch)
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([b"Starting Wave Execution (task timeout: 40 min)\n"])
+
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "failed"
+        assert seen["existed"] is True, "the last live state is worth publishing"
+        assert not (tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_monitor_disabled_build_writes_no_heartbeat_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kill switch turns off the whole lane, publishing included."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "completed"}, tasks_completed=1)
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        seen = self._watch_the_clear(monkeypatch)
+        proc = _LiveFakeProc([])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        await _run_node(_launch_state(), proc=proc, worktree=worktree, repo=repo)
+        await finisher
+
+        assert seen["existed"] is False
+        assert not (tmp_path / "receipts" / BUILD_ID / ar.IN_FLIGHT_STATE_NAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_receipts_root_never_regresses_the_build(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A status decoration must never be able to fail a build."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(worktree, statuses={"TASK-BMW-001": "completed"}, tasks_completed=1)
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(blocked))
+        proc = _LiveFakeProc([])
+
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.1)
+            proc.finish(0)
+
+        finisher = asyncio.ensure_future(_finish_later())
+        try:
+            result = await _run_node(
+                _launch_state(), proc=proc, worktree=worktree, repo=repo
+            )
+        finally:
+            blocked.chmod(0o700)
+        await finisher
+
+        assert result["async_tasks"][FEATURE_ID]["lifecycle"] == "running_wave"
+        assert proc.killed is False

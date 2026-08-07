@@ -236,6 +236,17 @@ class BuildRow(BaseModel):
     # — and a daemon that restarts mid-journey — can name the same subject.
     # ``None`` for every Mode A / Mode B build and every historical row.
     task_id: str | None = None
+    # Monitored-supervision lane / timeout truth (``schema_v9.sql``) — WHICH
+    # of the five deaths a FAILED build died: the semantic monitor's kill, the
+    # budget cap's kill, the runner's own wall clock, guardkit's in-band task
+    # clock, or none of those (an ordinary broken build). One of
+    # ``forge.subagents.build_monitor.TERMINAL_CLASSES``.
+    #
+    # ``None`` means NOT CLASSIFIED, and that is the common case by design:
+    # every historical row, every non-failed build, and every ORDINARY failure
+    # (the runner never writes the ``error`` class — its absence is its value).
+    # ``status`` is untouched by this column: a timeout is still ``FAILED``.
+    terminal_class: str | None = None
 
 
 class BuildStatusView(BaseModel):
@@ -260,6 +271,11 @@ class BuildStatusView(BaseModel):
     # so operators can see at a glance whether a build is Mode A / B / C
     # without joining against the full ``BuildRow``.
     mode: BuildMode = BuildMode.MODE_A
+    # Timeout truth (``schema_v9.sql``) — rendered by ``forge status`` as the
+    # CLASS column so an operator can tell "this ran out of time" from "this
+    # is broken" without opening the failure pack. ``None`` renders as a dash:
+    # not classified, which is what every ordinary FAILED build stays.
+    terminal_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,13 +338,18 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "mode",
             "profile",
             # The additive columns, in ``ALTER TABLE`` order — which is the
-            # order SQLite returns them for ``SELECT *``: v6, v7, then v8's
-            # ``task_id`` (the fix journey's durable subject). The tail was
-            # short by two before v8 added a third, which would have shifted
-            # ``task_id`` onto ``last_coach_score``'s value.
+            # order SQLite returns them for ``SELECT *``: v6, v7, v8's
+            # ``task_id`` (the fix journey's durable subject), then v9's
+            # ``terminal_class`` (timeout truth). The tail was short by two
+            # before v8 added a third, which would have shifted ``task_id``
+            # onto ``last_coach_score``'s value. EVERY future ALTER TABLE
+            # must append here in the same breath — this tuple is positional,
+            # so an omission silently reads the WRONG COLUMN's value rather
+            # than failing.
             "last_coach_score",
             "budget_breach",
             "task_id",
+            "terminal_class",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -365,6 +386,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         mode=BuildMode(data.get("mode") or BuildMode.MODE_A.value),
         profile=data.get("profile"),
         task_id=data.get("task_id"),
+        terminal_class=data.get("terminal_class"),
     )
 
 
@@ -378,6 +400,13 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         raw_mode = row["mode"]
     except (IndexError, KeyError):
         raw_mode = None
+    # Same tolerance for v9's ``terminal_class``: a projection built before
+    # this lane (or a database that has not yet run the v9 migration) simply
+    # has no such key, and "not classified" is the honest read.
+    try:
+        raw_terminal_class = row["terminal_class"]
+    except (IndexError, KeyError):
+        raw_terminal_class = None
     return BuildStatusView(
         build_id=row["build_id"],
         feature_id=row["feature_id"],
@@ -392,6 +421,7 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         pr_url=row["pr_url"],
         error=row["error"],
         mode=BuildMode(raw_mode) if raw_mode else BuildMode.MODE_A,
+        terminal_class=str(raw_terminal_class) if raw_terminal_class else None,
     )
 
 
@@ -1089,6 +1119,114 @@ class SqliteLifecyclePersistence:
             raise
 
     # ------------------------------------------------------------------
+    # Write API — record_terminal_class (timeout truth, schema_v9)
+    # ------------------------------------------------------------------
+
+    def record_terminal_class(self, build_id: str, terminal_class: str) -> None:
+        """Land WHICH of the five deaths a FAILED build died.
+
+        Write side of the terminal-class store (``schema_v9.sql``). The
+        lifecycle-bridge observer calls this when a ``build-failed`` envelope
+        arrives carrying the runner's class marker, with ``terminal_class`` one
+        of ``forge.subagents.build_monitor.TERMINAL_CLASSES``.
+
+        WHAT THIS EXISTS FOR. ``builds.status`` spells five different deaths
+        the same way — ``FAILED`` — so nothing downstream could tell a build
+        that ran out of time from a build that is broken, which are opposite
+        verdicts with opposite next actions. This column is the machine-
+        readable difference, and it is strictly BESIDE ``status``, never
+        instead of it.
+
+        **First-write-wins** — the UPDATE carries
+        ``AND terminal_class IS NULL``, exactly like
+        :meth:`record_budget_breach`. The first classification of a build is
+        the true one: a JetStream redelivery, a fetch-on-empty replay of the
+        same terminal, or a second observer racing the first all re-present
+        the SAME verdict, and a later write could only be a duplicate or a
+        degradation. A build already classified (or one that does not exist)
+        matches zero rows and is a quiet no-op.
+
+        This is a **status-preserving** UPDATE of ``terminal_class`` alone. It
+        never touches ``status`` — a timeout stays ``FAILED`` — honouring this
+        estate's honesty law: a recorder records what it observed, it does not
+        mint a state it did not effect. ``apply_transition`` remains the sole
+        ``builds.status`` writer.
+
+        The ``error`` class is deliberately NOT expected here: the runner never
+        stamps it, so an ordinary failure never reaches this method and its row
+        keeps a NULL ``terminal_class``, which reads as "not classified". An
+        empty value is refused rather than written as a meaningless marker.
+
+        Args:
+            build_id: The build being classified.
+            terminal_class: The closed-vocabulary class (see
+                ``build_monitor.TERMINAL_CLASSES``).
+
+        Raises:
+            ValueError: If ``build_id`` or ``terminal_class`` is empty.
+            sqlite3.Error: For any database error. The transaction is rolled
+                back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("record_terminal_class: build_id must be non-empty")
+        if not terminal_class:
+            raise ValueError("record_terminal_class: terminal_class must be non-empty")
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET terminal_class = ?
+                 WHERE build_id = ?
+                   AND terminal_class IS NULL
+                """,
+                (terminal_class, build_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
+    # Read API — read_terminal_class (timeout truth, schema_v9)
+    # ------------------------------------------------------------------
+
+    def read_terminal_class(self, build_id: str) -> str | None:
+        """Return the build's recorded terminal class, or ``None``.
+
+        Read side of the terminal-class store (``schema_v9.sql``). ``None``
+        means NOT CLASSIFIED — which covers a healthy build, an ordinary
+        failure (the runner never writes the ``error`` class), and every
+        historical row that pre-dates the column. It never means "this was not
+        a timeout" with any authority beyond "nothing said it was".
+
+        Args:
+            build_id: The build whose class is being read.
+
+        Returns:
+            The recorded class as a ``str``, or ``None`` if unset or the build
+            does not exist.
+
+        Raises:
+            ValueError: If ``build_id`` is empty.
+        """
+        if not build_id:
+            raise ValueError("read_terminal_class: build_id must be non-empty")
+        with self._reader() as cx:
+            row = cx.execute(
+                "SELECT terminal_class FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["terminal_class"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(value) if value is not None else None
+
+    # ------------------------------------------------------------------
     # Write API — clear_budget_breach (FEAT-UBS-002 stage 3, GATE)
     # ------------------------------------------------------------------
 
@@ -1335,7 +1473,7 @@ class SqliteLifecyclePersistence:
 
         active_sql = f"""
             SELECT build_id, feature_id, status, queued_at, started_at,
-                   completed_at, pr_url, error, mode
+                   completed_at, pr_url, error, mode, terminal_class
               FROM builds
              WHERE status IN ({active_placeholders})
                    {feature_clause_active}
@@ -1343,7 +1481,7 @@ class SqliteLifecyclePersistence:
         """
         terminal_sql = f"""
             SELECT build_id, feature_id, status, queued_at, started_at,
-                   completed_at, pr_url, error, mode
+                   completed_at, pr_url, error, mode, terminal_class
               FROM builds
              WHERE status IN ({terminal_placeholders})
                    {feature_clause_terminal}

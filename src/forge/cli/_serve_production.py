@@ -69,6 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
         BuildIdResolver,
         BuildStateRecorder,
         IdentityProvider,
+        TerminalClassRecorder,
     )
     from forge.pipeline.supervisor import BuildModeReader
 
@@ -191,6 +192,12 @@ class LifecycleBridgeWireupParts:
     # silent stuck build. Optional for the same reason as the resolver:
     # unit-tier parts constructions never reach the watchdog branch.
     build_mode_reader: "BuildModeReader | None" = None
+    # Timeout truth (2026-08-07) — the durable sink for WHICH of the five
+    # deaths a FAILED build died (``builds.terminal_class``, schema_v9).
+    # Optional for the same reason as the two above: unit-tier parts
+    # constructions publish no classified terminal, and a missing recorder is
+    # a quiet no-op, never a hole in an enforcement path.
+    terminal_class_recorder: "TerminalClassRecorder | None" = None
 
 
 def _build_async_tasks_identity_provider(
@@ -418,6 +425,12 @@ def _build_lifecycle_bridge_wireup_parts(
 
     build_mode_reader = SqliteBuildModeReader(sqlite_pool)
 
+    # Timeout truth (2026-08-07) — bind the durable class sink to the SAME
+    # shared facade every other write goes through (no second connection). The
+    # SQL is first-write-wins and status-preserving, so a redelivered terminal
+    # re-recording the same verdict changes nothing.
+    terminal_class_recorder = sqlite_pool.record_terminal_class
+
     return LifecycleBridgeWireupParts(
         bridge=bridge,
         translator=translator,
@@ -429,6 +442,7 @@ def _build_lifecycle_bridge_wireup_parts(
         registry=registry,
         build_id_resolver=build_id_resolver,
         build_mode_reader=build_mode_reader,
+        terminal_class_recorder=terminal_class_recorder,
     )
 
 

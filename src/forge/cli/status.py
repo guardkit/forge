@@ -42,7 +42,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Iterable
 
@@ -53,6 +53,8 @@ from rich.table import Table
 
 from forge.adapters.sqlite.connect import read_only_connect
 from forge.lifecycle.modes import BuildMode
+from forge.receipts import IN_FLIGHT_STATE_NAME, receipts_root
+from forge.subagents.build_monitor import resolve_poll_interval_seconds
 from forge.lifecycle.persistence import (
     ACTIVE_STATES,
     BuildStatusView,
@@ -96,6 +98,11 @@ _TERMINAL_STATES: Final[tuple[BuildState, ...]] = (
     BuildState.CANCELLED,
     BuildState.SKIPPED,
 )
+
+#: How many monitor poll intervals a heartbeat may age before the STAGE cell
+#: stops presenting it as live (see :func:`_in_flight_is_stale`). One interval
+#: for the cadence, two for slack.
+_STALE_POLL_MULTIPLIER: Final[float] = 3.0
 
 #: Environment variable used to point the CLI at a non-default db path.
 _FORGE_DB_PATH_ENV: Final[str] = "FORGE_DB_PATH"
@@ -155,12 +162,18 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
     additive migration in ``schema_v2.sql``) by defaulting to
     :attr:`BuildMode.MODE_A`. This keeps ``forge status`` working through
     the upgrade window and on databases that have not yet run the v2
-    migration.
+    migration. ``terminal_class`` (``schema_v9.sql``) gets exactly the same
+    tolerance: a database that has not run v9 has no such column, and "not
+    classified" is the honest read.
     """
     try:
         raw_mode = row["mode"]
     except (IndexError, KeyError):
         raw_mode = None
+    try:
+        raw_terminal_class = row["terminal_class"]
+    except (IndexError, KeyError):
+        raw_terminal_class = None
     return BuildStatusView(
         build_id=row["build_id"],
         feature_id=row["feature_id"],
@@ -175,7 +188,40 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         pr_url=row["pr_url"],
         error=row["error"],
         mode=BuildMode(raw_mode) if raw_mode else BuildMode.MODE_A,
+        terminal_class=str(raw_terminal_class) if raw_terminal_class else None,
     )
+
+
+#: Columns the projection always names.
+_BASE_PROJECTION: Final[str] = (
+    "build_id, feature_id, status, queued_at, started_at, "
+    "completed_at, pr_url, error, mode"
+)
+
+
+def _status_projection(cx: sqlite3.Connection) -> str:
+    """The SELECT column list, widened only where the database can serve it.
+
+    THE UPGRADE WINDOW IS REAL. The CLI never migrates — the ``forge serve``
+    daemon does, at boot. So there is a genuine interval in which a freshly
+    installed forge reads a database that is still on the previous schema, and
+    naming ``terminal_class`` unconditionally would turn ``forge status`` into
+    a hard error ("no such column") for exactly the operator who is mid-
+    upgrade and most wants to see what is running.
+
+    One ``PRAGMA table_info`` per invocation buys the answer. An unreadable
+    pragma degrades the same way a missing column does: to the narrow
+    projection, which every version of the schema can serve.
+    """
+    try:
+        columns = {row[1] for row in cx.execute("PRAGMA table_info(builds)")}
+    except sqlite3.Error:  # pragma: no cover — a pragma failure means the
+        # whole read is about to fail anyway; degrade rather than add a
+        # second, more confusing error on the way there.
+        return _BASE_PROJECTION
+    if "terminal_class" in columns:
+        return f"{_BASE_PROJECTION}, terminal_class"
+    return _BASE_PROJECTION
 
 
 def _query_status_views(
@@ -192,11 +238,11 @@ def _query_status_views(
       :data:`_RECENT_TERMINAL_LIMIT` terminal builds, sorted globally
       newest-first by ``queued_at`` (AC-001).
     """
+    projection = _status_projection(cx)
     if feature_id:
         rows = cx.execute(
-            """
-            SELECT build_id, feature_id, status, queued_at, started_at,
-                   completed_at, pr_url, error, mode
+            f"""
+            SELECT {projection}
               FROM builds
              WHERE feature_id = ?
              ORDER BY queued_at DESC
@@ -211,15 +257,13 @@ def _query_status_views(
     terminal_placeholders = ",".join(["?"] * len(terminal_values))
 
     active_sql = f"""
-        SELECT build_id, feature_id, status, queued_at, started_at,
-               completed_at, pr_url, error, mode
+        SELECT {projection}
           FROM builds
          WHERE status IN ({active_placeholders})
          ORDER BY queued_at DESC
     """
     terminal_sql = f"""
-        SELECT build_id, feature_id, status, queued_at, started_at,
-               completed_at, pr_url, error, mode
+        SELECT {projection}
           FROM builds
          WHERE status IN ({terminal_placeholders})
          ORDER BY queued_at DESC
@@ -386,6 +430,83 @@ def _all_terminal(views: Iterable[BuildStatusView]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _read_in_flight(build_id: str) -> dict[str, Any] | None:
+    """Read a running build's in-flight heartbeat, or ``None``.
+
+    Written by the build monitor's poll loop into
+    ``<receipts>/<build_id>/in-flight.json`` (see
+    :data:`forge.receipts.IN_FLIGHT_STATE_NAME`). ANY failure — no file, no
+    directory, unreadable, malformed, not a JSON object — is "absent", because
+    the only honest fallback for a status cell is the one it had before this
+    lane: ``—``. A status table must never fail over a decoration.
+    """
+    try:
+        path = receipts_root() / build_id / IN_FLIGHT_STATE_NAME
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _in_flight_is_stale(
+    payload: dict[str, Any], *, now: datetime | None = None
+) -> bool:
+    """Is this heartbeat too old to be presented as live?
+
+    THE FENCE. The heartbeat is republished once per monitor poll (60s by
+    default), so a file older than a few polls means the writer stopped without
+    cleaning up — a killed sidecar, a lost container, a machine that went away.
+    Presenting that as the build's current stage would be the pipeline claiming
+    a liveness it cannot see, which is the one thing this lane must not do.
+
+    Three poll intervals of grace: one for the cadence itself, two for a slow
+    filesystem or a poll that overran. A missing or unparseable ``updated_at``
+    is stale by definition — an unstamped heartbeat proves nothing about when.
+    """
+    raw = payload.get("updated_at")
+    if not isinstance(raw, str):
+        return True
+    try:
+        stamped = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    age = (reference - stamped).total_seconds()
+    return age > _STALE_POLL_MULTIPLIER * resolve_poll_interval_seconds()
+
+
+def _in_flight_stage_cell(payload: dict[str, Any]) -> str:
+    """Render one heartbeat as the STAGE cell's text.
+
+    Short on purpose — it shares a row with six other columns. The task id and
+    the turn are what an operator acts on ("it has been on TASK-X turn 4 for
+    twenty minutes"); the wave rides along when the ledger knows it. A build
+    that has not named a task yet reads ``starting``, which is what it is.
+
+    A stale heartbeat says so IN THE CELL rather than being hidden or silently
+    presented as current: the operator can then tell "nothing has moved" from
+    "nobody is watching", and those have different next actions.
+    """
+    parts: list[str] = []
+    task_id = payload.get("last_task_id")
+    parts.append(str(task_id) if task_id else "starting")
+    turn = payload.get("last_turn")
+    if isinstance(turn, int):
+        parts.append(f"turn {turn}")
+    wave = payload.get("current_wave")
+    if isinstance(wave, int):
+        parts.append(f"wave {wave}")
+    cell = " ".join(parts)
+    if _in_flight_is_stale(payload):
+        return f"{cell} (stale)"
+    return cell
+
+
 def _format_dt(value: datetime | None) -> str:
     """Render a UTC datetime as ``HH:MM:SS`` for the table view."""
     if value is None:
@@ -412,11 +533,35 @@ def _build_table(
 ) -> Table:
     """Build a Rich table for the status view.
 
-    The columns mirror ``API-cli.md §4.3``. The STAGE cell is left as a
-    placeholder (the most recent ``stage_label``, when known) — live
-    autobuild progress (``API-cli.md §4.4``) is OUT OF SCOPE for this
-    feature; it requires the ``async_tasks`` channel from
-    FEAT-FORGE-007.
+    The columns mirror ``API-cli.md §4.3``.
+
+    THE STAGE CELL (in-flight stage row, 2026-08-07). It used to be a
+    placeholder: ``—`` for every running build, and the most recent completed
+    ``stage_label`` only under ``--full``. So the one question an operator asks
+    of a running build — *what is it doing right now?* — was the one question
+    the table could not answer, even though the build monitor derived the
+    answer on every poll and kept it only for the failure pack.
+
+    It is now filled, for NON-TERMINAL builds only, from that monitor's
+    heartbeat file (:func:`_read_in_flight`). Three rules keep it honest:
+
+    * an absent or unreadable heartbeat renders ``—``, byte-identically to
+      before — every terminal build, every historical row, every build run by
+      a forge that predates this lane;
+    * a heartbeat older than a few poll intervals renders as stale rather than
+      as live (:func:`_in_flight_is_stale`) — the table never claims a
+      liveness it cannot see;
+    * a terminal row never consults the file at all, so the completed-stage
+      behaviour under ``--full`` is untouched.
+
+    CLASS (timeout truth, 2026-08-07) answers the question STATUS cannot.
+    ``FAILED`` is one word for five different deaths — a monitor kill, a
+    budget-cap kill, a wall-clock expiry, a guardkit in-band timeout, and an
+    ordinary broken build — and "it ran out of time" versus "it is broken"
+    are opposite verdicts with opposite next actions. STATUS is untouched:
+    it still reads exactly ``FAILED``. CLASS renders ``—`` whenever the row
+    carries no class, which is every healthy build, every historical row,
+    and every ordinary failure.
     """
     table = Table(title="Forge build status")
     table.add_column("BUILD", overflow="fold")
@@ -427,6 +572,9 @@ def _build_table(
     # as ``mode-a`` per the additive migration default.
     table.add_column("MODE")
     table.add_column("STATUS")
+    # CLASS — WHICH death a FAILED build died (timeout truth, schema_v9).
+    # Sits BESIDE status, never instead of it.
+    table.add_column("CLASS")
     table.add_column("STAGE")
     table.add_column("STARTED")
     table.add_column("ELAPSED")
@@ -437,11 +585,19 @@ def _build_table(
             entries = full_stages.get(view.build_id, [])
             if entries:
                 stage_cell = entries[-1].stage_label
+        if stage_cell == "—" and view.status not in _TERMINAL_STATES:
+            # Only ever FILLS an empty cell, and only for a build that could
+            # still be running: a completed stage_log entry is a fact, and a
+            # heartbeat must not overwrite one.
+            in_flight = _read_in_flight(view.build_id)
+            if in_flight is not None:
+                stage_cell = _in_flight_stage_cell(in_flight)
         table.add_row(
             view.build_id,
             view.feature_id,
             view.mode.value,
             view.status.value,
+            view.terminal_class or "—",
             stage_cell,
             _format_dt(view.started_at),
             _elapsed(view),
@@ -509,8 +665,20 @@ def _emit_in_flight_json(entries: list[BridgeRegistryEntry], *, out: Console) ->
 
 
 def _serialise_view(view: BuildStatusView) -> dict[str, Any]:
-    """Round-trip a :class:`BuildStatusView` through Pydantic JSON mode."""
-    return json.loads(view.model_dump_json())
+    """Round-trip a :class:`BuildStatusView` through Pydantic JSON mode.
+
+    ``in_flight`` is attached ONLY when a non-terminal build has a readable
+    heartbeat — strictly additive, so every terminal row and every row on a
+    forge with no heartbeat serialises byte-identically to before this lane.
+    The ``stale`` flag rides inside it rather than being folded into the text,
+    because a machine consumer should not have to parse an adjective.
+    """
+    row = json.loads(view.model_dump_json())
+    if view.status not in _TERMINAL_STATES:
+        in_flight = _read_in_flight(view.build_id)
+        if in_flight is not None:
+            row["in_flight"] = {**in_flight, "stale": _in_flight_is_stale(in_flight)}
+    return row
 
 
 def _serialise_stage(entry: StageLogEntry) -> dict[str, Any]:

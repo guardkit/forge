@@ -419,6 +419,13 @@ def bind_production_dispatch_chain(
                 # and terminalises every mode-c build that outlives the
                 # per-build deadline (drive-5, 2026-08-04).
                 build_mode_reader=bridge_wireup_parts.build_mode_reader,
+                # Timeout truth — lands WHICH of the five deaths a FAILED
+                # build died on ``builds.terminal_class``. Without it the
+                # class rides the wire and vanishes, and ``forge status``
+                # keeps spelling all five deaths ``FAILED``.
+                terminal_class_recorder=(
+                    bridge_wireup_parts.terminal_class_recorder
+                ),
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
