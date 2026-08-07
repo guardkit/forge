@@ -1617,7 +1617,13 @@ class TestFingerprintIsUnchangedByTheNewField:
     def test_a_wedge_verdict_is_unchanged_by_a_timeout_marker(
         self, tmp_path: Path
     ) -> None:
-        """The golden: the detector's answer with and without the marker."""
+        """The class changes; the movement verdict does not (two monitors).
+
+        Honest scope note (coach, 2026-08-07): this drives two FRESH monitors,
+        so it cannot catch a marker kind leaking into ``fingerprint()`` between
+        polls of ONE monitor — the tuple-identity tests above pin that
+        mutation, and they are the mutation-proven guard.
+        """
         _write_feature(
             tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"}, tasks_completed=0
         )
@@ -2043,3 +2049,72 @@ class TestInFlightHeartbeat:
         assert verdict.wedged is True, (
             "a heartbeat must not have reset the silence clock"
         )
+
+
+class TestInBandEvidencePrecision:
+    """The two coach-proven false positives (2026-08-07) stay dead."""
+
+    @staticmethod
+    def _task(task_id: str, marker: str, mtime: float) -> "bm.TaskProgress":
+        return bm.TaskProgress(
+            task_id=task_id,
+            files_changed=1,
+            phase="Player",
+            markers=2,
+            decision=None,
+            mtime=mtime,
+            last_marker=marker,
+        )
+
+    def test_a_stale_timeout_marker_is_outranked_by_later_activity(self) -> None:
+        """An early timeout the build recovered from is NOT the death's class."""
+        stale = self._task("TASK-A", "TIMEOUT", mtime=100.0)
+        later = self._task("TASK-Z", "COMPLETE", mtime=900.0)
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=(stale, later),
+            last_event=None,
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+        assert "TIMEOUT" not in evidence
+
+    def test_the_freshest_timeout_marker_still_witnesses(self) -> None:
+        """The positive direction is untouched: a live timeout classifies."""
+        earlier = self._task("TASK-A", "COMPLETE", mtime=100.0)
+        fresh = self._task("TASK-Z", "TIMEOUT", mtime=900.0)
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=(earlier, fresh),
+            last_event=None,
+        )
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-Z" in evidence
+
+    def test_a_negated_category_is_not_a_timeout(self) -> None:
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=None,
+            last_event={"failure_category": "no_timeout_configured", "task_id": "T"},
+        )
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_an_affirming_category_still_witnesses(self) -> None:
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=None,
+            last_event={"failure_category": "sdk_timeout", "task_id": "T"},
+        )
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+        assert "sdk_timeout" in evidence

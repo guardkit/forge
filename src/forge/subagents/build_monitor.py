@@ -1159,6 +1159,25 @@ _IN_BAND_TIMEOUT_MARKER: str = "TIMEOUT"
 _IN_BAND_FAILURE_CATEGORIES: tuple[str, ...] = ("timeout", "timed_out", "timed out")
 
 
+def _names_a_timeout(lowered: str) -> bool:
+    """True when the category AFFIRMS a timeout, never when it negates one.
+
+    Substring generosity is deliberate — forge does not own guardkit's
+    vocabulary and wants no release coupling — but ``no_timeout_configured``
+    is not a timeout (coach-proven false positive, 2026-08-07): a negation
+    particle immediately before the token flips the meaning, so that shape is
+    rejected while every affirming shape still matches.
+    """
+    for token in _IN_BAND_FAILURE_CATEGORIES:
+        idx = lowered.find(token)
+        while idx != -1:
+            prefix = lowered[:idx]
+            if not re.search(r"(?:^|[^a-z])(?:no|not|non)[_\- ]?$", prefix):
+                return True
+            idx = lowered.find(token, idx + 1)
+    return False
+
+
 def _in_band_timeout_evidence(
     progress: "tuple[TaskProgress, ...] | None",
     last_event: Mapping[str, Any] | None,
@@ -1177,17 +1196,30 @@ def _in_band_timeout_evidence(
     the same as "not a timeout" — the caller degrades to the honest
     :data:`TERMINAL_CLASS_ERROR` rather than guessing.
     """
-    for item in progress or ():
-        if (item.last_marker or "").upper() == _IN_BAND_TIMEOUT_MARKER:
+    items = tuple(progress or ())
+    timed_out_items = [
+        item
+        for item in items
+        if (item.last_marker or "").upper() == _IN_BAND_TIMEOUT_MARKER
+    ]
+    if timed_out_items:
+        # The witness must be the MOST RECENTLY TOUCHED task, not merely the
+        # alphabetically first with a TIMEOUT marker (coach-proven false
+        # positive, 2026-08-07): a build where an early task hit guardkit's
+        # clock, recovered, and later died of an ordinary error is an ordinary
+        # error — a stale marker outranked by later activity is not evidence.
+        witness = max(timed_out_items, key=lambda item: item.mtime)
+        freshest_mtime = max(item.mtime for item in items)
+        if witness.mtime >= freshest_mtime:
             return (
-                f"{item.task_id}'s progress.log ends on a TIMEOUT marker — "
+                f"{witness.task_id}'s progress.log ends on a TIMEOUT marker — "
                 "guardkit abandoned the SDK call on its own clock"
             )
     if isinstance(last_event, Mapping):
         raw = last_event.get("failure_category")
         if isinstance(raw, str):
             lowered = raw.strip().lower()
-            if any(token in lowered for token in _IN_BAND_FAILURE_CATEGORIES):
+            if _names_a_timeout(lowered):
                 task = last_event.get("task_id")
                 subject = f" for {task}" if task else ""
                 return (
@@ -1968,6 +2000,14 @@ class BuildMonitor:
         tmp = target.with_name(f"{target.name}.tmp")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                # The FEAT-DRF pack posture (0700) from the first heartbeat,
+                # not deferred until the tee's first stdout line — the
+                # heartbeat names tasks and features (coach residue,
+                # 2026-08-07).
+                os.chmod(target.parent, 0o700)
+            except OSError:  # pragma: no cover — mode is a nicety
+                pass
             payload = self.in_flight_state(build_id=build_id)
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             try:
