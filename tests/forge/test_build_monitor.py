@@ -82,9 +82,11 @@ def _write_feature(
     last_updated: str = "2026-07-31T10:00:00",
     task_timeout: float | None = None,
     estimates: dict[str, int] | None = None,
+    file_paths: dict[str, str] | None = None,
 ) -> Path:
     """Write a ``.guardkit/features/<FEAT>.yaml`` in guardkit's real shape."""
     estimates = estimates or {}
+    file_paths = file_paths or {}
     path = root / bm.FEATURES_DIR / f"{feature_id}.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     doc: dict = {
@@ -101,6 +103,13 @@ def _write_feature(
                 **(
                     {"estimated_minutes": estimates[task_id]}
                     if task_id in estimates
+                    else {}
+                ),
+                # guardkit's FeatureTask also carries the task markdown's
+                # path; it is written back on every save.
+                **(
+                    {"file_path": file_paths[task_id]}
+                    if task_id in file_paths
                     else {}
                 ),
             }
@@ -470,6 +479,272 @@ class TestWindowDerivation:
             for record in caplog.records
             if "has not declared a per-task budget" in record.getMessage()
         ]
+
+
+# ---------------------------------------------------------------------------
+# THE DECLARED PER-TASK OVERRIDE — frontmatter.autobuild.task_timeout
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-01 wedge rehearsal's register item, verbatim: "the
+# `autobuild.task_timeout` frontmatter override never reached the window
+# derivation (W stayed on the 3000s default)". An operator declared a per-task
+# budget in the task markdown, guardkit enforced it, and the monitor's W was
+# derived as though it had not been declared at all.
+#
+# Why no other tier covers it: an explicit override REPLACES guardkit's
+# feature-level number AND its floor, so the reconstruction tier cannot see it;
+# and the per-task INFO line that announces it is printed only when guardkit
+# dispatches that task, so the whole prelude before that runs on the wrong W.
+
+
+def _write_task_markdown(
+    root: Path,
+    task_id: str,
+    *,
+    state: str = "backlog",
+    slug: str = "a-feature",
+    frontmatter: str | None = None,
+) -> Path:
+    """A task markdown where guardkit's own TaskLoader would find it."""
+    path = root / bm.TASKS_DIR / state / slug / f"{task_id}-do-a-thing.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = "id: %s\nstatus: pending\n" % task_id
+    if frontmatter:
+        block += frontmatter
+    path.write_text(f"---\n{block}---\n\n# {task_id}\n\nDo a thing.\n", encoding="utf-8")
+    return path
+
+
+_OVERRIDE_FRONTMATTER = "autobuild:\n  task_timeout: 7200\n"
+
+
+class TestFrontmatterOverrideReachesTheWindow:
+    """A task's DECLARED budget is a window input, not a log line to await."""
+
+    def test_a_declared_override_raises_the_window(self, tmp_path: Path) -> None:
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        baseline = bm.BuildMonitor(
+            root=tmp_path, feature_id="FEAT-BM", clock=_Clock()
+        )
+        baseline.poll()
+        assert baseline.window_seconds == 3120.0, "the 3000s-default look"
+
+        _write_task_markdown(tmp_path, "TASK-A", frontmatter=_OVERRIDE_FRONTMATTER)
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0  # 7200 × 1.0 + 120
+        assert monitor.window_source == bm.WINDOW_SOURCE_FRONTMATTER_OVERRIDE
+
+    def test_the_override_is_multiplied_exactly_as_guardkit_multiplies_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On the local M0 seat guardkit enforces override × 4.0."""
+        monkeypatch.setenv(bm.BACKEND_BASE_URL_ENV, "http://localhost:4000")
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        _write_task_markdown(tmp_path, "TASK-A", frontmatter=_OVERRIDE_FRONTMATTER)
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 7200 * 4.0 + 120.0
+        assert monitor.window_source == bm.WINDOW_SOURCE_FRONTMATTER_OVERRIDE
+
+    @pytest.mark.parametrize(
+        "frontmatter",
+        [
+            pytest.param(None, id="no-autobuild-block"),
+            pytest.param("autobuild:\n  enable_pre_loop: true\n", id="no-timeout-key"),
+            pytest.param("autobuild:\n  task_timeout: 0\n", id="zero"),
+            pytest.param("autobuild:\n  task_timeout: -1\n", id="negative"),
+            pytest.param("autobuild:\n  task_timeout: soon\n", id="not-a-number"),
+            pytest.param("autobuild: 7200\n", id="autobuild-not-a-mapping"),
+        ],
+    )
+    def test_absence_keeps_todays_derivation_byte_identical(
+        self, tmp_path: Path, frontmatter: str | None
+    ) -> None:
+        """No usable override ⇒ the window AND its source are unchanged.
+
+        The parametrised shapes are exactly the ones guardkit itself refuses
+        (it warns and falls back to the feature-level budget), plus the
+        overwhelmingly common case: a task markdown that says nothing about
+        timeouts. None of them may move W.
+        """
+        for root in (tmp_path / "before", tmp_path / "after"):
+            root.mkdir()
+            _write_feature(
+                root,
+                "FEAT-BM",
+                statuses={"TASK-A": "in_progress", "TASK-B": "pending"},
+                estimates={"TASK-A": 20},
+            )
+        _write_task_markdown(
+            tmp_path / "after", "TASK-A", frontmatter=frontmatter
+        )
+        _write_task_markdown(tmp_path / "after", "TASK-B")
+
+        before = bm.BuildMonitor(
+            root=tmp_path / "before", feature_id="FEAT-BM", clock=_Clock()
+        )
+        after = bm.BuildMonitor(
+            root=tmp_path / "after", feature_id="FEAT-BM", clock=_Clock()
+        )
+        before.poll()
+        after.poll()
+        assert after.window_seconds == before.window_seconds
+        assert after.window_source == before.window_source
+
+    def test_the_ledgers_declared_path_is_read(self, tmp_path: Path) -> None:
+        """The feature YAML names the file; that exact path is tried first."""
+        path = _write_task_markdown(
+            tmp_path, "TASK-A", state="design_approved",
+            frontmatter=_OVERRIDE_FRONTMATTER,
+        )
+        _write_feature(
+            tmp_path,
+            "FEAT-BM",
+            statuses={"TASK-A": "in_progress"},
+            file_paths={"TASK-A": str(path.relative_to(tmp_path))},
+        )
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0
+
+    def test_a_stale_declared_path_falls_back_to_guardkits_own_search(
+        self, tmp_path: Path
+    ) -> None:
+        """guardkit MOVES a task file as it runs; the yaml's path goes stale.
+
+        guardkit's own loader ignores ``file_path`` entirely and searches
+        ``tasks/<state>/**/<id>*.md``. The monitor must do the same rather than
+        conclude "no override" from a path that no longer exists.
+        """
+        _write_task_markdown(
+            tmp_path, "TASK-A", state="in_progress",
+            frontmatter=_OVERRIDE_FRONTMATTER,
+        )
+        _write_feature(
+            tmp_path,
+            "FEAT-BM",
+            statuses={"TASK-A": "in_progress"},
+            file_paths={"TASK-A": "tasks/backlog/a-feature/TASK-A-do-a-thing.md"},
+        )
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0
+
+    def test_a_finished_tasks_override_does_not_hold_the_window_open(
+        self, tmp_path: Path
+    ) -> None:
+        _write_task_markdown(tmp_path, "TASK-BIG", frontmatter=_OVERRIDE_FRONTMATTER)
+        _write_task_markdown(tmp_path, "TASK-SMALL")
+        _write_feature(
+            tmp_path,
+            "FEAT-BM",
+            statuses={"TASK-BIG": "completed", "TASK-SMALL": "in_progress"},
+            tasks_completed=1,
+        )
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 3120.0, (
+            "a completed task cannot still be burning its declared budget"
+        )
+
+    def test_a_task_file_that_is_not_there_yet_is_retried_not_remembered(
+        self, tmp_path: Path
+    ) -> None:
+        """A file mid-move must never be cached as 'declares nothing'."""
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 3120.0
+
+        _write_task_markdown(tmp_path, "TASK-A", frontmatter=_OVERRIDE_FRONTMATTER)
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0
+
+    def test_the_markdown_is_read_once_per_task(self, tmp_path: Path) -> None:
+        """An override is authored before the build; one read settles it.
+
+        Proven behaviourally: the file is deleted after the first poll and the
+        window does not fall back — so no poll after the first re-reads it.
+        """
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        path = _write_task_markdown(
+            tmp_path, "TASK-A", frontmatter=_OVERRIDE_FRONTMATTER
+        )
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=_Clock())
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0
+        path.unlink()
+        monitor.poll()
+        assert monitor.window_seconds == 7320.0
+
+    def test_the_wedge_verdict_honours_the_declared_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """The whole point: a build inside its OWN declared budget is alive.
+
+        At the pre-cure window (3120s) this build reads WEDGED; guardkit would
+        still have been 4080s away from its own timeout — the double-kill of
+        design §j risk 6.
+        """
+        _write_feature(tmp_path, "FEAT-BM", statuses={"TASK-A": "in_progress"})
+        _write_progress(
+            tmp_path,
+            "TASK-A",
+            [_snapshot_line("TASK-A", elapsed=60, files_changed=2, phase="green")],
+        )
+        _write_task_markdown(tmp_path, "TASK-A", frontmatter=_OVERRIDE_FRONTMATTER)
+        clock = _Clock()
+        monitor = bm.BuildMonitor(root=tmp_path, feature_id="FEAT-BM", clock=clock)
+        monitor.poll()  # baseline the signals
+        clock.advance(3200.0)  # past the OLD window, inside the declared one
+        verdict = monitor.poll()
+        assert not verdict.wedged
+        assert verdict.window_seconds == 7320.0
+        clock.advance(4300.0)  # past the declared budget + slack
+        assert monitor.poll().wedged
+
+
+class TestFrontmatterTimeoutParsing:
+    """The mirror rejects exactly what guardkit itself rejects."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("---\nautobuild:\n  task_timeout: 7200\n---\nbody\n", 7200.0),
+            ("---\nautobuild:\n  task_timeout: '7200'\n---\n", 7200.0),
+            ("---\nautobuild:\n  task_timeout: 7200.0\n---\n", 7200.0),
+            ("---\nautobuild:\n  task_timeout: 0\n---\n", None),
+            ("---\nautobuild:\n  task_timeout: -5\n---\n", None),
+            ("---\nautobuild:\n  task_timeout: later\n---\n", None),
+            ("---\nautobuild: {}\n---\n", None),
+            ("---\nid: TASK-A\n---\n", None),
+            ("# no frontmatter at all\n", None),
+            ("---\nautobuild:\n  task_timeout: 7200\n", None),  # unterminated
+            ("---\nnot: [a, mapping\n---\n", None),  # unparseable YAML
+            ("", None),
+        ],
+    )
+    def test_parse(self, text: str, expected: float | None) -> None:
+        assert bm.parse_frontmatter_task_timeout(text) == expected
+
+    def test_the_search_order_mirrors_guardkits_loader(self, tmp_path: Path) -> None:
+        assert bm.TASK_SEARCH_DIRS == (
+            "backlog",
+            "in_progress",
+            "design_approved",
+            "in_review",
+            "blocked",
+        ), "guardkit's TaskLoader.SEARCH_PATHS, in its order"
+        assert "completed" not in bm.TASK_SEARCH_DIRS, (
+            "a finished task cannot still be burning a budget"
+        )
+
+    def test_find_task_file_never_raises_on_an_absent_tree(
+        self, tmp_path: Path
+    ) -> None:
+        assert bm.find_task_file(tmp_path / "nope", "TASK-A") is None
+        assert bm.find_task_file(tmp_path, "TASK-A", "tasks/gone/TASK-A.md") is None
 
 
 # ---------------------------------------------------------------------------
