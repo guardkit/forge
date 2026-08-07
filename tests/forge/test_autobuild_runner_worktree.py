@@ -2629,6 +2629,57 @@ class TestFeatureModeResidueIsSwept:
         assert "already-swept" in joined
         assert "could not remove its kept outer worktree" not in joined
 
+    def test_a_mid_walk_race_is_refused_not_misread_as_already_swept(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """rmtree dying on a vanishing ENTRY while the tree remains = REFUSE.
+
+        The already-swept branch keys on FileNotFoundError, but rmtree also
+        raises it when a concurrent deletion removes an entry mid-walk — and
+        then the tree, with files still in it, is NOT swept. Logging "ALREADY
+        GONE" there is a false line in an honesty lane (coach residue,
+        2026-08-07): the branch must re-check the root and refuse loudly.
+        """
+        wt_base = tmp_path / "worktrees"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+        outer, inner = _stage_prior_feature_mode_build(throwaway_repo, wt_base)
+        assert outer.exists()
+
+        real_rmtree = shutil.rmtree
+
+        def racing_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(str(path)) == outer:
+                raise FileNotFoundError(
+                    2, "vanishing entry mid-walk", str(outer / "ghost.txt")
+                )
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(ar.shutil, "rmtree", racing_rmtree)
+
+        with caplog.at_level(
+            logging.INFO, logger="forge.subagents.autobuild_runner"
+        ):
+            result = _invoke_with(
+                _flv1_fresh_launch(),
+                throwaway_repo,
+                _make_feature_mode_exec_stub({}),
+            )
+
+        assert _lifecycle(result, FLV1_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"]
+        assert "concurrent-deletion race" in message
+        assert "already-swept" not in message.split("not an ")[0]
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "was ALREADY GONE" not in joined
+        # The tree is left in place for forensics — refusal destroys nothing.
+        assert outer.exists()
+
 
 class TestFeatureModeSweepFences:
     """What the feature-shape sweep must NEVER touch."""
