@@ -3127,18 +3127,41 @@ async def _sweep_prior_build_residue_impl(
 
         try:
             shutil.rmtree(outer_root, ignore_errors=False)
+        except FileNotFoundError:
+            # ALREADY SWEPT IS NOT A FAILURE (ledgered 2026-08-03, cured
+            # 2026-08-07). The kept tree can already be gone — an operator
+            # cleaned it up, or an earlier pass removed it — while the SOURCE
+            # repo still holds its registration and its autobuild branch. That
+            # is precisely what this pass is here to clear, and it just did
+            # (the registration and the branch above). Calling the missing
+            # DIRECTORY a sweep failure refused the fresh dispatch over residue
+            # that no longer existed, and the standing workaround was to
+            # hand-create a decoy directory at the path so rmtree could
+            # succeed. Nothing is skipped by this branch: the export still ran
+            # FIRST (an export of a tree that is not there finds nothing to
+            # export, which is an honest nothing), and only the removal of an
+            # already-absent path is passed over.
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s: its outer "
+                "worktree %s was ALREADY GONE (nothing left to remove) — "
+                "counted as already-swept; its registration and branch were "
+                "cleared above",
+                prior_build_id,
+                outer_root,
+            )
         except OSError as exc:
             raise PriorBuildSweepError(
                 f"prior build {prior_build_id!r}: could not remove its kept "
                 f"outer worktree {outer_root} ({type(exc).__name__}: {exc})"
             ) from exc
-        logger.info(
-            "autobuild_runner: requeue sweep — prior build %s: removed outer "
-            "worktree tree %s (its evidence is durable under %s)",
-            prior_build_id,
-            outer_root,
-            _receipts_root() / prior_build_id,
-        )
+        else:
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s: removed "
+                "outer worktree tree %s (its evidence is durable under %s)",
+                prior_build_id,
+                outer_root,
+                _receipts_root() / prior_build_id,
+            )
         await _run_git(["worktree", "prune"], cwd=repo_path)
         logger.info(
             "autobuild_runner: requeue sweep — prior build %s swept; the "
