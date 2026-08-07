@@ -1009,6 +1009,9 @@ class TestLifecycleBridgeWireupComposition:
                 build_id_resolver=object(),
                 build_mode_reader=object(),
                 terminal_publish_ledger=object(),
+                # Timeout truth (schema_v9) — the durable class sink is
+                # passed through like every other SQLite-bound part.
+                terminal_class_recorder=object(),
             )
 
             previous_dispatch = _serve_daemon.dispatch_payload

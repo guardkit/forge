@@ -431,7 +431,10 @@ class TestRunnerFailedSnapshotRidesTheWire:
 
     @staticmethod
     def _translate_runner_failure(
-        *, reason: str, budget_cap_killed: bool = False
+        *,
+        reason: str,
+        budget_cap_killed: bool = False,
+        terminal_class: str | None = None,
     ) -> BuildFailedPayload:
         from forge.subagents import autobuild_runner as ar
 
@@ -444,6 +447,7 @@ class TestRunnerFailedSnapshotRidesTheWire:
             },
             reason=reason,
             budget_cap_killed=budget_cap_killed,
+            terminal_class=terminal_class,
         )
         translator = StreamEventTranslator()
         ctx = _make_context()
@@ -485,6 +489,44 @@ class TestRunnerFailedSnapshotRidesTheWire:
     def test_plain_failure_carries_no_cap_kill_marker(self) -> None:
         out = self._translate_runner_failure(reason="guardkit autobuild exit=2")
         assert getattr(out, "budget_cap_killed", False) is False
+
+    def test_terminal_class_threads_onto_the_typed_payload(self) -> None:
+        """Timeout truth: WHICH death this was reaches the wireup's seam."""
+        out = self._translate_runner_failure(
+            reason="guardkit autobuild exit=2",
+            terminal_class="timeout-in-band",
+        )
+        assert getattr(out, "terminal_class", None) == "timeout-in-band"
+        assert out.failure_reason == "guardkit autobuild exit=2", (
+            "the class rides BESIDE the reason, never rewrites it"
+        )
+
+    def test_the_class_never_changes_the_wire_bytes(self) -> None:
+        """The whole additive claim, proven: identical ``model_dump``.
+
+        Attachment-only, exactly the ``correlation_id`` / ``budget_cap_killed``
+        shape. A classified failure and an unclassified one serialise to the
+        same v1 bytes, so no downstream consumer of
+        ``pipeline.build-failed`` sees anything new unless it asks.
+        """
+        reason = "guardkit autobuild exit=2"
+        classified = self._translate_runner_failure(
+            reason=reason, terminal_class="timeout-wedge"
+        )
+        plain = self._translate_runner_failure(reason=reason)
+        assert "terminal_class" not in classified.model_dump()
+        assert classified.model_dump() == plain.model_dump()
+
+    def test_a_plain_failure_carries_no_class(self) -> None:
+        out = self._translate_runner_failure(reason="guardkit autobuild exit=2")
+        assert getattr(out, "terminal_class", None) is None
+
+    def test_the_error_class_is_never_stamped(self) -> None:
+        """``error`` is the absent-by-default value — even asked for by name."""
+        out = self._translate_runner_failure(
+            reason="guardkit autobuild exit=1", terminal_class="error"
+        )
+        assert getattr(out, "terminal_class", None) is None
 
 
 # ---------------------------------------------------------------------------

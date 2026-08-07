@@ -155,12 +155,18 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
     additive migration in ``schema_v2.sql``) by defaulting to
     :attr:`BuildMode.MODE_A`. This keeps ``forge status`` working through
     the upgrade window and on databases that have not yet run the v2
-    migration.
+    migration. ``terminal_class`` (``schema_v9.sql``) gets exactly the same
+    tolerance: a database that has not run v9 has no such column, and "not
+    classified" is the honest read.
     """
     try:
         raw_mode = row["mode"]
     except (IndexError, KeyError):
         raw_mode = None
+    try:
+        raw_terminal_class = row["terminal_class"]
+    except (IndexError, KeyError):
+        raw_terminal_class = None
     return BuildStatusView(
         build_id=row["build_id"],
         feature_id=row["feature_id"],
@@ -175,7 +181,40 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         pr_url=row["pr_url"],
         error=row["error"],
         mode=BuildMode(raw_mode) if raw_mode else BuildMode.MODE_A,
+        terminal_class=str(raw_terminal_class) if raw_terminal_class else None,
     )
+
+
+#: Columns the projection always names.
+_BASE_PROJECTION: Final[str] = (
+    "build_id, feature_id, status, queued_at, started_at, "
+    "completed_at, pr_url, error, mode"
+)
+
+
+def _status_projection(cx: sqlite3.Connection) -> str:
+    """The SELECT column list, widened only where the database can serve it.
+
+    THE UPGRADE WINDOW IS REAL. The CLI never migrates — the ``forge serve``
+    daemon does, at boot. So there is a genuine interval in which a freshly
+    installed forge reads a database that is still on the previous schema, and
+    naming ``terminal_class`` unconditionally would turn ``forge status`` into
+    a hard error ("no such column") for exactly the operator who is mid-
+    upgrade and most wants to see what is running.
+
+    One ``PRAGMA table_info`` per invocation buys the answer. An unreadable
+    pragma degrades the same way a missing column does: to the narrow
+    projection, which every version of the schema can serve.
+    """
+    try:
+        columns = {row[1] for row in cx.execute("PRAGMA table_info(builds)")}
+    except sqlite3.Error:  # pragma: no cover — a pragma failure means the
+        # whole read is about to fail anyway; degrade rather than add a
+        # second, more confusing error on the way there.
+        return _BASE_PROJECTION
+    if "terminal_class" in columns:
+        return f"{_BASE_PROJECTION}, terminal_class"
+    return _BASE_PROJECTION
 
 
 def _query_status_views(
@@ -192,11 +231,11 @@ def _query_status_views(
       :data:`_RECENT_TERMINAL_LIMIT` terminal builds, sorted globally
       newest-first by ``queued_at`` (AC-001).
     """
+    projection = _status_projection(cx)
     if feature_id:
         rows = cx.execute(
-            """
-            SELECT build_id, feature_id, status, queued_at, started_at,
-                   completed_at, pr_url, error, mode
+            f"""
+            SELECT {projection}
               FROM builds
              WHERE feature_id = ?
              ORDER BY queued_at DESC
@@ -211,15 +250,13 @@ def _query_status_views(
     terminal_placeholders = ",".join(["?"] * len(terminal_values))
 
     active_sql = f"""
-        SELECT build_id, feature_id, status, queued_at, started_at,
-               completed_at, pr_url, error, mode
+        SELECT {projection}
           FROM builds
          WHERE status IN ({active_placeholders})
          ORDER BY queued_at DESC
     """
     terminal_sql = f"""
-        SELECT build_id, feature_id, status, queued_at, started_at,
-               completed_at, pr_url, error, mode
+        SELECT {projection}
           FROM builds
          WHERE status IN ({terminal_placeholders})
          ORDER BY queued_at DESC
@@ -417,6 +454,15 @@ def _build_table(
     autobuild progress (``API-cli.md §4.4``) is OUT OF SCOPE for this
     feature; it requires the ``async_tasks`` channel from
     FEAT-FORGE-007.
+
+    CLASS (timeout truth, 2026-08-07) answers the question STATUS cannot.
+    ``FAILED`` is one word for five different deaths — a monitor kill, a
+    budget-cap kill, a wall-clock expiry, a guardkit in-band timeout, and an
+    ordinary broken build — and "it ran out of time" versus "it is broken"
+    are opposite verdicts with opposite next actions. STATUS is untouched:
+    it still reads exactly ``FAILED``. CLASS renders ``—`` whenever the row
+    carries no class, which is every healthy build, every historical row,
+    and every ordinary failure.
     """
     table = Table(title="Forge build status")
     table.add_column("BUILD", overflow="fold")
@@ -427,6 +473,9 @@ def _build_table(
     # as ``mode-a`` per the additive migration default.
     table.add_column("MODE")
     table.add_column("STATUS")
+    # CLASS — WHICH death a FAILED build died (timeout truth, schema_v9).
+    # Sits BESIDE status, never instead of it.
+    table.add_column("CLASS")
     table.add_column("STAGE")
     table.add_column("STARTED")
     table.add_column("ELAPSED")
@@ -442,6 +491,7 @@ def _build_table(
             view.feature_id,
             view.mode.value,
             view.status.value,
+            view.terminal_class or "—",
             stage_cell,
             _format_dt(view.started_at),
             _elapsed(view),
