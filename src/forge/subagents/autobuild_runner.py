@@ -632,8 +632,30 @@ class LifecycleEmitterAdapter:
         if method_name == "emit_complete":
             return emit(
                 self._ctx,
+                # ``repo`` STAYS None — honestly. This adapter genuinely does
+                # not hold the target repo name: :class:`forge.pipeline.
+                # BuildContext` is (feature_id, build_id, correlation_id,
+                # wave_total), and :class:`AutobuildState` has no repo field
+                # either. The name exists upstream on the originating
+                # ``BuildQueuedPayload``, but BuildContext drops it, so filling
+                # it here would mean inventing it.
                 repo=None,
-                branch=None,
+                # ``branch`` IS derivable, and the owner is told it. The
+                # runner's own convention, stated verbatim further down this
+                # module (the prior-build sweep's FEATURE-MODE residue note):
+                # guardkit's feature mode checks the build out on
+                # ``autobuild/<FEATURE_ID>`` — "the ref is named after the
+                # FEATURE, not any task id".
+                #
+                # It is built from ``self._ctx.feature_id`` — the SAME id
+                # ``emit_complete`` stamps onto ``BuildCompletePayload
+                # .feature_id`` — so the branch and the feature named in one
+                # envelope can never disagree. (``state.feature_id`` carries
+                # the same value in production; the ctx is the one the payload
+                # actually reads.) Same rule as the SSE producer's
+                # ``StreamEventTranslator._build_complete``, applied to this
+                # producer's own source of feature_id.
+                branch=f"autobuild/{self._ctx.feature_id}",
                 tasks_completed=state.tasks_completed,
                 tasks_failed=state.tasks_failed,
                 tasks_total=state.tasks_completed + state.tasks_failed,
