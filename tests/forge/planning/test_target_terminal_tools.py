@@ -18,7 +18,6 @@ from forge.planning import target_terminal_tools as ttt
 from forge.planning.target_terminal_tools import (
     NORMALIZER_MODULE_CANDIDATES,
     TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
-    DclAuthorOutcome,
     DividerRepairResult,
     comment_box_drawing_dividers,
     FrontmatterIdRepair,
@@ -31,7 +30,6 @@ from forge.planning.target_terminal_tools import (
     discover_target_test_roots,
     discover_ts_shape_test_roots,
     shallow_discover_test_roots,
-    make_dcl_author,
     make_normalize_feature_spec,
     make_validate_feature_plan,
     make_validate_gate_registry,
@@ -501,169 +499,6 @@ def test_tool_outcome_is_frozen() -> None:
     o = ToolOutcome(ok=True)
     with pytest.raises(Exception):
         o.ok = False  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# dcl author (W1-S2) — the §10 seat seam
-# ---------------------------------------------------------------------------
-
-
-def _fake_run_with_stdout(status: str, exit_code: int, stdout_tail: str = "", stderr: str = ""):
-    captured: dict[str, Any] = {}
-
-    async def _run(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            status=status, exit_code=exit_code, stderr=stderr, stdout_tail=stdout_tail
-        )
-
-    return _run, captured
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_wire_shape_on_exit_zero(tmp_path: Path) -> None:
-    """The exact CLI contract: rides the frozen seam as
-    ``guardkit dcl author --feature <slug> --task <id> --repo <wt> --request …
-    --criteria … --json`` with ``with_nats_streaming=False``, and parses the
-    --json envelope on exit 0."""
-    envelope = (
-        '{"authored": true, "attempts": 2, "zero_shot_clean": false, '
-        '"repaired_clean": true, "artifact": "features/x/x.dcl", '
-        '"receipt": "qa/dcl/authoring-x.yaml", "failure_reason": null}'
-    )
-    run_fn, captured = _fake_run_with_stdout("success", 0, stdout_tail=envelope)
-    author = make_dcl_author(run_fn=run_fn)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="feature_spec_inputs/cid.md",
-        criteria_rel=".guardkit/dcl-inputs/criteria-x.yaml",
-    )
-    assert isinstance(outcome, DclAuthorOutcome)
-    assert outcome.authored is True
-    assert outcome.exit_class == "authored"
-    assert outcome.envelope["attempts"] == 2
-    assert outcome.envelope["repaired_clean"] is True
-    # Wire shape.
-    assert captured["subcommand"] == "dcl"
-    assert captured["args"] == [
-        "author",
-        "--feature",
-        "x",
-        "--task",
-        "TASK-X-001",
-        "--repo",
-        str(tmp_path),
-        "--request",
-        "feature_spec_inputs/cid.md",
-        "--criteria",
-        ".guardkit/dcl-inputs/criteria-x.yaml",
-        "--json",
-    ]
-    assert captured["repo_path"] == tmp_path
-    assert captured["with_nats_streaming"] is False
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_exit_one_is_loud_authoring_failure(tmp_path: Path) -> None:
-    run_fn, _ = _fake_run_with_stdout(
-        "failed", 1, stdout_tail='{"authored": false, "failure_reason": "dirty second attempt"}'
-    )
-    author = make_dcl_author(run_fn=run_fn)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="r.md",
-        criteria_rel="c.yaml",
-    )
-    assert outcome.authored is False
-    assert outcome.exit_class == "authoring-failed"
-    assert "dirty second attempt" in outcome.detail
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_exit_two_is_instrument_error(tmp_path: Path) -> None:
-    run_fn, _ = _fake_run_with_stdout("failed", 2, stderr="node/checker missing")
-    author = make_dcl_author(run_fn=run_fn)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="r.md",
-        criteria_rel="c.yaml",
-    )
-    assert outcome.authored is False
-    assert outcome.exit_class == "instrument-error"
-    assert "node/checker missing" in outcome.detail
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_timeout_status(tmp_path: Path) -> None:
-    run_fn, _ = _fake_run_with_stdout("timeout", -1)
-    author = make_dcl_author(run_fn=run_fn)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="r.md",
-        criteria_rel="c.yaml",
-    )
-    assert outcome.authored is False
-    assert outcome.exit_class == "timeout"
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_never_crashes_on_raise(tmp_path: Path) -> None:
-    async def _boom(**kwargs):
-        raise RuntimeError("guardkit blew up")
-
-    author = make_dcl_author(run_fn=_boom)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="r.md",
-        criteria_rel="c.yaml",
-    )
-    assert outcome.authored is False
-    assert outcome.exit_class == "invocation-error"
-    assert "RuntimeError" in outcome.detail
-
-
-@pytest.mark.asyncio
-async def test_dcl_author_exit_zero_but_envelope_authored_false(tmp_path: Path) -> None:
-    """Exit 0 yet the envelope reports authored=false — treated as a loud
-    authoring failure (never a silent success)."""
-    run_fn, _ = _fake_run_with_stdout("success", 0, stdout_tail='{"authored": false}')
-    author = make_dcl_author(run_fn=run_fn)
-    outcome = await author(
-        worktree_path=tmp_path,
-        slug="x",
-        task_id="TASK-X-001",
-        request_rel="r.md",
-        criteria_rel="c.yaml",
-    )
-    assert outcome.authored is False
-    assert outcome.exit_class == "authoring-failed"
-
-
-def test_dcl_author_outcome_is_frozen() -> None:
-    o = DclAuthorOutcome(authored=True, exit_class="authored", exit_code=0, envelope={})
-    with pytest.raises(Exception):
-        o.authored = False  # type: ignore[misc]
-
-
-def test_extract_json_envelope_tolerates_preamble() -> None:
-    from forge.planning.target_terminal_tools import _extract_json_envelope
-
-    # A log preamble before the envelope — the last balanced object wins.
-    text = 'INFO probing seat\n{"authored": true, "attempts": 1}'
-    assert _extract_json_envelope(text) == {"authored": True, "attempts": 1}
-    # Garbage → empty (advisory metadata, never a gate).
-    assert _extract_json_envelope("no json here") == {}
-    assert _extract_json_envelope("") == {}
 
 
 # ---------------------------------------------------------------------------

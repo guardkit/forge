@@ -51,7 +51,7 @@ from forge.planning.driver import (
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
-from forge.planning.target_terminal_tools import DclAuthorOutcome, ToolOutcome
+from forge.planning.target_terminal_tools import ToolOutcome
 from nats_core.events import ApprovalResponsePayload
 
 CID = "tt-run-0001"
@@ -2779,109 +2779,16 @@ def test_derive_feature_gate_endpoint_none_when_no_machine_get() -> None:
 
 
 # ---------------------------------------------------------------------------
-# W1-S2 — the DCL machine-authoring leg (the chain authors its own `.dcl`).
+# THE DCL LEG IS GONE (struck 2026-08-15, Rich's word).
 #
-# On a `spec_track: dcl` repo the SEAT authors the capability at plan-commit
-# (§10 protocol) and forge commits it WITH the plan, then the bars/gate/build
-# legs run. The default gherkin world is provably INERT. Every authoring-path
-# failure is LOUD-but-unblocked (never a blocked plan). SINGLE-SLOT LAW: every
-# test injects a spy dcl_author — the network / :9000 is never touched.
+# guardkit deleted the `.dcl` spec track outright (guardkit b138d92c, card Q11):
+# `guardkit dcl author` no longer exists and guardkit's own spec_track allows
+# only "gherkin". Forge's W1-S2 leg — the harvest into the target repo's
+# `.guardkit/dcl-capture/queue.jsonl` and the seat call after it — came out with
+# it. These pin the ABSENCE: a target repo still carrying the leftover
+# `qa.spec_track: dcl` + `dcl.capture: true` config is simply IGNORED. Forge
+# does not police guardkit's config; guardkit does.
 # ---------------------------------------------------------------------------
-
-
-def _seed_dcl_config(
-    repo: Path,
-    *,
-    spec_track: str = "dcl",
-    capture: bool = False,
-    capture_sink: str | None = None,
-) -> None:
-    """Write + commit ``.guardkit/config.yaml`` onto the scratch repo (the
-    activation surface the leg reads DIRECTLY off the shared checkout)."""
-    gk = repo / ".guardkit"
-    gk.mkdir(parents=True, exist_ok=True)
-    lines = ["qa:\n", f"  spec_track: {spec_track}\n"]
-    if capture or capture_sink is not None:
-        lines.append("dcl:\n")
-        lines.append(f"  capture: {'true' if capture else 'false'}\n")
-        if capture_sink is not None:
-            lines.append(f"  capture_sink: {capture_sink}\n")
-    (gk / "config.yaml").write_text("".join(lines), encoding="utf-8")
-    env = _git_env()
-    subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
-    subprocess.run(
-        ["git", "commit", "-qm", "seed .guardkit/config.yaml"],
-        cwd=repo,
-        check=True,
-        env=env,
-    )
-
-
-def _dcl_author_spy(
-    *,
-    authored: bool = True,
-    exit_class: str = "authored",
-    exit_code: int = 0,
-    detail: str = "",
-    write_artifacts: bool = True,
-    envelope: dict[str, Any] | None = None,
-):
-    """A spy standing in for ``guardkit dcl author`` (the §10 seat). On the
-    authored path it writes a schema-faithful ``.dcl`` + receipt into the
-    worktree exactly as the real seat would; it NEVER touches the network."""
-    calls: list[dict[str, Any]] = []
-
-    async def _author(
-        *, worktree_path: Path, slug: str, task_id: str, request_rel: str, criteria_rel: str
-    ) -> DclAuthorOutcome:
-        # SINGLE-SLOT LAW witness: the criteria input the seat reads is on disk
-        # in the worktree (always materialised by forge); record whether the
-        # Request file is present too (true only under the real WorktreeGitRunner).
-        calls.append(
-            {
-                "slug": slug,
-                "task_id": task_id,
-                "request_rel": request_rel,
-                "criteria_rel": criteria_rel,
-                "criteria_present": (worktree_path / criteria_rel).is_file(),
-                "request_present": (worktree_path / request_rel).is_file(),
-            }
-        )
-        if authored and write_artifacts:
-            art = worktree_path / f"features/{slug}/{slug}.dcl"
-            art.parent.mkdir(parents=True, exist_ok=True)
-            art.write_text(
-                f"language dcl 1.0\n// @task:{task_id}\ncapability {slug} {{}}\n",
-                encoding="utf-8",
-            )
-            rec = worktree_path / f"qa/dcl/authoring-{slug}.yaml"
-            rec.parent.mkdir(parents=True, exist_ok=True)
-            rec.write_text(
-                "authored: true\nattempts: 1\nzero_shot_clean: true\n",
-                encoding="utf-8",
-            )
-        env = (
-            envelope
-            if envelope is not None
-            else {
-                "authored": authored,
-                "attempts": 1,
-                "zero_shot_clean": True,
-                "repaired_clean": None,
-                "artifact": f"features/{slug}/{slug}.dcl",
-                "receipt": f"qa/dcl/authoring-{slug}.yaml",
-                "failure_reason": None if authored else detail,
-            }
-        )
-        return DclAuthorOutcome(
-            authored=authored,
-            exit_class=exit_class,
-            exit_code=exit_code,
-            envelope=env,
-            detail=detail,
-        )
-
-    return _author, calls
 
 
 def _labels_in_order(store: SqlitePlanningRunStore, wanted: set[str]) -> list[str]:
@@ -2892,18 +2799,53 @@ def _labels_in_order(store: SqlitePlanningRunStore, wanted: set[str]) -> list[st
     ]
 
 
+def _seed_leftover_dcl_config(repo: Path) -> None:
+    """Commit the WORST-CASE leftover `.guardkit/config.yaml` onto the scratch
+    repo: the dcl track AND capture switched on — exactly what the live api_test
+    checkout carried when the struck leg harvested a brief into its main tree."""
+    gk = repo / ".guardkit"
+    gk.mkdir(parents=True, exist_ok=True)
+    (gk / "config.yaml").write_text(
+        "qa:\n  spec_track: dcl\ndcl:\n  capture: true\n", encoding="utf-8"
+    )
+    env = _git_env()
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-qm", "seed leftover .guardkit/config.yaml"],
+        cwd=repo,
+        check=True,
+        env=env,
+    )
+
+
 @pytest.mark.asyncio
-async def test_s2_happy_path_authors_and_commits_dcl_on_dcl_track(
-    store: SqlitePlanningRunStore, tmp_path: Path
+async def test_leftover_dcl_config_is_ignored_end_to_end(
+    store: SqlitePlanningRunStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """(i) On a dcl-track repo the seat authors the `.dcl` + receipt into the
-    worktree; forge commits BOTH as ONE commit on the planning branch BETWEEN
-    feature-plan and qa-pass-bars; the durable label order is
-    [feature-plan, dcl-author, qa-pass-bars, qa-feature-gate, build-queued]."""
+    """A target repo whose `.guardkit/config.yaml` still says `spec_track: dcl`
+    with `dcl.capture: true` drives to BUILD_QUEUED touching NOTHING dcl-shaped:
+
+    * no `.guardkit/dcl-capture/` in the SHARED checkout (the live defect: the
+      struck leg dirtied api_test's main tree with a harvest row),
+    * no `dcl-author` ledger event and no dcl-shaped leg label at all,
+    * no `.dcl` / `.guardkit/dcl-inputs` file on the planning branch,
+    * no guardkit subcommand shelled — the frozen run seam is booby-trapped for
+      the whole drive, so ANY `guardkit dcl author` attempt would explode,
+    * and the driver carries no `dcl_author` collaborator to call.
+    """
+    import forge.adapters.guardkit.run as guardkit_run_mod
+
+    async def _boom(**kwargs: Any) -> None:
+        raise AssertionError(
+            f"the drive shelled guardkit {kwargs.get('subcommand')!r} — "
+            "no leg may invoke a guardkit subcommand on this path"
+        )
+
+    monkeypatch.setattr(guardkit_run_mod, "run", _boom)
+
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    _seed_gate_surface(repo)
-    _seed_dcl_config(repo, spec_track="dcl")
+    _seed_leftover_dcl_config(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
     _queue(store)
     h = _make_driver(
@@ -2913,402 +2855,63 @@ async def test_s2_happy_path_authors_and_commits_dcl_on_dcl_track(
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_native_versions,
         pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
-    author, calls = _dcl_author_spy()
-    h.driver._deps.dcl_author = author
+    # The collaborator itself is gone from the deps surface.
+    assert not hasattr(h.driver._deps, "dcl_author")
 
     await h.driver.drive(CID)
 
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.BUILD_QUEUED.value
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
 
-    # The seat was invoked EXACTLY once, with the resolved slug/task and BOTH
-    # inputs on disk in the worktree (the Request off the branch, the criteria
-    # forge materialised).
-    assert len(calls) == 1
-    assert calls[0]["slug"] == "version-endpoint"
-    assert calls[0]["task_id"] == "TASK-VER-001"
-    assert calls[0]["request_rel"] == f"feature_spec_inputs/{CID}.md"
-    assert calls[0]["criteria_present"] is True
-    assert calls[0]["request_present"] is True
+    # (1) The SHARED checkout is untouched by any harvest.
+    assert not (repo / ".guardkit" / "dcl-capture").exists()
 
-    # The `.dcl` landed on the branch: the vocab skeleton first line + the
-    # @task marker.
-    art = _show_on_branch(repo, "features/version-endpoint/version-endpoint.dcl")
-    assert art.returncode == 0, art.stderr
-    assert art.stdout.splitlines()[0] == "language dcl 1.0"
-    assert "// @task:TASK-VER-001" in art.stdout
-    # The receipt landed too.
-    assert (
-        _show_on_branch(repo, "qa/dcl/authoring-version-endpoint.yaml").returncode == 0
-    )
+    # (2) No dcl-shaped ledger row of any kind.
+    assert not any("dcl" in e["stage_label"] for e in store.list_events(CID))
 
-    # ONE commit for the artifact + receipt (the ephemeral criteria input is
-    # NOT committed); distinct from the plan + bars commits.
-    dcl_sha = _leg_sha(store, "dcl-author")
-    assert dcl_sha and dcl_sha != _leg_sha(store, "feature-plan")
-    names = subprocess.run(
-        ["git", "show", "--name-only", "--format=", dcl_sha],
+    # (3) The chain's leg order runs plan -> bars -> gate -> build with nothing
+    #     between the plan and the bars.
+    assert _labels_in_order(
+        store,
+        {"feature-plan", "qa-pass-bars", "qa-feature-gate", "build-queued"},
+    ) == ["feature-plan", "qa-pass-bars", "qa-feature-gate", "build-queued"]
+
+    # (4) Nothing dcl-shaped was committed on the planning branch.
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", f"planning/{CID}"],
         cwd=repo,
         capture_output=True,
         text=True,
-    ).stdout.split()
-    assert sorted(names) == [
-        "features/version-endpoint/version-endpoint.dcl",
-        "qa/dcl/authoring-version-endpoint.yaml",
-    ]
-
-    # The durable dcl-author event carries the envelope fields + the sha.
-    ev = _leg_event_details_of(store, "dcl-author")
-    assert ev["authored"] is True
-    assert ev["artifact"] == "features/version-endpoint/version-endpoint.dcl"
-    assert ev["receipt"] == "qa/dcl/authoring-version-endpoint.yaml"
-    assert ev["attempts"] == 1
-    assert ev["zero_shot_clean"] is True
-    assert ev["sha"] == dcl_sha
-
-    # Label order: dcl-author sits BETWEEN feature-plan and the bars.
-    assert _labels_in_order(
-        store,
-        {"feature-plan", "dcl-author", "qa-pass-bars", "qa-feature-gate", "build-queued"},
-    ) == ["feature-plan", "dcl-author", "qa-pass-bars", "qa-feature-gate", "build-queued"]
-
-    # The bars + gate + build all still ran (the authoring rode alongside them).
-    assert h.ctx["counters"]["build_trigger"] == 1
-
-
-@pytest.mark.asyncio
-async def test_s2_gherkin_inert_proof_no_events_no_calls_no_commits(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(ii) The default gherkin world: NO `.guardkit/config.yaml` (spec_track
-    defaults gherkin, capture off) => the leg is provably INERT — zero seat
-    calls, zero dcl-author events, NO dcl commit — while bars + build proceed
-    byte-identically."""
-    _queue(store)
-    # A recording runner so we can prove the leg made NO git write of its own.
-    git = RecordingGitRunner()
-    h = _make_driver(store, git_runner=git, repo_path=str(tmp_path / "nope"))
-    author, calls = _dcl_author_spy()
-    h.driver._deps.dcl_author = author
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # Provably inert: the seat was never consulted and no dcl-author event exists.
-    assert calls == []
+    )
+    assert listed.returncode == 0
     assert not any(
-        e["stage_label"] == "dcl-author" for e in store.list_events(CID)
-    )
-    # No DCL commit was ever attempted (no tree write carries a criteria input
-    # or a `.dcl` artifact — the leg made zero git writes of its own).
-    assert not any(
-        any(
-            str(f).startswith(".guardkit/dcl-inputs/") or str(f).endswith(".dcl")
-            for f in c["files"]
-        )
-        for c in git.tree_calls
-    )
-    # The rest of the machine chain ran exactly as before.
-    assert h.ctx["counters"]["build_trigger"] == 1
-
-
-@pytest.mark.asyncio
-async def test_s2_authoring_failure_is_loud_but_unblocked(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(iii) The seat fails LOUDLY (exit 1): authored:false is recorded, a
-    WARNING fires, NO `.dcl` lands — and the bars + gate + build ALL still run
-    (the absence discipline carries the feature; never a blocked plan)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_gate_surface(repo)
-    _seed_dcl_config(repo, spec_track="dcl")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
-    )
-    author, calls = _dcl_author_spy(
-        authored=False,
-        exit_class="authoring-failed",
-        exit_code=1,
-        detail="dirty second attempt",
-        write_artifacts=False,
-    )
-    h.driver._deps.dcl_author = author
-
-    await h.driver.drive(CID)
-
-    run = store.get_run(CID)
-    # NOT a blocked plan — the run reaches the target terminal.
-    assert run["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(calls) == 1
-    # No `.dcl` on the branch (the loud no-artifact path).
-    assert (
-        _show_on_branch(repo, "features/version-endpoint/version-endpoint.dcl").returncode
-        != 0
-    )
-    # authored:false recorded with the exit class + reason.
-    ev = _leg_event_details_of(store, "dcl-author")
-    assert ev["authored"] is False
-    assert ev["exit_class"] == "authoring-failed"
-    assert "dirty second attempt" in ev["reason"]
-    # A WARNING notification fired naming the loud-continue.
-    assert any(
-        level == "warning" and "DCL authoring produced no artifact" in msg
-        for _cid, msg, level in h.ctx["notifications"]
-    )
-    # The bars, gate and build ALL still minted.
-    assert h.ctx["counters"]["pass_bar_validate"] >= 1
-    assert h.ctx["counters"]["gate_registry_validate"] == 1
-    assert h.ctx["counters"]["build_trigger"] == 1
-    assert (
-        _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode == 0
+        f.endswith(".dcl") or "dcl-inputs" in f or "dcl-capture" in f or "qa/dcl/" in f
+        for f in listed.stdout.splitlines()
     )
 
 
-@pytest.mark.asyncio
-async def test_s2_unwired_author_on_dcl_repo_loud_continue(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(iv) A dcl-track repo but the dcl_author collaborator is NOT wired: the
-    leg takes the SAME loud-continue failure branch (NOT _fail_leg) — authored:
-    false (exit_class=unwired), and bars + gate + build still run."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_gate_surface(repo)
-    _seed_dcl_config(repo, spec_track="dcl")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
-    )
-    # Explicitly leave dcl_author unwired (default None).
-    assert h.driver._deps.dcl_author is None
+def test_the_planning_driver_module_carries_no_dcl_leg() -> None:
+    """The leg's own code is gone — not merely unreachable. (A dormant
+    `_dcl_author_leg` would be a live re-wiring away from harvesting again.)
 
-    await h.driver.drive(CID)
+    The one surviving mention of the old label is prose: `_has_leg_event`'s
+    docstring, which records that a historical `dcl-author` row in an old ledger
+    is data the replay ignores.
+    """
+    import inspect
 
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.BUILD_QUEUED.value
-    ev = _leg_event_details_of(store, "dcl-author")
-    assert ev["authored"] is False
-    assert ev["exit_class"] == "unwired"
-    assert "not wired" in ev["reason"]
-    assert any(level == "warning" for _c, _m, level in h.ctx["notifications"])
-    # No `.dcl`, but the rest of the chain completed.
-    assert (
-        _show_on_branch(repo, "features/version-endpoint/version-endpoint.dcl").returncode
-        != 0
-    )
-    assert h.ctx["counters"]["build_trigger"] == 1
+    src = inspect.getsource(driver_module)
 
-
-@pytest.mark.asyncio
-async def test_s2_idempotent_redrive_no_reauthor(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(v) A crash-window re-drive with the dcl-author sentinel already present
-    no-ops the leg: the seat is NOT re-invoked and nothing is re-committed."""
-    _queue(store)
-    for to in (
-        PlanningState.RUNNING,
-        PlanningState.FEATURE_SPEC,
-        PlanningState.FEATURE_PLAN,
+    assert not [n for n in dir(PlanningRunDriver) if "dcl" in n.lower()]
+    for gone in (
+        "def _dcl",
+        "_read_dcl_activation",
+        "_DCL_AUTHOR_STAGE",
+        "dcl-capture",
+        "dcl_author",
+        "spec_track",
     ):
-        refused = store.transition(
-            correlation_id=CID, to_state=to, actor_identity="seed", stage_label="seed"
-        )
-        assert not isinstance(refused, TransitionRefused)
-    # Seed the chain up to and including the dcl-author leg (the crash window:
-    # authored + committed, state not yet advanced past FEATURE_PLAN).
-    store._record_event(
-        correlation_id=CID,
-        stage_label="feature-plan",
-        status="approved",
-        actor_identity="seed",
-        details_json=json.dumps(
-            {
-                "feature_id": "FEAT-AAAA",
-                "slug": "version-endpoint",
-                "target_repo": TARGET_REPO,
-                "branch": f"planning/{CID}",
-                "plan_files": ["features/x/FEAT-AAAA.yaml"],
-                "sha": "plan-sha",
-            }
-        ),
-    )
-    store._record_event(
-        correlation_id=CID,
-        stage_label="dcl-author",
-        status="approved",
-        actor_identity="seed",
-        details_json=json.dumps(
-            {"authored": True, "artifact": "features/version-endpoint/version-endpoint.dcl"}
-        ),
-    )
-    store._record_event(
-        correlation_id=CID,
-        stage_label="qa-pass-bars",
-        status="approved",
-        actor_identity="seed",
-        details_json=json.dumps(
-            {"feature_id": "FEAT-AAAA", "bar_files": ["qa/pass-bar-TASK-X-001.yaml"]}
-        ),
-    )
-    store._record_event(
-        correlation_id=CID,
-        stage_label="qa-feature-gate",
-        status="approved",
-        actor_identity="seed",
-        details_json=json.dumps({"skipped": True, "reason": "seeded"}),
-    )
-    store._record_event(
-        correlation_id=CID,
-        stage_label="build-queued",
-        status="approved",
-        actor_identity="seed",
-        details_json=json.dumps({"feature_id": "FEAT-AAAA", "build_id": "build-1"}),
-    )
-
-    # A dcl repo config so the leg WOULD author were the sentinel absent.
-    repo = tmp_path / "api_test"
-    repo.mkdir(parents=True, exist_ok=True)
-    (repo / ".guardkit").mkdir()
-    (repo / ".guardkit" / "config.yaml").write_text(
-        "qa:\n  spec_track: dcl\n", encoding="utf-8"
-    )
-    h = _make_driver(store, repo_path=str(repo))
-    author, calls = _dcl_author_spy()
-    h.driver._deps.dcl_author = author
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # The seat was NOT re-invoked (idempotent no-op) and nothing was re-queued.
-    assert calls == []
-    assert h.ctx["counters"]["build_trigger"] == 0
-    assert h.ctx["counters"]["plan"] == 0
-
-
-@pytest.mark.asyncio
-async def test_s2_capture_flag_on_harvests_one_brief_row(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(vi) `dcl.capture` ON (gherkin track): EXACTLY one well-formed jsonl row
-    lands at the SHARED checkout sink; the drive is unaffected (reaches
-    BUILD_QUEUED); zero seat calls (harvest is CPU-only)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_dcl_config(repo, spec_track="gherkin", capture=True)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-    )
-    author, calls = _dcl_author_spy()
-    h.driver._deps.dcl_author = author
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # Zero seat calls — harvest never invokes the author.
-    assert calls == []
-
-    sink = repo / ".guardkit" / "dcl-capture" / "queue.jsonl"
-    assert sink.is_file()
-    rows = [json.loads(line) for line in sink.read_text().splitlines() if line.strip()]
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["correlation_id"] == CID
-    assert row["source"] == "plan-commit-harvest"
-    assert row["spec_track"] == "gherkin"
-    assert row["repo"] == TARGET_REPO
-    assert "add a GET /stats endpoint" in row["request_text"]
-    assert row["machine_criteria"] and "version-endpoint" in row["machine_criteria"]
-
-
-@pytest.mark.asyncio
-async def test_s2_capture_sink_write_failure_is_swallowed(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(vi cont.) An unwritable sink (its parent is a FILE) is swallowed-to-log:
-    the drive is entirely unaffected (reaches BUILD_QUEUED), no row written."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    # `.guardkit/blocked` is a FILE, so mkdir of the sink's parent fails.
-    (repo / ".guardkit").mkdir()
-    (repo / ".guardkit" / "blocked").write_text("x", encoding="utf-8")
-    _seed_dcl_config(
-        repo, spec_track="gherkin", capture=True, capture_sink=".guardkit/blocked/queue.jsonl"
-    )
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-    )
-
-    await h.driver.drive(CID)
-
-    # The drive completed despite the harvest failure (swallow-to-log).
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # No row/dir was created under the blocked path.
-    assert (repo / ".guardkit" / "blocked").is_file()
-
-
-@pytest.mark.asyncio
-async def test_s2_capture_default_off_writes_no_row_no_dir(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(vi cont.) capture DEFAULT-OFF (a plain gherkin repo): no harvest row and
-    the capture dir is never created — the inert default touches nothing."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_dcl_config(repo, spec_track="gherkin")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-    )
-    author, calls = _dcl_author_spy()
-    h.driver._deps.dcl_author = author
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert calls == []
-    # No dcl-author event (provably inert), no capture dir.
-    assert not any(e["stage_label"] == "dcl-author" for e in store.list_events(CID))
-    assert not (repo / ".guardkit" / "dcl-capture").exists()
-
+        assert gone not in src, gone
 
 # ---------------------------------------------------------------------------
 # THE TYPESCRIPT SHAPE ON THE PLANNING PATH (design §D.3(ii))

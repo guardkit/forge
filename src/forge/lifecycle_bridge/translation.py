@@ -559,8 +559,20 @@ class StreamEventTranslator:
         payload = BuildCompletePayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
+            # ``repo`` STAYS None — honestly. Nothing on the wire into this
+            # translator carries it: ``AutobuildState`` (the SSE snapshot
+            # contract, ``autobuild_runner.AutobuildState``) has no repo field,
+            # and neither does :class:`forge.lifecycle_bridge.bridge.BuildContext`
+            # (feature_id / thread_id / run_id / correlation_id / deadline_at).
+            # A repo name would have to be invented, so it is not.
             repo=None,
-            branch=None,
+            # ``branch`` is DERIVABLE and now told. The runner's own convention,
+            # stated verbatim in ``forge.subagents.autobuild_runner`` (the
+            # prior-build sweep's FEATURE-MODE residue note): guardkit's feature
+            # mode checks the build out on ``autobuild/<FEATURE_ID>`` — "the ref
+            # is named after the FEATURE, not any task id". That is the branch
+            # holding the built code, which is what jarvis tells the owner.
+            branch=f"autobuild/{snap.feature_id}",
             tasks_completed=snap.tasks_completed,
             tasks_failed=max(total - snap.tasks_completed, 0),
             tasks_total=total,

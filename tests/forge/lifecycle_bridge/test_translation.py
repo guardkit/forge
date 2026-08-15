@@ -565,3 +565,109 @@ class TestNoDoubleEmits:
             assert out is None or hasattr(out, "model_dump"), (
                 f"translate() returned non-payload {type(out).__name__}"
             )
+
+
+# ---------------------------------------------------------------------------
+# The build terminal names the branch that holds the code (jarvis's ask)
+#
+# ``BuildCompletePayload.branch`` used to publish as ``None``, so the owner was
+# told a build finished without being told WHERE the built code is. The runner's
+# own convention — stated verbatim in ``forge.subagents.autobuild_runner``'s
+# prior-build sweep ("the ref is named after the FEATURE, not any task id") — is
+# ``autobuild/<FEATURE_ID>``, and it is derivable from the snapshot the
+# translator already holds. ``repo`` STAYS None: neither ``AutobuildState`` nor
+# ``BuildContext`` carries a repo name, and an invented one is worse than none.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCompleteNamesTheBranch:
+    def test_branch_is_the_feature_autobuild_ref(self) -> None:
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        translator.translate(
+            _state_part("FEAT-XLAT-001", lifecycle="running_wave", tasks_completed=2),
+            ctx,
+        )
+        out = translator.translate(
+            _state_part(
+                "FEAT-XLAT-001",
+                lifecycle="completed",
+                tasks_completed=2,
+                tasks_failed=0,
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildCompletePayload)
+        assert out.branch == "autobuild/FEAT-XLAT-001"
+
+    def test_branch_follows_the_snapshot_feature_id_not_the_context(self) -> None:
+        """The ref is named after the FEATURE THE SNAPSHOT REPORTS. The channel
+        is keyed by the context's id, but the snapshot's own ``feature_id`` is
+        what the payload (and hence the branch) carries — the same precedence
+        ``_extract_state`` already applies to ``feature_id`` itself."""
+        translator = StreamEventTranslator()
+        ctx = _make_context(feature_id="FEAT-KEY-001")
+
+        def _part(lifecycle: str, tasks_completed: int) -> StreamPart:
+            part = _state_part(
+                "FEAT-KEY-001",
+                lifecycle=lifecycle,
+                tasks_completed=tasks_completed,
+            )
+            part.data["async_tasks"]["FEAT-KEY-001"]["feature_id"] = "FEAT-SNAP-002"
+            return part
+
+        translator.translate(_part("running_wave", 1), ctx)
+        out = translator.translate(_part("completed", 1), ctx)
+        assert isinstance(out, BuildCompletePayload)
+        assert out.feature_id == "FEAT-SNAP-002"
+        assert out.branch == "autobuild/FEAT-SNAP-002"
+
+    def test_repo_stays_none_because_nothing_on_the_wire_carries_it(self) -> None:
+        """Honest absence: no repo name is invented. Pinned as a contract so a
+        later fill has to come from a real source (a snapshot/context field),
+        not from a guess."""
+        from forge.lifecycle_bridge.bridge import BuildContext as _Ctx
+        from forge.subagents.autobuild_runner import AutobuildState
+
+        assert "repo" not in AutobuildState.model_fields
+        assert "repo" not in _Ctx.__dataclass_fields__
+
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        translator.translate(
+            _state_part("FEAT-XLAT-001", lifecycle="running_wave", tasks_completed=1),
+            ctx,
+        )
+        out = translator.translate(
+            _state_part(
+                "FEAT-XLAT-001",
+                lifecycle="completed",
+                tasks_completed=1,
+                tasks_failed=0,
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildCompletePayload)
+        assert out.repo is None
+
+    def test_branch_rides_the_v1_wire_bytes(self) -> None:
+        """``branch`` is a declared v1 field, so it must appear in the dumped
+        envelope the wireup publishes — not merely on the object."""
+        translator = StreamEventTranslator()
+        ctx = _make_context()
+        translator.translate(
+            _state_part("FEAT-XLAT-001", lifecycle="running_wave", tasks_completed=1),
+            ctx,
+        )
+        out = translator.translate(
+            _state_part(
+                "FEAT-XLAT-001",
+                lifecycle="completed",
+                tasks_completed=1,
+                tasks_failed=0,
+            ),
+            ctx,
+        )
+        assert isinstance(out, BuildCompletePayload)
+        assert out.model_dump()["branch"] == "autobuild/FEAT-XLAT-001"

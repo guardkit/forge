@@ -244,9 +244,6 @@ class TestApprovalYamlRoundTrip:
                 # ``planning.digest_review`` — the machine chain's one pause.
                 # Default always_ask=True; the unfiltered dump always includes it.
                 "digest_review": {"always_ask": True, "skip_max_scenarios": 3},
-                # ``planning.dcl`` — the machine-authored DCL seat's single-slot
-                # flag. Default-ON; the unfiltered dump always includes it.
-                "dcl": {"author_at_plan_commit": True},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages); the unfiltered
             # round-trip dump always includes it with default values.
