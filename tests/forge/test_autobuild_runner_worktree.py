@@ -690,9 +690,9 @@ def test_sweep_never_crashes_on_unexpected_error(
 # ---------------------------------------------------------------------------
 
 
-#: The families :func:`_make_receipt_tree` seeds in the OUTER tree. Not the
-#: whole of ``_RECEIPT_FAMILIES`` — ``dcl-capture`` is deliberately absent so
-#: every assertion below also proves the honest "missing" accounting.
+#: The families :func:`_make_receipt_tree` seeds in the OUTER tree — now the
+#: whole of ``_RECEIPT_FAMILIES`` (the fourth family, ``dcl-capture``, went out
+#: with the DCL strike on 2026-08-15).
 _OUTER_SEEDED_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild-private",
     ".guardkit/qav-shadow",
@@ -729,7 +729,6 @@ def _make_inner_receipt_tree(worktree: Path, name: str = "FEAT-X") -> list[str]:
         f".guardkit/worktrees/{name}/.guardkit/autobuild/TASK-X-001/qav_shadow_turn_1.json",
         f".guardkit/worktrees/{name}/.guardkit/autobuild/TASK-X-001/task_work_results.json",
         f".guardkit/worktrees/{name}/.guardkit/qav-shadow/queue.jsonl",
-        f".guardkit/worktrees/{name}/.guardkit/dcl-capture/queue.jsonl",
     ]
     for rel in rels:
         p = worktree / rel
@@ -862,7 +861,6 @@ class TestInnerWorktreeReceiptsLand:
 
         assert "worktrees/FEAT-X/.guardkit/autobuild" in result.exported
         assert "worktrees/FEAT-X/.guardkit/qav-shadow" in result.exported
-        assert "worktrees/FEAT-X/.guardkit/dcl-capture" in result.exported
 
     def test_inner_copy_never_clobbers_the_outer_family(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -918,10 +916,13 @@ class TestInnerWorktreeReceiptsLand:
         assert result.ok is True
         assert not any(f.startswith("worktrees/") for f in result.exported)
 
-    def test_dcl_capture_family_is_exported(
+    def test_the_dcl_capture_family_is_no_longer_exported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The DCL machine-authoring corpus is a receipt family too."""
+        """The DCL strike (2026-08-15): ``dcl-capture`` is not a receipt family
+        any more. A tree that still carries the directory (an old build's
+        residue) is left where it is — never copied, never claimed, and not even
+        named as a skipped family, because forge no longer looks for it."""
         worktree = tmp_path / "wt"
         (worktree / ".guardkit/dcl-capture").mkdir(parents=True)
         (worktree / ".guardkit/dcl-capture/queue.jsonl").write_text("{}\n")
@@ -929,10 +930,10 @@ class TestInnerWorktreeReceiptsLand:
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(dest_root))
 
         result = ar._export_receipts(worktree, "build-DCL-1")
-        assert ".guardkit/dcl-capture" in result.exported
-        assert (
-            dest_root / "build-DCL-1/.guardkit/dcl-capture/queue.jsonl"
-        ).is_file()
+        assert ".guardkit/dcl-capture" not in ar._RECEIPT_FAMILIES
+        assert not any("dcl-capture" in fam for fam in result.exported)
+        assert not any("dcl-capture" in row["family"] for row in result.skipped)
+        assert not (dest_root / "build-DCL-1/.guardkit/dcl-capture").exists()
 
 
 class TestExportAccountingIsHonest:
@@ -973,7 +974,9 @@ class TestExportAccountingIsHonest:
         for family, count in result.file_counts.items():
             on_disk = sum(1 for p in (pack / family).rglob("*") if p.is_file())
             assert on_disk == count, family
-        assert sum(result.file_counts.values()) == 9
+        # 4 outer receipt files + 4 inner ones (the fifth inner file was the
+        # dcl-capture queue, gone with the 2026-08-15 DCL strike).
+        assert sum(result.file_counts.values()) == 8
 
     def test_one_bad_family_never_costs_the_others(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1164,12 +1167,13 @@ class TestFailurePackEndToEnd:
         assert sorted(manifest["receipt_families_exported"]) == sorted(
             _OUTER_SEEDED_FAMILIES
         )
-        # ...and the family the stub never wrote is named honestly instead of
-        # being claimed as an export that produced nothing.
-        assert {
-            row["family"]: row["reason"]
+        # ...and a family the stub never wrote is named honestly instead of
+        # being claimed as an export that produced nothing (the inner-worktree
+        # labels are the only absentees now the outer set is seeded whole).
+        assert all(
+            row["reason"] in ("missing", "empty")
             for row in manifest["receipt_families_skipped"]
-        }[".guardkit/dcl-capture"] == "missing"
+        )
         assert manifest["receipt_export_ok"] is True
         assert manifest["receipt_file_counts"][".guardkit/qav-shadow"] == 1
         # An ISO-8601 UTC instant the diagnoser can order packs by.

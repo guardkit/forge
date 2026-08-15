@@ -683,35 +683,6 @@ class TargetTerminalConfig(BaseModel):
     )
 
 
-class PlanningDclConfig(BaseModel):
-    """Forge-side kill switch for the W1-S2 DCL machine-authoring leg.
-
-    The PRIMARY gate on whether the plan-commit driver authors a ``.dcl``
-    capability is the TARGET REPO's own ``qa.spec_track`` (``dcl`` opts in;
-    anything else — the default ``gherkin`` world — is inert). This flag is a
-    forge-side kill switch layered ON TOP of that gate: default ``True`` means
-    the authoring leg runs wherever a repo is on the ``dcl`` track; set it
-    ``False`` to hold the seat-authoring step OFF fleet-wide without touching a
-    single repo's config. It NEVER turns authoring ON where ``spec_track`` is not
-    ``dcl`` — the fallback law (a gherkin repo keeps byte-identical verification
-    behaviour) is not a flag away from being broken.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    author_at_plan_commit: bool = Field(
-        default=True,
-        description=(
-            "Forge-side kill switch for the W1-S2 DCL seat-authoring leg. "
-            "Default True = author a .dcl at plan-commit on repos whose "
-            "qa.spec_track is 'dcl'. False = never author (the feature simply "
-            "has no DCL artifact; the absence discipline carries it). This flag "
-            "can only SUPPRESS authoring — it never enables it where spec_track "
-            "is not 'dcl' (the fallback law holds regardless)."
-        ),
-    )
-
-
 class PlanningDigestReviewConfig(BaseModel):
     """The machine chain's ONE pause: the spec digest review.
 
@@ -865,15 +836,6 @@ class PlanningConfig(BaseModel):
         description=(
             "The machine chain's one pause — the spec digest review. Defaults "
             "to always_ask=True: the card always asks."
-        ),
-    )
-    dcl: PlanningDclConfig = Field(
-        default_factory=PlanningDclConfig,
-        description=(
-            "W1-S2 DCL machine-authoring kill switch. Defaults to "
-            "author_at_plan_commit=True; the PRIMARY gate is the target repo's "
-            "qa.spec_track ('dcl' opts in), so the default is a no-op on every "
-            "gherkin-track repo."
         ),
     )
 
@@ -1316,7 +1278,6 @@ __all__ = [
     "PermissionsConfig",
     "PipelineConfig",
     "PlanningConfig",
-    "PlanningDclConfig",
     "PlanningModelResolution",
     "QueueConfig",
     "ResourcePreflightConfig",

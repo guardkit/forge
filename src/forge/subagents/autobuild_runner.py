@@ -1893,15 +1893,15 @@ IN_FLIGHT_STATE_NAME: str = _receipts.IN_FLIGHT_STATE_NAME
 #: The receipt families exported before the success-path worktree removal
 #: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
 #: FEAT-SCG conformance snapshot live under ``autobuild-private``; the shadow
-#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``;
-#: the DCL machine-authoring corpus under ``dcl-capture`` (added by the
-#: receipts-landing lane — it was written by every build and destroyed with
-#: the worktree on success, exactly the FEAT-UDBE loss class).
+#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``.
+#: The DCL machine-authoring corpus (``dcl-capture``) was a fourth family until
+#: 2026-08-15, when guardkit deleted the ``.dcl`` spec track outright — nothing
+#: writes that directory any more, so exporting it only ever produced an
+#: honest "missing" row.
 _RECEIPT_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild-private",
     ".guardkit/qav-shadow",
     ".guardkit/autobuild",
-    ".guardkit/dcl-capture",
 )
 
 #: Where guardkit registers its per-task INNER worktrees inside the outer
@@ -2528,8 +2528,8 @@ def _pack_evidence(
         )
     if not families:
         missing.append(
-            "receipt families — no coach verdict, evidence dossier, "
-            "qav-shadow queue or dcl-capture corpus landed in this pack"
+            "receipt families — no coach verdict, evidence dossier or "
+            "qav-shadow queue landed in this pack"
         )
     if semantic_state is None:
         missing.append(
