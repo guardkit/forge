@@ -690,7 +690,6 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
         from forge.planning.frontier import FrontierSecondOpinion
         from forge.planning.target_terminal_tools import (
-            make_dcl_author,
             make_normalize_feature_spec,
             make_validate_feature_plan,
             make_validate_gate_registry,
@@ -1014,12 +1013,6 @@ async def compose_planning_consumer_and_dispatch(
         # are validated by guardkit's OWN ``qa validate gate-registry`` before
         # they land.
         validate_gate_registry = make_validate_gate_registry()
-        # W1-S2: the DCL machine-authoring seat (``guardkit dcl author``, §10
-        # protocol). Consulted ONLY on a ``spec_track: dcl`` repo with the kill
-        # switch on — the gherkin default world never reaches it (the driver's
-        # spec_track gate short-circuits first). Rides the SAME frozen guardkit
-        # run seam; SINGLE-SLOT LAW: this is the only path that calls the seat.
-        dcl_author = make_dcl_author()
 
         # -- approval side -------------------------------------------------
         approval_publisher = ApprovalPublisher(nats_client=nats_client)
@@ -1116,10 +1109,6 @@ async def compose_planning_consumer_and_dispatch(
                 validate_gate_registry=validate_gate_registry,
                 # Lane B / Phase E1 (B3) — the Mode B build trigger.
                 dispatch_build_trigger=dispatch_build_trigger,
-                # W1-S2 — the DCL machine-authoring seat (no-op unless the target
-                # repo is on the qa.spec_track: dcl track AND the kill switch is
-                # on; the gherkin default world never consults it).
-                dcl_author=dcl_author,
             )
         )
 

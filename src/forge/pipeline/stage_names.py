@@ -97,6 +97,10 @@ STAGE_PLAIN_NAMES: dict[str, str] = {
     "feature-spec-draft": "writing the spec",
     "feature-spec-digest-review": "reading the spec digest",
     "build-queued": "handing to the build system",
+    # HISTORICAL — old ledger rows only. The W1-S2 DCL leg was struck on
+    # 2026-08-15 (guardkit deleted the `.dcl` spec track outright), so no run
+    # records this label any more; the entry stays so ledgers written before
+    # the strike still render in plain words.
     "dcl-author": "writing the capability file",
     "qa-pass-bars": "registering the quality checklist",
     "qa-pass-bars-auth-confirm": "confirming whether there is a sign-in",

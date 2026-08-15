@@ -344,11 +344,18 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# guardkit's vendored DCL checker (qa/dcl/bin/dcl_check.mjs, WASM) needs a
-# node runtime — the ``guardkit dcl author``/oracle legs shell it in-container
-# (first live-caught 2026-07-18, run s3dcl-6e6bdabea57c: exit-2 instrument
-# error, node absent). Bookworm ships node 18, whose Go wasm_exec requires
-# the webcrypto global behind a flag (global by default only from node 19).
+# 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
+# track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
+# nothing shells the vendored checker any more. ``nodejs`` and the flag below
+# are LEFT IN PLACE deliberately: removing a runtime package is an image
+# question of its own, not a side effect of striking a planning leg.
+#
+# The original reason, kept for the record: guardkit's vendored DCL checker
+# (qa/dcl/bin/dcl_check.mjs, WASM) needs a node runtime — the ``guardkit dcl
+# author``/oracle legs shelled it in-container (first live-caught 2026-07-18,
+# run s3dcl-6e6bdabea57c: exit-2 instrument error, node absent). Bookworm ships
+# node 18, whose Go wasm_exec requires the webcrypto global behind a flag
+# (global by default only from node 19).
 ENV NODE_OPTIONS=--experimental-global-webcrypto
 
 # Bring the resolved venv across from the builder stage. Owned by root
