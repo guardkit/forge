@@ -712,6 +712,49 @@ class PlanningDclConfig(BaseModel):
     )
 
 
+class PlanningDigestReviewConfig(BaseModel):
+    """The machine chain's ONE pause: the spec digest review.
+
+    After the spec is written the chain shows the owner a plain-language list —
+    one sentence per worked example, mechanically checked against the examples
+    themselves — and waits for their word. This config governs the single place
+    where the recommendation and the letter of the "a person's taps go DOWN,
+    never up" rule genuinely disagree.
+
+    ``always_ask`` (the default, and the recommendation): the card always asks.
+    A feature with no assumptions still has worked examples, and it is the
+    examples, not the assumptions, that say what will be built. Auto-approving
+    them would mean the machine can specify and queue a build no person ever
+    saw, which is the exact hole this pause exists to close.
+
+    ``always_ask=False``: skip the card on a THIN feature only — no assumptions
+    at all AND no more than ``skip_max_scenarios`` worked examples. Mechanically
+    decidable, no judgement, no model, and the skip is recorded durably when it
+    happens. Both paths are built and tested so the choice costs a value here
+    rather than a rebuild.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    always_ask: bool = Field(
+        default=True,
+        description=(
+            "True (default) = the spec digest card always asks. False = skip "
+            "the card on a thin feature (no assumptions and at most "
+            "skip_max_scenarios worked examples); every other feature still "
+            "asks."
+        ),
+    )
+    skip_max_scenarios: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Only consulted when always_ask is False: the most worked examples "
+            "a feature may have and still skip the card."
+        ),
+    )
+
+
 class PlanningConfig(BaseModel):
     """Configuration for Mode P planning approval-routing (FEAT-SPL-002).
 
@@ -815,6 +858,13 @@ class PlanningConfig(BaseModel):
             "Lane B / Phase E1 forge target-terminal configuration. Defaults "
             "to disabled (enabled=False) — the planning chain terminates at "
             "PLANNED_HANDOFF exactly as today (byte-for-byte no-op)."
+        ),
+    )
+    digest_review: PlanningDigestReviewConfig = Field(
+        default_factory=PlanningDigestReviewConfig,
+        description=(
+            "The machine chain's one pause — the spec digest review. Defaults "
+            "to always_ask=True: the card always asks."
         ),
     )
     dcl: PlanningDclConfig = Field(

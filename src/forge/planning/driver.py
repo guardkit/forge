@@ -44,7 +44,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
@@ -88,6 +88,10 @@ from forge.planning.revision import (
     parse_dispositions,
 )
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
+from forge.planning.spec_digest import (
+    DIGEST_ERROR_PREFIX,
+    check_digest_consistency,
+)
 from forge.planning.states import PlanningState
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -167,10 +171,25 @@ _DCL_AUTHOR_STAGE = "dcl-author"
 #: between the owner's tap and the bars commit drives straight through).
 _AUTH_CONFIRM_STAGE = "qa-pass-bars-auth-confirm"
 
+#: Durable stage label for the SPEC DRAFT — the spec is written and committed
+#: but the owner has NOT yet said yes to it. Deliberately NOT the leg's
+#: ``approved`` sentinel: it is the EARLIER sentinel that makes the digest door
+#: restart-survivable. A re-drive that finds a draft re-opens the door with the
+#: persisted card instead of re-dispatching the spec-writer and rewriting the
+#: spec underneath a card the owner is still reading.
+_SPEC_DRAFT_STAGE = "feature-spec-draft"
+
+#: Durable stage label for the SPEC DIGEST REVIEW DOOR — the one pause of the
+#: machine chain (the product-docs pause, absorbed and moved to where there is
+#: something a person can actually check). A durable ``approved`` event under
+#: this label is the door's idempotency sentinel; a ``revise`` event is a round
+#: the owner answered with a note.
+_DIGEST_REVIEW_STAGE = "feature-spec-digest-review"
+
 #: The door-event statuses that mean A CARD IS STILL LIVE IN FRONT OF THE OWNER.
 #: ``GATED`` is the first opening; ``reopened`` is a recovery re-emission after a
 #: daemon restart (the checkpoint's ``republish_pending`` mechanic, mirrored).
-#: When the LAST :data:`_AUTH_CONFIRM_STAGE` event carries one of these statuses
+#: When the LAST event for a door's stage label carries one of these statuses
 #: the door is OPEN, and its persisted ``request_id`` is re-emitted VERBATIM —
 #: minting a fresh id would orphan the card the owner can still see and silently
 #: drop the tap they are about to give it.
@@ -216,6 +235,72 @@ _AUTH_DOOR_TERMINAL_SUFFIX = {
         "checklist unattended."
     ),
 }
+
+#: The ``checkpoint_type`` on the SPEC DIGEST card's envelope. The
+#: ``product_docs`` prefix is not a trick — it is the messenger's actual
+#: discriminator for a planning card, and this card genuinely IS the product-docs
+#: checkpoint, absorbed and moved to where there is a spec to read. A planning
+#: card WITHOUT that prefix is never posted at all (its body is discarded at
+#: capture and its pause mirror is suppressed), so the prefix is what makes the
+#: one front door work.
+_DIGEST_REVIEW_CHECKPOINT_TYPE = "product_docs_spec_digest"
+
+#: The one-line pause rationale carried on the digest card's envelope.
+_DIGEST_REVIEW_RATIONALE = (
+    "The spec is written. The owner reads one plain sentence per worked example "
+    "— checked by ordinary code against the examples themselves — and says "
+    "whether that is what they want built."
+)
+
+#: What the honest terminal adds after a digest review that did not end in a
+#: yes. Plain language — the owner reads these.
+_DIGEST_DOOR_TERMINAL_SUFFIX = {
+    "rejected": (
+        "The owner said no to the spec without leaving a note, so there was "
+        "nothing to rewrite from and the run stopped."
+    ),
+    "timed_out": (
+        "Nobody answered the card inside the wait window, so the run stopped "
+        "rather than build a spec no one had read."
+    ),
+    "undeliverable": (
+        "The card could not be delivered, so nobody could read the spec; the "
+        "run stopped rather than build it unread."
+    ),
+    "deferred": (
+        "The owner set the card aside instead of deciding it either way, so the "
+        "run stopped rather than build a spec no one had said yes to."
+    ),
+}
+
+#: The id the SIGN-IN question rides under when it is folded onto the digest
+#: card (§2.6 — one tap, two questions).
+#:
+#: The owner's answer comes back on the SAME approval response as their answer
+#: to the spec, in the wire's existing structured per-item field
+#: (``ApprovalResponsePayload.dispositions``, ``nats-core``
+#: ``events/_agent.py:208-215``) — never by reading their free-text note. A note
+#: is prose, and guessing "there is a sign-in" out of prose is exactly the kind
+#: of judgement this lane forbids; a disposition is a value, and reading it is
+#: ordinary code.
+#:
+#: The card states the machine's assumption ("Nothing in this feature involves
+#: signing in…") and the owner decides it like any other assumption on the card:
+#:
+#: * ``accepted`` — agreed, there is no sign-in: the build carries on and the
+#:   quality checklist registers automatically (this is also what silence on
+#:   this one item means, which is the 2026-08-14 §2.6 ruling unchanged);
+#: * ``rejected`` — disagreed, this DOES involve signing in: the run takes the
+#:   attended-registration terminal the 2026-07-31 ruling guarantees;
+#: * anything else (``deferred`` / ``modified`` / ``undecided``) — an answer
+#:   that decided nothing, which stops the run and NAMES itself rather than
+#:   silently registering the checklist either way.
+_SIGN_IN_ASSUMPTION_ID = "sign-in"
+
+#: The digest artifact's suffix in the 007 native map. It rides beside the
+#: three-file contract and is committed as a fourth file, so the planning branch
+#: carries the complete record of what the owner approved.
+_SPEC_DIGEST_SUFFIX = "_digest.yaml"
 
 #: The target repo's OWN feature-behaviour gate TEMPLATE + gate registry, read
 #: off the planning branch (never fabricated forge-side). Their ABSENCE is an
@@ -337,11 +422,17 @@ DispatchProductOwnerFn = Callable[..., Awaitable[Any]]
 assumption-dialogue re-invoke (``None`` on the first dispatch)."""
 
 DispatchFeatureSpecFn = Callable[..., Awaitable[Any]]
-"""``async (*, plan_run_id, correlation_id, spec_input) -> StageDispatchResult``.
+"""``async (*, plan_run_id, correlation_id, spec_input, revision_of=None,
+validate_feedback=None) -> StageDispatchResult``.
 
 Lane B (B2): dispatch the ``po_feature_spec`` (007) leg with the committed
-feature-spec-input content; the result's ``role_output`` carries the three-file
-spec contract."""
+feature-spec-input content; the result's ``role_output`` carries the spec
+contract — the ``.feature``, the assumptions manifest, the summary and the SPEC
+DIGEST (the plain-language list a person reads).
+
+On a REWRITE round the two optional arguments carry the owner's note VERBATIM
+(``validate_feedback``) and the prior artifact set (``revision_of``). A
+first-round dispatch passes neither."""
 
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
 """``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
@@ -356,6 +447,52 @@ _assumptions.yaml), and the structured ``target_repo_descriptor`` — the exact
 argument shape ``architect_feature_plan`` requires (specialist-agent
 roles/architect/modes/feature_plan.py). The result's ``role_output`` carries the
 plan tree."""
+
+
+@dataclass(frozen=True)
+class _DoorAnswer:
+    """What came back through an inline confirmation door.
+
+    ``outcome`` is the caller's own vocabulary (``confirmed`` for the sign-in
+    door, ``approved`` / ``revise`` for the spec-digest door, plus the shared
+    ``rejected`` / ``deferred`` / ``timed_out`` / ``undeliverable``).
+    ``decision`` is the literal wire answer and ``notes`` the owner's own words
+    — the channel their red pen rides. Both are ``None`` when the door closed
+    without anybody answering it.
+
+    ``item_answers`` carries the per-item answers that rode the SAME response
+    (the wire's ``dispositions`` field), keyed by item id — the channel the
+    sign-in question folded onto the digest card is answered through. Empty
+    when the response carried none, which is every response today that is not a
+    per-item one.
+    """
+
+    outcome: str
+    request_id: str
+    decided_by: str | None = None
+    decision: str | None = None
+    notes: str | None = None
+    item_answers: Mapping[str, str] = field(default_factory=dict)
+
+
+def _item_answers(response: Any) -> dict[str, str]:
+    """The per-item answers on an approval response, keyed by item id.
+
+    Reads ``ApprovalResponsePayload.dispositions`` — the wire's own structured
+    per-item channel, whose values are already normalised to the canonical
+    vocabulary (``accepted`` / ``modified`` / ``rejected`` / ``deferred`` /
+    ``undecided``) by the payload model itself, so nothing here interprets
+    anything. A response carrying none (every whole-card answer today) yields an
+    empty map, and an entry too malformed to have both an id and a value is
+    dropped rather than guessed at.
+    """
+    answers: dict[str, str] = {}
+    for item in getattr(response, "dispositions", None) or []:
+        item_id = str(getattr(item, "assumption_id", "") or "")
+        disposition = str(getattr(item, "disposition", "") or "")
+        if item_id and disposition:
+            answers[item_id] = disposition
+    return answers
 
 
 @dataclass(frozen=True)
@@ -646,6 +783,41 @@ class PlanningRunDriver:
                 continue
 
             if isinstance(decision, PauseAtCheckpoint):
+                # THE ONE PAUSE, MOVED. On the machine chain the brief-stage
+                # card does not open: its question — "is this what you want?" —
+                # is asked later in the same run, in front of the SPEC, where
+                # there is something a person can actually check. The pause
+                # count per feature does not change: it was one, it stays one.
+                #
+                # This is not an auto-approve. ``checkpoint_product_docs`` is
+                # byte-unchanged and still always pauses; the machine chain
+                # simply does not call it, and puts a REAL human pause later in
+                # the same run. The row written here says WHY, in the actor
+                # identity, so nobody reading the log later mistakes an
+                # absorbed pause for a skipped one.
+                if self._target_terminal_enabled():
+                    if not self._absorb_product_docs_checkpoint(correlation_id):
+                        # The row is already there and the planner still wants
+                        # to pause: something upstream is refusing to read it.
+                        # Stop loudly rather than spin a no-yield loop writing
+                        # the same row forever.
+                        self._fail(
+                            correlation_id,
+                            stage_label=_PRODUCT_DOCS_STAGE,
+                            reason="the brief-stage checkpoint is already "
+                            "recorded as absorbed but the chain still asks to "
+                            "pause there",
+                        )
+                        await self._notify(
+                            correlation_id,
+                            f"Planning run {correlation_id} stopped at "
+                            f"{plain_stage_name(_PRODUCT_DOCS_STAGE)}: the run "
+                            "could not move past a step it has already been "
+                            "through. Nothing was built.",
+                            level="error",
+                        )
+                        return
+                    continue
                 paused = await self._checkpoint(correlation_id, plan_run_id)
                 if not paused:
                     # The pause did NOT reach durable state (pre-pause store
@@ -786,6 +958,56 @@ class PlanningRunDriver:
             level="error",
         )
         return False
+
+    def _absorb_product_docs_checkpoint(self, correlation_id: str) -> bool:
+        """Record the brief-stage checkpoint as cleared BY ABSORPTION.
+
+        Returns False when such a row already exists — the caller stops loudly
+        rather than writing it again, because a second write would mean the
+        chain is not reading the first one and the loop would never yield.
+
+        The machine chain asks its one question later, in front of the spec
+        digest — so the brief card never opens and this row stands in its place,
+        in exactly the shape an approval writes (the planner reads any
+        ``checkpoint_cleared`` row the same way, and force-labels it
+        ``product_docs``). The actor identity names the reason so the durable
+        record cannot be misread as a pause that was skipped: it was MOVED.
+
+        Nothing here auto-approves anything. The run still carries exactly one
+        mandatory human approval; it simply happens where the person can see
+        what they are approving.
+        """
+        for event in self._deps.store.list_events(correlation_id):
+            if (
+                event["stage_label"] == _PRODUCT_DOCS_STAGE
+                and event["status"] == "checkpoint_cleared"
+            ):
+                logger.error(
+                    "planning driver: run %s already carries a cleared "
+                    "brief-stage checkpoint but the chain asked to pause there "
+                    "again — refusing to write a second row",
+                    correlation_id,
+                )
+                return False
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_PRODUCT_DOCS_STAGE,
+            status="checkpoint_cleared",
+            actor_identity="planning-driver:absorbed-into-spec-review",
+            details_json=json.dumps(
+                {
+                    "stage_label": _PRODUCT_DOCS_STAGE,
+                    "outcome": "absorbed",
+                    "absorbed_into": _DIGEST_REVIEW_STAGE,
+                }
+            ),
+        )
+        logger.info(
+            "planning driver: run %s brief-stage checkpoint absorbed into the "
+            "spec digest review — one pause, asked where the spec is",
+            correlation_id,
+        )
+        return True
 
     async def _checkpoint(self, correlation_id: str, plan_run_id: str) -> bool:
         """Pause at the product docs checkpoint (DF-009: always pauses).
@@ -1257,12 +1479,33 @@ class PlanningRunDriver:
         return True
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
-        """FEATURE_SPEC leg: dispatch 007, write the triple, normalize, advance.
+        """FEATURE_SPEC leg: write the spec, show it to a person, then advance.
+
+        The chain's ONE pause lives here. The brief-stage checkpoint is absorbed
+        (see :meth:`_absorb_product_docs_checkpoint`) and its question moves to
+        the only place there is something a person can actually check: right
+        after the spec is written, in front of the SPEC DIGEST — one plain
+        sentence per worked example, mechanically checked against the examples
+        themselves.
+
+        The sequence, and the order matters because getting it wrong makes the
+        door un-restartable:
+
+        1. a durable ``feature-spec`` approved row → already said yes; advance;
+        2. a durable ``feature-spec-draft`` row → the spec is written and
+           committed but unanswered; skip straight to the door and re-open it
+           with the persisted card VERBATIM (never re-dispatch — that would
+           rewrite the spec underneath a card the owner is still reading);
+        3. otherwise dispatch the spec-writer, commit the spec, and record the
+           draft row;
+        4. open the digest door;
+        5. yes → the ``feature-spec`` approved row (unchanged in shape) and on
+           to the plan leg. A NOTE → the note is recorded, the draft is
+           superseded, and the spec-writer is re-invoked with the note VERBATIM
+           and the prior artifact set. Anything else → an honest terminal.
 
         Returns True to keep driving (now FEATURE_PLAN), False on a loud
-        terminal failure. Idempotent: a durable ``feature-spec`` approved event
-        means the spec already landed (crash before the state advance) — the
-        leg just re-advances without re-dispatching the specialist.
+        terminal failure.
         """
         deps = self._deps
         if self._has_leg_event(correlation_id, _FEATURE_SPEC_STAGE):
@@ -1281,8 +1524,127 @@ class PlanningRunDriver:
         target_repo, repo_path = resolved
         branch = f"planning/{correlation_id}"
         plan_run_id = f"plan-{correlation_id}"
+
+        # The owner's notes so far, oldest first. They are the revision channel
+        # AND, past the bound, the receipt the escalation quotes back.
+        notes = self._spec_review_notes(correlation_id)
+        draft = self._open_spec_draft(correlation_id)
+
+        while True:
+            if draft is None:
+                drafted = await self._draft_spec(
+                    row,
+                    correlation_id,
+                    target_repo=target_repo,
+                    repo_path=repo_path,
+                    branch=branch,
+                    plan_run_id=plan_run_id,
+                    notes=notes,
+                )
+                if drafted is None:
+                    return False  # the failure is already loud and terminal
+                draft = drafted
+
+            # THE ONE PAUSE. A run configured to skip the card on a thin
+            # feature skips it here — mechanically decidable, no judgement.
+            skip = self._digest_review_skip_reason(draft)
+            if skip is not None:
+                logger.info(
+                    "planning driver: run %s spec digest review skipped (%s)",
+                    correlation_id,
+                    skip,
+                )
+                deps.store._record_event(
+                    correlation_id=correlation_id,
+                    stage_label=_DIGEST_REVIEW_STAGE,
+                    status="skipped",
+                    actor_identity="planning-driver",
+                    details_json=json.dumps({"digest_review": {"skipped": skip}}),
+                )
+                return self._record_spec_approved(correlation_id, draft, branch)
+
+            answer = await self._spec_digest_review_door(row, correlation_id, draft)
+
+            if answer.outcome == "approved":
+                return self._record_spec_approved(
+                    correlation_id, draft, branch, answer=answer
+                )
+
+            if answer.outcome == "revise":
+                note = str(answer.notes or "")
+                notes = [*notes, note]
+                deps.store._record_event(
+                    correlation_id=correlation_id,
+                    stage_label=_SPEC_DRAFT_STAGE,
+                    status="superseded",
+                    actor_identity=answer.decided_by or "planning-driver",
+                    details_json=json.dumps(
+                        {"spec_draft": {"superseded_by_note": note}}
+                    ),
+                )
+                if len(notes) >= CYCLE_CAP:
+                    # PAST THE BOUND — loud, and it says what was asked for.
+                    # Three cards is the whole budget (the first plus two
+                    # rewrites); a fourth would be the machine insisting it can
+                    # get there when three rounds say it cannot.
+                    return await self._escalate_spec_review(correlation_id, notes)
+                logger.info(
+                    "planning driver: run %s spec digest returned with a note "
+                    "(round %d of %d) — rewriting the spec from it",
+                    correlation_id,
+                    len(notes) + 1,
+                    CYCLE_CAP,
+                )
+                draft = None
+                continue
+
+            # rejected with no note / deferred / timed out / undeliverable —
+            # each names itself, to the owner and on the durable row.
+            return await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"spec digest review closed as {answer.outcome} — the spec was "
+                f"not approved, so nothing was planned and nothing was built",
+                owner_message=(
+                    f"Planning run {correlation_id} stopped at "
+                    f"{plain_stage_name(_DIGEST_REVIEW_STAGE)}. "
+                    f"{_DIGEST_DOOR_TERMINAL_SUFFIX.get(answer.outcome, '')} "
+                    "Nothing was built."
+                ).strip(),
+            )
+
+    async def _draft_spec(
+        self,
+        row: Any,
+        correlation_id: str,
+        *,
+        target_repo: str,
+        repo_path: str,
+        branch: str,
+        plan_run_id: str,
+        notes: list[str],
+    ) -> dict[str, Any] | None:
+        """Dispatch the spec-writer, commit the spec, record the DRAFT row.
+
+        ``notes`` carries the owner's plain-English notes from earlier rounds;
+        the newest is threaded back as ``validate_feedback`` VERBATIM together
+        with the prior artifact set as ``revision_of`` — discharging the C5
+        channel that has been vocabulary since it was designed. A first-round
+        dispatch passes neither and is byte-identical to the call that shipped.
+
+        Returns the draft record (the same dict the door and the approved row
+        read), or ``None`` when the leg has already failed loudly.
+        """
+        deps = self._deps
         spec_input = build_feature_spec_input_content(
             self._run_data(row, correlation_id)
+        )
+        prior = (
+            await self._prior_spec_artifacts(
+                correlation_id, repo_path=repo_path, branch=branch
+            )
+            if notes
+            else None
         )
 
         try:
@@ -1290,48 +1652,82 @@ class PlanningRunDriver:
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
                 spec_input=spec_input,
+                # C5, discharged: the owner's own words drive the rewrite. They
+                # go through VERBATIM — never summarised, never reworded by an
+                # intermediate step. He said it once; the machine reads what he
+                # said.
+                revision_of=prior,
+                validate_feedback=notes[-1] if notes else None,
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
-            return await self._fail_leg(
+            await self._fail_leg(
                 correlation_id,
                 _FEATURE_SPEC_STAGE,
                 f"007 dispatch raised {type(exc).__name__}: {exc}",
             )
+            return None
         ok, reason = self._dispatch_ok(result)
         if not ok:
-            return await self._fail_leg(
+            await self._fail_leg(
                 correlation_id, _FEATURE_SPEC_STAGE, f"007 dispatch {reason}"
             )
+            return None
 
         role_output = self._role_output_of(result)
         slug = self._slug_of(role_output, correlation_id)
         files = self._spec_triple_files(role_output, slug)
         if not files:
-            return await self._fail_leg(
+            await self._fail_leg(
                 correlation_id,
                 _FEATURE_SPEC_STAGE,
-                "007 returned no three-file spec contract (invalid artifacts)",
+                "007 returned no spec contract (invalid artifacts)",
             )
+            return None
 
         # VALIDATION CHANNEL (C5): the 007 native map ships a validation.json
-        # self-check alongside the artifacts. Per the mode's own contract this
-        # channel exists to drive Mode P's bounded revision_of re-invoke (C5,
-        # not yet built) — it is ADVISORY data, not an oracle. The B2 spec of
-        # record's gates are the REAL oracles that run next (the normalizer +
-        # ``guardkit feature validate``): a self-flagged spec that passes them
-        # is good enough by the estate's own bar (the gold hermetic run shipped
-        # accepted:false on a minor count note while the coach scored 0.985).
-        # So: surface the self-reported errors LOUDLY, verbatim, then let the
-        # oracles decide. TODO(C5 follow-on): thread these errors + the prior
-        # artifact set back into 007 as the bounded revision re-invoke.
+        # self-check alongside the artifacts. TWO POSTURES, each honest about
+        # what it is.
+        #
+        # Every gate but one is ADVISORY: the B2 spec of record's REAL oracles
+        # run next (the normalizer + ``guardkit feature validate``), and a
+        # self-flagged spec that passes them is good enough by the estate's own
+        # bar (the gold hermetic run shipped accepted:false on a minor count
+        # note while the coach scored 0.985). So those are surfaced LOUDLY,
+        # verbatim, and the oracles decide.
+        #
+        # The DIGEST gate is the exception, and the reason is structural: there
+        # is no oracle downstream of it. The only thing after the digest is a
+        # person's eyes, and this check is the whole reason that read can be
+        # trusted to be complete. Asking someone to approve a digest we cannot
+        # prove is a compression is asking them to approve a lie — so a digest
+        # error STOPS the run here.
         spec_val_errors = self._validation_failures(role_output)
-        if spec_val_errors:
+        digest_errors = [e for e in spec_val_errors if e.startswith(DIGEST_ERROR_PREFIX)]
+        other_errors = [
+            e for e in spec_val_errors if not e.startswith(DIGEST_ERROR_PREFIX)
+        ]
+        if other_errors:
             logger.warning(
                 "007 validation.json self-check reported failures for %s "
                 "(ADVISORY — proceeding to the normalizer/validate oracles): %s",
                 correlation_id,
-                "; ".join(spec_val_errors),
+                "; ".join(other_errors),
             )
+        if digest_errors:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "the spec-writer's own digest check failed and the digest is "
+                "what a person reads instead of the spec: "
+                + "; ".join(digest_errors),
+                owner_message=(
+                    f"Planning run {correlation_id} stopped at "
+                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the plain-language "
+                    "summary of the spec did not match the spec, so there was "
+                    "nothing safe to show you. Nothing was built."
+                ),
+            )
+            return None
 
         feature_rel = self._feature_file_rel(files)
         normalize = deps.normalize_feature_spec
@@ -1353,49 +1749,253 @@ class PlanningRunDriver:
                 pre_commit=_pre_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
-            return await self._fail_leg(
+            await self._fail_leg(
                 correlation_id,
                 _FEATURE_SPEC_STAGE,
                 f"spec write raised {type(exc).__name__}: {exc}",
             )
+            return None
         if gitres.status == "failed":
-            return await self._fail_leg(
+            await self._fail_leg(
                 correlation_id,
                 _FEATURE_SPEC_STAGE,
                 f"spec write / normalizer failed: {gitres.stderr}",
             )
+            return None
 
-        # CAPTURE the 007 feature-grain pass-bar SEED (a tolerated extra in the
-        # native map, NEVER a committed spec-triple file) and persist it on the
-        # durable feature-spec event so it survives to plan-commit — where it is
-        # specialised into per-task bars (B4 round-19). ``None`` when this reply
-        # shipped no seed (an older specialist); the plan-commit leg fails loudly
-        # on that rather than silently skipping the bars the B2 gate demands.
+        # THE DIGEST IS RE-PROVEN AGAINST THE COMMITTED SPEC. The spec-writer
+        # checked its digest against its own text; the normalizer then rewrote
+        # the ``.feature`` IN PLACE at pre-commit (collapsing wrapped steps,
+        # commenting out box-drawing dividers), and the collapsed file is "the
+        # committed content of record" the build is checked against. A digest
+        # proven only against the pre-normalization text is a digest about an
+        # artifact nobody builds from — so the same pure, model-free check runs
+        # again here, on what actually landed on the branch.
+        #
+        # CAPTURE the 007 feature-grain pass-bar SEED first (a tolerated extra
+        # in the native map, NEVER a committed spec-triple file): it is
+        # persisted on the durable draft event so it survives to plan-commit —
+        # where it is specialised into per-task bars (B4 round-19) — AND it
+        # carries the sign-in flag the card folds in, so the run pauses once
+        # rather than twice. ``None`` when this reply shipped no seed (an older
+        # specialist); the plan-commit leg fails loudly on that rather than
+        # silently skipping the bars the B2 gate demands.
         pass_bar_seed = self._capture_pass_bar_seed(role_output)
+        seed: dict[str, Any] | None = None
+        if pass_bar_seed:
+            try:
+                parsed_seed = yaml.safe_load(pass_bar_seed)
+            except yaml.YAMLError:
+                parsed_seed = None
+            if isinstance(parsed_seed, Mapping):
+                seed = dict(parsed_seed)
+
+        digest_text = self._capture_digest(role_output, files)
+        proof = await self._prove_digest_against_branch(
+            correlation_id,
+            repo_path=repo_path,
+            branch=branch,
+            files=files,
+            digest_text=digest_text,
+            slug=slug,
+            seed=seed,
+        )
+        if proof is None:
+            return None
+        digest_obj, card = proof
+
+        draft: dict[str, Any] = {
+            "slug": slug,
+            "spec_files": sorted(files),
+            "target_repo": target_repo,
+            "repo_path": repo_path,
+            "branch": branch,
+            "sha": gitres.sha,
+            "pass_bar_seed": pass_bar_seed,
+            "digest": digest_text,
+            "card": card,
+            "scenario_count": len(digest_obj.get("scenarios") or []),
+            "assumption_count": len(digest_obj.get("assumptions") or []),
+            "cycle": len(notes) + 1,
+        }
+        # Status ``drafted``, deliberately NOT ``approved``: this row is the
+        # door's restart sentinel, never the leg's.
         deps.store._record_event(
             correlation_id=correlation_id,
-            stage_label=_FEATURE_SPEC_STAGE,
-            status="approved",
+            stage_label=_SPEC_DRAFT_STAGE,
+            status="drafted",
             actor_identity="planning-driver",
-            details_json=json.dumps(
-                {
-                    "slug": slug,
-                    "spec_files": sorted(files),
-                    "target_repo": target_repo,
-                    "repo_path": repo_path,
-                    "branch": branch,
-                    "sha": gitres.sha,
-                    "pass_bar_seed": pass_bar_seed,
-                }
-            ),
+            details_json=json.dumps({"spec_draft": draft}),
         )
         logger.info(
-            "planning driver: run %s feature-spec committed (slug=%s, %d files, "
-            "pass-bar seed %s)",
+            "planning driver: run %s feature-spec drafted (slug=%s, %d files, "
+            "%d worked example(s), pass-bar seed %s) — showing the digest",
             correlation_id,
             slug,
             len(files),
+            draft["scenario_count"],
             "captured" if pass_bar_seed is not None else "ABSENT",
+        )
+        return draft
+
+    async def _prove_digest_against_branch(
+        self,
+        correlation_id: str,
+        *,
+        repo_path: str,
+        branch: str,
+        files: Mapping[str, str],
+        digest_text: str | None,
+        slug: str,
+        seed: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Re-run the digest check against the COMMITTED spec, then build the card.
+
+        Returns ``(digest, card)`` or ``None`` when the leg has already failed
+        loudly. A missing digest is a failure, not a degrade: the run must never
+        publish an unproven digest and must never fall back to a "summary
+        unavailable" card — that posture is right for a supplementary summary
+        and wrong for the thing an approval rests on.
+        """
+        if not digest_text or not str(digest_text).strip():
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "the 007 reply shipped no spec digest (<slug>_digest.yaml); "
+                "there is no checked plain-language summary to show, and an "
+                "unchecked one must never be shown in its place",
+                owner_message=(
+                    f"Planning run {correlation_id} stopped at "
+                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the spec-writer "
+                    "produced no plain-language summary to show you, so there "
+                    "was nothing you could safely say yes to. Nothing was built."
+                ),
+            )
+            return None
+
+        try:
+            digest_obj = yaml.safe_load(str(digest_text))
+        except yaml.YAMLError as exc:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"the spec digest is not parseable YAML: {exc}",
+            )
+            return None
+
+        feature_rel = self._feature_file_rel(files)
+        assumptions_rel = next(
+            (rel for rel in files if rel.endswith(_SPEC_ASSUMPTIONS_SUFFIX)), None
+        )
+        committed_feature: str | None = None
+        committed_assumptions: str | None = None
+        if feature_rel:
+            committed_feature = await self._deps.git_runner.read_file_from_branch(
+                repo_path=repo_path, branch=branch, file_path=feature_rel
+            )
+        if assumptions_rel:
+            committed_assumptions = await self._deps.git_runner.read_file_from_branch(
+                repo_path=repo_path, branch=branch, file_path=assumptions_rel
+            )
+        if committed_feature is None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "could not read the committed .feature back off "
+                f"{branch} to re-prove the spec digest against it",
+            )
+            return None
+
+        manifest: dict[str, Any] = {}
+        if committed_assumptions:
+            try:
+                parsed = yaml.safe_load(committed_assumptions)
+            except yaml.YAMLError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                manifest = dict(parsed)
+
+        errors = check_digest_consistency(
+            digest_obj, committed_feature, manifest, slug
+        )
+        if errors:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                "the spec digest does not match the committed spec: "
+                + "; ".join(errors),
+                owner_message=(
+                    f"Planning run {correlation_id} stopped at "
+                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the plain-language "
+                    "summary of the spec did not match the spec it was supposed "
+                    "to summarise, so there was nothing safe to show you. "
+                    "Nothing was built."
+                ),
+            )
+            return None
+
+        card = self._digest_review_card(
+            correlation_id,
+            digest_obj=digest_obj if isinstance(digest_obj, Mapping) else {},
+            feature_text=committed_feature,
+            seed=seed,
+        )
+        return dict(digest_obj) if isinstance(digest_obj, dict) else {}, card
+
+    def _record_spec_approved(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        branch: str,
+        *,
+        answer: "_DoorAnswer | None" = None,
+    ) -> bool:
+        """Write the leg's durable ``approved`` row and advance to the plan leg.
+
+        The row keeps the shape every downstream leg already reads (slug, files,
+        repo, branch, sha, pass-bar seed) and ADDS the owner's act: who said yes
+        and, when the sign-in question rode the same card, that they answered it.
+        """
+        record: dict[str, Any] = {
+            "slug": draft.get("slug"),
+            "spec_files": list(draft.get("spec_files") or []),
+            "target_repo": draft.get("target_repo"),
+            "repo_path": draft.get("repo_path"),
+            "branch": draft.get("branch") or branch,
+            "sha": draft.get("sha"),
+            "pass_bar_seed": draft.get("pass_bar_seed"),
+        }
+        if answer is not None:
+            # The one tap answered the sign-in question too, when the card
+            # carried it — the pass-bars leg reads this instead of opening a
+            # second door an hour later with no spec attached. All THREE
+            # answers are recorded, not just the yes: "there IS a sign-in" is
+            # the answer the 2026-07-31 attended-registration guarantee exists
+            # for, and a run that could not record it could not reach it.
+            sign_in = self._sign_in_answer(draft, answer)
+            record["spec_review"] = {
+                "decided_by": answer.decided_by,
+                "request_id": answer.request_id,
+                "cycle": draft.get("cycle"),
+                **({"sign_in_answer": sign_in} if sign_in else {}),
+                # The pre-existing key, kept BYTE-IDENTICAL in meaning: present
+                # and true exactly when the owner confirmed there is no
+                # sign-in. A run already in flight when this landed is read by
+                # the same fallback in :meth:`_spec_review_auth_answer`.
+                **({"auth_confirmed": True} if sign_in == "confirmed" else {}),
+            }
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_FEATURE_SPEC_STAGE,
+            status="approved",
+            actor_identity=(answer.decided_by if answer else None) or "planning-driver",
+            details_json=json.dumps(record),
+        )
+        logger.info(
+            "planning driver: run %s feature-spec approved (slug=%s, %d files)",
+            correlation_id,
+            record["slug"],
+            len(record["spec_files"]),
         )
         return self._advance_after_spec(correlation_id)
 
@@ -1424,6 +2024,524 @@ class PlanningRunDriver:
             )
             return False
         return True
+
+    # ------------------------------------------------------------------ #
+    # The spec digest review — the machine chain's ONE pause
+    # ------------------------------------------------------------------ #
+
+    def _open_spec_draft(self, correlation_id: str) -> dict[str, Any] | None:
+        """The spec draft still waiting for an answer, or ``None``.
+
+        A draft is OPEN exactly when the LAST ``feature-spec-draft`` row is a
+        ``drafted`` one — a ``superseded`` row means the owner sent a note and
+        the spec is being rewritten, so there is nothing live to re-open.
+        """
+        latest: dict[str, Any] | None = None
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] != _SPEC_DRAFT_STAGE:
+                continue
+            if event["status"] != "drafted":
+                latest = None
+                continue
+            try:
+                details = json.loads(event["details_json"] or "{}") or {}
+            except (json.JSONDecodeError, ValueError):
+                latest = None
+                continue
+            record = details.get("spec_draft")
+            latest = dict(record) if isinstance(record, Mapping) else None
+        return latest
+
+    @staticmethod
+    def _sign_in_answer(
+        draft: Mapping[str, Any], answer: "_DoorAnswer"
+    ) -> str | None:
+        """What the owner said about the sign-in question, or ``None``.
+
+        ``None`` means the question was never asked — the card carried no
+        sign-in line, because the spec's own flag was down when it was
+        rendered. Otherwise one of the sign-in door's OWN outcome words, so the
+        pass-bars leg's terminal reads identically whichever door answered:
+
+        * ``confirmed`` — agreed there is no sign-in. This is also what an
+          answer that says nothing about this one item means: the 2026-08-14
+          §2.6 ruling is that saying yes to the spec confirms it, and that
+          ruling is unchanged here;
+        * ``rejected`` — disagreed: this DOES involve signing in, so the
+          quality checklist must be registered attended;
+        * ``deferred`` — an answer that decided nothing (set aside, or edited
+          rather than decided). Never read as agreement: the run stops and
+          names it.
+
+        Read from the response's per-item ``dispositions`` — a value, not
+        prose. Nothing here parses a note.
+        """
+        if not (draft.get("card") or {}).get("sign_in_check"):
+            return None
+        given = (answer.item_answers or {}).get(_SIGN_IN_ASSUMPTION_ID)
+        if given is None:
+            return "confirmed"
+        if given == "accepted":
+            return "confirmed"
+        if given == "rejected":
+            return "rejected"
+        return "deferred"
+
+    def _spec_review_auth_answer(
+        self, correlation_id: str
+    ) -> dict[str, Any] | None:
+        """The sign-in answer given on the spec digest card, or ``None``.
+
+        Present exactly when the card carried the sign-in question (the spec's
+        own flag was up when it was rendered) and the owner ended the review.
+        The pass-bars leg reads this instead of opening a second door, which is
+        what makes the run pause ONCE.
+
+        Shaped like the sign-in door's own record — same ``outcome`` vocabulary,
+        so the leg's receipt and its terminal read the same either way. A reader
+        of the durable log should not have to know which door answered the
+        question, only that a person did, who, and what they said.
+
+        ``auth_confirmed`` is the pre-thaw key and is still honoured, so a run
+        already in flight when the three-answer record landed reads correctly.
+        """
+        review = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE).get(
+            "spec_review"
+        )
+        if not isinstance(review, Mapping):
+            return None
+        outcome = str(review.get("sign_in_answer") or "")
+        if not outcome and review.get("auth_confirmed"):
+            outcome = "confirmed"
+        if not outcome:
+            return None
+        return {
+            "outcome": outcome,
+            "decided_by": review.get("decided_by"),
+            "request_id": review.get("request_id"),
+            "answered_on": "the spec digest card",
+        }
+
+    def _spec_review_notes(self, correlation_id: str) -> list[str]:
+        """Every note the owner has sent about this spec, oldest first."""
+        notes: list[str] = []
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] != _DIGEST_REVIEW_STAGE:
+                continue
+            if event["status"] != "revise":
+                continue
+            try:
+                details = json.loads(event["details_json"] or "{}") or {}
+            except (json.JSONDecodeError, ValueError):
+                continue
+            record = details.get("digest_review")
+            if isinstance(record, Mapping) and record.get("notes"):
+                notes.append(str(record["notes"]))
+        return notes
+
+    async def _prior_spec_artifacts(
+        self, correlation_id: str, *, repo_path: str, branch: str
+    ) -> dict[str, str] | None:
+        """The artifact set of the spec being revised, read off the branch.
+
+        Threaded to the spec-writer as ``revision_of`` so the rewrite starts
+        from what it actually wrote, not from a paraphrase of it. Read off the
+        branch rather than carried in memory, which is what makes it correct on
+        an idempotent re-drive. ``None`` when nothing readable is there.
+        """
+        draft = None
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] != _SPEC_DRAFT_STAGE:
+                continue
+            try:
+                details = json.loads(event["details_json"] or "{}") or {}
+            except (json.JSONDecodeError, ValueError):
+                continue
+            record = details.get("spec_draft")
+            if isinstance(record, Mapping) and record.get("spec_files"):
+                draft = dict(record)
+        if draft is None:
+            return None
+        prior: dict[str, str] = {}
+        for rel in draft.get("spec_files") or []:
+            content = await self._deps.git_runner.read_file_from_branch(
+                repo_path=repo_path, branch=branch, file_path=str(rel)
+            )
+            if content is not None:
+                prior[str(rel).rsplit("/", 1)[-1]] = content
+        return prior or None
+
+    def _digest_review_skip_reason(self, draft: Mapping[str, Any]) -> str | None:
+        """Why this run may skip the digest card, or ``None`` (it always asks).
+
+        The default is ALWAYS ASK, and that is the recommendation: a feature
+        with no assumptions still has worked examples, and it is the examples —
+        not the assumptions — that say what will be built. Auto-approving them
+        would mean the machine can specify and queue a build no person ever saw,
+        which is the exact hole this pause exists to close.
+
+        The alternative is built because a binding rule says a person's taps go
+        DOWN and never up, and on a thin feature the brief card used to
+        auto-approve itself. Turning ``always_ask`` off skips the card ONLY when
+        the spec has no assumptions AND no more than ``skip_max_scenarios``
+        worked examples — mechanically decidable, no judgement, and recorded
+        durably when it happens. One setting, both paths tested, so the ruling
+        costs a value in a config file rather than a rebuild.
+        """
+        cfg = self._deps.planning_config.digest_review
+        if cfg.always_ask:
+            return None
+        if (draft.get("card") or {}).get("sign_in_check"):
+            # A flagged feature is never thin enough to skip: the card is
+            # carrying a question only a person can answer, and skipping it
+            # would push that question onto a later door — which is the second
+            # pause this whole design exists to remove.
+            return None
+        scenarios = int(draft.get("scenario_count") or 0)
+        assumptions = int(draft.get("assumption_count") or 0)
+        if assumptions == 0 and scenarios <= int(cfg.skip_max_scenarios):
+            return (
+                f"the spec makes no assumptions and has {scenarios} worked "
+                f"example(s), and this run is set not to ask about thin features"
+            )
+        return None
+
+    async def _spec_digest_review_door(
+        self, row: Any, correlation_id: str, draft: Mapping[str, Any]
+    ) -> "_DoorAnswer":
+        """Show the spec digest and wait for the owner's word.
+
+        A THIN CALLER of :meth:`_inline_confirmation_door` — the same mechanism
+        the sign-in door rides, so the two can never behave differently.
+
+        The four answers, and what each means:
+
+        * approve / override → ``approved``: write the plan and the quality
+          checklist, then come back for the go-ahead. Nothing is built yet.
+        * reject WITH a note → ``revise``: the machine rewrites the spec from
+          the note and comes back with a fresh digest. ``reject`` is the wire's
+          own literal and the door branches on it here rather than dispatching
+          it, so it never means "cancel this run" the way it does at the
+          product-docs checkpoint.
+        * reject with NO note → ``rejected``: there is nothing to rewrite from,
+          so the run stops and says so. Only reachable from a command line: the
+          note box on the card is required.
+        * anything else (a "later") → ``deferred``: an answer that decided
+          nothing is still an ANSWER, so the run stops and names it rather than
+          reporting that nobody replied.
+
+        WHEN THE CARD ALSO CARRIED THE SIGN-IN QUESTION, that question is
+        answered SEPARATELY, on the same response, in the wire's per-item
+        ``dispositions`` field (:data:`_SIGN_IN_ASSUMPTION_ID`) — never by
+        reading the note. The two channels do not overlap: the note says what
+        the SPEC should say, the item answer says whether there is a sign-in.
+        The item answer is read only on the round that ENDS the review (an
+        approve); on a revise round the spec is about to change underneath it,
+        so the question is re-asked on the fresh card rather than carried
+        forward against a spec the owner has not seen. It is still recorded on
+        the door's durable row either way.
+        """
+        card = dict(draft.get("card") or {})
+
+        def _rehydrate(persisted: Mapping[str, Any], wait_seconds: int) -> dict[str, Any]:
+            # The persisted card is replayed VERBATIM after a restart — the
+            # owner's card is still in their Slack and a re-render off
+            # possibly-drifted source would not be the same card.
+            stored = persisted.get("card")
+            return dict(stored) if isinstance(stored, Mapping) else card
+
+        def _decide(response: Any) -> str:
+            if response.decision in ("approve", "override"):
+                return "approved"
+            if response.decision == "reject":
+                return "revise" if str(getattr(response, "notes", "") or "").strip() else "rejected"
+            return "deferred"
+
+        async def _closed(answer: "_DoorAnswer") -> None:
+            if answer.outcome == "approved":
+                sign_in = self._sign_in_answer(draft, answer)
+                if sign_in is not None and sign_in != "confirmed":
+                    # They said yes to the spec AND told us the sign-in is real
+                    # (or set that question aside). The run does not quietly
+                    # carry on as if they had not: say so NOW, at the tap, so
+                    # nobody learns an hour later that the run was always going
+                    # to stop.
+                    await self._notify(
+                        correlation_id,
+                        f"Planning run {correlation_id}: {answer.decided_by} "
+                        "said yes to the spec, and did not confirm that this "
+                        "feature is free of signing in. The machine will write "
+                        "the task plan and then stop, so a person can register "
+                        "the quality checklist. Nothing will be built.",
+                        level="info",
+                    )
+                    return
+                await self._notify(
+                    correlation_id,
+                    f"Planning run {correlation_id}: {answer.decided_by} said yes "
+                    "to the spec. Writing the task plan and the quality "
+                    "checklist next — nothing is built until you give the "
+                    "go-ahead.",
+                    level="info",
+                )
+            elif answer.outcome == "revise":
+                await self._notify(
+                    correlation_id,
+                    f"Planning run {correlation_id}: {answer.decided_by} sent a "
+                    "note. Rewriting the spec from it and coming back with a "
+                    "fresh list.",
+                    level="info",
+                )
+
+        return await self._inline_confirmation_door(
+            row,
+            correlation_id,
+            stage_label=_DIGEST_REVIEW_STAGE,
+            details_key="digest_review",
+            checkpoint_type=_DIGEST_REVIEW_CHECKPOINT_TYPE,
+            rationale=_DIGEST_REVIEW_RATIONALE,
+            sentinel_outcome="approved",
+            answered_outcome="approved",
+            persisted={"card": card},
+            # The card carries the whole ``.feature`` under "show me", so it is
+            # written ONCE per round, on the opening row a recovery replays
+            # from — never again on the verdict.
+            receipt_keys=(),
+            rehydrate=_rehydrate,
+            decide=_decide,
+            open_message=lambda approver, wait: self._digest_door_open_message(
+                correlation_id, expected_approver=approver, wait_seconds=wait
+            ),
+            log_noun="spec digest review door",
+            on_close=_closed,
+        )
+
+    def _digest_review_card(
+        self,
+        correlation_id: str,
+        *,
+        digest_obj: Mapping[str, Any],
+        feature_text: str,
+        seed: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """The card the owner reads — PLAIN language, one sentence per example.
+
+        Composed from the digest that has just been PROVEN against the committed
+        spec, so every sentence on this card has a worked example behind it and
+        every example has a sentence. The worked examples themselves ride along
+        for the "show me" view, one click deeper; they are never the ask.
+
+        The labels travel VERBATIM as the spec wrote them. Turning a label into
+        the words a person reads is the card renderer's job, and it renders only
+        the labels it has a plain word for — so an internal label can never
+        surprise a reader by appearing raw.
+
+        ONE THING THE RENDERER MUST DECIDE, NAMED HERE RATHER THAN DISCOVERED
+        LIVE: ``worked_examples`` is the WHOLE committed ``.feature``, verbatim
+        and UNSCRUBBED, and it rides to the messenger inside the approval
+        envelope's ``summary_data``. Real specs in this estate carry text the
+        plain-name fence forbids on a user surface — ``features/`` scenarios in
+        this very repo are tagged ``@task:TASK-MP-008`` (jarvis's forbidden
+        task-id pattern) and spec bodies routinely name the internal tools.
+
+        Every OTHER thing a person is asked about here is composed from the
+        digest and is fence-safe by construction, and the raw labels are
+        already ruled on (see the paragraph above: whitelisted at render). This
+        one field is neither, because its whole value is being the spec's own
+        words. So the surface that renders the "show me" view owns the choice —
+        scrub it, or exempt that view deliberately — and it cannot make that
+        choice by accident, because
+        ``test_the_show_me_text_is_the_raw_spec_unscrubbed`` pins exactly what
+        is in the field and what is not. Note that jarvis's fence suite renders
+        with neutral fixtures, so it will NOT catch this on its own.
+        """
+        wait_seconds = max(1, int(self._deps.planning_config.originator_wait_seconds))
+        examples: list[dict[str, Any]] = []
+        for entry in digest_obj.get("scenarios") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            examples.append(
+                {
+                    "sentence": str(entry.get("sentence") or ""),
+                    "tags": [str(tag) for tag in (entry.get("tags") or [])],
+                }
+            )
+        assumptions: list[dict[str, str]] = []
+        for entry in digest_obj.get("assumptions") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            assumptions.append(
+                {
+                    "assumption": str(entry.get("text") or ""),
+                    "why": str(entry.get("basis") or ""),
+                }
+            )
+        card: dict[str, Any] = {
+            "checkpoint": _DIGEST_REVIEW_CHECKPOINT_TYPE,
+            "title": "The spec is ready — here's what will be built",
+            "what_happened": (
+                "The spec-writer has written the worked examples this build "
+                "will be checked against. Below is one sentence per example, in "
+                "the order they appear. This list is checked by ordinary code "
+                "against the examples themselves — every example is here, none "
+                "has been left out."
+            ),
+            "what_it_will_do": examples,
+            "what_the_machine_assumed": assumptions,
+            "approve_means": (
+                "Yes — this is what I want built: the machine writes the task "
+                "plan and the quality checklist, then comes back for your "
+                "go-ahead before any build starts. Nothing is built yet."
+            ),
+            "note_means": (
+                "Send a note and the machine rewrites the spec from what you "
+                f"say and shows you a fresh list. Up to {CYCLE_CAP - 1} "
+                "rewrites; past that it stops and says it needs you."
+            ),
+            "show_means": (
+                "Show the worked examples to read the examples themselves. You "
+                "never have to."
+            ),
+            "no_answer_means": (
+                f"No answer within {self._plain_wait(wait_seconds)}: the run "
+                "stops and says so — nothing is built."
+            ),
+            # One click deeper. Never the ask, never in front of the reader.
+            "worked_examples": feature_text,
+        }
+        feature = str(digest_obj.get("feature") or "").strip()
+        if feature:
+            card["feature"] = feature
+
+        # THE ONE TAP ANSWERS BOTH QUESTIONS. The sign-in flag is already known
+        # here — it was raised by the same spec this card is about — so the
+        # question is asked HERE, with the spec in front of the reader, instead
+        # of an hour later on a second card with no spec attached. A run that
+        # pauses twice has failed; this is how it pauses once.
+        #
+        # It is written as an ASSUMPTION the reader decides, not as an
+        # instruction to write prose, and that is the whole point: a decided
+        # assumption comes back as a VALUE on the wire
+        # (:func:`_item_answers`), so both answers — "agreed, no sign-in" and
+        # "no, this really does involve signing in" — are read by ordinary
+        # code. The earlier wording asked for the second answer "in a note",
+        # which the note channel cannot carry: a note means REWRITE THE SPEC at
+        # this door, and no amount of reading the prose could tell the two
+        # apart without the machine judging what the words meant.
+        if seed is not None and bool(seed.get("auth_surface_bearing")):
+            card["sign_in_check"] = {
+                "title": "One thing to confirm",
+                "answer_id": _SIGN_IN_ASSUMPTION_ID,
+                "statement": (
+                    "Nothing in this feature involves signing in or checking "
+                    "who someone is."
+                ),
+                "body": (
+                    "The spec checker thinks this feature might involve "
+                    "signing in or checking who someone is. Say whether that "
+                    "is right here, with the spec in front of you — it is the "
+                    "only time you will be asked."
+                ),
+                "why_we_ask": (
+                    "The check that spots this is a keyword scan, and it fires "
+                    "most often on a spec that is explaining it does not need a "
+                    "sign-in."
+                ),
+                "agree_means": (
+                    "Agree — nothing here touches signing in: the build "
+                    "carries on and the quality checklist is registered "
+                    "automatically."
+                ),
+                "disagree_means": (
+                    "Disagree — this really does involve signing in: the "
+                    "machine writes the task plan and then STOPS, so a person "
+                    "registers the quality checklist by hand. Nothing is built."
+                ),
+                "no_answer_means": (
+                    "Say nothing about this one and saying yes to the spec is "
+                    "taken as agreeing there is no sign-in here."
+                ),
+                "flagged_lines": self._auth_basis_lines(
+                    str(seed.get("auth_surface_basis") or "no basis supplied")
+                ),
+            }
+        return card
+
+    def _digest_door_open_message(
+        self, correlation_id: str, *, expected_approver: str | None, wait_seconds: int
+    ) -> str:
+        """The plain-language ping that says the run is WAITING, not broken."""
+        who = expected_approver or "the run's approver"
+        return (
+            f"Planning run {correlation_id}: the spec is written. {who} has a "
+            "card listing, in one sentence each, everything this build will be "
+            "checked against. Say yes and the machine writes the task plan and "
+            "the quality checklist; send a note and it rewrites the spec from "
+            f"what you say. No answer within {self._plain_wait(wait_seconds)} "
+            "stops the run — nothing is built either way until you give the "
+            "go-ahead."
+        )
+
+    async def _escalate_spec_review(
+        self, correlation_id: str, notes: list[str]
+    ) -> bool:
+        """Past the revision bound: stop loudly, and say what was asked for.
+
+        The bound is the estate's existing frozen ``CYCLE_CAP`` — three cards
+        total, the first plus two rewrites — reused rather than a second number
+        minted beside it. The brief-stage dialogue this pause absorbs ran on
+        exactly that cap, so a person's budget per feature is unchanged.
+
+        This is the loud stop, not a quiet one: the run FAILS, the durable row
+        keeps every note verbatim, and the owner's sentence quotes back what
+        they said each time so the next person picks it up knowing what was
+        actually wanted.
+
+        HONEST DEVIATION FROM THE DESIGN, recorded rather than papered over: the
+        design named ``escalate_planning_run`` as the mechanism here. That
+        function re-targets the approver under a compare-and-set pinned to the
+        PAUSED state (``escalation.py`` — ``expected_from_state=PAUSED``), and
+        this run is at FEATURE_SPEC, which has no PAUSED edge. Calling it would
+        be refused at the CAS, log a misleading "a concurrent transition won"
+        warning, and overwrite the run's pending product-docs request id on the
+        way out. So the rung is built as what the design's own sentence asks
+        for — "the run stops with a terminal that says plainly … this one needs
+        a person" — rather than as a call that cannot do it.
+        """
+        quoted = "; ".join(f"“{note}”" for note in notes)
+        return await self._fail_leg(
+            correlation_id,
+            _FEATURE_SPEC_STAGE,
+            f"spec digest review reached the revision bound ({CYCLE_CAP} cards) "
+            f"without an approval; notes given: {quoted}",
+            owner_message=(
+                f"Planning run {correlation_id} stopped at "
+                f"{plain_stage_name(_DIGEST_REVIEW_STAGE)}: the machine tried "
+                f"{CYCLE_CAP} times and could not write a spec that matched your "
+                f"notes. Here is what you said each time: {quoted}. This one "
+                "needs a person. Nothing was built."
+            ),
+        )
+
+    @staticmethod
+    def _capture_digest(
+        role_output: Mapping[str, Any], files: Mapping[str, str]
+    ) -> str | None:
+        """The spec digest's content, from the committed files or the native map.
+
+        Prefers the committed set (the digest is a fourth committed file, so the
+        planning branch carries the complete record of what was approved), and
+        falls back to the reply's own map for the alternate ``files`` shape.
+        ``None`` when the reply shipped no digest at all — a loud failure at the
+        caller, never a card with an unchecked summary on it.
+        """
+        for rel, content in files.items():
+            if str(rel).endswith(_SPEC_DIGEST_SUFFIX):
+                return str(content)
+        for name, content in role_output.items():
+            if str(name).endswith(_SPEC_DIGEST_SUFFIX):
+                return str(content)
+        return None
 
     async def _feature_plan_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write + validate.
@@ -2286,9 +3404,37 @@ class PlanningRunDriver:
         auth_confirmation: dict[str, Any] | None = None
         if bool(seed.get("auth_surface_bearing")):
             basis = str(seed.get("auth_surface_basis") or "no basis supplied")
-            door = await self._auth_surface_confirmation_door(
-                row, correlation_id, seed=seed, basis=basis
-            )
+            # ONE PAUSE, COUNTED END TO END. The sign-in flag was raised by the
+            # SPEC, and the spec digest card already carried the question — with
+            # the spec itself in front of the reader, which is strictly better
+            # context for answering it than a card arriving here with no spec
+            # attached. Their one tap answered both, so this leg opens no door.
+            #
+            # The door below is NOT dead code: it is still the door for a run
+            # that reached here without a digest-review answer — the flag-OFF
+            # path and any run already in flight when this landed.
+            already = self._spec_review_auth_answer(correlation_id)
+            if already is not None:
+                # ALL THREE of the digest card's answers land here, not just
+                # the yes. "There IS a sign-in" takes the SAME terminal below
+                # that the sign-in door's own reject takes — the 2026-07-31
+                # attended-registration guarantee, reached through the one
+                # pause instead of a second door. There is one guarantee and
+                # one place it is enforced; the digest card only changes where
+                # the person was asked.
+                door = str(already.get("outcome") or "confirmed")
+                logger.info(
+                    "planning driver: run %s sign-in question was answered on "
+                    "the spec digest card by %s (%s); opening no second door",
+                    correlation_id,
+                    already.get("decided_by"),
+                    door,
+                )
+                auth_confirmation = dict(already)
+            else:
+                door = await self._auth_surface_confirmation_door(
+                    row, correlation_id, seed=seed, basis=basis
+                )
             if door != "confirmed":
                 # TWO AUDIENCES (the 2026-07-31 stage-names ruling). The
                 # MACHINE reason — durable FAILED row + logs — keeps the clause
@@ -2296,18 +3442,28 @@ class PlanningRunDriver:
                 # is the receipt an operator greps. The OWNER's sentence names
                 # NONE of them; it says which stage stopped, in plain words,
                 # why, and that nothing was built.
+                #
+                # A door word with no sentence of its own would be a terminal
+                # that says nothing, which is worse than a clumsy one — so an
+                # unknown word (only reachable from a durable row written by
+                # some later version) still names ITSELF.
+                suffix = _AUTH_DOOR_TERMINAL_SUFFIX.get(
+                    door,
+                    f"The sign-in question closed as {door}, which is not a "
+                    "yes, so the quality checklist must be registered attended.",
+                )
                 return await self._fail_leg(
                     correlation_id,
                     _QA_PASS_BARS_STAGE,
                     f"pass-bar seed is auth_surface_bearing — pass bars need "
                     f"attended registration per {_SPL_007_AUTH_CLAUSE}; refusing "
                     f"machine registration. Seed auth_surface_basis: {basis} "
-                    f"{_AUTH_DOOR_TERMINAL_SUFFIX[door]}",
+                    f"{suffix}",
                     owner_message=(
                         f"Planning run {correlation_id} stopped at "
                         f"{plain_stage_name(_QA_PASS_BARS_STAGE)}: the spec "
                         "checker flagged this feature as sitting behind a "
-                        f"sign-in. {_AUTH_DOOR_TERMINAL_SUFFIX[door]} Nothing "
+                        f"sign-in. {suffix} Nothing "
                         "was registered and nothing was built."
                     ),
                 )
@@ -2471,13 +3627,38 @@ class PlanningRunDriver:
         return True
 
     # ------------------------------------------------------------------ #
-    # The auth-confirmation door (cure for live run dff0cd00, 2026-07-31)
+    # THE INLINE CONFIRMATION DOOR — ONE mechanism, two callers
+    #
+    # Born as the auth-confirmation door (the cure for live run dff0cd00,
+    # 2026-07-31) and extracted here when the machine chain's spec-digest review
+    # needed the same pause. A pause mechanism that exists twice drifts, and two
+    # doors that behave differently are a promise the estate cannot keep — so
+    # there is ONE door, parameterised, and both callers get every mechanic:
+    # durable-before-wire bookkeeping, arm-before-post, the stale request-id
+    # guard, per-run approver pinning, verbatim re-open after a restart, and the
+    # idempotency sentinel that means an answered door is never re-asked.
     # ------------------------------------------------------------------ #
 
-    async def _auth_surface_confirmation_door(
-        self, row: Any, correlation_id: str, *, seed: Mapping[str, Any], basis: str
-    ) -> str:
-        """Ask the owner to confirm a flagged seed is authless; wait for the tap.
+    async def _inline_confirmation_door(
+        self,
+        row: Any,
+        correlation_id: str,
+        *,
+        stage_label: str,
+        details_key: str,
+        checkpoint_type: str,
+        rationale: str,
+        sentinel_outcome: str,
+        answered_outcome: str,
+        persisted: dict[str, Any],
+        receipt_keys: tuple[str, ...],
+        rehydrate: Callable[[Mapping[str, Any], int], dict[str, Any]],
+        decide: Callable[[Any], str],
+        open_message: Callable[[str | None, int], str],
+        log_noun: str,
+        on_close: Callable[[_DoorAnswer], Awaitable[None]] | None = None,
+    ) -> _DoorAnswer:
+        """Put ONE card in front of the run's approver and wait for the tap.
 
         MIRRORS the cycle-1 assumptions checkpoint one-for-one — durable
         bookkeeping BEFORE the wire, ONE approval-request envelope built by the
@@ -2488,58 +3669,109 @@ class PlanningRunDriver:
         ``request_id`` guard, and the wait window off
         ``PlanningConfig.originator_wait_seconds``.
 
-        The ONE deliberate difference: no PAUSED state transition. The run is
-        mid-machine-chain at FEATURE_PLAN, a state whose transition table has no
-        PAUSED edge (``planning/states.py`` — deliberately additive-only), so the
-        door waits INLINE instead of stranding a half-paused row.
+        The ONE deliberate difference from the checkpoint: no PAUSED state
+        transition. Both callers run mid-machine-chain, in states whose
+        transition table has no PAUSED edge (``planning/states.py`` —
+        deliberately additive-only), so the door waits INLINE instead of
+        stranding a half-paused row.
 
         SURVIVING A RESTART (the mechanic that makes the inline wait safe): the
         boot sweep enumerates FEATURE_SPEC / FEATURE_PLAN alongside QUEUED /
         RUNNING (``cli/_serve_planning.sweep_interrupted_planning_runs``), so a
-        daemon killed with the card live re-drives this leg on the next boot;
+        daemon killed with the card live re-drives its leg on the next boot;
         and a door that is STILL OPEN on the durable record is RE-OPENED with
-        its persisted ``request_id`` and ``attempt_count`` VERBATIM — exactly as
-        :meth:`_republish_pending` re-emits the checkpoint's — so the card the
-        owner can still see stays the card their tap answers. The durable
-        ``approved`` event written on confirmation is the idempotency sentinel:
-        a run that was already confirmed never re-asks.
+        its persisted ``request_id``, ``attempt_count`` and CARD CONTENT
+        VERBATIM — exactly as :meth:`_republish_pending` re-emits the
+        checkpoint's — so the card the owner can still see stays the card their
+        tap answers, word for word. The durable ``approved`` event written on a
+        yes is the idempotency sentinel: an answered door never re-asks.
 
-        Returns ``"confirmed"`` (the caller proceeds exactly as the unflagged
-        path), ``"rejected"``, ``"deferred"``, ``"timed_out"`` or
-        ``"undeliverable"`` — each of the last four mapping to the caller's
-        honest terminal, which NAMES which of them happened.
+        Parameters carry everything that differs between the two callers and
+        nothing else:
+
+        * ``stage_label`` / ``details_key`` — where the door's rows live and
+          under which key its record sits inside ``details_json``;
+        * ``checkpoint_type`` / ``rationale`` — the envelope's discriminator and
+          its one-line reason;
+        * ``sentinel_outcome`` — the outcome whose durable row is written as
+          ``approved`` (the idempotency sentinel);
+        * ``answered_outcome`` — what an ALREADY-answered door returns on a
+          re-drive without re-asking;
+        * ``persisted`` — the caller's own fields carried verbatim on the open
+          row, and replayed into ``rehydrate`` on a recovery re-open;
+        * ``receipt_keys`` — which of those fields ALSO belong on the verdict
+          row. The card lives on the opening row, which is the only row a
+          recovery reads, so a caller carrying a large card names no keys here
+          and the event log stops storing the same bytes once per verdict;
+        * ``rehydrate(persisted, wait_seconds)`` — builds the card dict from
+          those fields, so a re-emission is the SAME card and never a re-render
+          off possibly-drifted source;
+        * ``decide(response)`` — maps a wire answer onto the caller's outcome;
+        * ``open_message(approver, wait_seconds)`` — the plain-language ping
+          that says the run is WAITING, not broken;
+        * ``on_close`` — the caller's own closing act (a notification, a log).
+
+        Returns a :class:`_DoorAnswer` carrying the outcome, who decided it, the
+        wire decision literal and any free-text note they left.
         """
         deps = self._deps
         plan_run_id = f"plan-{correlation_id}"
 
-        # Idempotent: a durable confirmation is NEVER re-asked (a crash between
-        # the owner's tap and the bars commit drives straight through).
-        if self._has_leg_event(correlation_id, _AUTH_CONFIRM_STAGE):
+        # Idempotent: an answered door is NEVER re-asked (a crash between the
+        # owner's tap and the leg's own commit drives straight through).
+        if self._has_leg_event(correlation_id, stage_label):
             logger.info(
-                "planning driver: run %s auth-surface confirmation already "
-                "given (idempotent re-drive — registering the bars)",
+                "planning driver: run %s %s already answered (idempotent "
+                "re-drive — carrying on)",
                 correlation_id,
+                log_noun,
             )
-            return "confirmed"
+            # Replay the answer that was ACTUALLY given rather than a bare
+            # "yes". Who decided it is part of the receipt, and the per-item
+            # answers are load-bearing: a run that crashed between the owner's
+            # tap and the leg's own commit re-drives through here, and if the
+            # replay dropped their "yes, there IS a sign-in" the re-drive would
+            # read as agreement and register the checklist unattended. The
+            # durable row carries them; this reads them back.
+            given = self._leg_event_details(correlation_id, stage_label).get(
+                details_key
+            )
+            if isinstance(given, Mapping):
+                replayed = given.get("item_answers")
+                return _DoorAnswer(
+                    outcome=answered_outcome,
+                    request_id=str(given.get("request_id") or ""),
+                    decided_by=(
+                        str(given["decided_by"]) if given.get("decided_by") else None
+                    ),
+                    decision=(
+                        str(given["decision"]) if given.get("decision") else None
+                    ),
+                    item_answers=(
+                        {str(k): str(v) for k, v in replayed.items()}
+                        if isinstance(replayed, Mapping)
+                        else {}
+                    ),
+                )
+            return _DoorAnswer(outcome=answered_outcome, request_id="")
 
         current = deps.store.get_run(correlation_id) or row
         expected_approver = current["expected_approver"]
         wait_seconds = max(1, int(deps.planning_config.originator_wait_seconds))
-        basis_lines = self._auth_basis_lines(basis)
 
         # RECOVERY vs FRESH OPENING. A door left OPEN on the durable record is
         # one the daemon died holding: the owner's card is still in their Slack.
-        # Re-emit it VERBATIM (persisted request_id + attempt_count) — the
-        # checkpoint's :meth:`_republish_pending` mechanic — so their tap lands
-        # on THIS run instead of being dropped by the stale guard below. Only a
-        # genuinely new door mints a new id (and bumps the attempt, so a later
-        # round is never deduped away by first-response-wins idempotency).
-        open_door = self._open_auth_door(correlation_id)
+        # Re-emit it VERBATIM (persisted request_id + attempt_count + card) —
+        # the checkpoint's :meth:`_republish_pending` mechanic — so their tap
+        # lands on THIS run instead of being dropped by the stale guard below.
+        # Only a genuinely new door mints a new id (and bumps the attempt, so a
+        # later round is never deduped away by first-response-wins idempotency).
+        open_door = self._open_door(correlation_id, stage_label, details_key)
         if open_door is None:
-            attempt_count = self._auth_confirm_attempt(correlation_id)
+            attempt_count = self._door_attempt(correlation_id, stage_label)
             request_id = derive_request_id(
                 build_id=plan_run_id,
-                stage_label=_AUTH_CONFIRM_STAGE,
+                stage_label=stage_label,
                 attempt_count=attempt_count,
             )
             door_status = "GATED"
@@ -2548,42 +3780,39 @@ class PlanningRunDriver:
             request_id = str(open_door["request_id"])
             attempt_count = int(open_door.get("attempt_count") or 0)
             # The card's own words as first published — a re-emission must be
-            # the SAME card, not a re-render of a possibly-drifted basis.
-            persisted_basis = [
-                str(line) for line in (open_door.get("basis_lines") or []) if str(line)
-            ]
-            if persisted_basis:
-                basis_lines = persisted_basis
+            # the SAME card, not a re-render of possibly-drifted source.
+            persisted = {
+                key: open_door[key] for key in persisted if key in open_door
+            } or persisted
             door_status = "reopened"
             door_outcome = "reopened"
             logger.info(
-                "planning driver: run %s re-opening the auth-confirmation door "
-                "left live by a restart — re-emitting card %s (attempt=%d) "
-                "verbatim so the owner's existing card still answers it",
+                "planning driver: run %s re-opening the %s left live by a "
+                "restart — re-emitting card %s (attempt=%d) verbatim so the "
+                "owner's existing card still answers it",
                 correlation_id,
+                log_noun,
                 request_id,
                 attempt_count,
             )
 
-        card = self._auth_confirmation_card(
-            seed=seed, basis_lines=basis_lines, wait_seconds=wait_seconds
-        )
+        card = rehydrate(persisted, wait_seconds)
 
         # Durable-before-wire (the checkpoint's SQLite-before-wire discipline):
         # the open door is on the record before the card can be answered.
         deps.store._record_event(
             correlation_id=correlation_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
+            stage_label=stage_label,
             status=door_status,
             actor_identity="planning-driver",
             details_json=json.dumps(
                 {
-                    "auth_confirmation": {
+                    details_key: {
                         "outcome": door_outcome,
                         "request_id": request_id,
                         "attempt_count": attempt_count,
                         "expected_approver": expected_approver,
-                        "basis_lines": basis_lines,
+                        **persisted,
                         "wait_seconds": wait_seconds,
                     }
                 }
@@ -2594,12 +3823,12 @@ class PlanningRunDriver:
             request_id=request_id,
             plan_run_id=plan_run_id,
             feature_id=plan_run_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
+            stage_label=stage_label,
             summary_data=card,
             expected_approver=expected_approver,
             attempt_count=attempt_count,
-            rationale=_AUTH_CONFIRM_RATIONALE,
-            checkpoint_type=_AUTH_CONFIRM_CHECKPOINT_TYPE,
+            rationale=rationale,
+            checkpoint_type=checkpoint_type,
             # Thread the card into the run's own Slack thread (the durable
             # anchor on the row — never re-derived), like every planning card.
             parent_request_id=current["parent_request_id"],
@@ -2616,35 +3845,48 @@ class PlanningRunDriver:
                     # posted). "Nobody answered" would be a falsehood: nobody
                     # was ever ASKED. Take the undeliverable terminal instead.
                     logger.error(
-                        "planning driver: run %s auth-surface confirmation "
-                        "window (%ds) closed with the card never published "
-                        "(the response subscription never armed) — nobody was "
-                        "ever asked",
+                        "planning driver: run %s %s window (%ds) closed with "
+                        "the card never published (the response subscription "
+                        "never armed) — nobody was ever asked",
                         correlation_id,
+                        log_noun,
                         wait_seconds,
                     )
-                    self._record_auth_door_outcome(
-                        correlation_id,
-                        outcome="undeliverable",
-                        request_id=request_id,
-                        decided_by=None,
-                        basis_lines=basis_lines,
+                    answer = _DoorAnswer(
+                        outcome="undeliverable", request_id=request_id
                     )
-                    return "undeliverable"
+                    self._record_door_outcome(
+                        correlation_id,
+                        stage_label=stage_label,
+                        details_key=details_key,
+                        sentinel_outcome=sentinel_outcome,
+                        persisted=persisted,
+                        receipt_keys=receipt_keys,
+                        answer=answer,
+                    )
+                    if on_close is not None:
+                        await on_close(answer)
+                    return answer
                 logger.warning(
-                    "planning driver: run %s auth-surface confirmation window "
-                    "(%ds) closed with no answer",
+                    "planning driver: run %s %s window (%ds) closed with no "
+                    "answer",
                     correlation_id,
+                    log_noun,
                     wait_seconds,
                 )
-                self._record_auth_door_outcome(
+                answer = _DoorAnswer(outcome="timed_out", request_id=request_id)
+                self._record_door_outcome(
                     correlation_id,
-                    outcome="timed_out",
-                    request_id=request_id,
-                    decided_by=None,
-                    basis_lines=basis_lines,
+                    stage_label=stage_label,
+                    details_key=details_key,
+                    sentinel_outcome=sentinel_outcome,
+                    persisted=persisted,
+                    receipt_keys=receipt_keys,
+                    answer=answer,
                 )
-                return "timed_out"
+                if on_close is not None:
+                    await on_close(answer)
+                return answer
 
             armed: asyncio.Event = asyncio.Event()
             subscriber = deps.subscriber_factory(expected_approver, armed)
@@ -2652,7 +3894,7 @@ class PlanningRunDriver:
             wait_task = asyncio.create_task(
                 subscriber.await_response(
                     plan_run_id,
-                    stage_label=_AUTH_CONFIRM_STAGE,
+                    stage_label=stage_label,
                     attempt_count=attempt_count,
                     timeout_seconds=max(1, int(remaining)),
                 )
@@ -2661,8 +3903,9 @@ class PlanningRunDriver:
                 await asyncio.wait_for(armed.wait(), timeout=_ARM_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 logger.error(
-                    "planning driver: auth-confirmation subscription failed to "
-                    "arm for %s within %.0fs; retrying",
+                    "planning driver: %s subscription failed to arm for %s "
+                    "within %.0fs; retrying",
+                    log_noun,
                     correlation_id,
                     _ARM_TIMEOUT_SECONDS,
                 )
@@ -2677,28 +3920,32 @@ class PlanningRunDriver:
                     await deps.approval_publisher.publish_request(envelope)
                 except Exception:  # noqa: BLE001 — an undeliverable card is honest
                     logger.exception(
-                        "planning driver: auth-confirmation card publish failed "
-                        "for %s (request_id=%s); taking the honest terminal",
+                        "planning driver: %s card publish failed for %s "
+                        "(request_id=%s); taking the honest terminal",
+                        log_noun,
                         correlation_id,
                         request_id,
                     )
                     await self._cancel_waiter(wait_task, correlation_id)
-                    self._record_auth_door_outcome(
-                        correlation_id,
-                        outcome="undeliverable",
-                        request_id=request_id,
-                        decided_by=None,
-                        basis_lines=basis_lines,
+                    answer = _DoorAnswer(
+                        outcome="undeliverable", request_id=request_id
                     )
-                    return "undeliverable"
+                    self._record_door_outcome(
+                        correlation_id,
+                        stage_label=stage_label,
+                        details_key=details_key,
+                        sentinel_outcome=sentinel_outcome,
+                        persisted=persisted,
+                        receipt_keys=receipt_keys,
+                        answer=answer,
+                    )
+                    if on_close is not None:
+                        await on_close(answer)
+                    return answer
                 published = True
                 await self._notify(
                     correlation_id,
-                    self._auth_door_open_message(
-                        correlation_id,
-                        expected_approver=expected_approver,
-                        wait_seconds=wait_seconds,
-                    ),
+                    open_message(expected_approver, wait_seconds),
                     level="info",
                 )
 
@@ -2706,8 +3953,9 @@ class PlanningRunDriver:
                 response = await wait_task
             except Exception:  # noqa: BLE001 — a waiter defect must not kill the run
                 logger.exception(
-                    "planning driver: auth-confirmation waiter raised for %s; "
-                    "retrying inside the window",
+                    "planning driver: %s waiter raised for %s; retrying inside "
+                    "the window",
+                    log_noun,
                     correlation_id,
                 )
                 await asyncio.sleep(1.0)
@@ -2725,9 +3973,10 @@ class PlanningRunDriver:
             # late product-docs response, a superseded door round).
             if response.request_id != request_id:
                 logger.warning(
-                    "planning driver: response request_id=%s is not the auth "
-                    "confirmation card %s for %s; ignoring",
+                    "planning driver: response request_id=%s is not the %s card "
+                    "%s for %s; ignoring",
                     response.request_id,
+                    log_noun,
                     request_id,
                     correlation_id,
                 )
@@ -2737,8 +3986,9 @@ class PlanningRunDriver:
             # Per-run approver pinning (verbatim equality, JNB-101/104).
             if expected_approver and response.decided_by != expected_approver:
                 logger.warning(
-                    "planning driver: auth-confirmation responder mismatch for "
-                    "%s (got %s, expected %s); the door stays open",
+                    "planning driver: %s responder mismatch for %s (got %s, "
+                    "expected %s); the door stays open",
+                    log_noun,
                     correlation_id,
                     response.decided_by,
                     expected_approver,
@@ -2746,17 +3996,71 @@ class PlanningRunDriver:
                 await asyncio.sleep(1.0)
                 continue
 
+            answer = _DoorAnswer(
+                outcome=decide(response),
+                request_id=request_id,
+                decided_by=response.decided_by,
+                decision=str(response.decision),
+                notes=(str(response.notes) if getattr(response, "notes", None) else None),
+                item_answers=_item_answers(response),
+            )
+            self._record_door_outcome(
+                correlation_id,
+                stage_label=stage_label,
+                details_key=details_key,
+                sentinel_outcome=sentinel_outcome,
+                persisted=persisted,
+                receipt_keys=receipt_keys,
+                answer=answer,
+            )
+            if on_close is not None:
+                await on_close(answer)
+            return answer
+
+    async def _auth_surface_confirmation_door(
+        self, row: Any, correlation_id: str, *, seed: Mapping[str, Any], basis: str
+    ) -> str:
+        """Ask the owner to confirm a flagged seed is authless; wait for the tap.
+
+        A THIN CALLER of :meth:`_inline_confirmation_door` — every mechanic
+        (durable-before-wire, arm-before-post, the stale guard, approver
+        pinning, verbatim re-open, the idempotency sentinel) lives there and is
+        shared with the spec-digest door, so the two can never drift apart.
+
+        Returns ``"confirmed"`` (the caller proceeds exactly as the unflagged
+        path), ``"rejected"``, ``"deferred"``, ``"timed_out"`` or
+        ``"undeliverable"`` — each of the last four mapping to the caller's
+        honest terminal, which NAMES which of them happened.
+        """
+        basis_lines = self._auth_basis_lines(basis)
+
+        def _rehydrate(persisted: Mapping[str, Any], wait_seconds: int) -> dict[str, Any]:
+            lines = [
+                str(line) for line in (persisted.get("basis_lines") or []) if str(line)
+            ] or basis_lines
+            return self._auth_confirmation_card(
+                seed=seed, basis_lines=lines, wait_seconds=wait_seconds
+            )
+
+        def _decide(response: Any) -> str:
             if response.decision in ("approve", "override"):
-                self._record_auth_door_outcome(
-                    correlation_id,
-                    outcome="confirmed",
-                    request_id=request_id,
-                    decided_by=response.decided_by,
-                    basis_lines=basis_lines,
-                )
+                return "confirmed"
+            if response.decision == "reject":
+                return "rejected"
+            # The door asks for two answers, but it rides the SAME generic
+            # approval consumer as the product-docs checkpoint — whose
+            # ``decision`` literal also carries ``defer``. An answer that
+            # decides nothing is still an ANSWER: swallowing it and later
+            # reporting "nobody answered" would be a falsehood told to the very
+            # person who answered. So the door closes on it, the durable row
+            # records WHICH answer it was, and the terminal names it.
+            return "deferred"
+
+        async def _closed(answer: _DoorAnswer) -> None:
+            if answer.outcome == "confirmed":
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {response.decided_by} "
+                    f"Planning run {correlation_id}: {answer.decided_by} "
                     "confirmed there is no sign-in here — registering the "
                     "quality checklist as authless and carrying on with the build.",
                     level="info",
@@ -2765,50 +4069,48 @@ class PlanningRunDriver:
                     "planning driver: run %s auth surface confirmed authless by "
                     "%s; the pass-bar leg proceeds as the unflagged path",
                     correlation_id,
-                    response.decided_by,
+                    answer.decided_by,
                 )
-                return "confirmed"
-
-            if response.decision == "reject":
-                self._record_auth_door_outcome(
-                    correlation_id,
-                    outcome="rejected",
-                    request_id=request_id,
-                    decided_by=response.decided_by,
-                    basis_lines=basis_lines,
-                )
+            elif answer.outcome == "rejected":
                 logger.info(
                     "planning driver: run %s auth surface CONFIRMED REAL by %s; "
                     "attended registration it is",
                     correlation_id,
-                    response.decided_by,
+                    answer.decided_by,
                 )
-                return "rejected"
+            elif answer.outcome == "deferred":
+                logger.info(
+                    "planning driver: auth-confirmation answer %r from %s for %s "
+                    "decided nothing (a 'later' round); the door closes and the "
+                    "run takes the honest terminal naming it",
+                    answer.decision,
+                    answer.decided_by,
+                    correlation_id,
+                )
 
-            # The door asks for two answers, but it rides the SAME generic
-            # approval consumer as the product-docs checkpoint — whose
-            # ``decision`` literal also carries ``defer``. An answer that
-            # decides nothing is still an ANSWER: swallowing it and later
-            # reporting "nobody answered" would be a falsehood told to the very
-            # person who answered. So the door closes on it, the durable row
-            # records WHICH answer it was, and the terminal names it.
-            self._record_auth_door_outcome(
-                correlation_id,
-                outcome="deferred",
-                request_id=request_id,
-                decided_by=response.decided_by,
-                basis_lines=basis_lines,
-                decision=response.decision,
-            )
-            logger.info(
-                "planning driver: auth-confirmation answer %r from %s for %s "
-                "decided nothing (a 'later' round); the door closes and the "
-                "run takes the honest terminal naming it",
-                response.decision,
-                response.decided_by,
-                correlation_id,
-            )
-            return "deferred"
+        answer = await self._inline_confirmation_door(
+            row,
+            correlation_id,
+            stage_label=_AUTH_CONFIRM_STAGE,
+            details_key="auth_confirmation",
+            checkpoint_type=_AUTH_CONFIRM_CHECKPOINT_TYPE,
+            rationale=_AUTH_CONFIRM_RATIONALE,
+            sentinel_outcome="confirmed",
+            answered_outcome="confirmed",
+            persisted={"basis_lines": basis_lines},
+            # The flagged lines stay on the verdict: the pass-bars leg copies
+            # this row onto its own receipt, and a receipt that did not say
+            # WHAT was confirmed would be a worse receipt.
+            receipt_keys=("basis_lines",),
+            rehydrate=_rehydrate,
+            decide=_decide,
+            open_message=lambda approver, wait: self._auth_door_open_message(
+                correlation_id, expected_approver=approver, wait_seconds=wait
+            ),
+            log_noun="auth-surface confirmation door",
+            on_close=_closed,
+        )
+        return answer.outcome
 
     @staticmethod
     async def _cancel_waiter(wait_task: "asyncio.Task[Any]", correlation_id: str) -> None:
@@ -2824,8 +4126,8 @@ class PlanningRunDriver:
                 correlation_id,
             )
 
-    def _auth_confirm_attempt(self, correlation_id: str) -> int:
-        """How many auth-confirmation doors this run has already opened.
+    def _door_attempt(self, correlation_id: str, stage_label: str) -> int:
+        """How many doors this run has already opened at ``stage_label``.
 
         Counts ``GATED`` rows ONLY: a ``reopened`` row is the SAME door
         re-emitted after a restart, never a new round, so it must not bump the
@@ -2835,25 +4137,26 @@ class PlanningRunDriver:
         return sum(
             1
             for event in self._deps.store.list_events(correlation_id)
-            if event["stage_label"] == _AUTH_CONFIRM_STAGE
-            and event["status"] == "GATED"
+            if event["stage_label"] == stage_label and event["status"] == "GATED"
         )
 
-    def _open_auth_door(self, correlation_id: str) -> dict[str, Any] | None:
+    def _open_door(
+        self, correlation_id: str, stage_label: str, details_key: str
+    ) -> dict[str, Any] | None:
         """The still-OPEN door's persisted details, or ``None`` if none is open.
 
-        The durable event log is this door's row of record (the checkpoint keeps
+        The durable event log is a door's row of record (the checkpoint keeps
         its pending id on the run row; a machine-chain leg keeps its own on its
-        leg events). A door is OPEN exactly when the LAST
-        :data:`_AUTH_CONFIRM_STAGE` event is an opening
-        (:data:`_AUTH_DOOR_OPEN_STATUSES`) — every verdict status closes it.
-        Callers re-emit the returned ``request_id`` / ``attempt_count``
-        VERBATIM; a row too corrupt to carry a ``request_id`` reads as no open
-        door (a fresh, answerable card beats a card nobody can identify).
+        leg events). A door is OPEN exactly when the LAST event for
+        ``stage_label`` is an opening (:data:`_AUTH_DOOR_OPEN_STATUSES`) — every
+        verdict status closes it. Callers re-emit the returned ``request_id`` /
+        ``attempt_count`` and the persisted card VERBATIM; a row too corrupt to
+        carry a ``request_id`` reads as no open door (a fresh, answerable card
+        beats a card nobody can identify).
         """
         latest: dict[str, Any] | None = None
         for event in self._deps.store.list_events(correlation_id):
-            if event["stage_label"] != _AUTH_CONFIRM_STAGE:
+            if event["stage_label"] != stage_label:
                 continue
             if event["status"] not in _AUTH_DOOR_OPEN_STATUSES:
                 latest = None  # a verdict — the door is closed
@@ -2863,49 +4166,76 @@ class PlanningRunDriver:
             except (json.JSONDecodeError, ValueError):
                 latest = None
                 continue
-            confirmation = details.get("auth_confirmation")
+            record = details.get(details_key)
             latest = (
-                dict(confirmation)
-                if isinstance(confirmation, Mapping) and confirmation.get("request_id")
+                dict(record)
+                if isinstance(record, Mapping) and record.get("request_id")
                 else None
             )
         return latest
 
-    def _record_auth_door_outcome(
+    def _record_door_outcome(
         self,
         correlation_id: str,
         *,
-        outcome: str,
-        request_id: str,
-        decided_by: str | None,
-        basis_lines: list[str],
-        decision: str | None = None,
+        stage_label: str,
+        details_key: str,
+        sentinel_outcome: str,
+        persisted: Mapping[str, Any],
+        receipt_keys: tuple[str, ...],
+        answer: "_DoorAnswer",
     ) -> None:
-        """Write the door's durable verdict row.
+        """Write a door's durable verdict row.
 
-        ``confirmed`` records ``status="approved"`` — the idempotency sentinel
-        :meth:`_has_leg_event` reads. The other verdicts record their own
-        status so the audit log says WHICH way the door closed. None of these
-        statuses is ``checkpoint_cleared``, so the pure planner's history
-        projection is untouched (this is a machine-chain leg, not a Mode-P
-        checkpoint).
+        The caller's ``sentinel_outcome`` records ``status="approved"`` — the
+        idempotency sentinel :meth:`_has_leg_event` reads. Every other verdict
+        records its own status so the audit log says WHICH way the door closed.
+        None of these statuses is ``checkpoint_cleared``, so the pure planner's
+        history projection is untouched (these are machine-chain legs, not
+        Mode-P checkpoints).
+
+        The owner's own free-text NOTE is persisted whenever they left one, and
+        so are the per-item answers that rode the same response. The sign-in
+        door used to discard the note; one door means one behaviour, and a note
+        somebody took the trouble to write is not something to throw away.
+
+        ``receipt_keys`` is the subset of the caller's ``persisted`` fields that
+        belongs on a VERDICT row, and it exists to keep the event log from
+        carrying the same bytes over and over. The card the owner read is
+        replayed from the OPENING row (:meth:`_open_door` reads openings only),
+        so re-writing it onto every verdict bought nothing while writing the
+        whole ``.feature`` text into SQLite once per verdict on top of once per
+        opening. What a verdict row is FOR — who decided, which way, in their
+        own words, plus whatever the leg's later receipt quotes — is unchanged.
         """
         self._deps.store._record_event(
             correlation_id=correlation_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
-            status="approved" if outcome == "confirmed" else outcome,
-            actor_identity=decided_by or "planning-driver",
+            stage_label=stage_label,
+            status=(
+                "approved" if answer.outcome == sentinel_outcome else answer.outcome
+            ),
+            actor_identity=answer.decided_by or "planning-driver",
             details_json=json.dumps(
                 {
-                    "auth_confirmation": {
-                        "outcome": outcome,
-                        "request_id": request_id,
-                        "decided_by": decided_by,
-                        "basis_lines": basis_lines,
-                        # The literal wire answer, when the owner gave one that
-                        # decided nothing (a defer) — so the record says what
-                        # they actually tapped, never just "no answer".
-                        **({"decision": decision} if decision else {}),
+                    details_key: {
+                        "outcome": answer.outcome,
+                        "request_id": answer.request_id,
+                        "decided_by": answer.decided_by,
+                        **{
+                            key: persisted[key]
+                            for key in receipt_keys
+                            if key in persisted
+                        },
+                        # The literal wire answer, when the owner gave one — so
+                        # the record says what they actually tapped, never just
+                        # "no answer".
+                        **({"decision": answer.decision} if answer.decision else {}),
+                        **({"notes": answer.notes} if answer.notes else {}),
+                        **(
+                            {"item_answers": dict(answer.item_answers)}
+                            if answer.item_answers
+                            else {}
+                        ),
                     }
                 }
             ),
@@ -3599,47 +4929,64 @@ class PlanningRunDriver:
         """Project the committed triple from the 007 NATIVE suffix-keyed map.
 
         The deployed 007 ``role_output`` is an artifact map keyed by BARE
-        filename with the three contract suffixes (``.feature`` /
-        ``_assumptions.yaml`` / ``_summary.md``) PLUS extras (a
+        filename with the contract suffixes (``.feature`` /
+        ``_assumptions.yaml`` / ``_summary.md``, plus ``_digest.yaml``) PLUS
+        extras (a
         ``pass-bar-seed-*.yaml`` and the ``validation.json`` data channel).
         Requires EXACTLY one file per suffix; extras are tolerated but never
         committed. The committed paths are the canonical ``features/<slug>/``
         triple (``slug`` already resolved via ``_slug_of``). ``None`` when the
         map does not carry exactly one of each suffix.
+
+        THE SPEC DIGEST IS COMMITTED TOO, and additively: when the reply carries
+        exactly one ``<slug>_digest.yaml`` it lands beside the triple, so the
+        planning branch holds the complete record of what a person approved —
+        the plain-language list AND the examples it summarises. Its ABSENCE
+        never breaks the projection: an older spec-writer still yields its
+        three files, and the leg is the place that decides a missing digest is
+        a loud stop (there is nothing safe to show without one).
         """
         by_suffix: dict[str, list[str]] = {
             _SPEC_FEATURE_SUFFIX: [],
             _SPEC_ASSUMPTIONS_SUFFIX: [],
             _SPEC_SUMMARY_SUFFIX: [],
+            _SPEC_DIGEST_SUFFIX: [],
         }
         # Longest suffix first so ``_assumptions.yaml`` never loses to a broader
-        # match; the three are mutually exclusive but order-independence is cheap.
+        # match; the four are mutually exclusive but order-independence is cheap.
         for name, content in role_output.items():
             key = str(name)
             for suffix in (
                 _SPEC_ASSUMPTIONS_SUFFIX,
+                _SPEC_DIGEST_SUFFIX,
                 _SPEC_SUMMARY_SUFFIX,
                 _SPEC_FEATURE_SUFFIX,
             ):
                 if key.endswith(suffix):
                     by_suffix[suffix].append(str(content))
                     break
-        if any(len(matches) != 1 for matches in by_suffix.values()):
+        required = (
+            _SPEC_FEATURE_SUFFIX,
+            _SPEC_ASSUMPTIONS_SUFFIX,
+            _SPEC_SUMMARY_SUFFIX,
+        )
+        if any(len(by_suffix[suffix]) != 1 for suffix in required):
             return None
         base = f"features/{slug}"
-        return {
-            f"{base}/{slug}{_SPEC_FEATURE_SUFFIX}": by_suffix[_SPEC_FEATURE_SUFFIX][0],
-            f"{base}/{slug}{_SPEC_ASSUMPTIONS_SUFFIX}": by_suffix[
-                _SPEC_ASSUMPTIONS_SUFFIX
-            ][0],
-            f"{base}/{slug}{_SPEC_SUMMARY_SUFFIX}": by_suffix[_SPEC_SUMMARY_SUFFIX][0],
+        files = {
+            f"{base}/{slug}{suffix}": by_suffix[suffix][0] for suffix in required
         }
+        if len(by_suffix[_SPEC_DIGEST_SUFFIX]) == 1:
+            files[f"{base}/{slug}{_SPEC_DIGEST_SUFFIX}"] = by_suffix[
+                _SPEC_DIGEST_SUFFIX
+            ][0]
+        return files
 
     @staticmethod
     def _spec_triple_files(
         role_output: Mapping[str, Any], slug: str
     ) -> dict[str, str] | None:
-        """Project the three-file spec contract from the 007 role_output.
+        """Project the committed spec contract from the 007 role_output.
 
         Shape resolution (belt-and-braces):
           1. An explicit ``files`` mapping (specialist-authored repo-relative

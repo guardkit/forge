@@ -123,6 +123,33 @@ class ScriptedSubscriber:
         return self._script.pop(0)
 
 
+class AutoApproveSubscriber:
+    """Answers YES to whichever door is asking.
+
+    The default double for tests whose subject is NOT the pause: it derives the
+    card's ``request_id`` from the stage label and attempt the door itself asked
+    on, so the same double answers the spec digest card, the sign-in card and
+    the product-docs checkpoint without any test knowing which is live.
+    """
+
+    def __init__(self, armed: asyncio.Event | None, approver: str = ORIGINATOR) -> None:
+        self._armed = armed
+        self._approver = approver
+
+    async def await_response(self, build_id: str, **kwargs: Any) -> Any:
+        if self._armed is not None:
+            self._armed.set()
+        return ApprovalResponsePayload(
+            request_id=derive_request_id(
+                build_id=build_id,
+                stage_label=kwargs.get("stage_label", "product_docs"),
+                attempt_count=int(kwargs.get("attempt_count") or 0),
+            ),
+            decision="approve",
+            decided_by=self._approver,
+        )
+
+
 class FakeSecondOpinion:
     async def get_summary_for_approval(self, **kwargs: Any) -> dict[str, Any]:
         return {"title": "PO docs"}
@@ -214,6 +241,30 @@ class RecordingGitRunner:
         )
 
 
+#: The one worked example every default spec fixture carries.
+_FIXTURE_FEATURE = "Feature: stats\n  Scenario: ok\n    Given a\n"
+
+
+def _digest_yaml(slug: str) -> str:
+    """A VALID spec digest for :data:`_FIXTURE_FEATURE`.
+
+    One entry per worked example, the title copied verbatim, the labels
+    verbatim (there are none), one plain-English sentence, and the feature slug
+    the triple shares. This is what the deterministic check proves the card
+    against, so a fixture that drifts from the .feature fails the leg — which is
+    the whole point.
+    """
+    return (
+        f"feature: {slug}\n"
+        "generated: '2026-08-14T10:00:00Z'\n"
+        "scenarios:\n"
+        "- title: ok\n"
+        "  tags: []\n"
+        "  sentence: The service answers the request in the ordinary way.\n"
+        "assumptions: []\n"
+    )
+
+
 def _po_result() -> Any:
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
@@ -236,9 +287,10 @@ def _spec_result(files: dict[str, str] | None = None, slug: str = "stats-endpoin
             "files": files
             if files is not None
             else {
-                f"features/{slug}/{slug}.feature": "Feature: stats\n  Scenario: ok\n    Given a\n",
+                f"features/{slug}/{slug}.feature": _FIXTURE_FEATURE,
                 f"features/{slug}/{slug}_assumptions.yaml": "assumptions: []\n",
                 f"features/{slug}/{slug}_summary.md": "# summary\n",
+                f"features/{slug}/{slug}_digest.yaml": _digest_yaml(slug),
             },
         },
         reason=None,
@@ -272,9 +324,10 @@ def _spec_result_native(slug: str = "stats-endpoint", accepted: bool = True) -> 
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
         role_output={
-            f"{slug}.feature": "Feature: stats\n  Scenario: ok\n    Given a\n",
+            f"{slug}.feature": _FIXTURE_FEATURE,
             f"{slug}_assumptions.yaml": "assumptions: []\n",
             f"{slug}_summary.md": "# summary\n",
+            f"{slug}_digest.yaml": _digest_yaml(slug),
             f"pass-bar-seed-{slug}.yaml": _AUTHLESS_SEED_YAML,
             "validation.json": json.dumps(
                 {"accepted": accepted, "errors": [] if accepted else ["bad"],
@@ -361,6 +414,8 @@ def _make_driver(
     originator_wait_seconds: int = 3600,
     publisher: FakePublisher | None = None,
     spec_result: Any | None = None,
+    spec_result_factory: Any | None = None,
+    digest_review: Any | None = None,
     plan_result: Any | None = None,
     plan_result_factory: Any | None = None,
     spec_dispatch: Any | None = None,
@@ -400,8 +455,8 @@ def _make_driver(
 
     def _default_subscriber_factory(
         expected_approver: Any, armed: Any
-    ) -> ScriptedSubscriber:
-        return ScriptedSubscriber([_approve()], armed)
+    ) -> AutoApproveSubscriber:
+        return AutoApproveSubscriber(armed)
 
     subscriber_factory = subscriber_factory or _default_subscriber_factory
 
@@ -409,9 +464,25 @@ def _make_driver(
         counters["po"] += 1
         return _po_result()
 
-    async def _dispatch_spec(*, plan_run_id: str, correlation_id: str, spec_input: str) -> Any:
+    async def _dispatch_spec(
+        *,
+        plan_run_id: str,
+        correlation_id: str,
+        spec_input: str,
+        revision_of: dict[str, str] | None = None,
+        validate_feedback: str | None = None,
+    ) -> Any:
         counters["spec"] += 1
         assert spec_input  # forge supplies the committed handoff content
+        # A rewrite round carries the owner's note VERBATIM and the prior
+        # artifact set; a first round carries neither.
+        counters.setdefault("spec_revisions", [])
+        if revision_of is not None or validate_feedback is not None:
+            counters["spec_revisions"].append(
+                {"revision_of": revision_of, "validate_feedback": validate_feedback}
+            )
+        if spec_result_factory is not None:
+            return spec_result_factory(validate_feedback)
         return spec_result if spec_result is not None else _spec_result()
 
     async def _dispatch_plan(
@@ -527,6 +598,7 @@ def _make_driver(
         target_repo_paths={TARGET_REPO: repo_path},
         target_terminal=TargetTerminalConfig(enabled=target_terminal_enabled),
         originator_wait_seconds=originator_wait_seconds,
+        **({"digest_review": digest_review} if digest_review is not None else {}),
     )
 
     deps = PlanningDriverDeps(
@@ -1461,7 +1533,7 @@ def _door_events(store: SqlitePlanningRunStore) -> list[tuple[str, dict[str, Any
     ]
 
 
-def _auth_flagged_harness(
+async def _auth_flagged_harness(
     store: SqlitePlanningRunStore,
     tmp_path: Path,
     *,
@@ -1469,6 +1541,17 @@ def _auth_flagged_harness(
     originator_wait_seconds: int = 3600,
     publisher: FakePublisher | None = None,
 ) -> tuple[_Harness, Path]:
+    """A run parked where the SIGN-IN DOOR is still the door that asks.
+
+    Machine-chain stage 2 folded the sign-in question into the spec digest card,
+    so a run that starts fresh answers it there and this door never opens — one
+    pause, counted end to end. The door is not dead, though: it stays the door
+    for a run that reaches the quality-checklist leg with no digest answer on
+    its record, which is exactly what an IN-FLIGHT run looked like when stage 2
+    landed. That is the shape built here — the spec already committed and
+    approved with no spec-review record — so these tests keep proving the door
+    on the path where it is genuinely reachable.
+    """
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
@@ -1484,7 +1567,64 @@ def _auth_flagged_harness(
         originator_wait_seconds=originator_wait_seconds,
         publisher=publisher,
     )
+    await _carry_in_flight_spec(store, git, repo, seed_yaml=_ROUND19_SEED_AUTH)
     return h, repo
+
+
+async def _carry_in_flight_spec(
+    store: SqlitePlanningRunStore,
+    git: Any,
+    repo: Path,
+    *,
+    seed_yaml: str,
+    slug: str = "version-endpoint",
+) -> None:
+    """Commit a spec and approve it WITHOUT a digest-review record, at FEATURE_PLAN.
+
+    The shape a run already walking the chain had when stage 2 landed: its spec
+    leg ran under the old rules, so there is no record of anybody having been
+    asked the sign-in question.
+    """
+    branch = f"planning/{CID}"
+    files = {
+        f"features/{slug}/{slug}.feature": _FIXTURE_FEATURE,
+        f"features/{slug}/{slug}_assumptions.yaml": "assumptions: []\n",
+        f"features/{slug}/{slug}_summary.md": "# summary\n",
+    }
+    written = await git.prepare_branch_and_write_tree(
+        repo_path=str(repo),
+        branch=branch,
+        files=files,
+        message="planning: feature spec (in-flight fixture)",
+    )
+    for to_state in (
+        PlanningState.RUNNING,
+        PlanningState.FEATURE_SPEC,
+        PlanningState.FEATURE_PLAN,
+    ):
+        store.transition(
+            correlation_id=CID,
+            to_state=to_state,
+            actor_identity="in-flight-fixture",
+            stage_label="in-flight-fixture",
+        )
+    store._record_event(
+        correlation_id=CID,
+        stage_label="feature-spec",
+        status="approved",
+        actor_identity="planning-driver",
+        details_json=json.dumps(
+            {
+                "slug": slug,
+                "spec_files": sorted(files),
+                "target_repo": TARGET_REPO,
+                "repo_path": str(repo),
+                "branch": branch,
+                "sha": written.sha,
+                "pass_bar_seed": seed_yaml,
+            }
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1494,8 +1634,8 @@ async def test_auth_flagged_seed_confirmed_resumes_exactly_as_unflagged(
     """(a) CONFIRM: the LITERAL round-19 auth-flagged seed no longer kills the
     run — the owner taps confirm and machine registration proceeds EXACTLY as
     the unflagged path (three schema-green bars, then BUILD_QUEUED)."""
-    h, repo = _auth_flagged_harness(
-        store, tmp_path, script=[_approve(), _auth_door_answer("approve")]
+    h, repo = await _auth_flagged_harness(
+        store, tmp_path, script=[_auth_door_answer("approve")]
     )
 
     await h.driver.drive(CID)
@@ -1546,8 +1686,8 @@ async def test_auth_door_card_speaks_plain_language_and_quotes_the_basis(
     """The card the owner reads: the seed's OWN flagged words quoted verbatim,
     what confirming does, what rejecting does, what silence does — in plain
     language, threaded to the run's approver, with no jargon as a label."""
-    h, _repo = _auth_flagged_harness(
-        store, tmp_path, script=[_approve(), _auth_door_answer("approve")]
+    h, _repo = await _auth_flagged_harness(
+        store, tmp_path, script=[_auth_door_answer("approve")]
     )
 
     await h.driver.drive(CID)
@@ -1586,8 +1726,8 @@ async def test_auth_door_rejected_takes_the_honest_terminal(
     takes the SAME honest terminal that shipped before (SPL-007 §A.2 + the
     seed's basis verbatim), plus which way the door closed. No bars, no
     build, no idempotency sentinel."""
-    h, repo = _auth_flagged_harness(
-        store, tmp_path, script=[_approve(), _auth_door_answer("reject")]
+    h, repo = await _auth_flagged_harness(
+        store, tmp_path, script=[_auth_door_answer("reject")]
     )
 
     await h.driver.drive(CID)
@@ -1642,7 +1782,7 @@ async def test_auth_door_unanswered_times_out_to_the_honest_terminal(
 ) -> None:
     """(c) SILENCE: nobody answers inside the wait window — the run takes the
     same honest terminal, naming the timeout, and never registers a bar."""
-    h, _repo = _auth_flagged_harness(
+    h, _repo = await _auth_flagged_harness(
         store, tmp_path, script=[_approve()], originator_wait_seconds=1
     )
 
@@ -1669,10 +1809,10 @@ async def test_auth_door_undeliverable_card_takes_the_honest_terminal(
 ) -> None:
     """A card that cannot be put on the wire is not a silent wait: the run
     stops immediately with the honest terminal, saying nobody could answer."""
-    h, _repo = _auth_flagged_harness(
+    h, _repo = await _auth_flagged_harness(
         store,
         tmp_path,
-        script=[_approve(), _auth_door_answer("approve")],
+        script=[_auth_door_answer("approve")],
         publisher=AuthCardUndeliverablePublisher(),
     )
 
@@ -1697,7 +1837,7 @@ async def test_auth_door_ignores_a_stranger_and_a_foreign_card(
     """The door is pinned to the run's own approver and to its OWN card: a
     stranger's confirm and a reply to a different request_id are both ignored,
     and the run ends on the honest timeout — never on someone else's tap."""
-    h, _repo = _auth_flagged_harness(
+    h, _repo = await _auth_flagged_harness(
         store,
         tmp_path,
         script=[
@@ -1733,7 +1873,7 @@ async def test_auth_door_confirmation_is_never_re_asked_on_a_re_drive(
     # Drive once, confirming at the door, then rewind the durable record to the
     # crash window: the plan is committed, the confirmation is given, but the
     # bars leg never completed.
-    factory = SharedScriptSubscriberFactory([_approve(), _auth_door_answer("approve")])
+    factory = SharedScriptSubscriberFactory([_auth_door_answer("approve")])
     h = _make_driver(
         store,
         git_runner=git,
@@ -1743,6 +1883,7 @@ async def test_auth_door_confirmation_is_never_re_asked_on_a_re_drive(
         pass_bar_validate_fn=_schema_pass_bar_oracle,
         subscriber_factory=factory,
     )
+    await _carry_in_flight_spec(store, git, repo, seed_yaml=_ROUND19_SEED_AUTH)
     await h.driver.drive(CID)
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     door_openings = sum(
@@ -1784,21 +1925,18 @@ def _auth_cards(publisher: FakePublisher) -> list[Any]:
     ]
 
 
-class ArmOnlyTheFirstWaitFactory:
-    """Arms the product-docs waiter, then hands out subscriptions that NEVER arm.
+class NeverArmingFactory:
+    """Hands out subscriptions that NEVER arm.
 
     The wire the arm-before-post guard exists for: the door's subscription never
     comes up, so the card is never published and NOBODY is ever asked.
     """
 
-    def __init__(self, script: list[Any]) -> None:
-        self.script = list(script)
+    def __init__(self) -> None:
         self.calls = 0
 
     def __call__(self, expected_approver: Any, armed: Any) -> ScriptedSubscriber:
         self.calls += 1
-        if self.calls == 1:
-            return ScriptedSubscriber(self.script, armed)
         return ScriptedSubscriber([], None)
 
 
@@ -1833,8 +1971,10 @@ async def test_auth_door_survives_a_restart_and_re_emits_the_same_card(
             publisher=publisher,
         )
 
+    await _carry_in_flight_spec(store, git, repo, seed_yaml=_ROUND19_SEED_AUTH)
+
     # BOOT 1: the owner is asked — then the daemon dies with the card live.
-    first = _boot([_approve()])
+    first = _boot([])
     task = asyncio.create_task(first.driver.drive(CID))
     for _ in range(600):
         await asyncio.sleep(0.01)
@@ -1896,9 +2036,10 @@ async def test_auth_door_never_published_says_undeliverable_not_silence(
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
         plan_result_factory=_plan_result_native_versions,
         pass_bar_validate_fn=_schema_pass_bar_oracle,
-        subscriber_factory=ArmOnlyTheFirstWaitFactory([_approve()]),
+        subscriber_factory=NeverArmingFactory(),
         originator_wait_seconds=1,
     )
+    await _carry_in_flight_spec(store, git, repo, seed_yaml=_ROUND19_SEED_AUTH)
 
     await h.driver.drive(CID)
 
@@ -1928,10 +2069,10 @@ async def test_auth_door_defer_is_named_never_reported_as_silence(
     defer ends the run claiming "nobody answered the confirmation card" — told
     to the very person who answered it.
     """
-    h, repo = _auth_flagged_harness(
+    h, repo = await _auth_flagged_harness(
         store,
         tmp_path,
-        script=[_approve(), _auth_door_answer("defer")],
+        script=[_auth_door_answer("defer")],
         originator_wait_seconds=3600,
     )
 
