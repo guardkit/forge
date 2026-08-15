@@ -745,7 +745,27 @@ class PlanningRunDriver:
                 # identity, so nobody reading the log later mistakes an
                 # absorbed pause for a skipped one.
                 if self._target_terminal_enabled():
-                    self._absorb_product_docs_checkpoint(correlation_id)
+                    if not self._absorb_product_docs_checkpoint(correlation_id):
+                        # The row is already there and the planner still wants
+                        # to pause: something upstream is refusing to read it.
+                        # Stop loudly rather than spin a no-yield loop writing
+                        # the same row forever.
+                        self._fail(
+                            correlation_id,
+                            stage_label=_PRODUCT_DOCS_STAGE,
+                            reason="the brief-stage checkpoint is already "
+                            "recorded as absorbed but the chain still asks to "
+                            "pause there",
+                        )
+                        await self._notify(
+                            correlation_id,
+                            f"Planning run {correlation_id} stopped at "
+                            f"{plain_stage_name(_PRODUCT_DOCS_STAGE)}: the run "
+                            "could not move past a step it has already been "
+                            "through. Nothing was built.",
+                            level="error",
+                        )
+                        return
                     continue
                 paused = await self._checkpoint(correlation_id, plan_run_id)
                 if not paused:
@@ -888,8 +908,12 @@ class PlanningRunDriver:
         )
         return False
 
-    def _absorb_product_docs_checkpoint(self, correlation_id: str) -> None:
+    def _absorb_product_docs_checkpoint(self, correlation_id: str) -> bool:
         """Record the brief-stage checkpoint as cleared BY ABSORPTION.
+
+        Returns False when such a row already exists — the caller stops loudly
+        rather than writing it again, because a second write would mean the
+        chain is not reading the first one and the loop would never yield.
 
         The machine chain asks its one question later, in front of the spec
         digest — so the brief card never opens and this row stands in its place,
@@ -902,6 +926,18 @@ class PlanningRunDriver:
         mandatory human approval; it simply happens where the person can see
         what they are approving.
         """
+        for event in self._deps.store.list_events(correlation_id):
+            if (
+                event["stage_label"] == _PRODUCT_DOCS_STAGE
+                and event["status"] == "checkpoint_cleared"
+            ):
+                logger.error(
+                    "planning driver: run %s already carries a cleared "
+                    "brief-stage checkpoint but the chain asked to pause there "
+                    "again — refusing to write a second row",
+                    correlation_id,
+                )
+                return False
         self._deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_PRODUCT_DOCS_STAGE,
@@ -920,6 +956,7 @@ class PlanningRunDriver:
             "spec digest review — one pause, asked where the spec is",
             correlation_id,
         )
+        return True
 
     async def _checkpoint(self, correlation_id: str, plan_run_id: str) -> bool:
         """Pause at the product docs checkpoint (DF-009: always pauses).
