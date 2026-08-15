@@ -125,7 +125,10 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 #   007  specialist-agent/src/specialist_agent/roles/product_owner/modes/
 #        feature_spec.py → required_args=("from_input",)
 #        (``from_input`` = the approved feature_spec_inputs/<id>.md CONTENT;
-#         optional: context, stack, revision_of, validate_feedback)
+#         optional: context, stack, revision_of, validate_feedback — the last
+#         two are EMITTED on a rewrite round: ``validate_feedback`` carries the
+#         owner's note on the spec digest VERBATIM and ``revision_of`` the prior
+#         artifact set. A first-round dispatch emits neither.)
 #   008  specialist-agent/src/specialist_agent/roles/architect/modes/
 #        feature_plan.py → required_args=("feature_id","spec_feature",
 #        "spec_summary","target_repo_descriptor")
@@ -139,9 +142,31 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 # ---------------------------------------------------------------------------
 
 
-def build_feature_spec_command_args(*, from_input: str) -> dict[str, Any]:
-    """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above."""
-    return {"from_input": from_input}
+def build_feature_spec_command_args(
+    *,
+    from_input: str,
+    revision_of: dict[str, str] | None = None,
+    validate_feedback: str | None = None,
+) -> dict[str, Any]:
+    """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above.
+
+    The one required key, plus the two OPTIONAL revision keys when — and only
+    when — this is a rewrite. A first-round dispatch emits neither and is
+    byte-identical to the call that shipped.
+
+    ``validate_feedback`` is the owner's own note, VERBATIM: the mode's own
+    description of that argument is "review-gate failure text driving the
+    revision", and a note on a spec digest is precisely a review-gate response.
+    It is never summarised or reworded on the way — they said it once, and the
+    machine reads what they said. ``revision_of`` is the prior artifact set, so
+    the rewrite starts from what the spec-writer actually wrote.
+    """
+    args: dict[str, Any] = {"from_input": from_input}
+    if revision_of:
+        args["revision_of"] = dict(revision_of)
+    if validate_feedback is not None and str(validate_feedback).strip():
+        args["validate_feedback"] = validate_feedback
+    return args
 
 
 def build_feature_plan_command_args(
@@ -845,6 +870,8 @@ async def compose_planning_consumer_and_dispatch(
             plan_run_id: str,
             correlation_id: str,
             spec_input: str,
+            revision_of: dict[str, str] | None = None,
+            validate_feedback: str | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_SPEC,
@@ -855,7 +882,9 @@ async def compose_planning_consumer_and_dispatch(
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
                 extra_command_args=build_feature_spec_command_args(
-                    from_input=spec_input
+                    from_input=spec_input,
+                    revision_of=revision_of,
+                    validate_feedback=validate_feedback,
                 ),
             )
 

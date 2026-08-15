@@ -257,6 +257,9 @@ class TestYamlRoundTrip:
                 "frontier_timeout_seconds": 30,
                 "model_resolution": {"model": None, "fallbacks": []},
                 "target_terminal": {"enabled": False},
+                # ``planning.digest_review`` — the machine chain's one pause.
+                # Default always_ask=True; the unfiltered dump always includes it.
+                "digest_review": {"always_ask": True, "skip_max_scenarios": 3},
                 # ``planning.dcl`` — the machine-authored DCL seat's
                 # single-slot flag. Default-ON; always in the dump.
                 "dcl": {"author_at_plan_commit": True},
