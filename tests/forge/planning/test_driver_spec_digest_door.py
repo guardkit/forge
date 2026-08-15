@@ -21,7 +21,13 @@ What this file proves:
 * the digest is re-proven against the COMMITTED spec, and a mismatch stops the
   run rather than showing a summary nobody can trust;
 * an auth-flagged run pauses ONCE: the sign-in question rides the digest card
-  and the quality-checklist leg opens no second door.
+  and the quality-checklist leg opens no second door — and BOTH answers to that
+  question are real. "No sign-in here" carries on; "yes, there is one" takes the
+  2026-07-31 attended-registration terminal word for word; setting it aside is
+  never read as a yes; and a note still only ever means rewrite the spec;
+* the "show me" text is the raw spec, and this file says so out loud, because
+  the surface that renders it has a decision to make about that;
+* the spec text reaches the durable event log once per card, not once per row.
 
 Real v4 SQLite store, real gate adapters, fakes at the wire seams. No broker, no
 network: every subscription is an in-test double.
@@ -51,7 +57,7 @@ from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
 from forge.planning.target_terminal_tools import ToolOutcome
-from nats_core.events import ApprovalResponsePayload
+from nats_core.events import ApprovalResponsePayload, AssumptionDisposition
 
 CID = "digest-run-0001"
 PLAN_RUN_ID = f"plan-{CID}"
@@ -63,6 +69,13 @@ BRANCH = f"planning/{CID}"
 _DIGEST_STAGE = "feature-spec-digest-review"
 _DIGEST_CHECKPOINT_TYPE = "product_docs_spec_digest"
 _DRAFT_STAGE = "feature-spec-draft"
+_SPEC_STAGE = "feature-spec"
+_BARS_STAGE = "qa-pass-bars"
+_AUTH_DOOR_STAGE = "qa-pass-bars-auth-confirm"
+#: The id the sign-in question rides under on the card and in the answer. Named
+#: here rather than imported so a rename has to be a deliberate two-sided act:
+#: this string is a CONTRACT with whatever renders the card.
+_SIGN_IN_ITEM = "sign-in"
 
 FEATURE_TEXT = (
     "Feature: version endpoint\n"
@@ -453,12 +466,29 @@ def _answer(
     notes: str | None = None,
     attempt: int = 0,
     decided_by: str = ORIGINATOR,
+    sign_in: str | None = None,
 ) -> ApprovalResponsePayload:
+    """One owner answer on the wire.
+
+    ``sign_in`` is their answer to the sign-in question when the card carried
+    it: it rides in the payload's own per-item ``dispositions`` field, the same
+    structured channel the assumption dialogue already publishes through — not
+    in the note, which at this door means "rewrite the spec".
+    """
     return ApprovalResponsePayload(
         request_id=_digest_request_id(attempt),
         decision=decision,
         decided_by=decided_by,
         notes=notes,
+        dispositions=(
+            [
+                AssumptionDisposition(
+                    assumption_id=_SIGN_IN_ITEM, disposition=sign_in
+                )
+            ]
+            if sign_in
+            else None
+        ),
     )
 
 
@@ -1154,6 +1184,241 @@ async def test_an_auth_flagged_run_pauses_once_and_the_card_carries_the_question
 
 
 @pytest.mark.asyncio
+async def test_the_card_offers_a_real_answer_for_yes_there_is_a_sign_in(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The card must not promise an answer the machine cannot take.
+
+    It used to: it asked the owner to say "yes, there is a sign-in" IN A NOTE,
+    and a note at this door means REWRITE THE SPEC. So the card names the
+    answer channel it actually reads, and names what each answer does.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    check = _digest_cards(h)[0].payload["details"]["summary"]["sign_in_check"]
+    # The answer rides the per-item channel, under an id the renderer can key on.
+    assert check["answer_id"] == _SIGN_IN_ITEM
+    # Both answers are spelled out, and so is saying nothing.
+    assert "carries on" in check["agree_means"]
+    assert "STOPS" in check["disagree_means"]
+    assert "no sign-in here" in check["no_answer_means"]
+    # The promise that could not be kept is GONE from every word of the card.
+    assert "note" not in json.dumps(check).lower()
+
+
+@pytest.mark.asyncio
+async def test_yes_there_is_a_sign_in_stops_the_run_for_an_attended_checklist(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The 2026-07-31 guarantee, reached through the ONE pause.
+
+    The owner says yes to the spec and, on the same card, disagrees that this
+    feature is free of signing in. The spec is approved and the plan is written
+    — the person doing the attended registration needs both — and then the run
+    STOPS at the quality checklist rather than registering it authless.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("approve", sign_in="rejected")]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.FAILED.value
+    # ONE card in the whole run. The old second door is still never opened —
+    # the answer came off the digest card, it just was not a yes.
+    assert len(h.ctx["publisher"].envelopes) == 1
+    assert [s for s, _d in _events(store, _AUTH_DOOR_STAGE)] == []
+    # No checklist was registered and no build was queued: the leg's row is the
+    # FAILED one, never the "approved" idempotency sentinel.
+    assert [s for s, _d in _events(store, _BARS_STAGE)] == ["FAILED"]
+    assert h.ctx["build_triggers"] == []
+    # The owner's answer is on the durable spec row, in the sign-in door's own
+    # vocabulary, so the record reads the same whichever door answered.
+    spec = [d for s, d in _events(store, _SPEC_STAGE) if s == "approved"][-1]
+    assert spec["spec_review"]["sign_in_answer"] == "rejected"
+    assert "auth_confirmed" not in spec["spec_review"]
+    # The machine's receipt is the 2026-07-31 one, WORD FOR WORD — this is the
+    # same terminal, reached from the one pause instead of a second door.
+    assert "SPL-007 §A.2" in run["error"]
+    assert "attended registration" in run["error"]
+    assert "confirmed this IS a sign-in surface" in run["error"]
+    # The owner's sentence names no internal label.
+    reasons = " ".join(m for _c, m, _l in h.ctx["notifications"])
+    assert "stopped at registering the quality checklist" in reasons
+    for internal in ("qa-pass-bars", "auth_surface_bearing", "SPL-007"):
+        assert internal not in reasons
+    # And they were told AT THE TAP, not an hour later.
+    assert "task plan and then stop" in reasons
+
+
+@pytest.mark.asyncio
+async def test_no_there_is_no_sign_in_is_the_same_yes_it_always_was(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Answering the question explicitly must land exactly where saying nothing
+    about it lands — the 2026-08-14 ruling that one tap confirms it."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("approve", sign_in="accepted")]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert [s for s, _d in _events(store, _AUTH_DOOR_STAGE)] == []
+    bars = [d for s, d in _events(store, _BARS_STAGE) if s == "approved"][-1]
+    assert bars["auth_confirmation"]["outcome"] == "confirmed"
+    assert bars["auth_confirmation"]["answered_on"] == "the spec digest card"
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_answer_that_decided_nothing_is_never_read_as_a_yes(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Set the sign-in question aside and the run stops and NAMES that — the
+    one thing it must never do is take silence-with-a-shrug for confirmation."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("approve", sign_in="deferred")]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["build_triggers"] == []
+    spec = [d for s, d in _events(store, _SPEC_STAGE) if s == "approved"][-1]
+    assert spec["spec_review"]["sign_in_answer"] == "deferred"
+    assert "set the confirmation card aside" in store.get_run(CID)["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_note_still_only_ever_means_rewrite_the_spec(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The defect this pair of channels exists to kill.
+
+    A note saying "yes — this really does involve signing in" is prose, and the
+    machine does not read prose for decisions. It does what a note has always
+    meant here: rewrite the spec from those words. The sign-in answer is a
+    separate value, and on the fresh card the question is asked again against
+    the spec that was actually written.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer(
+                    "reject",
+                    notes="Yes — this really does involve signing in.",
+                    attempt=0,
+                ),
+                _answer("approve", attempt=1, sign_in="rejected"),
+            ]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED), _spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    # Round 1 rewrote the spec from their words, VERBATIM.
+    assert h.ctx["dispatches"][1]["validate_feedback"] == (
+        "Yes — this really does involve signing in."
+    )
+    # Round 2 asked the sign-in question again — the spec had changed underneath
+    # it — and their answer on THAT card is the one that counts.
+    assert len(_digest_cards(h)) == 2
+    assert "sign_in_check" in _digest_cards(h)[1].payload["details"]["summary"]
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["build_triggers"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_crash_between_the_tap_and_the_commit_keeps_the_sign_in_answer(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The narrow window that would turn a "yes, there IS a sign-in" into a yes.
+
+    The owner answers; the door writes its verdict; the daemon dies before the
+    spec leg writes its own row. The re-drive replays the answered door rather
+    than re-asking — so what it replays has to be the WHOLE answer. If the
+    per-item answers were dropped there, the re-drive would read their silence
+    as agreement and register the checklist authless.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("approve", sign_in="rejected")]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED)],
+    )
+    await h.driver.drive(CID)
+    assert [s for s, _d in _events(store, _DIGEST_STAGE)] == ["GATED", "approved"]
+
+    # Now re-drive the leg from the durable record alone, as a fresh boot would,
+    # with NOBODY left on the wire to answer anything.
+    boot2 = _make_driver(store, subscriber_factory=SharedScriptFactory([]))
+    row = store.get_run(CID)
+    draft = boot2.driver._open_spec_draft(CID)
+    replay = await boot2.driver._spec_digest_review_door(row, CID, draft or {})
+
+    assert replay.outcome == "approved"
+    assert replay.item_answers == {_SIGN_IN_ITEM: "rejected"}
+    assert boot2.driver._sign_in_answer(draft or {}, replay) == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_answer_on_a_rewrite_round_is_recorded_not_acted_on(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """A round that asks for a rewrite decides nothing about the sign-in: the
+    spec is about to change. It is still on the record, because an answer
+    somebody gave is not something to throw away."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer("reject", notes="call it the build stamp", sign_in="rejected"),
+                _answer("approve", attempt=1),
+            ]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED), _spec_reply(seed=_AUTHLESS_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    revise = [d for s, d in _events(store, _DIGEST_STAGE) if s == "revise"][-1]
+    assert revise["digest_review"]["item_answers"] == {_SIGN_IN_ITEM: "rejected"}
+    # The rewritten spec does not trip the scan, so the fresh card does not ask
+    # — and the run is judged on the spec that was actually written.
+    assert "sign_in_check" not in _digest_cards(h)[1].payload["details"]["summary"]
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+
+@pytest.mark.asyncio
 async def test_an_unflagged_run_gets_no_sign_in_line(
     store: SqlitePlanningRunStore,
 ) -> None:
@@ -1207,6 +1472,115 @@ async def test_a_flagged_feature_is_never_thin_enough_to_skip(
 
     assert len(_digest_cards(h)) == 1
     assert "sign_in_check" in _digest_cards(h)[0].payload["details"]["summary"]
+
+
+# ---------------------------------------------------------------------------
+# What the "show me" view inherits, pinned so it cannot be inherited by accident
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_show_me_text_is_the_raw_spec_unscrubbed(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The card's "show me" field is the whole committed spec, VERBATIM.
+
+    Everything else on this card is composed from the digest and is safe to put
+    in front of a person by construction. This one field is not: it is the
+    spec's own words, and real specs in this estate carry task ids and internal
+    tool names that the plain-name fence forbids on a user surface.
+
+    This test does not decide what the renderer should do about that — it pins
+    what is actually IN the field, so whoever builds the "show me" view has to
+    decide deliberately (scrub it, or exempt that view) rather than find out on
+    the first live run. The fence's own suite renders neutral fixtures and will
+    not catch this.
+    """
+    feature = FEATURE_TEXT.replace(
+        "  @key-example @smoke\n", "  @key-example @smoke @task:TASK-MP-008\n"
+    ).replace(
+        "    Given the service is running\n"
+        "    When the version is asked for\n",
+        "    Given the guardkit service is running\n"
+        "    When the version is asked for\n",
+        1,
+    )
+    digest = DIGEST_YAML.replace(
+        "  - '@smoke'\n", "  - '@smoke'\n  - '@task:TASK-MP-008'\n"
+    )
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(feature=feature, digest=digest)],
+    )
+
+    await h.driver.drive(CID)
+
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    # (1) "Show me" is the whole committed spec, byte for byte — task id, tool
+    # name, step text and all.
+    assert card["worked_examples"] == feature
+    assert "@task:TASK-MP-008" in card["worked_examples"]
+    assert "guardkit" in card["worked_examples"]
+
+    # (2) The labels travel raw too — but this one is ALREADY answered by the
+    # card's contract: the renderer shows only the labels it has a plain word
+    # for, so an unknown label is dropped rather than shown. Pinned so that
+    # contract stays a decision somebody made, not an accident.
+    assert card["what_it_will_do"][0]["tags"] == [
+        "@key-example",
+        "@smoke",
+        "@task:TASK-MP-008",
+    ]
+
+    # (3) Everything a person is actually ASKED about — every sentence, every
+    # assumption, every "what this means" line — is composed from the digest
+    # and is clean. That is why (1) is the one field the renderer must rule on.
+    prose = json.dumps(
+        {
+            k: v
+            for k, v in card.items()
+            if k not in ("worked_examples", "what_it_will_do")
+        }
+    )
+    prose += json.dumps([e["sentence"] for e in card["what_it_will_do"]])
+    assert "TASK-MP-008" not in prose
+    assert "guardkit" not in prose
+
+
+@pytest.mark.asyncio
+async def test_the_spec_text_is_written_to_the_event_log_once_per_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The card carries the whole spec, so the durable log must not carry it
+    over and over: it belongs on the OPENING row a restart replays from, and
+    nowhere else. A three-card run used to write it six or seven times."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer("reject", notes="call it the build stamp", attempt=0),
+                _answer("approve", attempt=1),
+            ]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    rows = _events(store, _DIGEST_STAGE)
+    assert [s for s, _d in rows] == ["GATED", "revise", "GATED", "approved"]
+    carrying = [s for s, d in rows if "worked_examples" in json.dumps(d)]
+    assert carrying == ["GATED", "GATED"], (
+        "the spec text belongs on the opening rows only"
+    )
+    # The verdict rows still say everything a verdict row is FOR.
+    verdict = dict(rows[1][1]["digest_review"])
+    assert verdict["outcome"] == "revise"
+    assert verdict["decided_by"] == ORIGINATOR
+    assert verdict["notes"] == "call it the build stamp"
+    assert verdict["decision"] == "reject"
 
 
 @pytest.mark.asyncio

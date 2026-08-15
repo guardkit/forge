@@ -24,11 +24,39 @@ normalizer rewrites it in place at pre-commit (collapsing wrapped steps,
 commenting out box-drawing dividers). A digest proven only against the
 pre-normalization spec is a digest about an artifact nobody builds from.
 
-Drift between the two copies is the real risk and it is met head-on: the shared
-behaviour is pinned by ``tests/forge/planning/test_spec_digest.py``, whose
-fixtures are the same shapes the specialist's own suite drives, and every gate
-below names its opposite number. A change to one copy without the other is a
-test failure, not a silent divergence.
+Drift between the two copies is the real risk, and here is exactly how much is
+done about it, because a claim on this lane has to be one you can check:
+
+* every gate below NAMES its opposite number in the specialist's copy, so a
+  reader changing one can find the other;
+* ``tests/forge/planning/test_spec_digest.py`` pins THIS copy's behaviour, with
+  fixtures of the same shapes the specialist's own suite drives.
+
+What that adds up to is a HAND-MAINTAINED MIRROR. There is no mechanical drift
+detector: the two suites carry independently-written fixtures, forge's suite
+imports nothing from specialist-agent (it cannot — no shared package, no
+declared dependency), and nothing anywhere fails when one copy changes and the
+other does not. An earlier version of this paragraph said drift "is met head-on"
+and that a one-sided change "is a test failure, not a silent divergence"; that
+was not true, and on a lane whose first law is that a claim must be checkable it
+was the wrong thing to leave written down.
+
+The two copies WERE compared, symbol by symbol, on 2026-08-15 against
+specialist-agent ``lane/stage2-digest-0814`` and found FAITHFUL: gates 1-9 and
+their error strings, :func:`parse_scenarios`, :func:`_has_mid_sentence_break`,
+:func:`_iso_text`, :func:`_with_final_newline`, :data:`_DIGEST_ABBREVIATIONS`,
+:data:`_DIGEST_STEP_LINE_RE`, :data:`_GHERKIN_COMMENT_RE`,
+:data:`DIGEST_ERROR_PREFIX`, :data:`_EARLIER_ASSUMPTIONS_KEY` and the manifest
+keys ``assumption`` / ``basis``. The only deltas are shape, not behaviour: the
+specialist imports ``datetime`` / ``Counter`` inside the functions, calls its
+parser ``_parse_scenarios``, spells the scenario-header count as a literal
+regex where this module names it :data:`_SCENARIO_HEADER_COUNT_RE`, and folds
+the comment-strip into a ``_scenario_scan_text`` helper.
+
+That comparison is a DATED ONE-OFF, not a standing gate — which is a weaker
+thing, and is written here as the weaker thing it is. Anyone changing a gate
+below should expect to change the specialist's copy in the same sitting, and
+should expect nothing to tell them if they forget.
 """
 
 from __future__ import annotations
