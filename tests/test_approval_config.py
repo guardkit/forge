@@ -241,6 +241,9 @@ class TestApprovalYamlRoundTrip:
                 # Lane B / Phase E1 (B1) target-terminal flag — default-OFF; the
                 # unfiltered round-trip dump always includes it.
                 "target_terminal": {"enabled": False},
+                # ``planning.digest_review`` — the machine chain's one pause.
+                # Default always_ask=True; the unfiltered dump always includes it.
+                "digest_review": {"always_ask": True, "skip_max_scenarios": 3},
                 # ``planning.dcl`` — the machine-authored DCL seat's single-slot
                 # flag. Default-ON; the unfiltered dump always includes it.
                 "dcl": {"author_at_plan_commit": True},
