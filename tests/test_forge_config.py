@@ -260,9 +260,6 @@ class TestYamlRoundTrip:
                 # ``planning.digest_review`` — the machine chain's one pause.
                 # Default always_ask=True; the unfiltered dump always includes it.
                 "digest_review": {"always_ask": True, "skip_max_scenarios": 3},
-                # ``planning.dcl`` — the machine-authored DCL seat's
-                # single-slot flag. Default-ON; always in the dump.
-                "dcl": {"author_at_plan_commit": True},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages) — like
             # ``planning`` above, the unfiltered round-trip dump always includes
@@ -409,3 +406,53 @@ class TestTargetTerminalConfig:
 
         with pytest.raises(ValidationError):
             TargetTerminalConfig.model_validate({"enabled": False, "bogus": 1})
+
+
+# ---------------------------------------------------------------------------
+# The struck DCL kill switch (2026-08-15)
+# ---------------------------------------------------------------------------
+
+
+class TestStruckDclConfigFailsLoud:
+    """``planning.dcl`` went out with the DCL leg. ``PlanningConfig`` is
+    ``extra="forbid"`` (its own long-standing policy, unchanged here), so a
+    yaml that still carries the block is REFUSED by name at load — never
+    silently ignored, which would leave an operator believing a kill switch
+    still governs something.
+    """
+
+    def test_planning_config_no_longer_has_dcl(self) -> None:
+        from forge.config.models import PlanningConfig
+
+        assert "dcl" not in PlanningConfig.model_fields
+
+    def test_a_stray_dcl_block_is_refused_by_name(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            ForgeConfig.model_validate(
+                {
+                    "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                    "planning": {"dcl": {"author_at_plan_commit": True}},
+                }
+            )
+        message = str(excinfo.value)
+        assert "planning.dcl" in message
+        assert "Extra inputs are not permitted" in message
+
+    def test_a_stray_dcl_block_is_refused_through_the_yaml_loader(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.config.loader import load_config
+
+        path = tmp_path / "forge.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                    "planning": {"dcl": {"author_at_plan_commit": True}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(path)
+        assert "planning.dcl" in str(excinfo.value)

@@ -632,8 +632,30 @@ class LifecycleEmitterAdapter:
         if method_name == "emit_complete":
             return emit(
                 self._ctx,
+                # ``repo`` STAYS None — honestly. This adapter genuinely does
+                # not hold the target repo name: :class:`forge.pipeline.
+                # BuildContext` is (feature_id, build_id, correlation_id,
+                # wave_total), and :class:`AutobuildState` has no repo field
+                # either. The name exists upstream on the originating
+                # ``BuildQueuedPayload``, but BuildContext drops it, so filling
+                # it here would mean inventing it.
                 repo=None,
-                branch=None,
+                # ``branch`` IS derivable, and the owner is told it. The
+                # runner's own convention, stated verbatim further down this
+                # module (the prior-build sweep's FEATURE-MODE residue note):
+                # guardkit's feature mode checks the build out on
+                # ``autobuild/<FEATURE_ID>`` — "the ref is named after the
+                # FEATURE, not any task id".
+                #
+                # It is built from ``self._ctx.feature_id`` — the SAME id
+                # ``emit_complete`` stamps onto ``BuildCompletePayload
+                # .feature_id`` — so the branch and the feature named in one
+                # envelope can never disagree. (``state.feature_id`` carries
+                # the same value in production; the ctx is the one the payload
+                # actually reads.) Same rule as the SSE producer's
+                # ``StreamEventTranslator._build_complete``, applied to this
+                # producer's own source of feature_id.
+                branch=f"autobuild/{self._ctx.feature_id}",
                 tasks_completed=state.tasks_completed,
                 tasks_failed=state.tasks_failed,
                 tasks_total=state.tasks_completed + state.tasks_failed,
@@ -1893,15 +1915,15 @@ IN_FLIGHT_STATE_NAME: str = _receipts.IN_FLIGHT_STATE_NAME
 #: The receipt families exported before the success-path worktree removal
 #: (FEAT-DRC / register 2a4): coach verdicts + evidence dossiers + the
 #: FEAT-SCG conformance snapshot live under ``autobuild-private``; the shadow
-#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``;
-#: the DCL machine-authoring corpus under ``dcl-capture`` (added by the
-#: receipts-landing lane — it was written by every build and destroyed with
-#: the worktree on success, exactly the FEAT-UDBE loss class).
+#: judge's queue under ``qav-shadow``; review summaries under ``autobuild``.
+#: The DCL machine-authoring corpus (``dcl-capture``) was a fourth family until
+#: 2026-08-15, when guardkit deleted the ``.dcl`` spec track outright — nothing
+#: writes that directory any more, so exporting it only ever produced an
+#: honest "missing" row.
 _RECEIPT_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild-private",
     ".guardkit/qav-shadow",
     ".guardkit/autobuild",
-    ".guardkit/dcl-capture",
 )
 
 #: Where guardkit registers its per-task INNER worktrees inside the outer
@@ -2528,8 +2550,8 @@ def _pack_evidence(
         )
     if not families:
         missing.append(
-            "receipt families — no coach verdict, evidence dossier, "
-            "qav-shadow queue or dcl-capture corpus landed in this pack"
+            "receipt families — no coach verdict, evidence dossier or "
+            "qav-shadow queue landed in this pack"
         )
     if semantic_state is None:
         missing.append(

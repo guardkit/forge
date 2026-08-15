@@ -73,6 +73,7 @@ from forge.subagents.autobuild_runner import (
 from nats_core.envelope import EventType, MessageEnvelope
 from nats_core.events import (
     ApprovalResponsePayload,
+    BuildCompletePayload,
     BuildPausedPayload,
     BuildResumedPayload,
 )
@@ -844,4 +845,123 @@ def _approval_response_envelope(
         event_type=EventType.APPROVAL_RESPONSE,
         correlation_id=correlation_id,
         payload=payload.model_dump(mode="json"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The direct-emit build terminal names the branch that holds the code
+#
+# The runner-side sibling of ``StreamEventTranslator._build_complete``. This
+# producer published ``branch=None`` too, so a build that completed through the
+# adapter told the owner it had finished without telling them WHERE the code is.
+# The runner's own convention — ``autobuild/<FEATURE_ID>``, "the ref is named
+# after the FEATURE, not any task id" — is derivable from the BuildContext the
+# adapter already holds. ``repo`` stays None: BuildContext drops the repo name
+# the originating BuildQueuedPayload carried, so filling it means inventing it.
+# ---------------------------------------------------------------------------
+
+
+class TestDirectEmitCompleteNamesTheBranch:
+    def test_completed_publishes_the_feature_autobuild_branch(self) -> None:
+        emitter, nc = _build_emitter()
+        adapter = LifecycleEmitterAdapter(emitter, _make_ctx())
+        state = _make_state(lifecycle="running_wave", tasks_completed=2)
+
+        _update_state(state, lifecycle="completed", emitter=adapter)
+
+        complete = [(s, b) for s, b in nc.published if "build-complete" in s]
+        assert len(complete) == 1, [s for s, _ in nc.published]
+        subject, body = complete[0]
+        assert subject == "pipeline.build-complete.FEAT-X"
+
+        payload = BuildCompletePayload.model_validate(
+            _decode_envelope(body).payload
+        )
+        # The branch names the SAME feature the payload names — one envelope
+        # can never disagree with itself.
+        assert payload.feature_id == "FEAT-X"
+        assert payload.branch == "autobuild/FEAT-X"
+
+    def test_repo_stays_none_because_the_adapter_never_holds_it(self) -> None:
+        """Honest absence, pinned: ``BuildContext`` carries no repo name, so a
+        later fill has to come from a real source rather than a guess."""
+        assert "repo" not in BuildContext.__dataclass_fields__
+
+        emitter, nc = _build_emitter()
+        adapter = LifecycleEmitterAdapter(emitter, _make_ctx())
+        state = _make_state(lifecycle="running_wave", tasks_completed=1)
+
+        _update_state(state, lifecycle="completed", emitter=adapter)
+
+        _, body = next(
+            (s, b) for s, b in nc.published if "build-complete" in s
+        )
+        payload = BuildCompletePayload.model_validate(
+            _decode_envelope(body).payload
+        )
+        assert payload.repo is None
+
+    def test_both_build_complete_producers_agree_on_the_branch(self) -> None:
+        """The SSE translator and this direct-emit adapter are two producers of
+        the SAME ``pipeline.build-complete`` envelope. They must mint the same
+        ref for the same feature, or the owner is told two different places to
+        look depending on which path published."""
+        from forge.lifecycle_bridge.translation import StreamEventTranslator
+
+        emitter, nc = _build_emitter()
+        adapter = LifecycleEmitterAdapter(emitter, _make_ctx())
+        state = _make_state(lifecycle="running_wave", tasks_completed=1)
+        _update_state(state, lifecycle="completed", emitter=adapter)
+        _, body = next((s, b) for s, b in nc.published if "build-complete" in s)
+        direct = BuildCompletePayload.model_validate(_decode_envelope(body).payload)
+
+        translator = StreamEventTranslator()
+        bridge_ctx = _bridge_context(feature_id="FEAT-X", correlation_id="corr-001")
+        translator.translate(_values_part("FEAT-X", "running_wave", 1), bridge_ctx)
+        sse = translator.translate(_values_part("FEAT-X", "completed", 1), bridge_ctx)
+
+        assert sse is not None
+        assert sse.branch == direct.branch == "autobuild/FEAT-X"
+
+
+def _bridge_context(*, feature_id: str, correlation_id: str):
+    """The lifecycle-bridge BuildContext (a DIFFERENT dataclass from the
+    pipeline one this module's ``_make_ctx`` builds)."""
+    from datetime import UTC, datetime, timedelta
+
+    from forge.lifecycle_bridge.bridge import BuildContext as BridgeBuildContext
+
+    return BridgeBuildContext(
+        feature_id=feature_id,
+        thread_id="thread-x",
+        run_id="run-x",
+        correlation_id=correlation_id,
+        deadline_at=datetime.now(UTC) + timedelta(seconds=300),
+    )
+
+
+def _values_part(feature_id: str, lifecycle: str, tasks_completed: int):
+    from langgraph_sdk.schema import StreamPart
+
+    from forge.lifecycle_bridge.translation import VALUES_STREAM_EVENT
+
+    return StreamPart(
+        event=VALUES_STREAM_EVENT,
+        data={
+            "async_tasks": {
+                feature_id: {
+                    "feature_id": feature_id,
+                    "build_id": "build-FEAT-X-20260502120000",
+                    "lifecycle": lifecycle,
+                    "wave_total": 1,
+                    "wave_index": 0,
+                    "task_index": 0,
+                    "tasks_completed": tasks_completed,
+                    "tasks_failed": 0,
+                    "waiting_for": None,
+                    "last_coach_score": None,
+                }
+            }
+        },
+        id=None,
     )
