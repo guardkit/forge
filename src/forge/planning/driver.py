@@ -167,10 +167,25 @@ _DCL_AUTHOR_STAGE = "dcl-author"
 #: between the owner's tap and the bars commit drives straight through).
 _AUTH_CONFIRM_STAGE = "qa-pass-bars-auth-confirm"
 
+#: Durable stage label for the SPEC DRAFT — the spec is written and committed
+#: but the owner has NOT yet said yes to it. Deliberately NOT the leg's
+#: ``approved`` sentinel: it is the EARLIER sentinel that makes the digest door
+#: restart-survivable. A re-drive that finds a draft re-opens the door with the
+#: persisted card instead of re-dispatching the spec-writer and rewriting the
+#: spec underneath a card the owner is still reading.
+_SPEC_DRAFT_STAGE = "feature-spec-draft"
+
+#: Durable stage label for the SPEC DIGEST REVIEW DOOR — the one pause of the
+#: machine chain (the product-docs pause, absorbed and moved to where there is
+#: something a person can actually check). A durable ``approved`` event under
+#: this label is the door's idempotency sentinel; a ``revise`` event is a round
+#: the owner answered with a note.
+_DIGEST_REVIEW_STAGE = "feature-spec-digest-review"
+
 #: The door-event statuses that mean A CARD IS STILL LIVE IN FRONT OF THE OWNER.
 #: ``GATED`` is the first opening; ``reopened`` is a recovery re-emission after a
 #: daemon restart (the checkpoint's ``republish_pending`` mechanic, mirrored).
-#: When the LAST :data:`_AUTH_CONFIRM_STAGE` event carries one of these statuses
+#: When the LAST event for a door's stage label carries one of these statuses
 #: the door is OPEN, and its persisted ``request_id`` is re-emitted VERBATIM —
 #: minting a fresh id would orphan the card the owner can still see and silently
 #: drop the tap they are about to give it.
@@ -216,6 +231,48 @@ _AUTH_DOOR_TERMINAL_SUFFIX = {
         "checklist unattended."
     ),
 }
+
+#: The ``checkpoint_type`` on the SPEC DIGEST card's envelope. The
+#: ``product_docs`` prefix is not a trick — it is the messenger's actual
+#: discriminator for a planning card, and this card genuinely IS the product-docs
+#: checkpoint, absorbed and moved to where there is a spec to read. A planning
+#: card WITHOUT that prefix is never posted at all (its body is discarded at
+#: capture and its pause mirror is suppressed), so the prefix is what makes the
+#: one front door work.
+_DIGEST_REVIEW_CHECKPOINT_TYPE = "product_docs_spec_digest"
+
+#: The one-line pause rationale carried on the digest card's envelope.
+_DIGEST_REVIEW_RATIONALE = (
+    "The spec is written. The owner reads one plain sentence per worked example "
+    "— checked by ordinary code against the examples themselves — and says "
+    "whether that is what they want built."
+)
+
+#: What the honest terminal adds after a digest review that did not end in a
+#: yes. Plain language — the owner reads these.
+_DIGEST_DOOR_TERMINAL_SUFFIX = {
+    "rejected": (
+        "The owner said no to the spec without leaving a note, so there was "
+        "nothing to rewrite from and the run stopped."
+    ),
+    "timed_out": (
+        "Nobody answered the card inside the wait window, so the run stopped "
+        "rather than build a spec no one had read."
+    ),
+    "undeliverable": (
+        "The card could not be delivered, so nobody could read the spec; the "
+        "run stopped rather than build it unread."
+    ),
+    "deferred": (
+        "The owner set the card aside instead of deciding it either way, so the "
+        "run stopped rather than build a spec no one had said yes to."
+    ),
+}
+
+#: The digest artifact's suffix in the 007 native map. It rides beside the
+#: three-file contract and is committed as a fourth file, so the planning branch
+#: carries the complete record of what the owner approved.
+_SPEC_DIGEST_SUFFIX = "_digest.yaml"
 
 #: The target repo's OWN feature-behaviour gate TEMPLATE + gate registry, read
 #: off the planning branch (never fabricated forge-side). Their ABSENCE is an
@@ -356,6 +413,25 @@ _assumptions.yaml), and the structured ``target_repo_descriptor`` — the exact
 argument shape ``architect_feature_plan`` requires (specialist-agent
 roles/architect/modes/feature_plan.py). The result's ``role_output`` carries the
 plan tree."""
+
+
+@dataclass(frozen=True)
+class _DoorAnswer:
+    """What came back through an inline confirmation door.
+
+    ``outcome`` is the caller's own vocabulary (``confirmed`` for the sign-in
+    door, ``approved`` / ``revise`` for the spec-digest door, plus the shared
+    ``rejected`` / ``deferred`` / ``timed_out`` / ``undeliverable``).
+    ``decision`` is the literal wire answer and ``notes`` the owner's own words
+    — the channel their red pen rides. Both are ``None`` when the door closed
+    without anybody answering it.
+    """
+
+    outcome: str
+    request_id: str
+    decided_by: str | None = None
+    decision: str | None = None
+    notes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2471,13 +2547,37 @@ class PlanningRunDriver:
         return True
 
     # ------------------------------------------------------------------ #
-    # The auth-confirmation door (cure for live run dff0cd00, 2026-07-31)
+    # THE INLINE CONFIRMATION DOOR — ONE mechanism, two callers
+    #
+    # Born as the auth-confirmation door (the cure for live run dff0cd00,
+    # 2026-07-31) and extracted here when the machine chain's spec-digest review
+    # needed the same pause. A pause mechanism that exists twice drifts, and two
+    # doors that behave differently are a promise the estate cannot keep — so
+    # there is ONE door, parameterised, and both callers get every mechanic:
+    # durable-before-wire bookkeeping, arm-before-post, the stale request-id
+    # guard, per-run approver pinning, verbatim re-open after a restart, and the
+    # idempotency sentinel that means an answered door is never re-asked.
     # ------------------------------------------------------------------ #
 
-    async def _auth_surface_confirmation_door(
-        self, row: Any, correlation_id: str, *, seed: Mapping[str, Any], basis: str
-    ) -> str:
-        """Ask the owner to confirm a flagged seed is authless; wait for the tap.
+    async def _inline_confirmation_door(
+        self,
+        row: Any,
+        correlation_id: str,
+        *,
+        stage_label: str,
+        details_key: str,
+        checkpoint_type: str,
+        rationale: str,
+        sentinel_outcome: str,
+        answered_outcome: str,
+        persisted: dict[str, Any],
+        rehydrate: Callable[[Mapping[str, Any], int], dict[str, Any]],
+        decide: Callable[[Any], str],
+        open_message: Callable[[str | None, int], str],
+        log_noun: str,
+        on_close: Callable[[_DoorAnswer], Awaitable[None]] | None = None,
+    ) -> _DoorAnswer:
+        """Put ONE card in front of the run's approver and wait for the tap.
 
         MIRRORS the cycle-1 assumptions checkpoint one-for-one — durable
         bookkeeping BEFORE the wire, ONE approval-request envelope built by the
@@ -2488,58 +2588,78 @@ class PlanningRunDriver:
         ``request_id`` guard, and the wait window off
         ``PlanningConfig.originator_wait_seconds``.
 
-        The ONE deliberate difference: no PAUSED state transition. The run is
-        mid-machine-chain at FEATURE_PLAN, a state whose transition table has no
-        PAUSED edge (``planning/states.py`` — deliberately additive-only), so the
-        door waits INLINE instead of stranding a half-paused row.
+        The ONE deliberate difference from the checkpoint: no PAUSED state
+        transition. Both callers run mid-machine-chain, in states whose
+        transition table has no PAUSED edge (``planning/states.py`` —
+        deliberately additive-only), so the door waits INLINE instead of
+        stranding a half-paused row.
 
         SURVIVING A RESTART (the mechanic that makes the inline wait safe): the
         boot sweep enumerates FEATURE_SPEC / FEATURE_PLAN alongside QUEUED /
         RUNNING (``cli/_serve_planning.sweep_interrupted_planning_runs``), so a
-        daemon killed with the card live re-drives this leg on the next boot;
+        daemon killed with the card live re-drives its leg on the next boot;
         and a door that is STILL OPEN on the durable record is RE-OPENED with
-        its persisted ``request_id`` and ``attempt_count`` VERBATIM — exactly as
-        :meth:`_republish_pending` re-emits the checkpoint's — so the card the
-        owner can still see stays the card their tap answers. The durable
-        ``approved`` event written on confirmation is the idempotency sentinel:
-        a run that was already confirmed never re-asks.
+        its persisted ``request_id``, ``attempt_count`` and CARD CONTENT
+        VERBATIM — exactly as :meth:`_republish_pending` re-emits the
+        checkpoint's — so the card the owner can still see stays the card their
+        tap answers, word for word. The durable ``approved`` event written on a
+        yes is the idempotency sentinel: an answered door never re-asks.
 
-        Returns ``"confirmed"`` (the caller proceeds exactly as the unflagged
-        path), ``"rejected"``, ``"deferred"``, ``"timed_out"`` or
-        ``"undeliverable"`` — each of the last four mapping to the caller's
-        honest terminal, which NAMES which of them happened.
+        Parameters carry everything that differs between the two callers and
+        nothing else:
+
+        * ``stage_label`` / ``details_key`` — where the door's rows live and
+          under which key its record sits inside ``details_json``;
+        * ``checkpoint_type`` / ``rationale`` — the envelope's discriminator and
+          its one-line reason;
+        * ``sentinel_outcome`` — the outcome whose durable row is written as
+          ``approved`` (the idempotency sentinel);
+        * ``answered_outcome`` — what an ALREADY-answered door returns on a
+          re-drive without re-asking;
+        * ``persisted`` — the caller's own fields carried verbatim on the open
+          row, and replayed into ``rehydrate`` on a recovery re-open;
+        * ``rehydrate(persisted, wait_seconds)`` — builds the card dict from
+          those fields, so a re-emission is the SAME card and never a re-render
+          off possibly-drifted source;
+        * ``decide(response)`` — maps a wire answer onto the caller's outcome;
+        * ``open_message(approver, wait_seconds)`` — the plain-language ping
+          that says the run is WAITING, not broken;
+        * ``on_close`` — the caller's own closing act (a notification, a log).
+
+        Returns a :class:`_DoorAnswer` carrying the outcome, who decided it, the
+        wire decision literal and any free-text note they left.
         """
         deps = self._deps
         plan_run_id = f"plan-{correlation_id}"
 
-        # Idempotent: a durable confirmation is NEVER re-asked (a crash between
-        # the owner's tap and the bars commit drives straight through).
-        if self._has_leg_event(correlation_id, _AUTH_CONFIRM_STAGE):
+        # Idempotent: an answered door is NEVER re-asked (a crash between the
+        # owner's tap and the leg's own commit drives straight through).
+        if self._has_leg_event(correlation_id, stage_label):
             logger.info(
-                "planning driver: run %s auth-surface confirmation already "
-                "given (idempotent re-drive — registering the bars)",
+                "planning driver: run %s %s already answered (idempotent "
+                "re-drive — carrying on)",
                 correlation_id,
+                log_noun,
             )
-            return "confirmed"
+            return _DoorAnswer(outcome=answered_outcome, request_id="")
 
         current = deps.store.get_run(correlation_id) or row
         expected_approver = current["expected_approver"]
         wait_seconds = max(1, int(deps.planning_config.originator_wait_seconds))
-        basis_lines = self._auth_basis_lines(basis)
 
         # RECOVERY vs FRESH OPENING. A door left OPEN on the durable record is
         # one the daemon died holding: the owner's card is still in their Slack.
-        # Re-emit it VERBATIM (persisted request_id + attempt_count) — the
-        # checkpoint's :meth:`_republish_pending` mechanic — so their tap lands
-        # on THIS run instead of being dropped by the stale guard below. Only a
-        # genuinely new door mints a new id (and bumps the attempt, so a later
-        # round is never deduped away by first-response-wins idempotency).
-        open_door = self._open_auth_door(correlation_id)
+        # Re-emit it VERBATIM (persisted request_id + attempt_count + card) —
+        # the checkpoint's :meth:`_republish_pending` mechanic — so their tap
+        # lands on THIS run instead of being dropped by the stale guard below.
+        # Only a genuinely new door mints a new id (and bumps the attempt, so a
+        # later round is never deduped away by first-response-wins idempotency).
+        open_door = self._open_door(correlation_id, stage_label, details_key)
         if open_door is None:
-            attempt_count = self._auth_confirm_attempt(correlation_id)
+            attempt_count = self._door_attempt(correlation_id, stage_label)
             request_id = derive_request_id(
                 build_id=plan_run_id,
-                stage_label=_AUTH_CONFIRM_STAGE,
+                stage_label=stage_label,
                 attempt_count=attempt_count,
             )
             door_status = "GATED"
@@ -2548,42 +2668,39 @@ class PlanningRunDriver:
             request_id = str(open_door["request_id"])
             attempt_count = int(open_door.get("attempt_count") or 0)
             # The card's own words as first published — a re-emission must be
-            # the SAME card, not a re-render of a possibly-drifted basis.
-            persisted_basis = [
-                str(line) for line in (open_door.get("basis_lines") or []) if str(line)
-            ]
-            if persisted_basis:
-                basis_lines = persisted_basis
+            # the SAME card, not a re-render of possibly-drifted source.
+            persisted = {
+                key: open_door[key] for key in persisted if key in open_door
+            } or persisted
             door_status = "reopened"
             door_outcome = "reopened"
             logger.info(
-                "planning driver: run %s re-opening the auth-confirmation door "
-                "left live by a restart — re-emitting card %s (attempt=%d) "
-                "verbatim so the owner's existing card still answers it",
+                "planning driver: run %s re-opening the %s left live by a "
+                "restart — re-emitting card %s (attempt=%d) verbatim so the "
+                "owner's existing card still answers it",
                 correlation_id,
+                log_noun,
                 request_id,
                 attempt_count,
             )
 
-        card = self._auth_confirmation_card(
-            seed=seed, basis_lines=basis_lines, wait_seconds=wait_seconds
-        )
+        card = rehydrate(persisted, wait_seconds)
 
         # Durable-before-wire (the checkpoint's SQLite-before-wire discipline):
         # the open door is on the record before the card can be answered.
         deps.store._record_event(
             correlation_id=correlation_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
+            stage_label=stage_label,
             status=door_status,
             actor_identity="planning-driver",
             details_json=json.dumps(
                 {
-                    "auth_confirmation": {
+                    details_key: {
                         "outcome": door_outcome,
                         "request_id": request_id,
                         "attempt_count": attempt_count,
                         "expected_approver": expected_approver,
-                        "basis_lines": basis_lines,
+                        **persisted,
                         "wait_seconds": wait_seconds,
                     }
                 }
@@ -2594,12 +2711,12 @@ class PlanningRunDriver:
             request_id=request_id,
             plan_run_id=plan_run_id,
             feature_id=plan_run_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
+            stage_label=stage_label,
             summary_data=card,
             expected_approver=expected_approver,
             attempt_count=attempt_count,
-            rationale=_AUTH_CONFIRM_RATIONALE,
-            checkpoint_type=_AUTH_CONFIRM_CHECKPOINT_TYPE,
+            rationale=rationale,
+            checkpoint_type=checkpoint_type,
             # Thread the card into the run's own Slack thread (the durable
             # anchor on the row — never re-derived), like every planning card.
             parent_request_id=current["parent_request_id"],
@@ -2616,35 +2733,46 @@ class PlanningRunDriver:
                     # posted). "Nobody answered" would be a falsehood: nobody
                     # was ever ASKED. Take the undeliverable terminal instead.
                     logger.error(
-                        "planning driver: run %s auth-surface confirmation "
-                        "window (%ds) closed with the card never published "
-                        "(the response subscription never armed) — nobody was "
-                        "ever asked",
+                        "planning driver: run %s %s window (%ds) closed with "
+                        "the card never published (the response subscription "
+                        "never armed) — nobody was ever asked",
                         correlation_id,
+                        log_noun,
                         wait_seconds,
                     )
-                    self._record_auth_door_outcome(
-                        correlation_id,
-                        outcome="undeliverable",
-                        request_id=request_id,
-                        decided_by=None,
-                        basis_lines=basis_lines,
+                    answer = _DoorAnswer(
+                        outcome="undeliverable", request_id=request_id
                     )
-                    return "undeliverable"
+                    self._record_door_outcome(
+                        correlation_id,
+                        stage_label=stage_label,
+                        details_key=details_key,
+                        sentinel_outcome=sentinel_outcome,
+                        persisted=persisted,
+                        answer=answer,
+                    )
+                    if on_close is not None:
+                        await on_close(answer)
+                    return answer
                 logger.warning(
-                    "planning driver: run %s auth-surface confirmation window "
-                    "(%ds) closed with no answer",
+                    "planning driver: run %s %s window (%ds) closed with no "
+                    "answer",
                     correlation_id,
+                    log_noun,
                     wait_seconds,
                 )
-                self._record_auth_door_outcome(
+                answer = _DoorAnswer(outcome="timed_out", request_id=request_id)
+                self._record_door_outcome(
                     correlation_id,
-                    outcome="timed_out",
-                    request_id=request_id,
-                    decided_by=None,
-                    basis_lines=basis_lines,
+                    stage_label=stage_label,
+                    details_key=details_key,
+                    sentinel_outcome=sentinel_outcome,
+                    persisted=persisted,
+                    answer=answer,
                 )
-                return "timed_out"
+                if on_close is not None:
+                    await on_close(answer)
+                return answer
 
             armed: asyncio.Event = asyncio.Event()
             subscriber = deps.subscriber_factory(expected_approver, armed)
@@ -2652,7 +2780,7 @@ class PlanningRunDriver:
             wait_task = asyncio.create_task(
                 subscriber.await_response(
                     plan_run_id,
-                    stage_label=_AUTH_CONFIRM_STAGE,
+                    stage_label=stage_label,
                     attempt_count=attempt_count,
                     timeout_seconds=max(1, int(remaining)),
                 )
@@ -2661,8 +2789,9 @@ class PlanningRunDriver:
                 await asyncio.wait_for(armed.wait(), timeout=_ARM_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 logger.error(
-                    "planning driver: auth-confirmation subscription failed to "
-                    "arm for %s within %.0fs; retrying",
+                    "planning driver: %s subscription failed to arm for %s "
+                    "within %.0fs; retrying",
+                    log_noun,
                     correlation_id,
                     _ARM_TIMEOUT_SECONDS,
                 )
@@ -2677,28 +2806,31 @@ class PlanningRunDriver:
                     await deps.approval_publisher.publish_request(envelope)
                 except Exception:  # noqa: BLE001 — an undeliverable card is honest
                     logger.exception(
-                        "planning driver: auth-confirmation card publish failed "
-                        "for %s (request_id=%s); taking the honest terminal",
+                        "planning driver: %s card publish failed for %s "
+                        "(request_id=%s); taking the honest terminal",
+                        log_noun,
                         correlation_id,
                         request_id,
                     )
                     await self._cancel_waiter(wait_task, correlation_id)
-                    self._record_auth_door_outcome(
-                        correlation_id,
-                        outcome="undeliverable",
-                        request_id=request_id,
-                        decided_by=None,
-                        basis_lines=basis_lines,
+                    answer = _DoorAnswer(
+                        outcome="undeliverable", request_id=request_id
                     )
-                    return "undeliverable"
+                    self._record_door_outcome(
+                        correlation_id,
+                        stage_label=stage_label,
+                        details_key=details_key,
+                        sentinel_outcome=sentinel_outcome,
+                        persisted=persisted,
+                        answer=answer,
+                    )
+                    if on_close is not None:
+                        await on_close(answer)
+                    return answer
                 published = True
                 await self._notify(
                     correlation_id,
-                    self._auth_door_open_message(
-                        correlation_id,
-                        expected_approver=expected_approver,
-                        wait_seconds=wait_seconds,
-                    ),
+                    open_message(expected_approver, wait_seconds),
                     level="info",
                 )
 
@@ -2706,8 +2838,9 @@ class PlanningRunDriver:
                 response = await wait_task
             except Exception:  # noqa: BLE001 — a waiter defect must not kill the run
                 logger.exception(
-                    "planning driver: auth-confirmation waiter raised for %s; "
-                    "retrying inside the window",
+                    "planning driver: %s waiter raised for %s; retrying inside "
+                    "the window",
+                    log_noun,
                     correlation_id,
                 )
                 await asyncio.sleep(1.0)
@@ -2725,9 +2858,10 @@ class PlanningRunDriver:
             # late product-docs response, a superseded door round).
             if response.request_id != request_id:
                 logger.warning(
-                    "planning driver: response request_id=%s is not the auth "
-                    "confirmation card %s for %s; ignoring",
+                    "planning driver: response request_id=%s is not the %s card "
+                    "%s for %s; ignoring",
                     response.request_id,
+                    log_noun,
                     request_id,
                     correlation_id,
                 )
@@ -2737,8 +2871,9 @@ class PlanningRunDriver:
             # Per-run approver pinning (verbatim equality, JNB-101/104).
             if expected_approver and response.decided_by != expected_approver:
                 logger.warning(
-                    "planning driver: auth-confirmation responder mismatch for "
-                    "%s (got %s, expected %s); the door stays open",
+                    "planning driver: %s responder mismatch for %s (got %s, "
+                    "expected %s); the door stays open",
+                    log_noun,
                     correlation_id,
                     response.decided_by,
                     expected_approver,
@@ -2746,17 +2881,69 @@ class PlanningRunDriver:
                 await asyncio.sleep(1.0)
                 continue
 
+            answer = _DoorAnswer(
+                outcome=decide(response),
+                request_id=request_id,
+                decided_by=response.decided_by,
+                decision=str(response.decision),
+                notes=(str(response.notes) if getattr(response, "notes", None) else None),
+            )
+            self._record_door_outcome(
+                correlation_id,
+                stage_label=stage_label,
+                details_key=details_key,
+                sentinel_outcome=sentinel_outcome,
+                persisted=persisted,
+                answer=answer,
+            )
+            if on_close is not None:
+                await on_close(answer)
+            return answer
+
+    async def _auth_surface_confirmation_door(
+        self, row: Any, correlation_id: str, *, seed: Mapping[str, Any], basis: str
+    ) -> str:
+        """Ask the owner to confirm a flagged seed is authless; wait for the tap.
+
+        A THIN CALLER of :meth:`_inline_confirmation_door` — every mechanic
+        (durable-before-wire, arm-before-post, the stale guard, approver
+        pinning, verbatim re-open, the idempotency sentinel) lives there and is
+        shared with the spec-digest door, so the two can never drift apart.
+
+        Returns ``"confirmed"`` (the caller proceeds exactly as the unflagged
+        path), ``"rejected"``, ``"deferred"``, ``"timed_out"`` or
+        ``"undeliverable"`` — each of the last four mapping to the caller's
+        honest terminal, which NAMES which of them happened.
+        """
+        basis_lines = self._auth_basis_lines(basis)
+
+        def _rehydrate(persisted: Mapping[str, Any], wait_seconds: int) -> dict[str, Any]:
+            lines = [
+                str(line) for line in (persisted.get("basis_lines") or []) if str(line)
+            ] or basis_lines
+            return self._auth_confirmation_card(
+                seed=seed, basis_lines=lines, wait_seconds=wait_seconds
+            )
+
+        def _decide(response: Any) -> str:
             if response.decision in ("approve", "override"):
-                self._record_auth_door_outcome(
-                    correlation_id,
-                    outcome="confirmed",
-                    request_id=request_id,
-                    decided_by=response.decided_by,
-                    basis_lines=basis_lines,
-                )
+                return "confirmed"
+            if response.decision == "reject":
+                return "rejected"
+            # The door asks for two answers, but it rides the SAME generic
+            # approval consumer as the product-docs checkpoint — whose
+            # ``decision`` literal also carries ``defer``. An answer that
+            # decides nothing is still an ANSWER: swallowing it and later
+            # reporting "nobody answered" would be a falsehood told to the very
+            # person who answered. So the door closes on it, the durable row
+            # records WHICH answer it was, and the terminal names it.
+            return "deferred"
+
+        async def _closed(answer: _DoorAnswer) -> None:
+            if answer.outcome == "confirmed":
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {response.decided_by} "
+                    f"Planning run {correlation_id}: {answer.decided_by} "
                     "confirmed there is no sign-in here — registering the "
                     "quality checklist as authless and carrying on with the build.",
                     level="info",
@@ -2765,50 +2952,44 @@ class PlanningRunDriver:
                     "planning driver: run %s auth surface confirmed authless by "
                     "%s; the pass-bar leg proceeds as the unflagged path",
                     correlation_id,
-                    response.decided_by,
+                    answer.decided_by,
                 )
-                return "confirmed"
-
-            if response.decision == "reject":
-                self._record_auth_door_outcome(
-                    correlation_id,
-                    outcome="rejected",
-                    request_id=request_id,
-                    decided_by=response.decided_by,
-                    basis_lines=basis_lines,
-                )
+            elif answer.outcome == "rejected":
                 logger.info(
                     "planning driver: run %s auth surface CONFIRMED REAL by %s; "
                     "attended registration it is",
                     correlation_id,
-                    response.decided_by,
+                    answer.decided_by,
                 )
-                return "rejected"
+            elif answer.outcome == "deferred":
+                logger.info(
+                    "planning driver: auth-confirmation answer %r from %s for %s "
+                    "decided nothing (a 'later' round); the door closes and the "
+                    "run takes the honest terminal naming it",
+                    answer.decision,
+                    answer.decided_by,
+                    correlation_id,
+                )
 
-            # The door asks for two answers, but it rides the SAME generic
-            # approval consumer as the product-docs checkpoint — whose
-            # ``decision`` literal also carries ``defer``. An answer that
-            # decides nothing is still an ANSWER: swallowing it and later
-            # reporting "nobody answered" would be a falsehood told to the very
-            # person who answered. So the door closes on it, the durable row
-            # records WHICH answer it was, and the terminal names it.
-            self._record_auth_door_outcome(
-                correlation_id,
-                outcome="deferred",
-                request_id=request_id,
-                decided_by=response.decided_by,
-                basis_lines=basis_lines,
-                decision=response.decision,
-            )
-            logger.info(
-                "planning driver: auth-confirmation answer %r from %s for %s "
-                "decided nothing (a 'later' round); the door closes and the "
-                "run takes the honest terminal naming it",
-                response.decision,
-                response.decided_by,
-                correlation_id,
-            )
-            return "deferred"
+        answer = await self._inline_confirmation_door(
+            row,
+            correlation_id,
+            stage_label=_AUTH_CONFIRM_STAGE,
+            details_key="auth_confirmation",
+            checkpoint_type=_AUTH_CONFIRM_CHECKPOINT_TYPE,
+            rationale=_AUTH_CONFIRM_RATIONALE,
+            sentinel_outcome="confirmed",
+            answered_outcome="confirmed",
+            persisted={"basis_lines": basis_lines},
+            rehydrate=_rehydrate,
+            decide=_decide,
+            open_message=lambda approver, wait: self._auth_door_open_message(
+                correlation_id, expected_approver=approver, wait_seconds=wait
+            ),
+            log_noun="auth-surface confirmation door",
+            on_close=_closed,
+        )
+        return answer.outcome
 
     @staticmethod
     async def _cancel_waiter(wait_task: "asyncio.Task[Any]", correlation_id: str) -> None:
@@ -2824,8 +3005,8 @@ class PlanningRunDriver:
                 correlation_id,
             )
 
-    def _auth_confirm_attempt(self, correlation_id: str) -> int:
-        """How many auth-confirmation doors this run has already opened.
+    def _door_attempt(self, correlation_id: str, stage_label: str) -> int:
+        """How many doors this run has already opened at ``stage_label``.
 
         Counts ``GATED`` rows ONLY: a ``reopened`` row is the SAME door
         re-emitted after a restart, never a new round, so it must not bump the
@@ -2835,25 +3016,26 @@ class PlanningRunDriver:
         return sum(
             1
             for event in self._deps.store.list_events(correlation_id)
-            if event["stage_label"] == _AUTH_CONFIRM_STAGE
-            and event["status"] == "GATED"
+            if event["stage_label"] == stage_label and event["status"] == "GATED"
         )
 
-    def _open_auth_door(self, correlation_id: str) -> dict[str, Any] | None:
+    def _open_door(
+        self, correlation_id: str, stage_label: str, details_key: str
+    ) -> dict[str, Any] | None:
         """The still-OPEN door's persisted details, or ``None`` if none is open.
 
-        The durable event log is this door's row of record (the checkpoint keeps
+        The durable event log is a door's row of record (the checkpoint keeps
         its pending id on the run row; a machine-chain leg keeps its own on its
-        leg events). A door is OPEN exactly when the LAST
-        :data:`_AUTH_CONFIRM_STAGE` event is an opening
-        (:data:`_AUTH_DOOR_OPEN_STATUSES`) — every verdict status closes it.
-        Callers re-emit the returned ``request_id`` / ``attempt_count``
-        VERBATIM; a row too corrupt to carry a ``request_id`` reads as no open
-        door (a fresh, answerable card beats a card nobody can identify).
+        leg events). A door is OPEN exactly when the LAST event for
+        ``stage_label`` is an opening (:data:`_AUTH_DOOR_OPEN_STATUSES`) — every
+        verdict status closes it. Callers re-emit the returned ``request_id`` /
+        ``attempt_count`` and the persisted card VERBATIM; a row too corrupt to
+        carry a ``request_id`` reads as no open door (a fresh, answerable card
+        beats a card nobody can identify).
         """
         latest: dict[str, Any] | None = None
         for event in self._deps.store.list_events(correlation_id):
-            if event["stage_label"] != _AUTH_CONFIRM_STAGE:
+            if event["stage_label"] != stage_label:
                 continue
             if event["status"] not in _AUTH_DOOR_OPEN_STATUSES:
                 latest = None  # a verdict — the door is closed
@@ -2863,49 +3045,56 @@ class PlanningRunDriver:
             except (json.JSONDecodeError, ValueError):
                 latest = None
                 continue
-            confirmation = details.get("auth_confirmation")
+            record = details.get(details_key)
             latest = (
-                dict(confirmation)
-                if isinstance(confirmation, Mapping) and confirmation.get("request_id")
+                dict(record)
+                if isinstance(record, Mapping) and record.get("request_id")
                 else None
             )
         return latest
 
-    def _record_auth_door_outcome(
+    def _record_door_outcome(
         self,
         correlation_id: str,
         *,
-        outcome: str,
-        request_id: str,
-        decided_by: str | None,
-        basis_lines: list[str],
-        decision: str | None = None,
+        stage_label: str,
+        details_key: str,
+        sentinel_outcome: str,
+        persisted: Mapping[str, Any],
+        answer: "_DoorAnswer",
     ) -> None:
-        """Write the door's durable verdict row.
+        """Write a door's durable verdict row.
 
-        ``confirmed`` records ``status="approved"`` — the idempotency sentinel
-        :meth:`_has_leg_event` reads. The other verdicts record their own
-        status so the audit log says WHICH way the door closed. None of these
-        statuses is ``checkpoint_cleared``, so the pure planner's history
-        projection is untouched (this is a machine-chain leg, not a Mode-P
-        checkpoint).
+        The caller's ``sentinel_outcome`` records ``status="approved"`` — the
+        idempotency sentinel :meth:`_has_leg_event` reads. Every other verdict
+        records its own status so the audit log says WHICH way the door closed.
+        None of these statuses is ``checkpoint_cleared``, so the pure planner's
+        history projection is untouched (these are machine-chain legs, not
+        Mode-P checkpoints).
+
+        The owner's own free-text NOTE is persisted whenever they left one. The
+        sign-in door used to discard it; one door means one behaviour, and a
+        note somebody took the trouble to write is not something to throw away.
         """
         self._deps.store._record_event(
             correlation_id=correlation_id,
-            stage_label=_AUTH_CONFIRM_STAGE,
-            status="approved" if outcome == "confirmed" else outcome,
-            actor_identity=decided_by or "planning-driver",
+            stage_label=stage_label,
+            status=(
+                "approved" if answer.outcome == sentinel_outcome else answer.outcome
+            ),
+            actor_identity=answer.decided_by or "planning-driver",
             details_json=json.dumps(
                 {
-                    "auth_confirmation": {
-                        "outcome": outcome,
-                        "request_id": request_id,
-                        "decided_by": decided_by,
-                        "basis_lines": basis_lines,
-                        # The literal wire answer, when the owner gave one that
-                        # decided nothing (a defer) — so the record says what
-                        # they actually tapped, never just "no answer".
-                        **({"decision": decision} if decision else {}),
+                    details_key: {
+                        "outcome": answer.outcome,
+                        "request_id": answer.request_id,
+                        "decided_by": answer.decided_by,
+                        **dict(persisted),
+                        # The literal wire answer, when the owner gave one — so
+                        # the record says what they actually tapped, never just
+                        # "no answer".
+                        **({"decision": answer.decision} if answer.decision else {}),
+                        **({"notes": answer.notes} if answer.notes else {}),
                     }
                 }
             ),
