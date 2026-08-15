@@ -40,6 +40,9 @@ from forge.planning.driver import PlanningRunDriver
 
 # The literal contract sets, transcribed from the two mode files above.
 _FEATURE_SPEC_REQUIRED = {"from_input"}
+#: The optional 007 args forge emits on a REWRITE round (machine chain stage 2):
+#: the owner's note on the spec digest, verbatim, and the prior artifact set.
+_FEATURE_SPEC_OPTIONAL_ON_WIRE = {"revision_of", "validate_feedback"}
 _FEATURE_PLAN_REQUIRED = {
     "feature_id",
     "spec_feature",
@@ -59,6 +62,34 @@ def test_feature_spec_wire_args_are_exactly_from_input() -> None:
     args = build_feature_spec_command_args(from_input="the approved input content")
     assert set(args) == _FEATURE_SPEC_REQUIRED
     assert args["from_input"] == "the approved input content"
+
+
+def test_feature_spec_revision_args_ride_only_on_a_rewrite() -> None:
+    """The two optional keys the mode declares — and forge now emits when, and
+    only when, the owner sent a note about the spec digest.
+
+    A first-round dispatch is byte-identical to the call that shipped (proven
+    above); a rewrite adds the note VERBATIM and the prior artifact set, and
+    nothing else. A field the mode's schema does not define is never invented.
+    """
+    args = build_feature_spec_command_args(
+        from_input="the approved input content",
+        revision_of={"version-endpoint.feature": "Feature: x\n"},
+        validate_feedback="the second example should be a 404, not a 400",
+    )
+    assert set(args) == _FEATURE_SPEC_REQUIRED | _FEATURE_SPEC_OPTIONAL_ON_WIRE
+    assert args["validate_feedback"] == (
+        "the second example should be a 404, not a 400"
+    )
+    assert args["revision_of"] == {"version-endpoint.feature": "Feature: x\n"}
+
+    # A blank note is not a note: it never reaches the wire.
+    assert set(
+        build_feature_spec_command_args(from_input="x", validate_feedback="   ")
+    ) == _FEATURE_SPEC_REQUIRED
+    assert set(
+        build_feature_spec_command_args(from_input="x", revision_of={})
+    ) == _FEATURE_SPEC_REQUIRED
 
 
 def test_feature_spec_required_mirror_matches_contract() -> None:
