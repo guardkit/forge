@@ -1207,3 +1207,19 @@ async def test_a_flagged_feature_is_never_thin_enough_to_skip(
 
     assert len(_digest_cards(h)) == 1
     assert "sign_in_check" in _digest_cards(h)[0].payload["details"]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_the_absorption_is_written_once_and_never_spins(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """If the row is already there and the chain still asks to pause, something
+    upstream is not reading it. Stop loudly rather than write it forever."""
+    _queue(store)
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+    assert h.driver._absorb_product_docs_checkpoint(CID) is True
+    assert h.driver._absorb_product_docs_checkpoint(CID) is False
+    assert (
+        len([s for s, _d in _events(store, "product_docs") if s == "checkpoint_cleared"])
+        == 1
+    )
