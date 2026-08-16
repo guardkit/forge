@@ -592,8 +592,13 @@ def _make_driver(
             return build_trigger_result
         return BuildTriggerResult(queued=True, build_id="build-1")
 
-    async def publish_notification(cid: str, message: str, level: str) -> None:
+    mentions: list[tuple[str, bool]] = []
+
+    async def publish_notification(
+        cid: str, message: str, level: str, *, mention: bool = True
+    ) -> None:
         notifications.append((cid, message, level))
+        mentions.append((message, mention))
 
     cfg = PlanningConfig(
         enabled=True,
@@ -634,6 +639,7 @@ def _make_driver(
         PlanningRunDriver(deps),
         {
             "notifications": notifications,
+            "mentions": mentions,
             "counters": counters,
             "git": deps.git_runner,
             "build_triggers": build_triggers,
@@ -2993,31 +2999,50 @@ def test_descriptor_degrades_shape_correctly_without_guardkit(
 
 
 # ---------------------------------------------------------------------------
-# THE STAMP NORMALIZER hook (Rich's condition 1, 2026-08-16)
+# THE STAMP NORMALIZER hook (Rich's condition 1, 2026-08-16; coordinator
+# review condition 5 the same day)
 #
 # ``guardkit qa normalize-stamps`` runs against the planning worktree
 # immediately BEFORE the plan-commit validate, so the rule-minted verifier
-# stamps are WRITTEN on the planning branch and ride the plan commit. Three
-# shapes: success writes + commits; refusal stops the run with a card naming
-# the titles verbatim; an older guardkit (no such subcommand) continues and is
-# receipted. Plus: forge declares ``feature_files:`` when the plan-writer
-# omitted it (the live 008 shape), and the not-wired path is receipted.
+# stamps are WRITTEN on the planning branch and ride the plan commit. Success
+# writes + commits; an older guardkit (no such subcommand) continues and is
+# receipted; forge declares ``feature_files:`` when the plan-writer omitted it
+# (the live 008 shape); the not-wired path is receipted.
+#
+# Condition 5: the STOP on partial / refused / failed is gated on the routing
+# law's ENFORCEMENT — feature-level ``routing_law:`` wins → repo
+# ``.guardkit/config.yaml`` → off. ENFORCED → the run stops with a card naming
+# the refused titles verbatim. NOT ENFORCED → the plan PROCEEDS: the decided
+# stamps already written ride the commit, every title is receipted, a WARNING
+# is logged, and the owner gets ONE plain un-@mentioned line in the thread. A
+# broken normalizer under NOT ENFORCED is an ERROR + receipt, never a stop.
+# The hook never writes ``routing_law`` anywhere (pinned).
 # ---------------------------------------------------------------------------
 
 from forge.planning.target_terminal_tools import StampNormalizerOutcome  # noqa: E402
 
 _STAMP_SPEC_REL = "features/stats-endpoint/stats-endpoint.feature"
+_MOON_TITLE = (
+    "The moon is made of a very particular kind of cheese that no rule family "
+    "in the design has ever heard about at all"
+)
+_UNDECIDABLE_TITLES = (_MOON_TITLE, "Another undecidable one")
 
 
 def _plan_yaml_rel(feature_id: str) -> str:
     return f".guardkit/features/{feature_id}.yaml"
 
 
-def _stamping_normalizer(counters_sink: dict[str, Any], *, outcome: Any = None):
+def _stamping_normalizer(
+    counters_sink: dict[str, Any], *, outcome: Any = None, write: bool = False
+):
     """A fake normalize_stamps collaborator that behaves like guardkit's: it
     WRITES ``scenarios:`` into the worktree's plan YAML (unless told to refuse /
     be unavailable) and reports what it did. Records call order + the YAML it
-    saw so the tests can prove ordering and the feature_files fill."""
+    saw so the tests can prove ordering and the feature_files fill. With
+    ``outcome`` + ``write=True`` it writes that outcome's ``stamped`` map first
+    (guardkit's PARTIAL law: decided stamps are on disk before the refusal is
+    reported)."""
 
     async def _normalize(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
         counters_sink.setdefault("order", []).append("normalize_stamps")
@@ -3025,6 +3050,12 @@ def _stamping_normalizer(counters_sink: dict[str, Any], *, outcome: Any = None):
         counters_sink["yaml_seen"] = yaml_path.read_text(encoding="utf-8") if yaml_path.is_file() else None
         counters_sink["worktree"] = str(worktree)
         if outcome is not None:
+            if write and outcome.stamped:
+                text = counters_sink["yaml_seen"] or ""
+                text += "scenarios:\n" + "".join(
+                    f'  "{t}":\n    verifier: "{v}"\n' for t, v in outcome.stamped.items()
+                )
+                yaml_path.write_text(text, encoding="utf-8")
             return outcome
         # guardkit's write_stamps shape: append the scenarios map.
         text = counters_sink["yaml_seen"] or ""
@@ -3034,9 +3065,63 @@ def _stamping_normalizer(counters_sink: dict[str, Any], *, outcome: Any = None):
             status="written",
             detail="1 scenario(s) stamped by rule, 0 already stamped (untouched)",
             stamped={"ok": "hurl"},
+            rules={"ok": "R9"},
         )
 
     return _normalize
+
+
+def _partial_outcome() -> StampNormalizerOutcome:
+    """The exit-3 shape: two decided (stamped + written), two refused."""
+    return StampNormalizerOutcome(
+        status="partial",
+        detail=(
+            "2 scenario(s) undecidable by rule — no fallback home, none invented; "
+            "2 scenario(s) stamped by rule and written, 0 already stamped (untouched)"
+        ),
+        refused_titles=_UNDECIDABLE_TITLES,
+        stamped={"Reading the current server time": "hurl", "ok": "probe:process"},
+        rules={"Reading the current server time": "R9", "ok": "R1"},
+        written=True,
+    )
+
+
+def _commit_repo_routing_law(repo: Path, value: str) -> None:
+    """``routing_law: <value>`` in the target repo's ``.guardkit/config.yaml``,
+    COMMITTED so the planning branch's worktree carries it (the same file and
+    key guardkit's plan-load half reads)."""
+    cfg = repo / ".guardkit" / "config.yaml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(f"toolchain:\n  test: pytest -q\nrouting_law: {value}\n", encoding="utf-8")
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", f"routing_law {value}"], cwd=repo, check=True, env=env)
+
+
+def _plan_result_with_feature_flag(value: str):
+    """A plan-writer YAML that carries its own ``routing_law:`` (the
+    feature-level escape hatch guardkit honours over the repo flag)."""
+
+    def _factory(feature_id: str) -> Any:
+        r = _plan_result_native(feature_id)
+        r.role_output[_plan_yaml_rel(feature_id)] = (
+            f"id: {feature_id}\nrouting_law: {value}\ntasks:\n- id: TASK-STAT-001\n"
+        )
+        return r
+
+    return _factory
+
+
+_UNENFORCED_LINE = (
+    "2 of 4 examples could not be given a verification home by rule —\n"
+    f"  - {_MOON_TITLE}\n"
+    "  - Another undecidable one\n"
+    "— the plan proceeds; this repo does not enforce the routing law yet"
+)
 
 
 def _share_order(sink: dict[str, Any], h: _Harness) -> None:
@@ -3096,7 +3181,12 @@ async def test_stamp_normalizer_success_writes_stamps_that_ride_the_plan_commit(
     assert rec["status"] == "written"
     assert rec["stamped"] == {"ok": "hurl"}
     assert rec["stamped_count"] == 1
+    assert rec["per_title"] == {"ok": "stamped by normalizer (rule R9): hurl"}
     assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
+    # condition 5: enforcement resolved + receipted (nothing set → off/default)
+    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "default"
+    assert rec["stops_the_run"] is False
+    assert "proceeded_unenforced" not in rec  # nothing to proceed past
     # (5) the owner line, plain words.
     plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
     assert plan_lines and "1 verifier stamp(s) minted by rule and committed with the plan" in plan_lines[0]
@@ -3106,18 +3196,16 @@ async def test_stamp_normalizer_success_writes_stamps_that_ride_the_plan_commit(
 async def test_stamp_normalizer_refusal_stops_the_run_with_the_titles_on_the_card(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
-    """Refusal (undecidable titles): the run STOPS at the plan leg, validate is
-    never reached, the plan is NOT committed, and the owner's card names every
-    refused title VERBATIM plus what to do."""
+    """ENFORCED (repo ``routing_law: enforced``) + refusal (undecidable titles,
+    an older all-or-nothing guardkit): the run STOPS at the plan leg, validate
+    is never reached, the plan is NOT committed, and the owner's card names
+    every refused title VERBATIM plus what to do."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
     _queue(store)
-    titles = (
-        "The moon is made of a very particular kind of cheese that no rule "
-        "family in the design has ever heard about at all",
-        "Another undecidable one",
-    )
+    titles = _UNDECIDABLE_TITLES
     refusal = StampNormalizerOutcome(
         status="refused",
         detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
@@ -3151,13 +3239,299 @@ async def test_stamp_normalizer_refusal_stops_the_run_with_the_titles_on_the_car
         assert f"  - {t}" in card
     assert "no rule to decide which verifier proves them" in card
     assert "nothing was stamped and nothing was built" in card
+    assert "This repo enforces the routing law" in card
     assert f".guardkit/features/{feature_id}.yaml" in card
     assert "toolchain, hurl, exam, probe:bus, probe:process, flutter, playwright, operator" in card
     assert "operator only for attended human work" in card
+    assert "R9" not in card and "rule R" not in card  # no rule ids on the face
     # the machine record keeps the internal reason + the titles.
     run = store.get_run(CID)
     assert "stamp normalizer refused" in (run["error"] or "")
     assert titles[1] in (run["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_enforced_partial_stops_with_the_titles_on_the_card(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ENFORCED + PARTIAL (exit 3: two decided + written, two refused): the run
+    STOPS, validate never runs, nothing reaches the branch (the worktree's
+    decided stamps die with the aborted commit), the card names the two
+    refused titles verbatim (no rule ids), the log says the law is enforced."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
+    )
+    _share_order(sink, h)
+    with caplog.at_level("WARNING", logger="forge.planning.driver"):
+        assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["validate"] == 0
+    assert h.ctx["counters"]["order"] == ["normalize_stamps"]
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).returncode != 0
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1
+    card = errors[0]
+    assert card.startswith(f"Planning run {CID} stopped at writing the task plan")
+    for t in _UNDECIDABLE_TITLES:
+        assert f"  - {t}" in card
+    assert "2 scenario(s) had no rule to decide which verifier proves them" in card
+    assert "This repo enforces the routing law" in card
+    assert "R1" not in card and "R9" not in card
+    # no plain "proceeds" line went out — the run stopped
+    assert not any("the plan proceeds" in m for _, m, _ in h.ctx["notifications"])
+    assert any(
+        r.levelname == "ERROR" and "IS enforced" in r.getMessage() for r in caplog.records
+    )
+    run = store.get_run(CID)
+    assert "stamp normalizer partial" in (run["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_not_enforced_partial_proceeds_with_receipt_and_one_plain_line(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """NOT ENFORCED (no flag anywhere) + PARTIAL: the plan PROCEEDS to validate
+    + commit + BUILD_QUEUED; the decided stamps the normalizer wrote are ON THE
+    BRANCH; the receipt names every refused title and every stamped title with
+    its rule; a WARNING is logged; ONE plain un-@mentioned line (exact text)
+    reaches the owner in the thread; the committed YAML carries no
+    ``routing_law:`` (the hook never writes it)."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
+    )
+    _share_order(sink, h)
+    with caplog.at_level("WARNING", logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # proceeded: normalizer, then validate, then the commit landed
+    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
+    assert committed.returncode == 0, committed.stderr
+    data = yaml.safe_load(committed.stdout)
+    # the DECIDED stamps ride the commit; the refused titles are absent (never invented)
+    assert data["scenarios"] == {
+        "Reading the current server time": {"verifier": "hurl"},
+        "ok": {"verifier": "probe:process"},
+    }
+    assert "routing_law" not in committed.stdout
+    assert "routing_law" not in data
+    # the receipt: status, enforcement, every title one line each
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "partial"
+    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "default"
+    assert rec["stops_the_run"] is False
+    assert rec["proceeded_unenforced"] is True
+    assert rec["refused_titles"] == list(_UNDECIDABLE_TITLES)
+    assert rec["per_title"] == {
+        "Reading the current server time": "stamped by normalizer (rule R9): hurl",
+        "ok": "stamped by normalizer (rule R1): probe:process",
+        _MOON_TITLE: "refused: no rule could decide a verification home",
+        "Another undecidable one": "refused: no rule could decide a verification home",
+    }
+    assert rec["rules"] == {"Reading the current server time": "R9", "ok": "R1"}
+    assert rec["owner_line"] == _UNENFORCED_LINE
+    assert rec["owner_line_sent"] == "sent"
+    # the WARNING
+    warns = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "PROCEEDS" in r.getMessage() and "Another undecidable one" in r.getMessage()
+        for r in warns
+    )
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+    # ONE plain line, exact text, un-@mentioned, level info (no prefix), in the thread
+    lines = [(m, lvl) for _, m, lvl in h.ctx["notifications"] if "the plan proceeds" in m]
+    assert lines == [(_UNENFORCED_LINE, "info")]
+    assert (_UNENFORCED_LINE, False) in h.ctx["mentions"]
+    # every OTHER line kept its mention
+    assert all(mention for m, mention in h.ctx["mentions"] if m != _UNENFORCED_LINE)
+    # no error card
+    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
+    # the plan-complete line's clause says what happened, in plain words
+    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
+    assert plan_lines and "2 verifier stamp(s) minted by rule and committed with the plan, 2 example(s) left without one (named above)" in plan_lines[0]
+    # the plain line went out BEFORE the plan-complete line
+    order = [m for _, m, _ in h.ctx["notifications"]]
+    assert order.index(_UNENFORCED_LINE) < order.index(plan_lines[0])
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_not_enforced_failed_proceeds_with_an_error_receipt(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """NOT ENFORCED + a cannot-run failure: a broken normalizer must not kill
+    an un-enforced chain — ERROR logged, receipted, the plan PROCEEDS
+    unstamped; no titles to name so no plain line, the plan-complete clause
+    says the stamps were not minted."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    failed = StampNormalizerOutcome(
+        status="failed",
+        detail="guardkit qa normalize-stamps could not run (exit 2): stamp normalizer: feature FEAT-X: `feature_files:` must be a list",
+    )
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=failed),
+    )
+    _share_order(sink, h)
+    with caplog.at_level("WARNING", logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
+    errs = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any(
+        "FAILED" in r.getMessage() and "must not kill an un-enforced chain" in r.getMessage()
+        for r in errs
+    )
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "failed"
+    assert rec["enforcement"] == "off"
+    assert rec["proceeded_unenforced"] is True
+    assert rec["owner_line"].startswith("no owner line: no refused titles to name")
+    assert "owner_line_sent" not in rec
+    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
+    assert not any("the plan proceeds" in m for _, m, _ in h.ctx["notifications"])
+    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
+    assert plan_lines and "verifier stamps NOT minted — the stamp normalizer could not run and this repo does not enforce the routing law yet" in plan_lines[0]
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
+    assert "scenarios:" not in committed and "routing_law" not in committed
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_feature_level_off_wins_over_repo_enforced(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The escape hatch: repo ``routing_law: enforced`` but the plan YAML says
+    ``routing_law: off`` (YAML 1.1 parses the bare token as False — absorbed)
+    → NOT enforced → a partial proceeds; the receipt names the source."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_with_feature_flag("off"),
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "feature"
+    assert rec["proceeded_unenforced"] is True
+    assert (_UNENFORCED_LINE, False) in h.ctx["mentions"]
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_feature_level_enforced_wins_over_a_silent_repo(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The other direction: no repo flag, the plan YAML says ``routing_law:
+    enforced`` → ENFORCED → a partial stops with the card."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_with_feature_flag("enforced"),
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1 and f"  - {_MOON_TITLE}" in errors[0]
+    assert h.ctx["counters"]["validate"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_unenforced_line_is_receipted_as_not_sent_without_a_notifier(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A composition with no notifier wired: the plan still proceeds and the
+    receipt says 'line not sent (no notifier)' — never a silent drop."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
+    )
+    h.driver._deps.publish_notification = None
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["owner_line"] == _UNENFORCED_LINE
+    assert rec["owner_line_sent"] == "line not sent (no notifier)"
+
+
+def test_the_hook_never_writes_routing_law_in_its_source() -> None:
+    """Static pin (condition 5): forge only READS ``routing_law`` — no string
+    the hook's writers could emit carries ``routing_law:``. Walks every
+    non-docstring string constant in the three modules that touch the plan
+    YAML / the config."""
+    import ast
+
+    from forge.pipeline import routing_stamps as rs
+    from forge.planning import target_terminal_tools as ttt
+
+    offenders: list[str] = []
+    for mod in (driver_module, ttt, rs):
+        src = Path(mod.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        docstrings: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                body = getattr(node, "body", [])
+                if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+                    docstrings.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                if "routing_law:" in node.value or "routing_law :" in node.value:
+                    offenders.append(f"{Path(mod.__file__).name}:{node.lineno}: {node.value[:60]!r}")
+    assert offenders == [], offenders
 
 
 @pytest.mark.asyncio
@@ -3215,10 +3589,11 @@ async def test_stamp_normalizer_unavailable_continues_and_is_receipted(
 async def test_stamp_normalizer_failure_stops_the_run_with_the_reason(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
-    """A cannot-run failure (not a refusal, not unavailable) is loud: the run
-    stops, validate never runs, the card names the reason."""
+    """ENFORCED + a cannot-run failure (not a refusal, not unavailable) is
+    loud: the run stops, validate never runs, the card names the reason."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
     _queue(store)
     failed = StampNormalizerOutcome(
@@ -3389,23 +3764,27 @@ async def test_live_plan_leg_commits_rule_minted_stamps_with_the_real_normalizer
     rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
     assert rec["status"] == "written"
     assert rec["stamped"] == {_LIVE_TITLE: "probe:process"}
+    assert rec["per_title"] == {_LIVE_TITLE: "stamped by normalizer (rule R1): probe:process"}
     assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
     assert rec["stamps_on_branch"] == 1
+    assert rec["enforcement"] == "off"
     assert h.ctx["counters"]["validate"] == 1
 
 
 @pytest.mark.asyncio
-async def test_live_plan_leg_refusal_card_names_the_real_normalizers_titles(
+async def test_live_plan_leg_enforced_refusal_card_names_the_real_normalizers_titles(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
-    """The default fixture feature ('Scenario: ok / Given a') is undecidable by
-    every rule — the REAL normalizer refuses, the run stops, the card names
-    'ok' verbatim, and no plan YAML reaches the branch."""
+    """ENFORCED repo: the default fixture feature ('Scenario: ok / Given a') is
+    undecidable by every rule — the REAL normalizer answers PARTIAL (exit 3,
+    nothing decided), the run stops, the card names 'ok' verbatim, and no
+    plan YAML reaches the branch."""
     from forge.planning.target_terminal_tools import make_normalize_stamps
 
     checkout, python = live_guardkit_or_skip(Path(__file__))
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
     _queue(store)
     h = _make_driver(
@@ -3424,3 +3803,50 @@ async def test_live_plan_leg_refusal_card_names_the_real_normalizers_titles(
     assert len(errors) == 1
     assert "  - ok\n" in errors[0]
     assert "1 scenario(s) had no rule to decide which verifier proves them" in errors[0]
+    assert "This repo enforces the routing law" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_live_plan_leg_not_enforced_partial_proceeds_with_the_real_normalizer(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """NOT ENFORCED (no flag): the same undecidable 'ok' through the REAL
+    normalizer (exit 3, nothing decided) — the plan PROCEEDS to BUILD_QUEUED,
+    the receipt names 'ok' as refused, the owner's plain line reads
+    '1 of 1 examples …', and the committed YAML carries forge's fill but no
+    ``scenarios:`` and no ``routing_law:``."""
+    from forge.planning.target_terminal_tools import make_normalize_stamps
+
+    checkout, python = live_guardkit_or_skip(Path(__file__))
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["validate"] == 1
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
+    assert committed.returncode == 0, committed.stderr
+    data = yaml.safe_load(committed.stdout)
+    assert data["feature_files"] == [_STAMP_SPEC_REL]
+    assert "scenarios" not in data and "routing_law" not in data
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "partial" and rec["refused_titles"] == ["ok"]
+    assert rec["enforcement"] == "off" and rec["proceeded_unenforced"] is True
+    expected_line = (
+        "1 of 1 examples could not be given a verification home by rule —\n"
+        "  - ok\n"
+        "— the plan proceeds; this repo does not enforce the routing law yet"
+    )
+    assert rec["owner_line"] == expected_line and rec["owner_line_sent"] == "sent"
+    assert (expected_line, False) in h.ctx["mentions"]
+    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
