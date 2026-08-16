@@ -1,0 +1,21 @@
+{
+  "feature_id": "FEAT-TIME",
+  "feature_yaml_path": ".guardkit/features/FEAT-TIME.yaml",
+  "feature_files": [
+    "features/time-endpoint/time-endpoint.feature"
+  ],
+  "stamped": {},
+  "test_refs": {},
+  "rules": {},
+  "reasons": {},
+  "refused": [
+    "The moon is made of a very particular kind of cheese that no rule family in the design has ever heard about at all",
+    "Another undecidable one"
+  ],
+  "already_stamped": [],
+  "operator_stamped": [],
+  "written": false,
+  "dry_run": false,
+  "repo_has_http_surface": true,
+  "http_surface_evidence": "qa/gates/registry.yaml gate 'hurl-twins'"
+}

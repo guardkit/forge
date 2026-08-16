@@ -1216,15 +1216,19 @@ def test_ts_dunder_tests_dir_is_a_root(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# THE STAMP NORMALIZER seam (Rich's condition 1, 2026-08-16)
+# THE STAMP NORMALIZER seam (Rich's condition 1, 2026-08-16; coordinator
+# condition 5 the same day — statuses written / nothing-to-do / partial /
+# refused / failed / unavailable / not-wired; the STOP is the driver's call on
+# enforcement, so the classifier only says ``is_failure``)
 #
 # ``guardkit qa normalize-stamps --feature <id> --repo <worktree>`` through the
 # frozen guardkit run seam; the classifier is exercised on the CLI's REAL
 # captured stdout shapes (tests/forge/planning/fixtures/stamp_normalizer/), the
 # clipped-tail and console-echo fallbacks, click's "No such command" (older
-# image), and the feature_files fill.
+# image), the exit-3 PARTIAL law, and the feature_files fill.
 # ---------------------------------------------------------------------------
 
+import dataclasses  # noqa: E402
 import shutil  # noqa: E402
 
 from forge.planning.target_terminal_tools import (  # noqa: E402
@@ -1266,7 +1270,7 @@ def test_classify_written_on_the_real_exit0_shape() -> None:
         stdout_tail=_fixture("written-stdout.txt"), stderr="",
     )
     assert out.status == "written"
-    assert not out.stops_the_run
+    assert not out.is_failure and not out.stops_the_run
     assert out.stamped == {
         "Reading the current server time": "hurl",
         "The time is fresh on every request": "hurl",
@@ -1286,7 +1290,7 @@ def test_classify_nothing_to_do_on_the_real_exit0_shape() -> None:
         stdout_tail=_fixture("nothing-to-do-stdout.txt"), stderr="",
     )
     assert out.status == "nothing-to-do"
-    assert not out.stops_the_run
+    assert not out.is_failure and not out.stops_the_run
     assert out.stamped == {}
     assert len(out.already_stamped) == 4
     assert "4 scenario(s) already stamped" in out.detail
@@ -1298,11 +1302,19 @@ def test_classify_refused_on_the_real_exit2_shape_names_titles_verbatim() -> Non
         stdout_tail=_fixture("refusal-stdout.txt"), stderr="",
     )
     assert out.status == "refused"
-    assert out.stops_the_run
+    assert out.is_failure
+    # the STOP is the driver's call on enforcement — unresolved is NOT a stop
+    assert not out.stops_the_run
+    assert dataclasses.replace(out, enforcement="enforced").stops_the_run
+    assert not dataclasses.replace(out, enforcement="off").stops_the_run
     assert out.refused_titles == (_MOON, "Another undecidable one")
     assert not out.titles_recovered_from_console_echo  # read from the JSON
     assert "2 scenario(s) undecidable by rule" in out.detail
     assert out.receipt()["refused_titles"] == [_MOON, "Another undecidable one"]
+    assert out.receipt()["per_title"] == {
+        _MOON: "refused: no rule could decide a verification home",
+        "Another undecidable one": "refused: no rule could decide a verification home",
+    }
 
 
 def test_classify_cannot_run_is_failed_with_the_reason() -> None:
@@ -1311,7 +1323,7 @@ def test_classify_cannot_run_is_failed_with_the_reason() -> None:
         stdout_tail=_fixture("not-found-stdout.txt"), stderr="",
     )
     assert out.status == "failed"
-    assert out.stops_the_run
+    assert out.is_failure and not out.stops_the_run  # enforcement decides
     assert out.refused_titles == ()
     assert "feature file not found" in out.detail
     assert "exit 2" in out.detail
@@ -1350,7 +1362,7 @@ def test_classify_timeout_is_failed_and_stops() -> None:
     out = classify_normalizer_result(
         "FEAT-X", status="timeout", exit_code=-1, stdout_tail="", stderr=""
     )
-    assert out.status == "failed" and out.stops_the_run
+    assert out.status == "failed" and out.is_failure
     assert "timed out" in out.detail
 
 
@@ -1359,9 +1371,123 @@ def test_classify_nonzero_without_any_readable_result_is_failed_with_streams() -
         "FEAT-X", status="failed", exit_code=1,
         stdout_tail="Traceback ...\nKeyError: 'boom'\n", stderr="warn\n",
     )
-    assert out.status == "failed" and out.stops_the_run
+    assert out.status == "failed" and out.is_failure
     assert "no readable result" in out.detail
     assert "KeyError: 'boom'" in out.detail and "warn" in out.detail
+
+
+# -- classify: the exit-3 PARTIAL law (guardkit a8e5bfa3) ----------------------
+
+
+def test_classify_partial_on_the_real_exit3_shape_names_titles_and_rules() -> None:
+    """Exit 3: every DECIDED stamp was written (``stamped`` + the ``rules``
+    per title), the undecidable titles are named verbatim, ``written`` true."""
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3,
+        stdout_tail=_fixture("partial-stdout.txt"), stderr=_fixture("partial-stderr.txt"),
+    )
+    assert out.status == "partial"
+    assert out.is_failure
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.stamped == {
+        "Reading the current server time": "hurl",
+        "The time is fresh on every request": "hurl",
+        "Write methods are rejected": "hurl",
+        "The endpoint is unaffected by database unavailability": "probe:process",
+    }
+    assert out.rules == {
+        "Reading the current server time": "R9",
+        "The time is fresh on every request": "R9",
+        "Write methods are rejected": "R9",
+        "The endpoint is unaffected by database unavailability": "R1",
+    }
+    assert out.written is True
+    assert not out.titles_recovered_from_console_echo  # the JSON was whole
+    assert out.total_scenarios == 6
+    assert "2 scenario(s) undecidable by rule" in out.detail
+    assert "4 scenario(s) stamped by rule and written" in out.detail
+    # the STOP is enforcement's call
+    assert not out.stops_the_run
+    assert dataclasses.replace(out, enforcement="enforced").stops_the_run
+    assert not dataclasses.replace(out, enforcement="off").stops_the_run
+    # the receipt: every title, one line each — refused by name, stamped by rule
+    rec = out.receipt()
+    assert rec["status"] == "partial" and rec["refused_count"] == 2
+    assert rec["rules"]["Write methods are rejected"] == "R9"
+    assert rec["per_title"] == {
+        "Reading the current server time": "stamped by normalizer (rule R9): hurl",
+        "The time is fresh on every request": "stamped by normalizer (rule R9): hurl",
+        "Write methods are rejected": "stamped by normalizer (rule R9): hurl",
+        "The endpoint is unaffected by database unavailability": "stamped by normalizer (rule R1): probe:process",
+        _MOON: "refused: no rule could decide a verification home",
+        "Another undecidable one": "refused: no rule could decide a verification home",
+    }
+    assert rec["written"] is True
+    assert "enforcement" not in rec  # not resolved by the classifier
+
+
+def test_classify_partial_with_nothing_decided() -> None:
+    """Exit 3 where EVERY title was undecidable: partial, nothing written,
+    titles named — the same shape the driver's default fixture feature yields
+    against the real normalizer."""
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3,
+        stdout_tail=_fixture("partial-none-stdout.txt"), stderr="",
+    )
+    assert out.status == "partial"
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.stamped == {} and out.rules == {}
+    assert out.written is False
+    assert out.total_scenarios == 2
+
+
+def test_classify_partial_reads_titles_from_the_stderr_echo_as_a_last_resort() -> None:
+    """The JSON on stdout was lost (clipped past its tail) but stderr's rich
+    ``! normalize-stamps PARTIAL:`` block survived, wrapped at 80 columns:
+    the titles are re-joined and the outcome SAYS they came from the echo."""
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3,
+        stdout_tail="", stderr=_fixture("partial-stderr.txt"),
+    )
+    assert out.status == "partial"
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.titles_recovered_from_console_echo
+    assert out.receipt()["titles_recovered_from_console_echo"] is True
+
+
+def test_classify_partial_with_a_clipped_head_reads_rules_and_refused_from_the_tail() -> None:
+    """The head of the exit-3 JSON was clipped INTO ``stamped`` — the
+    ``rules`` and ``refused`` blocks after it still read whole (partial),
+    the stamped map is lost (the driver reads the count back off disk)."""
+    text = _fixture("partial-stdout.txt")
+    clipped = text[text.index('"The time is fresh on every request": "hurl"') :]
+    payload = parse_normalizer_payload(clipped)
+    assert payload is not None and payload.get("partial") is True
+    assert payload["refused"] == [_MOON, "Another undecidable one"]
+    assert payload["rules"]["Write methods are rejected"] == "R9"
+    assert "stamped" not in payload  # its opening line was clipped away
+    assert payload["written"] is True
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail=clipped, stderr=""
+    )
+    assert out.status == "partial"
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.rules["Write methods are rejected"] == "R9"
+    assert not out.titles_recovered_from_console_echo
+
+
+def test_classify_partial_whose_titles_cannot_be_read_says_so() -> None:
+    """Exit 3 with NO readable list anywhere: still ``partial`` (the exit code
+    is guardkit's word), titles empty and ``titles_unreadable`` set — the
+    receipt says the list could not be read rather than inventing one."""
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail="garbage\n", stderr=""
+    )
+    assert out.status == "partial" and out.is_failure
+    assert out.refused_titles == ()
+    assert out.titles_unreadable
+    assert out.receipt()["titles_unreadable"] is True
+    assert "could not be read back" in out.detail
 
 
 # -- parse: whole JSON, clipped tail, console echo -----------------------------
@@ -1538,6 +1664,36 @@ async def test_make_normalize_stamps_unavailable_and_refused_and_raise(tmp_path:
     out = await make_normalize_stamps(run_fn=run_fn)(tmp_path, "FEAT-TIME")
     assert out.status == "refused" and out.refused_titles[1] == "Another undecidable one"
 
+
+@pytest.mark.asyncio
+async def test_make_normalize_stamps_partial_reads_the_written_count_back_off_the_branch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exit 3: the decided stamps are ON DISK (the normalizer wrote them) and
+    the seam reads the count back the same way it does for ``written``; the
+    log line is a WARNING naming the refused titles, not an error."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-TIME",
+        'id: FEAT-TIME\nfeature_files:\n  - f.feature\nscenarios:\n'
+        '  "Reading the current server time":\n    verifier: "hurl"\n'
+        '  "The time is fresh on every request":\n    verifier: "hurl"\n'
+        '  "Write methods are rejected":\n    verifier: "hurl"\n'
+        '  "The endpoint is unaffected by database unavailability":\n    verifier: "probe:process"\n',
+    )
+    run_fn, _ = _fake_run(
+        "failed", 3, tail=_fixture("partial-stdout.txt"), stderr=_fixture("partial-stderr.txt")
+    )
+    with caplog.at_level("WARNING", logger="forge.planning.target_terminal_tools"):
+        out = await make_normalize_stamps(run_fn=run_fn)(tmp_path, "FEAT-TIME")
+    assert out.status == "partial"
+    assert out.stamps_on_branch == 4
+    assert out.total_scenarios == 6
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "PARTIAL" in r.getMessage()]
+    assert warns and "Another undecidable one" in warns[0].getMessage()
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+
     async def _boom(**kwargs):
         raise RuntimeError("guardkit blew up")
 
@@ -1587,8 +1743,10 @@ async def test_live_guardkit_normalize_stamps_written_refused_and_not_found(tmp_
     out2 = await normalize(wt, "FEAT-TIME")
     assert out2.status == "nothing-to-do" and len(out2.already_stamped) == 4
 
-    # (3) refused — an undecidable scenario stops with the title verbatim,
-    #     nothing written (the earlier stamps stand, the new one is absent).
+    # (3) PARTIAL (guardkit a8e5bfa3) — an undecidable scenario is named
+    #     verbatim (exit 3), nothing invented for it (the earlier four stamps
+    #     stand, the new title is absent from the YAML), and the classifier
+    #     says partial / is_failure — the driver decides on enforcement.
     feat = wt / "features" / "time-endpoint" / "time-endpoint.feature"
     feat.write_text(
         feat.read_text(encoding="utf-8")
@@ -1596,10 +1754,29 @@ async def test_live_guardkit_normalize_stamps_written_refused_and_not_found(tmp_
         encoding="utf-8",
     )
     out3 = await normalize(wt, "FEAT-TIME")
-    assert out3.status == "refused", out3
+    assert out3.status == "partial", out3
+    assert out3.is_failure and not out3.stops_the_run
     assert out3.refused_titles == (_MOON,)
     assert not out3.titles_recovered_from_console_echo
+    assert len(out3.already_stamped) == 4 and out3.stamped == {}
+    assert out3.written is False and out3.stamps_on_branch == 4
+    assert out3.total_scenarios == 5
     assert _MOON not in yaml_path.read_text(encoding="utf-8")
+    # (3b) …and with the four hand stamps stripped again, the decided four are
+    #      WRITTEN alongside the refusal (written: true, rules per title).
+    yaml_path.write_text(_re.sub(r"scenarios:\n(?:  .*\n)+", "", yaml_path.read_text(encoding="utf-8")), encoding="utf-8")
+    out3b = await normalize(wt, "FEAT-TIME")
+    assert out3b.status == "partial" and out3b.written is True, out3b
+    assert out3b.refused_titles == (_MOON,)
+    assert set(out3b.stamped) == {
+        "Reading the current server time",
+        "The time is fresh on every request",
+        "Write methods are rejected",
+        "The endpoint is unaffected by database unavailability",
+    }
+    assert out3b.rules["The endpoint is unaffected by database unavailability"] == "R1"
+    assert out3b.stamps_on_branch == 4
+    assert 'verifier: "hurl"' in yaml_path.read_text(encoding="utf-8")
 
     # (4) cannot run — no such feature file.
     out4 = await normalize(wt, "FEAT-NOPE")

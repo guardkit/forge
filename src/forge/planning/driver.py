@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -391,8 +392,13 @@ _NON_ARTIFACT_KEYS = frozenset(
     }
 )
 
-PublishNotificationFn = Callable[[str, str, str], Awaitable[None]]
-"""``async (correlation_id, message, level) -> None`` — best-effort notify."""
+PublishNotificationFn = Callable[..., Awaitable[None]]
+"""``async (correlation_id, message, level) -> None`` — best-effort notify.
+
+A publisher MAY also accept ``mention: bool = True`` as a keyword; the driver
+passes ``mention=False`` (a plain line, no @mention — the stamp normalizer's
+un-enforced line) only to a publisher whose signature takes it, and the
+three-positional form otherwise."""
 
 ResourcePreflightFn = Callable[[], "ResourcePreflightResult"]
 """``() -> ResourcePreflightResult`` — a zero-arg pre-run resource check.
@@ -530,6 +536,20 @@ def _extract_assumptions(result: Any) -> list[dict[str, Any]]:
         if isinstance(breakdown, Mapping):
             raw = breakdown.get("assumptions")
     return normalize_assumptions(raw)
+
+
+def _accepts_keyword(fn: Any, name: str) -> bool:
+    """Whether calling ``fn(..., name=...)`` is accepted by its signature —
+    an explicit keyword parameter or a ``**kwargs`` catch-all. ``False`` when
+    the signature cannot be read (a builtin / C callable): the caller then
+    uses the positional form it always used."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 @dataclass
@@ -2661,6 +2681,11 @@ class PlanningRunDriver:
             # on the planning branch BEFORE validate — the normalizer runs
             # here, against the materialised worktree, so what it writes
             # rides the plan commit and validate reads the stamped YAML.
+            # Coordinator condition 5 (same day): the STOP is gated on the
+            # routing law's ENFORCEMENT for this repo/feature (feature-level
+            # flag → repo config → off). Not enforced, a partial / refused /
+            # failed normalizer never kills the plan — the decided stamps it
+            # wrote ride the commit, and everything is receipted below.
             stamps = await self._stamp_normalizer_step(
                 worktree, feature_id, spec_feature_paths
             )
@@ -2720,11 +2745,37 @@ class PlanningRunDriver:
 
         stamps = stamp_state.get("outcome")
         # The plan receipts carry the normalizer's outcome whichever way it
-        # went — written / nothing-to-do / unavailable / not-wired — so a
-        # plan committed WITHOUT stamps is never silent about it. (An
-        # idempotent RT-08 short-circuit that never ran the hook leaves the
-        # key absent, honestly.)
+        # went — written / nothing-to-do / partial / refused / failed /
+        # unavailable / not-wired — so a plan committed WITHOUT (all its)
+        # stamps is never silent about it. (An idempotent RT-08 short-circuit
+        # that never ran the hook leaves the key absent, honestly.)
         stamp_receipt = stamps.receipt() if stamps is not None else None
+        if stamps is not None and stamps.is_failure and not stamps.enforced:
+            # Coordinator condition 5: NOT ENFORCED → the plan PROCEEDED past
+            # a partial / refused / failed normalizer. The owner gets ONE
+            # plain, un-@mentioned line in the same thread naming every
+            # example that has no verification home (when there are titles
+            # to name); the receipt says whether it went out.
+            stamp_receipt = dict(stamp_receipt or {})
+            stamp_receipt["proceeded_unenforced"] = True
+            line = self._stamp_normalizer_unenforced_line(stamps)
+            if line is None:
+                stamp_receipt["owner_line"] = (
+                    "no owner line: no refused titles to name "
+                    f"(status {stamps.status}; see detail)"
+                )
+            else:
+                stamp_receipt["owner_line"] = line
+                sent = await self._notify(
+                    correlation_id, line, level="info", mention=False
+                )
+                stamp_receipt["owner_line_sent"] = (
+                    "sent"
+                    if sent == "sent"
+                    else "line not sent (no notifier)"
+                    if sent == "no-notifier"
+                    else "line not sent (publish failed)"
+                )
         details: dict[str, Any] = {
             "feature_id": feature_id,
             "slug": slug,
@@ -2776,13 +2827,25 @@ class PlanningRunDriver:
            key — api_test FEAT-F924);
         2. ``guardkit qa normalize-stamps --feature <id> --repo <worktree>``
            via the frozen guardkit seam. Written / nothing-to-do → proceed to
-           validate; refused / failed → the leg stops with a card;
-           unavailable (older guardkit, no such subcommand) → log
+           validate; unavailable (older guardkit, no such subcommand) → log
            ``normalizer unavailable`` and proceed, receipted; not wired →
-           proceed, receipted.
+           proceed, receipted. Partial / refused / failed → the routing
+           law's ENFORCEMENT for this repo/feature decides (coordinator
+           condition 5): ENFORCED → the leg stops with a card naming the
+           titles verbatim; NOT ENFORCED → the plan proceeds (the decided
+           stamps already written ride the commit), a WARNING (partial /
+           refused) or ERROR (failed) is logged here, and the caller
+           receipts every title and tells the owner in one plain line.
+
+        The enforcement is resolved AFTER the normalizer ran, from the
+        worktree: the feature YAML's own ``routing_law:`` wins, then the
+        repo's ``.guardkit/config.yaml``, else off — the same two places and
+        the same precedence guardkit's plan-load half reads. Forge only READS
+        the flag; it never writes ``routing_law`` (pinned by test).
 
         Never raises.
         """
+        from forge.pipeline.routing_stamps import resolve_routing_law
         from forge.planning.target_terminal_tools import (
             StampNormalizerOutcome,
             declare_feature_files_if_absent,
@@ -2807,20 +2870,45 @@ class PlanningRunDriver:
             # Coordinator condition 4: refuse LOUD, do not run the normalizer on
             # a plan whose feature_files: contradicts forge's own spec commit.
             logger.error("stamp normalizer hook: %s", fill.reason)
-            return StampNormalizerOutcome(status="refused", detail=fill.reason)
-        try:
-            outcome = await normalize(worktree, feature_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — collaborator boundary
-            logger.exception("stamp normalizer hook raised for %s", feature_id)
-            outcome = StampNormalizerOutcome(
-                status="failed",
-                detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
-            )
+            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
+        else:
+            try:
+                outcome = await normalize(worktree, feature_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — collaborator boundary
+                logger.exception("stamp normalizer hook raised for %s", feature_id)
+                outcome = StampNormalizerOutcome(
+                    status="failed",
+                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
+                )
         if fill.fired:
             outcome = dataclasses.replace(
                 outcome, feature_files_filled=tuple(fill.feature_files)
+            )
+        # Coordinator condition 5: the STOP is gated on enforcement.
+        try:
+            law = resolve_routing_law(worktree, feature_id)
+        except Exception as exc:  # noqa: BLE001 — a resolver defect is "off", said aloud
+            logger.warning(
+                "stamp normalizer hook: routing-law resolver raised %s: %s for %s "
+                "— enforcement read as off (the law is opt-in)",
+                type(exc).__name__,
+                exc,
+                feature_id,
+            )
+            outcome = dataclasses.replace(
+                outcome,
+                enforcement="off",
+                enforcement_source="default",
+                enforcement_detail=f"resolver raised {type(exc).__name__}: {exc}",
+            )
+        else:
+            outcome = dataclasses.replace(
+                outcome,
+                enforcement=law.enforcement,
+                enforcement_source=law.source,
+                enforcement_detail=law.detail,
             )
         if outcome.status == "unavailable":
             logger.warning(
@@ -2828,7 +2916,60 @@ class PlanningRunDriver:
                 feature_id,
                 outcome.detail,
             )
+        elif outcome.is_failure and not outcome.enforced:
+            if outcome.status == "failed":
+                logger.error(
+                    "stamp normalizer hook: %s FAILED for %s — %s; the routing law "
+                    "is NOT enforced here (%s), so the plan PROCEEDS unstamped "
+                    "(a broken normalizer must not kill an un-enforced chain)",
+                    outcome.status,
+                    feature_id,
+                    outcome.detail,
+                    outcome.enforcement_detail,
+                )
+            else:
+                logger.warning(
+                    "stamp normalizer hook: %s for %s — %s; refused titles: %s; the "
+                    "routing law is NOT enforced here (%s), so the plan PROCEEDS "
+                    "with the decided stamps written",
+                    outcome.status,
+                    feature_id,
+                    outcome.detail,
+                    list(outcome.refused_titles),
+                    outcome.enforcement_detail,
+                )
+        elif outcome.is_failure:
+            logger.error(
+                "stamp normalizer hook: %s for %s — %s; the routing law IS "
+                "enforced here (%s): the plan leg STOPS",
+                outcome.status,
+                feature_id,
+                outcome.detail,
+                outcome.enforcement_detail,
+            )
         return outcome
+
+    @staticmethod
+    def _stamp_normalizer_unenforced_line(
+        stamps: "StampNormalizerOutcome",
+    ) -> str | None:
+        """The ONE plain line the owner gets when the plan proceeded past a
+        partial / refused normalizer in a repo that does not enforce the
+        routing law — the refused titles named verbatim, one per line, no
+        rule ids, no @mention. ``None`` when there are no titles to name (a
+        cannot-run failure, or forge's own condition-4 refusal): those are
+        logged + receipted, and the plan-complete line carries the clause.
+        """
+        if not stamps.refused_titles:
+            return None
+        n = len(stamps.refused_titles)
+        m = stamps.total_scenarios
+        titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
+        return (
+            f"{n} of {m} examples could not be given a verification home by rule —\n"
+            f"{titles}\n"
+            "— the plan proceeds; this repo does not enforce the routing law yet"
+        )
 
     @staticmethod
     def _stamp_normalizer_clause(stamps: "StampNormalizerOutcome | None") -> str:
@@ -2845,19 +2986,46 @@ class PlanningRunDriver:
                 "; verifier stamps NOT minted — this guardkit predates the stamp "
                 "normalizer (rebake pending), so the plan is unstamped"
             )
+        if stamps.is_failure and not stamps.enforced:
+            k = len(stamps.refused_titles)
+            n = len(stamps.stamped) or (stamps.stamps_on_branch or 0)
+            if stamps.status == "partial" and k:
+                return (
+                    f"; {n} verifier stamp(s) minted by rule and committed with the "
+                    f"plan, {k} example(s) left without one (named above)"
+                )
+            if stamps.status == "partial":
+                return (
+                    f"; {n} verifier stamp(s) minted by rule and committed with the "
+                    "plan, some example(s) left without one (the normalizer's list "
+                    "could not be read back)"
+                )
+            if stamps.status == "refused" and k:
+                return (
+                    f"; verifier stamps NOT minted — {k} example(s) had no rule to "
+                    "decide a verifier (named above)"
+                )
+            return (
+                "; verifier stamps NOT minted — the stamp normalizer "
+                f"{'refused' if stamps.status == 'refused' else 'could not run'} "
+                "and this repo does not enforce the routing law yet"
+            )
         return ""
 
     @staticmethod
     def _stamp_normalizer_card(
         correlation_id: str, feature_id: str, stamps: "StampNormalizerOutcome"
     ) -> str:
-        """The owner's card when THE STAMP NORMALIZER stops the run.
+        """The owner's card when THE STAMP NORMALIZER stops the run — which
+        it does ONLY where the routing law is enforced for the repo/feature
+        (coordinator condition 5).
 
         Names every refused title VERBATIM (the rule could not decide which
-        verifier proves it and there is no fallback home), says nothing was
-        stamped and nothing was built, and says what a person does next — in
-        plain words, the vocabulary named once. A cannot-run failure names the
-        reason instead.
+        verifier proves it and there is no fallback home; partial and refused
+        alike — no rule ids on the face), says nothing was stamped on the
+        branch and nothing was built, says the repo enforces the law, and
+        says what a person does next — in plain words, the vocabulary named
+        once. A cannot-run failure names the reason instead.
         """
         from forge.pipeline.routing_stamps import VERIFIER_HOMES
 
@@ -2865,7 +3033,7 @@ class PlanningRunDriver:
             f"Planning run {correlation_id} stopped at "
             f"{plain_stage_name(_FEATURE_PLAN_STAGE)}"
         )
-        if stamps.status == "refused" and stamps.refused_titles:
+        if stamps.status in ("refused", "partial") and stamps.refused_titles:
             titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
             n = len(stamps.refused_titles)
             recovered = (
@@ -2880,6 +3048,8 @@ class PlanningRunDriver:
                 f"which verifier proves them, and there is no fallback home, so "
                 f"nothing was stamped and nothing was built{recovered}:\n"
                 f"{titles}\n"
+                f"This repo enforces the routing law: every scenario needs a "
+                f"verifier before its plan can be committed. "
                 f"What to do: give each of these scenarios a verifier by hand in "
                 f".guardkit/features/{feature_id}.yaml under scenarios: — one of "
                 f"{', '.join(VERIFIER_HOMES)} (operator only for attended human "
@@ -2887,8 +3057,8 @@ class PlanningRunDriver:
             )
         return (
             f"{head}: the verifier-stamp normalizer could not run for feature "
-            f"{feature_id}, so the plan was not stamped and nothing was built. "
-            f"Reason: {stamps.detail}"
+            f"{feature_id}, so the plan was not stamped and nothing was built "
+            f"(this repo enforces the routing law). Reason: {stamps.detail}"
         )
 
     async def _build_trigger_leg(self, row: Any, correlation_id: str) -> bool:
@@ -5148,16 +5318,42 @@ class PlanningRunDriver:
             )
 
     async def _notify(
-        self, correlation_id: str, message: str, *, level: str = "info"
-    ) -> None:
-        """Best-effort originator notification (DDR-007)."""
+        self,
+        correlation_id: str,
+        message: str,
+        *,
+        level: str = "info",
+        mention: bool = True,
+    ) -> str:
+        """Best-effort originator notification (DDR-007).
+
+        Returns ``"sent"`` / ``"no-notifier"`` / ``"failed"`` so a caller
+        that must RECEIPT whether a line went out can (the stamp normalizer's
+        un-enforced line). ``mention=False`` asks the notifier for a plain
+        line with no @mention (the composition's publisher accepts a
+        ``mention`` keyword and drops ``target_user``); a publisher that
+        does not take the keyword still gets the line, mentioned, and that is
+        logged rather than the line being dropped.
+        """
         publish = self._deps.publish_notification
         if publish is None:
-            return
+            return "no-notifier"
         try:
-            await publish(correlation_id, message, level)
+            if mention or not _accepts_keyword(publish, "mention"):
+                if not mention:
+                    logger.warning(
+                        "planning driver: notifier for %s takes no `mention` "
+                        "keyword — the plain line goes out with the notifier's "
+                        "default audience",
+                        correlation_id,
+                    )
+                await publish(correlation_id, message, level)
+            else:
+                await publish(correlation_id, message, level, mention=False)
         except Exception:  # noqa: BLE001 — notifications never block the chain
             logger.warning(
                 "planning driver: notification publish failed for %s (best-effort)",
                 correlation_id,
             )
+            return "failed"
+        return "sent"

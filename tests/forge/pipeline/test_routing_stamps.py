@@ -17,10 +17,14 @@ from typing import Any
 import pytest
 
 from forge.pipeline.routing_stamps import (
+    CONFIG_RELATIVE_PATH,
     HISTORY_RELATIVE_PATH,
     HOME_GATE_IDS,
+    ROUTING_LAW_KEY,
+    ROUTING_LAW_VALUES,
     VERIFIER_HOMES,
     Envelope,
+    RoutingLawResolution,
     ScenarioStamp,
     StampsRead,
     StampsStatus,
@@ -28,7 +32,10 @@ from forge.pipeline.routing_stamps import (
     make_stamps_leg,
     read_last_code_commit_time,
     read_newest_envelope,
+    read_repo_routing_law,
     read_scenario_stamps,
+    resolve_routing_law,
+    resolve_routing_law_enforcement,
 )
 
 T0 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -101,6 +108,120 @@ class TestTheClosedList:
             reason="guardkit is not installed in this interpreter (forge has no dependency on it)",
         )
         assert tuple(guardkit_stamp.VERIFIER_HOMES) == VERIFIER_HOMES
+        # the enforcement flag's mirror too (condition 5): same file, same key,
+        # same closed values as guardkit's plan-load half
+        assert Path(guardkit_stamp.CONFIG_RELATIVE_PATH) == CONFIG_RELATIVE_PATH
+        assert guardkit_stamp.ROUTING_LAW_KEY == ROUTING_LAW_KEY
+        assert tuple(guardkit_stamp.ROUTING_LAW_VALUES) == ROUTING_LAW_VALUES
+
+    def test_the_flag_mirror_is_guardkits_by_value(self) -> None:
+        assert CONFIG_RELATIVE_PATH == Path(".guardkit") / "config.yaml"
+        assert ROUTING_LAW_KEY == "routing_law"
+        assert ROUTING_LAW_VALUES == ("enforced", "off")
+
+
+# ---------------------------------------------------------------------------
+# The routing law's ENFORCEMENT resolver (coordinator condition 5, 08-16):
+# feature-level flag wins → repo .guardkit/config.yaml → off. Forge only READS.
+# ---------------------------------------------------------------------------
+
+
+def _write(root: Path, rel: str, text: str) -> Path:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+class TestResolveRoutingLaw:
+    def test_absent_everywhere_is_off_by_default(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\ntasks: []\n")
+        res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res == RoutingLawResolution(
+            enforcement="off",
+            source="default",
+            detail=res.detail,
+        )
+        assert not res.enforced and not res.invalid
+        assert "does not enforce the routing law yet" in res.detail
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "off"
+
+    def test_no_feature_yaml_and_no_config_is_off(self, tmp_path: Path) -> None:
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-NOPE") == "off"
+
+    def test_repo_enforced_is_honoured(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/config.yaml", "toolchain:\n  test: pytest\nrouting_law: enforced\n")
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\n")
+        res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res.enforcement == "enforced" and res.source == "repo" and res.enforced
+        assert ".guardkit/config.yaml says so" in res.detail
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "enforced"
+
+    def test_repo_off_is_off(self, tmp_path: Path) -> None:
+        # YAML 1.1: the bare token `off` parses as False — absorbed, read as "off"
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: off\n")
+        assert read_repo_routing_law(tmp_path) == ("off", False)
+        res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res.enforcement == "off" and res.source == "repo"
+
+    def test_feature_level_off_wins_over_repo_enforced(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: enforced\n")
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\nrouting_law: off\n")
+        res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res.enforcement == "off" and res.source == "feature"
+        assert "wins over the repo flag" in res.detail
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "off"
+
+    def test_feature_level_enforced_wins_over_repo_off_and_over_silence(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: off\n")
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\nrouting_law: enforced\n")
+        assert resolve_routing_law(tmp_path, "FEAT-X").source == "feature"
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "enforced"
+        (tmp_path / ".guardkit" / "config.yaml").unlink()
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "enforced"
+
+    def test_yml_suffix_is_read_too(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/features/FEAT-X.yml", "id: FEAT-X\nrouting_law: enforced\n")
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "enforced"
+
+    def test_an_invalid_present_value_is_read_as_enforced_never_silently_off(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # guardkit RAISES on these at plan load; forge reads them as ENFORCED and
+        # says so — a typo'd law flag must never un-enforce the law silently.
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: enforce\n")
+        with caplog.at_level("WARNING", logger="forge.pipeline.routing_stamps"):
+            res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res.enforcement == "enforced" and res.source == "repo" and res.invalid
+        assert "never as silently off" in res.detail
+        assert any("invalid" in r.getMessage() for r in caplog.records)
+        # the YAML boolean trap the other way (`on`/`true`/`yes` → True)
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\nrouting_law: on\n")
+        res2 = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res2.enforcement == "enforced" and res2.source == "feature" and res2.invalid
+
+    def test_an_unreadable_config_is_unset_never_a_crash(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: [unclosed\n")
+        assert read_repo_routing_law(tmp_path) == (None, False)
+        _write(tmp_path, ".guardkit/config.yaml", "- not\n- a mapping\n")
+        assert read_repo_routing_law(tmp_path) == (None, False)
+        assert resolve_routing_law_enforcement(tmp_path, "FEAT-X") == "off"
+
+    def test_an_unparseable_feature_yaml_falls_through_to_the_repo(self, tmp_path: Path) -> None:
+        _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "routing_law: [unclosed\n")
+        _write(tmp_path, ".guardkit/config.yaml", "routing_law: enforced\n")
+        res = resolve_routing_law(tmp_path, "FEAT-X")
+        assert res.enforcement == "enforced" and res.source == "repo"
+
+    def test_the_resolver_never_writes(self, tmp_path: Path) -> None:
+        cfg = _write(tmp_path, ".guardkit/config.yaml", "toolchain:\n  test: pytest\n")
+        feat = _write(tmp_path, ".guardkit/features/FEAT-X.yaml", "id: FEAT-X\n")
+        before = (cfg.read_bytes(), feat.read_bytes(), sorted(p.name for p in tmp_path.rglob("*")))
+        resolve_routing_law(tmp_path, "FEAT-X")
+        resolve_routing_law_enforcement(tmp_path, "FEAT-X")
+        after = (cfg.read_bytes(), feat.read_bytes(), sorted(p.name for p in tmp_path.rglob("*")))
+        assert before == after
+        assert b"routing_law" not in cfg.read_bytes() and b"routing_law" not in feat.read_bytes()
 
 
 # ---------------------------------------------------------------------------

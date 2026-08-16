@@ -1,0 +1,36 @@
+{
+  "feature_id": "FEAT-TIME",
+  "feature_yaml_path": ".guardkit/features/FEAT-TIME.yaml",
+  "feature_files": [
+    "features/time-endpoint/time-endpoint.feature"
+  ],
+  "stamped": {
+    "Reading the current server time": "hurl",
+    "The time is fresh on every request": "hurl",
+    "Write methods are rejected": "hurl",
+    "The endpoint is unaffected by database unavailability": "probe:process"
+  },
+  "test_refs": {},
+  "rules": {
+    "Reading the current server time": "R9",
+    "The time is fresh on every request": "R9",
+    "Write methods are rejected": "R9",
+    "The endpoint is unaffected by database unavailability": "R1"
+  },
+  "reasons": {
+    "Reading the current server time": "R9 hurl: get request to (qa/gates/registry.yaml gate 'hurl-twins')",
+    "The time is fresh on every request": "R9 hurl: get requests to (qa/gates/registry.yaml gate 'hurl-twins')",
+    "Write methods are rejected": "R9 hurl: post request to (qa/gates/registry.yaml gate 'hurl-twins')",
+    "The endpoint is unaffected by database unavailability": "R1 probe:process: database is unavailable"
+  },
+  "refused": [
+    "The moon is made of a very particular kind of cheese that no rule family in the design has ever heard about at all",
+    "Another undecidable one"
+  ],
+  "already_stamped": [],
+  "operator_stamped": [],
+  "written": true,
+  "dry_run": false,
+  "repo_has_http_surface": true,
+  "http_surface_evidence": "qa/gates/registry.yaml gate 'hurl-twins'"
+}

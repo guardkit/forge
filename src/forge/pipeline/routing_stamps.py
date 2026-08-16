@@ -70,6 +70,15 @@ reads the feature YAML with the stdlib + PyYAML and mirrors the closed
 vocabulary as a constant. If guardkit's list ever changes, the mirror is a
 one-line change and the loud UNREADABLE path (an unknown home) catches the
 gap in the meantime rather than passing it.
+
+The routing law's ENFORCEMENT (coordinator condition 5, 2026-08-16)
+-------------------------------------------------------------------
+:func:`resolve_routing_law` / :func:`resolve_routing_law_enforcement` read
+the SAME opt-in flag guardkit's plan-load half reads — the feature YAML's own
+``routing_law:`` wins, then the repo's ``.guardkit/config.yaml``, else off —
+so forge's plan-commit hook (THE STAMP NORMALIZER) stops a run over an
+undecidable stamp only where the law is actually flipped on. Forge only
+READS the flag; nothing in forge writes ``routing_law`` anywhere.
 """
 
 from __future__ import annotations
@@ -92,7 +101,14 @@ __all__ = [
     "HOME_GATE_IDS",
     "HISTORY_RELATIVE_PATH",
     "FEATURES_RELATIVE_PATH",
+    "CONFIG_RELATIVE_PATH",
+    "ROUTING_LAW_KEY",
+    "ROUTING_LAW_VALUES",
     "RECEIPT_ONLY_PATHS",
+    "RoutingLawResolution",
+    "read_repo_routing_law",
+    "resolve_routing_law",
+    "resolve_routing_law_enforcement",
     "ScenarioStamp",
     "StampsRead",
     "Envelope",
@@ -141,6 +157,15 @@ HISTORY_RELATIVE_PATH: Path = Path("qa") / "gates" / "history"
 
 #: Where guardkit keeps the feature YAML (``FeatureLoader.FEATURES_DIR``).
 FEATURES_RELATIVE_PATH: Path = Path(".guardkit") / "features"
+
+#: The per-repo routing-law flag lives in the same file as the ``toolchain:``
+#: declaration — a MIRROR of ``guardkit.orchestrator.verifier_stamp
+#: .CONFIG_RELATIVE_PATH`` / ``ROUTING_LAW_KEY`` / ``ROUTING_LAW_VALUES``
+#: (checked against the original by the same guardkit-importable test as
+#: ``VERIFIER_HOMES``).
+CONFIG_RELATIVE_PATH: Path = Path(".guardkit") / "config.yaml"
+ROUTING_LAW_KEY: str = "routing_law"
+ROUTING_LAW_VALUES: tuple[str, ...] = ("enforced", "off")
 
 #: Paths a commit may touch and still NOT count as a code change for the
 #: freshness rule (module docstring, "Freshness").
@@ -274,6 +299,179 @@ def read_scenario_stamps(feature_yaml_path: "Path | str") -> StampsRead:
     return StampsRead(
         path=path, present=True, stamps=tuple(stamps), routing_law=routing_law
     )
+
+
+# ---------------------------------------------------------------------------
+# The routing law's ENFORCEMENT (coordinator review condition 5, 2026-08-16)
+# ---------------------------------------------------------------------------
+#
+# Guardkit's plan-load half is OPT-IN (``verifier_stamp.py``, "The opt-in
+# flag"): the law bites only where a repo says ``routing_law: enforced`` in
+# ``.guardkit/config.yaml``, and a feature YAML's own ``routing_law:`` WINS
+# over the repo flag (the escape hatch). Forge's plan-commit hook (THE STAMP
+# NORMALIZER, ``forge.planning.driver``) reads the SAME two places with the
+# SAME precedence, so that a repo the law is not flipped on never has its
+# plans killed at plan-commit over an undecidable stamp — that would be
+# enforcement through the back door. Forge only READS the flag; nothing in
+# forge ever writes ``routing_law`` anywhere (pinned by test).
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingLawResolution:
+    """Where the routing law's enforcement for one feature came from.
+
+    ``enforcement`` — ``"enforced"`` or ``"off"``. ``source`` — ``"feature"``
+    (the feature YAML's own flag), ``"repo"`` (``.guardkit/config.yaml``), or
+    ``"default"`` (neither says anything → off). ``detail`` — the plain
+    sentence a receipt carries. ``invalid`` — a PRESENT flag with a value
+    outside the closed list (guardkit's plan load will reject it); forge
+    reads that as ENFORCED, never as silently off, and says so.
+    """
+
+    enforcement: str
+    source: str
+    detail: str
+    invalid: bool = False
+
+    @property
+    def enforced(self) -> bool:
+        return self.enforcement == "enforced"
+
+
+def _normalize_routing_law(raw: Any) -> "tuple[str | None, bool]":
+    """``(value, invalid)`` — mirrors guardkit's ``normalize_routing_law_flag``
+    without raising: ``None`` → absent; ``False`` (YAML 1.1 ``off``) →
+    ``"off"``; ``"enforced"``/``"off"`` → themselves; anything else (``True``
+    from ``on``/``yes``, a typo like ``enforce``) → ``("enforced", True)``
+    because a law flag must never be silently mis-read as off."""
+    if raw is None:
+        return None, False
+    if raw is False:
+        return "off", False
+    if isinstance(raw, str) and raw.strip() in ROUTING_LAW_VALUES:
+        return raw.strip(), False
+    return "enforced", True
+
+
+def read_repo_routing_law(repo_root: "Path | str") -> "tuple[str | None, bool]":
+    """``(value, invalid)`` from ``<repo_root>/.guardkit/config.yaml``'s
+    top-level ``routing_law:``; ``(None, False)`` when the file, the key, or a
+    readable mapping is absent (guardkit's ``load_repo_routing_law`` posture
+    for file-level rot: warn, treat as unset)."""
+    config_path = Path(repo_root) / CONFIG_RELATIVE_PATH
+    if not config_path.is_file():
+        return None, False
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — a broken config never crashes the hook
+        logger.warning(
+            "routing law: %s could not be read (%s: %s) — repo flag treated as unset",
+            config_path,
+            type(exc).__name__,
+            exc,
+        )
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    return _normalize_routing_law(data.get(ROUTING_LAW_KEY))
+
+
+def resolve_routing_law(worktree: "Path | str", feature_id: str) -> RoutingLawResolution:
+    """Feature-level ``routing_law:`` wins → repo ``.guardkit/config.yaml`` →
+    ``off``. Reads ``<worktree>/.guardkit/features/<feature_id>.yaml`` with
+    :func:`read_scenario_stamps` (which already absorbs the YAML ``off`` →
+    ``False`` trap) and the repo flag with :func:`read_repo_routing_law`.
+    Never raises; a flag forge cannot read is a flag that is not set.
+    """
+    root = Path(worktree)
+    feature_yaml = _feature_yaml_path(root, feature_id)
+    feature_flag: str | None = None
+    feature_invalid = False
+    try:
+        read = read_scenario_stamps(feature_yaml)
+    except Exception as exc:  # noqa: BLE001 — a reader defect is "unset", said aloud
+        logger.warning(
+            "routing law: reading %s raised %s: %s — feature-level flag treated as unset",
+            feature_yaml,
+            type(exc).__name__,
+            exc,
+        )
+        read = None
+    if read is not None and read.present and read.routing_law is not None:
+        feature_flag, feature_invalid = _normalize_routing_law(read.routing_law)
+    if feature_flag is not None:
+        if feature_invalid:
+            logger.warning(
+                "routing law: %s carries an invalid `%s:` value (%r) — read as "
+                "ENFORCED, never as silently off (guardkit's plan load will "
+                "reject it; the values are %s)",
+                feature_yaml,
+                ROUTING_LAW_KEY,
+                read.routing_law if read is not None else None,
+                " / ".join(ROUTING_LAW_VALUES),
+            )
+            return RoutingLawResolution(
+                enforcement="enforced",
+                source="feature",
+                detail=(
+                    f"routing law {ROUTING_LAW_KEY}: in the feature YAML is "
+                    f"{read.routing_law!r}, not one of "
+                    f"{' / '.join(ROUTING_LAW_VALUES)} — read as enforced, "
+                    "never as silently off"
+                ),
+                invalid=True,
+            )
+        return RoutingLawResolution(
+            enforcement=feature_flag,
+            source="feature",
+            detail=(
+                f"routing law {feature_flag}: the feature YAML "
+                f"({feature_yaml.name}) says so, which wins over the repo flag"
+            ),
+        )
+    repo_flag, repo_invalid = read_repo_routing_law(root)
+    if repo_flag is not None:
+        if repo_invalid:
+            logger.warning(
+                "routing law: %s carries an invalid `%s:` value — read as "
+                "ENFORCED, never as silently off (the values are %s)",
+                root / CONFIG_RELATIVE_PATH,
+                ROUTING_LAW_KEY,
+                " / ".join(ROUTING_LAW_VALUES),
+            )
+            return RoutingLawResolution(
+                enforcement="enforced",
+                source="repo",
+                detail=(
+                    f"routing law {ROUTING_LAW_KEY}: in "
+                    f"{CONFIG_RELATIVE_PATH.as_posix()} is not one of "
+                    f"{' / '.join(ROUTING_LAW_VALUES)} — read as enforced, "
+                    "never as silently off"
+                ),
+                invalid=True,
+            )
+        return RoutingLawResolution(
+            enforcement=repo_flag,
+            source="repo",
+            detail=(
+                f"routing law {repo_flag}: {CONFIG_RELATIVE_PATH.as_posix()} "
+                "says so (no feature-level flag)"
+            ),
+        )
+    return RoutingLawResolution(
+        enforcement="off",
+        source="default",
+        detail=(
+            f"routing law off: neither the feature YAML nor "
+            f"{CONFIG_RELATIVE_PATH.as_posix()} carries a {ROUTING_LAW_KEY}: "
+            "flag (this repo does not enforce the routing law yet)"
+        ),
+    )
+
+
+def resolve_routing_law_enforcement(worktree: "Path | str", feature_id: str) -> str:
+    """``"enforced"`` | ``"off"`` — the string form of :func:`resolve_routing_law`."""
+    return resolve_routing_law(worktree, feature_id).enforcement
 
 
 # ---------------------------------------------------------------------------
