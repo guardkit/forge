@@ -25,20 +25,29 @@ Design
   ships (``installer/core/commands/lib/feature_spec_normalize.py``); the exact
   interpreter/module path binds at Lane A / B4 and is a config knob here.
 
+Since 2026-08-16 a third seam sits between the two: THE STAMP NORMALIZER
+(``guardkit qa normalize-stamps``, Rich's condition 1) runs against the plan
+tree immediately BEFORE ``feature validate`` so the rule-minted ``verifier:``
+stamps are WRITTEN on the planning branch and ride the plan commit — see
+:func:`make_normalize_stamps` / :func:`classify_normalizer_result`.
+
 References: post-factory-2-three-lanes-handoff §3 B2; factory-2 record hops 6-7;
-sovereign-planning-loop-scope §4 (guardkit ``feature validate`` = the oracle).
+sovereign-planning-loop-scope §4 (guardkit ``feature validate`` = the oracle);
+ai-transition/docs/routing-law-stamp-normalizer-rules-2026-08-15.md (R1–R10).
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib
 import importlib.util
 import logging
+import json
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +58,16 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "NORMALIZER_MODULE_CANDIDATES",
     "TEST_ROOT_DISCOVERY_MODULE_CANDIDATES",
+    "NORMALIZER_EXIT_PARTIAL",
     "NormalizeFeatureSpecFn",
+    "NormalizeStampsFn",
     "NormalizerModuleUnresolved",
+    "StampNormalizerOutcome",
+    "FeatureFilesFill",
+    "classify_normalizer_result",
+    "declare_feature_files_if_absent",
+    "make_normalize_stamps",
+    "parse_normalizer_payload",
     "TargetTestRootsUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
@@ -550,6 +567,13 @@ NormalizeFeatureSpecFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 #: ``async (worktree_path, feature_id) -> ToolOutcome`` — run
 #: ``guardkit feature validate <feature_id>`` against the worktree.
 ValidateFeaturePlanFn = Callable[[Path, str], Awaitable[ToolOutcome]]
+
+#: ``async (worktree_path, feature_id) -> StampNormalizerOutcome`` — run THE
+#: STAMP NORMALIZER (``guardkit qa normalize-stamps --feature <id> --repo
+#: <worktree>``) against the planning worktree, immediately BEFORE the
+#: plan-commit ``feature validate`` (Rich's condition 1, 2026-08-16: the
+#: ``verifier:`` stamps are WRITTEN on the planning branch before validate).
+NormalizeStampsFn = Callable[[Path, str], Awaitable["StampNormalizerOutcome"]]
 
 #: ``async (worktree_path, bar_rel_path) -> ToolOutcome`` — run
 #: ``guardkit qa validate pass-bar <bar_rel_path>`` against the worktree. The
@@ -1215,6 +1239,656 @@ def make_validate_gate_registry(
         )
 
     return _validate
+
+
+# ---------------------------------------------------------------------------
+# THE STAMP NORMALIZER hook (Rich's condition 1, 2026-08-16; coordinator
+# review condition 5 the same day)
+#
+# guardkit-side seam: ``guardkit qa normalize-stamps --feature FEAT-X --repo
+# <path>`` (guardkit/orchestrator/stamp_normalizer.py + cli/qa.py, the
+# PARTIAL-WRITE law @ a8e5bfa3). It mints ``verifier:`` stamps by RULE
+# (R1–R10) from the parsed .feature and WRITES every DECIDED stamp into
+# ``.guardkit/features/<id>.yaml``'s ``scenarios:`` map — only titles lacking
+# a stamp, never overwriting — and RETURNS the undecidable titles BY NAME in
+# the JSON ``refused`` list. It never decides stop-vs-proceed; the caller
+# (forge's plan leg) does, on the routing law's ENFORCEMENT for that repo /
+# feature (``forge.pipeline.routing_stamps.resolve_routing_law``). Forge
+# invokes it through the SAME frozen ``forge.adapters.guardkit.run`` seam the
+# validate oracles ride, with cwd = the planning worktree, so what it writes
+# rides the plan commit (``commit_all`` = ``git add -A``).
+#
+# Contract of the CLI's stdout (JSON, indent=2) + exit codes:
+#   exit 0 → the NormalizeResult dict (``written``, ``stamped``, ``rules``,
+#            ``already_stamped``, ``refused: []`` …) — ALL decided
+#   exit 3 → the SAME NormalizeResult dict with ``refused`` NON-EMPTY —
+#            PARTIAL: every decided stamp was written (``written`` true iff
+#            any was), the refused titles are named; the human echo goes to
+#            STDERR (``! normalize-stamps PARTIAL: …``)
+#   exit 2 → {"feature_id", "error", "refused": [...], "written": false} —
+#            the normalizer could not RUN (``refused`` empty:
+#            StampNormalizerError / no such file) — or the pre-partial-law
+#            all-or-nothing refusal (``refused`` non-empty, an older guardkit)
+#   an OLDER guardkit (pre-rebake image) has no such subcommand: click exits 2
+#   with ``Error: No such command 'normalize-stamps'.`` on stderr and no JSON.
+# The frozen seam keeps only a 4 KB stdout TAIL (stderr whole) and the older
+# guardkit's rich console echoed the refusal (wrapped at 80 cols) AFTER the
+# JSON on stdout, so the parser below reads the JSON when whole, the JSON's
+# ``refused`` / ``rules`` / ``written`` blocks when the head was clipped, and
+# a console echo (stdout, or stderr's PARTIAL block) as the last resort —
+# never guessing a title it did not see.
+#
+# What the hook does with each status is the DRIVER's decision
+# (``PlanningRunDriver._feature_plan_leg``): under ``routing_law: enforced``
+# partial / refused / failed STOP the run with a card naming the titles
+# verbatim; NOT enforced they PROCEED — decided stamps on the branch, every
+# refused title receipted, a WARNING logged, one plain line to the owner —
+# because a repo the law is not flipped on must never lose a plan to it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StampNormalizerOutcome:
+    """What THE STAMP NORMALIZER did (or could not do) for one plan.
+
+    ``status``:
+
+    * ``"written"``       — every scenario decided; stamps minted by rule and
+      written into the YAML (exit 0)
+    * ``"nothing-to-do"`` — every scenario already carried a stamp (or the
+      feature has no scenarios); nothing written, exit 0
+    * ``"partial"``       — some titles undecidable (``refused_titles`` names
+      every one verbatim); every DECIDED stamp WAS written (``stamped`` /
+      ``rules`` name them; ``written`` true iff any) — exit 3
+    * ``"refused"``       — undecidable titles and nothing written (an older
+      all-or-nothing guardkit, exit 2 with ``refused``), or forge's own
+      pre-normalizer refusal (a plan whose ``feature_files:`` contradicts the
+      spec forge committed — condition 4; no titles)
+    * ``"failed"``        — the normalizer could not run / timed out / raised
+    * ``"unavailable"``   — the guardkit on this image predates the
+      subcommand; the run CONTINUES (backward compatible until the rebake)
+      and the receipts say so
+    * ``"not-wired"``     — no collaborator injected (hermetic composition);
+      the run continues and the receipts say so
+
+    Whether a failure STOPS the run is not this object's call alone: the
+    driver attaches the routing law's ``enforcement`` for the repo/feature
+    (``forge.pipeline.routing_stamps.resolve_routing_law``) and
+    :attr:`stops_the_run` is ``is_failure and enforced``. Not enforced, the
+    plan PROCEEDS with everything receipted (coordinator condition 5).
+    """
+
+    status: str
+    detail: str = ""
+    refused_titles: tuple[str, ...] = ()
+    stamped: Mapping[str, str] = field(default_factory=dict)  # title -> verifier
+    rules: Mapping[str, str] = field(default_factory=dict)  # title -> rule id (R1..R10)
+    already_stamped: tuple[str, ...] = ()
+    written: bool | None = None
+    feature_files_filled: tuple[str, ...] = ()
+    stamps_on_branch: int | None = None
+    titles_recovered_from_console_echo: bool = False
+    #: exit 3 whose refused list could not be read back from the streams —
+    #: the titles are unknown, and the receipt says so instead of guessing.
+    titles_unreadable: bool = False
+    #: The routing law's enforcement the driver resolved for this repo /
+    #: feature: ``"enforced"`` | ``"off"`` | ``None`` (not resolved yet).
+    enforcement: str | None = None
+    enforcement_source: str = ""
+    enforcement_detail: str = ""
+
+    @property
+    def is_failure(self) -> bool:
+        """The normalizer did not fully succeed: partial / refused / failed."""
+        return self.status in ("partial", "refused", "failed")
+
+    @property
+    def enforced(self) -> bool:
+        return self.enforcement == "enforced"
+
+    @property
+    def stops_the_run(self) -> bool:
+        """The plan leg stops ONLY where the routing law is enforced for this
+        repo / feature. Unresolved enforcement (``None``) is not enforced —
+        the law is opt-in, and a stop it did not opt into is the back door."""
+        return self.is_failure and self.enforced
+
+    @property
+    def total_scenarios(self) -> int:
+        """Stamped-now + already-stamped (or the on-disk count, whichever is
+        larger — the seam's clipped tail may have lost the ``stamped`` map)
+        + refused."""
+        decided = max(
+            len(self.stamped) + len(self.already_stamped),
+            self.stamps_on_branch or 0,
+        )
+        return decided + len(self.refused_titles)
+
+    def per_title(self) -> dict[str, str]:
+        """One plain line per scenario title — the receipt every plan record
+        carries: ``'stamped by normalizer (rule R9)'`` for each rule-minted
+        stamp, ``'refused: no rule could decide a verification home'`` for
+        each refused title, ``'already stamped (untouched)'`` for the rest."""
+        out: dict[str, str] = {}
+        for title, home in self.stamped.items():
+            rule = self.rules.get(title)
+            out[title] = (
+                f"stamped by normalizer (rule {rule}): {home}"
+                if rule
+                else f"stamped by normalizer: {home}"
+            )
+        for title in self.already_stamped:
+            out.setdefault(title, "already stamped (untouched)")
+        for title in self.refused_titles:
+            out[title] = "refused: no rule could decide a verification home"
+        return out
+
+    def receipt(self) -> dict[str, Any]:
+        """JSON-safe record for the plan receipts (the durable feature-plan
+        event details) — the hook is NEVER silent, whichever way it went."""
+        rec: dict[str, Any] = {
+            "status": self.status,
+            "detail": self.detail,
+            "stamped": dict(self.stamped),
+            "stamped_count": len(self.stamped),
+            "already_stamped_count": len(self.already_stamped),
+            "refused_titles": list(self.refused_titles),
+            "refused_count": len(self.refused_titles),
+        }
+        if self.rules:
+            rec["rules"] = dict(self.rules)
+        per_title = self.per_title()
+        if per_title:
+            rec["per_title"] = per_title
+        if self.written is not None:
+            rec["written"] = self.written
+        if self.feature_files_filled:
+            rec["feature_files_filled_by_forge"] = list(self.feature_files_filled)
+        if self.stamps_on_branch is not None:
+            rec["stamps_on_branch"] = self.stamps_on_branch
+        if self.titles_recovered_from_console_echo:
+            rec["titles_recovered_from_console_echo"] = True
+        if self.titles_unreadable:
+            rec["titles_unreadable"] = True
+        if self.enforcement is not None:
+            rec["enforcement"] = self.enforcement
+            rec["enforcement_source"] = self.enforcement_source
+            rec["enforcement_detail"] = self.enforcement_detail
+            rec["stops_the_run"] = self.stops_the_run
+        return rec
+
+
+@dataclass(frozen=True)
+class FeatureFilesFill:
+    """Receipt of :func:`declare_feature_files_if_absent`."""
+
+    fired: bool
+    yaml_rel: str
+    feature_files: tuple[str, ...] = ()
+    reason: str = ""
+    #: condition 4: a present model list that omits forge's committed spec path
+    inconsistent: bool = False
+
+
+#: click's usage error for a subcommand the installed guardkit does not have
+#: (an older image, pre-rebake) — the ONE shape that means "unavailable" rather
+#: than "refused"/"failed". Matched on stderr only.
+_NORMALIZER_UNAVAILABLE_RE = re.compile(
+    r"No such command ['\"](normalize-stamps|qa)['\"]"
+)
+_NORMALIZER_JSON_REFUSED_RE = re.compile(
+    r'^  "refused": (\[\]|\[\n(?:    .*\n)*?  \])', re.MULTILINE
+)
+_NORMALIZER_JSON_STAMPED_RE = re.compile(
+    r'^  "stamped": (\{\}|\{\n(?:    .*\n)*?  \})', re.MULTILINE
+)
+_NORMALIZER_JSON_RULES_RE = re.compile(
+    r'^  "rules": (\{\}|\{\n(?:    .*\n)*?  \})', re.MULTILINE
+)
+_NORMALIZER_JSON_ERROR_RE = re.compile(r'^  "error": (".*"),?$', re.MULTILINE)
+_NORMALIZER_JSON_WRITTEN_RE = re.compile(r'^  "written": (true|false),?$', re.MULTILINE)
+#: The exit code guardkit's CLI uses for PARTIAL (decided stamps written,
+#: ``refused`` names the rest) — distinct from 2 (cannot run) and 0 (all
+#: decided). guardkit ``cli/qa.py`` @ a8e5bfa3.
+NORMALIZER_EXIT_PARTIAL: int = 3
+
+
+def parse_normalizer_payload(stdout_tail: str, stderr: str = "") -> dict[str, Any] | None:
+    """Recover the ``normalize-stamps`` JSON result from the seam's stdout TAIL.
+
+    1. the whole JSON object when the tail still starts at its ``{`` (the
+       common case — a plan of a dozen scenarios is well under 4 KB);
+    2. else the ``"refused": [...]`` / ``"stamped": {...}`` / ``"rules":
+       {...}`` / ``"error": "…"`` / ``"written":`` blocks when the head was
+       clipped but the tail of the object survived (``partial: True``);
+    3. else a rich console echo — the older guardkit's ``Undecidable:`` block
+       on stdout, or the PARTIAL law's ``! normalize-stamps PARTIAL:`` block
+       on ``stderr`` (wrapped at 80 columns by rich when the stream is not a
+       tty; continuation lines are re-joined on a single space) —
+       ``partial: True`` and ``from_console_echo: True`` so the receipt says
+       how the titles were read.
+
+    Returns ``None`` when none of the three shapes is present.
+    """
+    text = stdout_tail or ""
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        start = text.find("{")
+        # indent=2 → the object's own closing brace is the LAST line that is
+        # exactly "}" (the console echo that follows never emits one).
+        end = -1
+        for m in re.finditer(r"^\}\s*$", text[start:], re.MULTILINE):
+            end = start + m.end()
+        if end > start:
+            try:
+                data = json.loads(text[start:end])
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+    partial: dict[str, Any] = {}
+    m = _NORMALIZER_JSON_REFUSED_RE.search(text)
+    if m:
+        try:
+            refused = json.loads(m.group(1))
+            if isinstance(refused, list):
+                partial["refused"] = [str(t) for t in refused]
+        except json.JSONDecodeError:
+            pass
+    for key, rx in (("stamped", _NORMALIZER_JSON_STAMPED_RE), ("rules", _NORMALIZER_JSON_RULES_RE)):
+        m = rx.search(text)
+        if m:
+            try:
+                block = json.loads(m.group(1))
+                if isinstance(block, dict):
+                    partial[key] = {str(k): str(v) for k, v in block.items()}
+            except json.JSONDecodeError:
+                pass
+    m = _NORMALIZER_JSON_ERROR_RE.search(text)
+    if m:
+        try:
+            partial["error"] = str(json.loads(m.group(1)))
+        except json.JSONDecodeError:
+            pass
+    m = _NORMALIZER_JSON_WRITTEN_RE.search(text)
+    if m:
+        partial["written"] = m.group(1) == "true"
+    if partial:
+        partial["partial"] = True
+        return partial
+    # Last resort: a console echo. The older guardkit's "Undecidable:" block
+    # on stdout (after the JSON), or the PARTIAL law's stderr block.
+    titles = _titles_from_console_echo(text, "Undecidable:")
+    if not titles:
+        titles = _titles_from_console_echo(stderr or "", "normalize-stamps PARTIAL:")
+    if not titles:
+        return None
+    return {"refused": titles, "partial": True, "from_console_echo": True}
+
+
+def _titles_from_console_echo(text: str, marker: str) -> list[str]:
+    """The ``  - title`` lines after the LAST ``marker`` in ``text``, wrapped
+    continuation lines re-joined on one space; ``[]`` when absent."""
+    idx = text.rfind(marker)
+    if idx < 0:
+        return []
+    titles: list[str] = []
+    for line in text[idx:].split("\n")[1:]:
+        if line.startswith("FIX:") or line.startswith("STAMP NORMALIZER:"):
+            break
+        if line.startswith("  - "):
+            titles.append(line[4:].rstrip())
+        elif titles and line.strip():
+            titles[-1] = titles[-1].rstrip() + " " + line.strip()
+        elif titles and not line.strip():
+            break
+        elif not titles and line.strip() and not line.startswith(" "):
+            # rich wraps the marker's own sentence onto a second line before
+            # the first "  - " (e.g. "decided stamps written):") — skip it.
+            continue
+    return titles
+
+
+def classify_normalizer_result(
+    feature_id: str,
+    *,
+    status: str,
+    exit_code: int,
+    stdout_tail: str,
+    stderr: str,
+) -> StampNormalizerOutcome:
+    """Map one ``guardkit qa normalize-stamps`` seam result onto an outcome.
+
+    Pure; the decision table the hook stands on (whether a failure STOPS
+    the run is the driver's call on the routing law's enforcement — see
+    :class:`StampNormalizerOutcome`):
+
+    * ``timeout``                              → ``failed``
+    * non-zero + click ``No such command``     → ``unavailable`` (continues)
+    * exit 0                                   → ``written`` / ``nothing-to-do``
+    * exit 3 (PARTIAL)                         → ``partial`` (decided stamps
+      written; ``refused_titles`` names the rest; ``rules`` per stamped title)
+    * exit 2 + JSON ``refused`` non-empty      → ``refused`` (older
+      all-or-nothing guardkit; titles, nothing written)
+    * exit 2 + JSON ``error`` (no refused)     → ``failed`` (the error)
+    * anything else non-zero                   → ``failed`` (streams)
+    """
+    stderr = stderr or ""
+    tail = stdout_tail or ""
+    if status == "timeout":
+        return StampNormalizerOutcome(
+            status="failed",
+            detail=f"guardkit qa normalize-stamps timed out for {feature_id}",
+        )
+    if exit_code != 0 and _NORMALIZER_UNAVAILABLE_RE.search(stderr):
+        line = next(
+            (ln.strip() for ln in stderr.splitlines() if "No such command" in ln),
+            stderr.strip(),
+        )
+        return StampNormalizerOutcome(
+            status="unavailable",
+            detail=(
+                "normalizer unavailable: the guardkit on this image has no "
+                f"`qa normalize-stamps` subcommand ({line}); verifier stamps "
+                f"were NOT minted for {feature_id} — the plan is committed as "
+                "the plan-writer wrote it (backward compatible until the rebake)"
+            ),
+        )
+    payload = parse_normalizer_payload(tail, stderr)
+    stamped_raw = (payload or {}).get("stamped") or {}
+    stamped = {str(k): str(v) for k, v in stamped_raw.items()} if isinstance(stamped_raw, dict) else {}
+    rules_raw = (payload or {}).get("rules") or {}
+    rules = {str(k): str(v) for k, v in rules_raw.items()} if isinstance(rules_raw, dict) else {}
+    already = tuple(str(t) for t in ((payload or {}).get("already_stamped") or []))
+    written = (payload or {}).get("written")
+    refused = tuple(str(t) for t in ((payload or {}).get("refused") or []))
+    from_echo = bool((payload or {}).get("from_console_echo"))
+    if status == "success" and exit_code == 0:
+        if written is True or (written is None and stamped):
+            return StampNormalizerOutcome(
+                status="written",
+                detail=(
+                    f"{len(stamped)} scenario(s) stamped by rule, "
+                    f"{len(already)} already stamped (untouched)"
+                ),
+                stamped=stamped,
+                rules=rules,
+                already_stamped=already,
+                written=True,
+            )
+        if payload is None:
+            return StampNormalizerOutcome(
+                status="written",
+                detail=(
+                    "exit 0 (stamps minted and written by guardkit) but the JSON "
+                    "result could not be read back from the output tail; see "
+                    "stamps_on_branch for what the plan of record carries"
+                ),
+            )
+        return StampNormalizerOutcome(
+            status="nothing-to-do",
+            detail=(
+                f"nothing to write: {len(already)} scenario(s) already stamped, "
+                "none unstamped"
+            ),
+            stamped=stamped,
+            rules=rules,
+            already_stamped=already,
+            written=False,
+        )
+    if exit_code == NORMALIZER_EXIT_PARTIAL:
+        # PARTIAL (guardkit a8e5bfa3): every decided stamp was WRITTEN; the
+        # refused titles are named. Nothing here decides stop-vs-proceed.
+        if not refused:
+            return StampNormalizerOutcome(
+                status="partial",
+                detail=(
+                    f"guardkit qa normalize-stamps exit {exit_code} (PARTIAL) for "
+                    f"{feature_id}: some scenario(s) were undecidable by rule but "
+                    "their titles could not be read back from the streams — see "
+                    "stamps_on_branch for what the plan of record carries"
+                ),
+                stamped=stamped,
+                rules=rules,
+                already_stamped=already,
+                written=written if isinstance(written, bool) else (True if stamped else None),
+                titles_unreadable=True,
+            )
+        return StampNormalizerOutcome(
+            status="partial",
+            detail=(
+                f"{len(refused)} scenario(s) undecidable by rule — no fallback "
+                f"home, none invented; {len(stamped)} scenario(s) stamped by rule "
+                f"and written, {len(already)} already stamped (untouched)"
+            ),
+            refused_titles=refused,
+            stamped=stamped,
+            rules=rules,
+            already_stamped=already,
+            written=written if isinstance(written, bool) else bool(stamped),
+            titles_recovered_from_console_echo=from_echo,
+        )
+    # Non-zero exit (2, or anything else).
+    if refused:
+        return StampNormalizerOutcome(
+            status="refused",
+            detail=(
+                f"{len(refused)} scenario(s) undecidable by rule (R1–R10) — no "
+                "fallback home; nothing was written"
+            ),
+            refused_titles=refused,
+            written=False,
+            titles_recovered_from_console_echo=from_echo,
+        )
+    error = (payload or {}).get("error")
+    if error:
+        return StampNormalizerOutcome(
+            status="failed",
+            detail=f"guardkit qa normalize-stamps could not run (exit {exit_code}): {error}",
+        )
+    streams = _combine_validate_error_streams(stdout_tail=tail, stderr=stderr)
+    return StampNormalizerOutcome(
+        status="failed",
+        detail=(
+            f"guardkit qa normalize-stamps {status} (exit {exit_code}) for "
+            f"{feature_id} with no readable result: {streams or '(no output)'}"
+        ),
+    )
+
+
+_FEATURE_FILES_KEY_RE = re.compile(r"^feature_files\s*:", re.MULTILINE)
+
+
+def _committed_paths_missing_from_declared(
+    yaml_text: str, committed: Sequence[str]
+) -> list[str]:
+    """Which of forge's committed spec paths are absent from a PRESENT
+    ``feature_files:`` list (substring match on the normalised path)."""
+    declared_block = yaml_text.split("feature_files:", 1)[1] if "feature_files:" in yaml_text else ""
+    declared_block = declared_block.split("\n\n", 1)[0]
+    norm = lambda x: str(x).strip().strip("'\"").lstrip("./")
+    declared = norm(declared_block)
+    # An EMPTY present list ({}, [], ~, null, or nothing) is the plan-writer's
+    # statement and is left alone (condition 2) — only a NON-EMPTY list that
+    # omits forge's committed path is inconsistent (condition 4).
+    if not any(line.strip().startswith("- ") for line in declared_block.splitlines()):
+        return []
+    return [c for c in committed if norm(c) not in declared]
+
+
+def declare_feature_files_if_absent(
+    worktree_path: Path, feature_id: str, feature_paths: Sequence[str]
+) -> FeatureFilesFill:
+    """Append ``feature_files:`` to the plan YAML when the plan-writer omitted it.
+
+    The normalizer's scenario universe is EXPLICIT, never inferred — it reads
+    the YAML's ``feature_files:``. The 008 plan-writer under the routing-law
+    templates omits the key (live: api_test FEAT-F924, planning run 59e31c95),
+    and forge is the one party that KNOWS the universe: it committed the spec
+    ``.feature`` itself one leg earlier. So forge names that file — the same
+    append guardkit's own ``write_stamps`` performs when handed the universe —
+    ONLY when the top-level key is absent altogether (a present key, even
+    empty, is the plan-writer's statement and is left alone for the
+    normalizer to judge loudly). Fires LOUDLY (logged + receipted); a missing
+    YAML is a no-op here (the normalizer / validate say so themselves).
+    """
+    rel = f".guardkit/features/{feature_id}.yaml"
+    path = worktree_path / rel
+    if not path.is_file():
+        alt = worktree_path / f".guardkit/features/{feature_id}.yml"
+        if alt.is_file():
+            path, rel = alt, f".guardkit/features/{feature_id}.yml"
+        else:
+            return FeatureFilesFill(False, rel, reason="plan YAML not present")
+    paths = tuple(str(p) for p in feature_paths if str(p).strip())
+    if not paths:
+        return FeatureFilesFill(False, rel, reason="no committed .feature path known")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return FeatureFilesFill(False, rel, reason=f"unreadable: {exc}")
+    if _FEATURE_FILES_KEY_RE.search(text):
+        # Coordinator condition 4 (review, 08-16): a PRESENT model-written list
+        # that omits the path forge itself committed the spec to is a real
+        # inconsistency — refuse LOUD here; never silently add to it.
+        missing = _committed_paths_missing_from_declared(text, paths)
+        if missing:
+            return FeatureFilesFill(
+                False,
+                rel,
+                reason=(
+                    "feature_files: declared by the plan-writer but it does NOT "
+                    "name the spec .feature forge committed on this branch: "
+                    + ", ".join(missing)
+                    + " — inconsistent plan; refusing (not silently added)"
+                ),
+                inconsistent=True,
+            )
+        return FeatureFilesFill(False, rel, reason="feature_files: already declared")
+    if not text.endswith("\n"):
+        text += "\n"
+    text += (
+        "# feature_files: declared by forge at plan-commit — the committed spec\n"
+        "# .feature of this planning run (the 008 plan-writer omitted the key);\n"
+        "# the routing law's scenario universe is explicit, never inferred.\n"
+        "feature_files:\n"
+        + "".join(f"  - {json.dumps(p, ensure_ascii=False)}\n" for p in paths)
+    )
+    path.write_text(text, encoding="utf-8")
+    logger.warning(
+        "stamp normalizer hook: %s declared no feature_files:; forge wrote the "
+        "committed spec .feature path(s) %s into it (explicit universe)",
+        rel,
+        list(paths),
+    )
+    return FeatureFilesFill(True, rel, feature_files=paths, reason="filled by forge")
+
+
+def _count_stamps_on_branch(worktree_path: Path, feature_id: str) -> int | None:
+    """How many ``scenarios:`` stamps the plan of record carries on disk —
+    read back with the SAME reader the close-side check uses, so the receipt
+    does not depend on the seam's clipped stdout."""
+    try:
+        from forge.pipeline.routing_stamps import read_scenario_stamps
+
+        for suffix in ("yaml", "yml"):
+            p = worktree_path / ".guardkit" / "features" / f"{feature_id}.{suffix}"
+            if p.is_file():
+                read = read_scenario_stamps(p)
+                return None if read.error else len(read.stamps)
+    except Exception:  # noqa: BLE001 — a receipt reader, never a decider
+        logger.debug("stamp count read-back failed", exc_info=True)
+    return None
+
+
+#: The normalizer is rules over a handful of files (no model in the loop) —
+#: seconds, not minutes. Bounded well under the plan-commit hook's 900 s ceiling
+#: (``WorktreeGitRunner.hook_timeout_s``) so normalizer + validate (600 s) still
+#: fit inside ONE pre-commit hook; a wedged normalizer fails the leg loudly.
+_DEFAULT_NORMALIZER_TIMEOUT_SECONDS: int = 120
+
+
+def make_normalize_stamps(
+    *,
+    read_allowlist: Sequence[Path] | None = None,
+    timeout_seconds: int = _DEFAULT_NORMALIZER_TIMEOUT_SECONDS,
+    run_fn: Callable[..., Awaitable[object]] = guardkit_run,
+) -> NormalizeStampsFn:
+    """Build the production THE-STAMP-NORMALIZER hook (plan leg, pre-validate).
+
+    Rides the SAME frozen :func:`forge.adapters.guardkit.run.run` seam the
+    validate oracles ride: ``guardkit qa normalize-stamps --feature <id>
+    --repo <worktree>`` with cwd = the planning worktree. Never raises: every
+    outcome — written / nothing-to-do / partial / refused / failed /
+    unavailable — comes back as a :class:`StampNormalizerOutcome` the driver
+    decides on (partial/refused/failed stop the run with a card ONLY where
+    the routing law is enforced for the repo/feature, else the plan proceeds
+    receipted; unavailable continues and is receipted).
+    """
+
+    async def _normalize(worktree_path: Path, feature_id: str) -> StampNormalizerOutcome:
+        allowlist = list(read_allowlist or [worktree_path])
+        try:
+            result = await guardkit_run_shim(
+                run_fn,
+                subcommand="qa",
+                args=[
+                    "normalize-stamps",
+                    "--feature",
+                    feature_id,
+                    "--repo",
+                    str(worktree_path),
+                ],
+                repo_path=worktree_path,
+                read_allowlist=allowlist,
+                timeout_seconds=timeout_seconds,
+                with_nats_streaming=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — oracle boundary
+            logger.exception("normalize_stamps invocation raised")
+            return StampNormalizerOutcome(
+                status="failed",
+                detail=f"qa normalize-stamps raised {type(exc).__name__}: {exc}",
+            )
+        outcome = classify_normalizer_result(
+            feature_id,
+            status=str(getattr(result, "status", "failed")),
+            exit_code=int(getattr(result, "exit_code", -1)),
+            stdout_tail=str(getattr(result, "stdout_tail", "") or ""),
+            stderr=str(getattr(result, "stderr", None) or ""),
+        )
+        if outcome.status in ("written", "nothing-to-do", "partial"):
+            # PARTIAL wrote its decided stamps too — read the plan of record
+            # back off disk (the seam's clipped tail may have lost the map).
+            count = _count_stamps_on_branch(worktree_path, feature_id)
+            if count is not None:
+                outcome = dataclasses.replace(outcome, stamps_on_branch=count)
+        if outcome.status in ("written", "nothing-to-do"):
+            logger.info(
+                "normalize_stamps: %s %s (%s; stamps on branch: %s)",
+                feature_id,
+                outcome.status,
+                outcome.detail,
+                outcome.stamps_on_branch,
+            )
+        elif outcome.status == "partial":
+            logger.warning(
+                "normalize_stamps: %s PARTIAL — %s; refused titles: %s "
+                "(stamps on branch: %s)",
+                feature_id,
+                outcome.detail,
+                list(outcome.refused_titles),
+                outcome.stamps_on_branch,
+            )
+        elif outcome.status == "unavailable":
+            logger.warning("normalize_stamps: %s", outcome.detail)
+        else:
+            logger.error("normalize_stamps: %s %s: %s", feature_id, outcome.status, outcome.detail)
+        return outcome
+
+    return _normalize
 
 
 async def guardkit_run_shim(run_fn: Callable[..., Awaitable[object]], **kwargs: object):

@@ -1,0 +1,9 @@
+{
+  "feature_id": "FEAT-NOPE",
+  "error": "feature file not found: /wt/.guardkit/features/FEAT-NOPE.yaml",
+  "refused": []
+}
+✗ normalize-stamps: feature file not found: 
+/tmp/claude-1000/-home-richardwoollcott-Projects-appmilla-github-ai-transition/9
+4c20492-8c19-4e2b-b567-7af181617596/scratchpad/probe/.guardkit/features/FEAT-NOP
+E.yaml

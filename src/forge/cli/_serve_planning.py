@@ -691,6 +691,7 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.frontier import FrontierSecondOpinion
         from forge.planning.target_terminal_tools import (
             make_normalize_feature_spec,
+            make_normalize_stamps,
             make_validate_feature_plan,
             make_validate_gate_registry,
             make_validate_pass_bar,
@@ -1006,6 +1007,13 @@ async def compose_planning_consumer_and_dispatch(
         # (``installer.core.*``) — the B4 run 4b3b0893 in-container gap.
         normalize_feature_spec = make_normalize_feature_spec(command_prefix=None)
         validate_feature_plan = make_validate_feature_plan()
+        # THE STAMP NORMALIZER (Rich's condition 1, 2026-08-16): ``guardkit qa
+        # normalize-stamps`` runs against the planning worktree immediately
+        # BEFORE the plan-commit validate, so the rule-minted verifier stamps
+        # are WRITTEN on the planning branch and ride the plan commit. Same
+        # frozen guardkit seam; an older guardkit without the subcommand
+        # continues (receipted) until the rebake.
+        normalize_stamps = make_normalize_stamps()
         # B4 round-19: the per-task pass bars forge mints from the 007 seed are
         # validated by guardkit's OWN ``qa validate pass-bar`` before they land.
         validate_pass_bar = make_validate_pass_bar()
@@ -1035,19 +1043,29 @@ async def compose_planning_consumer_and_dispatch(
 
         # -- notifications (jarvis.notification.slack) --------------------
         async def publish_planning_notification(
-            correlation_id: str, message: str, level: str = "info"
+            correlation_id: str,
+            message: str,
+            level: str = "info",
+            *,
+            mention: bool = True,
         ) -> None:
             # Assumption-dialogue projection (TASK-SPL003F-001): project the
             # durable thread anchor + originator so jarvis threads the message
             # into the originating conversation. Read from the planning_runs
             # row (never re-derived); degrade to None when absent (still
             # visible, unthreaded — never dropped).
+            #
+            # ``mention=False`` (the stamp normalizer's un-enforced line,
+            # coordinator condition 5): the line still THREADS (the anchor is
+            # kept) but carries no ``target_user``, so jarvis renders it plain
+            # — no @mention. jarvis's build-audience record ignores a None
+            # target_user, so the run's recorded owner is untouched.
             parent_request_id: str | None = None
             target_user: str | None = None
             row = store.get_run(correlation_id)
             if row is not None:
                 parent_request_id = row["parent_request_id"]
-                target_user = row["originating_user"]
+                target_user = row["originating_user"] if mention else None
 
             envelope = build_planning_notification_envelope(
                 correlation_id=correlation_id,
@@ -1102,6 +1120,7 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_feature_plan=dispatch_feature_plan,
                 normalize_feature_spec=normalize_feature_spec,
                 validate_feature_plan=validate_feature_plan,
+                normalize_stamps=normalize_stamps,
                 validate_pass_bar=validate_pass_bar,
                 # Lane B / Phase E1 (F2) — the per-feature live-gate registration
                 # leg (sibling of the pass-bar leg; no-op unless the endpoint is

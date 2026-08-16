@@ -462,6 +462,7 @@ def make_gates_green_reader(
     declaration_loader: Callable[..., Any] | None = None,
     command_runner: Callable[..., Any] | None = None,
     repo_root_reader: Callable[[str], Any] | None = None,
+    stamps_leg: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Build the merge-ready checkpoint's REAL ``gates_green_reader``.
 
@@ -489,6 +490,23 @@ def make_gates_green_reader(
        declaration's own ``test_timeout``. **Exit 0 = GREEN.** Any other
        exit code = **RED**. A timeout, or a command that would not
        start = **UNKNOWN**.
+    5. **The routing law's close-side check (card Q8/A.2 — the
+       ``stamps_satisfied`` leg).** Only reached on a GREEN suite. Read
+       the feature's per-scenario ``verifier:`` stamps from the CANONICAL
+       repo's ``.guardkit/features/<feature_id>.yaml`` (the plan of
+       record, same canonical-not-worktree law as step 2) and ask, home
+       by home, whether the promised verifier RAN GREEN for this branch:
+       ``toolchain`` rides step 4; ``hurl`` needs the newest F4 envelope
+       under the worktree's ``qa/gates/history/`` to be ``pass``, name
+       ``hurl-twins`` exit 0, and be newer than the branch's last code
+       commit; ``exam``/``probe:*``/``flutter``/``playwright`` need that
+       same fresh green envelope to name them; ``operator`` is satisfied
+       by declaration but LISTED as attended in the card detail. A
+       stamped verifier that did not run is **ABSENT = UNKNOWN**: no
+       card, and the detail names the scenario and the missing home in
+       plain language. **No stamps at all → not enforced**: the report
+       is exactly what step 4 said. See
+       :mod:`forge.pipeline.routing_stamps`.
 
     Every UNKNOWN is red-safe by the checkpoint's own precondition
     ("proven green", never "not proven red"), so every degrade on this
@@ -507,11 +525,18 @@ def make_gates_green_reader(
             subprocess-free.
         repo_root_reader: ``(build_id) -> Path | str | None`` — override
             for step 2.
+        stamps_leg: ``(*, feature_id, repo_root, worktree, branch,
+            toolchain_green) -> StampsVerdict`` — step 5. Defaults to
+            :func:`forge.pipeline.routing_stamps.make_stamps_leg` over
+            the real feature YAML, envelope and git readers. Injected so
+            tests drive every home without a repo on disk.
     """
     from forge.pipeline.merge_ready_checkpoint import GateStatus, GatesReport
+    from forge.pipeline.routing_stamps import make_stamps_leg
 
     _load = declaration_loader or load_declared_toolchain
     _run = command_runner or _run_declared_command
+    _stamps = stamps_leg or make_stamps_leg()
 
     def _default_repo_root(build_id: str) -> Any | None:
         row = pool.get_build_row(build_id)
@@ -534,6 +559,85 @@ def make_gates_green_reader(
             detail,
         )
         return GatesReport(status=GateStatus.UNKNOWN, detail=detail)
+
+    def _apply_stamps_leg(
+        *,
+        build_id: str,
+        feature_id: str,
+        repo_root: Any,
+        worktree: Any,
+        branch: Any,
+        suite_detail: str,
+    ) -> Any:
+        """Step 5 — the routing law's ``stamps_satisfied`` leg on a GREEN suite."""
+        try:
+            verdict = _stamps(
+                feature_id=feature_id,
+                repo_root=repo_root,
+                worktree=worktree,
+                branch=branch,
+                toolchain_green=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — a leg defect is not green
+            return _unknown(
+                f"the declared suite is green ({suite_detail}) but the routing "
+                f"law's stamps leg raised {type(exc).__name__}: {exc}, so the "
+                "stamped verifiers cannot be proven to have run",
+                build_id,
+            )
+        stamps_detail = getattr(verdict, "detail", "") or ""
+        if str(getattr(verdict, "status", "")) == "not-enforced":
+            # No stamps on this feature: the leg has NO effect. The report
+            # is byte-for-byte what step 4 said (backward compatible), and
+            # the log says why nothing more was asked.
+            logger.info(
+                "conductor gates: build_id=%s — GREEN. %s (%s)",
+                build_id,
+                suite_detail,
+                stamps_detail or "routing law: not enforced",
+            )
+            return GatesReport(status=GateStatus.GREEN, detail=suite_detail)
+        if getattr(verdict, "blocks_card", False):
+            missing = tuple(
+                f"routing law: {home} (scenario {title!r})"
+                for title, home in (getattr(verdict, "missing", ()) or ())
+            ) or ("routing law: scenario stamps unreadable",)
+            logger.warning(
+                "conductor gates: build_id=%s — the declared suite is GREEN "
+                "but the ROUTING LAW reads %s: %s The gate set answers "
+                "UNKNOWN, which the merge-ready checkpoint treats as RED: no "
+                "merge card will be published for this journey",
+                build_id,
+                getattr(verdict, "status", "absent"),
+                stamps_detail,
+            )
+            return GatesReport(
+                status=GateStatus.UNKNOWN,
+                failed_gates=missing,
+                detail=(
+                    f"{stamps_detail} The declared suite itself is green "
+                    f"({suite_detail})."
+                ),
+            )
+        attended = tuple(getattr(verdict, "attended", ()) or ())
+        if attended:
+            logger.warning(
+                "conductor gates: build_id=%s — ATTENDED scenarios on this "
+                "card (operator-stamped, verified by a human, not by the "
+                "machinery): %s",
+                build_id,
+                "; ".join(repr(t) for t in attended),
+            )
+        logger.info(
+            "conductor gates: build_id=%s — GREEN. %s %s",
+            build_id,
+            suite_detail,
+            stamps_detail,
+        )
+        return GatesReport(
+            status=GateStatus.GREEN,
+            detail=f"{suite_detail} {stamps_detail}".strip(),
+        )
 
     def read_gates(*, build_id: str, branch: Any = None) -> Any:
         row = pool.get_build_row(build_id)
@@ -610,9 +714,18 @@ def make_gates_green_reader(
             return _unknown(detail, build_id)
         if exit_code == 0:
             logger.info(
-                "conductor gates: build_id=%s — GREEN. %s", build_id, detail
+                "conductor gates: build_id=%s — declared suite GREEN. %s",
+                build_id,
+                detail,
             )
-            return GatesReport(status=GateStatus.GREEN, detail=detail)
+            return _apply_stamps_leg(
+                build_id=build_id,
+                feature_id=getattr(row, "feature_id", None) or "",
+                repo_root=repo_root,
+                worktree=worktree,
+                branch=branch or getattr(row, "branch", None),
+                suite_detail=detail,
+            )
         logger.warning(
             "conductor gates: build_id=%s — RED. %s. No merge card is "
             "published; the fix cycle runs BEFORE the merge word",
