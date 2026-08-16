@@ -1,0 +1,23 @@
+{
+  "feature_id": "FEAT-TIME",
+  "error": "STAMP NORMALIZER: feature FEAT-TIME has 2 UNDECIDABLE scenario(s) \u2014 no rule (R1\u2013R10, ai-transition/docs/routing-law-stamp-normalizer-rules-2026-08-15.md) matched and there is NO fallback home (card Q8/A.2: a scenario silently routed to a home it does not belong to is an unverified green). The run stops here; nothing was written.\nUndecidable:\n  - The moon is made of a very particular kind of cheese that no rule family in the design has ever heard about at all\n  - Another undecidable one\nFIX: stamp each title by hand in this feature's `scenarios:` map with a `verifier:` from the closed list (toolchain, hurl, exam, probe:bus, probe:process, flutter, playwright, operator) \u2014 `operator` ONLY for attended human work, never as a default \u2014 or set `routing_law: off` on this feature.",
+  "refused": [
+    "The moon is made of a very particular kind of cheese that no rule family in the design has ever heard about at all",
+    "Another undecidable one"
+  ],
+  "written": false
+}
+✗ normalize-stamps REFUSED (undecidable titles)
+STAMP NORMALIZER: feature FEAT-TIME has 2 UNDECIDABLE scenario(s) — no rule 
+(R1–R10, ai-transition/docs/routing-law-stamp-normalizer-rules-2026-08-15.md) 
+matched and there is NO fallback home (card Q8/A.2: a scenario silently routed 
+to a home it does not belong to is an unverified green). The run stops here; 
+nothing was written.
+Undecidable:
+  - The moon is made of a very particular kind of cheese that no rule family in 
+the design has ever heard about at all
+  - Another undecidable one
+FIX: stamp each title by hand in this feature's `scenarios:` map with a 
+`verifier:` from the closed list (toolchain, hurl, exam, probe:bus, 
+probe:process, flutter, playwright, operator) — `operator` ONLY for attended 
+human work, never as a default — or set `routing_law: off` on this feature.

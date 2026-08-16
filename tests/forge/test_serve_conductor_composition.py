@@ -1670,3 +1670,316 @@ class TestTheDurableOneCardLatch:
                 details={"gate_pause": {"request_id": "r", "attempt_count": 0}},
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# The routing law's close-side check (card Q8/A.2, second half) — the
+# ``stamps_satisfied`` leg on the merge-ready checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str, when: str | None = None) -> str:
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+    )
+    if when:
+        env["GIT_AUTHOR_DATE"] = when
+        env["GIT_COMMITTER_DATE"] = when
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True, env=env
+    ).stdout
+
+
+def _write_f4_envelope(
+    worktree: Path, run_id: str, *, started: str, verdict: str = "pass", hurl_exit: int = 0
+) -> Path:
+    import json
+
+    history = worktree / "qa" / "gates" / "history"
+    history.mkdir(parents=True, exist_ok=True)
+    out = history / f"{run_id}.json"
+    out.write_text(
+        json.dumps(
+            {
+                "format_version": "1.0",
+                "run_id": run_id,
+                "feature_id": "FEAT-G",
+                "target_env": "local",
+                "started": started,
+                "finished": started,
+                "preflight": {"checks": [], "instrument_ok": True},
+                "gates": [
+                    {"gate_id": "health", "exit_code": 0, "assertions": []},
+                    {"gate_id": "hurl-twins", "exit_code": hurl_exit, "assertions": []},
+                ],
+                "verdict": verdict,
+            }
+        )
+    )
+    return out
+
+
+@pytest.fixture
+def stamped_repo(tmp_path: Path) -> "dict[str, Any]":
+    """A fixture repo pair: a CANONICAL checkout carrying the stamped feature
+    YAML (the plan of record) and a fix-branch WORKTREE that is a real git
+    repo with one code commit at 10:00Z — plus a build row pointing at both.
+    """
+    canonical = tmp_path / "canonical"
+    features = canonical / ".guardkit" / "features"
+    features.mkdir(parents=True)
+    (features / "FEAT-G.yaml").write_text(
+        "id: FEAT-G\n"
+        "name: sign-in\n"
+        "routing_law: enforced\n"
+        "feature_files:\n"
+        "  - features/sign-in.feature\n"
+        "scenarios:\n"
+        "  'User signs in with valid credentials': hurl\n"
+        "  'Rate limiter refuses the 6th attempt':\n"
+        "    verifier: toolchain\n"
+        "    test_ref: test_rate_limiter_refuses_sixth\n"
+        "  'Owner reads the merge card in Slack': operator\n"
+    )
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    _git(worktree, "init", "-q", "-b", "fix/g")
+    (worktree / "app.py").write_text("print('fix')\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-q", "-m", "the fix", when="2026-08-15T10:00:00+00:00")
+
+    cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "gates.db")
+    migrations.apply_at_boot(cx)
+    cx.execute(
+        "INSERT INTO builds (build_id, feature_id, repo, branch, "
+        "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
+        "started_at, worktree_path, mode, task_id) VALUES (?, 'FEAT-G', "
+        "'org/target', 'fix/g', 'f.yaml', 'RUNNING', 'cli', 'corr-g', "
+        "'2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', ?, 'mode-c', "
+        "'TASK-G')",
+        (BUILD_ID, str(worktree)),
+    )
+    cx.commit()
+    return {
+        "pool": SqliteLifecyclePersistence(connection=cx),
+        "canonical": canonical,
+        "worktree": worktree,
+    }
+
+
+class TestTheRoutingLawCloseSide:
+    """Card A.2 second half: stamped verifier did not run = ABSENT = no card.
+
+    Every test here runs the REAL default leg (``make_stamps_leg()`` — real
+    YAML reader, real envelope reader, real git) through the REAL reader and,
+    for the checkpoint-level cases, the REAL ``MergeReadyCheckpointPublisher``.
+    Only the declared toolchain command is faked (exit 0, subprocess-free).
+    """
+
+    @staticmethod
+    def _reader(repo: "dict[str, Any]") -> Any:
+        from forge.cli._serve_conductor import make_gates_green_reader
+
+        def _green_suite(*, command: str, cwd: Any, timeout_seconds: int):
+            return 0, f"`{command}` exited 0"
+
+        return make_gates_green_reader(
+            pool=repo["pool"],
+            config=_gates_config({"org/target": str(repo["canonical"])}),
+            declaration_loader=lambda _root: _Declaration("uv run pytest -q"),
+            command_runner=_green_suite,
+        )
+
+    @staticmethod
+    def _submit(repo: "dict[str, Any]", reader: Any, published: list) -> Any:
+        from forge.cli._serve_conductor import make_merge_ready_checkpoint
+
+        checkpoint = make_merge_ready_checkpoint(
+            pool=repo["pool"],
+            publish_card=lambda **kw: published.append(kw) or "RESUMED",
+            gates_green_reader=reader,
+            published_probe=lambda _bid: False,
+        )
+        return asyncio.run(
+            checkpoint.submit_decision(
+                build_id=BUILD_ID, feature_id="FEAT-G", auto_approve=False, rationale="r"
+            )
+        )
+
+    def test_a_green_suite_with_a_hurl_stamp_and_no_envelope_is_absent_no_card(
+        self, stamped_repo: "dict[str, Any]"
+    ) -> None:
+        """THE close-side check: the suite is green, the card is still refused,
+        and the detail names the scenario and the missing home in plain words."""
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.UNKNOWN
+        assert report.failed_gates == (
+            "routing law: hurl (scenario 'User signs in with valid credentials')",
+        )
+        assert "'User signs in with valid credentials'" in report.detail
+        assert "`verifier: hurl`" in report.detail
+        assert "no results envelope exists under" in report.detail
+        assert "ABSENT is UNKNOWN, and UNKNOWN publishes no merge card" in report.detail
+        # The operator scenario is LISTED even on a blocked close.
+        assert "ATTENDED" in report.detail
+        assert "'Owner reads the merge card in Slack'" in report.detail
+        # And the suite's own green is stated so nobody goes looking for a red test.
+        assert "The declared suite itself is green" in report.detail
+
+        published: list[dict[str, Any]] = []
+        decision = self._submit(stamped_repo, self._reader(stamped_repo), published)
+        assert decision.card_published is False
+        assert published == []
+        assert "no card" in decision.rationale
+
+    def test_a_stale_envelope_is_absent_no_card(self, stamped_repo: "dict[str, Any]") -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        _write_f4_envelope(
+            stamped_repo["worktree"], "FEAT-G-local-stale", started="2026-08-15T09:00:00+00:00"
+        )
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.UNKNOWN
+        assert "STALE" in report.detail
+        assert "FEAT-G-local-stale" in report.detail
+
+    def test_a_fresh_green_hurl_envelope_publishes_the_card_and_lists_attended(
+        self, stamped_repo: "dict[str, Any]"
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        _write_f4_envelope(
+            stamped_repo["worktree"], "FEAT-G-local-fresh", started="2026-08-15T10:00:01+00:00"
+        )
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.GREEN
+        assert "all 3 stamped scenario(s)" in report.detail
+        assert "hurl: 1" in report.detail and "toolchain: 1" in report.detail
+        assert "FEAT-G-local-fresh" in report.detail
+        # operator: satisfied by declaration, LOGGED attended in the card text
+        assert "ATTENDED" in report.detail
+        assert "'Owner reads the merge card in Slack'" in report.detail
+
+        published: list[dict[str, Any]] = []
+        decision = self._submit(stamped_repo, self._reader(stamped_repo), published)
+        assert decision.card_published is True
+        assert len(published) == 1
+        assert published[0]["gates"].status is GateStatus.GREEN
+
+    def test_a_fresh_envelope_whose_hurl_gate_failed_is_absent(
+        self, stamped_repo: "dict[str, Any]"
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        _write_f4_envelope(
+            stamped_repo["worktree"],
+            "FEAT-G-local-red",
+            started="2026-08-15T10:00:01+00:00",
+            verdict="fail",
+            hurl_exit=1,
+        )
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.UNKNOWN
+        assert "verdict `fail`, not `pass`" in report.detail
+
+    def test_no_stamps_is_not_enforced_and_the_report_is_untouched(
+        self, stamped_repo: "dict[str, Any]"
+    ) -> None:
+        """Backward compatibility: a feature with no stamps reads exactly what
+        the toolchain leg said — same status, same detail, no routing-law text."""
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        feature = stamped_repo["canonical"] / ".guardkit" / "features" / "FEAT-G.yaml"
+        feature.write_text("id: FEAT-G\nname: sign-in\ntasks: []\n")
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.GREEN
+        assert report.detail == "`uv run pytest -q` exited 0"
+
+    def test_no_feature_yaml_at_all_is_not_enforced(self, stamped_repo: "dict[str, Any]") -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        (stamped_repo["canonical"] / ".guardkit" / "features" / "FEAT-G.yaml").unlink()
+        report = self._reader(stamped_repo)(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.GREEN
+        assert report.detail == "`uv run pytest -q` exited 0"
+
+    def test_a_red_suite_never_reaches_the_stamps_leg(self, stamped_repo: "dict[str, Any]") -> None:
+        """Order of decision: a red suite is RED (fix loop), not UNKNOWN."""
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list[str] = []
+
+        def _leg(**kw: Any):
+            calls.append("leg")
+            raise AssertionError("must not be reached")
+
+        reader = make_gates_green_reader(
+            pool=stamped_repo["pool"],
+            config=_gates_config({"org/target": str(stamped_repo["canonical"])}),
+            declaration_loader=lambda _root: _Declaration("uv run pytest -q"),
+            command_runner=lambda **_kw: (1, "exited 1"),
+            stamps_leg=_leg,
+        )
+        report = reader(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.RED
+        assert calls == []
+
+    def test_a_raising_leg_is_unknown_never_green(self, stamped_repo: "dict[str, Any]") -> None:
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        def _leg(**kw: Any):
+            raise RuntimeError("stamps reader on fire")
+
+        reader = make_gates_green_reader(
+            pool=stamped_repo["pool"],
+            config=_gates_config({"org/target": str(stamped_repo["canonical"])}),
+            declaration_loader=lambda _root: _Declaration("uv run pytest -q"),
+            command_runner=lambda **_kw: (0, "exited 0"),
+            stamps_leg=_leg,
+        )
+        report = reader(build_id=BUILD_ID, branch="fix/g")
+        assert report.status is GateStatus.UNKNOWN
+        assert "stamps reader on fire" in report.detail
+
+    def test_the_leg_receives_the_canonical_root_the_worktree_and_the_branch(
+        self, stamped_repo: "dict[str, Any]"
+    ) -> None:
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.pipeline.routing_stamps import StampsStatus, StampsVerdict
+
+        seen: list[dict[str, Any]] = []
+
+        def _leg(**kw: Any):
+            seen.append(kw)
+            return StampsVerdict(status=StampsStatus.NOT_ENFORCED)
+
+        reader = make_gates_green_reader(
+            pool=stamped_repo["pool"],
+            config=_gates_config({"org/target": str(stamped_repo["canonical"])}),
+            declaration_loader=lambda _root: _Declaration("uv run pytest -q"),
+            command_runner=lambda **_kw: (0, "exited 0"),
+            stamps_leg=_leg,
+        )
+        reader(build_id=BUILD_ID, branch="fix/g")
+        assert seen == [
+            {
+                "feature_id": "FEAT-G",
+                "repo_root": str(stamped_repo["canonical"]),
+                "worktree": str(stamped_repo["worktree"]),
+                "branch": "fix/g",
+                "toolchain_green": True,
+            }
+        ]

@@ -1,0 +1,8 @@
+WARNING:guardkit.orchestrator.stamp_normalizer:stamp normalizer: plan task doc tasks/backlog/time-endpoint/TASK-TIME-001-add-time-endpoint.md could not be read ([Errno 2] No such file or directory: 'tasks/backlog/time-endpoint/TASK-TIME-001-add-time-endpoint.md') — its test_ref / test nodes are NOT available to R8
+WARNING:guardkit.orchestrator.stamp_normalizer:STAMP NORMALIZER: feature FEAT-TIME — 2 scenario(s) UNDECIDABLE by rule (no home invented, none written for these): The moon is made of a very particular kind of cheese that no rule family in the design has ever heard about at all; Another undecidable one
+INFO:guardkit.orchestrator.stamp_normalizer:STAMP NORMALIZER: feature FEAT-TIME — 4 scenario(s) stamped by rule, 0 already stamped (untouched); wrote .guardkit/features/FEAT-TIME.yaml
+! normalize-stamps PARTIAL: 2 scenario(s) undecidable by rule (no home invented;
+decided stamps written):
+  - The moon is made of a very particular kind of cheese that no rule family in 
+the design has ever heard about at all
+  - Another undecidable one
