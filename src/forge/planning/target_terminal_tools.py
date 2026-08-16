@@ -1330,6 +1330,8 @@ class FeatureFilesFill:
     yaml_rel: str
     feature_files: tuple[str, ...] = ()
     reason: str = ""
+    #: condition 4: a present model list that omits forge's committed spec path
+    inconsistent: bool = False
 
 
 #: click's usage error for a subcommand the installed guardkit does not have
@@ -1523,6 +1525,23 @@ def classify_normalizer_result(
 _FEATURE_FILES_KEY_RE = re.compile(r"^feature_files\s*:", re.MULTILINE)
 
 
+def _committed_paths_missing_from_declared(
+    yaml_text: str, committed: Sequence[str]
+) -> list[str]:
+    """Which of forge's committed spec paths are absent from a PRESENT
+    ``feature_files:`` list (substring match on the normalised path)."""
+    declared_block = yaml_text.split("feature_files:", 1)[1] if "feature_files:" in yaml_text else ""
+    declared_block = declared_block.split("\n\n", 1)[0]
+    norm = lambda x: str(x).strip().strip("'\"").lstrip("./")
+    declared = norm(declared_block)
+    # An EMPTY present list ({}, [], ~, null, or nothing) is the plan-writer's
+    # statement and is left alone (condition 2) — only a NON-EMPTY list that
+    # omits forge's committed path is inconsistent (condition 4).
+    if not any(line.strip().startswith("- ") for line in declared_block.splitlines()):
+        return []
+    return [c for c in committed if norm(c) not in declared]
+
+
 def declare_feature_files_if_absent(
     worktree_path: Path, feature_id: str, feature_paths: Sequence[str]
 ) -> FeatureFilesFill:
@@ -1555,6 +1574,22 @@ def declare_feature_files_if_absent(
     except OSError as exc:
         return FeatureFilesFill(False, rel, reason=f"unreadable: {exc}")
     if _FEATURE_FILES_KEY_RE.search(text):
+        # Coordinator condition 4 (review, 08-16): a PRESENT model-written list
+        # that omits the path forge itself committed the spec to is a real
+        # inconsistency — refuse LOUD here; never silently add to it.
+        missing = _committed_paths_missing_from_declared(text, paths)
+        if missing:
+            return FeatureFilesFill(
+                False,
+                rel,
+                reason=(
+                    "feature_files: declared by the plan-writer but it does NOT "
+                    "name the spec .feature forge committed on this branch: "
+                    + ", ".join(missing)
+                    + " — inconsistent plan; refusing (not silently added)"
+                ),
+                inconsistent=True,
+            )
         return FeatureFilesFill(False, rel, reason="feature_files: already declared")
     if not text.endswith("\n"):
         text += "\n"

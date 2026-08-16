@@ -2803,6 +2803,11 @@ class PlanningRunDriver:
                 ),
             )
         fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
+        if fill.inconsistent:
+            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
+            # a plan whose feature_files: contradicts forge's own spec commit.
+            logger.error("stamp normalizer hook: %s", fill.reason)
+            return StampNormalizerOutcome(status="refused", detail=fill.reason)
         try:
             outcome = await normalize(worktree, feature_id)
         except asyncio.CancelledError:
