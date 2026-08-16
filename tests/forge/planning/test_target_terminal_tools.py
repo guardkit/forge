@@ -1468,7 +1468,7 @@ def test_fill_declares_feature_files_when_the_plan_writer_omitted_it(tmp_path: P
 
 def test_fill_leaves_a_present_key_alone_even_when_empty(tmp_path: Path) -> None:
     for body in (
-        "id: FEAT-A\nfeature_files:\n  - features/a/a.feature\ntasks: []\n",
+        "id: FEAT-A\nfeature_files:\n  - features/x/x.feature\ntasks: []\n",
         "id: FEAT-A\nfeature_files: []\ntasks: []\n",
         "id: FEAT-A\nfeature_files:\ntasks: []\n",
     ):
@@ -1604,3 +1604,41 @@ async def test_live_guardkit_normalize_stamps_written_refused_and_not_found(tmp_
     # (4) cannot run — no such feature file.
     out4 = await normalize(wt, "FEAT-NOPE")
     assert out4.status == "failed" and "feature file not found" in out4.detail
+
+
+def test_fill_refuses_loud_when_a_present_list_omits_forges_committed_spec(
+    tmp_path: Path,
+) -> None:
+    """Coordinator review condition 4 (08-16): a PRESENT model-written
+    ``feature_files:`` that does not name the spec forge itself committed is a
+    real inconsistency — refuse loudly, never silently add to it."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files:\n  - features/other/other.feature\ntasks: []\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is True
+    assert "does NOT name the spec .feature forge committed" in fill.reason
+    assert "features/user-search/user-search.feature" in fill.reason
+
+
+def test_fill_accepts_a_present_list_that_names_forges_committed_spec(
+    tmp_path: Path,
+) -> None:
+    """The consistent case: the model wrote the list AND it carries forge's
+    committed path — left alone, not inconsistent, not fired."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files:\n  - features/user-search/user-search.feature\ntasks: []\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is False
+    assert fill.reason == "feature_files: already declared"
