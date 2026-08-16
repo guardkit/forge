@@ -39,6 +39,7 @@ References: TASK-MP-012, FEAT-SPL-002, DF-009, RT-04, RT-08, DDR-007.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -101,6 +102,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.planning.checkpoint import SecondOpinionProvider
     from forge.planning.target_terminal_tools import (
         NormalizeFeatureSpecFn,
+        NormalizeStampsFn,
+        StampNormalizerOutcome,
         ValidateFeaturePlanFn,
         ValidateGateRegistryFn,
         ValidatePassBarFn,
@@ -558,6 +561,16 @@ class PlanningDriverDeps:
     dispatch_feature_plan: DispatchFeaturePlanFn | None = None
     normalize_feature_spec: "NormalizeFeatureSpecFn | None" = None
     validate_feature_plan: "ValidateFeaturePlanFn | None" = None
+    # THE STAMP NORMALIZER (Rich's condition 1, 2026-08-16) — ``guardkit qa
+    # normalize-stamps`` run against the planning worktree immediately BEFORE
+    # the plan-commit ``feature validate``, so the rule-minted ``verifier:``
+    # stamps are WRITTEN on the planning branch and ride the plan commit.
+    # Optional / default None: unwired = the plan leg proceeds exactly as
+    # before and the plan receipts say ``not-wired`` (never silent). Wired, a
+    # refusal (undecidable titles) or a failure STOPS the run with a card
+    # naming the titles verbatim; an older guardkit without the subcommand
+    # continues (backward compatible until the rebake) and is receipted.
+    normalize_stamps: "NormalizeStampsFn | None" = None
     # Lane B / Phase E1 (B4 round-19, Rich-ratified) — the guardkit ``qa validate
     # pass-bar`` oracle. Optional / default None: with the flag OFF it is never
     # consulted. With the flag ON the per-task QA pass-bar registration leg
@@ -2635,8 +2648,27 @@ class PlanningRunDriver:
             )
 
         validate = deps.validate_feature_plan
+        # THE STAMP NORMALIZER (Rich's condition 1): the committed spec
+        # ``.feature`` path(s) are the scenario universe forge can name when
+        # the plan-writer omitted ``feature_files:``.
+        spec_feature_paths = [
+            str(rel) for rel in spec_files if str(rel).endswith(".feature")
+        ]
+        stamp_state: dict[str, Any] = {}
 
         async def _pre_commit(worktree: Path) -> PreCommitResult:
+            # Rich's condition 1 (2026-08-16): the verifier stamps are WRITTEN
+            # on the planning branch BEFORE validate — the normalizer runs
+            # here, against the materialised worktree, so what it writes
+            # rides the plan commit and validate reads the stamped YAML.
+            stamps = await self._stamp_normalizer_step(
+                worktree, feature_id, spec_feature_paths
+            )
+            stamp_state["outcome"] = stamps
+            if stamps.stops_the_run:
+                return PreCommitResult(
+                    ok=False, detail=f"stamp normalizer {stamps.status}: {stamps.detail}"
+                )
             outcome = await validate(worktree, feature_id)
             return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
 
@@ -2659,6 +2691,26 @@ class PlanningRunDriver:
             )
             return False
         if gitres.status == "failed":
+            stamps = stamp_state.get("outcome")
+            if stamps is not None and stamps.stops_the_run:
+                # The normalizer stopped the run — the card names the refused
+                # titles VERBATIM (or the reason it could not run); the
+                # machine record keeps the internal reason.
+                await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_PLAN_STAGE,
+                    f"stamp normalizer {stamps.status} for {feature_id}: "
+                    f"{stamps.detail}"
+                    + (
+                        f"; refused titles: {list(stamps.refused_titles)!r}"
+                        if stamps.refused_titles
+                        else ""
+                    ),
+                    owner_message=self._stamp_normalizer_card(
+                        correlation_id, feature_id, stamps
+                    ),
+                )
+                return False
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
@@ -2666,27 +2718,35 @@ class PlanningRunDriver:
             )
             return False
 
+        stamps = stamp_state.get("outcome")
+        # The plan receipts carry the normalizer's outcome whichever way it
+        # went — written / nothing-to-do / unavailable / not-wired — so a
+        # plan committed WITHOUT stamps is never silent about it. (An
+        # idempotent RT-08 short-circuit that never ran the hook leaves the
+        # key absent, honestly.)
+        stamp_receipt = stamps.receipt() if stamps is not None else None
+        details: dict[str, Any] = {
+            "feature_id": feature_id,
+            "slug": slug,
+            "plan_files": sorted(files),
+            "target_repo": target_repo,
+            "branch": branch,
+            "sha": gitres.sha,
+        }
+        if stamp_receipt is not None:
+            details["stamp_normalizer"] = stamp_receipt
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,
             status="approved",
             actor_identity="planning-driver",
-            details_json=json.dumps(
-                {
-                    "feature_id": feature_id,
-                    "slug": slug,
-                    "plan_files": sorted(files),
-                    "target_repo": target_repo,
-                    "branch": branch,
-                    "sha": gitres.sha,
-                }
-            ),
+            details_json=json.dumps(details),
         )
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id}: machine spec + plan complete and "
-            f"validated (feature {feature_id}, branch {branch}); queueing the "
-            "build.",
+            f"validated (feature {feature_id}, branch {branch})"
+            f"{self._stamp_normalizer_clause(stamps)}; queueing the build.",
             level="info",
         )
         logger.info(
@@ -2696,6 +2756,135 @@ class PlanningRunDriver:
             feature_id,
         )
         return True
+
+    async def _stamp_normalizer_step(
+        self,
+        worktree: Path,
+        feature_id: str,
+        spec_feature_paths: list[str],
+    ) -> "StampNormalizerOutcome":
+        """Run THE STAMP NORMALIZER against the planning worktree (pre-validate).
+
+        Rich's condition 1 (2026-08-16): the ``verifier:`` stamps are WRITTEN
+        on the planning branch before validate. Two things happen here, in
+        order, both loud:
+
+        1. if the plan YAML declares no ``feature_files:`` at all, forge writes
+           the committed spec ``.feature`` path(s) into it — the universe the
+           normalizer reads is explicit, and forge is the party that knows it
+           (it committed that file one leg earlier; live 008 plans omit the
+           key — api_test FEAT-F924);
+        2. ``guardkit qa normalize-stamps --feature <id> --repo <worktree>``
+           via the frozen guardkit seam. Written / nothing-to-do → proceed to
+           validate; refused / failed → the leg stops with a card;
+           unavailable (older guardkit, no such subcommand) → log
+           ``normalizer unavailable`` and proceed, receipted; not wired →
+           proceed, receipted.
+
+        Never raises.
+        """
+        from forge.planning.target_terminal_tools import (
+            StampNormalizerOutcome,
+            declare_feature_files_if_absent,
+        )
+
+        normalize = self._deps.normalize_stamps
+        if normalize is None:
+            logger.info(
+                "stamp normalizer hook: not wired for %s — the plan is "
+                "committed as the plan-writer wrote it (receipted)",
+                feature_id,
+            )
+            return StampNormalizerOutcome(
+                status="not-wired",
+                detail=(
+                    "no normalize_stamps collaborator wired; verifier stamps were "
+                    "NOT minted by forge for this plan"
+                ),
+            )
+        fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
+        try:
+            outcome = await normalize(worktree, feature_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — collaborator boundary
+            logger.exception("stamp normalizer hook raised for %s", feature_id)
+            outcome = StampNormalizerOutcome(
+                status="failed",
+                detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
+            )
+        if fill.fired:
+            outcome = dataclasses.replace(
+                outcome, feature_files_filled=tuple(fill.feature_files)
+            )
+        if outcome.status == "unavailable":
+            logger.warning(
+                "stamp normalizer hook: normalizer unavailable for %s — %s",
+                feature_id,
+                outcome.detail,
+            )
+        return outcome
+
+    @staticmethod
+    def _stamp_normalizer_clause(stamps: "StampNormalizerOutcome | None") -> str:
+        """The owner-facing clause on the plan-complete line — plain words."""
+        if stamps is None:
+            return ""
+        if stamps.status == "written":
+            n = len(stamps.stamped) or (stamps.stamps_on_branch or 0)
+            return f"; {n} verifier stamp(s) minted by rule and committed with the plan"
+        if stamps.status == "nothing-to-do":
+            return "; every scenario already carried its verifier stamp"
+        if stamps.status == "unavailable":
+            return (
+                "; verifier stamps NOT minted — this guardkit predates the stamp "
+                "normalizer (rebake pending), so the plan is unstamped"
+            )
+        return ""
+
+    @staticmethod
+    def _stamp_normalizer_card(
+        correlation_id: str, feature_id: str, stamps: "StampNormalizerOutcome"
+    ) -> str:
+        """The owner's card when THE STAMP NORMALIZER stops the run.
+
+        Names every refused title VERBATIM (the rule could not decide which
+        verifier proves it and there is no fallback home), says nothing was
+        stamped and nothing was built, and says what a person does next — in
+        plain words, the vocabulary named once. A cannot-run failure names the
+        reason instead.
+        """
+        from forge.pipeline.routing_stamps import VERIFIER_HOMES
+
+        head = (
+            f"Planning run {correlation_id} stopped at "
+            f"{plain_stage_name(_FEATURE_PLAN_STAGE)}"
+        )
+        if stamps.status == "refused" and stamps.refused_titles:
+            titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
+            n = len(stamps.refused_titles)
+            recovered = (
+                " (titles read back from the normalizer's wrapped console echo; "
+                "compare against the spec)"
+                if stamps.titles_recovered_from_console_echo
+                else ""
+            )
+            return (
+                f"{head}: the verifier stamps could not all be minted by rule for "
+                f"feature {feature_id}. {n} scenario(s) had no rule to decide "
+                f"which verifier proves them, and there is no fallback home, so "
+                f"nothing was stamped and nothing was built{recovered}:\n"
+                f"{titles}\n"
+                f"What to do: give each of these scenarios a verifier by hand in "
+                f".guardkit/features/{feature_id}.yaml under scenarios: — one of "
+                f"{', '.join(VERIFIER_HOMES)} (operator only for attended human "
+                f"work, never as a default) — then re-run the request."
+            )
+        return (
+            f"{head}: the verifier-stamp normalizer could not run for feature "
+            f"{feature_id}, so the plan was not stamped and nothing was built. "
+            f"Reason: {stamps.detail}"
+        )
 
     async def _build_trigger_leg(self, row: Any, correlation_id: str) -> bool:
         """B3 build trigger: queue the validated feature, advance to BUILD_QUEUED.
