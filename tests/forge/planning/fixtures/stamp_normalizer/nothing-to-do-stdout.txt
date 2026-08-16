@@ -1,0 +1,22 @@
+{
+  "feature_id": "FEAT-TIME",
+  "feature_yaml_path": "/wt/.guardkit/features/FEAT-TIME.yaml",
+  "feature_files": [
+    "features/time-endpoint/time-endpoint.feature"
+  ],
+  "stamped": {},
+  "test_refs": {},
+  "rules": {},
+  "reasons": {},
+  "refused": [],
+  "already_stamped": [
+    "Reading the current server time",
+    "The time is fresh on every request",
+    "Write methods are rejected",
+    "The endpoint is unaffected by database unavailability"
+  ],
+  "written": false,
+  "dry_run": false,
+  "repo_has_http_surface": true,
+  "http_surface_evidence": "qa/gates/registry.yaml gate 'hurl-twins'"
+}

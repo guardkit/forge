@@ -427,6 +427,7 @@ def _make_driver(
     pass_bar_validate_fn: Any | None = None,
     gate_registry_validate: Any | None = None,
     gate_registry_validate_fn: Any | None = None,
+    normalize_stamps_fn: Any | None = None,
     wire_legs: bool = True,
     build_trigger_result: Any | None = None,
     build_trigger_fn: Any | None = None,
@@ -532,6 +533,7 @@ def _make_driver(
 
     async def _validate(worktree: Path, feature_id: str) -> ToolOutcome:
         counters["validate"] += 1
+        counters.setdefault("order", []).append("validate")
         # A dynamic oracle (e.g. the real guardkit smoke-gate path check that
         # inspects the worktree) takes precedence over a static ToolOutcome.
         if validate_fn is not None:
@@ -617,6 +619,9 @@ def _make_driver(
         dispatch_feature_plan=(plan_dispatch or _dispatch_plan) if wire_legs else None,
         normalize_feature_spec=_normalize if wire_legs else None,
         validate_feature_plan=_validate if wire_legs else None,
+        # THE STAMP NORMALIZER hook: unwired by default (the not-wired path,
+        # receipted); the stamp tests inject their own.
+        normalize_stamps=normalize_stamps_fn,
         validate_pass_bar=_validate_pass_bar if wire_legs else None,
         validate_gate_registry=_validate_gate_registry if wire_legs else None,
         dispatch_build_trigger=(
@@ -2985,3 +2990,437 @@ def test_descriptor_degrades_shape_correctly_without_guardkit(
         "appmilla/api_test", str(repo)
     )
     assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+
+
+# ---------------------------------------------------------------------------
+# THE STAMP NORMALIZER hook (Rich's condition 1, 2026-08-16)
+#
+# ``guardkit qa normalize-stamps`` runs against the planning worktree
+# immediately BEFORE the plan-commit validate, so the rule-minted verifier
+# stamps are WRITTEN on the planning branch and ride the plan commit. Three
+# shapes: success writes + commits; refusal stops the run with a card naming
+# the titles verbatim; an older guardkit (no such subcommand) continues and is
+# receipted. Plus: forge declares ``feature_files:`` when the plan-writer
+# omitted it (the live 008 shape), and the not-wired path is receipted.
+# ---------------------------------------------------------------------------
+
+from forge.planning.target_terminal_tools import StampNormalizerOutcome  # noqa: E402
+
+_STAMP_SPEC_REL = "features/stats-endpoint/stats-endpoint.feature"
+
+
+def _plan_yaml_rel(feature_id: str) -> str:
+    return f".guardkit/features/{feature_id}.yaml"
+
+
+def _stamping_normalizer(counters_sink: dict[str, Any], *, outcome: Any = None):
+    """A fake normalize_stamps collaborator that behaves like guardkit's: it
+    WRITES ``scenarios:`` into the worktree's plan YAML (unless told to refuse /
+    be unavailable) and reports what it did. Records call order + the YAML it
+    saw so the tests can prove ordering and the feature_files fill."""
+
+    async def _normalize(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
+        counters_sink.setdefault("order", []).append("normalize_stamps")
+        yaml_path = worktree / _plan_yaml_rel(feature_id)
+        counters_sink["yaml_seen"] = yaml_path.read_text(encoding="utf-8") if yaml_path.is_file() else None
+        counters_sink["worktree"] = str(worktree)
+        if outcome is not None:
+            return outcome
+        # guardkit's write_stamps shape: append the scenarios map.
+        text = counters_sink["yaml_seen"] or ""
+        text += 'scenarios:\n  "ok":\n    verifier: "hurl"\n'
+        yaml_path.write_text(text, encoding="utf-8")
+        return StampNormalizerOutcome(
+            status="written",
+            detail="1 scenario(s) stamped by rule, 0 already stamped (untouched)",
+            stamped={"ok": "hurl"},
+        )
+
+    return _normalize
+
+
+def _share_order(sink: dict[str, Any], h: _Harness) -> None:
+    """One call-order list across the fake normalizer and the harness's
+    validate, so a test can assert normalizer-then-validate."""
+    sink["order"] = h.ctx["counters"].setdefault("order", [])
+
+
+def _show(repo: Path, branch: str, path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "show", f"{branch}:{path}"], cwd=repo, capture_output=True, text=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_success_writes_stamps_that_ride_the_plan_commit(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Hook success: the normalizer runs BEFORE validate against the planning
+    worktree; what it wrote (the ``scenarios:`` map) and forge's own
+    ``feature_files:`` fill are ON THE BRANCH in the plan commit; the plan
+    receipts and the owner line say so."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink),
+    )
+    _share_order(sink, h)
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    branch = f"planning/{CID}"
+    committed = _show(repo, branch, _plan_yaml_rel(feature_id))
+    assert committed.returncode == 0, committed.stderr
+    # (1) the normalizer's write rides the plan commit — Rich's condition 1.
+    assert 'scenarios:\n  "ok":\n    verifier: "hurl"' in committed.stdout
+    # (2) forge declared the universe the plan-writer omitted: the committed
+    #     spec .feature path, appended before the normalizer ran.
+    assert "feature_files:" in committed.stdout
+    assert f'  - "{_STAMP_SPEC_REL}"' in committed.stdout
+    assert "feature_files:" in (sink["yaml_seen"] or "")  # fill BEFORE the hook
+    # (3) ordering: normalizer, then validate — validate read the stamped tree.
+    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
+    assert h.ctx["counters"]["validate"] == 1
+    # (4) receipts: the durable feature-plan event names what happened.
+    details = _leg_details(store, "feature-plan")
+    rec = details["stamp_normalizer"]
+    assert rec["status"] == "written"
+    assert rec["stamped"] == {"ok": "hurl"}
+    assert rec["stamped_count"] == 1
+    assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
+    # (5) the owner line, plain words.
+    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
+    assert plan_lines and "1 verifier stamp(s) minted by rule and committed with the plan" in plan_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_refusal_stops_the_run_with_the_titles_on_the_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Refusal (undecidable titles): the run STOPS at the plan leg, validate is
+    never reached, the plan is NOT committed, and the owner's card names every
+    refused title VERBATIM plus what to do."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    titles = (
+        "The moon is made of a very particular kind of cheese that no rule "
+        "family in the design has ever heard about at all",
+        "Another undecidable one",
+    )
+    refusal = StampNormalizerOutcome(
+        status="refused",
+        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
+        refused_titles=titles,
+    )
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=refusal),
+    )
+    _share_order(sink, h)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    # validate never ran — the normalizer refused BEFORE it.
+    assert h.ctx["counters"]["validate"] == 0
+    assert h.ctx["counters"]["order"] == ["normalize_stamps"]
+    # nothing was committed on the plan side (the spec leg's commit stands).
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    branch = f"planning/{CID}"
+    assert _show(repo, branch, _plan_yaml_rel(feature_id)).returncode != 0
+    assert _show(repo, branch, _STAMP_SPEC_REL).returncode == 0
+    # the card: plain stage name, both titles verbatim, what to do, nothing built.
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1
+    card = errors[0]
+    assert card.startswith(f"Planning run {CID} stopped at writing the task plan")
+    for t in titles:
+        assert f"  - {t}" in card
+    assert "no rule to decide which verifier proves them" in card
+    assert "nothing was stamped and nothing was built" in card
+    assert f".guardkit/features/{feature_id}.yaml" in card
+    assert "toolchain, hurl, exam, probe:bus, probe:process, flutter, playwright, operator" in card
+    assert "operator only for attended human work" in card
+    # the machine record keeps the internal reason + the titles.
+    run = store.get_run(CID)
+    assert "stamp normalizer refused" in (run["error"] or "")
+    assert titles[1] in (run["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_unavailable_continues_and_is_receipted(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An older guardkit (no ``qa normalize-stamps``): the run CONTINUES to
+    validate + commit + BUILD_QUEUED (backward compatible until the rebake),
+    the log says 'normalizer unavailable', and the plan receipts + owner line
+    say the plan is unstamped — never silent."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    unavailable = StampNormalizerOutcome(
+        status="unavailable",
+        detail=(
+            "normalizer unavailable: the guardkit on this image has no "
+            "`qa normalize-stamps` subcommand (Error: No such command "
+            "'normalize-stamps'.); verifier stamps were NOT minted"
+        ),
+    )
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=unavailable),
+    )
+    _share_order(sink, h)
+    with caplog.at_level("WARNING", logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
+    assert any("normalizer unavailable" in r.getMessage() for r in caplog.records)
+    details = _leg_details(store, "feature-plan")
+    rec = details["stamp_normalizer"]
+    assert rec["status"] == "unavailable"
+    assert "No such command" in rec["detail"]
+    assert rec["stamped_count"] == 0
+    # the plan committed WITHOUT scenarios: (honest) but WITH forge's
+    # feature_files: fill (the universe is on the branch for the rebaked run).
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
+    assert "scenarios:" not in committed
+    assert "feature_files:" in committed
+    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
+    assert plan_lines and "verifier stamps NOT minted" in plan_lines[0]
+    assert "rebake pending" in plan_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_failure_stops_the_run_with_the_reason(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A cannot-run failure (not a refusal, not unavailable) is loud: the run
+    stops, validate never runs, the card names the reason."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    failed = StampNormalizerOutcome(
+        status="failed",
+        detail="guardkit qa normalize-stamps could not run (exit 2): stamp normalizer: feature FEAT-X: `feature_files:` must be a list",
+    )
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer({}, outcome=failed),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["validate"] == 0
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1
+    assert "the verifier-stamp normalizer could not run" in errors[0]
+    assert "`feature_files:` must be a list" in errors[0]
+    assert "nothing was built" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_not_wired_is_receipted_and_byte_identical_otherwise(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Unwired (hermetic composition): the plan leg proceeds exactly as before
+    (no fill, no write, validate runs) and the receipts say ``not-wired``."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["order"] == ["validate"]
+    details = _leg_details(store, "feature-plan")
+    assert details["stamp_normalizer"]["status"] == "not-wired"
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
+    assert "feature_files:" not in committed  # no fill when the hook is not wired
+    assert "scenarios:" not in committed
+
+
+@pytest.mark.asyncio
+async def test_stamp_normalizer_leaves_a_declared_feature_files_alone(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """When the plan-writer DID declare ``feature_files:`` forge does not touch
+    it (a present key is the writer's statement) — no fill in the receipts."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+
+    def _plan_with_universe(feature_id: str) -> Any:
+        r = _plan_result_native(feature_id)
+        r.role_output[_plan_yaml_rel(feature_id)] = (
+            f"id: {feature_id}\nfeature_files:\n  - {_STAMP_SPEC_REL}\n"
+            "tasks:\n- id: TASK-STAT-001\n"
+        )
+        return r
+
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_with_universe,
+        normalize_stamps_fn=_stamping_normalizer(sink),
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "written"
+    assert "feature_files_filled_by_forge" not in rec
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
+    assert committed.count("feature_files:") == 1
+
+
+# -- LIVE: the whole plan leg with the REAL guardkit normalizer ------------------
+#
+# Skips unless a guardkit checkout carrying the normalizer is reachable (see
+# tests/forge/planning/_live_guardkit.py). Real git (WorktreeGitRunner), the
+# real ``guardkit qa normalize-stamps`` CLI through the real parser, forge's
+# real ``feature_files:`` fill on a plan YAML shaped like the live 008 output
+# (no feature_files, no scenarios — api_test FEAT-F924) — and the plan commit
+# on the planning branch carries the rule-minted stamps. Rich's condition 1,
+# end to end.
+
+from tests.forge.planning._live_guardkit import live_guardkit_or_skip, live_run_fn  # noqa: E402
+
+_LIVE_TITLE = "The endpoint is unaffected by database unavailability"
+_LIVE_FEATURE = (
+    "Feature: stats\n"
+    f"  Scenario: {_LIVE_TITLE}\n"
+    "    Given the database is unavailable\n"
+    "    When I request the statistics\n"
+    "    Then the response is served from memory\n"
+)
+
+
+def _live_spec_result(slug: str = "stats-endpoint") -> Any:
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        role_output={
+            f"{slug}.feature": _LIVE_FEATURE,
+            f"{slug}_assumptions.yaml": "assumptions: []\n",
+            f"{slug}_summary.md": "# summary\n",
+            f"{slug}_digest.yaml": (
+                f"feature: {slug}\n"
+                "generated: '2026-08-16T10:00:00Z'\n"
+                "scenarios:\n"
+                f"- title: {_LIVE_TITLE}\n"
+                "  tags: []\n"
+                "  sentence: The endpoint keeps answering when the database is down.\n"
+                "assumptions: []\n"
+            ),
+            f"pass-bar-seed-{slug}.yaml": _AUTHLESS_SEED_YAML,
+            "validation.json": json.dumps(
+                {"accepted": True, "errors": [], "gates_run": ["gherkin_backstop"]}
+            ),
+        },
+        reason=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_plan_leg_commits_rule_minted_stamps_with_the_real_normalizer(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    from forge.planning.target_terminal_tools import make_normalize_stamps
+
+    checkout, python = live_guardkit_or_skip(Path(__file__))
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_live_spec_result(),
+        plan_result_factory=_plan_result_native,  # NO feature_files, NO scenarios
+        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
+    assert committed.returncode == 0, committed.stderr
+    data = yaml.safe_load(committed.stdout)
+    # forge's fill named the universe; guardkit's rule R1 minted the stamp;
+    # both are IN THE PLAN COMMIT on the planning branch.
+    assert data["feature_files"] == [_STAMP_SPEC_REL]
+    assert data["scenarios"] == {_LIVE_TITLE: {"verifier": "probe:process"}}
+    assert data["tasks"] == [{"id": "TASK-STAT-001"}]  # nothing else touched
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "written"
+    assert rec["stamped"] == {_LIVE_TITLE: "probe:process"}
+    assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
+    assert rec["stamps_on_branch"] == 1
+    assert h.ctx["counters"]["validate"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_plan_leg_refusal_card_names_the_real_normalizers_titles(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The default fixture feature ('Scenario: ok / Given a') is undecidable by
+    every rule — the REAL normalizer refuses, the run stops, the card names
+    'ok' verbatim, and no plan YAML reaches the branch."""
+    from forge.planning.target_terminal_tools import make_normalize_stamps
+
+    checkout, python = live_guardkit_or_skip(Path(__file__))
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["validate"] == 0
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).returncode != 0
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1
+    assert "  - ok\n" in errors[0]
+    assert "1 scenario(s) had no rule to decide which verifier proves them" in errors[0]
