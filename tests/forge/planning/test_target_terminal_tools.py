@@ -1819,3 +1819,47 @@ def test_fill_accepts_a_present_list_that_names_forges_committed_spec(
     assert fill.fired is False
     assert fill.inconsistent is False
     assert fill.reason == "feature_files: already declared"
+
+
+# ---------------------------------------------------------------------------
+# ADVISORY DISAGREEMENTS (Rich's ruling 08-18, drive-19 datum): the normalizer's
+# `disagreements` list rides through the classifier into the receipt, on ANY
+# status; malformed entries are dropped, never guessed.
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_carries_disagreements_on_a_nothing_to_do_success() -> None:
+    import json
+
+    payload = {
+        "feature_id": "FEAT-X",
+        "stamped": {},
+        "rules": {},
+        "already_stamped": ["A", "B", "C"],
+        "refused": [],
+        "written": False,
+        "disagreements": [
+            {"title": "A", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "the endpoint returns"},
+            {"title": "B", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "GET request to"},
+            {"not-a-title": "junk"},
+        ],
+    }
+    out = classify_normalizer_result(
+        "FEAT-X", status="success", exit_code=0, stdout_tail=json.dumps(payload, indent=2), stderr=""
+    )
+    assert out.status == "nothing-to-do"
+    assert len(out.disagreements) == 2  # the junk entry dropped
+    assert out.disagreements[0]["title"] == "A" and out.disagreements[0]["rule_home"] == "hurl"
+    rec = out.receipt()
+    assert rec["disagreement_count"] == 2
+    assert rec["disagreements"][1]["stamped"] == "toolchain"
+
+
+def test_classifier_disagreements_absent_when_the_normalizer_sent_none() -> None:
+    import json
+
+    payload = {"feature_id": "FEAT-X", "stamped": {"T": "hurl"}, "rules": {"T": "R9"}, "refused": [], "written": True}
+    out = classify_normalizer_result(
+        "FEAT-X", status="success", exit_code=0, stdout_tail=json.dumps(payload, indent=2), stderr=""
+    )
+    assert out.disagreements == () and "disagreements" not in out.receipt()
