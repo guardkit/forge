@@ -2750,6 +2750,17 @@ class PlanningRunDriver:
         # stamps is never silent about it. (An idempotent RT-08 short-circuit
         # that never ran the hook leaves the key absent, honestly.)
         stamp_receipt = stamps.receipt() if stamps is not None else None
+        if stamps is not None and stamps.disagreements:
+            # ADVISORY disagreements (Rich's ruling 08-18): named to the owner
+            # on their own plain line WHATEVER the status / enforcement — the
+            # stamps are never changed, so visibility is the whole mechanism.
+            stamp_receipt = dict(stamp_receipt or {})
+            dline = self._stamp_disagreements_line(stamps)
+            stamp_receipt["disagreements_line"] = dline
+            dsent = await self._notify(correlation_id, dline, level="info", mention=False)
+            stamp_receipt["disagreements_line_sent"] = (
+                "sent" if dsent == "sent" else "line not sent (no notifier)"
+            )
         if stamps is not None and stamps.is_failure and not stamps.enforced:
             # Coordinator condition 5: NOT ENFORCED → the plan PROCEEDED past
             # a partial / refused / failed normalizer. The owner gets ONE
@@ -2969,6 +2980,28 @@ class PlanningRunDriver:
             f"{n} of {m} examples could not be given a verification home by rule —\n"
             f"{titles}\n"
             "— the plan proceeds; this repo does not enforce the routing law yet"
+        )
+
+    @staticmethod
+    def _stamp_disagreements_line(stamps: "StampNormalizerOutcome") -> str | None:
+        """The ONE plain line the owner gets when the rules DISAGREE with a
+        stamp already on the plan (Rich's ruling 08-18, drive-19 datum): the
+        stamp is left exactly as written — this is visibility at zero
+        authority — so it goes out WHATEVER the status and whether or not the
+        repo enforces the law (a legal-but-wrong stamp passes the law). Plain
+        words, no rule ids, no @mention."""
+        if not stamps.disagreements:
+            return None
+        n = len(stamps.disagreements)
+        rows = "\n".join(
+            f"  - {d.get('title', '?')} — stamped {d.get('stamped', '?')}, "
+            f"the rules say {d.get('rule_home', '?')}"
+            for d in stamps.disagreements
+        )
+        return (
+            f"{n} example(s) carry a verification home the rules would not have chosen —\n"
+            f"{rows}\n"
+            "— the stamps stand as written (nothing was changed); worth a look before this feature graduates"
         )
 
     @staticmethod

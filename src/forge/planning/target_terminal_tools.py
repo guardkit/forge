@@ -1321,6 +1321,13 @@ class StampNormalizerOutcome:
     status: str
     detail: str = ""
     refused_titles: tuple[str, ...] = ()
+    #: ADVISORY (Rich's ruling 08-18, drive-19 datum): already-stamped titles
+    #: the rules would home DIFFERENTLY — {title, stamped, rule_home, rule,
+    #: evidence}. Never overwritten by anyone; named on the owner's plain
+    #: line and in the receipt whatever the status and whether or not the
+    #: repo enforces the law (a legal-but-wrong stamp passes the law — this
+    #: is how it stays visible).
+    disagreements: tuple[Mapping[str, str], ...] = ()
     stamped: Mapping[str, str] = field(default_factory=dict)  # title -> verifier
     rules: Mapping[str, str] = field(default_factory=dict)  # title -> rule id (R1..R10)
     already_stamped: tuple[str, ...] = ()
@@ -1397,6 +1404,9 @@ class StampNormalizerOutcome:
         }
         if self.rules:
             rec["rules"] = dict(self.rules)
+        if self.disagreements:
+            rec["disagreements"] = [dict(d) for d in self.disagreements]
+            rec["disagreement_count"] = len(self.disagreements)
         per_title = self.per_title()
         if per_title:
             rec["per_title"] = per_title
@@ -1549,6 +1559,18 @@ def _titles_from_console_echo(text: str, marker: str) -> list[str]:
     return titles
 
 
+def _coerce_disagreements(raw: Any) -> tuple[Mapping[str, str], ...]:
+    """The normalizer's ``disagreements`` list → a tuple of str→str maps
+    (title / stamped / rule_home / rule / evidence). Malformed entries are
+    dropped rather than guessed; a receipt reader, never a decider."""
+    out: list[Mapping[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("title"):
+                out.append({str(k): str(v) for k, v in item.items() if v is not None})
+    return tuple(out)
+
+
 def classify_normalizer_result(
     feature_id: str,
     *,
@@ -1602,6 +1624,7 @@ def classify_normalizer_result(
     already = tuple(str(t) for t in ((payload or {}).get("already_stamped") or []))
     written = (payload or {}).get("written")
     refused = tuple(str(t) for t in ((payload or {}).get("refused") or []))
+    disagreements = _coerce_disagreements((payload or {}).get("disagreements"))
     from_echo = bool((payload or {}).get("from_console_echo"))
     if status == "success" and exit_code == 0:
         if written is True or (written is None and stamped):
@@ -1614,6 +1637,7 @@ def classify_normalizer_result(
                 stamped=stamped,
                 rules=rules,
                 already_stamped=already,
+                disagreements=disagreements,
                 written=True,
             )
         if payload is None:
@@ -1634,6 +1658,7 @@ def classify_normalizer_result(
             stamped=stamped,
             rules=rules,
             already_stamped=already,
+            disagreements=disagreements,
             written=False,
         )
     if exit_code == NORMALIZER_EXIT_PARTIAL:
@@ -1651,6 +1676,7 @@ def classify_normalizer_result(
                 stamped=stamped,
                 rules=rules,
                 already_stamped=already,
+                disagreements=disagreements,
                 written=written if isinstance(written, bool) else (True if stamped else None),
                 titles_unreadable=True,
             )
@@ -1665,6 +1691,7 @@ def classify_normalizer_result(
             stamped=stamped,
             rules=rules,
             already_stamped=already,
+            disagreements=disagreements,
             written=written if isinstance(written, bool) else bool(stamped),
             titles_recovered_from_console_echo=from_echo,
         )

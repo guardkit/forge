@@ -3850,3 +3850,76 @@ async def test_live_plan_leg_not_enforced_partial_proceeds_with_the_real_normali
     assert rec["owner_line"] == expected_line and rec["owner_line_sent"] == "sent"
     assert (expected_line, False) in h.ctx["mentions"]
     assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
+
+
+# ---------------------------------------------------------------------------
+# ADVISORY DISAGREEMENTS reach the owner as ONE plain line — WHATEVER the
+# status and whether or not the repo enforces the law (a legal-but-wrong
+# stamp PASSES the law; the stamp is never changed, so the line IS the
+# mechanism). Rich's ruling 08-18, drive-19 datum.
+# ---------------------------------------------------------------------------
+
+_DISAGREEMENTS = (
+    {"title": "The endpoint returns the count", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "the endpoint returns"},
+    {"title": "Unauthenticated requests are rejected", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "requests are rejected"},
+)
+_DISAGREEMENTS_LINE = (
+    "2 example(s) carry a verification home the rules would not have chosen —\n"
+    "  - The endpoint returns the count — stamped toolchain, the rules say hurl\n"
+    "  - Unauthenticated requests are rejected — stamped toolchain, the rules say hurl\n"
+    "— the stamps stand as written (nothing was changed); worth a look before this feature graduates"
+)
+
+
+def _nothing_to_do_with_disagreements() -> StampNormalizerOutcome:
+    return StampNormalizerOutcome(
+        status="nothing-to-do",
+        detail="2 scenario(s) already stamped, none unstamped",
+        already_stamped=("The endpoint returns the count", "Unauthenticated requests are rejected"),
+        written=False,
+        disagreements=_DISAGREEMENTS,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforcement", ["off", "enforced"])
+async def test_stamp_disagreements_reach_the_owner_on_a_clean_run_whatever_the_enforcement(
+    store: SqlitePlanningRunStore, tmp_path: Path, enforcement: str
+) -> None:
+    """A fully-successful normalizer (nothing-to-do — the model stamped
+    everything) that DISAGREES with two model stamps: the plan proceeds to
+    BUILD_QUEUED under BOTH enforcement modes (a legal wrong stamp is not a
+    law violation), the receipt carries the disagreements, and the owner
+    gets exactly ONE plain un-@mentioned line naming them; no error card,
+    no stamp changed."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    if enforcement == "enforced":
+        _commit_repo_routing_law(repo, "enforced")
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_nothing_to_do_with_disagreements()),
+    )
+    _share_order(sink, h)
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert rec["status"] == "nothing-to-do"
+    assert rec["enforcement"] == enforcement
+    assert rec["disagreement_count"] == 2
+    assert [d["title"] for d in rec["disagreements"]] == [d["title"] for d in _DISAGREEMENTS]
+    assert rec["disagreements_line"] == _DISAGREEMENTS_LINE
+    assert rec["disagreements_line_sent"] == "sent"
+    lines = [(m, lvl) for _, m, lvl in h.ctx["notifications"] if "the rules would not have chosen" in m]
+    assert lines == [(_DISAGREEMENTS_LINE, "info")]
+    assert (_DISAGREEMENTS_LINE, False) in h.ctx["mentions"]
+    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
+    # no "the plan proceeds… does not enforce" line — nothing was refused
+    assert not any("could not be given a verification home" in m for _, m, _ in h.ctx["notifications"])
