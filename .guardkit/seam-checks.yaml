@@ -1,0 +1,68 @@
+# Seam checks for this repository.
+#
+# WHAT THIS FILE IS, in plain words: a short list of things that must still
+# work after a build finishes. GuardKit runs them for real (it starts them in
+# a separate process) instead of trusting the test suite, because a codebase
+# can have a completely green test suite and still be unable to start up.
+#
+# Why this repository has one: in July a review of the planning feature found
+# that the daemon's start-up code called three planning functions using
+# argument names those functions did not have. Every test passed, because the
+# tests replaced those functions with stand-ins that accept any arguments at
+# all. Nothing ever started the real thing, so nobody found out until a human
+# read the code. The checks below start the real thing.
+#
+# The kinds used here:
+#   import    — "does this file load at all?"  Runs `python -c
+#               "import <module>"` and requires a clean exit.
+#   construct — "can this object actually be created?"  Calls the named
+#               function or class with the listed arguments and checks the
+#               result is of the expected type.
+#   command   — any command line, with the exit code it must return. Used
+#               here to run the one test file that checks the daemon's
+#               start-up code calls the planning functions with argument
+#               names those functions really accept.
+#
+# Who may edit this file: humans (and the Coach at triage) only. GuardKit
+# reads the copy that existed when the build branch was created, so an edit
+# made by the build itself has no effect on that build.
+version: 1
+
+# The files that assemble the program out of its parts ("composition roots").
+composition_roots:
+  - path: src/forge/cli/serve.py
+  - path: src/forge/cli/_serve_planning.py
+
+exclusions: []
+
+boot_smoke:
+  # The command-line entry point the `forge` command runs.
+  - id: forge-cli-loads
+    kind: import
+    target: forge.cli.main
+
+  # The long-running daemon's start-up module — where everything is wired
+  # together at boot.
+  - id: forge-serve-loads
+    kind: import
+    target: forge.cli.serve
+
+  # The planning start-up module: the other half of the July defect.
+  - id: forge-serve-planning-loads
+    kind: import
+    target: forge.cli._serve_planning
+
+  # The planning settings object must still build from its own defaults; if
+  # it cannot, the daemon cannot read its configuration file at boot.
+  - id: forge-planning-config-constructs
+    kind: construct
+    target: forge.config.models:PlanningConfig
+    expect_type: forge.config.models:PlanningConfig
+
+  # Run the start-up wiring test for real. This is the test that checks the
+  # daemon calls the three planning functions with argument names those
+  # functions actually accept — the exact defect the July review found.
+  - id: forge-planning-serve-wiring
+    kind: command
+    target: .venv/bin/python -m pytest tests/cli/test_serve_planning_wiring.py -q -p no:cacheprovider
+    expected_exit: 0
