@@ -13,8 +13,9 @@
 # read the code. The checks below start the real thing.
 #
 # The kinds used here:
-#   import    — "does this file load at all?"  Runs `python -c
-#               "import <module>"` and requires a clean exit.
+#   import    — "does this file load at all?"  GuardKit starts this project's
+#               own Python (the one in .venv) and asks it to import the
+#               module, requiring a clean exit.
 #   construct — "can this object actually be created?"  Calls the named
 #               function or class with the listed arguments and checks the
 #               result is of the expected type.
@@ -23,9 +24,10 @@
 #               start-up code calls the planning functions with argument
 #               names those functions really accept.
 #
-# Who may edit this file: humans (and the Coach at triage) only. GuardKit
-# reads the copy that existed when the build branch was created, so an edit
-# made by the build itself has no effect on that build.
+# Who may edit this file: people (and the Coach at triage) only. GuardKit
+# reads ONLY the copy that existed at the commit the build branch was created
+# from, so a change made during a build has no effect on that build — it is
+# reported, and it applies from the next build onwards.
 version: 1
 
 # The files that assemble the program out of its parts ("composition roots").
@@ -62,6 +64,11 @@ boot_smoke:
   # Run the start-up wiring test for real. This is the test that checks the
   # daemon calls the three planning functions with argument names those
   # functions actually accept — the exact defect the July review found.
+  #
+  # This one needs the build's own virtual environment to exist at
+  # <repo>/.venv. If it does not, this check reports a failure whose real
+  # cause is the missing environment, not the code — read it that way before
+  # believing the red.
   - id: forge-planning-serve-wiring
     kind: command
     target: .venv/bin/python -m pytest tests/cli/test_serve_planning_wiring.py -q -p no:cacheprovider
