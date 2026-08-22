@@ -495,6 +495,7 @@ def _make_driver(
         spec_summary: str,
         target_repo_descriptor: dict[str, Any],
         spec_assumptions: str | None = None,
+        spec_feature_paths: list[str] | None = None,
     ) -> Any:
         counters["plan"] += 1
         # Reject-on-missing, exactly like the real specialist command router:
@@ -519,6 +520,7 @@ def _make_driver(
         counters["last_feature_id"] = feature_id
         counters["last_descriptor"] = target_repo_descriptor
         counters["last_spec_assumptions"] = spec_assumptions
+        counters["last_spec_feature_paths"] = spec_feature_paths
         if plan_result is not None:
             return plan_result
         if plan_result_factory is not None:
@@ -892,6 +894,56 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     # The optional assumptions content was threaded (the default spec triple
     # carries an _assumptions.yaml).
     assert h.ctx["counters"]["last_spec_assumptions"] == "assumptions: []\n"
+    # ...and so was WHERE the specification sits, not only what it says
+    # (2026-08-22). The plan YAML has to declare that location under
+    # ``feature_files:``; before this, forge sent the contents alone and the
+    # plan-writer, asked for a fact nobody gave it, built a folder name out of
+    # the feature's title. Six of the ten captured plans that wrote the key
+    # named a folder that does not exist. This is the exact list forge itself
+    # committed one leg earlier and hands to the stamp normalizer below.
+    assert h.ctx["counters"]["last_spec_feature_paths"] == [
+        "features/stats-endpoint/stats-endpoint.feature"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_location_sent_to_the_writer_is_the_one_forge_checks_against(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """ONE list, two uses — and that is the whole point of the fix.
+
+    Forge sends the plan-writer the specification's committed path so the plan
+    can declare it, and forge later checks the plan's declaration against the
+    same path at plan-commit (``declare_feature_files_if_absent``). If those two
+    were computed separately they could drift, and a drift would put forge in
+    the position of refusing a plan for failing to match a path forge never
+    sent. They are the SAME list, computed once, above the dispatch.
+
+    The spec triple here is committed under a NON-DEFAULT slug, so a path
+    derived from the feature title could not accidentally match.
+    """
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    (repo / "tests" / "health").mkdir(parents=True)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result(slug="users-count-endpoint"),
+    )
+
+    await h.driver.drive(CID)
+
+    sent = h.ctx["counters"]["last_spec_feature_paths"]
+    assert sent == [
+        "features/users-count-endpoint/users-count-endpoint.feature"
+    ], "the writer is told where the specification actually is"
+    # Only the .feature is a location for feature_files: — the summary and the
+    # assumptions manifest are not scenario sources and never ride here.
+    assert all(path.endswith(".feature") for path in sent)
 
 
 # ---------------------------------------------------------------------------

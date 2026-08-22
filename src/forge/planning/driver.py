@@ -434,8 +434,8 @@ first-round dispatch passes neither."""
 
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
 """``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
-spec_summary, target_repo_descriptor, spec_assumptions=None)
--> StageDispatchResult``.
+spec_summary, target_repo_descriptor, spec_assumptions=None,
+spec_feature_paths=None) -> StageDispatchResult``.
 
 Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge supplies
 the SUPPLIED minted ``feature_id`` (RV-1: the plan leg asserts it), the 007 spec
@@ -444,7 +444,18 @@ the committed _summary.md, optional ``spec_assumptions`` = the committed
 _assumptions.yaml), and the structured ``target_repo_descriptor`` — the exact
 argument shape ``architect_feature_plan`` requires (specialist-agent
 roles/architect/modes/feature_plan.py). The result's ``role_output`` carries the
-plan tree."""
+plan tree.
+
+2026-08-22 (the specification-location lane): ``spec_feature_paths`` carries
+WHERE the spec ``.feature`` sits on the planning branch, beside
+``spec_feature``, which carries WHAT it says. The plan YAML has to declare that
+location under ``feature_files:``, and until now forge never told the plan-writer
+what it was — so the writer built a folder name out of the feature's title, and
+six of the ten plans captured on 2026-08-22 that wrote the key named a folder
+that does not exist. Forge already knew: it committed those files itself one leg
+earlier, and reads them back off the branch two statements above this dispatch.
+OPTIONAL on the wire, so an older specialist that does not know the argument is
+unaffected."""
 
 
 @dataclass(frozen=True)
@@ -2605,6 +2616,17 @@ class PlanningRunDriver:
         target_repo_descriptor = self._build_target_repo_descriptor(
             target_repo, repo_path
         )
+        # WHERE the specification sits, beside WHAT it says (2026-08-22). These
+        # are the same paths the stamp normalizer uses further down; they are
+        # computed HERE, before the dispatch, because the plan-writer needs them
+        # to fill in the plan YAML's ``feature_files:`` — and before this it was
+        # never told them. Six of the ten plans captured on 2026-08-22 that wrote
+        # that key named a folder that does not exist, every one of them a folder
+        # name built out of the feature's title. Forge is the party that knows:
+        # it committed these files one leg earlier and has just read them back.
+        spec_feature_paths = [
+            str(rel) for rel in spec_files if str(rel).endswith(".feature")
+        ]
 
         try:
             result = await deps.dispatch_feature_plan(
@@ -2615,6 +2637,7 @@ class PlanningRunDriver:
                 spec_summary=spec_summary,
                 target_repo_descriptor=target_repo_descriptor,
                 spec_assumptions=spec_assumptions,
+                spec_feature_paths=spec_feature_paths,
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -2670,10 +2693,10 @@ class PlanningRunDriver:
         validate = deps.validate_feature_plan
         # THE STAMP NORMALIZER (Rich's condition 1): the committed spec
         # ``.feature`` path(s) are the scenario universe forge can name when
-        # the plan-writer omitted ``feature_files:``.
-        spec_feature_paths = [
-            str(rel) for rel in spec_files if str(rel).endswith(".feature")
-        ]
+        # the plan-writer omitted ``feature_files:``. ``spec_feature_paths`` is
+        # computed above the dispatch since 2026-08-22 — the SAME list is now
+        # also sent to the plan-writer, so what forge checks here and what the
+        # writer was told cannot drift apart.
         stamp_state: dict[str, Any] = {}
 
         async def _pre_commit(worktree: Path) -> PreCommitResult:
