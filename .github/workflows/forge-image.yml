@@ -1,14 +1,29 @@
 # =============================================================================
 # forge-production-image — TASK-F009-007 (FEAT-FORGE-009 wave 3)
 #
-# Builds and smoke-tests the canonical forge production image on every
-# pull request that touches the production-image surface. Closes
-# binding-shape item 7 and acceptance criteria AC-F (no real provider
-# keys), AC-I (CI gate on PR), and the image-size budget regression
-# check (B4 / ASSUM-003).
+# TWO JOBS, two different purposes:
 #
-# Status-check name registered with GitHub:
+#   build-and-smoke-test  Builds and smoke-tests the canonical forge
+#                         production image. Pull-request-only, and only
+#                         for PRs touching the production-image surface,
+#                         exactly as before. Closes binding-shape item 7
+#                         and acceptance criteria AC-F (no real provider
+#                         keys), AC-I (CI gate on PR), and the image-size
+#                         budget regression check (B4 / ASSUM-003).
+#
+#   tests                 ADDED 2026-08-22. Runs 7,237 of forge's 7,257
+#                         tests in about two minutes, on every push to
+#                         main as well as on those PRs. See that job's
+#                         own header for the measured pass/fail figures
+#                         and for exactly which tests are excluded and
+#                         why. Before it existed this workflow had run
+#                         zero times in its life, so forge's real
+#                         executed-test count in CI was 0, not the 26
+#                         that ``pytest -m smoke tests/bdd/`` selects.
+#
+# Status-check names registered with GitHub:
 #   forge-production-image / build-and-smoke-test
+#   forge-production-image / tests
 #
 # This workflow is a Contract A *consumer* — it invokes
 # scripts/build-image.sh (the canonical producer, TASK-F009-005) and
@@ -29,6 +44,9 @@ name: forge-production-image
 # Quoted ``"on":`` avoids the YAML 1.1 ``on -> True`` boolean coercion
 # that some parsers apply.
 "on":
+  # PULL REQUESTS: unchanged. Only a PR touching the production-image
+  # surface triggers this workflow, and only such a PR pays for a full
+  # docker build + trufflehog scan.
   pull_request:
     paths:
       - Dockerfile
@@ -36,6 +54,20 @@ name: forge-production-image
       - src/forge/**
       - scripts/build-image.sh
       - .github/workflows/forge-image.yml
+  # PUSH TO MAIN: added 2026-08-22. Before this, a push to main ran
+  # NOTHING — this repository's only workflow fired on pull requests
+  # alone, and forge merges to main through gates rather than through
+  # PRs, so the workflow had never executed once (GitHub's Actions API
+  # reported a total run count of 0). No path filter here on purpose:
+  # any change that reaches main gets the test suite run against it.
+  # The expensive image build is NOT part of that — the
+  # build-and-smoke-test job below stays pull-request-only via its
+  # ``if:`` guard, so this addition costs roughly two minutes of runner
+  # time per push, not thirty.
+  push:
+    branches: [main]
+  # Lets a human start the suite by hand from the Actions tab.
+  workflow_dispatch:
 
 # ``contents: read`` is the only permission the build needs. The
 # secret-scan step does not require GITHUB_TOKEN write access — it
@@ -46,6 +78,11 @@ permissions:
 jobs:
   build-and-smoke-test:
     name: Build and smoke-test the production image
+    # Pull-request-only, exactly as before the push-to-main trigger was
+    # added. A docker build plus a trufflehog layer scan is a ~30 minute
+    # job and pushes to main should not pay for it; the `tests` job
+    # below is what a push to main runs.
+    if: github.event_name == 'pull_request'
     # ubuntu-latest pins the runner architecture to linux/amd64. The
     # E3.2 scenario (architecture-mismatch) is meaningful only because
     # the runner architecture is a known constant — see the
@@ -89,7 +126,11 @@ jobs:
       - name: Check out nats-core (sibling working tree)
         uses: actions/checkout@v4
         with:
-          repository: appmilla/nats-core
+          # Corrected 2026-08-22: this said ``appmilla/nats-core``, which
+          # does not exist (the GitHub API returns 404 for it). The real
+          # repository is ``guardkit/nats-core`` and it is public, so the
+          # default GITHUB_TOKEN can read it — no secret needed.
+          repository: guardkit/nats-core
           path: nats-core
           # ref left as default branch — nats-core ships from main on
           # tagged releases; if a future task needs a pinned ref it
@@ -106,31 +147,41 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # ---------------------------------------------------------------
-      # Step 4: Set up Python for the BDD smoke run
+      # Step 4: Install forge and its test dependencies (uv, not pip)
       #
-      # The smoke step (Step 8 below) runs ``pytest -m smoke
-      # tests/bdd/`` against the built image, which executes from the
-      # forge working tree on the runner host (not inside the
-      # container). Python and the test deps must be installed here.
+      # The smoke step (Step 8 below) runs pytest against the built
+      # image from the forge working tree on the runner host (not
+      # inside the container), so Python and the test deps must be
+      # installed here.
+      #
+      # CORRECTED 2026-08-22. This step used to be
+      # ``python -m pip install -e ".[dev]"`` and COULD NOT SUCCEED:
+      # forge pins ``nats-core>=0.3.0,<0.8`` and no version in that
+      # range is published to PyPI, so pip ends with "No matching
+      # distribution found for nats-core". uv resolves nats-core from
+      # the sibling checkout laid down by Step 2 (the ``[tool.uv.sources]``
+      # entry ``nats-core = { path = "../nats-core" }``), which is the
+      # only install path that works. ``[providers]`` is still omitted
+      # on purpose — the smoke set does not import provider SDKs.
+      #
+      # ``uv sync`` may rewrite uv.lock on the runner because the
+      # committed lock still declares requires-python >=3.11 while
+      # pyproject.toml declares >=3.12. That rewrite is thrown away with
+      # the runner; refreshing the committed lock is a separate job of
+      # work.
       # ---------------------------------------------------------------
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          # Matches pyproject requires-python >=3.12 (fleet-memory floor;
-          # see the `memory` extra note there).
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: forge/pyproject.toml
+          enable-cache: true
 
-      - name: Install forge test dependencies
+      - name: Set up Python 3.12
         working-directory: forge
-        run: |
-          python -m pip install --upgrade pip
-          # Install forge with dev extras so pytest, pytest-bdd, and
-          # pytest-asyncio resolve. ``[providers]`` is intentionally
-          # omitted — the smoke-set only exercises @smoke scenarios,
-          # which do not import provider SDKs.
-          python -m pip install -e ".[dev]"
+        run: uv python install 3.12
+
+      - name: Install forge test dependencies (uv, sibling nats-core)
+        working-directory: forge
+        run: uv sync --extra dev
 
       # ---------------------------------------------------------------
       # Step 5: Build the image via the canonical producer script
@@ -206,7 +257,7 @@ jobs:
         env:
           FORGE_IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
-          pytest -m smoke tests/bdd/ -v
+          uv run --no-sync pytest -m smoke tests/bdd/ -v
 
       # ---------------------------------------------------------------
       # Step 9: Provider-key scan (AC-F / C1 scenario)
@@ -233,3 +284,125 @@ jobs:
             --no-update
             docker
             --image=${{ env.IMAGE_TAG }}
+
+  # =============================================================================
+  # tests — the suite that a push to main actually runs
+  #
+  # ADDED 2026-08-22. Before it, forge's automated testing was a single
+  # step of the job above: ``pytest -m smoke tests/bdd/``, which selects
+  # 26 of the repository's 7,257 tests, and which fired only on a pull
+  # request touching five specific paths. Since forge merges to main
+  # through gates rather than pull requests, that trigger had never
+  # fired: GitHub's Actions API reported 0 runs of this workflow, ever.
+  # The real before-figure is therefore 0 tests executed, not 26.
+  #
+  # MEASURED, 2026-08-22, on a clean checkout with the same three
+  # checkouts and the same install this job performs:
+  #
+  #     7,257 collected
+  #        21 deselected  — 20 by the ``slow`` marker (docker builds and
+  #                         live NATS brokers, which pyproject.toml
+  #                         already documents as "excluded by default")
+  #                         plus 1 named below: the live-broker
+  #                         end-to-end test that carries no slow marker
+  #     -----
+  #     7,237 run  ->  7,226 pass, 10 skip, 1 FAIL, in 1 minute 43 seconds
+  #
+  # (7,257 minus 21 is 7,236, one short of the 7,237 pytest reports as
+  # run. One item is counted once at collection and twice at run time —
+  # a pytest-bdd scenario reported under two node ids. Both figures are
+  # quoted as observed rather than reconciled by arithmetic.)
+  #
+  # The single failure is real and is deliberately left in:
+  #     tests/forge/test_supervisor_async_subagent_wiring.py::
+  #       TestDispatchAutobuildSignature::
+  #       test_signature_has_exactly_five_collaborator_kwargs
+  # ``dispatch_autobuild_async`` grew a sixth keyword argument, ``budget``,
+  # and this test still asserts five. That is a genuine drift between the
+  # code and its contract test, so this job is expected to be RED on
+  # arrival until someone rules on which side is wrong.
+  # =============================================================================
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # forge, nats-core and guardkit are laid down as siblings under
+      # $GITHUB_WORKSPACE, matching the layout pyproject.toml's
+      # ``[tool.uv.sources]`` assumes.
+      - name: Check out forge
+        uses: actions/checkout@v4
+        with:
+          path: forge
+
+      # nats-core is a hard runtime dependency of forge that is NOT
+      # installable from PyPI (see the install step in the job above).
+      # Public repo, so the default GITHUB_TOKEN reads it.
+      - name: Check out nats-core (sibling working tree)
+        uses: actions/checkout@v4
+        with:
+          repository: guardkit/nats-core
+          path: nats-core
+
+      # guardkit is needed for 13 tests under tests/forge/planning/.
+      # ``forge.planning.target_terminal_tools.discover_target_test_roots``
+      # imports guardkit's test-root discovery and raises
+      # TargetTestRootsUnresolved when it cannot; without this checkout
+      # those 13 tests fail for a missing dependency rather than for
+      # anything about forge. guardkit is a PUBLIC repository, so the
+      # default GITHUB_TOKEN is enough — no secret is involved.
+      - name: Check out guardkit (test-root discovery dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: guardkit/guardkit
+          path: guardkit
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        working-directory: forge
+        run: uv python install 3.12
+
+      # Same install as the image job, and for the same reason: pip
+      # cannot resolve nats-core, uv can, from ../nats-core.
+      - name: Install forge and its test dependencies
+        working-directory: forge
+        run: uv sync --extra dev
+
+      # WHAT IS EXCLUDED, AND WHY. Both exclusions are for tests that
+      # need infrastructure a GitHub runner does not have. Neither hides
+      # a failing assertion.
+      #
+      #   -m "not slow"   20 tests. ``slow`` is forge's own registered
+      #                   marker for "tests that require docker / live
+      #                   NATS — excluded by default" (pyproject.toml).
+      #                   The image job above is where the docker-backed
+      #                   ones run, against a real built image.
+      #
+      #   --deselect ...  1 test. tests/integration/
+      #                   test_forge_serve_orchestrator_e2e.py's
+      #                   full-lifecycle test opens a real NATS
+      #                   connection and times out when no broker
+      #                   answers. It carries no ``slow`` marker, so the
+      #                   marker expression above does not catch it and
+      #                   it has to be named. Naming it here means the
+      #                   exclusion is auditable; leaving it in would
+      #                   mean a permanently red step whose redness said
+      #                   nothing.
+      #
+      # PYTHONPATH puts the guardkit checkout on the import path for the
+      # 13 planning tests described in the job header.
+      #
+      # ``-p no:randomly`` is not used and no seed is fixed: the suite
+      # runs in collection order, as it does locally.
+      - name: Run the suite
+        working-directory: forge
+        env:
+          PYTHONPATH: ${{ github.workspace }}/guardkit
+        run: |
+          uv run --no-sync pytest -q -rf --tb=short \
+            -m "not slow" \
+            --deselect "tests/integration/test_forge_serve_orchestrator_e2e.py::TestForgeServeLifecycleE2E::test_full_lifecycle_envelope_sequence_and_correlation"
