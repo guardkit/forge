@@ -164,11 +164,30 @@ jobs:
       # only install path that works. ``[providers]`` is still omitted
       # on purpose — the smoke set does not import provider SDKs.
       #
-      # ``uv sync`` may rewrite uv.lock on the runner because the
-      # committed lock still declares requires-python >=3.11 while
-      # pyproject.toml declares >=3.12. That rewrite is thrown away with
-      # the runner; refreshing the committed lock is a separate job of
-      # work.
+      # ``--frozen`` IS LOAD-BEARING. The committed uv.lock declares
+      # requires-python >=3.11 while pyproject.toml declares >=3.12. On
+      # that mismatch uv DISCARDS the lock and re-resolves from scratch —
+      # and re-resolution requires every path source in
+      # ``[tool.uv.sources]`` to exist on disk, including
+      # ``fleet-memory = { path = "../fleet-memory" }`` from the optional
+      # ``memory`` extra. This job checks out forge and nats-core, not
+      # fleet-memory, so a re-resolving ``uv sync`` dies with
+      # "Distribution not found at: file:///.../fleet-memory" and the job
+      # installs nothing. ``--frozen`` uses the committed lock as-is, so
+      # no re-resolution happens and no absent sibling is consulted.
+      #
+      # MEASURED 2026-08-22 in a reproduction of this runner's layout
+      # (forge + nats-core, NO fleet-memory): ``uv sync --extra dev``
+      # fails as above; ``uv sync --frozen --extra dev`` exits 0 and the
+      # suite then runs 7,223 tests.
+      #
+      # FOLLOW-UP, deliberately not done here: fix the requires-python
+      # drift in uv.lock, then switch these steps to ``--locked``, which
+      # FAILS LOUDLY when the lock is stale instead of silently using it.
+      # ``--locked`` cannot be adopted today because the lock IS stale.
+      # Re-locking currently moves 1,551 lines and downgrades watchfiles
+      # 1.2.0 -> 1.1.1, which is a dependency change, not a CI-config
+      # change, and wants its own lane.
       # ---------------------------------------------------------------
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -181,7 +200,7 @@ jobs:
 
       - name: Install forge test dependencies (uv, sibling nats-core)
         working-directory: forge
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
 
       # ---------------------------------------------------------------
       # Step 5: Build the image via the canonical producer script
@@ -296,8 +315,10 @@ jobs:
   # fired: GitHub's Actions API reported 0 runs of this workflow, ever.
   # The real before-figure is therefore 0 tests executed, not 26.
   #
-  # MEASURED, 2026-08-22, on a clean checkout with the same three
-  # checkouts and the same install this job performs:
+  # MEASURED, 2026-08-22, on Python 3.12 (the version this job installs)
+  # in a REPRODUCTION OF THIS RUNNER'S LAYOUT — forge and nats-core
+  # unpacked as siblings by ``git archive``, with NO fleet-memory present,
+  # which is what the checkout steps below actually lay down:
   #
   #     7,257 collected
   #        21 deselected  — 20 by the ``slow`` marker (docker builds and
@@ -306,7 +327,13 @@ jobs:
   #                         plus 1 named below: the live-broker
   #                         end-to-end test that carries no slow marker
   #     -----
-  #     7,237 run  ->  7,226 pass, 10 skip, 1 FAIL, in 1 minute 43 seconds
+  #     7,237 run  ->  7,222 pass, 14 skip, 1 FAIL, in 1 minute 47 seconds
+  #
+  # An earlier revision of this header claimed 7,226 pass / 10 skip. That
+  # was measured in a working tree that had a ``../fleet-memory`` symlink,
+  # which no runner has, and on Python 3.14, which no job here installs.
+  # Four fleet-memory-gated tests SKIP on a runner instead of passing.
+  # The figures above are from the runner-shaped layout and supersede it.
   #
   # (7,257 minus 21 is 7,236, one short of the 7,237 pytest reports as
   # run. One item is counted once at collection and twice at run time —
@@ -366,11 +393,14 @@ jobs:
         working-directory: forge
         run: uv python install 3.12
 
-      # Same install as the image job, and for the same reason: pip
-      # cannot resolve nats-core, uv can, from ../nats-core.
+      # Same install as the image job, and for the same reasons: pip
+      # cannot resolve nats-core, uv can, from ../nats-core; and
+      # ``--frozen`` is required because this job does not check out
+      # fleet-memory, so a re-resolving ``uv sync`` cannot satisfy that
+      # path source. See the long note in the image job above.
       - name: Install forge and its test dependencies
         working-directory: forge
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
 
       # WHAT IS EXCLUDED, AND WHY. Both exclusions are for tests that
       # need infrastructure a GitHub runner does not have. Neither hides
