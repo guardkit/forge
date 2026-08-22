@@ -1822,6 +1822,291 @@ def test_fill_accepts_a_present_list_that_names_forges_committed_spec(
 
 
 # ---------------------------------------------------------------------------
+# HOW the declared-list check DECIDES (defect found by adversarial review,
+# 2026-08-22; the 08-16 ruling itself is untouched — a present list that omits
+# forge's committed spec still refuses LOUD).
+#
+# The check used to read the ``feature_files:`` block up to the next BLANK LINE
+# and then ask whether the committed path was a SUBSTRING of that window. Both
+# halves were wrong, and wrong in opposite directions:
+#
+#   * over-sensitive — an EMPTY list followed by any other YAML list before the
+#     next blank line swallowed that list, so the block looked non-empty and a
+#     correct plan was refused (measured on unmodified forge);
+#   * under-sensitive — the committed path appearing ANYWHERE in that window
+#     (a comment, a neighbouring key's value, or inside a longer and different
+#     path) satisfied the substring test, so a plan naming the wrong file was
+#     accepted (measured on unmodified forge).
+#
+# It now reads the block to the next TOP-LEVEL KEY and compares PARSED entries,
+# path against path.
+# ---------------------------------------------------------------------------
+
+
+def test_fill_does_not_refuse_an_empty_list_followed_by_another_yaml_list(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (over-sensitive): ``feature_files: []`` is an empty statement
+    however the plan continues. Before the fix, the block was read to the next
+    blank line, so the ``tasks:`` list bled into it and the plan was refused;
+    with a blank line between them the SAME plan was accepted. The blank line
+    is not supposed to be load-bearing."""
+    for body in (
+        "id: FEAT-A\nfeature_files: []\ntasks:\n  - id: TASK-A-001\n",
+        "id: FEAT-A\nfeature_files: []\n\ntasks:\n  - id: TASK-A-001\n",
+        "id: FEAT-A\nfeature_files:\ntasks:\n  - id: TASK-A-001\n",
+        "id: FEAT-A\nfeature_files: []\ntasks:\n- id: TASK-A-001\n",
+    ):
+        p = _write_plan_yaml(tmp_path, "FEAT-A", body)
+        fill = declare_feature_files_if_absent(
+            tmp_path, "FEAT-A", ["features/x/x.feature"]
+        )
+        assert fill.fired is False, body
+        assert fill.inconsistent is False, body
+        assert fill.reason == "feature_files: already declared", body
+        assert p.read_text(encoding="utf-8") == body  # untouched
+
+
+def test_fill_refuses_a_wrong_path_even_when_the_right_one_is_nearby_text(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (under-sensitive): the declared list names the wrong file and
+    only the surrounding TEXT mentions forge's committed path — in a comment,
+    or as a neighbouring key's value. Before the fix the substring test was
+    satisfied by that text and the inconsistent plan was accepted."""
+    committed = "features/user-search/user-search.feature"
+    for body in (
+        "id: FEAT-X\nfeature_files:\n  - features/other/other.feature\n"
+        f"# forge committed {committed}\ntasks: []\n",
+        "id: FEAT-X\nfeature_files:\n  - features/other/other.feature\n"
+        f"spec_source: {committed}\n",
+    ):
+        _write_plan_yaml(tmp_path, "FEAT-X", body)
+        fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [committed])
+        assert fill.fired is False, body
+        assert fill.inconsistent is True, body
+        assert committed in fill.reason, body
+
+
+def test_fill_refuses_a_declared_path_that_merely_contains_the_committed_one(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (under-sensitive): ``vendor/features/x/x.feature`` is a
+    DIFFERENT file from ``features/x/x.feature``, and the substring test could
+    not tell them apart. Entries are compared as paths now."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files:\n"
+        "  - vendor/features/user-search/user-search.feature\ntasks: []\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is True
+
+
+def test_fill_refuses_a_wrong_flow_style_list(tmp_path: Path) -> None:
+    """A one-line ``[a, b]`` list is a declaration like any other. The old
+    non-empty test looked for ``- `` lines only, so a flow-style list that
+    omitted forge's spec was accepted silently — the same defect wearing
+    different syntax."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files: [features/other/other.feature]\ntasks: []\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is True
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-Y",
+        "id: FEAT-Y\nfeature_files: [features/user-search/user-search.feature]\n",
+    )
+    ok = declare_feature_files_if_absent(
+        tmp_path, "FEAT-Y", ["features/user-search/user-search.feature"]
+    )
+    assert ok.fired is False and ok.inconsistent is False
+
+
+def test_fill_treats_a_dot_slash_prefix_as_the_same_path(tmp_path: Path) -> None:
+    """``./a/b.feature``, ``a/b.feature`` and ``a/./b.feature`` are one file.
+    Normalisation must not eat a leading ``../`` or ``/`` while collapsing
+    them, so a genuinely different path still refuses."""
+    committed = "features/user-search/user-search.feature"
+    for declared in (
+        f"./{committed}",
+        committed,
+        "features/./user-search/user-search.feature",
+        f"features//user-search/user-search.feature",
+    ):
+        _write_plan_yaml(
+            tmp_path, "FEAT-X", f"id: FEAT-X\nfeature_files:\n  - {declared}\n"
+        )
+        fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [committed])
+        assert fill.inconsistent is False, declared
+        assert fill.reason == "feature_files: already declared", declared
+    # and the committed side may carry the ./ instead
+    _write_plan_yaml(tmp_path, "FEAT-X", f"id: FEAT-X\nfeature_files:\n  - {committed}\n")
+    fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [f"./{committed}"])
+    assert fill.inconsistent is False
+    # a path that only LOOKS similar is still a different file
+    _write_plan_yaml(
+        tmp_path, "FEAT-X", f"id: FEAT-X\nfeature_files:\n  - ../{committed}\n"
+    )
+    fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [committed])
+    assert fill.inconsistent is True
+
+
+def test_fill_reads_quoted_and_unquoted_entries_the_same(tmp_path: Path) -> None:
+    """The plan-writer's quoting style is not a fact about the file it names —
+    and forge's own fill writes JSON-quoted entries, so a re-read of a plan
+    forge filled must not look inconsistent to the very next run."""
+    committed = "features/user-search/user-search.feature"
+    for entry in (committed, f'"{committed}"', f"'{committed}'"):
+        _write_plan_yaml(
+            tmp_path, "FEAT-X", f"id: FEAT-X\nfeature_files:\n  - {entry}\ntasks: []\n"
+        )
+        fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [committed])
+        assert fill.inconsistent is False, entry
+        assert fill.reason == "feature_files: already declared", entry
+
+
+def test_fill_accepts_a_declared_list_that_is_a_superset(tmp_path: Path) -> None:
+    """The ruling is that forge's committed spec must be NAMED, not that the
+    plan-writer may name nothing else — a plan may declare more .feature files
+    than this one planning run committed."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files:\n"
+        "  - features/user-search/user-search.feature\n"
+        "  - features/extra/extra.feature\n"
+        "  - ./features/third/third.feature\ntasks: []\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is False
+    assert fill.reason == "feature_files: already declared"
+    # every committed path must be named, not just one of them
+    fill = declare_feature_files_if_absent(
+        tmp_path,
+        "FEAT-X",
+        ["features/user-search/user-search.feature", "features/missing/missing.feature"],
+    )
+    assert fill.inconsistent is True
+    assert "features/missing/missing.feature" in fill.reason
+    assert "features/user-search/user-search.feature" not in fill.reason
+
+
+def test_fill_does_not_judge_a_plan_it_cannot_read(tmp_path: Path) -> None:
+    """A plan whose YAML does not parse, or whose ``feature_files:`` is not a
+    list of path strings, is NOT judged: saying "your list omits my spec" about
+    a list forge never parsed is a guess wearing a finding's name. Forge says
+    what it could not read, does not set ``inconsistent`` (which would stop the
+    run on a claim it cannot support), and — the half of the 08-16 ruling that
+    matters most — still writes NOTHING to a plan that declared the key.
+
+    guardkit's own loader rejects each of these shapes by name at plan load
+    (``feature_files must be a list of paths`` / non-empty path strings), so
+    nothing slips through unremarked; it is simply not forge's finding to make.
+    """
+    committed = "features/user-search/user-search.feature"
+    for body in (
+        # unparseable YAML, inside the block
+        "id: FEAT-X\nfeature_files:\n  - features/other/other.feature\n"
+        "  bad: [unclosed\ntasks: []\n",
+        # off-schema: a bare scalar, not a list
+        "id: FEAT-X\nfeature_files: features/other/other.feature\ntasks: []\n",
+        # off-schema: an entry that is not a path string
+        "id: FEAT-X\nfeature_files:\n  - path: features/other/other.feature\ntasks: []\n",
+        # off-schema: an empty entry
+        "id: FEAT-X\nfeature_files:\n  - ''\ntasks: []\n",
+    ):
+        p = _write_plan_yaml(tmp_path, "FEAT-X", body)
+        fill = declare_feature_files_if_absent(tmp_path, "FEAT-X", [committed])
+        assert fill.fired is False, body
+        assert fill.inconsistent is False, body
+        assert "could not read it" in fill.reason, body
+        assert p.read_text(encoding="utf-8") == body, body  # nothing written
+
+
+def test_fill_judges_a_readable_block_in_a_plan_that_is_broken_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """MEASURED behaviour of the two-step read: the whole document is parsed
+    first, and only if THAT fails is the ``feature_files:`` block parsed on its
+    own. So a plan broken far from the key still gets its declaration judged —
+    the block parse is a real parse, not a salvage heuristic. Refusing to judge
+    is reserved for a declaration forge genuinely could not read."""
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-X",
+        "id: FEAT-X\nfeature_files:\n  - features/other/other.feature\n"
+        "tasks:\n  - id: T1\n   broken: [\n",
+    )
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is False
+    assert fill.inconsistent is True
+    # ...and the same plan with a CORRECT declaration is not refused
+    _write_plan_yaml(
+        tmp_path,
+        "FEAT-Y",
+        "id: FEAT-Y\nfeature_files:\n  - features/user-search/user-search.feature\n"
+        "tasks:\n  - id: T1\n   broken: [\n",
+    )
+    ok = declare_feature_files_if_absent(
+        tmp_path, "FEAT-Y", ["features/user-search/user-search.feature"]
+    )
+    assert ok.fired is False and ok.inconsistent is False
+
+
+def test_fill_still_fires_on_a_malformed_plan_with_no_feature_files_key(
+    tmp_path: Path,
+) -> None:
+    """The fill is gated on the top-level KEY being absent, and that gate reads
+    text, not a parse — so a plan that is broken elsewhere and never declared
+    the key is still given its explicit universe (unchanged behaviour, pinned
+    so the parsing added here does not quietly narrow the fill)."""
+    _write_plan_yaml(tmp_path, "FEAT-X", "id: FEAT-X\ntasks:\n  - id: T1\n   broken: [\n")
+    fill = declare_feature_files_if_absent(
+        tmp_path, "FEAT-X", ["features/user-search/user-search.feature"]
+    )
+    assert fill.fired is True
+    assert fill.feature_files == ("features/user-search/user-search.feature",)
+
+
+def test_fill_reads_the_block_to_the_next_top_level_key_not_the_next_blank_line(
+    tmp_path: Path,
+) -> None:
+    """The block extraction directly: blank lines and comments sit INSIDE a
+    block; a column-0 block sequence belongs to the key above it; a new
+    top-level key or a document marker ends it."""
+    from forge.planning.target_terminal_tools import _feature_files_block
+
+    assert _feature_files_block("id: A\ntasks: []\n") is None
+    # a column-0 sequence belongs to the key, and `tasks:` ends the block
+    assert _feature_files_block(
+        "id: A\nfeature_files:\n- a.feature\n\n# note\n- b.feature\ntasks: []\n"
+    ) == "feature_files:\n- a.feature\n\n# note\n- b.feature\n"
+    # a document marker ends it even though it starts with a dash
+    assert _feature_files_block("feature_files:\n  - a.feature\n---\nother: 1\n") == (
+        "feature_files:\n  - a.feature\n"
+    )
+    # a following list no longer bleeds into an empty declaration
+    assert _feature_files_block("feature_files: []\ntasks:\n  - id: T1\n") == (
+        "feature_files: []\n"
+    )
+
+# ---------------------------------------------------------------------------
 # ADVISORY DISAGREEMENTS (Rich's ruling 08-18, drive-19 datum): the normalizer's
 # `disagreements` list rides through the classifier into the receipt, on ANY
 # status; malformed entries are dropped, never guessed.
