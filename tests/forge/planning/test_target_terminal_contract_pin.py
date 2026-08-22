@@ -20,8 +20,16 @@ against them; these pins MUST track them byte-for-byte):
        feature_plan.py
          required_args = ("feature_id", "spec_feature", "spec_summary",
                           "target_repo_descriptor")
-         optional      = spec_assumptions, revision_of, validate_feedback
+         optional      = spec_assumptions, spec_feature_paths, revision_of,
+                         validate_feedback
          TARGET_REPO_DESCRIPTOR_SCHEMA required = {"repo", "test_roots"}
+
+``spec_feature_paths`` (2026-08-22) is OPTIONAL on both sides deliberately. The
+two repositories ship as separate images and either can be redeployed first; a
+REQUIRED argument would mean that in one of those two orders every plan is
+refused pre-model until the second deploy lands. Optional, the argument is inert
+until both sides carry it, in either order, with no window in which planning is
+down. That is why the REQUIRED set below is unchanged.
 """
 
 from __future__ import annotations
@@ -49,7 +57,9 @@ _FEATURE_PLAN_REQUIRED = {
     "spec_summary",
     "target_repo_descriptor",
 }
-_FEATURE_PLAN_OPTIONAL_ON_WIRE = {"spec_assumptions"}
+#: The optional 008 args forge emits. ``spec_feature_paths`` rides whenever the
+#: spec leg committed a ``.feature`` — i.e. on every real planning run.
+_FEATURE_PLAN_OPTIONAL_ON_WIRE = {"spec_assumptions", "spec_feature_paths"}
 _TARGET_REPO_DESCRIPTOR_REQUIRED = {"repo", "test_roots"}
 
 
@@ -134,7 +144,7 @@ def test_feature_plan_wire_args_include_spec_assumptions_when_present() -> None:
         target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
         spec_assumptions="assumptions: []\n",
     )
-    assert set(args) == _FEATURE_PLAN_REQUIRED | _FEATURE_PLAN_OPTIONAL_ON_WIRE
+    assert set(args) == _FEATURE_PLAN_REQUIRED | {"spec_assumptions"}
     assert args["spec_assumptions"] == "assumptions: []\n"
 
 
@@ -148,6 +158,65 @@ def test_feature_plan_wire_args_omit_blank_spec_assumptions() -> None:
             spec_assumptions=blank,
         )
         assert "spec_assumptions" not in args
+
+
+def test_feature_plan_wire_args_carry_the_committed_spec_location() -> None:
+    """The specification's LOCATION rides beside its CONTENTS (2026-08-22).
+
+    The plan YAML has to declare where the spec ``.feature`` lives, under
+    ``feature_files:``. Before this argument forge sent only the contents, so the
+    plan-writer was asked for a fact nobody gave it and built a folder name out
+    of the feature's title instead: six of the ten captured plans that wrote the
+    key named a folder that does not exist. Forge committed those files one leg
+    earlier, so it is the party that knows.
+    """
+    args = build_feature_plan_command_args(
+        feature_id="FEAT-BEEF",
+        spec_feature="Feature: x\n",
+        spec_summary="# summary\n",
+        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+        spec_feature_paths=[
+            "features/users-count-endpoint/users-count-endpoint.feature"
+        ],
+    )
+    # Assert against the OPTIONAL constant, not a literal. Reviewed 2026-08-22:
+    # this constant had no remaining reference, so editing it failed nothing and
+    # "the contract pin was updated in lockstep" overstated what it did. Naming
+    # it here makes the pin real again — a drift in the optional set now fails a
+    # test instead of failing a live planning run.
+    assert set(args) == _FEATURE_PLAN_REQUIRED | {"spec_feature_paths"}
+    assert "spec_feature_paths" in _FEATURE_PLAN_OPTIONAL_ON_WIRE
+    assert set(args) - _FEATURE_PLAN_REQUIRED <= _FEATURE_PLAN_OPTIONAL_ON_WIRE
+    assert args["spec_feature_paths"] == [
+        "features/users-count-endpoint/users-count-endpoint.feature"
+    ]
+
+
+def test_feature_plan_wire_args_omit_an_empty_spec_location() -> None:
+    """No location is said with silence, never with an empty list — the
+    specialist treats a missing argument and an empty one identically, and an
+    empty list on the wire would only invite them to diverge."""
+    for empty in (None, [], ["   "], ("",)):
+        args = build_feature_plan_command_args(
+            feature_id="FEAT-BEEF",
+            spec_feature="Feature: x\n",
+            spec_summary="# summary\n",
+            target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+            spec_feature_paths=empty,
+        )
+        assert "spec_feature_paths" not in args
+        assert set(args) == _FEATURE_PLAN_REQUIRED
+
+
+def test_feature_plan_required_set_is_unchanged_by_the_location_argument() -> None:
+    """THE DEPLOY-ORDER PIN. ``spec_feature_paths`` must never join the REQUIRED
+    set on either side: the mode refuses a missing required argument pre-model,
+    so a required argument would take the planning leg down for every run made
+    between the two images being redeployed, in whichever order that happens."""
+    assert "spec_feature_paths" not in _FEATURE_PLAN_REQUIRED
+    assert "spec_feature_paths" not in set(
+        SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.FEATURE_PLAN]
+    )
 
 
 def test_feature_plan_descriptor_carries_only_schema_fields() -> None:

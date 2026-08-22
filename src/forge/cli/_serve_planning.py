@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from forge.adapters.nats.envelope_subscribe import EnvelopeSubscribeClient
@@ -136,7 +137,16 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 #         ``spec_feature``/``spec_summary`` = the 007 .feature/_summary.md
 #         CONTENTS; ``target_repo_descriptor`` = the {repo, test_roots, ...}
 #         object (TARGET_REPO_DESCRIPTOR_SCHEMA); optional: ``spec_assumptions``
-#         = the 007 _assumptions.yaml content, revision_of, validate_feedback)
+#         = the 007 _assumptions.yaml content, ``spec_feature_paths`` = the
+#         repo-relative path(s) the .feature is committed at on the planning
+#         branch, revision_of, validate_feedback)
+#        ``spec_feature_paths`` is OPTIONAL ON BOTH SIDES ON PURPOSE. The two
+#        repositories ship as separate images and either can be redeployed
+#        first; a REQUIRED argument would mean that in one of those two orders
+#        every plan is refused pre-model until the second deploy lands, which is
+#        the failure this whole note exists to prevent. Optional, the argument
+#        is inert until both sides carry it, in either order, with no window in
+#        which planning is down.
 # The contract-pin test (tests/forge/planning/test_target_terminal_contract_pin)
 # asserts the literal arg-name sets these emit against those files.
 # ---------------------------------------------------------------------------
@@ -176,11 +186,22 @@ def build_feature_plan_command_args(
     spec_summary: str,
     target_repo_descriptor: dict[str, Any],
     spec_assumptions: str | None = None,
+    spec_feature_paths: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
 
-    Only the four required keys plus ``spec_assumptions`` when non-blank —
+    Only the four required keys plus the two optional ones when non-blank —
     never a field the schema does not define.
+
+    ``spec_feature_paths`` (2026-08-22) is WHERE the specification sits on the
+    planning branch, beside ``spec_feature``, which is WHAT it says. The plan
+    YAML must declare that location under ``feature_files:``, and until this
+    argument existed forge never told the plan-writer what it was: measured over
+    eleven captured planning runs, ten plans wrote the key and SIX of those ten
+    named a folder that does not exist, each one a folder name built out of the
+    feature's title. Forge committed those files itself one leg earlier, so it is
+    the party that knows. Blank / empty is omitted entirely: an empty list is not
+    a location, and a caller with nothing to say says nothing.
     """
     args: dict[str, Any] = {
         "feature_id": feature_id,
@@ -190,6 +211,9 @@ def build_feature_plan_command_args(
     }
     if spec_assumptions is not None and str(spec_assumptions).strip():
         args["spec_assumptions"] = spec_assumptions
+    paths = [str(p).strip() for p in (spec_feature_paths or ()) if str(p).strip()]
+    if paths:
+        args["spec_feature_paths"] = paths
     return args
 
 
@@ -897,6 +921,7 @@ async def compose_planning_consumer_and_dispatch(
             spec_summary: str,
             target_repo_descriptor: dict[str, Any],
             spec_assumptions: str | None = None,
+            spec_feature_paths: Sequence[str] | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -912,6 +937,7 @@ async def compose_planning_consumer_and_dispatch(
                     spec_summary=spec_summary,
                     target_repo_descriptor=target_repo_descriptor,
                     spec_assumptions=spec_assumptions,
+                    spec_feature_paths=spec_feature_paths,
                 ),
             )
 
