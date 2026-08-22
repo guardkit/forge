@@ -44,12 +44,15 @@ import importlib
 import importlib.util
 import logging
 import json
+import posixpath
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from forge.adapters.guardkit.run import run as guardkit_run
 
@@ -1725,22 +1728,153 @@ def classify_normalizer_result(
 
 _FEATURE_FILES_KEY_RE = re.compile(r"^feature_files\s*:", re.MULTILINE)
 
+#: A YAML document marker at column 0 ends the ``feature_files:`` block even
+#: though it starts with a dash (so it is not a block-sequence item).
+_YAML_DOC_MARKER_RE = re.compile(r"^(---|\.\.\.)\s*$")
+
+
+@dataclass(frozen=True)
+class _DeclaredFeatureFiles:
+    """What forge could read out of a PRESENT top-level ``feature_files:``.
+
+    Exactly one of the two fields is meaningful:
+
+    * ``undecidable`` non-empty — forge could NOT read the declaration (the
+      YAML does not parse, or the value is off-schema). Nothing is claimed
+      about its contents. See :func:`_committed_paths_missing_from_declared`.
+    * otherwise ``missing`` — the committed spec paths absent from a
+      well-formed, NON-EMPTY declared list (empty tuple = consistent, or an
+      empty declaration, which is the plan-writer's statement and is left
+      alone).
+    """
+
+    missing: tuple[str, ...] = ()
+    undecidable: str = ""
+
+
+def _feature_files_block(yaml_text: str) -> str | None:
+    """The text of the top-level ``feature_files:`` key, key line included,
+    read to the NEXT TOP-LEVEL KEY — not to the next blank line.
+
+    A block sequence under a top-level key may legally sit at column 0
+    (``feature_files:\n- a.feature``), and blank lines and comments may appear
+    anywhere inside a block, so none of those end it. What ends it is a new
+    construct at column 0: another key, or a document marker.
+
+    Returns ``None`` when there is no top-level ``feature_files:`` at all.
+    """
+    match = _FEATURE_FILES_KEY_RE.search(yaml_text)
+    if match is None:
+        return None
+    lines = yaml_text.splitlines()
+    # The key line's index, counted with the SAME splitter that produced
+    # ``lines`` — so a stray \r cannot slide the two out of step.
+    first = len(yaml_text[: match.start()].splitlines())
+    block = [lines[first]]
+    for line in lines[first + 1 :]:
+        if not line.strip():
+            block.append(line)  # blank line: inside the block, not the end of it
+            continue
+        if line[:1].isspace() or line.lstrip().startswith("#"):
+            block.append(line)  # indented content, or a comment
+            continue
+        if _YAML_DOC_MARKER_RE.match(line):
+            break  # a new document ends the block
+        if line == "-" or line.startswith("- "):
+            block.append(line)  # a column-0 block-sequence item under the key
+            continue
+        break  # anything else at column 0 is the next top-level construct
+    return "\n".join(block) + "\n"
+
+
+def _read_declared_feature_files(yaml_text: str) -> tuple[object, str]:
+    """Read the top-level ``feature_files:`` VALUE with PyYAML.
+
+    Returns ``(value, "")`` on a successful parse, or ``(None, why)`` when the
+    declaration could not be read. The whole document is tried first — that is
+    the reader guardkit's own plan load uses, so it sees exactly what the
+    consumer will — and only if the document does not parse (it may be
+    malformed anywhere, including far from this key) is the extracted
+    ``feature_files:`` block parsed on its own. Both are real parses; there is
+    no fallback that guesses.
+    """
+    whole_error = ""
+    try:
+        document = yaml.safe_load(yaml_text)
+    except Exception as exc:  # noqa: BLE001 — an unreadable plan is said, not hidden
+        whole_error = f"{type(exc).__name__}: {exc}"
+    else:
+        if isinstance(document, dict) and "feature_files" in document:
+            return document["feature_files"], ""
+
+    block = _feature_files_block(yaml_text)
+    if block is None:
+        return None, "no top-level feature_files: key"
+    try:
+        parsed = yaml.safe_load(block)
+    except Exception as exc:  # noqa: BLE001
+        return None, (
+            f"the feature_files: block does not parse as YAML ({type(exc).__name__}: {exc})"
+        )
+    if isinstance(parsed, dict) and "feature_files" in parsed:
+        return parsed["feature_files"], ""
+    if whole_error:
+        return None, f"the plan YAML does not parse ({whole_error})"
+    return None, "the top-level feature_files: line does not read back as a key"
+
+
+def _normalised_spec_path(raw: str) -> str:
+    """One spelling for one repo-relative path, so ``./a/b.feature`` and
+    ``a/b.feature`` compare equal. ``posixpath.normpath`` collapses ``./`` and
+    duplicate separators without eating a leading ``../`` or ``/``."""
+    text = raw.strip()
+    return posixpath.normpath(text) if text else ""
+
 
 def _committed_paths_missing_from_declared(
     yaml_text: str, committed: Sequence[str]
-) -> list[str]:
+) -> _DeclaredFeatureFiles:
     """Which of forge's committed spec paths are absent from a PRESENT
-    ``feature_files:`` list (substring match on the normalised path)."""
-    declared_block = yaml_text.split("feature_files:", 1)[1] if "feature_files:" in yaml_text else ""
-    declared_block = declared_block.split("\n\n", 1)[0]
-    norm = lambda x: str(x).strip().strip("'\"").lstrip("./")
-    declared = norm(declared_block)
-    # An EMPTY present list ({}, [], ~, null, or nothing) is the plan-writer's
-    # statement and is left alone (condition 2) — only a NON-EMPTY list that
-    # omits forge's committed path is inconsistent (condition 4).
-    if not any(line.strip().startswith("- ") for line in declared_block.splitlines()):
-        return []
-    return [c for c in committed if norm(c) not in declared]
+    ``feature_files:`` list — comparing PARSED entries, path against path.
+
+    An EMPTY present list ({}, [], ~, null, or nothing) is the plan-writer's
+    statement and is left alone (condition 2) — only a NON-EMPTY list that
+    omits forge's committed path is inconsistent (condition 4).
+
+    Off-schema declarations are NOT judged, and say so. guardkit's own plan
+    loader (``guardkit.orchestrator.feature_loader.Feature``) requires
+    ``feature_files`` to be a list of non-empty strings and rejects anything
+    else loudly at load time — measured 2026-08-22: a bare string gives "Input
+    should be a valid list", a non-string entry "Input should be a valid
+    string", an empty-string entry "entries must be non-empty repo-relative
+    paths". So a shape forge cannot compare is already caught downstream, and
+    forge answering "your list omits my path" about a list it could not read
+    would be a guess wearing a finding's name. Forge names what it could not
+    read instead; either way it writes NOTHING to a plan that declared the key.
+    """
+    declared, why = _read_declared_feature_files(yaml_text)
+    if why:
+        return _DeclaredFeatureFiles(undecidable=why)
+    if declared is None or declared == [] or declared == {} or declared == "":
+        return _DeclaredFeatureFiles()  # condition 2: an empty statement, left alone
+    if not isinstance(declared, list):
+        return _DeclaredFeatureFiles(
+            undecidable=(
+                f"feature_files: is {type(declared).__name__}, not a list of paths"
+            )
+        )
+    if not all(isinstance(entry, str) and entry.strip() for entry in declared):
+        return _DeclaredFeatureFiles(
+            undecidable="feature_files: has an entry that is not a non-empty path string"
+        )
+    declared_paths = {_normalised_spec_path(entry) for entry in declared}
+    return _DeclaredFeatureFiles(
+        missing=tuple(
+            path
+            for path in committed
+            if _normalised_spec_path(str(path)) not in declared_paths
+        )
+    )
 
 
 def declare_feature_files_if_absent(
@@ -1778,15 +1912,37 @@ def declare_feature_files_if_absent(
         # Coordinator condition 4 (review, 08-16): a PRESENT model-written list
         # that omits the path forge itself committed the spec to is a real
         # inconsistency — refuse LOUD here; never silently add to it.
-        missing = _committed_paths_missing_from_declared(text, paths)
-        if missing:
+        read = _committed_paths_missing_from_declared(text, paths)
+        if read.undecidable:
+            # Present, but forge could not READ it. Saying "your list omits my
+            # path" here would be a claim about contents forge never parsed, so
+            # forge says what it could not read and judges nothing. The key is
+            # present, so nothing is written either way; guardkit's plan load
+            # rejects the malformed/off-schema plan itself, by name.
+            logger.warning(
+                "stamp normalizer hook: %s declares feature_files: but forge "
+                "could not read it (%s) — not judged, nothing written",
+                rel,
+                read.undecidable,
+            )
+            return FeatureFilesFill(
+                False,
+                rel,
+                reason=(
+                    "feature_files: is declared but forge could not read it ("
+                    + read.undecidable
+                    + ") — not judged against the committed spec .feature, and "
+                    "nothing written"
+                ),
+            )
+        if read.missing:
             return FeatureFilesFill(
                 False,
                 rel,
                 reason=(
                     "feature_files: declared by the plan-writer but it does NOT "
                     "name the spec .feature forge committed on this branch: "
-                    + ", ".join(missing)
+                    + ", ".join(read.missing)
                     + " — inconsistent plan; refusing (not silently added)"
                 ),
                 inconsistent=True,
