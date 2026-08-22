@@ -329,11 +329,22 @@ jobs:
   #     -----
   #     7,237 run  ->  7,222 pass, 14 skip, 1 FAIL, in 1 minute 47 seconds
   #
-  # An earlier revision of this header claimed 7,226 pass / 10 skip. That
-  # was measured in a working tree that had a ``../fleet-memory`` symlink,
-  # which no runner has, and on Python 3.14, which no job here installs.
-  # Four fleet-memory-gated tests SKIP on a runner instead of passing.
-  # The figures above are from the runner-shaped layout and supersede it.
+  # THE ONLY FIGURES HERE THAT COUNT ARE FROM A REAL RUNNER. This header
+  # has now been wrong twice, both times because a local measurement was
+  # quoted as if it were a CI one:
+  #
+  #   1st: 7,226 pass / 10 skip — measured in a working tree with a
+  #        ../fleet-memory symlink no runner has, on Python 3.14 which no
+  #        job here installs. Four fleet-memory-gated tests SKIP on a
+  #        runner rather than pass.
+  #   2nd: the "1 FAIL" above. The first real run of this job reported
+  #        42 failed / 7,178 passed. 41 of those were the runner having no
+  #        git identity, which the step below now fixes; the local box had
+  #        one configured, so nothing local could ever have shown it.
+  #
+  # The single genuine failure named below survived both corrections and
+  # is the real state. Anyone editing these numbers again: take them from
+  # a run of this workflow, not from your machine.
   #
   # (7,257 minus 21 is 7,236, one short of the 7,237 pytest reports as
   # run. One item is counted once at collection and twice at run time —
@@ -428,6 +439,26 @@ jobs:
       #
       # ``-p no:randomly`` is not used and no seed is fixed: the suite
       # runs in collection order, as it does locally.
+      # A GITHUB RUNNER HAS NO GIT IDENTITY, and forge's planning driver
+      # commits through git in the code under test — not just in test
+      # helpers. Without this step the driver's handoff write dies with
+      # "Author identity unknown / fatal: empty ident name", the run is
+      # recorded as FAILED instead of BUILD_QUEUED, and 41 tests fail for
+      # a reason that has nothing to do with forge.
+      #
+      # MEASURED on the first real run of this job (2026-08-22): 42 failed
+      # / 7,178 passed. 41 of the 42 were this. The test helpers in
+      # test_driver_target_terminal.py already pass GIT_AUTHOR_* env vars
+      # for their OWN seed commits, which is why the cause is easy to miss
+      # — the commits that fail are the ones the production path makes.
+      #
+      # --global, not --local: the code under test creates repositories in
+      # temporary directories, so a per-repo identity would not reach them.
+      - name: Give the runner a git identity (the code under test commits)
+        run: |
+          git config --global user.email "ci@forge.invalid"
+          git config --global user.name "forge CI"
+
       - name: Run the suite
         working-directory: forge
         env:
