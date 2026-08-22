@@ -179,7 +179,14 @@ def test_feature_plan_wire_args_carry_the_committed_spec_location() -> None:
             "features/users-count-endpoint/users-count-endpoint.feature"
         ],
     )
+    # Assert against the OPTIONAL constant, not a literal. Reviewed 2026-08-22:
+    # this constant had no remaining reference, so editing it failed nothing and
+    # "the contract pin was updated in lockstep" overstated what it did. Naming
+    # it here makes the pin real again — a drift in the optional set now fails a
+    # test instead of failing a live planning run.
     assert set(args) == _FEATURE_PLAN_REQUIRED | {"spec_feature_paths"}
+    assert "spec_feature_paths" in _FEATURE_PLAN_OPTIONAL_ON_WIRE
+    assert set(args) - _FEATURE_PLAN_REQUIRED <= _FEATURE_PLAN_OPTIONAL_ON_WIRE
     assert args["spec_feature_paths"] == [
         "features/users-count-endpoint/users-count-endpoint.feature"
     ]
