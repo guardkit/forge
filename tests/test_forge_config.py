@@ -309,6 +309,12 @@ class TestYamlRoundTrip:
             # always includes both keys and this exhaustive fixture must
             # declare them.
             "conductor": {"enabled": False, "seat": None},
+            # ``merge_executor`` — the merge word's activation switch
+            # (make-merge-work build spec 2026-08-24). Default-OFF: no merge
+            # card is offered and no approval response is consumed. A
+            # first-class config section, so the unfiltered round-trip dump
+            # always includes it and this exhaustive fixture must declare it.
+            "merge_executor": {"enabled": False, "response_wait_seconds": 86400},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],
