@@ -581,8 +581,12 @@ async def execute_merge_deploy(
             failed_step="deploy",
             verdict=str(verdict) if verdict is not None else None,
             detail=(
-                f"{feature_id} merged, but the deploy ended "
-                f"{d_outcome or 'without an outcome'} — nothing further was "
+                (
+                    f"dry run — nothing merged; the deploy ended "
+                    if dry_run
+                    else f"{feature_id} merged, but the deploy ended "
+                )
+                + f"{d_outcome or 'without an outcome'} — nothing further was "
                 "touched"
             ),
             checks_passed=checks_passed,
