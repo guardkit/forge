@@ -2002,6 +2002,12 @@ class PlanningRunDriver:
             "branch": draft.get("branch") or branch,
             "sha": draft.get("sha"),
             "pass_bar_seed": draft.get("pass_bar_seed"),
+            # Carried from the draft so the gate leg can read the digest's
+            # OPTIONAL endpoint field: the spec author states the method and
+            # path outright, which beats re-deriving them from criterion prose.
+            # Absent on the draft (no digest in the reply) simply stores None,
+            # and the gate leg falls back to the prose regex exactly as before.
+            "digest": draft.get("digest"),
         }
         if answer is not None:
             # The one tap answered the sign-in question too, when the card
@@ -4336,7 +4342,12 @@ class PlanningRunDriver:
             seed.get("criteria") if isinstance(seed, Mapping) else None
         ) or []
 
-        endpoint = self._derive_feature_gate_endpoint(criteria)
+        # The digest's optional endpoint field first (the spec author stated it
+        # outright); the criterion-prose regex stays as the fallback so every
+        # feature that registers a gate today still registers one.
+        endpoint = self._feature_gate_endpoint_from_digest(
+            spec_details.get("digest")
+        ) or self._derive_feature_gate_endpoint(criteria)
         if endpoint is None:
             return self._skip_feature_gate(
                 correlation_id,
@@ -4521,6 +4532,36 @@ class PlanningRunDriver:
             details_json=json.dumps({"skipped": True, "reason": reason}),
         )
         return True
+
+    @staticmethod
+    def _feature_gate_endpoint_from_digest(digest_text: Any) -> dict[str, str] | None:
+        """The spec digest's OPTIONAL ``endpoint`` field, or None.
+
+        The digest is a machine-readable artifact of the four-file contract and
+        the spec author knows the method and path first-hand, so when the field
+        is present it beats re-deriving them from criterion prose. The field is
+        optional by design: a feature that is not an HTTP endpoint omits it and
+        falls through to the prose path, then to an honest skip.
+
+        Applies the SAME v1 restriction as :meth:`_derive_get_endpoint` — GET
+        only, the sole verb whose happy-path status forge knows (200). A digest
+        naming any other verb is not a wider gate, it is no gate: forge would
+        have to guess a success status, which it never does.
+        """
+        try:
+            obj = yaml.safe_load(str(digest_text or ""))
+        except yaml.YAMLError:
+            return None
+        if not isinstance(obj, Mapping):
+            return None
+        endpoint = obj.get("endpoint")
+        if not isinstance(endpoint, Mapping):
+            return None
+        method = str(endpoint.get("method") or "").strip().upper()
+        path = str(endpoint.get("path") or "").strip()
+        if method != "GET" or not path.startswith("/"):
+            return None
+        return {"method": "GET", "path": path}
 
     def _derive_feature_gate_endpoint(
         self, criteria: Any
