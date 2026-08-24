@@ -625,3 +625,14 @@ class TestExecutorSequencing:
         outcome = await _run_executor(deps, repo_root)
         assert outcome.checks_passed == 7 and outcome.checks_total == 7
         assert "checks 7/7" in outcome.detail
+
+    def test_deploy_task_id_is_task_shaped(self) -> None:
+        """The first dry fire caught this live: DeployQueuedPayload validates
+        ^TASK-[A-Z0-9]{3,12}$ and the old merge-{build_id} shape failed it."""
+        import re
+
+        from forge.pipeline.merge_executor import _deploy_task_id
+
+        for fid in ("FEAT-E613", "FEAT-153C", "feat-x!", ""):
+            tid = _deploy_task_id(fid)
+            assert re.fullmatch(r"TASK-[A-Z0-9]{3,12}", tid), (fid, tid)
