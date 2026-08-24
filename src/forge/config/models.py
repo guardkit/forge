@@ -1178,6 +1178,52 @@ class ConductorConfig(BaseModel):
         return self
 
 
+class MergeExecutorConfig(BaseModel):
+    """The merge word's activation switch (make-merge-work build spec 2026-08-24).
+
+    The merge-and-deploy executor turns the build-complete card's "the merge
+    word is yours" sentence into a mechanism: with the switch on, a clean
+    routine build offers a [Merge & deploy] card and a server-side executor
+    acts on the approval (merge -> re-check -> sandbox deploy -> live checks
+    -> one-line report). ``enabled`` defaults to **False**, and with it off
+    the tree is byte-for-byte today's behaviour: no card is offered after a
+    clean build and no approval response is consumed.
+
+    **Deploy-order law** (mirrors :class:`ConductorConfig` — this model is
+    ``extra="forbid"`` and the loader propagates the ValidationError
+    unwrapped): writing a ``merge_executor:`` section into a deployed
+    ``forge.yaml`` before the image that defines the field is running refuses
+    the WHOLE config at load — and that binds the langgraph sidecar too,
+    which lazily re-reads the same file and degrades to a permissive
+    filesystem check on any load failure. Merge and redeploy BOTH surfaces
+    first, then add the ``merge_executor:`` section. This lane writes NO yaml
+    key anywhere.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the merge-and-deploy executor (the merge word "
+            "as a mechanism). False (the default) = byte-for-byte today's "
+            "behaviour: no merge card is offered after a clean build and no "
+            "approval response is consumed. True = a clean routine build "
+            "offers the merge card and the executor acts on the approval."
+        ),
+    )
+    response_wait_seconds: int = Field(
+        default=86400,
+        ge=0,
+        description=(
+            "timeout_seconds published on the merge approval request — how "
+            "long the card presents itself as valid. Default one day: the "
+            "merge word is an owner's act and may come long after the build "
+            "finishes."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -1230,6 +1276,15 @@ class ForgeConfig(BaseModel):
             "Defaults to disabled (enabled=False) — with it off the tree is "
             "byte-for-byte today's behaviour and '--mode c' is refused at "
             "queue time."
+        ),
+    )
+    merge_executor: MergeExecutorConfig = Field(
+        default_factory=MergeExecutorConfig,
+        description=(
+            "The merge word's activation switch (make-merge-work build spec "
+            "2026-08-24). Defaults to disabled (enabled=False) — with it off "
+            "no merge card is offered after a clean build and no approval "
+            "response is consumed; today's behaviour byte-for-byte."
         ),
     )
     resource_preflight: ResourcePreflightConfig = Field(
