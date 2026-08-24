@@ -291,7 +291,18 @@ async def execute_merge_deploy(
             checks_passed=outcome.checks_passed,
             checks_total=outcome.checks_total,
             detail=outcome.detail,
+            dry_run=dry_run,
         )
+        if dry_run:
+            logger.info(
+                "merge-executor: dry run — outcome kept to receipts only, "
+                "no stage-complete published for %s",
+                build_id,
+            )
+            _write_receipt(
+                "merge_deploy_report.json", payload.model_dump(mode="json")
+            )
+            return outcome
         try:
             await deps.pipeline_publisher.publish_stage_complete(payload)
         except Exception as exc:  # noqa: BLE001 — the report is derived truth
@@ -324,119 +335,146 @@ async def execute_merge_deploy(
                 ),
             )
         )
-    _claim_step(
-        MERGE_STEP_MERGE_TARGET_IDENTIFIER,
-        {
-            "merge_step": {
-                "expect_main_sha": expect_main_sha,
-                "decided_by": decided_by,
-                "dry_run": dry_run,
-            }
-        },
-    )
-
-    args = [
-        "merge",
-        feature_id,
-        "--target",
-        "main",
-        "--expect-main-sha",
-        expect_main_sha,
-        "--json",
-    ]
-    baseline_path: Path | None = None
-    if baseline_failing is not None:
-        baseline_path = (
-            repo_root / ".guardkit" / "tmp" / f"merge-baseline-{build_id}.json"
+    if dry_run:
+        # A dry run merges NOTHING and leaves NO durable step rows — a claimed
+        # step would make a later real press refuse "already on record". It
+        # proves the plumbing end to end and exercises the deploy stage's own
+        # dry mode below; the receipts on disk are its only record.
+        _write_receipt(
+            "merge_deploy_merge.json",
+            {
+                "step": "merge",
+                "dry_run": True,
+                "skipped": (
+                    "dry run — nothing merged; a real press would merge "
+                    f"autobuild/{feature_id} into main at {expect_main_sha}"
+                ),
+            },
         )
-        try:
-            baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            baseline_path.write_text(
-                json.dumps({"failing": baseline_failing}, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            args += ["--baseline-json", str(baseline_path)]
-        except OSError as exc:
-            logger.warning(
-                "merge-executor: could not write the baseline file for %s "
-                "(%s) — the merge runs without a pre-merge baseline",
-                build_id,
-                exc,
-            )
-            baseline_path = None
-
-    result = await deps.guardkit_run(
-        subcommand="autobuild",
-        args=args,
-        repo_path=repo_root,
-        read_allowlist=[repo_root],
-        timeout_seconds=MERGE_TIMEOUT_SECONDS,
-        with_nats_streaming=False,
-    )
-    report = _parse_merge_report(result)
-    refusal: str | None = None
-    result_status = getattr(result, "status", "failed")
-    if result_status != "success":
-        stderr = (getattr(result, "stderr", None) or "").strip()
-        tail = (getattr(result, "stdout_tail", "") or "").strip()
-        refusal = (
-            f"the merge command did not succeed (status={result_status})"
-            + (f": {stderr[-400:]}" if stderr else (f": {tail[-400:]}" if tail else ""))
-        )
-    elif report is not None:
-        refusal = _report_refusal(report)
-
-    _write_receipt(
-        "merge_deploy_merge.json",
-        {
-            "step": "merge",
-            "status": result_status,
-            "exit_code": getattr(result, "exit_code", None),
-            "refusal": refusal,
-            "report": report,
-            "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
-            "baseline_file": str(baseline_path) if baseline_path else None,
-        },
-    )
-    if refusal:
-        return await _publish_report(
-            MergeDeployOutcome(
-                result="merge-refused",
-                status="FAILED",
-                failed_step="merge",
-                detail=refusal,
-            )
+        merged_sha = None
+        checks_passed = None
+        checks_total = None
+    else:
+        _claim_step(
+            MERGE_STEP_MERGE_TARGET_IDENTIFIER,
+            {
+                "merge_step": {
+                    "expect_main_sha": expect_main_sha,
+                    "decided_by": decided_by,
+                    "dry_run": dry_run,
+                }
+            },
         )
 
-    merged_sha = _report_sha(report)
-    checks_passed = _report_int(report, "checks_passed")
-    checks_total = _report_int(report, "checks_total")
+        args = [
+            "merge",
+            feature_id,
+            "--target",
+            "main",
+            "--expect-main-sha",
+            expect_main_sha,
+            "--json",
+        ]
+        baseline_path: Path | None = None
+        if baseline_failing is not None:
+            baseline_path = (
+                repo_root / ".guardkit" / "tmp" / f"merge-baseline-{build_id}.json"
+            )
+            try:
+                baseline_path.parent.mkdir(parents=True, exist_ok=True)
+                baseline_path.write_text(
+                    json.dumps(
+                        {"failing": baseline_failing}, indent=2, sort_keys=True
+                    ),
+                    encoding="utf-8",
+                )
+                args += ["--baseline-json", str(baseline_path)]
+            except OSError as exc:
+                logger.warning(
+                    "merge-executor: could not write the baseline file for %s "
+                    "(%s) — the merge runs without a pre-merge baseline",
+                    build_id,
+                    exc,
+                )
+                baseline_path = None
+
+        result = await deps.guardkit_run(
+            subcommand="autobuild",
+            args=args,
+            repo_path=repo_root,
+            read_allowlist=[repo_root],
+            timeout_seconds=MERGE_TIMEOUT_SECONDS,
+            with_nats_streaming=False,
+        )
+        report = _parse_merge_report(result)
+        refusal: str | None = None
+        result_status = getattr(result, "status", "failed")
+        if result_status != "success":
+            stderr = (getattr(result, "stderr", None) or "").strip()
+            tail = (getattr(result, "stdout_tail", "") or "").strip()
+            refusal = (
+                f"the merge command did not succeed (status={result_status})"
+                + (
+                    f": {stderr[-400:]}"
+                    if stderr
+                    else (f": {tail[-400:]}" if tail else "")
+                )
+            )
+        elif report is not None:
+            refusal = _report_refusal(report)
+
+        _write_receipt(
+            "merge_deploy_merge.json",
+            {
+                "step": "merge",
+                "status": result_status,
+                "exit_code": getattr(result, "exit_code", None),
+                "refusal": refusal,
+                "report": report,
+                "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
+                "baseline_file": str(baseline_path) if baseline_path else None,
+            },
+        )
+        if refusal:
+            return await _publish_report(
+                MergeDeployOutcome(
+                    result="merge-refused",
+                    status="FAILED",
+                    failed_step="merge",
+                    detail=refusal,
+                )
+            )
+
+        merged_sha = _report_sha(report)
+        checks_passed = _report_int(report, "checks_passed")
+        checks_total = _report_int(report, "checks_total")
 
     # ------------------------------------------------------------------
     # STEP deploy (mirrors the attended dispatch, in-daemon)
     # ------------------------------------------------------------------
-    if _has_step(MERGE_STEP_DEPLOY_TARGET_IDENTIFIER):
-        logger.error(
-            "merge-executor: %s already has a deploy step on record — refusing "
-            "to dispatch the deploy twice",
-            build_id,
-        )
-        return await _publish_report(
-            MergeDeployOutcome(
-                result="merged-deploy-failed",
-                status="FAILED",
-                merged_sha=merged_sha,
-                failed_step="deploy",
-                detail=(
-                    "the merge landed but a deploy step is already on record — "
-                    "refusing to dispatch it twice"
-                ),
+    if not dry_run:
+        if _has_step(MERGE_STEP_DEPLOY_TARGET_IDENTIFIER):
+            logger.error(
+                "merge-executor: %s already has a deploy step on record — "
+                "refusing to dispatch the deploy twice",
+                build_id,
             )
+            return await _publish_report(
+                MergeDeployOutcome(
+                    result="merged-deploy-failed",
+                    status="FAILED",
+                    merged_sha=merged_sha,
+                    failed_step="deploy",
+                    detail=(
+                        "the merge landed but a deploy step is already on "
+                        "record — refusing to dispatch it twice"
+                    ),
+                )
+            )
+        _claim_step(
+            MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
+            {"deploy_step": {"merged_sha": merged_sha, "dry_run": dry_run}},
         )
-    _claim_step(
-        MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
-        {"deploy_step": {"merged_sha": merged_sha, "dry_run": dry_run}},
-    )
 
     try:
         deploy_result = await deps.deploy_dispatcher(

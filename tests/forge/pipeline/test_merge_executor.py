@@ -552,12 +552,43 @@ class TestExecutorSequencing:
         assert "deploy.enabled=false" in outcome.detail
 
     @pytest.mark.asyncio
-    async def test_dry_run_threads_through_to_the_dispatcher(
+    async def test_dry_run_merges_nothing_claims_nothing_publishes_nothing(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        """A dry run is genuinely dry: no merge, no durable step rows, no
+        Slack-bound publish — only the deploy dispatch in its own labelled
+        dry mode, and receipts on disk."""
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root, dry_run=True)
+        assert gk.calls == []  # the merge command is never invoked
+        assert dp.calls[0]["dry_run"] is True  # deploy runs in its dry mode
+        assert publisher.reports == []  # nothing reaches Slack
+        assert _stage_ids(pool) == []  # no durable step rows claimed
+        assert outcome.merged_sha is None
+        receipts = _receipts_env / f"merge-{BUILD_ID}"
+        merge_receipt = json.loads(
+            (receipts / "merge_deploy_merge.json").read_text()
+        )
+        assert merge_receipt["dry_run"] is True
+        assert "nothing merged" in merge_receipt["skipped"]
+        report_receipt = json.loads(
+            (receipts / "merge_deploy_report.json").read_text()
+        )
+        assert report_receipt["dry_run"] is True
+
+    @pytest.mark.asyncio
+    async def test_dry_run_never_blocks_a_later_real_press(
         self, config, pool, repo_root
     ) -> None:
+        """The poisoning case the guard exists for: a dry run must leave no
+        step rows, so the real press afterwards merges normally instead of
+        refusing "already on record"."""
         deps, publisher, gk, dp = _deps(config, pool)
         await _run_executor(deps, repo_root, dry_run=True)
-        assert dp.calls[0]["dry_run"] is True
+        outcome = await _run_executor(deps, repo_root, dry_run=False)
+        assert outcome.result == "merged-and-running"
+        assert len(gk.calls) == 1  # the real merge ran, unblocked
+        assert len(publisher.reports) == 1  # and the real outcome published
 
     @pytest.mark.asyncio
     async def test_baseline_file_written_and_flag_passed(
