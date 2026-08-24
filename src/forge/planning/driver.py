@@ -1693,6 +1693,28 @@ class PlanningRunDriver:
         slug = self._slug_of(role_output, correlation_id)
         files = self._spec_triple_files(role_output, slug)
         if not files:
+            # A DEGRADED dispatch means no specialist was resolvable and NOTHING RAN — reporting
+            # that as "invalid artifacts" blames the model for output it was never asked to
+            # produce. Measured 2026-08-24: a missing NATS credential made the PO specialist
+            # unreachable, forge logged `dispatch.degraded ... no_specialist_resolvable` one line
+            # earlier, and the operator-facing failure still read "007 returned no spec contract
+            # (invalid artifacts)" — pointing every debugging instinct at the wrong layer.
+            # `_dispatch_ok` deliberately treats `degraded` as ok (it can legitimately carry
+            # output elsewhere), so the distinction has to be drawn HERE, where the emptiness is.
+            outcome_value = str(
+                getattr(getattr(result, "outcome", None), "value", "") or ""
+            ).lower()
+            if outcome_value == "degraded":
+                degraded_reason = (
+                    getattr(result, "reason", None) or "no specialist resolvable"
+                )
+                await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_SPEC_STAGE,
+                    f"007 never ran — dispatch degraded ({degraded_reason}); "
+                    "no specialist was reachable, so no spec was produced",
+                )
+                return None
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_SPEC_STAGE,
