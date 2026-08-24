@@ -88,7 +88,12 @@ async def _aopen_backends(
 
 
 def _resolve_build_row(pool: Any, feature_id: str, build_id: str | None) -> Any:
-    """The newest COMPLETE routine build row for the feature (or the named one)."""
+    """The newest COMPLETE non-fix-journey build row (or the named one).
+
+    Routine means "not a fix journey" — the machine chain has queued builds
+    as both mode-a and mode-b over time, and both are mergeable feature
+    builds; only mode-c (the fix journey) is excluded.
+    """
     from forge.lifecycle.modes import BuildMode
     from forge.lifecycle.state_machine import BuildState
 
@@ -103,7 +108,7 @@ def _resolve_build_row(pool: Any, feature_id: str, build_id: str | None) -> Any:
             )
         return row
     for row in pool.read_history(limit=1000, feature_id=feature_id):
-        if row.status is BuildState.COMPLETE and row.mode is BuildMode.MODE_A:
+        if row.status is BuildState.COMPLETE and row.mode is not BuildMode.MODE_C:
             return row
     raise click.ClickException(
         f"no COMPLETE routine build is on record for {feature_id} — nothing "
@@ -198,7 +203,11 @@ async def _arun(
     "--dry-run",
     is_flag=True,
     default=False,
-    help="Thread dry-run through the deploy step (labelled, zero blast radius).",
+    help=(
+        "Genuinely dry: nothing merges, no durable step rows are claimed, "
+        "nothing is published to Slack — the deploy stage runs in its own "
+        "labelled dry mode and the receipts on disk are the only record."
+    ),
 )
 @click.pass_context
 def merge_deploy_cmd(
