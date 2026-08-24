@@ -497,7 +497,14 @@ async def execute_merge_deploy(
                 status="FAILED",
                 merged_sha=merged_sha,
                 failed_step="deploy",
-                detail=f"the merge landed but the deploy dispatch raised: {exc}",
+                detail=(
+                    (
+                        "dry run — nothing merged; "
+                        if dry_run
+                        else "the merge landed but "
+                    )
+                    + f"the deploy dispatch raised: {exc}"
+                ),
                 checks_passed=checks_passed,
                 checks_total=checks_total,
             )
@@ -664,12 +671,31 @@ def build_in_daemon_deploy_dispatcher(
             target_repo_root=str(repo_root),
             feature=feature_id,
             feat_id=feature_id,
-            # Distinct per run — the F7 record filename is date-granular.
-            task_id=f"merge-{build_id}",
+            # Distinct per run AND TASK-shaped — DeployQueuedPayload validates
+            # ^TASK-[A-Z0-9]{3,12}$ (the first dry fire caught this live);
+            # the time suffix also keeps the date-granular F7 record filename
+            # distinct across same-day runs.
+            task_id=_deploy_task_id(feature_id),
             deployer=f"merge-word:{decided_by}",
         )
 
     return _dispatch
+
+
+def _deploy_task_id(feature_id: str) -> str:
+    """A TASK-shaped, per-run-distinct id for the deploy leg.
+
+    DeployQueuedPayload validates ``^TASK-[A-Z0-9]{3,12}$``. Compose it from
+    the feature's own suffix plus a UTC HHMMSS stamp so two same-day runs
+    never collide on the date-granular deploy-record filename.
+    """
+    from datetime import datetime, timezone
+
+    suffix = "".join(
+        ch for ch in feature_id.upper().removeprefix("FEAT-") if ch.isalnum()
+    )[:6] or "MERGE"
+    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+    return f"TASK-{(suffix + stamp)[:12]}"
 
 
 # ---------------------------------------------------------------------------
