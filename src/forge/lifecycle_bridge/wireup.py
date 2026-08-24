@@ -499,6 +499,7 @@ class LifecycleBridgeWireup:
         budget_observer: "BudgetBreachObserver | None" = None,
         build_mode_reader: "BuildModeReader | None" = None,
         terminal_class_recorder: "TerminalClassRecorder | None" = None,
+        merge_offer_hook: Callable[[PipelineEvent], Awaitable[None]] | None = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -566,6 +567,13 @@ class LifecycleBridgeWireup:
         # that has not opted in) makes the hook a strict no-op: the observer
         # behaves byte-for-byte as it did before this lane.
         self._terminal_class_recorder = terminal_class_recorder
+        # Make-merge-work (2026-08-24): fire-and-forget merge-offer hook,
+        # invoked AFTER a terminal envelope's publish + build-state write-back
+        # succeed and never delaying _on_terminal's ack. ``None`` (the
+        # default, and every deployment with merge_executor.enabled=False)
+        # is a strict no-op — byte-identical to the pre-lane observer.
+        self._merge_offer_hook = merge_offer_hook
+        self._merge_offer_tasks: set[asyncio.Task[None]] = set()
         # Per-feature budget-detection state (one session per observer task).
         # Created at observer start when a detector is wired, dropped in the
         # observer's ``finally`` — so the review-cycle count resets on bridge
@@ -1411,6 +1419,11 @@ class LifecycleBridgeWireup:
             if isinstance(event, TERMINAL_PAYLOAD_TYPES):
                 if published_ok:
                     terminal_seen = True
+                    # Make-merge-work (2026-08-24): offer the merge card AFTER
+                    # the BuildStateRecorder hop (inside _publish_event) —
+                    # fire-and-forget, so a slow offer can never delay
+                    # _on_terminal's ack/detach.
+                    self._spawn_merge_offer(event)
                     await self._on_terminal(handle, feature_id, correlation_id)
                     return (True, True)
                 # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope
@@ -1726,6 +1739,42 @@ class LifecycleBridgeWireup:
                 feature_id,
                 correlation_id,
             )
+
+    def _spawn_merge_offer(self, event: PipelineEvent) -> None:
+        """Fire the merge-offer hook for a published terminal, detached.
+
+        Make-merge-work (2026-08-24). No hook (the default) is a strict
+        no-op. The task is held in a strong-reference set (dropped on
+        completion) so the event loop cannot garbage-collect it mid-flight,
+        and any exception it raises is logged by its own wrapper — the
+        lifecycle stream is more load-bearing than the offer.
+        """
+        hook = self._merge_offer_hook
+        if hook is None:
+            return
+
+        async def _run() -> None:
+            try:
+                await hook(event)
+            except Exception as exc:  # noqa: BLE001 — offer must not break the stream
+                logger.error(
+                    "wireup._spawn_merge_offer: merge-offer hook raised (%s) "
+                    "for payload_type=%s; the lifecycle stream continues",
+                    exc,
+                    type(event).__name__,
+                )
+
+        try:
+            task = asyncio.create_task(_run())
+        except RuntimeError:  # pragma: no cover — no running event loop
+            logger.error(
+                "wireup._spawn_merge_offer: no running event loop; the merge "
+                "offer for payload_type=%s was dropped",
+                type(event).__name__,
+            )
+            return
+        self._merge_offer_tasks.add(task)
+        task.add_done_callback(self._merge_offer_tasks.discard)
 
     # ------------------------------------------------------------------
     # Identity resolution

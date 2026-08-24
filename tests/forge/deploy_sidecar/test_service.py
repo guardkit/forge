@@ -263,6 +263,28 @@ def test_env_not_object_refused(repo: Path) -> None:
     assert "'env' must be a JSON object" in body["error"]
 
 
+def test_candidate_down_env_key_allowed(repo: Path) -> None:
+    """Make-merge-work (2026-08-24): CANDIDATE_DOWN rides the BASE allowlist.
+
+    The candidate-stack teardown env — without it every sidecar-surface run
+    leaks the candidate stack on :8902 (the teardown env was refused 400).
+    """
+    assert "CANDIDATE_DOWN" in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {"CANDIDATE_DOWN": "1"},
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["extra_env"]["CANDIDATE_DOWN"] == "1"
+
+
 def test_live_gate_env_key_allowed(repo: Path) -> None:
     _write_profile(
         repo,
