@@ -353,6 +353,32 @@ def bind_production_dispatch_chain(
             client, config=forge_config.pipeline
         )
 
+        # Make-merge-work (2026-08-24) — the merge-offer hook, composed only
+        # when merge_executor.enabled is on (default OFF = byte-for-byte
+        # today's behaviour: the hook stays None and the wireup's seam is a
+        # strict no-op). DDR-007 boot protection: a composition failure never
+        # bricks boot — the offer simply stays off; the ERROR log is the probe.
+        merge_offer_hook: Any = None
+        try:
+            _merge_cfg = getattr(forge_config, "merge_executor", None)
+            if _merge_cfg is not None and _merge_cfg.enabled:
+                from forge.pipeline.merge_offer import MergeOfferService
+
+                _merge_offer_service = MergeOfferService(
+                    config=forge_config,
+                    pool=sqlite_pool,
+                    pipeline_publisher=publisher,
+                    raw_publish=client.publish,
+                )
+                merge_offer_hook = _merge_offer_service.maybe_offer
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            merge_offer_hook = None
+            logger.error(
+                "forge-serve: merge-offer composition FAILED (%s) — no merge "
+                "card will be offered after clean builds until fixed",
+                exc,
+            )
+
         register_ack_handle: Any = None
         terminal_publish_ledger: Any = None
         if bridge_wireup_parts is not None:
@@ -426,6 +452,9 @@ def bind_production_dispatch_chain(
                 terminal_class_recorder=(
                     bridge_wireup_parts.terminal_class_recorder
                 ),
+                # Make-merge-work (2026-08-24) — the merge card rides the
+                # terminal seam; None (flag off) keeps the seam a no-op.
+                merge_offer_hook=merge_offer_hook,
             )
             register_ack_handle = wireup.register_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
@@ -602,6 +631,50 @@ def bind_production_dispatch_chain(
                 "forge-serve: deploy-stage composition FAILED (%s) — the "
                 "deploy stage stays INERT (DEPLOY / LIVE_GATE will not "
                 "dispatch) until fixed",
+                exc,
+            )
+
+        # Make-merge-work (2026-08-24) — attach the merge-approval consumer,
+        # gated on merge_executor.enabled (default OFF = nothing subscribes).
+        # A CORE NATS subscription — never JetStream (the AGENTS stream is
+        # no_ack). DDR-007 boot protection: a composition failure never
+        # bricks boot; merge approvals simply go unconsumed until fixed.
+        try:
+            _merge_cfg = getattr(forge_config, "merge_executor", None)
+            if _merge_cfg is not None and _merge_cfg.enabled:
+                from forge.adapters.guardkit.run import run as _merge_guardkit_run
+                from forge.adapters.nats.envelope_subscribe import (
+                    EnvelopeSubscribeClient,
+                )
+                from forge.pipeline.merge_executor import (
+                    MergeApprovalConsumer,
+                    MergeExecutorDeps,
+                    build_in_daemon_deploy_dispatcher,
+                )
+
+                _merge_consumer = MergeApprovalConsumer(
+                    MergeExecutorDeps(
+                        config=forge_config,
+                        pool=sqlite_pool,
+                        pipeline_publisher=publisher,
+                        guardkit_run=_merge_guardkit_run,
+                        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+                            config=forge_config,
+                            nats_client=client,
+                            db_path=db_path,
+                        ),
+                    )
+                )
+                await _merge_consumer.attach(EnvelopeSubscribeClient(client))
+                logger.info(
+                    "forge-serve: merge-approval consumer attached "
+                    "(merge_executor.enabled=true) — the merge word has a "
+                    "listener"
+                )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            logger.error(
+                "forge-serve: merge-executor composition FAILED (%s) — merge "
+                "approvals will NOT be consumed until fixed",
                 exc,
             )
 

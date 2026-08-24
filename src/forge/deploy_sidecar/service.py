@@ -79,7 +79,17 @@ TIMEOUT_MAX: float = 1800.0
 #: Base env-key allowlist (LAW 3). The profile's live_gate.env / candidate.env
 #: key names are unioned onto this per request.
 ENV_ALLOWLIST_BASE: frozenset[str] = frozenset(
-    {"REVERT", "ROLLBACK_IMAGE_REF", "ENV_FILE", "CANDIDATE", "PROMOTE"}
+    {
+        "REVERT",
+        "ROLLBACK_IMAGE_REF",
+        "ENV_FILE",
+        "CANDIDATE",
+        "PROMOTE",
+        # Make-merge-work (2026-08-24): the candidate-stack teardown env.
+        # Without it every sidecar-surface run leaks the candidate stack on
+        # :8902 — the teardown request's env key was refused 400.
+        "CANDIDATE_DOWN",
+    }
 )
 
 #: Maximum characters of script output returned as ``output_tail``. The
