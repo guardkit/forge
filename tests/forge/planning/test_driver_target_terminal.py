@@ -2586,6 +2586,133 @@ async def test_f2_underivable_seed_honest_skip_build_still_queues(
     assert "no derivable endpoint" in ev.get("reason", "")
 
 
+def _with_digest_endpoint(result: Any, method: str, path: str) -> Any:
+    """The same native spec reply, its digest carrying the OPTIONAL endpoint field."""
+    block = f"endpoint:\n  method: {method}\n  path: {path}\n"
+
+    rewritten = 0
+
+    def _rewrite(mapping: dict[str, Any]) -> None:
+        nonlocal rewritten
+        for key, content in list(mapping.items()):
+            if isinstance(content, dict):  # the nested committed-files shape
+                _rewrite(content)
+            elif str(key).endswith("_digest.yaml"):
+                mapping[key] = str(content).replace(
+                    "scenarios:\n", block + "scenarios:\n", 1
+                )
+                rewritten += 1
+
+    _rewrite(result.role_output)
+    assert rewritten, "digest fixture never rewritten — the helper found no digest"
+    return result
+
+
+@pytest.mark.asyncio
+async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """THE FEAT-F2B0 CASE: the criteria prose yields nothing (that seed skips on
+    its own — proven by the test above), but the digest states the endpoint
+    outright, so the gate REGISTERS against the path that was actually asked
+    for. This is the whole point of the optional field: a real endpoint feature
+    stops falling through to an honest skip."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_with_digest_endpoint(
+            _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS),
+            "GET",
+            "/users/{user_id}",
+        ),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # No skip — a gate was registered, and against the DIGEST's path.
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is not True, ev
+    assert h.ctx["counters"]["gate_registry_validate"] == 1
+    # The gate id still comes from the seed's slug; only the REQUEST comes from
+    # the digest. (The test above proves this same seed lands no gate at all.)
+    gate = _show_on_branch(repo, "qa/gates/nightly_report_gate.py")
+    assert gate.returncode == 0, gate.stderr
+    assert '"gate_id": "nightly-report",' in gate.stdout
+    assert (
+        '"request": {"method": "GET", "path": "/users/{user_id}"},' in gate.stdout
+    )
+    compile(gate.stdout, "nightly_report_gate.py", "exec")
+
+
+@pytest.mark.asyncio
+async def test_f2_digest_endpoint_absent_leaves_the_prose_path_exactly_as_it_was(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The field is OPTIONAL: with no endpoint in the digest the derivable seed
+    still registers its gate from the prose, byte-identically. Nothing that
+    gates today stops gating."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    gate = _show_on_branch(repo, "qa/gates/version_endpoint_gate.py")
+    assert gate.returncode == 0, gate.stderr
+    assert '"request": {"method": "GET", "path": "/version"},' in gate.stdout
+
+
+@pytest.mark.asyncio
+async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A digest naming POST is not a wider gate — forge does not know POST's
+    happy-path status, so it skips honestly rather than guessing one."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_with_digest_endpoint(
+            _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS), "POST", "/users"
+        ),
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert "no derivable endpoint" in ev.get("reason", "")
+
+
 @pytest.mark.asyncio
 async def test_f2_missing_template_honest_skip(
     store: SqlitePlanningRunStore, tmp_path: Path
@@ -2827,6 +2954,46 @@ def test_derive_feature_gate_endpoint_first_machine_get_wins() -> None:
         "method": "GET",
         "path": "/version",
     }
+
+
+def test_feature_gate_endpoint_from_digest_reads_the_optional_field() -> None:
+    """The digest's endpoint field is taken at face value when it names a GET."""
+    digest = (
+        'feature: get-user-by-id\n'
+        'generated: "2026-08-24T09:00:00Z"\n'
+        'endpoint:\n'
+        '  method: GET\n'
+        '  path: /users/{user_id}\n'
+        'scenarios: []\n'
+    )
+    assert PlanningRunDriver._feature_gate_endpoint_from_digest(digest) == {
+        "method": "GET",
+        "path": "/users/{user_id}",
+    }
+    # lower-case and padded verbs are the same statement, not a different one
+    assert PlanningRunDriver._feature_gate_endpoint_from_digest(
+        "endpoint:\n  method: ' get '\n  path: /v\n"
+    ) == {"method": "GET", "path": "/v"}
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "",  # nothing at all
+        "feature: x\nscenarios: []\n",  # field omitted — the common, correct case
+        "endpoint:\n  method: POST\n  path: /users\n",  # verb forge cannot gate
+        "endpoint:\n  method: GET\n  path: users/1\n",  # not rooted
+        "endpoint:\n  method: GET\n",  # no path
+        "endpoint: /users/1\n",  # scalar, not a mapping
+        "endpoint:\n  - GET\n",  # list, not a mapping
+        "just a sentence, not yaml at all",  # parses to a str
+        "endpoint:\n  method: GET\n path: /bad\n",  # unparseable YAML
+    ],
+)
+def test_feature_gate_endpoint_from_digest_negatives(digest: str) -> None:
+    """Anything short of an explicit rooted GET yields None, so the caller falls
+    through to the prose regex and then to an honest skip — never a guessed gate."""
+    assert PlanningRunDriver._feature_gate_endpoint_from_digest(digest) is None
 
 
 def test_derive_feature_gate_endpoint_none_when_no_machine_get() -> None:
