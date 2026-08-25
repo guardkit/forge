@@ -626,6 +626,46 @@ class TestExecutorSequencing:
         assert outcome.checks_passed == 7 and outcome.checks_total == 7
         assert "checks 7/7" in outcome.detail
 
+    def test_response_subject_filter_uses_whole_token_wildcards_only(
+        self,
+    ) -> None:
+        """The first real press proved this live: NATS wildcards match whole
+        tokens, so a partial like 'merge-*' silently matches nothing."""
+        from forge.pipeline.merge_executor import MERGE_RESPONSE_SUBJECT_FILTER
+
+        for token in MERGE_RESPONSE_SUBJECT_FILTER.split("."):
+            assert token in ("*", ">") or (
+                "*" not in token and ">" not in token
+            ), token
+
+    @pytest.mark.asyncio
+    async def test_landed_merge_with_failed_verify_is_not_called_refused(
+        self, config, pool, repo_root
+    ) -> None:
+        """FEAT-7CEA's real fire: the merge LANDED, the post-merge checks hit
+        a pytest usage error, and the old label lied ('merge-refused'). A
+        landed merge with red checks reports merged-verify-failed, keeps the
+        sha, and never dispatches the deploy."""
+        gk = _FakeGuardKit(
+            status="failed",  # the verb exits 4: merged, verify not passed
+            report={
+                "outcome": "merged",
+                "post_sha": "c" * 40,
+                "verify_ok": False,
+                "verify_detail": "pytest usage error (exit 4)",
+                "charged_failures": [],
+            },
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.failed_step == "verify"
+        assert outcome.merged_sha == "c" * 40
+        assert "pytest usage error" in outcome.detail
+        assert "merged" in outcome.detail
+        assert dp.calls == []  # no deploy on red checks
+        assert publisher.reports[0].result == "merged-verify-failed"
+
     def test_deploy_task_id_is_task_shaped(self) -> None:
         """The first dry fire caught this live: DeployQueuedPayload validates
         ^TASK-[A-Z0-9]{3,12}$ and the old merge-{build_id} shape failed it."""

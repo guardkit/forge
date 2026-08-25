@@ -62,7 +62,11 @@ __all__ = [
 ]
 
 #: CORE subscription filter — one token per feature (``merge-FEAT-X``).
-MERGE_RESPONSE_SUBJECT_FILTER: str = "agents.approval.forge.merge-*.response"
+# NATS wildcards match WHOLE tokens only — the original "merge-*" partial
+# matched nothing, and the first real press (FEAT-7CEA, 2026-08-24 22:21)
+# published into silence and proved it live. Subscribe to every forge
+# approval response instead; the handler skips non-merge request ids quietly.
+MERGE_RESPONSE_SUBJECT_FILTER: str = "agents.approval.forge.*.response"
 
 #: ``request_id`` prefix — the remainder is the REAL build_id.
 REQUEST_ID_PREFIX: str = "merge-"
@@ -197,7 +201,9 @@ def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
 def _report_sha(report: dict[str, Any] | None) -> str | None:
     if not report:
         return None
-    for key in ("merged_sha", "merge_sha", "merge_commit", "sha"):
+    # "post_sha" is the key the guardkit merge verb actually emits (the first
+    # real fire's receipt proved the happy-path sha was being dropped).
+    for key in ("merged_sha", "post_sha", "merge_sha", "merge_commit", "sha"):
         value = report.get(key)
         if isinstance(value, str) and value:
             return value
@@ -407,9 +413,14 @@ async def execute_merge_deploy(
             with_nats_streaming=False,
         )
         report = _parse_merge_report(result)
+        # The merge verb exits non-zero for "merged but the checks after it
+        # did not pass" (exit 4) — the first real fire (FEAT-7CEA) proved that
+        # calling a LANDED merge "merge-refused" is a lie. Trust the report's
+        # own outcome over the exit code.
+        merged_in_report = bool(report and report.get("outcome") == "merged")
         refusal: str | None = None
         result_status = getattr(result, "status", "failed")
-        if result_status != "success":
+        if result_status != "success" and not merged_in_report:
             stderr = (getattr(result, "stderr", None) or "").strip()
             tail = (getattr(result, "stdout_tail", "") or "").strip()
             refusal = (
@@ -420,7 +431,7 @@ async def execute_merge_deploy(
                     else (f": {tail[-400:]}" if tail else "")
                 )
             )
-        elif report is not None:
+        elif report is not None and not merged_in_report:
             refusal = _report_refusal(report)
 
         _write_receipt(
@@ -448,6 +459,34 @@ async def execute_merge_deploy(
         merged_sha = _report_sha(report)
         checks_passed = _report_int(report, "checks_passed")
         checks_total = _report_int(report, "checks_total")
+
+        if merged_in_report and report.get("verify_ok") is False:
+            charged = report.get("charged_failures") or []
+            return await _publish_report(
+                MergeDeployOutcome(
+                    result="merged-verify-failed",
+                    status="FAILED",
+                    merged_sha=merged_sha,
+                    failed_step="verify",
+                    detail=(
+                        f"{feature_id} merged ({(merged_sha or '')[:10]}), "
+                        "but the post-merge checks did not pass: "
+                        + str(
+                            report.get("verify_detail")
+                            or report.get("verify_status")
+                            or "verification failed"
+                        )
+                        + (
+                            f" — {len(charged)} charged failure(s)"
+                            if charged
+                            else ""
+                        )
+                        + ". The deploy was not dispatched."
+                    ),
+                    checks_passed=checks_passed,
+                    checks_total=checks_total,
+                )
+            )
 
     # ------------------------------------------------------------------
     # STEP deploy (mirrors the attended dispatch, in-daemon)
@@ -750,8 +789,11 @@ class MergeApprovalConsumer:
             not request_id.startswith(REQUEST_ID_PREFIX)
             or len(request_id) <= len(REQUEST_ID_PREFIX)
         ):
-            logger.warning(
-                "merge-executor: refusing response %r — not a merge request id",
+            # Expected traffic, not a refusal: the wildcard subscription sees
+            # EVERY forge approval response (gate taps included) — skip the
+            # non-merge ones quietly.
+            logger.debug(
+                "merge-executor: ignoring %r — not a merge request id",
                 request_id,
             )
             return
