@@ -68,6 +68,7 @@ from forge.adapters.nats.approval_subscriber import (
 from forge.adapters.nats.synthetic_response_injector import (
     SyntheticResponseInjector,
 )
+from forge.config.models import DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS
 from forge.gating.identity import derive_request_id
 
 # The canonical approval-request envelope builder lives (privately) in
@@ -136,6 +137,14 @@ class ApprovalGateParts:
             fleet-memory reader and the degraded
             :class:`~forge.gating.degraded.EmptyPriorsReader`; omitting
             it is a ``TypeError``, never a quiet empty read.
+        gate_approval_max_wait_seconds: The build gate's total approval
+            wait, from forge.yaml ``autobuild_gate.approval_max_wait_seconds``
+            (2026-08-26). ``0`` (the default) = wait indefinitely for the
+            human answer; positive = cancel the build after that many
+            seconds without one. Carried on the parts so the boot-time
+            rearm path (``_serve_gate_activation.rearm_paused_gates``)
+            builds its per-build subscribers with the SAME wait the live
+            gate uses.
     """
 
     publisher: ApprovalPublisher
@@ -145,6 +154,9 @@ class ApprovalGateParts:
     expected_approver: str | None
     emitter: "PipelineLifecycleEmitter | None"
     priors_reader: "PriorsReader"
+    gate_approval_max_wait_seconds: int = (
+        DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS
+    )
 
 
 _bound_gate_parts: ApprovalGateParts | None = None
@@ -234,6 +246,15 @@ def build_approval_gate_parts(
         A frozen :class:`ApprovalGateParts`.
     """
     approval_config = forge_config.approval
+    # The build gate's own total-wait knob (2026-08-26). 0 = wait
+    # indefinitely for the human answer (the default); positive restores a
+    # hard ceiling. ``getattr`` guards config doubles that predate the field.
+    autobuild_gate_config = getattr(forge_config, "autobuild_gate", None)
+    gate_max_wait = (
+        autobuild_gate_config.approval_max_wait_seconds
+        if autobuild_gate_config is not None
+        else DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS
+    )
     # ALWAYS thread expected_approver explicitly from config — never
     # rely on the ApprovalSubscriberDeps dataclass default (None =
     # permissive), so config and wired behaviour cannot silently
@@ -268,6 +289,7 @@ def build_approval_gate_parts(
         "expected_approver": expected_approver,
         "project": project,
         "bridge_registry_lookup": bridge_registry_lookup,
+        "max_total_wait_seconds": gate_max_wait,
     }
     if subscriber_clock is not None:
         deps_kwargs["clock"] = subscriber_clock
@@ -279,12 +301,13 @@ def build_approval_gate_parts(
     logger.info(
         "forge-serve: approval gate parts composed "
         "(expected_approver=%r refresh=%s bridge_lookup=%s "
-        "default_wait=%ds max_wait=%ds)",
+        "default_wait=%ds max_wait=%ds gate_total_wait=%s)",
         expected_approver,
         "enabled" if publish_refresh is not None else "disabled",
         "wired" if bridge_registry_lookup is not None else "absent",
         approval_config.default_wait_seconds,
         approval_config.max_wait_seconds,
+        "indefinite" if gate_max_wait <= 0 else f"{gate_max_wait}s",
     )
 
     return ApprovalGateParts(
@@ -295,6 +318,7 @@ def build_approval_gate_parts(
         expected_approver=expected_approver,
         emitter=emitter,
         priors_reader=priors_reader,
+        gate_approval_max_wait_seconds=gate_max_wait,
     )
 
 

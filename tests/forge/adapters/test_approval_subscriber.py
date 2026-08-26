@@ -179,6 +179,7 @@ def _make_deps(
     project: str | None = None,
     clock: Any = None,
     dedup_ttl_seconds: int = 300,
+    max_total_wait_seconds: int | None = None,
 ) -> ApprovalSubscriberDeps:
     """Build :class:`ApprovalSubscriberDeps` with safe test defaults.
 
@@ -195,6 +196,7 @@ def _make_deps(
         project=project,
         clock=clock if clock is not None else sub_module._MonotonicClock(),
         dedup_ttl_seconds=dedup_ttl_seconds,
+        max_total_wait_seconds=max_total_wait_seconds,
     )
 
 
@@ -851,3 +853,133 @@ class TestMaxWaitBound:
                 stage_label="",
                 timeout_seconds=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# The build gate's total-wait override (2026-08-26): 0 = wait forever,
+# positive = ceiling, None = the protocol ceiling (unchanged callers).
+# ---------------------------------------------------------------------------
+
+
+class TestMaxTotalWaitOverride:
+    """deps.max_total_wait_seconds — the build gate's wait-forever knob."""
+
+    @pytest.mark.asyncio
+    async def test_unbounded_override_waits_past_config_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Control: with the SAME fast-advancing clock and no override, the
+        # protocol ceiling returns None before a response could ever land.
+        control = ApprovalSubscriber(
+            _make_deps(
+                config=ApprovalConfig(default_wait_seconds=0, max_wait_seconds=2),
+                clock=AdvancingClock(step=10.0),
+            )
+        )
+        assert (
+            await control.await_response(
+                BUILD_ID, stage_label=STAGE_LABEL, timeout_seconds=0
+            )
+            is None
+        )
+
+        # Unbounded override: same config, same clock — the wait survives far
+        # past the config ceiling and resolves on the late response, even with
+        # NO refresh publisher wired (the rearm path's shape).
+        monkeypatch.setattr(sub_module, "UNBOUNDED_IDLE_WAIT_SECONDS", 0.02)
+        client = FakeNATSClient()
+        sub = ApprovalSubscriber(
+            _make_deps(
+                nats_client=client,
+                config=ApprovalConfig(default_wait_seconds=0, max_wait_seconds=2),
+                clock=AdvancingClock(step=10.0),
+                max_total_wait_seconds=0,
+            )
+        )
+        request_id = derive_request_id(
+            build_id=BUILD_ID, stage_label=STAGE_LABEL, attempt_count=0
+        )
+        wait_task = asyncio.create_task(
+            sub.await_response(BUILD_ID, stage_label=STAGE_LABEL, timeout_seconds=0)
+        )
+        # Let several zero-per-attempt windows expire — the unbounded wait
+        # must keep going instead of giving up after the first one.
+        await asyncio.sleep(0.15)
+        assert not wait_task.done(), "unbounded wait must not give up"
+        await client.last_callback(_make_envelope(request_id=request_id))
+        result = await asyncio.wait_for(wait_task, timeout=5.0)
+        assert isinstance(result, ApprovalResponsePayload)
+        assert result.decision == "approve"
+
+    @pytest.mark.asyncio
+    async def test_unbounded_override_keeps_refreshing_past_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sub_module, "UNBOUNDED_IDLE_WAIT_SECONDS", 0.02)
+        client = FakeNATSClient()
+
+        # Approve on the FIFTH refresh — by then the advancing clock has run
+        # far past the 2s config ceiling, where the old code had already
+        # returned None and cancelled the build.
+        async def publish_refresh(
+            build_id: str, stage_label: str, attempt_count: int
+        ) -> None:
+            if attempt_count >= 5:
+                rid = derive_request_id(
+                    build_id=build_id,
+                    stage_label=stage_label,
+                    attempt_count=attempt_count,
+                )
+                await client.last_callback(_make_envelope(request_id=rid))
+
+        sub = ApprovalSubscriber(
+            _make_deps(
+                nats_client=client,
+                config=ApprovalConfig(default_wait_seconds=0, max_wait_seconds=2),
+                publish_refresh=publish_refresh,
+                clock=AdvancingClock(step=1.0),
+                max_total_wait_seconds=0,
+            )
+        )
+        result = await asyncio.wait_for(
+            sub.await_response(
+                BUILD_ID, stage_label=STAGE_LABEL, timeout_seconds=0
+            ),
+            timeout=5.0,
+        )
+        assert isinstance(result, ApprovalResponsePayload)
+        assert result.decision == "approve"
+
+    @pytest.mark.asyncio
+    async def test_positive_override_enforces_below_config_ceiling(self) -> None:
+        # config allows 3600s; the override says 2s — the override wins and
+        # the wait still expires (the knob keeps working when set).
+        publish_refresh = AsyncMock()
+        sub = ApprovalSubscriber(
+            _make_deps(
+                config=ApprovalConfig(
+                    default_wait_seconds=0, max_wait_seconds=3600
+                ),
+                publish_refresh=publish_refresh,
+                clock=AdvancingClock(step=1.0),
+                max_total_wait_seconds=2,
+            )
+        )
+        result = await sub.await_response(
+            BUILD_ID, stage_label=STAGE_LABEL, timeout_seconds=0
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_none_override_keeps_config_ceiling(self) -> None:
+        # None = the pre-existing behaviour for every non-gate caller.
+        sub = ApprovalSubscriber(
+            _make_deps(
+                config=ApprovalConfig(default_wait_seconds=0, max_wait_seconds=0),
+                max_total_wait_seconds=None,
+            )
+        )
+        result = await sub.await_response(
+            BUILD_ID, stage_label=STAGE_LABEL, timeout_seconds=0
+        )
+        assert result is None

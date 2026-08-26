@@ -736,6 +736,11 @@ async def rearm_paused_gates(
                     expected_approver=parts.expected_approver,
                     project=None,
                     bridge_registry_lookup=None,
+                    # The rearm wait honours the SAME build-gate total-wait
+                    # knob the live gate uses (0 = wait indefinitely,
+                    # 2026-08-26) — a daemon restart mid-pause must not turn
+                    # an indefinite wait back into a give-up.
+                    max_total_wait_seconds=parts.gate_approval_max_wait_seconds,
                 )
             )
             # Wrap the arm-signalling subscriber in the per-build bound context
