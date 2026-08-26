@@ -415,7 +415,7 @@ class TestFailureReasonFormat:
             ctx,
         )
         assert isinstance(out, BuildFailedPayload)
-        assert out.failure_reason == "autobuild failed (sse)"
+        assert out.failure_reason == "the build failed without reporting a reason"
 
 
 class TestRunnerFailedSnapshotRidesTheWire:
@@ -424,7 +424,7 @@ class TestRunnerFailedSnapshotRidesTheWire:
     ``autobuild_runner._build_failed_snapshot``'s docstring long CLAIMED the
     reason "ends up on the wire via the pipeline.build-failed envelope", but
     the snapshot carried no error metadata, so every runner failure surfaced
-    as the generic ``"autobuild failed (sse)"``. These tests drive the
+    as the generic ``"the build failed without reporting a reason"``. These tests drive the
     RUNNER'S OWN snapshot (not a hand-built fixture) through the real
     translator, so any future drift in either module's shape breaks here.
     """
@@ -470,7 +470,7 @@ class TestRunnerFailedSnapshotRidesTheWire:
         out = self._translate_runner_failure(reason=reason)
         assert out.failure_reason == reason, (
             "the runner's reason must ride the wire verbatim — the generic "
-            "'autobuild failed (sse)' fallback means the flat error_message "
+            "'the build failed without reporting a reason' fallback means the flat error_message "
             "contract broke"
         )
 

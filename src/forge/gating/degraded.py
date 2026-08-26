@@ -47,19 +47,22 @@ __all__ = [
     "degraded_recovery_decision",
 ]
 
-#: Human-readable rationale stamped on every degraded-mode decision so the
-#: gate history is honest about *why* the build paused: no coach score is
-#: available at dispatch and v1 never auto-approves (DF-009 ratchet). The
-#: wording is deliberately TRUE whether the priors read matched 0 or N —
-#: this static callable never sees the priors, so it must not claim their
-#: absence (the 2026-08-04 activation sitting caught the old text lying on
-#: the card while the daemon logged 5 matched; count-aware rationale rides
-#: the real-reasoning-model lane, not this constant).
+#: Human-readable rationale stamped on every degraded-mode decision. This
+#: sentence renders VERBATIM on the Slack approval card the owner reads
+#: ("Rationale: ..."), so it is part of the owner surface and must be plain
+#: English — no register codes, no internal shorthand (Rich's standing rule;
+#: the previous wording named an ADR and a ratchet code on the card and was
+#: rewritten 2026-08-26). Two truth constraints carried over from the old
+#: comment: the wording must stay TRUE whether the priors read matched 0 or
+#: N (this static callable never sees the priors, so it must not claim
+#: their absence — the 2026-08-04 activation sitting caught the old text
+#: lying on the card while the daemon logged 5 matched), and count-aware
+#: wording rides the real-reasoning-model lane, not this constant. Only the
+#: human-read sentence changed; the machine-read fields beside it (mode /
+#: threshold / prior ids) are untouched.
 DEGRADED_RATIONALE: str = (
-    "Degraded/training mode: no coach score is available at dispatch and "
-    "v1 never auto-approves, so the gate mandates human approval before "
-    "the build starts; any retrieved priors ride the decision as evidence "
-    "(ADR-ARCH-019 honesty posture)."
+    "No automatic score exists at this stage, so the factory always asks "
+    "you before starting a build."
 )
 
 #: Static reasoning-model response body. Matches the JSON contract that
