@@ -295,6 +295,11 @@ class TestApprovalYamlRoundTrip:
             # first-class config section, so the unfiltered round-trip dump
             # always includes it and this exhaustive fixture must declare it.
             "merge_executor": {"enabled": False, "response_wait_seconds": 86400},
+            # ``autobuild_gate`` — the build gate's human-approval wait
+            # (2026-08-26). Default 0 = wait indefinitely for the answer; the
+            # unfiltered round-trip dump always includes it, so this
+            # exhaustive fixture must declare it.
+            "autobuild_gate": {"approval_max_wait_seconds": 0},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

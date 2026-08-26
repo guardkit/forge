@@ -33,7 +33,10 @@ Responsibilities (mirrors the AC list of TASK-CGCP-007):
   fresh :class:`ApprovalRequestPayload` via the injected
   :data:`PublishRefreshCallback`. The prior ``request_id`` remains
   valid for dedup until the short TTL elapses.
-* Total wait bounded by :attr:`ApprovalConfig.max_wait_seconds`.
+* Total wait bounded by :attr:`ApprovalConfig.max_wait_seconds` — unless
+  the deps carry a ``max_total_wait_seconds`` override (the build gate's
+  forge.yaml ``autobuild_gate.approval_max_wait_seconds`` knob): ``0`` there
+  means no ceiling at all — the wait continues until a response arrives.
 
 Clock injection is mandatory — the dedup TTL never reads the wall clock
 directly. Tests substitute :class:`Clock` instances that advance time
@@ -88,6 +91,13 @@ DEFAULT_DEDUP_TTL_SECONDS: Final[int] = 300
 #: ``source_id`` stamped on every envelope Forge emits via this
 #: subscriber's refresh-on-timeout path. Mirrors the publisher.
 SOURCE_ID: Final[str] = "forge"
+
+#: Idle wait per loop iteration when the total wait is UNBOUNDED
+#: (``max_total_wait_seconds=0``) and the per-attempt wait is zero. Without
+#: this floor a zero per-attempt wait in unbounded mode would busy-spin the
+#: event loop (and, with a refresh publisher wired, republish the approval
+#: card at spin speed). Tests may monkeypatch it smaller.
+UNBOUNDED_IDLE_WAIT_SECONDS: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +258,18 @@ class ApprovalSubscriberDeps:
             FW10-010 behaviour: the subscriber emits ``build-resumed``
             itself (AC-3 — backward compatibility for tests / deploys
             that do not wire the bridge).
+        max_total_wait_seconds: Optional override of the TOTAL wait
+            ceiling. ``None`` (the default) keeps the protocol ceiling,
+            ``config.max_wait_seconds`` — every existing caller
+            (planning doors, conductor resume) is unchanged. ``0``
+            means NO ceiling: the wait continues indefinitely until a
+            response arrives. A positive value is used as the ceiling
+            instead of ``config.max_wait_seconds``. The build gate
+            threads forge.yaml's
+            ``autobuild_gate.approval_max_wait_seconds`` here (default
+            0 = wait forever, 2026-08-26 — an unanswered gate card must
+            keep waiting like the spec digest pause, not cancel the
+            build).
     """
 
     nats_client: Any
@@ -258,6 +280,7 @@ class ApprovalSubscriberDeps:
     clock: Clock = field(default_factory=_MonotonicClock)
     dedup_ttl_seconds: int = DEFAULT_DEDUP_TTL_SECONDS
     bridge_registry_lookup: BridgeRegistryLookup | None = None
+    max_total_wait_seconds: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -410,14 +433,18 @@ class ApprovalSubscriber:
             timeout_seconds: Per-attempt wait. ``None`` falls back to
                 :attr:`ApprovalConfig.default_wait_seconds`. Total
                 wait is independently bounded by
-                :attr:`ApprovalConfig.max_wait_seconds`.
+                :attr:`ApprovalConfig.max_wait_seconds`, unless the
+                deps' ``max_total_wait_seconds`` overrides it (``0``
+                there = no ceiling, wait indefinitely).
 
         Returns:
             The validated :class:`ApprovalResponsePayload` of the
             first-arrival, allowed-responder, allowed-decision response;
             or ``None`` on:
-              * timeout (total wait reached
-                ``ApprovalConfig.max_wait_seconds`` with no response),
+              * timeout (total wait reached the effective ceiling —
+                ``ApprovalConfig.max_wait_seconds``, or the deps'
+                ``max_total_wait_seconds`` override — with no
+                response; never on the unbounded-override path),
               * duplicate-only path (every observed response was a
                 duplicate or refused — but the wait loop continues
                 inside, so this only happens via the timeout path).
@@ -440,7 +467,18 @@ class ApprovalSubscriber:
             if timeout_seconds is not None
             else self._deps.config.default_wait_seconds
         )
-        max_total = self._deps.config.max_wait_seconds
+        # Effective total-wait ceiling. ``None`` on the override keeps the
+        # protocol ceiling (config.max_wait_seconds); ``0`` means NO ceiling
+        # (the build gate's wait-forever default, 2026-08-26); positive
+        # overrides the ceiling.
+        override = self._deps.max_total_wait_seconds
+        max_total: float | None
+        if override is None:
+            max_total = float(self._deps.config.max_wait_seconds)
+        elif override <= 0:
+            max_total = None
+        else:
+            max_total = float(override)
 
         subject = self._subject_for(build_id, self._deps.project)
 
@@ -477,19 +515,28 @@ class ApprovalSubscriber:
 
         try:
             while True:
-                elapsed = clock.monotonic() - start
-                remaining = float(max_total) - elapsed
-                if remaining <= 0:
-                    logger.info(
-                        "approval_subscriber: max_wait reached build_id=%s "
-                        "stage=%s attempt=%d — returning None",
-                        build_id,
-                        stage_label,
-                        current_attempt,
+                if max_total is None:
+                    # Unbounded wait — no ceiling to check. Floor a zero
+                    # per-attempt wait so the loop never busy-spins.
+                    wait = (
+                        float(per_attempt)
+                        if per_attempt > 0
+                        else UNBOUNDED_IDLE_WAIT_SECONDS
                     )
-                    return None
+                else:
+                    elapsed = clock.monotonic() - start
+                    remaining = max_total - elapsed
+                    if remaining <= 0:
+                        logger.info(
+                            "approval_subscriber: max_wait reached build_id=%s "
+                            "stage=%s attempt=%d — returning None",
+                            build_id,
+                            stage_label,
+                            current_attempt,
+                        )
+                        return None
 
-                wait = min(float(per_attempt), remaining)
+                    wait = min(float(per_attempt), remaining)
                 try:
                     payload = await asyncio.wait_for(queue.get(), timeout=wait)
                 except asyncio.TimeoutError:
@@ -544,6 +591,18 @@ class ApprovalSubscriber:
                             current_attempt,
                             exc,
                         )
+                elif max_total is None:
+                    # No publisher wired but the wait is UNBOUNDED — keep
+                    # waiting. The build gate's rearm path wires no refresh
+                    # publisher, and its default (2026-08-26) is to wait
+                    # indefinitely for a human answer, not give up after
+                    # one window.
+                    logger.debug(
+                        "approval_subscriber: per-attempt timeout with no "
+                        "refresh publisher build_id=%s — unbounded wait, "
+                        "continuing",
+                        build_id,
+                    )
                 else:
                     # No publisher wired — single-shot wait. Returning
                     # None here matches the contract: caller decides.

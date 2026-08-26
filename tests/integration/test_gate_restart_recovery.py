@@ -160,12 +160,22 @@ def _make_payload(
     return payload
 
 
-def _forge_config(**approval_overrides: Any) -> ForgeConfig:
+def _forge_config(
+    *,
+    autobuild_gate_max_wait_seconds: int | None = None,
+    **approval_overrides: Any,
+) -> ForgeConfig:
     doc: dict[str, Any] = {
         "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
     }
     if approval_overrides:
         doc["approval"] = approval_overrides
+    if autobuild_gate_max_wait_seconds is not None:
+        # 2026-08-26: the build gate waits indefinitely by default; expiry
+        # scenarios opt back into a hard ceiling through this knob.
+        doc["autobuild_gate"] = {
+            "approval_max_wait_seconds": autobuild_gate_max_wait_seconds
+        }
     return ForgeConfig.model_validate(doc)
 
 
@@ -519,7 +529,12 @@ class TestPostRestartRejectAndExpiry:
         # Zero per-attempt wait + no refresh → the re-armed window expires
         # immediately and the gate applies the max-wait cancel.
         cfg = _forge_config(
-            default_wait_seconds=0, max_wait_seconds=3600, expected_approver=RICH
+            default_wait_seconds=0,
+            max_wait_seconds=3600,
+            expected_approver=RICH,
+            # Opt back into a bounded wait — the 2026-08-26 default is
+            # wait-forever, under which this scenario would never expire.
+            autobuild_gate_max_wait_seconds=3600,
         )
         build_id = await _seed_paused_via_first_session(nats, pool, forge_config=cfg)
         nats.reset_wire()
@@ -1035,3 +1050,63 @@ class TestRearmNeverResumesAFixJourneyRoutine:
         assert launched[0]["repo"] == "guardkit/forge"
         assert _row(pool, build_id) == (BuildState.RUNNING.value, None)
         assert _payloads(nats, "pipeline.build-failed.FEAT-REARMA") == []
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-26 — the re-armed gate wait is indefinite by default
+# ---------------------------------------------------------------------------
+
+
+class TestPostRestartDefaultWaitIsIndefinite:
+    """By default (knob absent) a re-armed gate wait never expires.
+
+    Exactly the setup that used to expire in a single zero-length window
+    (default_wait_seconds=0, no refresh publisher on the rearm path) — but
+    with the build-gate wait knob left at its default, the re-armed wait
+    keeps waiting and the late approve still resumes and launches.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rearmed_wait_survives_and_late_approve_lands(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.adapters.nats import approval_subscriber as sub_module
+
+        monkeypatch.setattr(sub_module, "UNBOUNDED_IDLE_WAIT_SECONDS", 0.02)
+        cfg = _forge_config(default_wait_seconds=0, expected_approver=RICH)
+        build_id = await _seed_paused_via_first_session(nats, pool, forge_config=cfg)
+        nats.reset_wire()
+        parts2 = _build_parts(nats, forge_config=cfg)
+        _serve_deps_gating.bind_gate_parts(parts2)
+        repo2, sm2 = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        launcher = _FakeResumeLauncher()
+
+        tasks = await rearm_paused_gates(
+            parts=parts2,
+            sqlite_pool=pool,
+            gate_repository=repo2,
+            gate_state_machine=sm2,
+            resume_launcher=launcher,
+            client=nats,
+            clock=FixedClock(),
+        )
+        assert len(tasks) == 1
+
+        # Several zero-length windows elapse; the old behaviour had already
+        # returned None here (TIMED_OUT + CANCELLED). The indefinite default
+        # keeps the wait alive.
+        await asyncio.sleep(0.2)
+        assert not tasks[0].done(), "re-armed gate wait must not expire by default"
+
+        await nats.deliver_response(
+            build_id=build_id,
+            request_id=_request_id(build_id, 0),
+            decision="approve",
+        )
+        outcome = await asyncio.wait_for(tasks[0], timeout=5.0)
+        assert outcome is GateOutcome.RESUMED
+        assert len(launcher.calls) == 1
+        assert launcher.calls[0]["build_id"] == build_id
