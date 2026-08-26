@@ -43,6 +43,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
 )
+from forge.pipeline.digest_conformance import run_digest_conformance
 from forge.receipts import receipts_root
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,10 @@ async def execute_merge_deploy(
     """
     started = deps.clock()
     receipts_dir = deps.receipts_root_fn() / f"merge-{build_id}"
+    # Advisory digest-conformance state — filled in after a landed merge,
+    # read by the report step. It can add a warning line; it can never
+    # block anything.
+    digest_conformance: dict[str, Any] = {}
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -277,6 +282,9 @@ async def execute_merge_deploy(
 
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         completed = deps.clock()
+        conformance_warning = digest_conformance.get("warning")
+        if conformance_warning:
+            outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
         payload = StageCompletePayload(
             feature_id=feature_id,
             build_id=build_id,
@@ -297,6 +305,7 @@ async def execute_merge_deploy(
             checks_passed=outcome.checks_passed,
             checks_total=outcome.checks_total,
             detail=outcome.detail,
+            digest_conformance_warning=conformance_warning,
             dry_run=dry_run,
         )
         if dry_run:
@@ -459,6 +468,31 @@ async def execute_merge_deploy(
         merged_sha = _report_sha(report)
         checks_passed = _report_int(report, "checks_passed")
         checks_total = _report_int(report, "checks_total")
+
+        # Advisory: does the merged tree keep the promises in the feature's
+        # spec digest? Deterministic and never blocking — the receipt lands
+        # beside the other merge receipts and any failure rides the merge
+        # report as one plain warning line. Built after FEAT-EF8D
+        # (2026-08-26), where every test was green but the built endpoint
+        # did not do what the approved digest promised.
+        try:
+            conformance = run_digest_conformance(
+                repo_root=repo_root, feature_id=feature_id
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory must never stop a merge
+            conformance = {
+                "advisory": True,
+                "feature_id": feature_id,
+                "conformant": None,
+                "checks": [],
+                "warning": None,
+                "skipped": (
+                    "the digest conformance check itself failed "
+                    f"({exc}) — nothing was checked"
+                ),
+            }
+        digest_conformance.update(conformance)
+        _write_receipt("digest_conformance.json", conformance)
 
         if merged_in_report and report.get("verify_ok") is False:
             charged = report.get("charged_failures") or []

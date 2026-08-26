@@ -676,3 +676,92 @@ class TestExecutorSequencing:
         for fid in ("FEAT-E613", "FEAT-153C", "feat-x!", ""):
             tid = _deploy_task_id(fid)
             assert re.fullmatch(r"TASK-[A-Z0-9]{3,12}", tid), (fid, tid)
+
+
+# ---------------------------------------------------------------------------
+# Digest conformance (advisory) riding the executor
+# ---------------------------------------------------------------------------
+
+from tests.forge.pipeline.test_digest_conformance import (
+    write_created_per_day_case,
+)
+
+
+class TestDigestConformanceAdvisory:
+    """The FEAT-EF8D lesson wired in: after a landed merge the executor reads
+    the spec digest against the merged tree. A broken promise adds one plain
+    warning line to the merge report and a receipt — it NEVER blocks."""
+
+    @pytest.mark.asyncio
+    async def test_broken_promise_warns_but_never_blocks(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        write_created_per_day_case(
+            repo_root, feature_id=FEATURE_ID, conforming=False
+        )
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        # Advisory: the merge and deploy still went through untouched.
+        assert outcome.result == "merged-and-running"
+        assert outcome.status == "PASSED"
+        assert len(dp.calls) == 1
+        # One plain warning line rides the outcome and the published report.
+        assert "WARNING:" in outcome.detail
+        assert "7" in outcome.detail
+        report = publisher.reports[0]
+        assert "WARNING:" in report.detail
+        assert report.digest_conformance_warning
+        # The receipt landed beside the other merge receipts.
+        receipt = json.loads(
+            (
+                _receipts_env / f"merge-{BUILD_ID}" / "digest_conformance.json"
+            ).read_text()
+        )
+        assert receipt["conformant"] is False
+        # The endpoint EXISTS — the finding is the untested seven-promise.
+        endpoint_checks = [
+            c for c in receipt["checks"] if c["check"] == "endpoint-exists"
+        ]
+        assert endpoint_checks[0]["verdict"] == "pass"
+        failed = [c for c in receipt["checks"] if c["verdict"] == "fail"]
+        assert failed
+        assert all(
+            c["check"] == "number-promise-is-tested" for c in failed
+        )
+
+    @pytest.mark.asyncio
+    async def test_conforming_feature_stays_quiet(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        write_created_per_day_case(
+            repo_root, feature_id=FEATURE_ID, conforming=True
+        )
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert "WARNING" not in outcome.detail
+        assert publisher.reports[0].digest_conformance_warning is None
+        receipt = json.loads(
+            (
+                _receipts_env / f"merge-{BUILD_ID}" / "digest_conformance.json"
+            ).read_text()
+        )
+        assert receipt["conformant"] is True
+
+    @pytest.mark.asyncio
+    async def test_feature_without_a_digest_is_skipped_quietly(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        # No digest in the tree: the receipt says so in plain words and no
+        # warning is raised — an absent digest is not a failure.
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert "WARNING" not in outcome.detail
+        receipt = json.loads(
+            (
+                _receipts_env / f"merge-{BUILD_ID}" / "digest_conformance.json"
+            ).read_text()
+        )
+        assert receipt["conformant"] is None
+        assert "no spec digest was found" in receipt["skipped"]
