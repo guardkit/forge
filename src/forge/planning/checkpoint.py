@@ -53,6 +53,16 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+#: Owner-facing pause explanation for the product-docs checkpoint. It rides
+#: the approval-request details jarvis renders on Slack, so it must be plain
+#: English (no register codes, no internal shorthand — the owner's standing
+#: rule). The old wording cited a design-fence code on the card.
+PRODUCT_DOCS_PAUSE_RATIONALE: str = (
+    "The product documents step always asks for your approval before the "
+    "run continues."
+)
+
+
 __all__ = [
     "checkpoint_product_docs",
     "build_planning_approval_envelope",
@@ -179,7 +189,7 @@ async def checkpoint_product_docs(
         target_kind="fleet_capability",
         target_identifier="product_docs_approval",
         mode=GateMode.MANDATORY_HUMAN_APPROVAL,
-        rationale="Product docs checkpoint requires human approval (DF-009)",
+        rationale=PRODUCT_DOCS_PAUSE_RATIONALE,
         coach_score=coach_evidence.get("coach_score") if coach_evidence else None,
         criterion_breakdown={},
         detection_findings=[],
@@ -357,7 +367,7 @@ def build_planning_approval_envelope(
         "gate_mode": GateMode.MANDATORY_HUMAN_APPROVAL.value,
         "coach_score": coach_score,
         "rationale": rationale
-        or "Product docs checkpoint requires human approval (DF-009)",
+        or PRODUCT_DOCS_PAUSE_RATIONALE,
         "summary": summary_payload,  # Validated components only (RT-09)
         "checkpoint_type": checkpoint_type,
         # Spec: "an approval request should be sent naming the originator

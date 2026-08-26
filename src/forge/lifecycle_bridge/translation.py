@@ -103,6 +103,16 @@ from forge.lifecycle_bridge.bridge import BuildContext
 
 logger = logging.getLogger(__name__)
 
+#: Owner-facing fallback strings. These land verbatim in the Slack
+#: notification payloads jarvis relays ("Summary: ..." / "Reason: ..."),
+#: so they speak plain English — no internal codenames ("autobuild") and no
+#: shorthand ("(sse)"). "the live build feed" is the plain name for the
+#: runner's event stream this translator listens to.
+COMPLETED_SUMMARY_FALLBACK: str = "build completed (reported by the live build feed)"
+FAILED_REASON_FALLBACK: str = "the build failed without reporting a reason"
+CANCELLED_REASON_FALLBACK: str = "the build was cancelled (reported by the live build feed)"
+
+
 
 __all__ = [
     "MissingCorrelationIdError",
@@ -578,7 +588,7 @@ class StreamEventTranslator:
             tasks_total=total,
             pr_url=None,
             duration_seconds=0,
-            summary="autobuild completed (sse)",
+            summary=COMPLETED_SUMMARY_FALLBACK,
         )
         attach_correlation_id_to_v1_payload(payload, correlation_id)
         return payload
@@ -624,7 +634,7 @@ class StreamEventTranslator:
         elif snap.error_message:
             failure_reason = snap.error_message
         else:
-            failure_reason = "autobuild failed (sse)"
+            failure_reason = FAILED_REASON_FALLBACK
         payload = BuildFailedPayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
@@ -661,7 +671,7 @@ class StreamEventTranslator:
         return BuildCancelledPayload(
             feature_id=snap.feature_id,
             build_id=snap.build_id,
-            reason="autobuild cancelled (sse)",
+            reason=CANCELLED_REASON_FALLBACK,
             cancelled_by="lifecycle_bridge",
             cancelled_at=self._clock().isoformat(),
             correlation_id=correlation_id,

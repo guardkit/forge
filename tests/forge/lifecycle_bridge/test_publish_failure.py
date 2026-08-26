@@ -513,7 +513,7 @@ class TestAsyncFailureReasonFormat:
             ctx,
         )
         assert isinstance(out, BuildFailedPayload)
-        assert out.failure_reason == "autobuild failed (sse)"
+        assert out.failure_reason == "the build failed without reporting a reason"
 
     def test_failure_reason_supports_nested_last_error_shape(self) -> None:
         """Legacy nested ``last_error`` mapping is also accepted (mixed-fleet)."""
