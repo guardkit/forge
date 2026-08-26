@@ -33,7 +33,9 @@ This is strictly **additive**: :const:`PLANNING_TRANSITIONS` (the flag-OFF
 table) is byte-for-byte unchanged, PLANNED_HANDOFF remains a reachable
 terminal even with the flag on (it is the shipped fallback forever), and
 the flag-ON table :const:`PLANNING_TRANSITIONS_TARGET_TERMINAL` only *adds*
-the RUNNING → FEATURE_SPEC edge plus the three new states. The store
+the RUNNING → FEATURE_SPEC edge plus the three new states (and, 2026-08-26,
+the FEATURE_SPEC → CANCELLED edge — the owner calling the run off at the
+spec-review card). The store
 selects between the two tables via :func:`planning_transitions_for`, so a
 store built with the flag off behaves exactly as it did before this change.
 
@@ -124,6 +126,10 @@ PLANNING_TRANSITIONS_TARGET_TERMINAL: Final[
         PlanningState.FEATURE_PLAN,
         PlanningState.FAILED,
         PlanningState.TIMED_OUT,
+        # 2026-08-26: the owner can call the run off at the spec-review card
+        # (a typed reply whose first word is "reject"). That is their own
+        # stop, so it ends CANCELLED — distinct from a machine FAILED.
+        PlanningState.CANCELLED,
     },
     PlanningState.FEATURE_PLAN: {
         PlanningState.BUILD_QUEUED,

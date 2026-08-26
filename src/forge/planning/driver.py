@@ -458,6 +458,30 @@ OPTIONAL on the wire, so an older specialist that does not know the argument is
 unaffected."""
 
 
+def _reject_word_split(note: str) -> tuple[bool, str]:
+    """Split a typed reply that STARTS with the word "reject" from its reason.
+
+    The digest card's note box is the owner's only typed channel, and every
+    note rides the wire as ``decision="reject"`` — so the word the reply
+    STARTS with is the only way a typed "reject" (stop this run) can be told
+    apart from a revision note. A first word of "reject" — any
+    capitalisation, with or without more words, trailing punctuation on the
+    word tolerated ("reject:", "reject -") — counts. Everything after the
+    word, minus any leading separator, is the owner's reason.
+
+    Returns ``(starts_with_reject, reason)``; ``reason`` is ``""`` for a
+    bare "reject" and whenever the first word is anything else.
+    """
+    parts = str(note or "").strip().split(None, 1)
+    if not parts:
+        return False, ""
+    first = parts[0].rstrip(".,:;!?-\u2013\u2014")
+    if first.lower() != "reject":
+        return False, ""
+    rest = parts[1] if len(parts) > 1 else ""
+    return True, rest.lstrip(" \t.,:;!?-\u2013\u2014").strip()
+
+
 @dataclass(frozen=True)
 class _DoorAnswer:
     """What came back through an inline confirmation door.
@@ -1586,6 +1610,9 @@ class PlanningRunDriver:
                     correlation_id, draft, branch, answer=answer
                 )
 
+            if answer.outcome == "cancelled":
+                return await self._cancel_run_at_digest_door(correlation_id, answer)
+
             if answer.outcome == "revise":
                 note = str(answer.notes or "")
                 notes = [*notes, note]
@@ -1628,6 +1655,63 @@ class PlanningRunDriver:
                     "Nothing was built."
                 ).strip(),
             )
+
+    async def _cancel_run_at_digest_door(
+        self, correlation_id: str, answer: "_DoorAnswer"
+    ) -> bool:
+        """The owner typed "reject" at the spec-review card: end the run CANCELLED.
+
+        Their own stop, not a machine failure — so the run takes the CANCELLED
+        terminal (the same terminal a reject takes at the product-docs
+        checkpoint), with whatever followed the word kept as the reason, and
+        the Slack line says plainly that the run is over and a fresh sentence
+        starts a new one.
+        """
+        _starts, reason = _reject_word_split(str(answer.notes or ""))
+        recorded_reason = reason or "no reason was given beyond the reject itself"
+        refused = self._deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.CANCELLED,
+            actor_identity=answer.decided_by or "planning-driver",
+            stage_label=_DIGEST_REVIEW_STAGE,
+            error=recorded_reason,
+            details_json=json.dumps(
+                {
+                    "digest_review": {
+                        "outcome": "cancelled",
+                        "reason": recorded_reason,
+                        "decided_by": answer.decided_by,
+                    }
+                }
+            ),
+        )
+        if isinstance(refused, TransitionRefused):
+            logger.warning(
+                "planning driver: CANCELLED transition refused for %s "
+                "(current=%s, reason=%s)",
+                correlation_id,
+                refused.current_state,
+                recorded_reason,
+            )
+        logger.info(
+            "planning driver: run %s cancelled at the spec digest review by "
+            "%s: %s",
+            correlation_id,
+            answer.decided_by,
+            recorded_reason,
+        )
+        await self._notify(
+            correlation_id,
+            (
+                f"Planning run {correlation_id} is cancelled — you said "
+                "reject on the spec review"
+                + (f": {reason}" if reason else "")
+                + ". Nothing was built. Send a fresh sentence in the "
+                "planning channel whenever you want to start again."
+            ),
+            level="info",
+        )
+        return False
 
     async def _draft_spec(
         self,
@@ -2258,15 +2342,19 @@ class PlanningRunDriver:
         A THIN CALLER of :meth:`_inline_confirmation_door` — the same mechanism
         the sign-in door rides, so the two can never behave differently.
 
-        The four answers, and what each means:
+        The five answers, and what each means:
 
         * approve / override → ``approved``: write the plan and the quality
           checklist, then come back for the go-ahead. Nothing is built yet.
         * reject WITH a note → ``revise``: the machine rewrites the spec from
           the note and comes back with a fresh digest. ``reject`` is the wire's
           own literal and the door branches on it here rather than dispatching
-          it, so it never means "cancel this run" the way it does at the
-          product-docs checkpoint.
+          it, so a note does not by itself mean "cancel this run" the way a
+          reject does at the product-docs checkpoint.
+        * a note whose FIRST WORD is "reject" (any capitalisation, with or
+          without more words) → ``cancelled``: the owner is calling the run
+          off, not redrafting. The run ends CANCELLED and whatever followed
+          the word is kept as their reason.
         * reject with NO note → ``rejected``: there is nothing to rewrite from,
           so the run stops and says so. Only reachable from a command line: the
           note box on the card is required.
@@ -2298,7 +2386,19 @@ class PlanningRunDriver:
             if response.decision in ("approve", "override"):
                 return "approved"
             if response.decision == "reject":
-                return "revise" if str(getattr(response, "notes", "") or "").strip() else "rejected"
+                note = str(getattr(response, "notes", "") or "").strip()
+                if not note:
+                    return "rejected"
+                # A typed reply whose FIRST WORD is "reject" is the owner
+                # calling the run off, not a revision note. Every typed note
+                # rides the wire as decision="reject", so the word is the only
+                # signal (2026-08-24: "reject I typed the wrong sentence"
+                # became a revision note and the machine redrafted the same
+                # bad sentence).
+                starts_with_reject, _reason = _reject_word_split(note)
+                if starts_with_reject:
+                    return "cancelled"
+                return "revise"
             return "deferred"
 
         async def _closed(answer: "_DoorAnswer") -> None:
