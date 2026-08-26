@@ -202,3 +202,12 @@ def test_flag_off_table_cannot_reach_target_terminal_states() -> None:
     assert PlanningState.FEATURE_SPEC not in reachable
     assert PlanningState.FEATURE_PLAN not in reachable
     assert PlanningState.BUILD_QUEUED not in reachable
+
+
+def test_the_owner_can_cancel_at_the_spec_review_card() -> None:
+    """FEATURE_SPEC -> CANCELLED (flag-ON only): a typed reply starting with
+    the word "reject" at the spec-review card ends the run as the owner's own
+    stop — CANCELLED, not a machine FAILED. Additive: the frozen flag-OFF
+    table test above still pins the shipped table byte-for-byte."""
+    table = PLANNING_TRANSITIONS_TARGET_TERMINAL
+    assert PlanningState.CANCELLED in table[PlanningState.FEATURE_SPEC]

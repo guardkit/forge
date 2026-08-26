@@ -764,6 +764,88 @@ async def test_a_no_without_a_note_stops_honestly(
 
 
 @pytest.mark.asyncio
+async def test_a_note_that_starts_with_reject_cancels_the_run(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The 2026-08-24 defect, pinned: "reject I typed the wrong sentence" was
+    read as a revision note and the machine redrafted the same bad sentence.
+    A typed reply whose first word is reject is the owner calling the run off:
+    the run ends CANCELLED with their remaining words as the reason."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes="reject - I messed up the original sentence")]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    run = store.get_run(CID)
+    assert run["state"] == PlanningState.CANCELLED.value
+    assert run["error"] == "I messed up the original sentence"
+    # No redraft: the spec-writer ran once, for the original draft only.
+    assert len(h.ctx["dispatches"]) == 1
+    assert len(_digest_cards(h)) == 1
+    assert h.ctx["build_triggers"] == []
+    # The durable record: the door's verdict row, then the CANCELLED move.
+    assert [status for status, _d in _events(store, _DIGEST_STAGE)] == [
+        "GATED",
+        "cancelled",
+        "CANCELLED",
+    ]
+    told = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "cancelled" in told
+    assert "I messed up the original sentence" in told
+    assert "fresh sentence" in told
+
+
+@pytest.mark.asyncio
+async def test_a_bare_reject_cancels_with_no_reason_to_quote(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Just the word, nothing after it: still the owner's stop, still CANCELLED."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("reject", notes="reject")]),
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.CANCELLED.value
+    assert len(h.ctx["dispatches"]) == 1
+    told = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
+    assert "cancelled" in told
+    assert "fresh sentence" in told
+
+
+@pytest.mark.asyncio
+async def test_a_note_merely_containing_reject_still_means_rewrite(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Only the FIRST word cancels: ordinary feedback that mentions rejecting
+    something is still a revision note and the rewrite loop is unchanged."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer("reject", notes="please reject unknown formats with a 400"),
+                _answer("approve", attempt=1),
+            ]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["dispatches"][1]["validate_feedback"] == (
+        "please reject unknown formats with a 400"
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_later_answer_is_named_never_reported_as_silence(
     store: SqlitePlanningRunStore,
 ) -> None:
