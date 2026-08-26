@@ -590,3 +590,27 @@ class TestServeComposeSeam:
                 _serve_daemon.dispatch_payload = previous_dispatch
         finally:
             cx.close()
+
+
+class TestGateTotalWaitThreading:
+    """The forge.yaml autobuild_gate knob reaches the subscriber deps.
+
+    2026-08-26: the build gate waits indefinitely for a human answer by
+    default (knob absent / 0); a positive knob restores a hard ceiling.
+    """
+
+    def test_default_is_wait_forever(self) -> None:
+        parts = _build_parts(_StubClient(), _forge_config())
+        assert parts.gate_approval_max_wait_seconds == 0
+        assert parts.subscriber._deps.max_total_wait_seconds == 0
+
+    def test_configured_ceiling_reaches_subscriber_deps(self) -> None:
+        cfg = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+                "autobuild_gate": {"approval_max_wait_seconds": 1800},
+            }
+        )
+        parts = _build_parts(_StubClient(), cfg)
+        assert parts.gate_approval_max_wait_seconds == 1800
+        assert parts.subscriber._deps.max_total_wait_seconds == 1800

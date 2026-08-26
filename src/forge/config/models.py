@@ -92,6 +92,16 @@ DEFAULT_APPROVAL_WAIT_SECONDS = 300
 #: forge.yaml.approval.max_wait_seconds ≈ 3600").
 DEFAULT_APPROVAL_MAX_WAIT_SECONDS = 3600
 
+#: The build gate's own approval-wait ceiling (2026-08-26). 0 means the gate
+#: waits indefinitely for a human answer — the approval card stays live until
+#: someone answers, exactly like the spec digest pause. This deliberately
+#: replaces the old behaviour where ``approval.max_wait_seconds`` (1 hour)
+#: cancelled the whole build when nobody tapped the card in time; with the
+#: queue verb retired, a cancelled gate had no re-offer path and the only
+#: recovery was re-planning the whole feature. Operators who want a hard
+#: ceiling back set ``autobuild_gate.approval_max_wait_seconds`` in forge.yaml.
+DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS = 0
+
 #: FEAT-UBS-002 — the reserved profile name whose caps must all be unset. It
 #: encodes FEAT-FORGE-008 ASSUM-010 (attended mode = reviewer-driven, no numeric
 #: cap). ``BudgetConfig`` rejects any config that puts a cap on this profile.
@@ -272,6 +282,39 @@ class ApprovalConfig(BaseModel):
                 f"approval.max_wait_seconds ({self.max_wait_seconds})"
             )
         return self
+
+
+class AutobuildGateConfig(BaseModel):
+    """Configuration for the build gate's human-approval wait (2026-08-26).
+
+    The build gate is the pause that asks a human to approve a build before
+    it runs (and the merge-ready card that reuses the same machinery). This
+    model governs how long that pause may wait for an answer. It is a
+    separate surface from :class:`ApprovalConfig` on purpose:
+    ``approval.default_wait_seconds`` / ``approval.max_wait_seconds`` remain
+    the wire protocol's per-window and refresh-budget numbers, still read by
+    the planning doors and the conductor's wait windows. This knob overrides
+    only the gate's TOTAL wait.
+
+    Default is 0 = wait indefinitely. A build gate that nobody answers should
+    keep waiting — like the spec digest pause — not cancel the build, because
+    a cancelled gate has no re-offer path and the only recovery is re-planning
+    the whole feature.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_max_wait_seconds: int = Field(
+        default=DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS,
+        ge=0,
+        description=(
+            "How long the build gate may wait for a human to answer its "
+            "approval card, in seconds. 0 (the default) means wait "
+            "indefinitely — the card stays live until someone answers. A "
+            "positive number restores a hard ceiling: a build whose card is "
+            "not answered within that many seconds is cancelled."
+        ),
+    )
 
 
 class FilesystemPermissions(BaseModel):
@@ -1295,6 +1338,15 @@ class ForgeConfig(BaseModel):
             "is safe on by default (never a mid-run kill)."
         ),
     )
+    autobuild_gate: AutobuildGateConfig = Field(
+        default_factory=AutobuildGateConfig,
+        description=(
+            "The build gate's human-approval wait (2026-08-26). Defaults to "
+            "approval_max_wait_seconds=0 — the gate waits indefinitely for a "
+            "human answer instead of cancelling the build after "
+            "approval.max_wait_seconds."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -1307,6 +1359,7 @@ class ForgeConfig(BaseModel):
 __all__ = [
     "ATTENDED_PROFILE_NAME",
     "DEFAULT_APPROVAL_MAX_WAIT_SECONDS",
+    "DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS",
     "DEFAULT_APPROVAL_WAIT_SECONDS",
     "DEFAULT_APPROVED_ORIGINATORS",
     "DEFAULT_BUILD_QUEUE_SUBJECT",
@@ -1323,6 +1376,7 @@ __all__ = [
     "FIX_JOURNEY_MAX_REVIEW_CYCLES",
     "FIX_JOURNEY_PROFILE_NAME",
     "ApprovalConfig",
+    "AutobuildGateConfig",
     "BudgetConfig",
     "BudgetGuards",
     "ConductorConfig",
