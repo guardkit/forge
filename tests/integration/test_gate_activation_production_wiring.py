@@ -145,12 +145,22 @@ def _make_payload(
     )
 
 
-def _forge_config(**approval_overrides: Any) -> ForgeConfig:
+def _forge_config(
+    *,
+    autobuild_gate_max_wait_seconds: int | None = None,
+    **approval_overrides: Any,
+) -> ForgeConfig:
     doc: dict[str, Any] = {
         "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
     }
     if approval_overrides:
         doc["approval"] = approval_overrides
+    if autobuild_gate_max_wait_seconds is not None:
+        # 2026-08-26: the build gate waits indefinitely by default; expiry
+        # scenarios opt back into a hard ceiling through this knob.
+        doc["autobuild_gate"] = {
+            "approval_max_wait_seconds": autobuild_gate_max_wait_seconds
+        }
     return ForgeConfig.model_validate(doc)
 
 
@@ -477,6 +487,9 @@ class TestExpiryCancels:
                 default_wait_seconds=0,
                 max_wait_seconds=3600,
                 expected_approver=RICH,
+                # Opt back into a bounded wait — the 2026-08-26 default is
+                # wait-forever, under which this scenario would never expire.
+                autobuild_gate_max_wait_seconds=3600,
             ),
         )
 
