@@ -400,7 +400,7 @@ EXPOSE 8080
 # guarantees an explicit non-zero healthcheck exit code so Docker
 # reports the container as ``unhealthy`` rather than ``starting``.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fs http://localhost:8080/healthz || exit 1
+    CMD curl -fs http://localhost:${FORGE_HEALTHZ_PORT:-8080}/healthz || exit 1
 
 # Exec form is required: shell form would route through /bin/sh and
 # break signal forwarding to the Python daemon (SIGTERM-on-stop must
