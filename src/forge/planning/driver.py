@@ -356,6 +356,18 @@ _UNIVERSAL_NEGATIVE_PATH = "dependency_down_degradation"
 #: ``PassBar.CURRENT_FORMAT_VERSION``). Carried from the seed when present.
 _PASS_BAR_FORMAT_VERSION = "2.0"
 
+#: Where a target repository keeps its own written architecture rules, when it
+#: keeps any. api_test does: twelve rules, each one quoting the sentence in
+#: docs/architecture/ it comes from. Most repositories have no such file, and
+#: for those the descriptor carries no rules key and planning is unchanged.
+_ARCHITECTURE_RULES_REL = "docs/architecture-rules.yaml"
+
+#: Bounds on what travels in the descriptor, so a long rules file cannot swell
+#: the planning request. api_test's file has 12 rules and its longest quoted
+#: sentence is around 200 characters, so neither bound bites there.
+_MAX_ARCHITECTURE_RULES = 60
+_MAX_ARCHITECTURE_RULE_CHARS = 400
+
 #: The contract reference the auth door's card and its honest terminal name
 #: verbatim (the clause whose OWN words are "requires human confirmation").
 _SPL_007_AUTH_CLAUSE = "SPL-007 §A.2"
@@ -5308,6 +5320,90 @@ class PlanningRunDriver:
         )
 
     @staticmethod
+    def _read_architecture_rules(repo_path: str) -> dict[str, Any] | None:
+        """Read the target repo's own written architecture rules, if it has any.
+
+        A repository may keep its rules in one file — api_test keeps
+        ``docs/architecture-rules.yaml``, twelve rules, each quoting the sentence
+        in ``docs/architecture/`` it comes from. The planning seat cannot open
+        files, so the rules travel as text: the rule id, the rule in one plain
+        sentence, and the sentence it was taken from. The rest of that file is
+        machinery for the conformance checker (``checked_by``, ``signals``,
+        ``expected_current_finding``) and tells a plan-writer nothing, so it
+        stays behind.
+
+        No file ⇒ ``None`` ⇒ the descriptor carries no rules key and planning is
+        byte-for-byte what it was before this existed. A file that cannot be read
+        or is the wrong shape is a logged warning and ``None`` as well: a rules
+        file must never be able to stop a planning run.
+        """
+
+        def _clip(text: str) -> str:
+            text = " ".join(text.split())
+            if len(text) <= _MAX_ARCHITECTURE_RULE_CHARS:
+                return text
+            return text[: _MAX_ARCHITECTURE_RULE_CHARS - 1].rstrip() + "\u2026"
+
+        path = Path(repo_path) / _ARCHITECTURE_RULES_REL
+        try:
+            if not path.is_file():
+                return None
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 — never fail a plan over this
+            logger.warning(
+                "target_repo_descriptor: could not read the target repo's "
+                "architecture rules at %s (%s); planning without them",
+                path,
+                exc,
+            )
+            return None
+
+        if not isinstance(data, Mapping) or not isinstance(data.get("rules"), list):
+            logger.warning(
+                "target_repo_descriptor: %s does not have a top-level 'rules' "
+                "list; planning without the architecture rules",
+                path,
+            )
+            return None
+
+        rules: list[dict[str, str]] = []
+        for entry in data["rules"]:
+            if len(rules) >= _MAX_ARCHITECTURE_RULES:
+                logger.warning(
+                    "target_repo_descriptor: %s lists more than %d rules; "
+                    "sending the first %d",
+                    path,
+                    _MAX_ARCHITECTURE_RULES,
+                    _MAX_ARCHITECTURE_RULES,
+                )
+                break
+            if not isinstance(entry, Mapping):
+                continue
+            rule_id = str(entry.get("id") or "").strip()
+            rule_text = str(entry.get("rule") or "").strip()
+            # A rule with no id or no sentence says nothing a plan can be held
+            # to, so it is left out rather than sent half-formed.
+            if not rule_id or not rule_text:
+                continue
+            item: dict[str, str] = {"id": rule_id, "rule": _clip(rule_text)}
+            document = str(entry.get("source_document") or "").strip()
+            if document:
+                item["source_document"] = _clip(document)
+            sentence = str(entry.get("source_sentence") or "").strip()
+            if sentence:
+                item["source_sentence"] = _clip(sentence)
+            rules.append(item)
+
+        if not rules:
+            logger.warning(
+                "target_repo_descriptor: %s lists no readable rules; planning "
+                "without the architecture rules",
+                path,
+            )
+            return None
+        return {"source_file": _ARCHITECTURE_RULES_REL, "rules": rules}
+
+    @staticmethod
     def _build_target_repo_descriptor(
         target_repo: str, repo_path: str
     ) -> dict[str, Any]:
@@ -5315,9 +5411,13 @@ class PlanningRunDriver:
 
         Schema of record (specialist-agent roles/architect/modes/feature_plan.py
         ``TARGET_REPO_DESCRIPTOR_SCHEMA``): required = ``repo`` + ``test_roots``;
-        optional = ``default_branch`` / ``sibling_repos`` / ``stack``. forge NEVER
-        invents an undefined field: ``repo`` is the configured target repo name;
-        ``sibling_repos`` is omitted — forge does not cheaply know siblings.
+        optional = ``default_branch`` / ``sibling_repos`` / ``stack`` /
+        ``architecture_rules``. forge NEVER invents an undefined field: ``repo``
+        is the configured target repo name; ``sibling_repos`` is omitted — forge
+        does not cheaply know siblings; ``architecture_rules`` is present only
+        when the target repo actually keeps a rules file (see
+        :meth:`_read_architecture_rules`), and the schema defines the field as of
+        2026-08-31.
 
         ``test_roots`` is the EXACT ``tests/<name>`` set the downstream
         ``guardkit feature validate`` pre-commit oracle enforces, discovered by
@@ -5365,7 +5465,14 @@ class PlanningRunDriver:
                 exc,
             )
             test_roots = shallow_discover_test_roots(repo_path)
-        return {"repo": target_repo, "test_roots": test_roots}
+        descriptor: dict[str, Any] = {"repo": target_repo, "test_roots": test_roots}
+        # The repo's own architecture rules, when it keeps a rules file. Before
+        # this, the plan-writer was never shown them, and two features built the
+        # week of 2026-08-24 drifted from rules nobody had told it about.
+        architecture_rules = PlanningRunDriver._read_architecture_rules(repo_path)
+        if architecture_rules is not None:
+            descriptor["architecture_rules"] = architecture_rules
+        return descriptor
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
         """True iff a durable ``approved`` event exists for ``stage_label``.
