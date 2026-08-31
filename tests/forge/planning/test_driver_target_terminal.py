@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -516,6 +517,9 @@ def _make_driver(
             "test_roots",
             "sibling_repos",
             "stack",
+            # Present only when the target repo keeps a rules file
+            # (docs/architecture-rules.yaml); defined in the schema 2026-08-31.
+            "architecture_rules",
         }
         counters["last_feature_id"] = feature_id
         counters["last_descriptor"] = target_repo_descriptor
@@ -3215,6 +3219,196 @@ def test_descriptor_degrades_shape_correctly_without_guardkit(
         "appmilla/api_test", str(repo)
     )
     assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+
+
+# ---------------------------------------------------------------------------
+# THE TARGET REPO'S OWN ARCHITECTURE RULES IN THE DESCRIPTOR (2026-08-31)
+#
+# The plan-writer was never shown the target repository's architecture rules, so
+# two features built the week of 2026-08-24 drifted from rules nobody had told
+# it about. When the repo keeps docs/architecture-rules.yaml, the rules
+# themselves now ride in the descriptor as text (the seat cannot open files).
+# When it does not, the descriptor is byte-for-byte what it was.
+# ---------------------------------------------------------------------------
+
+
+_RULES_FILE = """
+format_version: "1.0"
+repo: api_test
+rules:
+  - id: R-OV-1
+    rule: Database queries live in the feature's crud.py, not in its router.py.
+    source_document: docs/architecture/00-system-overview.md
+    source_section: Architectural Layers
+    source_sentence: "**CRUD Layer (`crud.py`)**: Implements database operations."
+    checked_by: >-
+      Parse every file under src/ with Python's ast module and report a finding
+      for every query built outside crud.py.
+    signals:
+      kind: call-site-home-file
+      home_file: crud.py
+  - id: R-ADR001-1
+    rule: A feature module does not import another feature module.
+    source_document: docs/architecture/adr-001-feature-based-module-structure.md
+    source_sentence: "Cross-feature coupling where one module imports internals."
+not_rules:
+  - id: routers-do-not-hold-business-logic
+    would_say: "Business logic lives in a service file."
+"""
+
+
+def _repo_with_tests(tmp_path: Path, name: str = "api_test") -> Path:
+    repo = tmp_path / name
+    (repo / "tests" / "health").mkdir(parents=True)
+    (repo / "tests" / "users").mkdir(parents=True)
+    return repo
+
+
+def test_descriptor_carries_the_repo_architecture_rules(tmp_path: Path) -> None:
+    """A repo WITH a rules file: the rules travel as text — id, the rule in one
+    sentence, and the sentence it was quoted from. The checker's own machinery
+    (checked_by / signals) and the deliberately-left-out list stay behind."""
+    repo = _repo_with_tests(tmp_path)
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "architecture-rules.yaml").write_text(
+        _RULES_FILE, encoding="utf-8"
+    )
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    rules_block = descriptor["architecture_rules"]
+    assert rules_block["source_file"] == "docs/architecture-rules.yaml"
+    assert rules_block["rules"] == [
+        {
+            "id": "R-OV-1",
+            "rule": (
+                "Database queries live in the feature's crud.py, not in its "
+                "router.py."
+            ),
+            "source_document": "docs/architecture/00-system-overview.md",
+            "source_sentence": (
+                "**CRUD Layer (`crud.py`)**: Implements database operations."
+            ),
+        },
+        {
+            "id": "R-ADR001-1",
+            "rule": "A feature module does not import another feature module.",
+            "source_document": (
+                "docs/architecture/adr-001-feature-based-module-structure.md"
+            ),
+            "source_sentence": (
+                "Cross-feature coupling where one module imports internals."
+            ),
+        },
+    ]
+    # The rest of the descriptor is untouched.
+    assert descriptor["repo"] == "appmilla/api_test"
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+    # Nothing from the checker's machinery leaks into the request.
+    assert "checked_by" not in json.dumps(descriptor)
+    assert "not_rules" not in json.dumps(descriptor)
+
+
+def test_descriptor_omits_the_key_for_a_repo_with_no_rules_file(
+    tmp_path: Path,
+) -> None:
+    """A repo WITHOUT a rules file plans exactly as it did before: no key at
+    all, not an empty one."""
+    repo = _repo_with_tests(tmp_path, "ts-api-test")
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/ts-api-test", str(repo)
+    )
+    assert descriptor == {
+        "repo": "appmilla/ts-api-test",
+        "test_roots": ["tests/health", "tests/users"],
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "rules: [ this is not: valid: yaml",  # corrupt
+        "format_version: '1.0'\n",  # no rules key
+        "rules: a string, not a list\n",  # wrong shape
+        "rules:\n  - id: R-1\n",  # a rule with no sentence
+        "",  # empty file
+    ],
+)
+def test_unreadable_rules_file_omits_the_key_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, content: str
+) -> None:
+    """An unreadable, corrupt or empty rules file must never stop a plan: the
+    key is left out, a warning is logged, and nothing is raised."""
+    repo = _repo_with_tests(tmp_path)
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "architecture-rules.yaml").write_text(content, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/api_test", str(repo)
+        )
+    assert "architecture_rules" not in descriptor
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+    assert any(
+        "architecture rules" in rec.getMessage()
+        or "'rules' list" in rec.getMessage()
+        or "no readable rules" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_rules_file_that_cannot_be_opened_omits_the_key_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The rules path being a directory (or any other read error) degrades the
+    same way — warning, omitted key, no exception."""
+    repo = _repo_with_tests(tmp_path)
+    (repo / "docs" / "architecture-rules.yaml").mkdir(parents=True)
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/api_test", str(repo)
+        )
+    assert "architecture_rules" not in descriptor
+
+
+def test_a_long_rules_file_is_bounded(tmp_path: Path) -> None:
+    """A long rules file cannot swell the planning request: the rule count is
+    capped and a very long sentence is trimmed."""
+    repo = _repo_with_tests(tmp_path)
+    (repo / "docs").mkdir(parents=True)
+    long_sentence = "x" * 900
+    body = "rules:\n" + "".join(
+        f"  - id: R-{n}\n"
+        f"    rule: Rule number {n}.\n"
+        f'    source_sentence: "{long_sentence}"\n'
+        for n in range(200)
+    )
+    (repo / "docs" / "architecture-rules.yaml").write_text(body, encoding="utf-8")
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    rules = descriptor["architecture_rules"]["rules"]
+    assert len(rules) == 60
+    assert len(rules[0]["source_sentence"]) == 400
+    assert rules[0]["source_sentence"].endswith("\u2026")
+
+
+def test_the_real_api_test_rules_file_shape_reads(tmp_path: Path) -> None:
+    """The shape api_test actually ships — comments, block scalars, a
+    not_rules section — reads into twelve-ish plain entries with no loss of the
+    rule text."""
+    repo = _repo_with_tests(tmp_path)
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "architecture-rules.yaml").write_text(
+        "# a comment\n" + _RULES_FILE, encoding="utf-8"
+    )
+    block = PlanningRunDriver._read_architecture_rules(str(repo))
+    assert block is not None
+    assert [r["id"] for r in block["rules"]] == ["R-OV-1", "R-ADR001-1"]
 
 
 # ---------------------------------------------------------------------------
