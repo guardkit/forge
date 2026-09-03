@@ -205,3 +205,21 @@ the safety net. (Contrast: nats and the specialists are system-scoped and alread
   throwaway `systemd --user` unit with the same `Restart=on-failure` policy:
   kill the process → journalctl shows `status=9/KILL` → `Scheduled restart` →
   `Started`. Proves the supervision mechanism behind both units.
+
+## Recreating forge-prod (settings of record, 2026-09-03)
+
+forge-prod is a plain `docker run` container. Until 2026-09-03 its settings existed only inside the
+running container: when it had to be recreated (to route it through LiteLLM) the env had to be
+rebuilt from `docker inspect`. They now live sops-encrypted at
+`~/.config/fleet-secrets/forge/forge-prod.enc.env` (owner + escrow recipients, same as `nats/`), and
+`ops/forge-prod-recreate.sh` recreates the container from them:
+
+```
+bash ops/forge-prod-recreate.sh              # gates on 'forge status' (every build terminal), then recreates
+DRY_RUN=1 bash ops/forge-prod-recreate.sh    # prints the docker command; names only, nothing changes
+```
+
+To change a setting (for example `OPENAI_BASE_URL`, today `http://localhost:4000/v1` = LiteLLM, or the
+LiteLLM factory key in `OPENAI_API_KEY`): `sops ~/.config/fleet-secrets/forge/forge-prod.enc.env`, then
+run the script. The pre-LiteLLM settings (switchboard direct on :9000) are kept encrypted beside it as
+`forge-prod.pre-litellm-2026-09-03.enc.env` for rollback. No plaintext copy is kept anywhere.
