@@ -1,0 +1,35 @@
+PROVENANCE — the two pass bars of record from a real planning run, and the two
+task files they were minted for. DO NOT hand-edit.
+
+What these files are
+  Copies, byte for byte, of four files forge's planning driver and the 008
+  planner committed on 4 September 2026 for FEAT-44A8 ("User List ETag
+  Support") in the api_test repository. The two pass bars are IDENTICAL in
+  their criteria even though one belongs to a feature task and the other to a
+  documentation task — the defect this lane fixes.
+
+Where they came from (read-only copy, taken 2026-09-04)
+  repo:   /home/richardwoollcott/Projects/appmilla_github/api_test
+  branch: planning/7dae0e91-a9f9-483e-8ef4-6f20bb41f323
+  paths:  qa/pass-bar-TASK-44A8-001.yaml
+          qa/pass-bar-TASK-44A8-004.yaml
+          tasks/backlog/user-list-etag/TASK-44A8-001-add-etag-generation.md
+          tasks/backlog/user-list-etag/TASK-44A8-004-update-docs.md
+
+Checksums of the copies (sha256), identical to the source files
+  abb5b235616174e30b88de752db5847dc4afe483d93792df57b072f28ea8bdac  pass-bar-TASK-44A8-001.yaml
+  40945fd263cc06debda2b5d824d21664f309396e1c1b0c25e99f16d9cd4a4df6  pass-bar-TASK-44A8-004.yaml
+  dcf33ebeac262ab60e99a6638e9c432d13f621546cc4b75d0f82eeb052aa8dca  TASK-44A8-001-add-etag-generation.md
+  c2843330ff1ebaa754e304fea76236f6d9b7266a511c395234fa21e43c8d1352  TASK-44A8-004-update-docs.md
+
+Why they are kept here
+  TASK-44A8-004 is typed `documentation` in its own front matter, which tells
+  guardkit to run no tests for it. Its pass bar nonetheless asked for two
+  machine criteria about how the running endpoint behaves — evidence a task
+  that edits docs/API.md can never produce. These files are the test's ground
+  truth for both halves of the fix: the feature task's bar must still mint
+  exactly as it did, and the documentation task's bar must list what that task
+  actually delivers.
+
+No secrets: all four files were scanned for API keys and message-broker URLs
+before they were copied (zero matches).

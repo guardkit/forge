@@ -4336,3 +4336,290 @@ async def test_stamp_disagreements_reach_the_owner_on_a_clean_run_whatever_the_e
     assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
     # no "the plan proceeds… does not enforce" line — nothing was refused
     assert not any("could not be given a verification home" in m for _, m, _ in h.ctx["notifications"])
+
+
+# ---------------------------------------------------------------------------
+# A DOCUMENTATION TASK'S QUALITY CHECKLIST (build-FEAT-44A8, 2026-09-04)
+#
+# FEAT-44A8's fourth task, TASK-44A8-004, is typed `documentation` in its own
+# front matter — the type that tells guardkit to run no tests. Its registered
+# pass bar nonetheless carried the FEATURE's two machine criteria, identical to
+# task 001's: evidence about how the running endpoint behaves, asked of a task
+# that only edits docs/API.md. The four files under fixtures/ are the real
+# bytes from that run (see their PROVENANCE.txt).
+#
+# The fix: a task the PLAN ITSELF types documentation gets the checklist it can
+# be held to — the criteria written on the task — and the file says why. Every
+# other task mints exactly what it minted before.
+# ---------------------------------------------------------------------------
+
+_44A8_FIXTURES = _FIXTURES / "pass-bars-44a8-20260904"
+_BAR_OF_RECORD_001 = yaml.safe_load(
+    (_44A8_FIXTURES / "pass-bar-TASK-44A8-001.yaml").read_text(encoding="utf-8")
+)
+_BAR_OF_RECORD_004 = yaml.safe_load(
+    (_44A8_FIXTURES / "pass-bar-TASK-44A8-004.yaml").read_text(encoding="utf-8")
+)
+_TASK_MD_001 = (_44A8_FIXTURES / "TASK-44A8-001-add-etag-generation.md").read_text(
+    encoding="utf-8"
+)
+_TASK_MD_004 = (_44A8_FIXTURES / "TASK-44A8-004-update-docs.md").read_text(
+    encoding="utf-8"
+)
+_TASK_FILE_004 = "tasks/backlog/user-list-etag/TASK-44A8-004-update-docs.md"
+
+
+def _seed_of_record() -> dict[str, Any]:
+    """The feature-grain seed the two bars of record were fanned out from.
+
+    Reconstructed from the registered bar itself: the leg carries the seed's
+    ``preconditions`` and ``criteria`` verbatim, so the bar of record IS the
+    seed's checklist.
+    """
+    return {
+        "format_version": _BAR_OF_RECORD_001["format_version"],
+        "preconditions": list(_BAR_OF_RECORD_001["preconditions"]),
+        "criteria": [dict(c) for c in _BAR_OF_RECORD_001["criteria"]],
+    }
+
+
+def test_the_two_bars_of_record_are_identical_in_criteria() -> None:
+    """The defect, pinned: a documentation task's bar was a copy of a feature
+    task's, machine criteria and all."""
+    assert _BAR_OF_RECORD_001["criteria"] == _BAR_OF_RECORD_004["criteria"]
+    assert all(c["class"] == "machine" for c in _BAR_OF_RECORD_004["criteria"])
+    assert "task_type: documentation" in _TASK_MD_004
+    assert "task_type: feature" in _TASK_MD_001
+
+
+def test_feature_task_bar_is_unchanged() -> None:
+    """A feature task mints EXACTLY the bar of record — no note, no narrowing."""
+    minted = PlanningRunDriver._mint_pass_bar_yaml(
+        task_id="TASK-44A8-001",
+        seed=_seed_of_record(),
+        sha=_BAR_OF_RECORD_001["registered_at"]["sha"],
+        date=_BAR_OF_RECORD_001["registered_at"]["date"],
+        task_type=driver_module.task_type_from_front_matter(_TASK_MD_001),
+        task_file="tasks/backlog/user-list-etag/TASK-44A8-001-add-etag-generation.md",
+        task_text=_TASK_MD_001,
+    )
+    assert driver_module._DOCS_BAR_NOTE_MARKER not in minted
+    bar = yaml.safe_load(minted)
+    _assert_pass_bar_schema(bar)
+    assert bar == _BAR_OF_RECORD_001
+
+
+def test_documentation_task_bar_drops_the_feature_machine_criteria() -> None:
+    """The fix: TASK-44A8-004's bar no longer asks a documentation task for
+    machine evidence about the endpoint; it lists what that task delivers, and
+    the file says why."""
+    minted = PlanningRunDriver._mint_pass_bar_yaml(
+        task_id="TASK-44A8-004",
+        seed=_seed_of_record(),
+        sha=_BAR_OF_RECORD_004["registered_at"]["sha"],
+        date=_BAR_OF_RECORD_004["registered_at"]["date"],
+        task_type=driver_module.task_type_from_front_matter(_TASK_MD_004),
+        task_file=_TASK_FILE_004,
+        task_text=_TASK_MD_004,
+    )
+    bar = yaml.safe_load(minted)
+    # Still a bar guardkit's own qa validate accepts, still the same task.
+    _assert_pass_bar_schema(bar)
+    assert bar["task_id"] == "TASK-44A8-004"
+    assert bar["registered_at"] == _BAR_OF_RECORD_004["registered_at"]
+    assert bar["preconditions"] == _BAR_OF_RECORD_004["preconditions"]
+    assert bar["negative_paths"] == _BAR_OF_RECORD_004["negative_paths"]
+    # None of the feature's criteria survive onto it.
+    feature_texts = {c["text"] for c in _BAR_OF_RECORD_004["criteria"]}
+    assert not feature_texts & {c["text"] for c in bar["criteria"]}
+    # What it carries instead: the three criteria written on the task itself.
+    assert [c["text"] for c in bar["criteria"]] == [
+        "Documentation updated to include ETag support details",
+        "Examples of conditional GET requests provided",
+        "All modified files pass project-configured lint/format checks with zero errors",
+    ]
+    assert all(c["evidence_kind"] == "log" for c in bar["criteria"])
+    assert len({c["id"] for c in bar["criteria"]}) == 3
+    # And the file says, in plain words, why it is not the feature's checklist.
+    assert driver_module._DOCS_BAR_NOTE_MARKER in minted
+    assert _TASK_FILE_004 in minted
+    assert "guardkit runs" in minted and "no tests for that type" in minted
+
+
+def test_documentation_task_with_no_criteria_of_its_own_keeps_a_valid_bar() -> None:
+    """A documentation task whose file lists no criteria, against an all-machine
+    seed: the bar keeps the feature's criteria — a bar with none at all is
+    invalid and would stop the whole plan — and the note says so, so nobody
+    reads them as this task's work."""
+    minted = PlanningRunDriver._mint_pass_bar_yaml(
+        task_id="TASK-44A8-009",
+        seed=_seed_of_record(),
+        sha="e95128f8d34cb20a6d8eca8b76e9ff79af09c3dd",
+        date="2026-09-04",
+        task_type="documentation",
+        task_file="tasks/backlog/user-list-etag/TASK-44A8-009-notes.md",
+        task_text="---\nid: TASK-44A8-009\ntask_type: documentation\n---\n\n# no criteria\n",
+    )
+    bar = yaml.safe_load(minted)
+    _assert_pass_bar_schema(bar)
+    assert bar["criteria"] == _BAR_OF_RECORD_004["criteria"]
+    assert "could not be narrowed" in minted
+
+
+def test_documentation_task_keeps_only_non_machine_criteria_when_it_has_them() -> None:
+    """No criteria on the task file, but the feature checklist has an operator
+    item: the machine ones go, the operator one stays."""
+    seed = _seed_of_record()
+    seed["criteria"] = seed["criteria"] + [
+        {
+            "id": "user-list-etag-support-AC-009",
+            "text": "An operator confirms the published docs read correctly",
+            "class": "operator",
+            "evidence_kind": "operator_signoff",
+            "runbook_ref": "docs/runbooks/docs-review.md",
+        }
+    ]
+    minted = PlanningRunDriver._mint_pass_bar_yaml(
+        task_id="TASK-44A8-009",
+        seed=seed,
+        sha="e95128f8d34cb20a6d8eca8b76e9ff79af09c3dd",
+        date="2026-09-04",
+        task_type="documentation",
+        task_file="tasks/backlog/user-list-etag/TASK-44A8-009-notes.md",
+        task_text="---\ntask_type: documentation\n---\n\n# no criteria section\n",
+    )
+    bar = yaml.safe_load(minted)
+    _assert_pass_bar_schema(bar)
+    assert [c["id"] for c in bar["criteria"]] == ["user-list-etag-support-AC-009"]
+
+
+def test_task_type_is_read_from_the_plans_own_front_matter() -> None:
+    """The type comes from the same place guardkit reads it, and an unreadable
+    or absent declaration means 'behave exactly as before'."""
+    read = driver_module.task_type_from_front_matter
+    assert read(_TASK_MD_004) == "documentation"
+    assert read(_TASK_MD_001) == "feature"
+    # guardkit's own alias for documentation.
+    assert read("---\ntask_type: research\n---\n") == "research"
+    assert "research" in driver_module._DOCS_TASK_TYPES
+    # No front matter, no key, empty file → nothing declared.
+    assert read("# just a heading\n") is None
+    assert read("---\nid: TASK-1\n---\n") is None
+    assert read("") is None
+
+
+def test_task_criteria_read_both_bullet_shapes() -> None:
+    """Plain bullets (what the 008 planner writes) and checkbox bullets both
+    count — reading only the checkbox form is the 2026-08-14 close-blocker."""
+    text = (
+        "---\ntask_type: documentation\n---\n\n"
+        "## Acceptance Criteria\n\n"
+        "- [ ] The guide is written\n"
+        "- AC-KEEP: The examples run\n\n"
+        "## Implementation Notes\n\n"
+        "- not a criterion\n"
+    )
+    criteria = driver_module.task_acceptance_criteria(text)
+    assert [(c["id"], c["text"]) for c in criteria] == [
+        ("AC-1", "The guide is written"),
+        ("AC-KEEP", "The examples run"),
+    ]
+
+
+def _plan_result_docs_task(feature_id: str) -> Any:
+    """A validated plan of two tasks — one feature, one documentation — each
+    with the task file the plan wrote, so the type travels with the plan."""
+    feature_yaml = (
+        f"id: {feature_id}\n"
+        "tasks:\n"
+        "- id: TASK-VER-001\n"
+        "  file_path: tasks/backlog/version-endpoint/TASK-VER-001-endpoint.md\n"
+        "- id: TASK-VER-004\n"
+        "  file_path: tasks/backlog/version-endpoint/TASK-VER-004-update-docs.md\n"
+    )
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"),
+        role_output={
+            f".guardkit/features/{feature_id}.yaml": feature_yaml,
+            "tasks/backlog/version-endpoint/TASK-VER-001-endpoint.md": (
+                "---\nid: TASK-VER-001\ntask_type: feature\n---\n\n"
+                "## Acceptance Criteria\n\n- The endpoint answers\n"
+            ),
+            "tasks/backlog/version-endpoint/TASK-VER-004-update-docs.md": (
+                "---\nid: TASK-VER-004\ntask_type: documentation\n---\n\n"
+                "## Acceptance Criteria\n\n"
+                "- The version endpoint is documented\n"
+                "- An example request is shown\n"
+            ),
+            "validation.json": json.dumps(
+                {"accepted": True, "errors": [], "gates_run": ["feature_validate"]}
+            ),
+        },
+        reason=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_documentation_task_bar_lands_narrowed_on_the_branch(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """End to end through real git: the driver reads each task's declared type
+    off the branch, so the documentation task's registered bar carries its own
+    criteria while the feature task's carries the feature's — both validated,
+    both committed, and the build still queued."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_docs_task,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["build_trigger"] == 1
+    assert set(h.ctx["validated_bars"]) == {
+        "qa/pass-bar-TASK-VER-001.yaml",
+        "qa/pass-bar-TASK-VER-004.yaml",
+    }
+
+    branch = f"planning/{CID}"
+
+    def _show(path: str) -> str:
+        return subprocess.run(
+            ["git", "show", f"{branch}:{path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    feature_bar_raw = _show("qa/pass-bar-TASK-VER-001.yaml")
+    feature_bar = yaml.safe_load(feature_bar_raw)
+    _assert_pass_bar_schema(feature_bar)
+    assert driver_module._DOCS_BAR_NOTE_MARKER not in feature_bar_raw
+    assert [c["id"] for c in feature_bar["criteria"]] == [
+        "version-endpoint-AC-001",
+        "version-endpoint-AC-002",
+    ]
+
+    docs_bar_raw = _show("qa/pass-bar-TASK-VER-004.yaml")
+    docs_bar = yaml.safe_load(docs_bar_raw)
+    _assert_pass_bar_schema(docs_bar)
+    assert driver_module._DOCS_BAR_NOTE_MARKER in docs_bar_raw
+    assert "TASK-VER-004-update-docs.md" in docs_bar_raw
+    assert [c["text"] for c in docs_bar["criteria"]] == [
+        "The version endpoint is documented",
+        "An example request is shown",
+    ]
+    assert not any(c["evidence_kind"] == "screenshot" for c in docs_bar["criteria"])
+
+    # The leg receipt names which bars were narrowed, without opening them.
+    assert _leg_details(store, "qa-pass-bars")["documentation_tasks"] == [
+        "TASK-VER-004"
+    ]
