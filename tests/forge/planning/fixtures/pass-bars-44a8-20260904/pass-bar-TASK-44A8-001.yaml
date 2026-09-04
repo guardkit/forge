@@ -1,0 +1,23 @@
+format_version: '2.0'
+task_id: TASK-44A8-001
+registered_at:
+  sha: e95128f8d34cb20a6d8eca8b76e9ff79af09c3dd
+  date: '2026-09-04'
+auth_surface_bearing: false
+preconditions:
+- suite_green_vs_ledger
+- analyze_clean
+- build_artifact
+criteria:
+- id: user-list-etag-support-AC-001
+  text: A request to the user list endpoint returns the list with an ETag
+  class: machine
+  evidence_kind: screenshot
+  runbook_ref: null
+- id: user-list-etag-support-AC-002
+  text: A request with a matching If-None-Match header returns 304 without a body
+  class: machine
+  evidence_kind: screenshot
+  runbook_ref: null
+negative_paths:
+- dependency_down_degradation

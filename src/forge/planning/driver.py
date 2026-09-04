@@ -356,6 +356,46 @@ _UNIVERSAL_NEGATIVE_PATH = "dependency_down_degradation"
 #: ``PassBar.CURRENT_FORMAT_VERSION``). Carried from the seed when present.
 _PASS_BAR_FORMAT_VERSION = "2.0"
 
+#: Task types whose guardkit quality-gate profile asks for NO tests
+#: (``guardkit/models/task_types.py`` DEFAULT_PROFILES: DOCUMENTATION has
+#: ``tests_required=False`` and ``plan_audit_required=False``). ``research`` is
+#: guardkit's own alias for ``documentation`` (TASK_TYPE_ALIASES in that file),
+#: so a plan that uses the alias lands in the same place. The plan states the
+#: type itself in each task file's front matter, and that front-matter value is
+#: the SAME one guardkit reads at build time
+#: (``FeatureOrchestrator._read_task_type_from_frontmatter``) — so forge keys off
+#: the plan's own word, never a second guess of its own.
+_DOCS_TASK_TYPES = frozenset({"documentation", "research"})
+
+#: Evidence kind forge writes on a criterion it derives from a task's own
+#: "## Acceptance Criteria" section. Mirrors guardkit's own machine minter
+#: (``guardkit/orchestrator/pass_bar_mint.py`` ``_DERIVED_EVIDENCE_KIND``): a
+#: checker loop produces a log, and the two LIVE kinds (``screenshot``,
+#: ``operator_signoff``) would arm the feature-complete runtime-surface gate off
+#: a documentation task — a fabricated gate.
+_DERIVED_EVIDENCE_KIND = "log"
+
+#: The marker every narrowed documentation bar carries in its leading comment
+#: block. ``PassBar`` is ``extra="forbid"``, so a note has nowhere to live as a
+#: field; guardkit's own minter uses the same leading-comment form, which the
+#: schema ignores and a reader cannot miss.
+_DOCS_BAR_NOTE_MARKER = "DOCUMENTATION TASK — NOT A COPY OF THE FEATURE CHECKLIST"
+
+#: One "## Acceptance Criteria" bullet in a task file. Both the plain-bullet
+#: form the 008 planner writes (``- text``) and the checkbox form
+#: (``- [ ] text``) count: the checkbox is optional, and reading only the
+#: checkbox form is the same bug that blocked a feature close on 2026-08-14.
+_TASK_CRITERION_RE = re.compile(r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(?P<text>\S.*?)\s*$")
+
+#: A criterion that names its own id (``AC-1: ...``) keeps it, exactly as
+#: guardkit's minter does; anything else is numbered in order.
+_TASK_CRITERION_ID_RE = re.compile(
+    r"^(?P<id>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*)\s*:\s*(?P<text>\S.*)$"
+)
+
+#: A markdown heading of any level, used to find (and end) the criteria section.
+_TASK_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*$")
+
 #: Where a target repository keeps its own written architecture rules, when it
 #: keeps any. api_test does: twelve rules, each one quoting the sentence in
 #: docs/architecture/ it comes from. Most repositories have no such file, and
@@ -597,6 +637,92 @@ def _accepts_keyword(fn: Any, name: str) -> bool:
     if name in params:
         return True
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def task_type_from_front_matter(task_text: str) -> str | None:
+    """Read a task file's declared ``task_type``, lower-cased, or ``None``.
+
+    The plan writes each task as a markdown file whose YAML front matter states
+    the task's own type (``task_type: documentation``). That declared value is
+    the SAME one guardkit reads when it decides which quality gates to run
+    (``FeatureOrchestrator._read_task_type_from_frontmatter``), so it is the one
+    honest answer to "will tests run for this task" available at plan-commit.
+
+    A deliberate line scan rather than a YAML parse: this runs over files a
+    model wrote, and front matter that does not parse must not take the
+    planning run down. No front matter, no key, or an unreadable file ⇒
+    ``None`` ⇒ the caller behaves exactly as it did before this existed.
+    """
+    lines = (task_text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        if name.strip() != "task_type":
+            continue
+        cleaned = value.strip().strip('"').strip("'").lower()
+        return cleaned or None
+    return None
+
+
+def task_acceptance_criteria(task_text: str) -> list[dict[str, str]]:
+    """The criteria written ON a task, as pass-bar criterion mappings.
+
+    Reads the task file's ``## Acceptance Criteria`` section — the same section
+    guardkit's own machine minter reads
+    (``guardkit/orchestrator/pass_bar_mint.py`` ``read_acceptance_criteria``)
+    and the same list the Coach holds the task to. Returns ``[]`` when the
+    section is absent or empty.
+
+    Class and evidence kind mirror that minter's judgements, for its reasons:
+    ``machine`` because there is no operator runbook to route an operator
+    criterion to (a criterion with nowhere to route is a silently dropped one),
+    and ``log`` because the two live evidence kinds would arm the
+    feature-complete runtime-surface gate off a documentation task.
+    """
+    in_section = False
+    raw_items: list[str] = []
+    for line in (task_text or "").splitlines():
+        heading = _TASK_HEADING_RE.match(line)
+        if heading:
+            title = heading.group("title").strip().lower()
+            if in_section:
+                break
+            in_section = title.startswith("acceptance criteria")
+            continue
+        if not in_section:
+            continue
+        item = _TASK_CRITERION_RE.match(line)
+        if item:
+            raw_items.append(item.group("text"))
+
+    criteria: list[dict[str, str]] = []
+    used: set[str] = set()
+    for ordinal, raw in enumerate(raw_items, start=1):
+        named = _TASK_CRITERION_ID_RE.match(raw)
+        if named:
+            candidate, text = named.group("id"), named.group("text")
+        else:
+            candidate, text = f"AC-{ordinal}", raw
+        unique, suffix = candidate, 2
+        while unique in used:
+            unique = f"{candidate}-{suffix}"
+            suffix += 1
+        used.add(unique)
+        criteria.append(
+            {
+                "id": unique,
+                "text": text,
+                "class": "machine",
+                "evidence_kind": _DERIVED_EVIDENCE_KIND,
+                "runbook_ref": None,
+            }
+        )
+    return criteria
 
 
 @dataclass
@@ -3558,10 +3684,10 @@ class PlanningRunDriver:
 
         # The per-task bar ids ARE the validated plan's task ids — the SAME
         # source ``guardkit feature validate`` reads: the committed feature YAML.
-        task_ids = await self._read_plan_task_ids(
+        plan_tasks = await self._read_plan_tasks(
             repo_path, branch, feature_id, plan_files
         )
-        if task_ids is None:
+        if plan_tasks is None:
             return await self._fail_leg(
                 correlation_id,
                 _QA_PASS_BARS_STAGE,
@@ -3571,7 +3697,7 @@ class PlanningRunDriver:
             )
 
         run_date = deps.clock().date().isoformat()
-        if not task_ids:
+        if not plan_tasks:
             # A validated plan with zero tasks: no per-task bars to register.
             # Record the leg complete (idempotent) and advance — B2 is vacuous.
             logger.info(
@@ -3604,12 +3730,44 @@ class PlanningRunDriver:
         # commit sha, date = the run date from the driver's clock,
         # auth_surface_bearing false on this path either by construction (an
         # unflagged seed) or by the owner's explicit confirmation at the door.
-        bars: dict[str, str] = {
-            f"qa/pass-bar-{task_id}.yaml": self._mint_pass_bar_yaml(
-                task_id=task_id, seed=seed, sha=plan_sha, date=run_date
+        #
+        # One task type is not a plain fan-out (2026-09-04, off build-FEAT-44A8):
+        # a task the PLAN ITSELF types ``documentation`` gets the checklist it
+        # can actually be held to instead of the feature's machine criteria,
+        # because guardkit runs no tests for that type and the task could never
+        # produce that evidence. Forge reads the type from the same place
+        # guardkit reads it — the task file's front matter, committed with the
+        # plan — and a task file it cannot read simply mints as it always did.
+        bars: dict[str, str] = {}
+        docs_bars: list[str] = []
+        for task in plan_tasks:
+            task_id = task["id"]
+            task_file = task.get("file_path")
+            task_text = (
+                await self._read_task_declaration(repo_path, branch, task_file)
+                if task_file
+                else None
             )
-            for task_id in task_ids
-        }
+            task_type = task_type_from_front_matter(task_text or "")
+            if (task_type or "") in _DOCS_TASK_TYPES:
+                docs_bars.append(task_id)
+            bars[f"qa/pass-bar-{task_id}.yaml"] = self._mint_pass_bar_yaml(
+                task_id=task_id,
+                seed=seed,
+                sha=plan_sha,
+                date=run_date,
+                task_type=task_type,
+                task_file=task_file,
+                task_text=task_text,
+            )
+        if docs_bars:
+            logger.info(
+                "planning driver: run %s — %s are documentation tasks, so their "
+                "quality checklists list what those tasks deliver instead of the "
+                "feature's machine criteria (guardkit runs no tests for that type)",
+                correlation_id,
+                ", ".join(sorted(docs_bars)),
+            )
 
         validate = deps.validate_pass_bar
 
@@ -3661,6 +3819,15 @@ class PlanningRunDriver:
                     "registered_at_sha": plan_sha,
                     "sha": gitres.sha,
                     "branch": branch,
+                    # Present only when the plan had documentation tasks, whose
+                    # bars list their own criteria rather than the feature's
+                    # machine ones — on the receipt so a reader can see which
+                    # bars were narrowed without opening them.
+                    **(
+                        {"documentation_tasks": sorted(docs_bars)}
+                        if docs_bars
+                        else {}
+                    ),
                     # Present ONLY when the auth door was walked: the owner's
                     # act is part of the leg's receipt, never inferred later.
                     **(
@@ -5233,17 +5400,19 @@ class PlanningRunDriver:
                 return str(content)
         return None
 
-    async def _read_plan_task_ids(
+    async def _read_plan_tasks(
         self, repo_path: str, branch: str, feature_id: str, plan_files: Any
-    ) -> list[str] | None:
-        """Enumerate the validated plan's task ids from its committed feature YAML.
+    ) -> list[dict[str, str]] | None:
+        """Enumerate the validated plan's tasks from its committed feature YAML.
 
         The feature YAML (``.guardkit/features/<feature_id>.yaml``) is the SAME
         source ``guardkit feature validate`` reads; forge reads it back off the
         planning branch (not from memory, so this is correct on an idempotent
-        re-drive) and returns ``[task.id for task in tasks]`` in plan order.
-        Returns ``None`` when the feature YAML cannot be located among the
-        committed plan files, read, or parsed — a loud-fail signal for the caller.
+        re-drive) and returns one record per task in plan order: its ``id``, and
+        its ``file_path`` when the plan states one (the task's own markdown file,
+        which is where the plan declares that task's type). Returns ``None`` when
+        the feature YAML cannot be located among the committed plan files, read,
+        or parsed — a loud-fail signal for the caller.
         """
         # Locate the feature YAML among the committed plan files: the entry whose
         # path ends with ``<feature_id>.yaml``, preferring the canonical
@@ -5272,17 +5441,131 @@ class PlanningRunDriver:
             # A feature YAML with no ``tasks`` key (or a null/absent list) has no
             # tasks to register bars for — an empty enumeration, not a read error.
             return []
-        task_ids: list[str] = []
+        records: list[dict[str, str]] = []
         for task in tasks:
             if isinstance(task, Mapping):
                 tid = task.get("id")
                 if tid:
-                    task_ids.append(str(tid))
-        return task_ids
+                    record: dict[str, str] = {"id": str(tid)}
+                    file_path = task.get("file_path")
+                    if file_path:
+                        record["file_path"] = str(file_path)
+                    records.append(record)
+        return records
+
+    async def _read_task_declaration(
+        self, repo_path: str, branch: str, file_path: str
+    ) -> str | None:
+        """The text of one task file off the planning branch, or ``None``.
+
+        Read so the bar minter can see the type the plan gave the task and the
+        criteria the plan wrote on it. A file that is missing or unreadable is a
+        logged warning and ``None``: the bar is then minted exactly as it was
+        before this existed. Reading a task file must never be able to stop a
+        planning run.
+        """
+        try:
+            return await self._deps.git_runner.read_file_from_branch(
+                repo_path=repo_path, branch=branch, file_path=file_path
+            )
+        except Exception as exc:  # noqa: BLE001 — read boundary, never fatal
+            logger.warning(
+                "planning driver: could not read task file %s off %s (%s); "
+                "minting its pass bar from the feature seed unchanged",
+                file_path,
+                branch,
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _documentation_bar_criteria(
+        *,
+        task_id: str,
+        task_file: str,
+        seed_criteria: list[Any],
+        task_text: str | None,
+    ) -> tuple[list[Any], list[str]]:
+        """The criteria a DOCUMENTATION task can honestly be held to, + the note.
+
+        Why this exists (build-FEAT-44A8, 4 September 2026). The seed is
+        FEATURE-grain, and forge used to copy it onto every task's bar. For
+        TASK-44A8-004, a documentation task, that put two criteria about how the
+        running endpoint behaves onto a bar for a task that only edits
+        ``docs/API.md`` — and whose type tells guardkit to run no tests at all
+        (``DOCUMENTATION`` profile: ``tests_required=False``). A checklist that
+        asks for evidence the task can never produce is a false record.
+
+        What replaces them, in order:
+
+        1. The criteria written ON the task itself ("## Acceptance Criteria" in
+           its task file) — the list the Coach actually checks that task
+           against, and the same source guardkit's own machine minter uses.
+        2. Failing that, the seed's non-machine criteria only.
+        3. Failing that, the seed unchanged — because ``PassBar.criteria``
+           requires at least one entry, and a bar that will not validate stops
+           the whole plan. In that case the note says the bar could not be
+           narrowed, so nobody reads it as a claim about this task.
+
+        Returns ``(criteria, note_lines)``; the note is written into the file as
+        a leading comment block (``PassBar`` forbids extra fields, so a comment
+        is the only place a note can live — guardkit's minter does the same).
+        """
+        own = task_acceptance_criteria(task_text or "")
+        if own:
+            note = [
+                f"The plan types {task_id} as a documentation task, and guardkit runs",
+                "no tests for that type (documentation profile: tests_required =",
+                "false). So the feature's machine criteria — how the running",
+                "endpoint behaves — are left off this bar: this task edits",
+                "documents and could never produce that evidence. They are still",
+                "carried by the feature's other tasks and answered by the live gate.",
+                "The criteria below are the ones written on the task itself,",
+                f"in {task_file} under '## Acceptance Criteria' — what the build",
+                "actually holds this task to.",
+                "They are classed 'machine' with evidence kind 'log' because there is",
+                "no operator runbook to route an operator criterion to, and the live",
+                "evidence kinds would arm the feature-complete runtime-surface gate",
+                "off a documentation task.",
+            ]
+            return own, note
+
+        non_machine = [
+            c
+            for c in seed_criteria
+            if not (isinstance(c, Mapping) and str(c.get("class")) == "machine")
+        ]
+        if non_machine:
+            note = [
+                f"The plan types {task_id} as a documentation task, and guardkit runs",
+                "no tests for that type. The task file carries no '## Acceptance",
+                "Criteria' section, so this bar keeps only the checklist items that",
+                "do not ask for machine evidence; the machine ones stay with the",
+                "feature's other tasks and the live gate.",
+            ]
+            return non_machine, note
+
+        note = [
+            f"The plan types {task_id} as a documentation task, and guardkit runs",
+            "no tests for that type — so the feature's machine criteria below are",
+            "NOT work this task can evidence. They could not be narrowed away: the",
+            "task file lists no acceptance criteria of its own and the feature",
+            "checklist has no non-machine items, and a bar with no criteria at all",
+            "is invalid and would stop the plan. Read them as the feature's, not",
+            "as this task's.",
+        ]
+        return list(seed_criteria), note
 
     @staticmethod
     def _mint_pass_bar_yaml(
-        *, task_id: str, seed: Mapping[str, Any], sha: str, date: str
+        *,
+        task_id: str,
+        seed: Mapping[str, Any],
+        sha: str,
+        date: str,
+        task_type: str | None = None,
+        task_file: str | None = None,
+        task_text: str | None = None,
     ) -> str:
         """Mint one ``qa/pass-bar-<TASK-ID>.yaml`` from the seed (F2 shape).
 
@@ -5296,11 +5579,30 @@ class PlanningRunDriver:
         door with "there is no sign-in here" (a flagged seed reaches minting ONLY
         through that confirmation); ``negative_paths`` supplies the universal
         minimum the seed omits.
+
+        ONE exception to "carried verbatim", added 2026-09-04: when the plan
+        itself types the task ``documentation`` (or its alias ``research``), the
+        criteria come from :meth:`_documentation_bar_criteria` and the file
+        carries a leading note saying why. Every other task type — and every
+        task whose type forge could not read — mints byte-for-byte what it
+        minted before.
         """
         negative_paths = sorted(
             {str(p) for p in (seed.get("negative_paths") or [])}
             | {_UNIVERSAL_NEGATIVE_PATH}
         )
+        criteria: list[Any] = [
+            dict(c) if isinstance(c, Mapping) else c
+            for c in (seed.get("criteria") or [])
+        ]
+        note_lines: list[str] = []
+        if (task_type or "").strip().lower() in _DOCS_TASK_TYPES:
+            criteria, note_lines = PlanningRunDriver._documentation_bar_criteria(
+                task_id=task_id,
+                task_file=task_file or "the task file",
+                seed_criteria=criteria,
+                task_text=task_text,
+            )
         bar: dict[str, Any] = {
             "format_version": str(
                 seed.get("format_version") or _PASS_BAR_FORMAT_VERSION
@@ -5309,15 +5611,19 @@ class PlanningRunDriver:
             "registered_at": {"sha": sha, "date": date},
             "auth_surface_bearing": False,
             "preconditions": list(seed.get("preconditions") or []),
-            "criteria": [
-                dict(c) if isinstance(c, Mapping) else c
-                for c in (seed.get("criteria") or [])
-            ],
+            "criteria": criteria,
             "negative_paths": negative_paths,
         }
-        return yaml.safe_dump(
+        body = yaml.safe_dump(
             bar, sort_keys=False, default_flow_style=False, allow_unicode=True
         )
+        if not note_lines:
+            return body
+        rule = "# " + "-" * 74
+        header = [rule, f"# {_DOCS_BAR_NOTE_MARKER}", "#"]
+        header += [f"# {line}" for line in note_lines]
+        header += ["#", f"# Written by forge's planning driver on {date}.", rule]
+        return "\n".join(header) + "\n" + body
 
     @staticmethod
     def _read_architecture_rules(repo_path: str) -> dict[str, Any] | None:
