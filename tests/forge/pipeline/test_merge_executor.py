@@ -24,8 +24,13 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence, StageLogEntry
+from forge.lifecycle.metrics import (
+    MERGE_READY_TARGET_IDENTIFIER,
+    self_closed_defect_rate,
+)
 from forge.pipeline.merge_executor import (
     MERGE_DECISION_TARGET_IDENTIFIER,
+    MERGE_REPORT_TARGET_IDENTIFIER,
     MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
     MERGE_STEP_MERGE_TARGET_IDENTIFIER,
     MergeApprovalConsumer,
@@ -765,3 +770,146 @@ class TestDigestConformanceAdvisory:
         )
         assert receipt["conformant"] is None
         assert "no spec digest was found" in receipt["skipped"]
+
+
+# ---------------------------------------------------------------------------
+# The report on the build's own record
+# ---------------------------------------------------------------------------
+
+
+class _PoolThatCannotRecordTheReport:
+    """The real pool, except that writing the report row raises.
+
+    Everything else — the step claims, the reads — goes through untouched,
+    so the test isolates exactly one failure: the database refusing the
+    report row.
+    """
+
+    def __init__(self, pool: SqliteLifecyclePersistence) -> None:
+        self._pool = pool
+
+    def record_stage(self, entry: StageLogEntry) -> None:
+        if entry.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER:
+            raise sqlite3.OperationalError("database is locked")
+        self._pool.record_stage(entry)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+
+def _report_rows(
+    pool: SqliteLifecyclePersistence, build_id: str = BUILD_ID
+) -> list[StageLogEntry]:
+    return [
+        s
+        for s in pool.read_stages(build_id)
+        if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+    ]
+
+
+class TestTheReportIsOnTheBuildsRecord:
+    """The merge report is a message and a file; it must also be a row.
+
+    The self-closed defect rate (``forge status --m5``) can only read the
+    database, so a report that lives only on the bus and on disk leaves the
+    number stuck at zero however many repairs really merged, deployed and
+    stayed green.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_green_report_is_recorded_with_its_outcome_word(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+
+        rows = _report_rows(pool)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.stage_label == "merge-deploy"
+        assert row.status == "PASSED"
+        # The outcome word is a field of its own, not buried in prose.
+        assert row.details["result"] == "merged-and-running"
+        assert row.details["build_id"] == BUILD_ID
+        assert row.details["correlation_id"] == CORRELATION
+
+    @pytest.mark.asyncio
+    async def test_a_red_report_is_recorded_with_its_red_word(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(
+            config, pool, deploy=_FakeDeploy(outcome="reverted", verdict="fail")
+        )
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-reverted"
+
+        rows = _report_rows(pool)
+        assert len(rows) == 1
+        assert rows[0].status == "FAILED"
+        assert rows[0].details["result"] == "merged-deploy-reverted"
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_records_no_report(
+        self, config, pool, repo_root
+    ) -> None:
+        """A dry run changed nothing, so it leaves nothing on the record."""
+        deps, publisher, gk, dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, dry_run=True)
+        assert _report_rows(pool) == []
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_cannot_be_written_never_costs_the_report(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        deps.pool = _PoolThatCannotRecordTheReport(pool)  # type: ignore[assignment]
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-and-running"
+        assert publisher.reports[0].result == "merged-and-running"
+        assert (
+            _receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_report.json"
+        ).is_file()
+        assert _report_rows(pool) == []
+
+    @pytest.mark.asyncio
+    async def test_the_self_closed_defect_rate_counts_a_real_green_run(
+        self, config, pool, repo_root
+    ) -> None:
+        """The two ends meet: what the executor writes is what M5 reads.
+
+        A repair row, its build, Rich's merge-ready card, and then a real
+        run of the executor — no seeded report row anywhere — reads 1 of 1.
+        """
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        correlation_id = f"corr-{BUILD_ID}"  # what _ensure_build gives the build
+        pool.connection.execute(
+            "INSERT INTO work_queue (sentence, target_repo, kind, status, rank,"
+            " originating_user, correlation_id, queued_at) VALUES"
+            " (?, ?, 'fix', 'ADMITTED', 1.0, 'rich', ?, '2026-09-05T09:00:00+00:00')",
+            ("The merge of FEAT-MX1 went red.", REPO, correlation_id),
+        )
+        pool.connection.commit()
+        now = _utcnow()
+        pool.record_stage(
+            StageLogEntry(
+                build_id=BUILD_ID,
+                stage_label="the merge-ready checkpoint",
+                target_kind="local_tool",
+                target_identifier=MERGE_READY_TARGET_IDENTIFIER,
+                status="GATED",
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"merge_ready": {"gates": "green"}},
+            )
+        )
+        assert self_closed_defect_rate(pool.connection) == (0, 1)
+
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+
+        assert self_closed_defect_rate(pool.connection) == (1, 1)

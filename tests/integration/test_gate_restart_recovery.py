@@ -44,11 +44,22 @@ from typing import Any
 
 import pytest
 
+from nats_core.envelope import EventType, MessageEnvelope
+
+from forge.adapters.nats.pipeline_consumer import (
+    ReconcileDeps,
+    reconcile_on_boot as consumer_reconcile_on_boot,
+)
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import _serve_deps, _serve_deps_gating, _serve_gate_activation
+from forge.cli._conductor_worktree import WorktreeReady
 from forge.cli._serve_deps import (
     build_pipeline_consumer_deps,
     build_serve_resume_launcher,
+)
+from forge.cli.serve import build_conductor_router
+from forge.lifecycle.recovery import (
+    reconcile_on_boot as lifecycle_reconcile_on_boot,
 )
 from forge.cli._serve_deps_gating import build_approval_gate_parts
 from forge.cli._serve_gate_activation import maybe_gate_build, rearm_paused_gates
@@ -134,6 +145,7 @@ def _make_payload(
     queued_at: datetime = QUEUED_AT,
     mode: Any = None,
     task_id: str | None = None,
+    profile: str | None = None,
 ) -> SimpleNamespace:
     payload = SimpleNamespace(
         feature_id=feature_id,
@@ -157,6 +169,12 @@ def _make_payload(
         payload.mode = mode
     if task_id is not None:
         payload.task_id = task_id
+    # ``profile`` is sniffed off the payload by ``record_pending_build`` and
+    # lands on ``builds.profile`` — the column THE CAP LAW reads before a fix
+    # journey may open. Off the namespace unless asked for, so every
+    # pre-existing scenario's row is byte-identical to what it was.
+    if profile is not None:
+        payload.profile = profile
     return payload
 
 
@@ -282,6 +300,7 @@ async def _seed_paused_via_first_session(
     correlation_id: str = CORRELATION_ID,
     mode: Any = None,
     task_id: str | None = None,
+    profile: str | None = None,
 ) -> str:
     """Run the live gate to a genuine PAUSED row, then kill the frame.
 
@@ -295,6 +314,7 @@ async def _seed_paused_via_first_session(
             correlation_id=correlation_id,
             mode=mode,
             task_id=task_id,
+            profile=profile,
         )
     )
     repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
@@ -919,17 +939,23 @@ class _RearmGuardStarter:
 class TestRearmNeverResumesAFixJourneyRoutine:
     """A mode-c row carded, restarted, then approved must NOT run routine.
 
-    The sweep's approve path holds only the resume launcher — no router
-    is consulted anywhere on it — so before this lane a fix journey that
-    met a daemon restart came back as a ROUTINE autobuild driven against
-    a TASK-xxx subject: the wrong machinery, silently. The launcher is
-    guarded now (``build_serve_resume_launcher``): a mode-c row is
-    refused loudly instead. Journey RE-ENTRY proper stays ledgered.
+    The sweep's approve path has no router of its own — it holds only the
+    resume launcher — so before the guard a fix journey that met a daemon
+    restart came back as a ROUTINE autobuild driven against a TASK-xxx
+    subject: the wrong machinery, silently.
 
-    Both halves are pinned — the refusal AND its mutation guard (a
-    routine build on the very same launcher still launches), because a
-    guard that refused everything would pass the first half and brick the
-    whole rearm path in production.
+    **2026-09-05 (the conductor rewire, rule 5).** The refusal this class
+    used to pin end-to-end is no longer the production answer. The daemon
+    now threads its composed conductor router into
+    ``build_serve_resume_launcher``, so a re-approved fix journey is
+    CONDUCTED — see :class:`TestFixJourneyReEntryDoors` for that half.
+    What survives here is the guard's floor: with NO router (the
+    conductor switched off, the only configuration in which the boot
+    sweep can meet a mode-c row with nothing to hand it to) the row is
+    still refused loudly rather than routine-launched, and a routine
+    build on the very same launcher still launches (the mutation guard —
+    a guard that refused everything would pass the first half and brick
+    the whole rearm path in production).
     """
 
     async def _rearm_and_approve(
@@ -960,7 +986,11 @@ class TestRearmNeverResumesAFixJourneyRoutine:
         return await asyncio.wait_for(tasks[0], timeout=5.0)
 
     def _real_launcher(
-        self, nats: EventLogNats, pool: SqliteLifecyclePersistence
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        *,
+        conductor_router: Any = None,
     ) -> Any:
         _publisher, emitter = build_publisher_and_emitter(nats)
         return build_serve_resume_launcher(
@@ -968,10 +998,11 @@ class TestRearmNeverResumesAFixJourneyRoutine:
             _forge_config(),
             lifecycle_emitter=emitter,
             async_task_starter=_RearmGuardStarter(),
+            conductor_router=conductor_router,
         )
 
     @pytest.mark.asyncio
-    async def test_an_approved_fix_journey_is_refused_not_routine_launched(
+    async def test_a_fix_journey_with_no_conductor_is_refused_not_launched(
         self,
         nats: EventLogNats,
         pool: SqliteLifecyclePersistence,
@@ -1110,3 +1141,534 @@ class TestPostRestartDefaultWaitIsIndefinite:
         assert outcome is GateOutcome.RESUMED
         assert len(launcher.calls) == 1
         assert launcher.calls[0]["build_id"] == build_id
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-05 — the fix journey's three doors back in (conductor rewire rule 5)
+#
+# A fix journey that meets a daemon restart comes back through exactly one of
+# three doors, decided by the state its ``builds`` row was left in:
+#
+#   PAUSED       — it was sitting on Rich's build-gate card. The boot rearm
+#                  sweep re-cards it; his approval reaches the resume
+#                  launcher, which now holds the conductor's router.
+#   INTERRUPTED  — the previous process died while it was driving. The
+#                  redelivered build-queued message lands on reconcile's
+#                  named INTERRUPTED branch, which hands it to dispatch: one
+#                  fresh card, then the router.
+#   RUNNING      — the same thing one step earlier. The boot recovery pass
+#                  (``forge.lifecycle.recovery``) moves the row to
+#                  INTERRUPTED and stops, so the row walks through the
+#                  INTERRUPTED door behind it.
+#
+# Every door must produce the SAME two things and no more: ONE new card for
+# Rich, and ONE working tree — the journey's own, REUSED, never a second one.
+# Retry-from-scratch means the turns start again from turn one; the tree is
+# not thrown away (ADR-ARCH-028, 2026-09-05 amendment).
+# ---------------------------------------------------------------------------
+
+
+REENTRY_TASK_ID = "TASK-REENTRY1"
+
+
+class _RecordingFailurePublisher:
+    """Duck-typed ``PipelineFailurePublisher`` for the boot recovery pass."""
+
+    def __init__(self) -> None:
+        self.published: list[Any] = []
+
+    async def publish_build_failed(self, payload: Any) -> None:
+        self.published.append(payload)
+
+
+class _RecordingApprovalPublisher:
+    """Duck-typed ``ApprovalRepublisher`` for the boot recovery pass."""
+
+    def __init__(self) -> None:
+        self.published: list[Any] = []
+
+    async def publish_request(self, envelope: Any) -> None:
+        self.published.append(envelope)
+
+
+def _conductor_config() -> ForgeConfig:
+    """``_forge_config()`` with the conductor switched ON and a seat named.
+
+    ``conductor.enabled: true`` with no seat refuses at config load, so the
+    seat is named here exactly as the deployed ``forge.yaml`` names one.
+    """
+    return ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+            "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
+        }
+    )
+
+
+class _ReusedWorktreeWriter:
+    """A worktree writer that answers "your own tree, reused" and records.
+
+    The REAL writer's reuse arm — the one that recognises the journey's own
+    path AND branch and answers ``reused=True`` rather than materialising a
+    second tree — is driven against a scratch git checkout in
+    ``tests/forge/test_conductor_worktree.py``. These are RE-ENTRY tests, so
+    the writer is injected: what they pin is that each door asks for the tree
+    exactly once and gets a reused one.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(self, _pool: Any, _config: Any, build_id: str) -> Any:
+        self.calls.append(build_id)
+        return WorktreeReady(
+            path=f"/srv/forge/.forge/worktrees/{build_id}",
+            branch=f"fix/{REENTRY_TASK_ID}-{build_id[-8:]}",
+            reused=True,
+        )
+
+
+class _ReEntryConductor:
+    """The real router over recording collaborators.
+
+    Built with :func:`forge.cli.serve.build_conductor_router` — the same
+    factory the daemon composes — so the cap law, the worktree writer seam
+    and the taken-and-terminal vocabulary are all the production ones. Only
+    the supervisor, the turn-loop spawn and the worktree writer are stood in
+    for (a real turn loop would run a model).
+    """
+
+    def __init__(self, pool: SqliteLifecyclePersistence) -> None:
+        self.worktrees = _ReusedWorktreeWriter()
+        self.spawned: list[Any] = []
+        self.supervisors: list[str] = []
+        self.router = build_conductor_router(
+            pool=pool,
+            config=_conductor_config(),
+            supervisor_factory=self._make_supervisor,
+            spawn=self._spawn,
+            worktree_writer=self.worktrees,
+        )
+        assert self.router is not None, "the conductor composed as None"
+
+    def _make_supervisor(self, build_id: str) -> Any:
+        self.supervisors.append(build_id)
+        return object()
+
+    def _spawn(self, coro: Any) -> Any:
+        self.spawned.append(coro)
+        coro.close()  # the turn loop is not driven here; nothing is left awaiting
+        return None
+
+
+def _queued_envelope_bytes(
+    *,
+    feature_id: str,
+    correlation_id: str,
+    task_id: str = REENTRY_TASK_ID,
+    mode: str = "mode-c",
+) -> bytes:
+    """One real ``build-queued`` envelope for the redelivered message.
+
+    Identity (``feature_id`` + ``queued_at``) is the same the row was seeded
+    with, so ``derive_build_id`` lands on the SAME build_id — which is what
+    makes this a REDELIVERY rather than a new build.
+    """
+    payload = {
+        "feature_id": feature_id,
+        "repo": "guardkit/forge",
+        "branch": "main",
+        "feature_yaml_path": "/srv/forge/features/test/test.yaml",
+        "max_turns": 5,
+        "sdk_timeout_seconds": 1800,
+        "triggered_by": "cli",
+        "originating_adapter": "cli-wrapper",
+        "originating_user": "rich",
+        "correlation_id": correlation_id,
+        "requested_at": QUEUED_AT.isoformat(),
+        "queued_at": QUEUED_AT.isoformat(),
+    }
+    if mode == "mode-c":
+        # ``task_id`` is required on the wire iff the build is mode-c.
+        payload["mode"] = mode
+        payload["task_id"] = task_id
+    envelope = MessageEnvelope(
+        source_id="cli-wrapper",
+        event_type=EventType.BUILD_QUEUED,
+        correlation_id=correlation_id,
+        payload=payload,
+    )
+    return envelope.model_dump_json().encode("utf-8")
+
+
+def _redelivery_msg(data: bytes) -> Any:
+    """A stand-in for ``nats.aio.msg.Msg`` — ``.data`` plus an awaitable ack."""
+
+    class _Msg:
+        def __init__(self) -> None:
+            self.data = data
+            self.acks = 0
+
+        async def ack(self) -> None:
+            self.acks += 1
+
+    return _Msg()
+
+
+def _reconcile_deps(
+    consumer_deps: Any,
+    msg: Any,
+    pool: SqliteLifecyclePersistence,
+    *,
+    resets: list[tuple[str, str]],
+) -> ReconcileDeps:
+    """``ReconcileDeps`` around ONE redelivery and the REAL consumer deps.
+
+    ``read_build_state`` reads the real ``builds`` row, so the branch the
+    reconcile takes is decided by the database and not by a fixture.
+
+    The PAUSED collaborators are the production no-ops: inside ``forge
+    serve`` the rearm sweep owns every PAUSED re-emit and this seam
+    suppresses its own (``_serve_production._build_consumer_reconcile_seam``).
+    ``mark_interrupted_and_reset`` only RECORDS: the INTERRUPTED branch must
+    not call it (a reset to PREPARING would strand the redelivery on
+    dispatch's held-slot arm — no card, no journey).
+    """
+    batches: list[list[Any]] = [[msg]]
+
+    async def _fetch() -> list[Any]:
+        return batches.pop(0) if batches else []
+
+    async def _read_state(feature_id: str, correlation_id: str) -> str | None:
+        row = pool.connection.execute(
+            "SELECT status FROM builds WHERE feature_id = ? "
+            "AND correlation_id = ?",
+            (feature_id, correlation_id),
+        ).fetchone()
+        return None if row is None else row["status"]
+
+    async def _mark(feature_id: str, correlation_id: str) -> None:
+        resets.append((feature_id, correlation_id))
+
+    async def _no_paused() -> list[Any]:
+        return []
+
+    async def _noop_paused(_payload: Any) -> None:
+        return None
+
+    async def _noop_request(_payload: Any, _subject: str) -> None:
+        return None
+
+    return ReconcileDeps(
+        consumer_deps=consumer_deps,
+        fetch_redeliveries=_fetch,
+        read_build_state=_read_state,
+        mark_interrupted_and_reset=_mark,
+        iter_paused_builds=_no_paused,
+        publish_build_paused=_noop_paused,
+        publish_approval_request=_noop_request,
+    )
+
+
+async def _seed_mode_c_row(
+    pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+    target: BuildState,
+) -> str:
+    """Insert a mode-c row and walk it to ``target`` through the state machine."""
+    build_id = pool.record_pending_build(
+        _make_payload(
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            mode=BuildMode.MODE_C,
+            task_id=REENTRY_TASK_ID,
+            # THE CAP LAW reads this column before the journey may open.
+            profile="fix-journey",
+        )
+    )
+    hops = {
+        BuildState.RUNNING: (
+            (BuildState.QUEUED, BuildState.PREPARING),
+            (BuildState.PREPARING, BuildState.RUNNING),
+        ),
+        BuildState.INTERRUPTED: (
+            (BuildState.QUEUED, BuildState.PREPARING),
+            (BuildState.PREPARING, BuildState.RUNNING),
+            (BuildState.RUNNING, BuildState.INTERRUPTED),
+        ),
+    }[target]
+    for frm, to in hops:
+        pool.apply_transition(
+            compose_transition(Build(build_id=build_id, status=frm), to)
+        )
+    assert _row(pool, build_id)[0] == target.value
+    return build_id
+
+
+class TestFixJourneyReEntryDoors:
+    """Each door: exactly ONE new card and ONE reused working tree.
+
+    The routine autobuild launcher is recorded in every scenario and must
+    stay empty — a fix journey that comes back as a routine build against a
+    TASK-xxx subject is the silent downgrade the whole seam exists to stop.
+    """
+
+    def _record_routine_launches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> list[dict[str, Any]]:
+        launched: list[dict[str, Any]] = []
+
+        async def _recording_dispatch(**kwargs: Any) -> Any:
+            launched.append(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            _serve_deps, "dispatch_autobuild_async", _recording_dispatch
+        )
+        return launched
+
+    def _cards(self, nats: EventLogNats, build_id: str) -> list[dict[str, Any]]:
+        """The approval requests published for this build — Rich's cards."""
+        return _payloads(nats, _request_subject(build_id))
+
+    async def _drive_the_redelivery_door(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        *,
+        build_id: str,
+        feature_id: str,
+        correlation_id: str,
+        conductor: _ReEntryConductor,
+        mode: str = "mode-c",
+    ) -> tuple[Any, list[tuple[str, str]]]:
+        """Boot the consumer seam over ONE redelivery of ``build_id``."""
+        parts = _build_parts(nats)
+        _serve_deps_gating.bind_gate_parts(parts)
+        repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        consumer_deps = build_pipeline_consumer_deps(
+            nats,
+            _conductor_config(),
+            pool,
+            async_task_starter=_FakeStarter(),
+            gate_repository=repo,
+            gate_state_machine=sm,
+            gate_clock=FixedClock(),
+            conductor_router=conductor.router,
+        )
+        msg = _redelivery_msg(
+            _queued_envelope_bytes(
+                feature_id=feature_id,
+                correlation_id=correlation_id,
+                mode=mode,
+            )
+        )
+        resets: list[tuple[str, str]] = []
+        deps = _reconcile_deps(consumer_deps, msg, pool, resets=resets)
+
+        task = asyncio.create_task(consumer_reconcile_on_boot(deps))
+        # Rich taps approve on the card the gate just posted.
+        await _drive_response(
+            nats,
+            build_id=build_id,
+            request_id=_request_id(build_id, 0),
+            decision="approve",
+        )
+        report = await asyncio.wait_for(task, timeout=5.0)
+        return report, resets
+
+    # -- door 1: PAUSED — the boot rearm sweep ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_paused_journey_is_re_carded_and_conducted_on_approval(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        launched = self._record_routine_launches(monkeypatch)
+        build_id = await _seed_paused_via_first_session(
+            nats,
+            pool,
+            feature_id="FEAT-DOORP",
+            correlation_id="corr-door-paused",
+            mode=BuildMode.MODE_C,
+            task_id=REENTRY_TASK_ID,
+            profile="fix-journey",
+        )
+        conductor = _ReEntryConductor(pool)
+
+        # SESSION 2 — the sweep re-cards, Rich approves, the launcher routes.
+        nats.reset_wire()
+        parts2 = _build_parts(nats)
+        _serve_deps_gating.bind_gate_parts(parts2)
+        repo2, sm2 = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        _publisher, emitter = build_publisher_and_emitter(nats)
+        launcher = build_serve_resume_launcher(
+            pool,
+            _conductor_config(),
+            lifecycle_emitter=emitter,
+            async_task_starter=_RearmGuardStarter(),
+            conductor_router=conductor.router,
+        )
+        tasks = await rearm_paused_gates(
+            parts=parts2,
+            sqlite_pool=pool,
+            gate_repository=repo2,
+            gate_state_machine=sm2,
+            resume_launcher=launcher,
+            client=nats,
+            clock=FixedClock(),
+        )
+        assert len(tasks) == 1
+        await nats.deliver_response(
+            build_id=build_id,
+            request_id=_request_id(build_id, 0),
+            decision="approve",
+        )
+        outcome = await asyncio.wait_for(tasks[0], timeout=5.0)
+
+        assert outcome is GateOutcome.RESUMED
+        assert len(self._cards(nats, build_id)) == 1, "exactly one new card"
+        assert conductor.worktrees.calls == [build_id], "one working tree"
+        assert len(conductor.spawned) == 1, "one turn loop"
+        assert launched == [], "the journey came back as a ROUTINE autobuild"
+        row = pool.get_build_row(build_id)
+        assert row is not None and row.status is not BuildState.FAILED
+        assert _payloads(nats, "pipeline.build-failed.FEAT-DOORP") == []
+
+    # -- door 2: INTERRUPTED — reconcile's named branch -------------------
+
+    @pytest.mark.asyncio
+    async def test_interrupted_journey_is_re_carded_and_reuses_its_worktree(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        launched = self._record_routine_launches(monkeypatch)
+        feature_id, correlation_id = "FEAT-DOORI", "corr-door-interrupted"
+        build_id = await _seed_mode_c_row(
+            pool,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            target=BuildState.INTERRUPTED,
+        )
+        conductor = _ReEntryConductor(pool)
+
+        report, resets = await self._drive_the_redelivery_door(
+            nats,
+            pool,
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            conductor=conductor,
+        )
+
+        # The NAMED branch ran — not the "unexpected state" fall-through,
+        # which would have counted this as a fresh build.
+        assert report.restarted_interrupted == 1
+        assert report.fresh_builds == 0
+        assert resets == [], (
+            "the INTERRUPTED branch reset the row to PREPARING — dispatch's "
+            "held-slot arm then owns it and no card is ever posted"
+        )
+        assert len(self._cards(nats, build_id)) == 1, "exactly one new card"
+        assert conductor.worktrees.calls == [build_id], "one working tree"
+        assert len(conductor.spawned) == 1, "one turn loop"
+        assert launched == [], "the journey came back as a ROUTINE autobuild"
+        row = pool.get_build_row(build_id)
+        assert row is not None and row.status is not BuildState.FAILED
+
+    # -- door 3: RUNNING — the boot recovery pass, then door 2 -----------
+
+    @pytest.mark.asyncio
+    async def test_running_journey_walks_through_the_interrupted_door(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        launched = self._record_routine_launches(monkeypatch)
+        feature_id, correlation_id = "FEAT-DOORR", "corr-door-running"
+        build_id = await _seed_mode_c_row(
+            pool,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            target=BuildState.RUNNING,
+        )
+
+        # The REAL boot recovery pass — the first thing the daemon runs. A
+        # RUNNING row becomes INTERRUPTED and stops there; nothing is
+        # re-emitted for it, which is why the redelivery below is its only
+        # way back in.
+        recovery_report = await lifecycle_reconcile_on_boot(
+            pool, _RecordingFailurePublisher(), _RecordingApprovalPublisher()
+        )
+        assert recovery_report.interrupted_count == 1
+        assert _row(pool, build_id)[0] == BuildState.INTERRUPTED.value
+
+        conductor = _ReEntryConductor(pool)
+        report, resets = await self._drive_the_redelivery_door(
+            nats,
+            pool,
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            conductor=conductor,
+        )
+
+        assert report.restarted_interrupted == 1
+        assert resets == []
+        assert len(self._cards(nats, build_id)) == 1, "exactly one new card"
+        assert conductor.worktrees.calls == [build_id], "one working tree"
+        assert len(conductor.spawned) == 1, "one turn loop"
+        assert launched == [], "the journey came back as a ROUTINE autobuild"
+
+    # -- the mutation guard: a ROUTINE build is untouched by all of this --
+
+    @pytest.mark.asyncio
+    async def test_a_routine_interrupted_build_is_not_given_to_the_conductor(
+        self,
+        nats: EventLogNats,
+        pool: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The named branch is state-shaped, not mode-shaped.
+
+        An INTERRUPTED mode-a row takes the same branch and the same one
+        card — and then launches the ROUTINE autobuild, because the router
+        declines anything that is not a fix journey.
+        """
+        launched = self._record_routine_launches(monkeypatch)
+        feature_id, correlation_id = "FEAT-DOORA", "corr-door-routine"
+        build_id = pool.record_pending_build(
+            _make_payload(feature_id=feature_id, correlation_id=correlation_id)
+        )
+        for frm, to in (
+            (BuildState.QUEUED, BuildState.PREPARING),
+            (BuildState.PREPARING, BuildState.RUNNING),
+            (BuildState.RUNNING, BuildState.INTERRUPTED),
+        ):
+            pool.apply_transition(
+                compose_transition(Build(build_id=build_id, status=frm), to)
+            )
+        conductor = _ReEntryConductor(pool)
+
+        report, _resets = await self._drive_the_redelivery_door(
+            nats,
+            pool,
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            conductor=conductor,
+            mode="mode-a",
+        )
+
+        assert report.restarted_interrupted == 1
+        assert len(self._cards(nats, build_id)) == 1
+        assert conductor.worktrees.calls == [], "a routine build got a journey tree"
+        assert conductor.spawned == [], "a routine build got a turn loop"
+        assert len(launched) == 1 and launched[0]["build_id"] == build_id

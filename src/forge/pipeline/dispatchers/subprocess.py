@@ -695,7 +695,8 @@ def _build_argv_for_stage(
     ``guardkit task-work`` declares the flag, so a dispatch carrying it
     would have died on an unknown argument. The parent feature is resolved
     by the queue *out of the fix-task YAML*, by design
-    (``_load_parent_feature_from_fix_task_yaml`` in ``cli/queue.py``) — so
+    (``forge.pipeline.fix_admission.read_parent_feature``, the one reader
+    both the CLI and the work queue go through) — so
     handing the subprocess ``--feature-yaml`` hands it the parent feature
     too, through the one artefact that owns it. One identifier, one source.
 

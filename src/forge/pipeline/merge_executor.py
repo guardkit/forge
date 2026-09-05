@@ -58,6 +58,7 @@ __all__ = [
     "MergeApprovalConsumer",
     "MergeDeployOutcome",
     "MergeExecutorDeps",
+    "RED_MERGE_ENDINGS",
     "build_in_daemon_deploy_dispatcher",
     "execute_merge_deploy",
 ]
@@ -170,7 +171,15 @@ def _parse_merge_report(result: Any) -> dict[str, Any] | None:
 
 
 _FAILURE_STATUS_WORDS = frozenset(
-    {"refused", "refusal", "conflict", "failed", "error", "verify-failed", "verify_failed"}
+    {
+        "refused",
+        "refusal",
+        "conflict",
+        "failed",
+        "error",
+        "verify-failed",
+        "verify_failed",
+    }
 )
 
 
@@ -197,6 +206,44 @@ def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
         return None
     value = report.get(key)
     return value if isinstance(value, int) else None
+
+
+#: The endings where the merge LANDED and what followed it went red. These
+#: are the ones worth a repair job: the branch is on main and the estate is
+#: not healthy. ``merge-refused`` is deliberately absent — a refused merge
+#: changed nothing.
+RED_MERGE_ENDINGS: frozenset[str] = frozenset(
+    {"merged-verify-failed", "merged-deploy-reverted", "merged-deploy-failed"}
+)
+
+
+def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") -> None:
+    """File one repair row for a merge whose checks went red. Never raises.
+
+    The producer already swallows everything; this call site catches too,
+    because the merge report is the only durable record of what the merge
+    did and a queue row must never be able to cost it.
+    """
+    try:
+        from forge.pipeline.fix_row_producer import (
+            SOURCE_MERGE_REPORT,
+            maybe_mint_fix_row,
+        )
+
+        maybe_mint_fix_row(
+            pool=pool,
+            build_id=build_id,
+            source=SOURCE_MERGE_REPORT,
+            detail=f"{outcome.result} — {outcome.detail}",
+        )
+    except Exception as exc:  # noqa: BLE001 — a queue row never costs a report
+        logger.warning(
+            "merge-executor: filing a repair row for %s raised (%s: %s); "
+            "the merge report stands",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _report_sha(report: dict[str, Any] | None) -> str | None:
@@ -280,6 +327,44 @@ async def execute_merge_deploy(
             )
         )
 
+    def _record_report(payload: StageCompletePayload, completed: datetime) -> None:
+        """Put the merge report on the build's own record, not only on the bus.
+
+        The published report is a message and the receipt is a file, and
+        neither can be read back by a query. So the same report is also
+        appended to ``stage_log``, with its outcome word at the top level of
+        the details as ``result`` — that is what the self-closed defect rate
+        reads to tell a repair that merged, deployed and stayed green from
+        one that stopped at a red step (``lifecycle/metrics.py``).
+
+        A dry run never gets here: it leaves no durable rows on purpose.
+        Never raises — the bus report and the receipt on disk are the record,
+        and a row that cannot be written must not cost them.
+        """
+        try:
+            deps.pool.record_stage(
+                StageLogEntry(
+                    build_id=build_id,
+                    stage_label=MERGE_REPORT_STAGE_LABEL,
+                    target_kind="local_tool",
+                    target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                    status=payload.status,
+                    gate_mode=None,
+                    started_at=completed,
+                    completed_at=completed,
+                    duration_secs=float(payload.duration_secs or 0.0),
+                    details=payload.model_dump(mode="json"),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — a row never costs a report
+            logger.error(
+                "merge-executor: could not record the merge report for %s "
+                "(%s: %s) — the published report and the receipt stand",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         completed = deps.clock()
         conformance_warning = digest_conformance.get("warning")
@@ -314,9 +399,7 @@ async def execute_merge_deploy(
                 "no stage-complete published for %s",
                 build_id,
             )
-            _write_receipt(
-                "merge_deploy_report.json", payload.model_dump(mode="json")
-            )
+            _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
             return outcome
         try:
             await deps.pipeline_publisher.publish_stage_complete(payload)
@@ -328,6 +411,15 @@ async def execute_merge_deploy(
                 exc,
             )
         _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
+        _record_report(payload, completed)
+        # A MERGE THAT DID NOT STAY GREEN BECOMES A REPAIR JOB (conductor
+        # rewire rule 1). The three red endings below are the ones where the
+        # merge itself landed and what came after it went red — the live
+        # checks, the deploy, or the revert. A refused merge is not one of
+        # them: nothing changed, so there is nothing to repair. The dry run
+        # is not one either: it changed nothing on purpose.
+        if not dry_run and outcome.result in RED_MERGE_ENDINGS:
+            _mint_repair_row(deps.pool, build_id, outcome)
         return outcome
 
     # ------------------------------------------------------------------
@@ -398,9 +490,7 @@ async def execute_merge_deploy(
             try:
                 baseline_path.parent.mkdir(parents=True, exist_ok=True)
                 baseline_path.write_text(
-                    json.dumps(
-                        {"failing": baseline_failing}, indent=2, sort_keys=True
-                    ),
+                    json.dumps({"failing": baseline_failing}, indent=2, sort_keys=True),
                     encoding="utf-8",
                 )
                 args += ["--baseline-json", str(baseline_path)]
@@ -432,13 +522,8 @@ async def execute_merge_deploy(
         if result_status != "success" and not merged_in_report:
             stderr = (getattr(result, "stderr", None) or "").strip()
             tail = (getattr(result, "stdout_tail", "") or "").strip()
-            refusal = (
-                f"the merge command did not succeed (status={result_status})"
-                + (
-                    f": {stderr[-400:]}"
-                    if stderr
-                    else (f": {tail[-400:]}" if tail else "")
-                )
+            refusal = f"the merge command did not succeed (status={result_status})" + (
+                f": {stderr[-400:]}" if stderr else (f": {tail[-400:]}" if tail else "")
             )
         elif report is not None and not merged_in_report:
             refusal = _report_refusal(report)
@@ -510,11 +595,7 @@ async def execute_merge_deploy(
                             or report.get("verify_status")
                             or "verification failed"
                         )
-                        + (
-                            f" — {len(charged)} charged failure(s)"
-                            if charged
-                            else ""
-                        )
+                        + (f" — {len(charged)} charged failure(s)" if charged else "")
                         + ". The deploy was not dispatched."
                     ),
                     checks_passed=checks_passed,
@@ -655,7 +736,7 @@ async def execute_merge_deploy(
             verdict=str(verdict) if verdict is not None else None,
             detail=(
                 (
-                    f"dry run — nothing merged; the deploy ended "
+                    "dry run — nothing merged; the deploy ended "
                     if dry_run
                     else f"{feature_id} merged, but the deploy ended "
                 )
@@ -768,9 +849,12 @@ def _deploy_task_id(feature_id: str) -> str:
     """
     from datetime import datetime, timezone
 
-    suffix = "".join(
-        ch for ch in feature_id.upper().removeprefix("FEAT-") if ch.isalnum()
-    )[:6] or "MERGE"
+    suffix = (
+        "".join(ch for ch in feature_id.upper().removeprefix("FEAT-") if ch.isalnum())[
+            :6
+        ]
+        or "MERGE"
+    )
     stamp = datetime.now(timezone.utc).strftime("%H%M%S")
     return f"TASK-{(suffix + stamp)[:12]}"
 
@@ -819,9 +903,8 @@ class MergeApprovalConsumer:
             )
             return
         request_id = payload.request_id
-        if (
-            not request_id.startswith(REQUEST_ID_PREFIX)
-            or len(request_id) <= len(REQUEST_ID_PREFIX)
+        if not request_id.startswith(REQUEST_ID_PREFIX) or len(request_id) <= len(
+            REQUEST_ID_PREFIX
         ):
             # Expected traffic, not a refusal: the wildcard subscription sees
             # EVERY forge approval response (gate taps included) — skip the
@@ -836,16 +919,13 @@ class MergeApprovalConsumer:
             stages = self._deps.pool.read_stages(build_id)
         except Exception as exc:  # noqa: BLE001 — trust boundary
             logger.warning(
-                "merge-executor: refusing %s — could not read its stage log "
-                "(%s)",
+                "merge-executor: refusing %s — could not read its stage log (%s)",
                 request_id,
                 exc,
             )
             return
         offers = [
-            s
-            for s in stages
-            if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+            s for s in stages if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
         ]
         if not offers:
             logger.warning(
@@ -881,10 +961,7 @@ class MergeApprovalConsumer:
                 envelope.correlation_id,
             )
             return
-        if any(
-            s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
-            for s in stages
-        ):
+        if any(s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER for s in stages):
             logger.warning(
                 "merge-executor: refusing %s — a decision is already on "
                 "record (restart can never double-run)",

@@ -1237,6 +1237,68 @@ async def compose_planning_consumer_and_dispatch(
                 target_repo=admission.target_repo,
             )
 
+        # -- the fix branch (conductor rewire rules 2 and 4) ---------------
+        # A repair row does NOT start a planning run: it opens a fix journey
+        # — a mode-c build — through the same admission the CLI's
+        # ``forge queue --mode c`` goes through, in process and never as a
+        # shell-out. It is shut by default: ``conductor.admit_fix_rows`` is
+        # False, so repair rows sit in the queue where they can be read and
+        # the "next I'd pick" line can name them, and nothing starts.
+        from forge.config.models import FIX_JOURNEY_PROFILE_NAME
+        from forge.lifecycle.persistence import SqliteLifecyclePersistence
+        from forge.pipeline.fix_admission import (
+            admit_fix_row,
+            republish_build_queued,
+        )
+
+        lifecycle_pool = SqliteLifecyclePersistence(
+            connection=pool, db_path=db_path
+        )
+
+        def _fix_build(correlation_id: str) -> Any:
+            """The BUILD a repair row started, read the way a run is read."""
+            try:
+                return pool.execute(
+                    "SELECT * FROM builds WHERE correlation_id = ? "
+                    "ORDER BY queued_at DESC LIMIT 1",
+                    (correlation_id,),
+                ).fetchone()
+            except Exception as exc:  # noqa: BLE001 — a read never stops the loop
+                logger.warning(
+                    "work queue: could not read the build for %s (%s)",
+                    correlation_id,
+                    exc,
+                )
+                return None
+
+        async def _publish_build_queued(subject: str, body: bytes) -> None:
+            await nats_client.publish(subject, body)
+
+        async def _start_fix_journey(admission: Admission) -> None:
+            await admit_fix_row(
+                config=config,
+                persistence=lifecycle_pool,
+                store=queue_store,
+                queue_id=admission.queue_id,
+                correlation_id=admission.correlation_id,
+                sentence=admission.request_text,
+                target_repo=admission.target_repo,
+                originating_user=admission.originating_user,
+                publish=_publish_build_queued,
+                profile=FIX_JOURNEY_PROFILE_NAME,
+                clock=clock_fn,
+            )
+
+        async def _republish_fix_build(build: Any) -> None:
+            """Say a written-but-never-announced build's queued event again.
+
+            The write comes before the publish, so a publish that failed
+            leaves a build row the pipeline was never told about. The event is
+            rebuilt from that row, so it is the same event on the same
+            subject under the same correlation id.
+            """
+            await republish_build_queued(build, publish=_publish_build_queued)
+
         queue_loop = WorkQueueLoop(
             queue_store,
             count_in_flight=lambda: count_in_flight(pool),
@@ -1247,14 +1309,24 @@ async def compose_planning_consumer_and_dispatch(
             max_in_flight=config.queue.max_in_flight,
             stale_after_days=config.queue.stale_after_days,
             clock=clock_fn,
+            start_fix=_start_fix_journey,
+            fix_build=_fix_build,
+            republish_build=_republish_fix_build,
+            admit_fix_rows=config.conductor.admit_fix_rows,
         )
         queue_loop_task = asyncio.create_task(queue_loop.run())
         _supervise(queue_loop_task, "work-queue-take-next")
         logger.info(
             "planning composition: the work queue is live — one sentence at a "
-            "time up to %d in flight, order %s",
+            "time up to %d in flight, order %s; repairs are %s",
             config.queue.max_in_flight,
             config.queue.order,
+            (
+                "STARTED by the queue"
+                if config.conductor.admit_fix_rows
+                else "filed and left in the queue (conductor.admit_fix_rows "
+                "is off)"
+            ),
         )
 
         subscription = None

@@ -435,3 +435,46 @@ class TestMessagesSpeakPlainNames:
 
         # Any "mode <letter>" NOT preceded by the literal flag "--".
         assert re.search(r"(?<!--)\bmode[ -][abc]\b", message.lower()) is None
+
+
+# ---------------------------------------------------------------------------
+# Whether the queue may START a repair (conductor rewire spec rule 4)
+# ---------------------------------------------------------------------------
+
+
+class TestAdmitFixRows:
+    """Shadow by default: repairs are filed, listed, and not started.
+
+    The whole posture of the rewire's first stage is in this one default.
+    A failed build files a repair row whatever this says; this decides only
+    whether the queue may open the fix journey by itself, and it takes the
+    owner's word and an attended restart to change.
+    """
+
+    def test_it_is_off_by_default(self) -> None:
+        assert ConductorConfig().admit_fix_rows is False
+
+    def test_a_config_written_before_this_lane_still_loads(self, tmp_path) -> None:
+        path = tmp_path / "forge.yaml"
+        path.write_text(_MINIMAL + _ON)
+
+        loaded = load_config(path)
+
+        assert loaded.conductor.admit_fix_rows is False
+
+    def test_the_owner_can_turn_it_on_in_the_yaml(self, tmp_path) -> None:
+        path = tmp_path / "forge.yaml"
+        path.write_text(_MINIMAL + _ON + "  admit_fix_rows: true\n")
+
+        loaded = load_config(path)
+
+        assert loaded.conductor.admit_fix_rows is True
+
+    def test_a_typo_fails_loudly_rather_than_reading_as_off(self) -> None:
+        with pytest.raises(Exception):
+            _config(_MINIMAL + _ON + "  admit_fix_row: true\n")
+
+    def test_it_does_not_switch_the_conductor_itself_on(self) -> None:
+        """Two switches, two decisions: one activates the journey, one lets
+        the queue start it. Turning the second on alone starts nothing."""
+        assert ConductorConfig(admit_fix_rows=True).enabled is False
