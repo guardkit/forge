@@ -2112,3 +2112,215 @@ async def test_no_card_or_ping_ever_shows_a_raw_chat_id(
     assert "you sent a note" in told
     assert "you said yes to the spec" in told
     assert "You have a card listing" in told
+
+
+# ---------------------------------------------------------------------------
+# What the card promises about silence is what silence actually does
+# ---------------------------------------------------------------------------
+#
+# This door is an INLINE wait, not a paused checkpoint: ``_open_inline_door``
+# runs its own window off ``PlanningConfig.originator_wait_seconds`` and, when
+# that window closes with no answer, ends the run. The two-phase "wait, then
+# remind the same person, then wait again" in ``planning/escalation.py`` runs
+# only for a row that is durably PAUSED (every transition there is a
+# compare-and-swap from PAUSED), and this door deliberately never enters that
+# state. ``escalated_wait_seconds`` therefore has NO effect on any card in this
+# file, and a sentence promising a reminder here would promise something the
+# machine never sends.
+#
+# These two tests are the guard on that: they hold the words next to the
+# behaviour. If the door is ever changed to remind and wait again, they fail —
+# and the words must change in the same act.
+
+
+@pytest.mark.asyncio
+async def test_the_wait_the_card_promises_is_the_wait_the_door_really_keeps(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """One wait, on the person who asked, and then the run stops.
+
+    The run is driven with a one-second window and nobody answers, so the
+    SAME run proves both halves: what the card said would happen, and what
+    happened.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=1,
+    )
+
+    await h.driver.drive(CID)
+
+    # What happened: one window, then the end. No second round, no re-target.
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert [status for status, _d in _events(store, _DIGEST_STAGE)] == [
+        "GATED",
+        "timed_out",
+    ]
+    assert len(_digest_cards(h)) == 1
+
+    # What the card said would happen, in the same words.
+    card = _digest_cards(h)[0]
+    said = card.payload["details"]["summary"]["no_answer_means"]
+    assert "1 second" in said
+    assert "the run stops" in said
+
+    # And the Slack line that opened the door said the same one wait.
+    ping = next(
+        m for _c, m, _l in h.ctx["notifications"] if "You have a card listing" in m
+    )
+    assert "1 second" in ping
+    assert "stops the run" in ping
+
+    # Neither surface promises a reminder or a second window: this door sends
+    # no reminder, and the escalated wait (4 hours by default) never applies.
+    for words in (_card_text(card).lower(), ping.lower()):
+        assert "remind" not in words
+        assert "4 hours" not in words
+
+
+def test_the_sign_in_cards_own_words_about_silence_match_the_same_one_wait(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The second door's card and ping, built straight from the driver.
+
+    This door opens only when the digest door did not carry the question, and
+    it is the same inline wait — so it makes the same promise about silence
+    and no other.
+    """
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([]))
+
+    card = h.driver._auth_confirmation_card(
+        seed={"feature_slug": SLUG},
+        basis_lines=["the spec mentions a bearer token when explaining it needs none"],
+        wait_seconds=3600,
+    )
+    ping = h.driver._auth_door_open_message(CID, wait_seconds=3600)
+
+    assert "1 hour" in card["no_answer_means"]
+    assert "the run stops" in card["no_answer_means"]
+    assert "1 hour" in ping
+    assert "stops the run" in ping
+
+    for words in (json.dumps(card).lower(), ping.lower()):
+        assert "remind" not in words
+        assert "4 hours" not in words
+
+
+@pytest.mark.parametrize(
+    ("wait_seconds", "in_words"),
+    [(3600, "1 hour"), (600, "10 minutes")],
+)
+def test_all_four_silence_sentences_name_the_one_wait_the_config_sets(
+    store: SqlitePlanningRunStore, wait_seconds: int, in_words: str
+) -> None:
+    """The wait is READ, not written into the words.
+
+    Four surfaces say what silence does — the spec card and the line that
+    opens it, the sign-in card and the line that opens it. All four are built
+    straight from the driver here at two different settings, so a number typed
+    into a sentence instead of read from the setting fails this.
+
+    The live setting is an hour; ten minutes is the same sentence with a
+    different setting behind it. Neither ever mentions the four-hour escalated
+    window, because no card this door sends is affected by it.
+    """
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=wait_seconds,
+    )
+
+    spec_card = h.driver._digest_review_card(
+        CID,
+        digest_obj={
+            "scenarios": [{"sentence": "the list comes back in order", "tags": []}],
+            "assumptions": [],
+        },
+        feature_text="Feature: anything\n",
+    )
+    spec_ping = h.driver._digest_door_open_message(CID, wait_seconds=wait_seconds)
+    auth_card = h.driver._auth_confirmation_card(
+        seed={"feature_slug": SLUG},
+        basis_lines=["the spec mentions a token while explaining it needs none"],
+        wait_seconds=wait_seconds,
+    )
+    auth_ping = h.driver._auth_door_open_message(CID, wait_seconds=wait_seconds)
+
+    said = [
+        spec_card["no_answer_means"],
+        spec_ping,
+        auth_card["no_answer_means"],
+        auth_ping,
+    ]
+    for sentence in said:
+        assert "No answer within " + in_words in sentence
+        # The whole promise, in one window: silence ends the run.
+        assert "stops" in sentence
+
+    # Nothing anywhere on either card, or in either line, offers a reminder or
+    # a second window. The escalated wait is four hours and is never reached.
+    for words in (
+        json.dumps(spec_card).lower(),
+        spec_ping.lower(),
+        json.dumps(auth_card).lower(),
+        auth_ping.lower(),
+    ):
+        assert "remind" not in words
+        assert "4 hours" not in words
+        assert "try again" not in words
+
+
+def test_no_sentence_in_the_driver_promises_a_reminder_nobody_sends() -> None:
+    """A FIFTH surface cannot quietly make the promise the first four don't.
+
+    The tests above build the four sentences that exist today. This one reads
+    the driver's own source — the code, not its explanations — and holds every
+    "…answer within…" sentence in it to the same two rules: the wait is
+    rendered from the run's own window through ``_plain_wait``, and the
+    sentence does not offer a reminder. A card added later is caught here even
+    if nobody thinks to test its words.
+    """
+    import ast
+
+    from forge.planning import driver as driver_module
+
+    source = Path(driver_module.__file__).read_text(encoding="utf-8")
+    lines = source.splitlines()
+
+    # The explanations are not the promise: skip every docstring, so a
+    # paragraph that DESCRIBES the rule is not read as breaking it.
+    prose: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(
+            node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        ):
+            continue
+        body = getattr(node, "body", None) or []
+        first = body[0] if body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            prose.update(range(first.lineno - 1, (first.end_lineno or first.lineno)))
+
+    sites = [
+        i
+        for i, line in enumerate(lines)
+        if "answer within" in line and i not in prose and not line.lstrip().startswith("#")
+    ]
+    # The four that exist today: the spec card and its line, the sign-in card
+    # and its line. A floor, not a cap — a fifth is checked, not banned.
+    assert len(sites) >= 4
+
+    for index in sites:
+        sentence = " ".join(lines[index : index + 3])
+        assert "_plain_wait(wait_seconds)" in sentence, (
+            f"line {index + 1} writes a wait into the words instead of reading "
+            "it from the run's own window"
+        )
+        assert "remind" not in sentence.lower(), (
+            f"line {index + 1} promises a reminder; this door sends none"
+        )

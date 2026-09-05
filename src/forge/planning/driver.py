@@ -4162,6 +4162,20 @@ class PlanningRunDriver:
         deliberately additive-only), so the door waits INLINE instead of
         stranding a half-paused row.
 
+        WHAT THAT MEANS FOR THE WORDS ON THESE CARDS, said here because it has
+        already been got wrong once (2026-09-05): there is no reminder and no
+        second window. ``planning/escalation.py`` — wait, remind the same
+        person, wait again — refuses anything that is not durably PAUSED
+        (``evaluate_escalation_phase`` returns CONTINUE_WAITING, and every
+        transition below it is a compare-and-swap from PAUSED), so
+        ``PlanningConfig.escalated_wait_seconds`` has NO effect on any card
+        this door sends. One window off ``originator_wait_seconds``, then the
+        leg ends and the owner is told it stopped. Every "No answer within…"
+        sentence on these cards must say exactly that and no more; if the door
+        ever gains a reminder, the words change in the same act.
+        ``tests/forge/planning/test_driver_spec_digest_door.py`` holds them
+        together.
+
         SURVIVING A RESTART (the mechanic that makes the inline wait safe): the
         boot sweep enumerates FEATURE_SPEC / FEATURE_PLAN alongside QUEUED /
         RUNNING (``cli/_serve_planning.sweep_interrupted_planning_runs``), so a
