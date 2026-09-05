@@ -782,6 +782,16 @@ RESTART_FROM_PREPARING_STATES: frozenset[str] = IN_FLIGHT_BUILD_STATES | frozens
 #: SQLite reader returns.
 PAUSED_BUILD_STATE: str = "PAUSED"
 
+#: Single literal value: the persisted state for a build the previous
+#: process was driving when it died and that was never reset to
+#: ``PREPARING`` (the reset is the second of two writes, so a crash can
+#: land between them). It had no branch of its own until the conductor
+#: rewire: an INTERRUPTED fix journey fell through to the defensive
+#: "unexpected state" warning below and was re-dispatched anyway, which
+#: was the right ACT reached by the wrong ROUTE. It is a named branch
+#: now — see :func:`_reconcile_one_redelivery`.
+INTERRUPTED_BUILD_STATE: str = "INTERRUPTED"
+
 
 @dataclass(frozen=True, slots=True)
 class PausedBuildSnapshot:
@@ -898,10 +908,14 @@ class ReconcileReport:
             scan re-emitted that the redelivery loop did NOT already
             cover (so total paused re-emissions == ``re_emitted_paused +
             paused_scan_re_emitted``).
+        restarted_interrupted: Redelivered messages whose SQLite row was
+            already ``INTERRUPTED`` (a crash between the two recovery
+            writes) and was restarted from scratch.
     """
 
     acked_terminal: int = 0
     restarted_in_flight: int = 0
+    restarted_interrupted: int = 0
     re_emitted_paused: int = 0
     fresh_builds: int = 0
     malformed: int = 0
@@ -931,7 +945,14 @@ async def reconcile_on_boot(deps: ReconcileDeps) -> ReconcileReport:
        :class:`ApprovalRequestPayload` with the ORIGINAL ``correlation_id``
        (first-response-wins per ADR-ARCH-021), leave the message unacked
        so the queue position is preserved.
-    4. *unknown* (no SQLite row matches)
+    4. *interrupted* (``INTERRUPTED``)
+       → retry from scratch: hand the message to the standard dispatch
+       path, which re-enters the row through the pre-dispatch approval
+       gate (no reset to ``PREPARING`` first — that would strand the
+       redelivery on dispatch's held-slot arm). A fix journey taking this
+       route is re-carded and reuses the working tree it already has
+       (ADR-ARCH-028).
+    5. *unknown* (no SQLite row matches)
        → fresh build; hand to :func:`handle_message` for the normal
        validation + dispatch path.
 
@@ -989,9 +1010,11 @@ async def reconcile_on_boot(deps: ReconcileDeps) -> ReconcileReport:
 
     logger.info(
         "reconcile_on_boot: complete acked_terminal=%d restarted=%d "
-        "re_emitted_paused=%d fresh=%d malformed=%d paused_scan=%d",
+        "restarted_interrupted=%d re_emitted_paused=%d fresh=%d "
+        "malformed=%d paused_scan=%d",
         report.acked_terminal,
         report.restarted_in_flight,
+        report.restarted_interrupted,
         report.re_emitted_paused,
         report.fresh_builds,
         report.malformed,
@@ -1120,6 +1143,45 @@ async def _reconcile_one_redelivery(
         report.restarted_in_flight += 1
         return
 
+    # --- Branch 4: INTERRUPTED → retry from scratch, working tree reused -
+    # Named, not fallen into. This is the state a build is left in by the
+    # boot recovery pass (``forge.lifecycle.recovery``, which moves every
+    # RUNNING / PREPARING / FINALISING row to INTERRUPTED and stops there)
+    # and by a crash between the two writes of
+    # ``mark_interrupted_and_reset``. Before this branch such a redelivery
+    # reached the "unexpected state" warning below and was dispatched as a
+    # fresh build — the right ACT by the wrong ROUTE, with a WARNING in the
+    # log saying the module did not recognise its own state.
+    #
+    # The row is deliberately NOT reset to PREPARING first. ``dispatch_build``
+    # owns the advance: its runless re-dispatch arm re-enters a QUEUED or
+    # INTERRUPTED row through the pre-dispatch approval gate, which drives
+    # INTERRUPTED → PREPARING → RUNNING itself. A row moved to PREPARING here
+    # would land on that arm's held-slot branch instead — no card, no launch,
+    # and the slot held until the JetStream ack_wait expiry.
+    #
+    # What the dispatch then does for a FIX JOURNEY (conductor rewire rule
+    # 5) is the reason for naming the branch: the gate publishes ONE fresh
+    # build-gate card for Rich, and on his approval the conductor's worktree
+    # writer finds the journey's OWN tree already registered on its own
+    # branch and REUSES it (``reused=True``) rather than materialising a
+    # second one. Retry-from-scratch here means the turns start again from
+    # turn one, not that the tree is thrown away — a state-preserving resume
+    # would need a turn cursor the driver does not have and is not built
+    # (ADR-ARCH-028, 2026-09-05 amendment).
+    if state == INTERRUPTED_BUILD_STATE:
+        logger.info(
+            "reconcile_on_boot: build feature_id=%s correlation_id=%s was "
+            "left INTERRUPTED by the previous process; starting it again "
+            "from the beginning and reusing the working tree it already has",
+            feature_id,
+            correlation_id,
+        )
+        ack_callback = _build_ack_callback(msg)
+        await deps.consumer_deps.dispatch_build(payload, ack_callback)
+        report.restarted_interrupted += 1
+        return
+
     # Defensive: unexpected state. This should never fire — the SQLite
     # column is constrained to the values above — but if a future
     # migration adds a state without updating this module, we don't
@@ -1144,6 +1206,7 @@ __all__ = [
     "BuildAckHandle",
     "DURABLE_NAME",
     "FORGE_SOURCE_ID",
+    "INTERRUPTED_BUILD_STATE",
     "IN_FLIGHT_BUILD_STATES",
     "InFlightAckRegistry",
     "PAUSED_BUILD_STATE",

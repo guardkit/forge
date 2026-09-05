@@ -11,6 +11,7 @@ external library exercised here is ``nats-py``'s ``ConsumerConfig`` dataclass
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from forge.adapters.nats.pipeline_consumer import (
     ACK_WAIT_SECONDS,
     BUILD_QUEUE_SUBJECT,
     DURABLE_NAME,
+    INTERRUPTED_BUILD_STATE,
     IN_FLIGHT_BUILD_STATES,
     PAUSED_BUILD_STATE,
     REASON_MALFORMED_PAYLOAD,
@@ -752,6 +754,7 @@ class TestReconcileLifecycle:
         assert report.fresh_builds == 0
         assert report.malformed == 0
         assert report.paused_scan_re_emitted == 0
+        assert report.restarted_interrupted == 0
 
     @pytest.mark.asyncio
     async def test_drains_until_fetch_returns_empty(
@@ -1110,6 +1113,116 @@ class TestReconcileAllBranches:
         assert report.re_emitted_paused == 1
         assert report.fresh_builds == 1
         assert report.paused_scan_re_emitted == 0  # already covered via redelivery
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-05 (conductor rewire rule 5): INTERRUPTED is a NAMED branch
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileInterruptedBranch:
+    """An INTERRUPTED row is restarted deliberately, not fallen into.
+
+    Before this branch an INTERRUPTED redelivery matched nothing — not the
+    terminal set, not PAUSED, not the in-flight set — and reached the
+    "unexpected state" fall-through, which logged a WARNING and re-ran the
+    message through ``handle_message`` as if it were a brand-new build. The
+    ACT was roughly right and the ROUTE said the module did not recognise
+    its own state.
+
+    Two properties are pinned, and the second is the load-bearing one:
+
+    1. the row is handed to ``dispatch_build`` and counted as a restart,
+       with no warning and no "fresh build";
+    2. the row is NOT reset to ``PREPARING`` first. ``dispatch_build``'s
+       runless re-dispatch arm only re-enters a QUEUED or INTERRUPTED row;
+       a row moved to PREPARING lands on its held-slot arm instead — no
+       card, no launch, and the queue slot held until the JetStream
+       ack_wait expiry.
+    """
+
+    @pytest.mark.asyncio
+    async def test_interrupted_redelivery_is_restarted_not_treated_as_fresh(
+        self,
+        reconcile_factory,
+        allowlist_root: Path,
+    ) -> None:
+        yaml_path = allowlist_root / "feature.yaml"
+        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
+        deps, mocks = reconcile_factory(
+            state_by_key={("FEAT-A1B2", "corr-001"): INTERRUPTED_BUILD_STATE},
+            redelivery_batches=[[msg]],
+        )
+
+        report = await reconcile_on_boot(deps)
+
+        mocks["dispatch_build"].assert_awaited_once()
+        assert report.restarted_interrupted == 1
+        assert report.fresh_builds == 0
+        assert report.restarted_in_flight == 0
+        # Not acked here: the dispatched build owns its own terminal ack.
+        msg.ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_interrupted_row_is_not_reset_to_preparing_first(
+        self,
+        reconcile_factory,
+        allowlist_root: Path,
+    ) -> None:
+        yaml_path = allowlist_root / "feature.yaml"
+        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
+        deps, mocks = reconcile_factory(
+            state_by_key={("FEAT-A1B2", "corr-001"): INTERRUPTED_BUILD_STATE},
+            redelivery_batches=[[msg]],
+        )
+
+        await reconcile_on_boot(deps)
+
+        mocks["mark_interrupted_and_reset"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_unexpected_state_warning_no_longer_fires(
+        self,
+        reconcile_factory,
+        allowlist_root: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        yaml_path = allowlist_root / "feature.yaml"
+        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
+        deps, _mocks = reconcile_factory(
+            state_by_key={("FEAT-A1B2", "corr-001"): INTERRUPTED_BUILD_STATE},
+            redelivery_batches=[[msg]],
+        )
+
+        with caplog.at_level(logging.INFO):
+            await reconcile_on_boot(deps)
+
+        assert "unexpected state" not in caplog.text
+        # And it says plainly what it did instead.
+        assert "left INTERRUPTED by the previous process" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unknown_state_still_warns_and_falls_back(
+        self,
+        reconcile_factory,
+        allowlist_root: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The defensive arm survives: only INTERRUPTED was taken out of it."""
+        yaml_path = allowlist_root / "feature.yaml"
+        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
+        deps, mocks = reconcile_factory(
+            state_by_key={("FEAT-A1B2", "corr-001"): "SOME-FUTURE-STATE"},
+            redelivery_batches=[[msg]],
+        )
+
+        with caplog.at_level(logging.WARNING):
+            report = await reconcile_on_boot(deps)
+
+        assert "unexpected state" in caplog.text
+        assert report.fresh_builds == 1
+        assert report.restarted_interrupted == 0
+        mocks["dispatch_build"].assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
