@@ -1704,3 +1704,283 @@ async def test_the_absorption_is_written_once_and_never_spins(
         len([s for s, _d in _events(store, "product_docs") if s == "checkpoint_cleared"])
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# Was the note actually honoured? (2026-09-05)
+# ---------------------------------------------------------------------------
+#
+# Rich sent "drop example 3, seven exactly is the rule" on a spec digest card.
+# The spec-writer came back with the same six examples (one reworded, still
+# there), its coach scored the rewrite 1.0 because its criteria never ask
+# whether the feedback was resolved, and the second card was identical to the
+# first line for line — with no word that nothing had changed. One of the three
+# touches a person has silently did nothing. These tests pin the card and the
+# ping saying which it was.
+
+#: The first card's ``what_happened``, byte for byte. Written out here rather
+#: than imported so a change to the words a person reads has to be a deliberate
+#: two-sided act.
+_ROUND_ONE_TEXT = (
+    "The spec-writer has written the worked examples this build will be "
+    "checked against. Below is one sentence per example, in the order they "
+    "appear. This list is checked by ordinary code against the examples "
+    "themselves — every example is here, none has been left out."
+)
+
+_THE_NOTE = "drop example 3, seven exactly is the rule"
+
+_FEATURE_THREE = (
+    "Feature: version endpoint\n"
+    "\n"
+    "  @key-example @smoke\n"
+    "  Scenario: Version endpoint returns the running build\n"
+    "    Given the service is running\n"
+    "    When the version is asked for\n"
+    "    Then the build it started from comes back\n"
+    "\n"
+    "  @negative\n"
+    "  Scenario: Version endpoint rejects an unknown format\n"
+    "    Given the service is running\n"
+    "    When an unpublished format is asked for\n"
+    "    Then the request is refused\n"
+    "\n"
+    "  @negative\n"
+    "  Scenario: Version endpoint refuses an empty request\n"
+    "    Given the service is running\n"
+    "    When nothing at all is asked for\n"
+    "    Then the request is refused\n"
+)
+
+_DIGEST_THREE = (
+    f"feature: {SLUG}\n"
+    "generated: '2026-09-05T10:00:00Z'\n"
+    "scenarios:\n"
+    "- title: Version endpoint returns the running build\n"
+    "  tags:\n"
+    "  - '@key-example'\n"
+    "  - '@smoke'\n"
+    "  sentence: Asking the service which version it is running returns the build\n"
+    "    it was started from.\n"
+    "- title: Version endpoint rejects an unknown format\n"
+    "  tags:\n"
+    "  - '@negative'\n"
+    "  sentence: Asking for the version in a format the service does not publish is\n"
+    "    refused rather than guessed at.\n"
+    "- title: Version endpoint refuses an empty request\n"
+    "  tags:\n"
+    "  - '@negative'\n"
+    "  sentence: Asking for nothing at all is refused rather than answered with a\n"
+    "    guess.\n"
+    "assumptions:\n"
+    "- id: ASSUM-001\n"
+    "  text: The version string comes from the build metadata.\n"
+    "  basis: common practice; the input did not say\n"
+)
+
+#: The honoured rewrite: the third example is GONE and the two that remain are
+#: said differently — "2 examples changed, 1 removed".
+_FEATURE_TWO_REWORDED = (
+    "Feature: version endpoint\n"
+    "\n"
+    "  @key-example @smoke\n"
+    "  Scenario: Version endpoint returns the running build\n"
+    "    Given the service is running\n"
+    "    When the version is asked for\n"
+    "    Then the build it started from comes back\n"
+    "\n"
+    "  @negative\n"
+    "  Scenario: Version endpoint rejects an unknown format\n"
+    "    Given the service is running\n"
+    "    When an unpublished format is asked for\n"
+    "    Then the request is refused with a 404\n"
+)
+
+_DIGEST_TWO_REWORDED = (
+    f"feature: {SLUG}\n"
+    "generated: '2026-09-05T11:00:00Z'\n"
+    "scenarios:\n"
+    "- title: Version endpoint returns the running build\n"
+    "  tags:\n"
+    "  - '@key-example'\n"
+    "  - '@smoke'\n"
+    "  sentence: Asking the service which build stamp it is running returns the\n"
+    "    stamp it was started from.\n"
+    "- title: Version endpoint rejects an unknown format\n"
+    "  tags:\n"
+    "  - '@negative'\n"
+    "  sentence: Asking for the build stamp in a format the service does not publish\n"
+    "    comes back as not found.\n"
+    "assumptions:\n"
+    "- id: ASSUM-001\n"
+    "  text: The version string comes from the build metadata.\n"
+    "  basis: common practice; the input did not say\n"
+)
+
+
+def _card_text(envelope: Any) -> str:
+    """Everything on one card a PERSON reads — the spec's own text excluded.
+
+    ``worked_examples`` is the raw ``.feature``, one click deeper and ruled on
+    elsewhere; every other field on the card is prose written for a reader.
+    """
+    summary = dict(envelope.payload["details"]["summary"])
+    summary.pop("worked_examples", None)
+    return json.dumps(summary)
+
+
+@pytest.mark.asyncio
+async def test_the_first_card_says_exactly_what_it_always_said(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Round one has nothing to compare against, so nothing is added to it."""
+    _queue(store)
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+
+    await h.driver.drive(CID)
+
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert summary["what_happened"] == _ROUND_ONE_TEXT
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_changed_nothing_says_so_on_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """THE DEFECT. The spec-writer returns the same list; the second card used
+    to be identical to the first with no word that the note did nothing."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    cards = _digest_cards(h)
+    assert len(cards) == 2
+    first, second = (c.payload["details"]["summary"] for c in cards)
+    # The lists really are identical — this is the defect's own shape.
+    assert first["what_it_will_do"] == second["what_it_will_do"]
+    assert second["what_happened"] == (
+        'The rewrite came back with the same list. Your note was: '
+        f'"{_THE_NOTE}". Approve anyway, send another note, or reject.'
+    )
+    # Never blocked, no fourth act: the same three answers, and the run went on
+    # to build when the owner said yes anyway.
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert set(second) == set(first)
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_changed_nothing_says_so_in_the_ping(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """One sentence, on the notification that opens that round."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    said = [m for _c, m, _l in h.ctx["notifications"] if "same list" in m]
+    assert len(said) == 1
+    assert said[0] == (
+        f"Planning run {CID}: the rewrite came back with the same list — your "
+        f'note was "{_THE_NOTE}" — so approve anyway, send another note, or '
+        "reject."
+    )
+    # ONE sentence: no full stop before the last one.
+    assert said[0].count(".") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_changed_something_names_what_changed(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The honoured note: the card is what it was, plus one line of counts."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[
+            _spec_reply(feature=_FEATURE_THREE, digest=_DIGEST_THREE),
+            _spec_reply(feature=_FEATURE_TWO_REWORDED, digest=_DIGEST_TWO_REWORDED),
+        ],
+    )
+
+    await h.driver.drive(CID)
+
+    cards = _digest_cards(h)
+    assert len(cards) == 2
+    first, second = (c.payload["details"]["summary"] for c in cards)
+    assert len(first["what_it_will_do"]) == 3
+    assert len(second["what_it_will_do"]) == 2
+    assert second["what_happened"] == (
+        _ROUND_ONE_TEXT + " What changed since your note: 2 examples changed, "
+        "1 removed."
+    )
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+
+@pytest.mark.asyncio
+async def test_an_assumption_that_changed_is_counted_too(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The card asks about the assumptions as well, so they are compared too."""
+    _queue(store)
+    dropped_assumptions = "assumptions: []\n"
+    digest_without = DIGEST_YAML.split("assumptions:\n")[0] + "assumptions: []\n"
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[
+            _spec_reply(),
+            _spec_reply(assumptions=dropped_assumptions, digest=digest_without),
+        ],
+    )
+
+    await h.driver.drive(CID)
+
+    second = _digest_cards(h)[1].payload["details"]["summary"]
+    assert second["what_it_will_do"] == (
+        _digest_cards(h)[0].payload["details"]["summary"]["what_it_will_do"]
+    )
+    assert second["what_happened"] == (
+        _ROUND_ONE_TEXT + " What changed since your note: 1 assumption removed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_card_or_ping_ever_shows_a_raw_chat_id(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """"U03QR8WKT29 sent a note" identified nobody. The person is "you"."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+    )
+
+    await h.driver.drive(CID)
+
+    told = " ".join(m for _c, m, _l in h.ctx["notifications"])
+    assert ORIGINATOR not in told
+    for card in _digest_cards(h):
+        assert ORIGINATOR not in _card_text(card)
+    # And it still says who did what — in a word a person recognises.
+    assert "you sent a note" in told
+    assert "you said yes to the spec" in told
+    assert "You have a card listing" in told
