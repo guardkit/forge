@@ -61,6 +61,7 @@ from forge.planning.audit import audit_planning_model_resolution
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.notifications import build_planning_notification_envelope
 from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.work_queue_store import WorkQueueStore
 from forge.planning.states import PlanningState
 from forge.preflight import run_resource_preflight
 
@@ -733,6 +734,9 @@ async def compose_planning_consumer_and_dispatch(
             target_terminal_enabled=config.planning.target_terminal.enabled,
         )
         repository, state_machine = build_planning_gate_adapters(store, clock=clock_fn)
+        # The work queue (Lane B stage one) shares the same connection as the
+        # planning store: one writer, one database, one transaction discipline.
+        queue_store = WorkQueueStore(pool)
 
         # -- background task supervision ----------------------------------
         background_tasks: set[asyncio.Task[Any]] = set()
@@ -1074,6 +1078,7 @@ async def compose_planning_consumer_and_dispatch(
             level: str = "info",
             *,
             mention: bool = True,
+            parent_request_id: str | None = None,
         ) -> None:
             # Assumption-dialogue projection (TASK-SPL003F-001): project the
             # durable thread anchor + originator so jarvis threads the message
@@ -1086,18 +1091,29 @@ async def compose_planning_consumer_and_dispatch(
             # kept) but carries no ``target_user``, so jarvis renders it plain
             # — no @mention. jarvis's build-audience record ignores a None
             # target_user, so the run's recorded owner is untouched.
-            parent_request_id: str | None = None
+            #
+            # ``parent_request_id`` passed in by the caller is the anchor for a
+            # message that has NO planning run yet — a queue reply. The queue
+            # row carries the person, so the mention still works; the thread
+            # anchor comes from the message that is being answered.
+            anchor: str | None = None
             target_user: str | None = None
             row = store.get_run(correlation_id)
             if row is not None:
-                parent_request_id = row["parent_request_id"]
+                anchor = row["parent_request_id"]
                 target_user = row["originating_user"] if mention else None
+            else:
+                queued = queue_store.get_by_correlation_id(correlation_id)
+                if queued is not None and mention:
+                    target_user = queued["originating_user"]
+            if anchor is None:
+                anchor = parent_request_id
 
             envelope = build_planning_notification_envelope(
                 correlation_id=correlation_id,
                 message=message,
                 level=level,
-                parent_request_id=parent_request_id,
+                parent_request_id=anchor,
                 target_user=target_user,
             )
             await nats_client.publish(
@@ -1174,13 +1190,23 @@ async def compose_planning_consumer_and_dispatch(
         async def _on_recorded(correlation_id: str) -> None:
             _spawn_drive(correlation_id)
 
-        async def _notify_two_arg(correlation_id: str, message: str) -> None:
-            await publish_planning_notification(correlation_id, message, "info")
+        async def _notify_two_arg(
+            correlation_id: str,
+            message: str,
+            *,
+            parent_request_id: str | None = None,
+        ) -> None:
+            await publish_planning_notification(
+                correlation_id, message, "info", parent_request_id=parent_request_id
+            )
 
         consumer_deps = PlanningConsumerDeps(
             store=store,
             publish_notification=_notify_two_arg,
             on_recorded=_on_recorded,
+            # Lane B stage one: a sentence becomes a queue row here, and the
+            # take-next loop creates the planning run later.
+            queue_store=queue_store,
             # The intake resolves the repository a sentence names against
             # planning.target_repo_paths and refuses a name it does not know
             # (2026-09-05 rules 3 and 4).

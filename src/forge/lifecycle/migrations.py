@@ -44,12 +44,15 @@ from typing import Final
 # ``builds.terminal_class`` column, which tells a MONITOR kill, a BUDGET-cap
 # kill, a WALL-CLOCK expiry and a guardkit IN-BAND timeout apart from an
 # ordinary broken build — all four of which ``status`` still spells FAILED.
+# bumped to 10 in the work-queue lane (Lane B stage one) to add the two new
+# ``work_queue`` / ``work_queue_events`` tables — the list of sentences the
+# factory has been asked for but has not started yet.
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 9
+_SCHEMA_VERSION: Final[int] = 10
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -70,6 +73,11 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # distinction rides beside it, NULL-able, and an ordinary failure never
     # writes it.
     (9, "schema_v9.sql"),
+    # v10 (work queue, Lane B stage one) — the two new tables ``work_queue``
+    # and ``work_queue_events``. Purely additive: no existing table, column or
+    # index is touched, so a forge that never reads the queue behaves exactly
+    # as it does today.
+    (10, "schema_v10.sql"),
 )
 
 
