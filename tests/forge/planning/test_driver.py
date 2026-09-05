@@ -797,3 +797,85 @@ class TestCoachDeployedReplyReachesHandoff:
         # the document. This is the exact regression the pre-fix driver had.
         assert "COACH-EVIDENCE-NOT-THE-DOC-b19c" not in content
         assert "COACH-CRITERION-clarity" not in content
+
+
+# ---------------------------------------------------------------------------
+# Which repository the run lands in (2026-09-05 spec, rules 4 and 6)
+# ---------------------------------------------------------------------------
+
+
+class TestRepositoryIsNamedOutLoud:
+    """A run that named no repository still says where it is being built."""
+
+    @staticmethod
+    def _config() -> PlanningConfig:
+        return PlanningConfig(
+            enabled=True,
+            default_target_repo="guardkit/api_test",
+            target_repo_paths={
+                "guardkit/api_test": "/srv/repos/api_test",
+                "appmilla/study-tutor": "/srv/repos/study-tutor",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_repo_named_in_log(
+        self, store: SqlitePlanningRunStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The assumed default is logged by name, never assumed silently."""
+        driver, _ = _make_driver(store, config=self._config())
+        row = {"target_repo": None}
+
+        with caplog.at_level("INFO", logger="forge.planning.driver"):
+            resolved = await driver._resolve_repo(
+                row, CID, stage_label="feature-spec"
+            )
+
+        assert resolved == ("guardkit/api_test", "/srv/repos/api_test")
+        assert any(
+            "guardkit/api_test" in record.getMessage()
+            and "default" in record.getMessage()
+            for record in caplog.records
+        ), "the log must name the repository that was assumed"
+
+    @pytest.mark.asyncio
+    async def test_a_named_repo_is_not_logged_as_an_assumption(
+        self, store: SqlitePlanningRunStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A sentence that named its repository assumed nothing."""
+        driver, _ = _make_driver(store, config=self._config())
+        row = {"target_repo": "appmilla/study-tutor"}
+
+        with caplog.at_level("INFO", logger="forge.planning.driver"):
+            resolved = await driver._resolve_repo(
+                row, CID, stage_label="feature-spec"
+            )
+
+        assert resolved == ("appmilla/study-tutor", "/srv/repos/study-tutor")
+        assert not any(
+            "named no repository" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_late_unknown_repo_failure_lists_the_known_names(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """A row naming a repository the config lost fails with the list."""
+        _queue_run(store)
+        store.transition(
+            correlation_id=CID,
+            to_state=PlanningState.RUNNING,
+            actor_identity="test",
+        )
+        driver, ctx = _make_driver(store, config=self._config())
+        row = {"target_repo": "elsewhere/nowhere"}
+
+        resolved = await driver._resolve_repo(row, CID, stage_label="feature-spec")
+
+        assert resolved is None
+        run = store.get_run(CID)
+        assert run["state"] == PlanningState.FAILED.value
+        assert (
+            "known repos: guardkit/api_test, appmilla/study-tutor" in run["error"]
+        )

@@ -653,6 +653,26 @@ async def test_the_card_is_one_sentence_per_example_in_plain_language(
 
 
 @pytest.mark.asyncio
+async def test_digest_card_carries_target_repo(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The card names the repository this build will land in (rule 5).
+
+    The owner approves a spec at this card; which repository it will be built
+    in is part of what they are agreeing to, so it travels on the card rather
+    than being knowable only from the logs. A renderer that does not know the
+    field shows the card exactly as before.
+    """
+    _queue(store)
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+
+    await h.driver.drive(CID)
+
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert summary["target_repo"] == TARGET_REPO
+
+
+@pytest.mark.asyncio
 async def test_the_card_threads_under_the_runs_own_anchor(
     store: SqlitePlanningRunStore,
 ) -> None:
@@ -1619,11 +1639,16 @@ async def test_the_show_me_text_is_the_raw_spec_unscrubbed(
     # (3) Everything a person is actually ASKED about — every sentence, every
     # assumption, every "what this means" line — is composed from the digest
     # and is clean. That is why (1) is the one field the renderer must rule on.
+    #
+    # ``target_repo`` is excluded alongside it, and deliberately: it is the
+    # repository name itself (2026-09-05 rule 5 — the card says where this
+    # will be built), so it CONTAINS the org name by design. It is not spec
+    # text and it is not a leak.
     prose = json.dumps(
         {
             k: v
             for k, v in card.items()
-            if k not in ("worked_examples", "what_it_will_do")
+            if k not in ("worked_examples", "what_it_will_do", "target_repo")
         }
     )
     prose += json.dumps([e["sentence"] for e in card["what_it_will_do"]])

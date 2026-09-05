@@ -1181,6 +1181,10 @@ async def compose_planning_consumer_and_dispatch(
             store=store,
             publish_notification=_notify_two_arg,
             on_recorded=_on_recorded,
+            # The intake resolves the repository a sentence names against
+            # planning.target_repo_paths and refuses a name it does not know
+            # (2026-09-05 rules 3 and 4).
+            planning_config=config.planning,
         )
 
         subscription = None

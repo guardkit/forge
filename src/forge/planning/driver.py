@@ -68,6 +68,7 @@ from forge.planning.escalation import (
     EscalationPolicy,
     evaluate_escalation_phase,
 )
+from forge.planning.failure import fail_run, mark_run_failed
 from forge.planning.handoff import (
     PlannedHandoffHandler,
     PreCommitResult,
@@ -95,6 +96,7 @@ from forge.planning.spec_digest import (
     check_digest_consistency,
 )
 from forge.planning.states import PlanningState
+from forge.planning.target_repos import format_known_repos
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import PlanningConfig
@@ -2053,6 +2055,7 @@ class PlanningRunDriver:
         digest_text = self._capture_digest(role_output, files)
         proof = await self._prove_digest_against_branch(
             correlation_id,
+            target_repo=target_repo,
             repo_path=repo_path,
             branch=branch,
             files=files,
@@ -2102,6 +2105,7 @@ class PlanningRunDriver:
         self,
         correlation_id: str,
         *,
+        target_repo: str | None = None,
         repo_path: str,
         branch: str,
         files: Mapping[str, str],
@@ -2199,6 +2203,7 @@ class PlanningRunDriver:
             digest_obj=digest_obj if isinstance(digest_obj, Mapping) else {},
             feature_text=committed_feature,
             seed=seed,
+            target_repo=target_repo,
         )
         return dict(digest_obj) if isinstance(digest_obj, dict) else {}, card
 
@@ -2605,6 +2610,7 @@ class PlanningRunDriver:
         digest_obj: Mapping[str, Any],
         feature_text: str,
         seed: Mapping[str, Any] | None = None,
+        target_repo: str | None = None,
     ) -> dict[str, Any]:
         """The card the owner reads — PLAIN language, one sentence per example.
 
@@ -2694,6 +2700,15 @@ class PlanningRunDriver:
         feature = str(digest_obj.get("feature") or "").strip()
         if feature:
             card["feature"] = feature
+
+        # WHICH REPOSITORY this will be built in, on the card the owner
+        # approves (2026-09-05 rule 5). A sentence that named no repository
+        # went to the default, and the default is named here too, so the
+        # reader never has to guess. A renderer that does not know the field
+        # shows the card exactly as it did before.
+        repo = target_repo or self._deps.planning_config.default_target_repo
+        if repo:
+            card["target_repo"] = repo
 
         # THE ONE TAP ANSWERS BOTH QUESTIONS. The sign-in flag is already known
         # here — it was raised by the same spec this card is about — so the
@@ -5017,18 +5032,30 @@ class PlanningRunDriver:
     ) -> tuple[str, str] | None:
         """Resolve ``(target_repo, repo_path)`` or fail the run loudly."""
         cfg = self._deps.planning_config
-        target_repo = row["target_repo"] or cfg.default_target_repo
+        named = row["target_repo"]
+        target_repo = named or cfg.default_target_repo
         if target_repo is None:
             await self._fail_leg(
                 correlation_id, stage_label, "no target repository configured"
             )
             return None
+        if not named:
+            # The assumed repository is said OUT LOUD (2026-09-05 rule 6). A
+            # sentence that named no repository still lands somewhere, and the
+            # log is where that "somewhere" has to be readable afterwards.
+            logger.info(
+                "planning driver: run %s named no repository; building in the "
+                "default %s",
+                correlation_id,
+                target_repo,
+            )
         repo_path = cfg.target_repo_paths.get(target_repo)
         if repo_path is None:
             await self._fail_leg(
                 correlation_id,
                 stage_label,
-                f"target repo {target_repo} not in target_repo_paths",
+                f"target repo {target_repo} not in target_repo_paths; "
+                f"known repos: {format_known_repos(cfg.target_repo_paths)}",
             )
             return None
         return target_repo, repo_path
@@ -5077,23 +5104,22 @@ class PlanningRunDriver:
         compose its own sentence (the auth door does). When it is omitted the
         default sentence is composed here: the plain noun plus the leg's reason.
         """
-        self._fail(correlation_id, stage_label=stage_label, reason=reason)
-        logger.error(
-            "planning driver: run %s FAILED at %s: %s",
+        async def _notify_owner(cid: str, message: str) -> str:
+            return await self._notify(cid, message, level="error")
+
+        return await fail_run(
+            self._deps.store,
             correlation_id,
-            stage_label,
-            reason,
-        )
-        await self._notify(
-            correlation_id,
-            owner_message
+            stage_label=stage_label,
+            reason=reason,
+            owner_message=owner_message
             or (
                 f"Planning run {correlation_id} stopped at "
                 f"{plain_stage_name(stage_label)}: {reason}"
             ),
-            level="error",
+            notify=_notify_owner,
+            log=logger,
         )
-        return False
 
     def _mint_feature_id(self, correlation_id: str) -> str:
         """Mint a deterministic ``FEAT-XXXX`` id for the plan (rule 6).
@@ -5933,21 +5959,16 @@ class PlanningRunDriver:
         return latest
 
     def _fail(self, correlation_id: str, *, stage_label: str, reason: str) -> None:
-        refused = self._deps.store.transition(
-            correlation_id=correlation_id,
-            to_state=PlanningState.FAILED,
-            actor_identity="planning-driver",
+        # The write itself lives in forge.planning.failure so the intake
+        # consumer's refusal and this driver end a run through ONE piece of
+        # code (2026-09-05 rule 4).
+        mark_run_failed(
+            self._deps.store,
+            correlation_id,
             stage_label=stage_label,
-            error=reason,
+            reason=reason,
+            log=logger,
         )
-        if isinstance(refused, TransitionRefused):
-            logger.warning(
-                "planning driver: FAILED transition refused for %s "
-                "(current=%s, reason=%s)",
-                correlation_id,
-                refused.current_state,
-                reason,
-            )
 
     async def _notify(
         self,

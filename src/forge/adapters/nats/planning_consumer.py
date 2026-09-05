@@ -28,13 +28,19 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from nats_core.envelope import MessageEnvelope
 from nats_core.events import PlanningQueuedPayload
 from pydantic import ValidationError
 
+from forge.planning.failure import fail_run
 from forge.planning.run_store import DuplicateRun, SqlitePlanningRunStore
+from forge.planning.states import PlanningState
+from forge.planning.target_repos import (
+    resolve_target_repo,
+    unknown_repo_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,11 @@ CORRELATION_ID_PATTERN: str = r"^[A-Za-z0-9_-]{1,128}$"
 #: review, carried LOW). 5s bounds the loop while keeping transient
 #: SQLITE_BUSY recovery prompt.
 NAK_REDELIVERY_DELAY_SECONDS: float = 5.0
+
+#: Stage label written on the durable row when a sentence names a repository
+#: this forge does not know (2026-09-05 rule 4). The row records the refusal
+#: under this label; the person gets one plain sentence, not this string.
+UNKNOWN_REPO_STAGE_LABEL: str = "planning-intake"
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +187,18 @@ class PlanningConsumerDeps:
             re-kick a no-op). The production composition uses this to
             kick the planning chain driver. Exceptions are caught and
             logged — a driver defect never wedges intake.
+        planning_config: The forge's planning configuration, used to resolve
+            the repository a sentence names against
+            ``planning.target_repo_paths`` (2026-09-05 rule 3). None (the
+            default) means no resolution is attempted and the payload's
+            repository name is recorded as it arrives — the behaviour before
+            names could be typed.
     """
 
     store: SqlitePlanningRunStore
     publish_notification: PublishNotification | None = None
     on_recorded: Callable[[str], Awaitable[None]] | None = None
+    planning_config: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +300,20 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             correlation_id,
         )
 
+    # --- 3b. Resolve the repository the sentence named (rule 3) ----------
+    # Done BEFORE the row is written so the row carries the CONFIGURATION KEY
+    # (what every later leg looks up), not the short name a person typed. An
+    # unresolvable name is remembered here and refused after the row exists,
+    # so the refusal has a run to attach to.
+    resolution = None
+    recorded_repo = payload.target_repo
+    if payload.target_repo and deps.planning_config is not None:
+        resolution = resolve_target_repo(
+            payload.target_repo, deps.planning_config.target_repo_paths
+        )
+        if resolution.name is not None:
+            recorded_repo = resolution.name
+
     # --- 4. Record queued run (idempotent on correlation_id) -------------
     try:
         result = deps.store.record_queued(
@@ -292,7 +324,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             triggered_by=payload.triggered_by,
             originating_adapter=payload.originating_adapter,
             parent_request_id=payload.parent_request_id,
-            target_repo=payload.target_repo,
+            target_repo=recorded_repo,
         )
     except Exception as exc:
         # Store write failed (e.g. transient SQLITE_BUSY) — request
@@ -352,6 +384,40 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
         await _kick_driver(deps, correlation_id, context="non-terminal duplicate")
         return
 
+    # --- 5b. Unknown repository → refuse loudly, build nothing (rule 4) --
+    if resolution is not None and resolution.name is None:
+        logger.warning(
+            "planning_consumer: correlation_id=%s named repository %r, which "
+            "is not resolvable (%s); failing the run and telling the sender",
+            correlation_id,
+            payload.target_repo,
+            resolution.reason,
+        )
+        # The row is one second old and still QUEUED, and a run fails FROM
+        # RUNNING (the store's transition table has no QUEUED → FAILED edge),
+        # so it takes the same first step the driver takes before it fails a
+        # leg at run start.
+        deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.RUNNING,
+            actor_identity="planning-intake",
+            stage_label=UNKNOWN_REPO_STAGE_LABEL,
+        )
+        await fail_run(
+            deps.store,
+            correlation_id,
+            stage_label=UNKNOWN_REPO_STAGE_LABEL,
+            reason=resolution.reason,
+            owner_message=unknown_repo_message(
+                str(payload.target_repo), deps.planning_config.target_repo_paths
+            ),
+            notify=deps.publish_notification,
+            log=logger,
+        )
+        # Acked, and the driver is NOT kicked: no planning leg runs.
+        await msg.ack()
+        return
+
     # --- 6. Success: ack AFTER persist (ASSUM-015) -----------------------
     logger.info(
         "planning_consumer: recorded planning run correlation_id=%s "
@@ -370,6 +436,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
 
 __all__ = [
     "CORRELATION_ID_PATTERN",
+    "UNKNOWN_REPO_STAGE_LABEL",
     "NAK_REDELIVERY_DELAY_SECONDS",
     "PLANNING_DURABLE_NAME",
     "PLANNING_QUEUED_SUBJECT_FILTER",
