@@ -14,6 +14,9 @@ What these pin, in the words of the thing they protect:
   close-out reads ``clean-review-no-fixes`` and it has no merge report; a
   measure that counted it would mint a false one-of-one on day one. This is
   the single most load-bearing test in the file.
+- **The outcome word is read from the report's own field.** A red report
+  whose prose quotes the green word is not a success, and a step claim under
+  the same label is not the report.
 - **The line says so in words when there is nothing to say.** No repair rows
   yet is not a rate of zero.
 
@@ -39,6 +42,7 @@ from forge.lifecycle.metrics import (
     MERGED_AND_RUNNING,
     MERGE_READY_TARGET_IDENTIFIER,
     MERGE_REPORT_STAGE_LABEL,
+    MERGE_REPORT_TARGET_IDENTIFIER,
     self_closed_defect_rate,
 )
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -202,7 +206,7 @@ def merge_report(
         cx,
         build_id=build_id,
         stage_label=MERGE_REPORT_STAGE_LABEL,
-        target_identifier="merge_deploy_executor",
+        target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
         at=at,
         status="PASSED" if result == MERGED_AND_RUNNING else "FAILED",
         details={
@@ -432,6 +436,74 @@ class TestWhatDoesNotCount:
         )
         merge_report(cx, build_id, at="2026-09-05T10:00:00+00:00")
         merge_ready_card(cx, build_id, at="2026-09-05T10:05:00+00:00")
+
+        assert self_closed_defect_rate(cx) == (0, 1)
+
+    def test_a_red_report_that_quotes_the_green_word_does_not_count(
+        self, cx: sqlite3.Connection
+    ) -> None:
+        """The outcome word is read from the report's own field, by name.
+
+        The report carries a free-text ``detail`` line beside its ``result``,
+        and that line can say the green word while reporting a red ending —
+        "the deploy never reached merged-and-running" is a failure. Reading
+        the whole details blob would score that as a defect the factory
+        closed by itself: a red deploy counted as a success.
+        """
+        correlation_id = "fix-build-FEAT-44A8-20260905083000"
+        file_repair_row(cx, correlation_id=correlation_id, queued_at=INSIDE)
+        build_id = open_build(
+            cx, build_id="build-repair-1", correlation_id=correlation_id
+        )
+        merge_ready_card(cx, build_id, at="2026-09-05T10:00:00+00:00")
+        record_stage(
+            cx,
+            build_id=build_id,
+            stage_label=MERGE_REPORT_STAGE_LABEL,
+            target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+            at="2026-09-05T10:05:00+00:00",
+            status="FAILED",
+            details={
+                "result": "merged-deploy-failed",
+                "detail": (
+                    "the deploy rolled back and the live checks never "
+                    "reached merged-and-running"
+                ),
+            },
+        )
+
+        assert self_closed_defect_rate(cx) == (0, 1)
+
+    def test_a_merge_step_row_under_the_same_label_is_not_the_report(
+        self, cx: sqlite3.Connection
+    ) -> None:
+        """The merge and deploy step claims share the report's label.
+
+        They are written before each irreversible act and say nothing about
+        how it ended, so only the report row itself — ``merge_deploy_executor``
+        — can close a repair.
+        """
+        correlation_id = "fix-build-FEAT-44A8-20260905083000"
+        file_repair_row(cx, correlation_id=correlation_id, queued_at=INSIDE)
+        build_id = open_build(
+            cx, build_id="build-repair-1", correlation_id=correlation_id
+        )
+        merge_ready_card(cx, build_id, at="2026-09-05T10:00:00+00:00")
+        record_stage(
+            cx,
+            build_id=build_id,
+            stage_label=MERGE_REPORT_STAGE_LABEL,
+            target_identifier="merge_deploy_merge",
+            at="2026-09-05T10:05:00+00:00",
+            status="GATED",
+            details={
+                "merge_step": {
+                    "expect_main_sha": "a" * 40,
+                    "decided_by": "rich",
+                    "result": MERGED_AND_RUNNING,
+                }
+            },
+        )
 
         assert self_closed_defect_rate(cx) == (0, 1)
 
