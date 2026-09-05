@@ -35,11 +35,15 @@ from nats_core.events import PlanningQueuedPayload
 from pydantic import ValidationError
 
 from forge.planning.failure import fail_run
-from forge.planning.run_store import DuplicateRun, SqlitePlanningRunStore
+from forge.planning.run_store import (
+    DuplicateRun,
+    SqlitePlanningRunStore,
+    TransitionRefused,
+)
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import (
+    refusal_message,
     resolve_target_repo,
-    unknown_repo_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +84,11 @@ NAK_REDELIVERY_DELAY_SECONDS: float = 5.0
 #: this forge does not know (2026-09-05 rule 4). The row records the refusal
 #: under this label; the person gets one plain sentence, not this string.
 UNKNOWN_REPO_STAGE_LABEL: str = "planning-intake"
+
+#: Who the durable row and the logs name when the intake — not the chain
+#: driver — ends a run. Keeps a refusal at the door out of the driver's
+#: receipts.
+INTAKE_ACTOR: str = "planning-intake"
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +208,28 @@ class PlanningConsumerDeps:
     publish_notification: PublishNotification | None = None
     on_recorded: Callable[[str], Awaitable[None]] | None = None
     planning_config: Any | None = None
+
+
+# ---------------------------------------------------------------------------
+# Telling the sender
+# ---------------------------------------------------------------------------
+
+
+async def _notify_best_effort(
+    deps: PlanningConsumerDeps, correlation_id: str, message: str
+) -> None:
+    """Send one sentence to whoever asked; never let it block the ack."""
+    if deps.publish_notification is None:
+        return
+    try:
+        await deps.publish_notification(correlation_id, message)
+    except Exception as exc:  # noqa: BLE001 — a notification never blocks the ack
+        logger.warning(
+            "planning_consumer: publish_notification raised (%s) for "
+            "correlation_id=%s; continuing",
+            exc,
+            correlation_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -393,24 +424,41 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             payload.target_repo,
             resolution.reason,
         )
+        owner_message = refusal_message(
+            str(payload.target_repo),
+            resolution,
+            deps.planning_config.target_repo_paths,
+        )
         # The row is one second old and still QUEUED, and a run fails FROM
         # RUNNING (the store's transition table has no QUEUED → FAILED edge),
         # so it takes the same first step the driver takes before it fails a
-        # leg at run start.
-        deps.store.transition(
+        # leg at run start. If that step is refused the row is no longer the
+        # QUEUED row we just wrote — something else moved it — so FAILED
+        # cannot be written either; say so loudly rather than pretending the
+        # run ended, and still tell the sender their name was refused.
+        refused = deps.store.transition(
             correlation_id=correlation_id,
             to_state=PlanningState.RUNNING,
-            actor_identity="planning-intake",
+            actor_identity=INTAKE_ACTOR,
             stage_label=UNKNOWN_REPO_STAGE_LABEL,
         )
+        if isinstance(refused, TransitionRefused):
+            logger.error(
+                "planning intake: correlation_id=%s could not be moved out of "
+                "%s to be failed; the row stays as it is and no leg is kicked",
+                correlation_id,
+                refused.current_state,
+            )
+            await _notify_best_effort(deps, correlation_id, owner_message)
+            await msg.ack()
+            return
         await fail_run(
             deps.store,
             correlation_id,
             stage_label=UNKNOWN_REPO_STAGE_LABEL,
             reason=resolution.reason,
-            owner_message=unknown_repo_message(
-                str(payload.target_repo), deps.planning_config.target_repo_paths
-            ),
+            owner_message=owner_message,
+            actor=INTAKE_ACTOR,
             notify=deps.publish_notification,
             log=logger,
         )
@@ -436,6 +484,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
 
 __all__ = [
     "CORRELATION_ID_PATTERN",
+    "INTAKE_ACTOR",
     "UNKNOWN_REPO_STAGE_LABEL",
     "NAK_REDELIVERY_DELAY_SECONDS",
     "PLANNING_DURABLE_NAME",

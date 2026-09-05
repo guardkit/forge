@@ -6,17 +6,18 @@ checkout and being refused when the matches are different checkouts. Rule 4:
 the refusal names, in plain words, every repository a person MAY ask for,
 with two keys for one checkout collapsed to a single name.
 
-These are the short-name cases. They are proved here rather than through the
-intake consumer because the wire payload's own validator
-(``PlanningQueuedPayload``) accepts only ``org/name``, so a short name cannot
-reach the consumer today — see this lane's report.
+These are the short-name cases, proved directly against the resolver; the
+intake consumer's tests prove the same names travelling the whole way from
+the wire.
 """
 
 from __future__ import annotations
 
 from forge.planning.target_repos import (
+    ambiguous_repo_message,
     format_known_repos,
     known_repo_names,
+    refusal_message,
     resolve_target_repo,
     unknown_repo_message,
 )
@@ -55,11 +56,13 @@ class TestResolution:
         assert resolution.name is None
         assert "guardkit/api_test" in resolution.reason
         assert "appmilla/api_test" in resolution.reason
+        assert resolution.matches == ("guardkit/api_test", "appmilla/api_test")
 
     def test_unknown_short_name_is_refused(self) -> None:
         resolution = resolve_target_repo("nowhere", {"g/api_test": "/srv/a"})
         assert resolution.name is None
         assert "nowhere" in resolution.reason
+        assert resolution.matches == (), "nothing matched, so nothing to list"
 
     def test_unknown_full_key_is_refused(self) -> None:
         resolution = resolve_target_repo("elsewhere/nowhere", {"g/a": "/srv/a"})
@@ -90,4 +93,37 @@ class TestKnownNames:
     def test_no_repositories_configured_still_reads_as_a_sentence(self) -> None:
         assert format_known_repos({}) == (
             "nothing yet — no repositories are configured"
+        )
+
+
+class TestWhatThePersonIsTold:
+    """Two refusals, two different true sentences."""
+
+    _PATHS = {
+        "guardkit/api_test": "/srv/repos/guardkit-api_test",
+        "appmilla/api_test": "/srv/repos/appmilla-api_test",
+        "appmilla/study-tutor": "/srv/repos/study-tutor",
+    }
+
+    def test_a_name_it_has_never_heard_of_lists_the_names(self) -> None:
+        resolution = resolve_target_repo("nowhere", self._PATHS)
+
+        assert refusal_message("nowhere", resolution, self._PATHS) == (
+            "I don't know a repository called nowhere. I can build in: "
+            "guardkit/api_test, appmilla/api_test, appmilla/study-tutor."
+        )
+
+    def test_a_name_it_knows_twice_over_asks_which_one(self) -> None:
+        """Saying "I don't know api_test" would not be true — it knows two."""
+        resolution = resolve_target_repo("api_test", self._PATHS)
+
+        assert refusal_message("api_test", resolution, self._PATHS) == (
+            "More than one repository is called api_test. Say which one you "
+            "mean: guardkit/api_test, appmilla/api_test."
+        )
+
+    def test_the_ambiguous_sentence_names_every_candidate(self) -> None:
+        assert ambiguous_repo_message("api_test", ("a/api_test", "b/api_test")) == (
+            "More than one repository is called api_test. Say which one you "
+            "mean: a/api_test, b/api_test."
         )
