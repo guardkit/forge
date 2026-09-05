@@ -54,6 +54,7 @@ from forge.adapters.nats.planning_consumer import (
     PLANNING_DURABLE_NAME,
     PLANNING_QUEUED_SUBJECT_FILTER,
     PlanningConsumerDeps,
+    create_and_start_planning_run,
     handle_planning_message,
 )
 from forge.adapters.sqlite import connect_writer
@@ -61,6 +62,12 @@ from forge.planning.audit import audit_planning_model_resolution
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.notifications import build_planning_notification_envelope
 from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.work_queue_loop import (
+    Admission,
+    WorkQueueLoop,
+    count_in_flight,
+    paused_repositories,
+)
 from forge.planning.work_queue_store import WorkQueueStore
 from forge.planning.states import PlanningState
 from forge.preflight import run_resource_preflight
@@ -736,7 +743,7 @@ async def compose_planning_consumer_and_dispatch(
         repository, state_machine = build_planning_gate_adapters(store, clock=clock_fn)
         # The work queue (Lane B stage one) shares the same connection as the
         # planning store: one writer, one database, one transaction discipline.
-        queue_store = WorkQueueStore(pool)
+        queue_store = WorkQueueStore(pool, clock=clock_fn)
 
         # -- background task supervision ----------------------------------
         background_tasks: set[asyncio.Task[Any]] = set()
@@ -1211,6 +1218,43 @@ async def compose_planning_consumer_and_dispatch(
             # planning.target_repo_paths and refuses a name it does not know
             # (2026-09-05 rules 3 and 4).
             planning_config=config.planning,
+        )
+
+        # -- the take-next loop (Lane B stage one, contracts 6-8) ----------
+        # A sibling supervised task beside the intake consumer: every ten
+        # seconds it closes what has finished, asks about a broken chain, and
+        # admits the next sentence by creating its planning run in process,
+        # under the sentence's own correlation id.
+        async def _start_queued_run(admission: Admission) -> None:
+            await create_and_start_planning_run(
+                consumer_deps,
+                correlation_id=admission.correlation_id,
+                request_text=admission.request_text,
+                originating_user=admission.originating_user,
+                triggered_by=admission.triggered_by,
+                originating_adapter=admission.originating_adapter,
+                parent_request_id=admission.parent_request_id,
+                target_repo=admission.target_repo,
+            )
+
+        queue_loop = WorkQueueLoop(
+            queue_store,
+            count_in_flight=lambda: count_in_flight(pool),
+            planning_run=store.get_run,
+            paused_repositories=lambda: paused_repositories(pool),
+            start_run=_start_queued_run,
+            notify=_notify_two_arg,
+            max_in_flight=config.queue.max_in_flight,
+            stale_after_days=config.queue.stale_after_days,
+            clock=clock_fn,
+        )
+        queue_loop_task = asyncio.create_task(queue_loop.run())
+        _supervise(queue_loop_task, "work-queue-take-next")
+        logger.info(
+            "planning composition: the work queue is live — one sentence at a "
+            "time up to %d in flight, order %s",
+            config.queue.max_in_flight,
+            config.queue.order,
         )
 
         subscription = None

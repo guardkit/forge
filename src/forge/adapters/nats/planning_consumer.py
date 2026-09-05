@@ -392,6 +392,12 @@ async def _handle_with_queue(
             originating_user=identity,
             target_repo=recorded_repo,
             kind=kind,
+            # Where it came from, kept for the take-next loop: the planning
+            # run it creates later needs the same thread anchor and trigger
+            # this message carried, or the person's Slack thread goes quiet.
+            parent_request_id=payload.parent_request_id,
+            originating_adapter=payload.originating_adapter,
+            triggered_by=payload.triggered_by,
         )
     except Exception as exc:  # noqa: BLE001 — never drop a sentence
         logger.error(
