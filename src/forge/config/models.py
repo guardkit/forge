@@ -417,6 +417,38 @@ class QueueConfig(BaseModel):
         ),
     )
 
+    # -- the work queue the factory keeps for itself (Lane B stage one) ----
+    # These three describe the queue of SENTENCES waiting to become planning
+    # runs, not the build queue above. They are optional with defaults that
+    # reproduce today's behaviour exactly, so a forge.yaml written before this
+    # lane loads unchanged (this model is extra="forbid"; adding OPTIONAL
+    # fields is safe, removing or renaming one is not).
+    max_in_flight: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many pieces of work the factory may have running at once. "
+            "One is today's behaviour: the take-next loop admits a queued "
+            "sentence only when nothing is in flight."
+        ),
+    )
+    order: Literal["shadow"] = Field(
+        default="shadow",
+        description=(
+            "How the queue chooses what to take next. 'shadow' — the only "
+            "value this stage accepts — takes the oldest waiting row and "
+            "only SAYS which row a class order would have picked."
+        ),
+    )
+    stale_after_days: int = Field(
+        default=7,
+        ge=1,
+        description=(
+            "How long a sentence may sit in the queue before the forge asks "
+            "once, in the channel, whether to keep it or drop it."
+        ),
+    )
+
 
 class BudgetGuards(BaseModel):
     """Per-profile build budget caps (FEAT-UBS-002) — and the leg knobs.

@@ -193,6 +193,13 @@ class TestApprovalYamlRoundTrip:
                 "default_sdk_timeout_seconds": 1800,
                 "default_history_limit": 50,
                 "repo_allowlist": [],
+                # The work queue the factory keeps for itself (Lane B stage
+                # one) added three settings to this same block; the
+                # unfiltered round-trip dump always includes them, so this
+                # exhaustive fixture must declare them at their defaults.
+                "max_in_flight": 1,
+                "order": "shadow",
+                "stale_after_days": 7,
             },
             # ``budget`` was added by FEAT-UBS-002 — like ``queue`` above, the
             # unfiltered round-trip dump now always includes it, so this "all

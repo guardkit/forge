@@ -243,7 +243,7 @@ class TestBootLogEmitsAppliedCount:
             "Expected an INFO log line containing 'SQLite migration' "
             f"after fresh-DB bind; got: {[r.getMessage() for r in caplog.records]!r}"
         )
-        # Nine bundled migrations (schema.sql + schema_v2.sql + schema_v3.sql,
+        # Ten bundled migrations (schema.sql + schema_v2.sql + schema_v3.sql,
         # the latter added by FEAT-SPL-002 Mode P; schema_v4.sql added by the
         # Lane B / Phase E1 target-terminal CHECK widening; schema_v5.sql added
         # by TASK-UBS-002-integration for the builds.profile column; schema_v6.sql
@@ -252,8 +252,11 @@ class TestBootLogEmitsAppliedCount:
         # added by the conductor revival for the builds.task_id column — the fix
         # journey's durable subject; schema_v9.sql added by the
         # monitored-supervision lane for the builds.terminal_class column —
-        # WHICH of the five deaths a FAILED build died) → applied=9.
-        assert "applied 9" in applied_lines[0], applied_lines[0]
+        # WHICH of the five deaths a FAILED build died; schema_v10.sql added by
+        # the work-queue lane for the work_queue / work_queue_events tables —
+        # the list of sentences the factory has been asked for and has not
+        # started yet) → applied=10.
+        assert "applied 10" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------
