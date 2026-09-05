@@ -21,7 +21,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 from forge.cli.main import main
@@ -93,12 +92,43 @@ def test_an_empty_map_prints_nothing_and_succeeds(tmp_path):
     assert result.output == ""
 
 
+# A config this command cannot read is answered with one plain sentence and a
+# non-zero exit — never a traceback. The recreate script prints this command's
+# stderr straight to a human who is standing over a container they are about to
+# take down, so the three ways a config can be unreadable all read the same.
+
+
 def test_a_missing_config_file_is_refused(tmp_path):
     result = CliRunner().invoke(
         main, ["repo-paths", "--config", str(tmp_path / "nowhere.yaml")]
     )
 
     assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "there is no file at" in result.output
+
+
+def test_a_config_that_is_not_valid_yaml_is_refused_in_plain_english(tmp_path):
+    config = _write_config(tmp_path, "planning:\n  target_repo_paths: [1, 2\n")
+
+    result = CliRunner().invoke(main, ["repo-paths", "--config", str(config)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "could not be read as a forge.yaml" in result.output
+
+
+def test_a_config_that_fails_validation_is_refused_in_plain_english(tmp_path):
+    config = _write_config(tmp_path, "planning:\n  target_repo_paths: not-a-mapping\n")
+
+    result = CliRunner().invoke(main, ["repo-paths", "--config", str(config)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "could not be read as a forge.yaml" in result.output
 
 
 def test_without_any_config_it_says_so_in_plain_english(tmp_path, monkeypatch):
@@ -195,6 +225,44 @@ def test_the_script_refuses_when_the_repository_map_cannot_be_read(tmp_path):
     assert result.returncode == 1
     assert "refusing to recreate forge-prod" in result.stderr
     assert not (tmp_path / "docker-was-called").exists()
+
+
+def test_the_map_read_leaves_the_lock_file_alone(tmp_path):
+    """The read runs as ``uv run --frozen --no-sync``, and this is why.
+
+    Reading the repository map happens seconds before ``docker rm -f`` takes
+    forge-prod down. Without ``--frozen`` that read can rewrite ``uv.lock``;
+    without ``--no-sync`` it re-installs the virtual environment and can reach
+    the network to resolve dependencies. Neither belongs in front of a
+    container's removal, and a rewritten lock file is a change nobody asked
+    for, in a checkout somebody else may be sharing.
+    """
+    config = _write_config(tmp_path)
+
+    result = _run_script(tmp_path, config)
+
+    assert result.returncode == 0, result.stderr
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "uv.lock"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == ""
+
+
+def test_the_map_read_asks_uv_not_to_touch_the_lock_or_the_venv():
+    """The flags themselves, so a future edit cannot drop them by accident."""
+    line = [
+        line
+        for line in RECREATE_SCRIPT.read_text(encoding="utf-8").splitlines()
+        if "forge repo-paths" in line and line.startswith("REPO_PATHS=")
+    ]
+    assert len(line) == 1
+    assert "--frozen" in line[0]
+    assert "--no-sync" in line[0]
 
 
 def test_the_script_refuses_when_the_map_names_no_checkouts(tmp_path):

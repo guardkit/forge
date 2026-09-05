@@ -12,7 +12,11 @@ command prints each distinct path once, sorted, one per line, and nothing else:
 its whole job is to be read by a shell loop.
 
 ``--config`` is accepted here as well as on the group so the recreate script can
-say ``uv run forge repo-paths --config "$FORGE_CONFIG"`` in one line.
+say ``uv run forge repo-paths --config "$FORGE_CONFIG"`` in one line. A config
+that cannot be read — missing, not valid YAML, or not a shape ``forge.yaml``
+accepts — comes back as one plain sentence and a non-zero exit, never a
+traceback: the recreate script prints this command's stderr to a human who is
+about to take a container down.
 """
 
 from __future__ import annotations
@@ -41,7 +45,10 @@ def distinct_repo_paths(config: Any) -> list[str]:
 @click.option(
     "--config",
     "config_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    # NOT ``exists=True``: a missing file is answered by the plain sentence
+    # below, in the same voice as a malformed one, rather than by Click's
+    # usage error.
+    type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Path to forge.yaml. Defaults to whichever config the group loaded.",
 )
@@ -51,7 +58,18 @@ def repo_paths_cmd(config: Any, config_path: Path | None) -> None:
     if config_path is not None:
         from forge.config.loader import load_config
 
-        config = load_config(config_path)
+        try:
+            config = load_config(config_path)
+        except FileNotFoundError:
+            raise click.ClickException(
+                f"there is no file at {config_path} to read the repository map from"
+            ) from None
+        except Exception as exc:  # noqa: BLE001 — every failure reads the same
+            raise click.ClickException(
+                f"{config_path} could not be read as a forge.yaml — it is not "
+                f"valid YAML, or it is missing something forge.yaml must have "
+                f"({exc.__class__.__name__})"
+            ) from None
     if config is None:
         raise click.ClickException(
             "no forge.yaml to read — pass --config /path/to/forge.yaml, or run "

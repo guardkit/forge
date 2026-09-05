@@ -30,6 +30,10 @@ from forge.config.loader import load_config
 #: fallback below can be exercised end to end.
 _REAL_DISCOVER = register_repo._discover_test_roots
 
+#: The real estate gate, captured before the autouse fixture stubs it, so the
+#: gate's own branches can be exercised directly without docker.
+_REAL_ESTATE_STEP = register_repo._estate_step
+
 # A comment on nearly every block: this is what must survive the edit.
 FIXTURE_CONFIG = """\
 # forge.yaml — the fixture. Every comment in this file is load-bearing prose.
@@ -105,7 +109,11 @@ def _isolate(monkeypatch, tmp_path):
     # A tmp_path checkout belongs to whoever runs the suite; the uid rule is
     # exercised directly in its own test.
     monkeypatch.setattr(register_repo, "EXPECTED_OWNER_UID", os.getuid())
-    monkeypatch.setattr(register_repo, "_estate_status_views", lambda: [])
+    monkeypatch.setattr(
+        register_repo,
+        "_estate_step",
+        lambda: register_repo.Step("estate", "ok", "all builds terminal"),
+    )
     monkeypatch.setattr(
         register_repo, "_discover_test_roots", lambda repo: ["tests/smoke"]
     )
@@ -299,6 +307,55 @@ def test_missing_toolchain_test_flag_is_refused(_isolate, tmp_path):
     assert result.exit_code == 1
     assert "--toolchain-test" in result.output
     assert config.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("bad", ["guardkit/bench-one", "../bench-one", "a\\b"])
+def test_a_name_with_a_path_separator_is_refused_before_anything_is_written(
+    _isolate, tmp_path, bad
+):
+    """The name becomes two map keys, a folder name and part of a backup's name.
+
+    A separator in it would mint the key ``guardkit/guardkit/bench-one``, which
+    nothing looks up, and would put the dated backup in another directory. It is
+    refused before the first write, so both files are exactly as they were —
+    checked by mtime, not by reading, so "nothing was written" means nothing at
+    all, not "nothing that changed the bytes".
+    """
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    repo_config = repo / ".guardkit" / "config.yaml"
+    config = _write_config(tmp_path)
+    before = (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns)
+    before_text = config.read_text(encoding="utf-8")
+
+    result = _run(config, str(repo), "--name", bad)
+
+    assert result.exit_code == 1
+    assert "path separator" in result.output
+    assert (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns) == before
+    assert config.read_text(encoding="utf-8") == before_text
+    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
+
+
+def test_the_separator_refusal_is_a_refused_step_named_name(_isolate, tmp_path):
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--name", "guardkit/bench-one", "--json")
+
+    payload = json.loads(result.output.split("Error:")[0])
+    assert payload[-1]["status"] == "refused"
+    assert payload[-1]["step"] == "name"
+
+
+def test_a_plain_name_is_still_accepted(_isolate, tmp_path):
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--name", "bench_one")
+
+    assert result.exit_code == 0, result.output
+    parsed = load_config(config)
+    assert parsed.planning.target_repo_paths["guardkit/bench_one"] == str(repo)
 
 
 def test_a_refusal_is_reported_as_a_refused_step_under_json(_isolate, tmp_path):
@@ -587,33 +644,193 @@ def test_json_is_a_list_of_step_status_detail(_isolate, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_the_estate_gate_reports_non_terminal_builds_and_still_prints_the_command(
+# The gate reads a ledger. It reads it the way the recreate script of record
+# does — ask a running forge-prod container first, fall back to FORGE_DB_PATH,
+# and say so plainly when there is neither. No test here touches docker: the
+# thing that runs commands is a parameter, and every test answers it itself.
+
+
+def _fake_runner(answers):
+    """A runner that answers by command word and records what it was asked."""
+    calls: list[list[str]] = []
+
+    def run(argv):
+        argv = list(argv)
+        calls.append(argv)
+        return answers[argv[1]]  # 'inspect' or 'exec'
+
+    run.calls = calls  # type: ignore[attr-defined]
+    return run
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(
+        args=["docker"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _rows(*statuses):
+    return json.dumps(
+        [{"build_id": f"b{i}", "status": s} for i, s in enumerate(statuses)]
+    )
+
+
+def test_a_running_container_is_asked_the_way_the_recreate_script_asks_it():
+    runner = _fake_runner(
+        {
+            "inspect": _completed(stdout="true\n"),
+            "exec": _completed(stdout=_rows("COMPLETE", "FAILED")),
+        }
+    )
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert (step.status, step.detail) == ("ok", "all builds terminal")
+    assert runner.calls[1] == [
+        "docker",
+        "exec",
+        "forge-prod",
+        "forge",
+        "--config",
+        "/var/forge/forge.yaml",
+        "status",
+        "--json",
+    ]
+
+
+def test_the_container_branch_counts_the_builds_that_are_not_terminal():
+    runner = _fake_runner(
+        {
+            "inspect": _completed(stdout="true\n"),
+            "exec": _completed(stdout=_rows("COMPLETE", "RUNNING", "QUEUED")),
+        }
+    )
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert (step.status, step.detail) == ("wait", "2 builds are not terminal")
+
+
+def test_one_non_terminal_build_reads_as_a_sentence():
+    runner = _fake_runner(
+        {
+            "inspect": _completed(stdout="true\n"),
+            "exec": _completed(stdout=_rows("COMPLETE", "RUNNING")),
+        }
+    )
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert step.detail == "1 build is not terminal"
+
+
+def test_a_container_that_cannot_be_read_warns_rather_than_stopping():
+    runner = _fake_runner(
+        {
+            "inspect": _completed(stdout="true\n"),
+            "exec": _completed(returncode=1, stderr="forge status: database error"),
+        }
+    )
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert step.status == "warn"
+    assert step.detail.startswith("could not read the build ledger")
+
+
+def test_a_stopped_container_falls_through_to_the_ledger_path(monkeypatch, tmp_path):
+    """A container that exists but is down is not asked; FORGE_DB_PATH is read."""
+    ledger = tmp_path / "forge.db"
+    ledger.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
+    monkeypatch.setattr(
+        register_repo, "_read_ledger_views", lambda path: ["running-build"]
+    )
+    monkeypatch.setattr(register_repo, "_all_terminal", lambda views: False)
+    runner = _fake_runner({"inspect": _completed(stdout="false\n")})
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert (step.status, step.detail) == ("wait", "1 build is not terminal")
+    assert [c[1] for c in runner.calls] == ["inspect"]  # never asked the container
+
+
+def test_no_container_at_all_falls_through_to_the_ledger_path(monkeypatch, tmp_path):
+    ledger = tmp_path / "forge.db"
+    ledger.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
+    monkeypatch.setattr(register_repo, "_read_ledger_views", lambda path: [])
+    runner = _fake_runner({"inspect": _completed(returncode=1, stderr="No such object")})
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert (step.status, step.detail) == ("ok", "all builds terminal")
+
+
+def test_a_machine_with_no_docker_command_at_all_still_reads_the_ledger(
+    monkeypatch, tmp_path
+):
+    ledger = tmp_path / "forge.db"
+    ledger.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
+    monkeypatch.setattr(register_repo, "_read_ledger_views", lambda path: [])
+
+    def _no_docker(argv):
+        raise FileNotFoundError("docker")
+
+    step = _REAL_ESTATE_STEP(runner=_no_docker)
+
+    assert step.status == "ok"
+
+
+def test_neither_a_container_nor_a_ledger_path_says_so_plainly(monkeypatch):
+    monkeypatch.delenv("FORGE_DB_PATH", raising=False)
+    runner = _fake_runner({"inspect": _completed(returncode=1)})
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert step.status == "warn"
+    assert step.detail == (
+        "could not read the build ledger (no forge-prod container and "
+        "FORGE_DB_PATH unset)"
+    )
+
+
+def test_the_gate_reads_the_ledger_and_never_creates_one(monkeypatch, tmp_path):
+    """The read-only path, run for real against a path that is not a database.
+
+    It must warn — and it must leave no file behind. A ledger this command
+    invented would show no builds, and the gate would say "all terminal" about
+    an estate it had never read.
+    """
+    missing = tmp_path / "nowhere" / "forge.db"
+    monkeypatch.setenv("FORGE_DB_PATH", str(missing))
+    runner = _fake_runner({"inspect": _completed(returncode=1)})
+
+    step = _REAL_ESTATE_STEP(runner=runner)
+
+    assert step.status == "warn"
+    assert step.detail.startswith("could not read the build ledger")
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
+def test_the_gate_line_reaches_the_report_and_the_command_still_prints(
     _isolate, tmp_path, monkeypatch
 ):
     repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
     config = _write_config(tmp_path)
-    monkeypatch.setattr(register_repo, "_estate_status_views", lambda: ["a", "b"])
-    monkeypatch.setattr(register_repo, "_all_terminal", lambda views: False)
+    monkeypatch.setattr(
+        register_repo,
+        "_estate_step",
+        lambda: register_repo.Step("estate", "wait", "2 builds are not terminal"),
+    )
 
     result = _run(config, str(repo))
 
     assert result.exit_code == 0, result.output
-    assert "estate" in result.output
     assert "2 builds are not terminal" in result.output
     assert "run: bash ops/forge-prod-recreate.sh" in result.output
-
-
-def test_one_non_terminal_build_reads_as_a_sentence(_isolate, tmp_path, monkeypatch):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    monkeypatch.setattr(register_repo, "_estate_status_views", lambda: ["a"])
-    monkeypatch.setattr(register_repo, "_all_terminal", lambda views: False)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    assert "1 build is not terminal" in result.output
-    assert "1 builds" not in result.output
 
 
 def test_an_unreadable_build_ledger_warns_rather_than_stopping(
@@ -621,11 +838,11 @@ def test_an_unreadable_build_ledger_warns_rather_than_stopping(
 ):
     repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
     config = _write_config(tmp_path)
-
-    def _boom():
-        raise RuntimeError("no such database")
-
-    monkeypatch.setattr(register_repo, "_estate_status_views", _boom)
+    monkeypatch.setattr(
+        register_repo,
+        "_estate_step",
+        lambda: register_repo.Step("estate", "warn", "could not read the build ledger"),
+    )
 
     result = _run(config, str(repo), "--json")
 
