@@ -2112,3 +2112,97 @@ async def test_no_card_or_ping_ever_shows_a_raw_chat_id(
     assert "you sent a note" in told
     assert "you said yes to the spec" in told
     assert "You have a card listing" in told
+
+
+# ---------------------------------------------------------------------------
+# What the card promises about silence is what silence actually does
+# ---------------------------------------------------------------------------
+#
+# This door is an INLINE wait, not a paused checkpoint: ``_open_inline_door``
+# runs its own window off ``PlanningConfig.originator_wait_seconds`` and, when
+# that window closes with no answer, ends the run. The two-phase "wait, then
+# remind the same person, then wait again" in ``planning/escalation.py`` runs
+# only for a row that is durably PAUSED (every transition there is a
+# compare-and-swap from PAUSED), and this door deliberately never enters that
+# state. ``escalated_wait_seconds`` therefore has NO effect on any card in this
+# file, and a sentence promising a reminder here would promise something the
+# machine never sends.
+#
+# These two tests are the guard on that: they hold the words next to the
+# behaviour. If the door is ever changed to remind and wait again, they fail —
+# and the words must change in the same act.
+
+
+@pytest.mark.asyncio
+async def test_the_wait_the_card_promises_is_the_wait_the_door_really_keeps(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """One wait, on the person who asked, and then the run stops.
+
+    The run is driven with a one-second window and nobody answers, so the
+    SAME run proves both halves: what the card said would happen, and what
+    happened.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=1,
+    )
+
+    await h.driver.drive(CID)
+
+    # What happened: one window, then the end. No second round, no re-target.
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert [status for status, _d in _events(store, _DIGEST_STAGE)] == [
+        "GATED",
+        "timed_out",
+    ]
+    assert len(_digest_cards(h)) == 1
+
+    # What the card said would happen, in the same words.
+    card = _digest_cards(h)[0]
+    said = card.payload["details"]["summary"]["no_answer_means"]
+    assert "1 second" in said
+    assert "the run stops" in said
+
+    # And the Slack line that opened the door said the same one wait.
+    ping = next(
+        m for _c, m, _l in h.ctx["notifications"] if "You have a card listing" in m
+    )
+    assert "1 second" in ping
+    assert "stops the run" in ping
+
+    # Neither surface promises a reminder or a second window: this door sends
+    # no reminder, and the escalated wait (4 hours by default) never applies.
+    for words in (_card_text(card).lower(), ping.lower()):
+        assert "remind" not in words
+        assert "4 hours" not in words
+
+
+def test_the_sign_in_cards_own_words_about_silence_match_the_same_one_wait(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The second door's card and ping, built straight from the driver.
+
+    This door opens only when the digest door did not carry the question, and
+    it is the same inline wait — so it makes the same promise about silence
+    and no other.
+    """
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([]))
+
+    card = h.driver._auth_confirmation_card(
+        seed={"feature_slug": SLUG},
+        basis_lines=["the spec mentions a bearer token when explaining it needs none"],
+        wait_seconds=3600,
+    )
+    ping = h.driver._auth_door_open_message(CID, wait_seconds=3600)
+
+    assert "1 hour" in card["no_answer_means"]
+    assert "the run stops" in card["no_answer_means"]
+    assert "1 hour" in ping
+    assert "stops the run" in ping
+
+    for words in (json.dumps(card).lower(), ping.lower()):
+        assert "remind" not in words
+        assert "4 hours" not in words
