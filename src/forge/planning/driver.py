@@ -61,6 +61,7 @@ from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
     PlanningEscalationContext,
     _dispatch_approval_response,
+    _person_words,
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
@@ -535,26 +536,6 @@ def _reject_word_split(note: str) -> tuple[bool, str]:
         return False, ""
     rest = parts[1] if len(parts) > 1 else ""
     return True, rest.lstrip(" \t.,:;!?-\u2013\u2014").strip()
-
-
-def _person_words(identity: str | None, display_name: str | None = None) -> str:
-    """The person, in words a reader recognises — never a raw chat id.
-
-    A card and its notifications are read by the person who was asked, and on
-    2026-09-05 one of them read "U03QR8WKT29 sent a note". That string is the
-    chat system's internal member id: it identifies nobody to a human eye, and
-    it is the only identity the approval payload carries today (``decided_by``
-    and the run's ``expected_approver`` are both that id).
-
-    So: a display name if one ever travels with the answer, and otherwise the
-    word "you" — the person reading the line IS the person who was asked, since
-    the card is threaded to them. The raw id never reaches a sentence a person
-    reads; it stays on the durable row, where it belongs.
-    """
-    name = str(display_name or "").strip()
-    if name:
-        return name
-    return "you"
 
 
 def _responder_display_name(response: Any) -> str | None:

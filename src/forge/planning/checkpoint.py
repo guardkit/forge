@@ -70,6 +70,38 @@ __all__ = [
     "SecondOpinionProvider",
 ]
 
+def _person_words(identity: str | None, display_name: str | None = None) -> str:
+    """The person, in words a reader recognises — never a raw chat id.
+
+    A card and its notifications are read by the person who was asked, and on
+    2026-09-05 one of them read "U03QR8WKT29 sent a note". That string is the
+    chat system's internal member id: it identifies nobody to a human eye, and
+    it is the only identity the approval payload carries today (``decided_by``
+    and the run's ``expected_approver`` are both that id).
+
+    So: a display name if one ever travels with the answer, and otherwise the
+    word "you" — the person reading the line IS the person who was asked, since
+    the card is threaded to them. The raw id never reaches a sentence a person
+    reads; it stays on the durable row, where it belongs.
+
+    This lives here, beside the envelope builder, because the card copy that
+    builder writes needs it too — the id was still on ``action_description``
+    after the notification lines were cleaned (coach finding, 2026-09-05).
+    """
+    name = str(display_name or "").strip()
+    if name:
+        return name
+    return "you"
+
+
+def _person_possessive_words(
+    identity: str | None, display_name: str | None = None
+) -> str:
+    """The same person, in the possessive — "your word" / "Rich's word"."""
+    words = _person_words(identity, display_name)
+    return "your" if words == "you" else f"{words}'s"
+
+
 # Terminal states that accept no outgoing transitions
 _TERMINAL_STATES = {
     PlanningState.FAILED,
@@ -392,7 +424,7 @@ def build_planning_approval_envelope(
         # every machine that consumes it.
         action_description=(
             f"The full journey is waiting at {plain_stage_name(stage_label)} "
-            f"for {expected_approver or 'a human approver'}'s word "
+            f"for {_person_possessive_words(expected_approver)} word "
             f"(planning run {plan_run_id})."
         ),
         risk_level="medium",

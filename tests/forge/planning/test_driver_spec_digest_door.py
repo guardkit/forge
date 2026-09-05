@@ -1818,15 +1818,43 @@ _DIGEST_TWO_REWORDED = (
 )
 
 
-def _card_text(envelope: Any) -> str:
-    """Everything on one card a PERSON reads — the spec's own text excluded.
+#: Fields on the approval envelope that no person reads: routing keys, ids the
+#: machine addresses itself by, and the raw ``.feature`` text (one click
+#: deeper, ruled on elsewhere). EVERYTHING else on the card is prose written
+#: for a reader and must survive the raw-id sweep — reading only ``summary``
+#: is what let ``action_description`` keep saying "for U0RIGINATOR's word"
+#: while the sweep passed (coach finding, 2026-09-05).
+_MACHINE_ONLY_TOP_LEVEL = frozenset({"request_id", "agent_id"})
+_MACHINE_ONLY_DETAILS = frozenset(
+    {
+        "build_id",
+        "feature_id",
+        "stage_label",
+        "gate_mode",
+        "expected_approver",
+        "parent_request_id",
+        "originating_channel",
+    }
+)
 
-    ``worked_examples`` is the raw ``.feature``, one click deeper and ruled on
-    elsewhere; every other field on the card is prose written for a reader.
-    """
-    summary = dict(envelope.payload["details"]["summary"])
+
+def _card_text(envelope: Any) -> str:
+    """Everything on one card a PERSON reads — machine fields excluded."""
+    payload = {
+        key: value
+        for key, value in envelope.payload.items()
+        if key not in _MACHINE_ONLY_TOP_LEVEL
+    }
+    details = {
+        key: value
+        for key, value in (payload.get("details") or {}).items()
+        if key not in _MACHINE_ONLY_DETAILS
+    }
+    summary = dict(details.get("summary") or {})
     summary.pop("worked_examples", None)
-    return json.dumps(summary)
+    details["summary"] = summary
+    payload["details"] = details
+    return json.dumps(payload, default=str)
 
 
 @pytest.mark.asyncio
@@ -1980,6 +2008,10 @@ async def test_no_card_or_ping_ever_shows_a_raw_chat_id(
     assert ORIGINATOR not in told
     for card in _digest_cards(h):
         assert ORIGINATOR not in _card_text(card)
+        # The one-line summary at the top of the card is read by a person too.
+        assert "for your word" in card.payload["action_description"]
+        # The id is still on the row the machine routes by — that is not text.
+        assert card.payload["details"]["expected_approver"] == ORIGINATOR
     # And it still says who did what — in a word a person recognises.
     assert "you sent a note" in told
     assert "you said yes to the spec" in told
