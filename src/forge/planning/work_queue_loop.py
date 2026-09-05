@@ -34,6 +34,12 @@ What the loop does, in order, every tick
    created with the row's ORIGINAL correlation id. Nothing is re-published and
    no new id is minted, so every downstream receipt and the Slack thread keep
    working.
+4. **Takes out what can never be started.** A repair the admission refuses
+   for a reason that will not change — a repository the configuration does
+   not know, a budget profile with no cap, a row that names no build — is
+   closed BLOCKED with that refusal as its reason and said once in the
+   channel. A refusal that only means "not now", and a transport failure,
+   go back in the queue for the next tick as before.
 
 Beside every admission it works out which row a class order would have taken
 — fixes first, then anything whose repository has a card waiting on Rich, then
@@ -66,6 +72,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli.status import _TERMINAL_STATES as _BUILD_TERMINAL_STATES
 from forge.lifecycle.persistence import ACTIVE_STATES as _BUILD_ACTIVE_STATES
+from forge.pipeline.fix_admission import FixAdmissionRefused
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     age_phrase,
@@ -151,6 +158,10 @@ PLANNING_ACTIVE_STATES: frozenset[str] = frozenset(
         PlanningState.FEATURE_PLAN.value,
     }
 )
+
+#: The events-row action written when a repair row is refused for good and
+#: leaves the queue (conductor rewire, coach item 2).
+BLOCKED_ACTION: str = "blocked"
 
 #: How a run that ended badly is described in the row's closing reason.
 _FAILURE_WORDS: Mapping[str, str] = {
@@ -346,6 +357,11 @@ class WorkQueueLoop:
         self._start_fix = start_fix
         self._fix_build = fix_build
         self._admit_fix_rows = admit_fix_rows
+        # What the loop has already said, so it does not say it every ten
+        # seconds: the number it was last holding at, and the set of repair
+        # rows it last reported as waiting.
+        self._last_hold: int | None = None
+        self._waiting_said_for: frozenset[int] | None = None
 
     # -- one pass --------------------------------------------------------
 
@@ -501,7 +517,7 @@ class WorkQueueLoop:
         if in_flight >= self._max_in_flight:
             # Said once per change of the number, at INFO, so a queue that never
             # admits anything is visible in the log rather than silent (2026-09-05).
-            if getattr(self, "_last_hold", None) != in_flight:
+            if self._last_hold != in_flight:
                 self._last_hold = in_flight
                 logger.info(
                     "work queue: holding — %d piece(s) of work in flight against a cap of %d",
@@ -523,15 +539,9 @@ class WorkQueueLoop:
         # repairs may start.
         takeable = [row for row in eligible if self._is_takeable(row)]
         if not takeable:
-            waiting = self._class_pick(eligible)
-            logger.info(
-                "work queue: #%d (%s) is waiting and nothing may be started "
-                "— repairs are not admitted yet (conductor.admit_fix_rows is "
-                "off)",
-                waiting.queue_id,
-                waiting.label(),
-            )
+            self._say_nothing_may_start(open_rows, eligible)
             return None
+        self._waiting_said_for = None
 
         taken = takeable[0]  # list_open is already lowest rank first, then oldest
         taken_id = int(taken["id"])
@@ -584,6 +594,23 @@ class WorkQueueLoop:
             return None
         try:
             await starter(admission)
+        except FixAdmissionRefused as refusal:
+            if refusal.permanent:
+                if self._close_refused(taken, refusal):
+                    await self._say(
+                        taken, refusal_line(taken_id, refusal.message)
+                    )
+                return None
+            logger.warning(
+                "work queue: #%d could not be started this time (%s); putting "
+                "it back in the queue for the next tick",
+                taken_id,
+                refusal.message,
+            )
+            self._store.requeue(
+                taken_id, actor_identity=LOOP_ACTOR, reason=refusal.message
+            )
+            return None
         except Exception as exc:  # noqa: BLE001 — never lose the sentence
             logger.exception(
                 "work queue: starting the planning run for #%d failed (%s); "
@@ -596,6 +623,82 @@ class WorkQueueLoop:
             )
             return None
         return taken_id
+
+    def _say_nothing_may_start(
+        self, open_rows: Sequence[sqlite3.Row], eligible: Sequence[sqlite3.Row]
+    ) -> None:
+        """Say once — not every ten seconds — that nothing here may be started.
+
+        The queue holds only repair rows and repairs are shut, so this tick
+        starts nothing. Said at INFO once per CHANGE of the repair rows that
+        are open: a queue left alone for a day would otherwise write the same
+        line eight and a half thousand times, and a line nobody can read is
+        the same as no line at all.
+        """
+        waiting_now = frozenset(
+            int(row["id"]) for row in open_rows if str(row["kind"]) == FIX_KIND
+        )
+        if waiting_now == self._waiting_said_for:
+            return
+        self._waiting_said_for = waiting_now
+        waiting = self._class_pick(eligible)
+        logger.info(
+            "work queue: #%d (%s) is waiting and nothing may be started "
+            "— repairs are not admitted yet (conductor.admit_fix_rows is "
+            "off)",
+            waiting.queue_id,
+            waiting.label(),
+        )
+
+    def _close_refused(
+        self, row: sqlite3.Row, refusal: FixAdmissionRefused
+    ) -> bool:
+        """Take a row out of the queue that will be refused the same way for ever.
+
+        An unknown repository, a budget profile with no cap, a row that names
+        no build: offering one of those to the admission again on the next
+        tick, and every tick after it, changes nothing and hides everything
+        behind it. The row closes BLOCKED with the refusal's own sentence as
+        its reason.
+
+        Returns whether the row was actually closed here: a row someone
+        dropped in the same moment is already out of the queue, and nothing
+        more should be said about it.
+        """
+        queue_id = int(row["id"])
+        logger.warning(
+            "work queue: #%d cannot be started (%s: %s); closing it and "
+            "taking it out of the queue",
+            queue_id,
+            refusal.reason,
+            refusal.message,
+        )
+        if not self._store.close(
+            queue_id,
+            status="BLOCKED",
+            actor_identity=LOOP_ACTOR,
+            reason=refusal.message,
+        ):
+            return False
+        try:
+            self._store.record_event(
+                queue_id=queue_id,
+                action=BLOCKED_ACTION,
+                actor_identity=LOOP_ACTOR,
+                details={
+                    "reason": refusal.reason,
+                    "message": refusal.message,
+                    "permanent": True,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — a note never costs the close
+            logger.warning(
+                "work queue: could not write the blocked note for #%d (%s: %s)",
+                queue_id,
+                type(exc).__name__,
+                exc,
+            )
+        return True
 
     def _is_takeable(self, row: sqlite3.Row) -> bool:
         """True when this row may be STARTED, not merely chosen.
@@ -830,6 +933,15 @@ class WorkQueueLoop:
             await sleeper(interval_seconds)
 
 
+def refusal_line(queue_id: int, reason: str) -> str:
+    """The one line the channel gets when a row is refused for good."""
+    trimmed = " ".join(str(reason).split()).rstrip(".")
+    return (
+        f"#{queue_id} cannot be started: {trimmed}. It is out of the queue; "
+        "drop it or fix the cause and send it again."
+    )
+
+
 def shadow_line(shadow: Pick, taken_id: int) -> str:
     """The one line the loop says when the class order disagrees with the queue."""
     return (
@@ -851,6 +963,7 @@ def _parse(moment: str) -> datetime:
 
 __all__ = [
     "Admission",
+    "BLOCKED_ACTION",
     "BUILD_FAILURE_STATES",
     "BUILD_SUCCESS_STATES",
     "BUILD_TERMINAL_STATES",
@@ -866,5 +979,6 @@ __all__ = [
     "WorkQueueLoop",
     "count_in_flight",
     "paused_repositories",
+    "refusal_line",
     "shadow_line",
 ]
