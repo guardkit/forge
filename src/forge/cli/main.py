@@ -8,6 +8,8 @@ every subcommand currently shipped:
 * ``forge history`` (TASK-PSM-010 — read-path bypass to SQLite)
 * ``forge cancel`` (TASK-PSM-011 — thin wrapper over CliSteeringHandler)
 * ``forge skip`` (TASK-PSM-011 — thin wrapper over CliSteeringHandler)
+* ``forge register-repo`` (register-repo spec 2026-09-05 — takes a git
+  checkout to "the factory can build in it")
 
 The ``[project.scripts]`` entry in ``pyproject.toml`` (TASK-PSM-012) wires
 ``forge.cli.main:main`` to the ``forge`` console script so
@@ -41,6 +43,7 @@ from forge.cli import deploy as _deploy
 from forge.cli import history as _history
 from forge.cli import merge_deploy as _merge_deploy
 from forge.cli import queue as _queue
+from forge.cli import register_repo as _register_repo
 from forge.cli import review_gate as _review_gate
 from forge.cli import runbook as _runbook
 from forge.cli import serve as _serve
@@ -104,6 +107,7 @@ main.add_command(_deploy.deploy_cmd)
 main.add_command(_merge_deploy.merge_deploy_cmd)
 main.add_command(_runbook.runbook_cmd)
 main.add_command(_review_gate.review_gate_cmd)
+main.add_command(_register_repo.register_repo_cmd)
 
 
 __all__ = ["CliRuntime", "build_cli_runtime", "main"]
