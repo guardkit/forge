@@ -17,6 +17,7 @@ from forge.lifecycle import migrations
 from forge.planning.work_queue_commands import (
     age_phrase,
     execute_command,
+    NOT_A_ROW_NUMBER,
     list_reply,
     queued_reply,
 )
@@ -314,3 +315,192 @@ class TestEventsAndUnknownVerbs:
         reply = _run(store, {"verb": "explode", "id": 1})
         assert reply == "I do not know that queue command, so I have changed nothing."
         assert len(store.list_open()) == 1
+
+
+# ---------------------------------------------------------------------------
+# "In front of #12" when #12 is gone (coaches' correction, 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+class TestBeforeARowThatIsGone:
+    """The same line every other verb gives, and nothing filed."""
+
+    def test_a_withdrawn_row_gets_the_closed_line(
+        self, store: WorkQueueStore
+    ) -> None:
+        filed = _file(store, "plan-1")
+        store.drop(filed.queue_id, actor_identity=USER)
+        reply = _run(
+            store,
+            {
+                "verb": "add_before",
+                "id": filed.queue_id,
+                "sentence": "do this one sooner",
+            },
+            correlation_id="plan-before",
+        )
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it is withdrawn."
+        )
+        assert store.get_by_correlation_id("plan-before") is None
+        assert store.list_open() == []
+
+    def test_a_finished_row_gets_the_closed_line(
+        self, store: WorkQueueStore
+    ) -> None:
+        filed = _file(store, "plan-1")
+        store.close(filed.queue_id, status="DONE", actor_identity="forge")
+        reply = _run(
+            store,
+            {
+                "verb": "add_before",
+                "id": filed.queue_id,
+                "sentence": "do this one sooner",
+            },
+            correlation_id="plan-before",
+        )
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it is done."
+        )
+        assert store.get_by_correlation_id("plan-before") is None
+
+    def test_a_blocked_row_gets_the_closed_line(self, store: WorkQueueStore) -> None:
+        filed = _file(store, "plan-1")
+        store.close(
+            filed.queue_id,
+            status="BLOCKED",
+            actor_identity="forge",
+            reason="the planning run failed",
+        )
+        reply = _run(
+            store,
+            {
+                "verb": "add_before",
+                "id": filed.queue_id,
+                "sentence": "do this one sooner",
+            },
+            correlation_id="plan-before",
+        )
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it is blocked."
+        )
+        assert store.get_by_correlation_id("plan-before") is None
+
+    def test_it_never_goes_to_the_back_of_the_queue(
+        self, store: WorkQueueStore
+    ) -> None:
+        gone = _file(store, "plan-1")
+        waiting = _file(store, "plan-2")
+        store.drop(gone.queue_id, actor_identity=USER)
+        _run(
+            store,
+            {"verb": "add_before", "id": gone.queue_id, "sentence": "sneak in"},
+            correlation_id="plan-before",
+        )
+        assert [int(row["id"]) for row in store.list_open()] == [waiting.queue_id]
+
+
+# ---------------------------------------------------------------------------
+# Row numbers that could never name a row
+# ---------------------------------------------------------------------------
+
+
+IMPOSSIBLE_IDS = [0, -1, 10**12, "\u0661\u0662", "12", None, 12.5]
+
+
+class TestImpossibleRowNumbers:
+    """Jarvis forwards whatever matched its pattern; the forge checks it."""
+
+    @pytest.mark.parametrize("value", IMPOSSIBLE_IDS)
+    @pytest.mark.parametrize("verb", ["promote", "keep", "drop"])
+    def test_one_plain_reply_and_nothing_changes(
+        self, store: WorkQueueStore, verb: str, value: object
+    ) -> None:
+        filed = _file(store, "plan-1")
+        assert _run(store, {"verb": verb, "id": value}) == NOT_A_ROW_NUMBER
+        row = store.get(filed.queue_id)
+        assert row["status"] == "QUEUED" and row["keep_count"] == 0
+        assert [e["action"] for e in store.list_events(filed.queue_id)] == ["queued"]
+
+    @pytest.mark.parametrize("value", IMPOSSIBLE_IDS)
+    def test_a_link_either_way_round(
+        self, store: WorkQueueStore, value: object
+    ) -> None:
+        filed = _file(store, "plan-1")
+        assert (
+            _run(store, {"verb": "link", "id": filed.queue_id, "after": value})
+            == NOT_A_ROW_NUMBER
+        )
+        assert (
+            _run(store, {"verb": "link", "id": value, "after": filed.queue_id})
+            == NOT_A_ROW_NUMBER
+        )
+        assert store.get(filed.queue_id)["after_id"] is None
+
+    @pytest.mark.parametrize("value", IMPOSSIBLE_IDS)
+    def test_before_files_nothing(
+        self, store: WorkQueueStore, value: object
+    ) -> None:
+        _file(store, "plan-1")
+        reply = _run(
+            store,
+            {"verb": "add_before", "id": value, "sentence": "do this one sooner"},
+            correlation_id="plan-before",
+        )
+        assert reply == NOT_A_ROW_NUMBER
+        assert store.get_by_correlation_id("plan-before") is None
+
+
+# ---------------------------------------------------------------------------
+# Waits that would never end
+# ---------------------------------------------------------------------------
+
+
+class TestLinksThatWouldNeverEnd:
+    def test_a_row_cannot_be_told_to_wait_for_itself(
+        self, store: WorkQueueStore
+    ) -> None:
+        filed = _file(store, "plan-1")
+        reply = _run(
+            store, {"verb": "link", "id": filed.queue_id, "after": filed.queue_id}
+        )
+        assert reply == f"#{filed.queue_id} cannot wait for itself."
+        assert store.get(filed.queue_id)["after_id"] is None
+        assert [e["action"] for e in store.list_events(filed.queue_id)] == ["queued"]
+
+    def test_a_circle_is_refused_in_one_line(self, store: WorkQueueStore) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        _run(store, {"verb": "link", "id": first.queue_id, "after": second.queue_id})
+        reply = _run(
+            store, {"verb": "link", "id": second.queue_id, "after": first.queue_id}
+        )
+        assert reply == (
+            f"#{second.queue_id} cannot wait for #{first.queue_id}, because "
+            f"#{first.queue_id} is already waiting on #{second.queue_id}."
+        )
+        assert store.get(second.queue_id)["after_id"] is None
+        assert [e["action"] for e in store.list_events(second.queue_id)] == ["queued"]
+
+    def test_a_longer_circle_is_refused_too(self, store: WorkQueueStore) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        third = _file(store, "plan-3")
+        _run(store, {"verb": "link", "id": first.queue_id, "after": second.queue_id})
+        _run(store, {"verb": "link", "id": second.queue_id, "after": third.queue_id})
+        reply = _run(
+            store, {"verb": "link", "id": third.queue_id, "after": first.queue_id}
+        )
+        assert reply.startswith(f"#{third.queue_id} cannot wait for #{first.queue_id}")
+        assert store.get(third.queue_id)["after_id"] is None
+
+    def test_an_ordinary_wait_still_works(self, store: WorkQueueStore) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        reply = _run(
+            store, {"verb": "link", "id": second.queue_id, "after": first.queue_id}
+        )
+        assert reply == (
+            f"#{second.queue_id} will wait until #{first.queue_id} is done."
+        )
+        assert store.get(second.queue_id)["after_id"] == first.queue_id

@@ -30,6 +30,7 @@ from forge.lifecycle import migrations
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_loop import (
     LOOP_ACTOR,
+    STALE_TICK_INTERVAL_SECONDS,
     Admission,
     WorkQueueLoop,
     count_in_flight,
@@ -61,22 +62,41 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         self._instant = self._instant + timedelta(seconds=seconds)
 
+    def set_to(self, instant: datetime) -> None:
+        """Put the clock at an exact moment, in whatever timezone it names."""
+        self._instant = instant
+
     async def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         self.advance(seconds)
 
 
 class RunMaker:
-    """Stands in for creating and starting the planning run."""
+    """Stands in for creating and starting the planning run.
 
-    def __init__(self, *, fail_with: Exception | None = None) -> None:
+    Like the real thing, a run that starts leaves a planning run behind it —
+    the loop reads that to know the row is really under way, and puts back any
+    admitted row that has none.
+    """
+
+    def __init__(
+        self,
+        *,
+        runs: dict[str, dict[str, Any]] | None = None,
+        fail_with: Exception | None = None,
+    ) -> None:
         self.admissions: list[Admission] = []
+        self._runs = runs if runs is not None else {}
         self._fail_with = fail_with
 
     async def __call__(self, admission: Admission) -> None:
         self.admissions.append(admission)
         if self._fail_with is not None:
             raise self._fail_with
+        self._runs.setdefault(
+            admission.correlation_id,
+            {"state": PlanningState.QUEUED.value, "error": None},
+        )
 
 
 class Notifier:
@@ -145,7 +165,7 @@ def build_loop(
     max_in_flight: int = 1,
     stale_after_days: int = 7,
 ) -> tuple[WorkQueueLoop, RunMaker]:
-    maker = run_maker or RunMaker()
+    maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
         store,
         count_in_flight=lambda: in_flight,
@@ -577,7 +597,7 @@ class TestClosingAdmittedRows:
         file_row(store, "plan-1")
         file_row(store, "plan-2")
         busy = {"count": 0}
-        maker = RunMaker()
+        maker = RunMaker(runs=runs)
         loop = WorkQueueLoop(
             store,
             count_in_flight=lambda: busy["count"],
@@ -1078,3 +1098,369 @@ def _planning_msg() -> Any:
     msg.ack = AsyncMock()
     msg.nak = AsyncMock()
     return msg
+
+
+# ---------------------------------------------------------------------------
+# Picking up what was dropped (coaches' correction, 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+class DeadRunMaker(RunMaker):
+    """A run maker that reports success and leaves no planning run behind.
+
+    What a forge that stops in the moment between marking a row admitted and
+    creating its run looks like from the next boot's point of view.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(runs={})
+
+
+class TestPickingUpWhatWasDropped:
+    @pytest.mark.asyncio
+    async def test_a_row_admitted_with_no_run_behind_it_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        stopped, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            run_maker=DeadRunMaker(),
+        )
+        await stopped.take_next()
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+        # The forge comes back up.
+        fresh, maker = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        assert fresh.recover_admitted() == [queue_id]
+
+        row = store.get(queue_id)
+        assert row["status"] == "QUEUED"
+        assert row["admitted_at"] is None
+        assert "requeued" in [e["action"] for e in store.list_events(queue_id)]
+
+    @pytest.mark.asyncio
+    async def test_the_sentence_is_taken_again_on_the_next_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        file_row(store, "plan-1")
+        stopped, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            run_maker=DeadRunMaker(),
+        )
+        await stopped.take_next()
+
+        fresh, maker = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        await fresh.tick()
+
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_it_happens_before_the_first_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        stopped, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            run_maker=DeadRunMaker(),
+        )
+        await stopped.take_next()
+
+        fresh, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        await fresh.run(sleep=clock.sleep, iterations=0)
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_row_with_a_run_behind_it_is_left_alone(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        await loop.take_next()
+        runs["plan-1"] = {"state": PlanningState.RUNNING.value, "error": None}
+
+        assert loop.recover_admitted() == []
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+    @pytest.mark.asyncio
+    async def test_a_row_still_waiting_is_left_alone(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+
+        assert loop.recover_admitted() == []
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert [e["action"] for e in store.list_events(queue_id)] == ["queued"]
+
+
+# ---------------------------------------------------------------------------
+# Slack never stops the work (coaches' correction, 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+class ExplodingNotifier:
+    """A notifier that fails the way an unreachable Slack would."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(
+        self,
+        correlation_id: str,
+        message: str,
+        *,
+        parent_request_id: str | None = None,
+    ) -> None:
+        self.calls.append((correlation_id, message))
+        raise RuntimeError("Slack is not answering")
+
+    @property
+    def messages(self) -> list[str]:
+        return [message for _, message in self.calls]
+
+
+class TwoArgumentNotifier:
+    """An older notifier that knows nothing about threads."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, correlation_id: str, message: str) -> None:
+        self.calls.append((correlation_id, message))
+
+    @property
+    def messages(self) -> list[str]:
+        return [message for _, message in self.calls]
+
+
+class TypeErrorNotifier:
+    """A notifier that takes the thread and then breaks on its own account."""
+
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    async def __call__(
+        self,
+        correlation_id: str,
+        message: str,
+        *,
+        parent_request_id: str | None = None,
+    ) -> None:
+        self.calls.append(parent_request_id)
+        raise TypeError("something inside the notifier broke")
+
+
+class TestSlackNeverStopsTheWork:
+    @staticmethod
+    def _two_rows_the_orders_disagree_about(store: WorkQueueStore) -> None:
+        """A feature first and a fix behind it, so the loop has a line to say."""
+        file_row(store, "plan-1", kind="feature")
+        file_row(store, "plan-2", kind="fix")
+
+    @pytest.mark.asyncio
+    async def test_a_notifier_that_fails_does_not_stop_the_admission(
+        self, store: WorkQueueStore, clock: FakeClock, runs: dict
+    ) -> None:
+        self._two_rows_the_orders_disagree_about(store)
+        notifier = ExplodingNotifier()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,  # type: ignore[arg-type]
+            runs=runs,
+        )
+
+        taken = await loop.take_next()
+
+        assert taken is not None
+        assert notifier.calls  # it did try to say something
+        assert store.get(taken)["status"] == "ADMITTED"
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_notifier_that_fails_does_not_stop_a_whole_tick(
+        self, store: WorkQueueStore, clock: FakeClock, runs: dict
+    ) -> None:
+        self._two_rows_the_orders_disagree_about(store)
+        notifier = ExplodingNotifier()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,  # type: ignore[arg-type]
+            runs=runs,
+        )
+
+        await loop.tick()
+
+        assert len(maker.admissions) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_older_notifier_is_called_with_the_two_it_takes(
+        self, store: WorkQueueStore, clock: FakeClock, runs: dict
+    ) -> None:
+        self._two_rows_the_orders_disagree_about(store)
+        notifier = TwoArgumentNotifier()
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,  # type: ignore[arg-type]
+            runs=runs,
+        )
+
+        await loop.take_next()
+
+        assert len(notifier.calls) == 1
+        assert notifier.messages[0].startswith("next I'd pick")
+
+    @pytest.mark.asyncio
+    async def test_a_notifier_that_breaks_is_not_called_a_second_time(
+        self, store: WorkQueueStore, clock: FakeClock, runs: dict
+    ) -> None:
+        # The old code decided how to call the notifier by calling it and
+        # catching TypeError, so a TypeError from INSIDE the notifier looked
+        # like a notifier that takes two arguments and the message went twice.
+        self._two_rows_the_orders_disagree_about(store)
+        notifier = TypeErrorNotifier()
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,  # type: ignore[arg-type]
+            runs=runs,
+        )
+
+        await loop.take_next()
+
+        assert notifier.calls == [THREAD]
+
+
+# ---------------------------------------------------------------------------
+# How often the forge asks about old sentences (coaches' correction)
+# ---------------------------------------------------------------------------
+
+
+class TestTheStaleCheckCadence:
+    def test_the_check_is_daily(self) -> None:
+        assert STALE_TICK_INTERVAL_SECONDS == 24 * 60 * 60.0
+
+    @pytest.mark.asyncio
+    async def test_the_first_check_comes_a_day_after_boot_not_a_week(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        file_row(store, "plan-1")
+        clock.advance(8 * 24 * 60 * 60)
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, in_flight=1
+        )
+
+        # Thirty hours of ticks — more than a day, nothing like a week.
+        await loop.run(
+            sleep=clock.sleep,
+            interval_seconds=6 * 60 * 60,
+            iterations=5,
+        )
+
+        assert len([m for m in notifier.messages if "waiting a while" in m]) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_old_weekly_schedule_would_have_said_nothing(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        file_row(store, "plan-1")
+        clock.advance(8 * 24 * 60 * 60)
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, in_flight=1
+        )
+
+        await loop.run(
+            sleep=clock.sleep,
+            interval_seconds=6 * 60 * 60,
+            stale_interval_seconds=7 * 24 * 60 * 60,
+            iterations=5,
+        )
+
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_daily_check_still_only_asks_once_a_week(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        clock.advance(8 * 24 * 60 * 60)
+
+        assert await loop.stale_tick() == [queue_id]
+        for _ in range(6):
+            clock.advance(24 * 60 * 60)
+            assert await loop.stale_tick() == []
+        assert len(notifier.messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_it_asks_again_once_the_quiet_week_is_over(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        clock.advance(8 * 24 * 60 * 60)
+        await loop.stale_tick()
+
+        clock.advance(7 * 24 * 60 * 60)
+
+        assert await loop.stale_tick() == [queue_id]
+        assert len(notifier.messages) == 2
+
+
+# ---------------------------------------------------------------------------
+# "Go" is judged by the clock, not by how the timestamp is spelled
+# ---------------------------------------------------------------------------
+
+
+class TestGoIsJudgedByTheClock:
+    @pytest.mark.asyncio
+    async def test_a_promote_from_before_the_question_is_not_go(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        first = file_row(store, "plan-1")
+        second = file_row(store, "plan-2")
+        store.link(second, first, actor_identity=USER)
+        store.drop(first, actor_identity=USER)
+        loop, maker = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+
+        # Someone moved the row half an hour BEFORE the forge asked, from a
+        # place two hours ahead of London. As text "10:30+02:00" sorts after
+        # "09:00+00:00"; as a moment in time it comes first.
+        clock.set_to(datetime(2026, 9, 5, 10, 30, tzinfo=timezone(timedelta(hours=2))))
+        store.promote(second, actor_identity=USER)
+        clock.set_to(datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc))
+        await loop.ask_hold_or_go()
+
+        assert await loop.take_next() is None
+        assert maker.admissions == []
+        assert store.get(second)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_promote_after_the_question_is_go(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        first = file_row(store, "plan-1")
+        second = file_row(store, "plan-2")
+        store.link(second, first, actor_identity=USER)
+        store.drop(first, actor_identity=USER)
+        loop, maker = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+
+        clock.set_to(datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc))
+        await loop.ask_hold_or_go()
+        clock.set_to(datetime(2026, 9, 5, 11, 30, tzinfo=timezone(timedelta(hours=2))))
+        store.promote(second, actor_identity=USER)
+
+        assert await loop.take_next() == second
+        assert [a.correlation_id for a in maker.admissions] == ["plan-2"]

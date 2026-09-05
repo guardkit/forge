@@ -14,6 +14,12 @@ Public surface
 What the loop does, in order, every tick
 ----------------------------------------
 
+0. **Picks up what was dropped.** A row marked admitted whose planning run
+   does not exist — the forge stopped between the two, or the notification
+   after the admission failed — is put back in the queue with a line in the
+   log, at the start of every tick and once more when the loop starts. Left
+   alone it would sit admitted for ever and the queue behind it would never
+   move.
 1. **Closes what has finished.** Every admitted row's planning run is read;
    a run that ended well closes the row done, a run that ended badly closes
    it blocked with the reason. There is no callback on the planning store's
@@ -60,7 +66,10 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli.status import _TERMINAL_STATES as _BUILD_TERMINAL_STATES
 from forge.planning.states import PlanningState
-from forge.planning.work_queue_commands import age_phrase
+from forge.planning.work_queue_commands import (
+    age_phrase,
+    notifier_takes_parent_request_id,
+)
 from forge.planning.work_queue_store import WorkQueueStore
 
 logger = logging.getLogger(__name__)
@@ -69,8 +78,16 @@ logger = logging.getLogger(__name__)
 #: How often the loop looks at the queue (contract 6).
 TAKE_NEXT_INTERVAL_SECONDS: float = 10.0
 
-#: How often the loop asks about sentences that have been waiting (contract 8).
-STALE_TICK_INTERVAL_SECONDS: float = 7 * 24 * 60 * 60.0
+#: How often the loop looks for sentences that have been waiting (contract 8
+#: as the coaches read it on 2026-09-05): every day, and the first look one
+#: day after the forge starts rather than a week after. A forge restarted
+#: every few days used to reach the end of the week and start counting again,
+#: so nobody was ever asked.
+STALE_TICK_INTERVAL_SECONDS: float = 24 * 60 * 60.0
+
+#: How long the forge leaves a row alone after asking about it before asking
+#: again — the week the message itself promises.
+STALE_REPING_DAYS: int = 7
 
 #: Who the loop is, on the events rows it writes.
 LOOP_ACTOR: str = "forge-work-queue"
@@ -229,7 +246,9 @@ class WorkQueueLoop:
             the same in-process step the intake took before the queue existed.
         notify:
             Says one sentence in Slack: ``notify(correlation_id, message)``,
-            optionally with ``parent_request_id=`` for the thread.
+            optionally with ``parent_request_id=`` for the thread. Whether
+            this one takes that argument is read from it here, once, and
+            remembered.
         """
         self._store = store
         self._count_in_flight = count_in_flight
@@ -239,15 +258,49 @@ class WorkQueueLoop:
         self._notify = notify
         self._max_in_flight = max_in_flight
         self._stale_after_days = stale_after_days
+        self._notify_takes_thread = notifier_takes_parent_request_id(notify)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     # -- one pass --------------------------------------------------------
 
     async def tick(self) -> None:
-        """Close what finished, ask about a broken chain, take the next one."""
+        """Pick up what was dropped, close what finished, take the next one."""
+        self.recover_admitted()
         self.close_finished()
         await self.ask_hold_or_go()
         await self.take_next()
+
+    # -- 0. picking up what was dropped ----------------------------------
+
+    def recover_admitted(self) -> list[int]:
+        """Put back every admitted row that has no planning run behind it.
+
+        Two ways a row gets stuck this way: the forge stopped in the moment
+        between marking the row admitted and creating its run, or something
+        in the reply path threw where the admission could still see it. Either
+        way nothing will ever finish the row, and with a cap of one in flight
+        the whole queue stops behind it. Returns the ids put back.
+        """
+        recovered: list[int] = []
+        for row in self._store.list_open():
+            if str(row["status"]) != "ADMITTED":
+                continue
+            if self._planning_run(str(row["correlation_id"])) is not None:
+                continue
+            queue_id = int(row["id"])
+            if self._store.requeue(
+                queue_id,
+                actor_identity=LOOP_ACTOR,
+                reason="it was admitted but no planning run was ever created",
+            ):
+                logger.warning(
+                    "work queue: #%d was admitted but has no planning run "
+                    "(correlation id %s); putting it back in the queue",
+                    queue_id,
+                    str(row["correlation_id"]),
+                )
+                recovered.append(queue_id)
+        return recovered
 
     # -- 1. closing ------------------------------------------------------
 
@@ -420,7 +473,12 @@ class WorkQueueLoop:
         if asked is None:
             return False
         promoted = self._store.latest_event_at(queue_id, "promote")
-        return promoted is not None and promoted >= asked
+        if promoted is None:
+            return False
+        # Both are timestamps, so compare them as timestamps. As text,
+        # "2026-09-05T10:30:00+02:00" sorts after "2026-09-05T09:00:00+00:00"
+        # although it happened half an hour earlier.
+        return _parse(promoted) >= _parse(asked)
 
     def _class_pick(self, eligible: Sequence[sqlite3.Row]) -> Pick:
         """Which row the class order would take — fixes, cards, features, questions."""
@@ -476,14 +534,21 @@ class WorkQueueLoop:
     # -- staleness -------------------------------------------------------
 
     async def stale_tick(self) -> list[int]:
-        """Ask, in one message, about every sentence that has waited too long."""
+        """Ask, in one message, about every sentence that has waited too long.
+
+        Run daily. A row joins the message when it has been waiting longer
+        than the threshold AND has not been asked about in the last week —
+        which is what the message itself promises.
+        """
         now = self._clock()
         threshold = timedelta(days=self._stale_after_days)
+        quiet_week = timedelta(days=STALE_REPING_DAYS)
         stale = [
             row
             for row in self._store.list_open()
             if str(row["status"]) == "QUEUED"
             and (now - self._waiting_since(row)) >= threshold
+            and not self._asked_lately(row, now, quiet_week)
         ]
         if not stale:
             return []
@@ -508,35 +573,49 @@ class WorkQueueLoop:
         return [int(row["id"]) for row in stale]
 
     def _waiting_since(self, row: sqlite3.Row) -> datetime:
-        """When this row's staleness clock last started.
+        """When this row's waiting clock last started.
 
-        The clock starts when the sentence was filed, and starts again every
-        time someone says ``keep`` or the forge has already asked about it —
-        so nobody is asked about the same row twice in one week.
+        The clock starts when the sentence was filed, and starts again when
+        someone says ``keep`` — that is what keeping it means. Being asked
+        about does not restart it; it only buys the row a quiet week, which
+        :meth:`_asked_lately` handles.
         """
         moments = [str(row["queued_at"])]
-        if row["stale_pinged_at"]:
-            moments.append(str(row["stale_pinged_at"]))
         kept = self._store.latest_event_at(int(row["id"]), "keep")
         if kept:
             moments.append(kept)
         return max(_parse(moment) for moment in moments)
 
+    @staticmethod
+    def _asked_lately(row: sqlite3.Row, now: datetime, quiet: timedelta) -> bool:
+        """True when this row was already asked about inside the quiet week."""
+        asked = row["stale_pinged_at"]
+        if not asked:
+            return False
+        return (now - _parse(str(asked))) < quiet
+
     # -- saying things ---------------------------------------------------
 
     async def _say(self, row: sqlite3.Row, message: str) -> None:
-        """One sentence in the thread the row's sentence arrived in."""
-        origin = self._store.origin_details(int(row["id"]))
+        """One sentence in the thread the row's sentence arrived in.
+
+        Nothing that happens in here reaches the caller. Whether the notifier
+        takes the thread was settled when the loop was wired up, so there is
+        no call made to find out; and anything the notifier throws is logged
+        and dropped, because the work starting must never depend on Slack
+        being reachable.
+        """
+        correlation_id = str(row["correlation_id"])
         try:
-            await self._notify(
-                str(row["correlation_id"]),
-                message,
-                parent_request_id=origin.get("parent_request_id"),
-            )
-        except TypeError:
-            # A notifier that takes only the two arguments (an older callable,
-            # a test double) still gets its message.
-            await self._notify(str(row["correlation_id"]), message)
+            if self._notify_takes_thread:
+                origin = self._store.origin_details(int(row["id"]))
+                await self._notify(
+                    correlation_id,
+                    message,
+                    parent_request_id=origin.get("parent_request_id"),
+                )
+            else:
+                await self._notify(correlation_id, message)
         except Exception as exc:  # noqa: BLE001 — a message never stops the queue
             logger.warning(
                 "work queue: could not say %r about #%s (%s)",
@@ -555,7 +634,7 @@ class WorkQueueLoop:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         iterations: int | None = None,
     ) -> None:
-        """Tick every ten seconds forever, and ask about stale rows weekly.
+        """Tick every ten seconds forever, and look for stale rows daily.
 
         ``sleep`` and the clock are injectable so a test drives real time
         without waiting for it; ``iterations`` bounds the loop for the same
@@ -563,6 +642,10 @@ class WorkQueueLoop:
         single bad row must never stop the queue.
         """
         sleeper = sleep or asyncio.sleep
+        # A forge that stopped between "admitted" and "the run has started"
+        # comes back with a row nothing will ever finish. Put those back
+        # before the first tick, not only on the tick after it.
+        self.recover_admitted()
         next_stale = self._clock() + timedelta(seconds=stale_interval_seconds)
         done = 0
         while iterations is None or done < iterations:
@@ -608,6 +691,7 @@ __all__ = [
     "PLANNING_SUCCESS_STATES",
     "PLANNING_TERMINAL_STATES",
     "Pick",
+    "STALE_REPING_DAYS",
     "STALE_TICK_INTERVAL_SECONDS",
     "TAKE_NEXT_INTERVAL_SECONDS",
     "WorkQueueLoop",
