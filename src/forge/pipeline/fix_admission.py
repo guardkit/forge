@@ -89,6 +89,13 @@ SOURCE_ID: str = "forge"
 ADMITTED_BUILD_ACTION: str = "admitted_build"
 
 
+#: The refusals that mean "not now" rather than "not ever". Everything else a
+#: refusal can say — an unknown repository, an uncapped profile, a malformed
+#: fix-task file, a row that names no build — will say the same thing on the
+#: next tick, so the queue closes the row instead of asking again for ever.
+TRANSIENT_REFUSAL_REASONS: frozenset[str] = frozenset({"duplicate"})
+
+
 # ---------------------------------------------------------------------------
 # Outcomes
 # ---------------------------------------------------------------------------
@@ -117,12 +124,25 @@ class FixAdmissionRefused(Exception):
             exit code — one of ``cap``, ``task-id``, ``fix-task-yaml``,
             ``parent-feature``, ``repo-not-allowed``, ``repo-unknown``,
             ``no-source-build`` or ``duplicate``.
+        permanent: Whether trying again changes anything. A repository the
+            configuration does not know, a budget profile with no cap, a row
+            that names no build, a fix-task file that will not parse: every
+            one of those refuses exactly the same way on the next tick, so
+            the queue closes the row rather than offering it for ever. The
+            one refusal that is NOT permanent is ``duplicate`` — another
+            build for the same feature is in flight right now, and when it
+            ends this row can go.
     """
 
-    def __init__(self, message: str, *, reason: str) -> None:
+    def __init__(
+        self, message: str, *, reason: str, permanent: bool | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.reason = reason
+        self.permanent = (
+            reason not in TRANSIENT_REFUSAL_REASONS if permanent is None else permanent
+        )
 
 
 class FixPublishFailed(Exception):
@@ -178,6 +198,7 @@ def mint_fix_task_id(feature_id: str, *, existing: Iterable[str] = ()) -> str:
                 f"there are already {number - 1} repairs of {feature_id} and "
                 "no room left in a task identifier for another",
                 reason="task-id",
+                permanent=True,
             )
         candidate = f"TASK-{stem[:room]}{tail}"
         if candidate not in taken:
@@ -240,6 +261,7 @@ def read_parent_feature(yaml_path: Path | str) -> str:
         raise FixAdmissionRefused(
             f"Cannot read fix-task YAML {str(path)!r}: {exc}",
             reason="fix-task-yaml",
+            permanent=True,
         ) from exc
 
     try:
@@ -248,12 +270,14 @@ def read_parent_feature(yaml_path: Path | str) -> str:
         raise FixAdmissionRefused(
             f"Fix-task YAML {str(path)!r} is malformed: {exc}",
             reason="fix-task-yaml",
+            permanent=True,
         ) from exc
 
     if not isinstance(data, dict):
         raise FixAdmissionRefused(
             f"Fix-task YAML {str(path)!r} must be a YAML mapping at the top level",
             reason="fix-task-yaml",
+            permanent=True,
         )
 
     parent = data.get("parent_feature")
@@ -262,6 +286,7 @@ def read_parent_feature(yaml_path: Path | str) -> str:
             "Mode C requires the fix-task YAML to declare a non-empty "
             f"'parent_feature' field (string); got {parent!r} in {path}",
             reason="fix-task-yaml",
+            permanent=True,
         )
     return parent
 
@@ -337,7 +362,9 @@ async def admit_fix_build(
         config, profile, uncapped_acknowledged=uncapped_acknowledged
     )
     if cap_refusal is not None:
-        raise FixAdmissionRefused(cap_refusal.message, reason="cap")
+        raise FixAdmissionRefused(
+            cap_refusal.message, reason="cap", permanent=True
+        )
 
     # 2. The subject.
     if not TASK_ID_REGEX.match(task_id):
@@ -345,6 +372,7 @@ async def admit_fix_build(
             "Mode C requires positional argument to match "
             f"{TASK_ID_REGEX.pattern}; got {task_id!r}",
             reason="task-id",
+            permanent=True,
         )
 
     # 3. The parent feature, from the fix-task YAML.
@@ -356,6 +384,7 @@ async def admit_fix_build(
             f"Invalid parent_feature in fix-task YAML ({exc.reason}): "
             f"{exc.value!r}",
             reason="parent-feature",
+            permanent=True,
         ) from exc
 
     # 4. The repository.
@@ -365,6 +394,7 @@ async def admit_fix_build(
             f"Repository {str(repo)!r} is not in queue.repo_allowlist; "
             "refusing to enqueue (Group C path-allowlist refused).",
             reason="repo-not-allowed",
+            permanent=True,
         )
 
     # 5. The payload, the row, then the publish.
@@ -404,6 +434,7 @@ async def admit_fix_build(
             f"duplicate build refused: an active build for {feature_id} "
             "is already in flight (Group C).",
             reason="duplicate",
+            permanent=False,
         )
 
     try:
@@ -412,7 +443,9 @@ async def admit_fix_build(
         )
     except DuplicateBuildError as exc:
         raise FixAdmissionRefused(
-            f"duplicate build refused: {exc} (Group B).", reason="duplicate"
+            f"duplicate build refused: {exc} (Group B).",
+            reason="duplicate",
+            permanent=False,
         ) from exc
 
     admission = FixAdmission(
@@ -497,6 +530,7 @@ async def admit_fix_row(
             f"#{queue_id} does not name the build it is repairing, so there "
             "is no failed build to review.",
             reason="no-source-build",
+            permanent=True,
         )
 
     row = persistence.get_build_row(source)
@@ -505,6 +539,7 @@ async def admit_fix_row(
             f"#{queue_id} is a repair of {source}, and there is no such "
             "build on record any more.",
             reason="no-source-build",
+            permanent=True,
         )
     parent_feature = str(getattr(row, "feature_id", "") or "")
     if not parent_feature:
@@ -512,6 +547,7 @@ async def admit_fix_row(
             f"the build {source} names no feature, so there is nothing for a "
             "repair to point at.",
             reason="parent-feature",
+            permanent=True,
         )
 
     name = str(target_repo or getattr(row, "repo", "") or "")
@@ -519,7 +555,9 @@ async def admit_fix_row(
     resolution = resolve_target_repo(name, paths)
     if resolution.name is None:
         raise FixAdmissionRefused(
-            refusal_message(name, resolution, paths), reason="repo-unknown"
+            refusal_message(name, resolution, paths),
+            reason="repo-unknown",
+            permanent=True,
         )
     repo_path = Path(str(paths[resolution.name])).expanduser()
 
@@ -656,6 +694,7 @@ def _one_line(text: str) -> str:
 
 __all__ = [
     "ADMITTED_BUILD_ACTION",
+    "TRANSIENT_REFUSAL_REASONS",
     "BUILD_QUEUED_SUBJECT_PREFIX",
     "FEATURES_DIR_PARTS",
     "FixAdmission",

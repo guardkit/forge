@@ -279,6 +279,7 @@ class TestTheFixTaskFile:
 
         assert fragment in caught.value.message
         assert caught.value.reason == "fix-task-yaml"
+        assert caught.value.permanent is True
 
     def test_a_file_that_is_not_there_is_refused_in_words(
         self, tmp_path: Path
@@ -329,6 +330,7 @@ class TestTheCapLawInProcess:
             self._admit(config, pool, repo_root, profile="attended")
 
         assert caught.value.reason == "cap"
+        assert caught.value.permanent is True
         assert build_rows(pool) == []
 
     def test_the_production_shape_an_absent_fix_journey_block(
@@ -344,6 +346,7 @@ class TestTheCapLawInProcess:
             self._admit(config, pool, repo_root, profile=FIX_JOURNEY_PROFILE_NAME)
 
         assert caught.value.reason == "cap"
+        assert caught.value.permanent is True
         assert "unknown budget profile" in caught.value.message
         assert build_rows(pool) == []
 
@@ -359,6 +362,7 @@ class TestTheCapLawInProcess:
             self._admit(config, pool, repo_root, profile="too-tight")
 
         assert caught.value.reason == "cap"
+        assert caught.value.permanent is True
 
     def test_a_capped_profile_opens_the_journey(
         self, config: ForgeConfig, repo_root: Path, pool: SqliteLifecyclePersistence
@@ -413,6 +417,7 @@ class TestTheOtherRefusals:
             self._admit(config, pool, repo_root, task_id="FEAT-44A8")
 
         assert caught.value.reason == "task-id"
+        assert caught.value.permanent is True
         assert "Mode C requires positional argument to match" in caught.value.message
         assert build_rows(pool) == []
 
@@ -430,6 +435,7 @@ class TestTheOtherRefusals:
             self._admit(config, pool, repo_root, fix_task_yaml=bad)
 
         assert caught.value.reason == "parent-feature"
+        assert caught.value.permanent is True
         assert "Invalid parent_feature" in caught.value.message
         assert build_rows(pool) == []
 
@@ -444,6 +450,7 @@ class TestTheOtherRefusals:
             self._admit(config, pool, repo_root, repo_path=elsewhere)
 
         assert caught.value.reason == "repo-not-allowed"
+        assert caught.value.permanent is True
         assert build_rows(pool) == []
 
     def test_an_active_build_for_the_same_feature_is_refused(
@@ -466,6 +473,7 @@ class TestTheOtherRefusals:
             self._admit(config, pool, repo_root)
 
         assert caught.value.reason == "duplicate"
+        assert caught.value.permanent is False
 
     def test_a_publish_that_fails_leaves_the_row_alone(
         self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
@@ -689,6 +697,7 @@ class TestAdmittingAQueueRow:
             )
 
         assert caught.value.reason == "repo-unknown"
+        assert caught.value.permanent is True
         assert "I don't know a repository called" in caught.value.message
 
     def test_a_row_whose_failed_build_is_gone_is_refused_in_words(
@@ -715,6 +724,7 @@ class TestAdmittingAQueueRow:
             )
 
         assert caught.value.reason == "no-source-build"
+        assert caught.value.permanent is True
         assert build_rows(pool) == []
 
     def test_a_row_that_names_no_failed_build_is_refused_in_words(
@@ -747,6 +757,7 @@ class TestAdmittingAQueueRow:
             )
 
         assert caught.value.reason == "no-source-build"
+        assert caught.value.permanent is True
 
 
 # ---------------------------------------------------------------------------

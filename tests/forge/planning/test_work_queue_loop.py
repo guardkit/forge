@@ -27,6 +27,11 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
+from forge.pipeline.fix_admission import (
+    FixAdmission,
+    FixAdmissionRefused,
+    FixPublishFailed,
+)
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_loop import (
     LOOP_ACTOR,
@@ -1743,3 +1748,286 @@ class TestGoIsJudgedByTheClock:
 
         assert await loop.take_next() == second
         assert [a.correlation_id for a in maker.admissions] == ["plan-2"]
+
+
+# ---------------------------------------------------------------------------
+# A refusal that will say the same thing next tick takes the row out
+# ---------------------------------------------------------------------------
+
+
+def refused(reason: str, message: str, *, permanent: bool) -> FixAdmissionRefused:
+    return FixAdmissionRefused(message, reason=reason, permanent=permanent)
+
+
+def publish_failed() -> FixPublishFailed:
+    """The transport half: the build row landed, the pipeline was not told."""
+    return FixPublishFailed(
+        "Queued FEAT-44A8 (build pending) but pipeline NOT NOTIFIED — publish "
+        "failed (messaging-layer): connection refused",
+        admission=FixAdmission(
+            build_id="build-FEAT-44A8-1",
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id="FEAT-44A8",
+            correlation_id="fix-build-1",
+            repo="appmilla_github/api_test",
+            fix_task_path="/tmp/TASK-FEAT44A8FIX1.yaml",
+        ),
+    )
+
+
+UNKNOWN_REPO = (
+    "I don't know a repository called 'api-test'. The ones I know are: "
+    "api_test, forge."
+)
+
+
+class TestARefusalThatWillNotChange:
+    """A row nothing can ever start leaves the queue, and says so once.
+
+    An unknown repository, a budget profile with no cap, a row that names no
+    build: the admission refuses each of those the same way every ten
+    seconds for ever, and with a cap of one in flight everything behind it
+    waits for ever too. So the row closes BLOCKED with the refusal's own
+    sentence, and the channel is told once. A refusal that only means "not
+    now" — another build for the same feature is running — still goes back
+    in the queue.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_repository_takes_the_row_out_of_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == UNKNOWN_REPO
+
+    @pytest.mark.asyncio
+    async def test_the_channel_is_told_once_in_the_words_the_spec_gives(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        await loop.tick()
+        await loop.tick()  # and again, in case it wants to repeat itself
+
+        assert notifier.messages == [
+            f"#{queue_id} cannot be started: {UNKNOWN_REPO} It is out of the "
+            "queue; drop it or fix the cause and send it again."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_closing_is_written_down_as_blocked(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("cap", "the profile has no cap", permanent=True)
+            ),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        blocked = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "blocked"
+        ]
+        assert len(blocked) == 1
+        assert blocked[0]["actor_identity"] == LOOP_ACTOR
+        assert "the profile has no cap" in str(blocked[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_the_row_behind_it_goes_on_the_next_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The whole point: one bad row must not stop the queue for ever."""
+        fix = file_row(store, "fix-build-1", kind="fix")
+        feature = file_row(store, "plan-1", kind="feature")
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(fix)["status"] == "BLOCKED"
+
+        assert await loop.take_next() == feature
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_that_only_means_not_now_goes_back_in_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused(
+                    "duplicate",
+                    "duplicate build refused: an active build for FEAT-44A8 "
+                    "is already in flight (Group C).",
+                    permanent=False,
+                )
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_goes_back_in_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The build row landed and the broker did not hear about it. Try again."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=publish_failed()),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_feature_row_refused_by_its_own_starter_still_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Nothing here changes for the planning-run path."""
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            run_maker=RunMaker(fail_with=RuntimeError("the driver is asleep")),
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+
+# ---------------------------------------------------------------------------
+# The waiting line is said once, not every ten seconds
+# ---------------------------------------------------------------------------
+
+
+class TestTheWaitingLineIsSaidOnce:
+    """A queue holding only repairs, with repairs shut, is quiet in the log.
+
+    The line is worth saying — otherwise a queue that never admits anything
+    looks like a queue with nothing in it — but at one tick every ten seconds
+    it would be written eight and a half thousand times a day, and a log
+    nobody can read is the same as no log. It is said once per change of the
+    repair rows that are open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ten_ticks_say_it_once(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.run(iterations=10, sleep=clock.sleep)
+
+        assert clock.slept == [10.0] * 10
+        assert _waiting_lines(caplog) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_new_repair_arriving_is_said(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Once per CHANGE: the queue is a different queue now."""
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.take_next()
+            await loop.take_next()
+            file_row(store, "fix-build-2", kind="fix")
+            await loop.take_next()
+            await loop.take_next()
+
+        assert _waiting_lines(caplog) == 2
+
+
+def _waiting_lines(caplog: pytest.LogCaptureFixture) -> int:
+    return len(
+        [
+            record
+            for record in caplog.records
+            if "is waiting and nothing may be started" in record.getMessage()
+        ]
+    )
