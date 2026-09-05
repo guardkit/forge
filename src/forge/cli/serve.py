@@ -1575,6 +1575,19 @@ def _compose_conductor_router(
             "(never spin-poll), and a red gate stops as RED_GATE_STOP"
         )
 
+    # THE PACK READER (conductor rewire rule 3). Composed here and nowhere
+    # else: without it a fix journey reads the failure pack under its OWN
+    # build id, finds nothing, and reviews the failure blind — which is
+    # exactly what a journey run today would have done. The reader answers
+    # "which failed build is this journey repairing?" from the correlation id
+    # the repair carries (``fix-<the failed build's id>``), so no column and
+    # no new table is needed. A journey queued some other way answers None
+    # and falls back to its own receipts directory, the documented default
+    # at ``fix_task_context_builder``.
+    from forge.pipeline.fix_row_producer import make_failure_pack_source_reader
+
+    failure_pack_source_reader = make_failure_pack_source_reader(sqlite_pool)
+
     # The SEAT, config-as-code (conductor-activation design pass §2). The
     # env stopgap this used to fall through to is DELETED: the seat is a
     # field on ``ConductorConfig``, and ``conductor.enabled: true`` with no
@@ -1590,12 +1603,14 @@ def _compose_conductor_router(
         lifecycle_emitter=lifecycle_emitter,
         publish_card=publish_card,
         gates_green_reader=gates_green_reader,
+        failure_pack_source_reader=failure_pack_source_reader,
         leg_model=forge_config.conductor.seat,
     )
     driver_deps_factory = build_conductor_driver_deps_factory(
         pool=sqlite_pool,
         config=forge_config,
         subscriber_factory=subscriber_factory,
+        source_build_id_reader=failure_pack_source_reader,
     )
     return build_conductor_router(
         pool=sqlite_pool,

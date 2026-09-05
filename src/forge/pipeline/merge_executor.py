@@ -58,6 +58,7 @@ __all__ = [
     "MergeApprovalConsumer",
     "MergeDeployOutcome",
     "MergeExecutorDeps",
+    "RED_MERGE_ENDINGS",
     "build_in_daemon_deploy_dispatcher",
     "execute_merge_deploy",
 ]
@@ -199,6 +200,44 @@ def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+#: The endings where the merge LANDED and what followed it went red. These
+#: are the ones worth a repair job: the branch is on main and the estate is
+#: not healthy. ``merge-refused`` is deliberately absent — a refused merge
+#: changed nothing.
+RED_MERGE_ENDINGS: frozenset[str] = frozenset(
+    {"merged-verify-failed", "merged-deploy-reverted", "merged-deploy-failed"}
+)
+
+
+def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") -> None:
+    """File one repair row for a merge whose checks went red. Never raises.
+
+    The producer already swallows everything; this call site catches too,
+    because the merge report is the only durable record of what the merge
+    did and a queue row must never be able to cost it.
+    """
+    try:
+        from forge.pipeline.fix_row_producer import (
+            SOURCE_MERGE_REPORT,
+            maybe_mint_fix_row,
+        )
+
+        maybe_mint_fix_row(
+            pool=pool,
+            build_id=build_id,
+            source=SOURCE_MERGE_REPORT,
+            detail=f"{outcome.result} — {outcome.detail}",
+        )
+    except Exception as exc:  # noqa: BLE001 — a queue row never costs a report
+        logger.warning(
+            "merge-executor: filing a repair row for %s raised (%s: %s); "
+            "the merge report stands",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _report_sha(report: dict[str, Any] | None) -> str | None:
     if not report:
         return None
@@ -328,6 +367,14 @@ async def execute_merge_deploy(
                 exc,
             )
         _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
+        # A MERGE THAT DID NOT STAY GREEN BECOMES A REPAIR JOB (conductor
+        # rewire rule 1). The three red endings below are the ones where the
+        # merge itself landed and what came after it went red — the live
+        # checks, the deploy, or the revert. A refused merge is not one of
+        # them: nothing changed, so there is nothing to repair. The dry run
+        # is not one either: it changed nothing on purpose.
+        if not dry_run and outcome.result in RED_MERGE_ENDINGS:
+            _mint_repair_row(deps.pool, build_id, outcome)
         return outcome
 
     # ------------------------------------------------------------------

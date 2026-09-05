@@ -164,6 +164,9 @@ def build_loop(
     paused: set[str] | None = None,
     max_in_flight: int = 1,
     stale_after_days: int = 7,
+    admit_fix_rows: bool = False,
+    fix_maker: RunMaker | None = None,
+    builds: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[WorkQueueLoop, RunMaker]:
     maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
@@ -176,6 +179,9 @@ def build_loop(
         max_in_flight=max_in_flight,
         stale_after_days=stale_after_days,
         clock=clock.now,
+        start_fix=fix_maker,
+        fix_build=(lambda cid: (builds or {}).get(cid)) if builds is not None else None,
+        admit_fix_rows=admit_fix_rows,
     )
     return loop, maker
 
@@ -662,9 +668,24 @@ class TestTheShadowOrder:
     async def test_it_says_nothing_when_the_two_agree(
         self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
     ) -> None:
+        """Repairs admitted, the fix row is first anyway — nothing to say.
+
+        ``admit_fix_rows`` is on here because with it off the two picks
+        genuinely disagree: the class order wants the repair and the queue
+        may not start one. That disagreement is worth a line, and it has its
+        own test below.
+        """
         file_row(store, "plan-1", kind="fix")
         file_row(store, "plan-2", kind="feature")
-        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
 
         await loop.take_next()
 
@@ -885,6 +906,223 @@ class TestRunningForever:
         await loop.run(sleep=clock.sleep, iterations=3)
 
         assert calls["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# The fix branch (conductor rewire spec 2026-09-05, rules 2 and 4)
+# ---------------------------------------------------------------------------
+
+
+class TestTheFixBranch:
+    """A repair is not a planning run, and it is shut by default.
+
+    ``conductor.admit_fix_rows`` is False in the shipped configuration, so a
+    repair row is FILED and LEFT: it can be listed, it can be named by the
+    "next I'd pick" line, and nothing about it starts. With the owner's word
+    the same row goes to the fix journey — never to the planning-run path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_repair_is_left_alone_while_repairs_are_shut(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        fix_maker = RunMaker()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            fix_maker=fix_maker,
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert maker.admissions == []
+        assert fix_maker.admissions == []
+
+    @pytest.mark.asyncio
+    async def test_the_shadow_line_still_names_the_repair_that_is_waiting(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Shut does not mean silent: the queue says what it would pick."""
+        feature = file_row(store, "plan-1", kind="feature")
+        fix = file_row(store, "fix-build-1", kind="fix")
+        loop, maker = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        taken = await loop.take_next()
+
+        assert taken == feature
+        assert notifier.messages == [
+            f"next I'd pick #{fix} (fix · api_test), because fixes go first; "
+            f"taking #{feature} as things stand."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_with_the_word_given_the_repair_goes_to_the_fix_journey(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        fix_maker = RunMaker()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=fix_maker,
+            builds={},
+        )
+
+        assert await loop.take_next() == queue_id
+
+        # The fix journey opened it; the planning-run path never saw it.
+        assert [a.queue_id for a in fix_maker.admissions] == [queue_id]
+        assert maker.admissions == []
+        assert fix_maker.admissions[0].kind == "fix"
+        assert fix_maker.admissions[0].correlation_id == "fix-build-1"
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "ADMITTED"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_never_creates_a_planning_run(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        assert runs == {}
+
+    @pytest.mark.asyncio
+    async def test_a_feature_beside_a_repair_is_still_taken_while_repairs_are_shut(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The queue does not stop behind a row it may not start."""
+        file_row(store, "fix-build-1", kind="fix")
+        feature = file_row(store, "plan-1", kind="feature")
+        loop, maker = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        assert await loop.take_next() == feature
+        assert [a.queue_id for a in maker.admissions] == [feature]
+
+    @pytest.mark.asyncio
+    async def test_a_repair_closes_on_its_build_not_on_a_planning_run(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds=builds,
+        )
+        await loop.take_next()
+
+        builds["fix-build-1"] = {"status": "RUNNING", "error": None}
+        loop.close_finished()
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+        builds["fix-build-1"] = {"status": "COMPLETE", "error": None}
+        loop.close_finished()
+        assert store.get(queue_id)["status"] == "DONE"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_journey_blocks_the_row_in_its_own_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds=builds,
+        )
+        await loop.take_next()
+
+        builds["fix-build-1"] = {"status": "FAILED", "error": None}
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "the fix journey failed"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_admitted_with_no_build_behind_it_is_put_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The forge stopped between admitting the row and opening the build."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        store.admit(queue_id, actor_identity="test")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
+
+        assert loop.recover_admitted() == [queue_id]
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_open_a_journey_the_row_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """A misconfiguration loses no work: the row returns to the queue."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=None,
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_row_is_never_put_back_when_nothing_reads_builds(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """No build reader wired: the loop must not decide the row never ran."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        store.admit(queue_id, actor_identity="test")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, admit_fix_rows=True
+        )
+
+        assert loop.recover_admitted() == []
+        assert store.get(queue_id)["status"] == "ADMITTED"
 
 
 # ---------------------------------------------------------------------------

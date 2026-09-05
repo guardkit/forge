@@ -402,6 +402,77 @@ class TestTheLegSeatIsConfigAsCode:
         assert captured["leg_model"] is None
 
 
+class TestThePackReaderIsWired:
+    """Conductor rewire rule 3 — the gap the design pass found on 5 September.
+
+    ``cli/serve.py`` composed the conductor WITHOUT
+    ``failure_pack_source_reader``, so a journey read the failure pack under
+    its own build id, found nothing, and would have reviewed blind. These
+    capture the two production call sites and prove a reader now reaches
+    both — and that it answers with the failed build the repair names.
+    """
+
+    @staticmethod
+    def _capture(module_attr: str) -> Any:
+        return getattr(serve_conductor_mod, module_attr)
+
+    def _compose(self, pool: SqliteLifecyclePersistence, attr: str) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+        original = getattr(serve_conductor_mod, attr)
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        setattr(serve_conductor_mod, attr, _capture)
+        try:
+            serve_mod._compose_conductor_router(
+                sqlite_pool=pool,
+                forge_config=_config(conductor_on=True),
+                lifecycle_emitter=None,
+                gate_parts=None,
+                gate_repository=None,
+                gate_state_machine=None,
+                clock=lambda: None,
+            )
+        finally:
+            setattr(serve_conductor_mod, attr, original)
+        return captured
+
+    def test_the_supervisor_factory_gets_a_pack_reader(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        captured = self._compose(pool, "build_conductor_supervisor_factory")
+
+        assert captured["failure_pack_source_reader"] is not None
+
+    def test_the_driver_deps_factory_gets_the_same_reader(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """The failure pack a journey WRITES points back at the same build."""
+        captured = self._compose(pool, "build_conductor_driver_deps_factory")
+
+        assert captured["source_build_id_reader"] is not None
+
+    def test_the_reader_names_the_failed_build_the_repair_came_from(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        captured = self._compose(pool, "build_conductor_supervisor_factory")
+        pool.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, "
+            "feature_yaml_path, status, triggered_by, correlation_id, "
+            "queued_at, mode) VALUES ('build-repair-1', 'FEAT-44A8', "
+            "'appmilla/api_test', 'main', 'f.yaml', 'QUEUED', 'cli', "
+            "'fix-build-FEAT-44A8-20260904131328', '2026-09-05T00:00:00Z', "
+            "'mode-c')"
+        )
+        pool.connection.commit()
+
+        read = captured["failure_pack_source_reader"]
+
+        assert read("build-repair-1") == "build-FEAT-44A8-20260904131328"
+
+
 class TestTheLegBudgetsAreYamlKnobs:
     """The experiment round's knobs, wired at the composition site.
 
