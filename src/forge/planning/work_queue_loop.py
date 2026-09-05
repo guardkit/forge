@@ -698,11 +698,12 @@ class WorkQueueLoop:
         - **over** — close the row DONE or BLOCKED to match, the same way the
           closing pass would have.
 
-        Returns False when this is somebody else's build after all — nothing
-        here reads builds, or there is no build under this correlation id — and
-        putting the row back for the next tick is right.
+        Returns False when this is somebody else's build after all — the row
+        is not a repair, nothing here reads builds, or there is no build under
+        this correlation id — and putting the row back for the next tick is
+        right.
         """
-        if self._fix_build is None:
+        if str(row["kind"]) != FIX_KIND or self._fix_build is None:
             return False
         queue_id = int(row["id"])
         correlation_id = str(row["correlation_id"])
