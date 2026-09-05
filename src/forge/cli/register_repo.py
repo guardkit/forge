@@ -8,11 +8,12 @@ here starts, stops or recreates a container, and nothing here touches a model.
 
 What it does, in order:
 
-1. Refuses early and writes nothing at all when the checkout is not a thing the
-   build side could ever resolve (missing, not a directory, no ``.git``, not
-   owned by uid 1000, not directly under ``FORGE_REPO_BASE``), when a repository
-   map key for this name already points somewhere else, or when there is no
-   ``test:`` command for the merge-ready gate to run.
+1. Refuses early and writes nothing at all when ``--name`` carries a path
+   separator, when the checkout is not a thing the build side could ever
+   resolve (missing, not a directory, no ``.git``, not owned by uid 1000, not
+   directly under ``FORGE_REPO_BASE``), when a repository map key for this name
+   already points somewhere else, or when there is no ``test:`` command for the
+   merge-ready gate to run.
 2. Warns and carries on for the things that are merely thin: no git remote, no
    test roots, no ``deploy/profile.yaml``, no ``docs/architecture-rules.yaml``.
 3. Scaffolds guardkit in the repository when it has none, writes the minimal
@@ -26,7 +27,10 @@ What it does, in order:
    so this module never does that. One dated backup is taken before the first
    change, and :func:`forge.config.loader.load_config` must re-parse the result
    or the backup goes back and the command exits non-zero.
-5. Checks that no build is in flight, and prints the recreate command.
+5. Checks that no build is in flight — asking a running forge-prod container
+   first and ``FORGE_DB_PATH`` second, the way the recreate script's own gate
+   reads the ledger, and never creating a ledger of its own — and prints the
+   recreate command.
 
 Exit codes: 0 = registered (or nothing to do, or a warn-only run); 1 = refused,
 with a plain sentence saying which check said no.
@@ -71,6 +75,21 @@ REPO_MAP_NAMESPACES: tuple[str, ...] = ("guardkit", "appmilla_github")
 
 #: The command a human runs after this one, printed and never run.
 RECREATE_COMMAND: str = "bash ops/forge-prod-recreate.sh"
+
+#: The container the estate runs the forge in, and the config path inside it.
+#: The recreate script's own gate reads the ledger through this container
+#: (``ops/forge-prod-recreate.sh``), because the ledger the *estate* builds
+#: against lives in the container's bind, not beside whatever directory a human
+#: happened to run this command from. This gate reads it the same way.
+FORGE_PROD_CONTAINER: str = "forge-prod"
+FORGE_PROD_CONFIG: str = "/var/forge/forge.yaml"
+
+#: The environment variable that names a ledger to read when there is no
+#: forge-prod container (``cli/status.py:108``).
+FORGE_DB_PATH_ENV: str = "FORGE_DB_PATH"
+
+#: How long the two docker reads may take before the gate gives up and warns.
+DOCKER_READ_TIMEOUT: int = 30
 
 #: fleet-memory's identifier contract (``fleet-memory``
 #: ``src/fleet_memory/payloads/base.py:16``), enforced by guardkit's own
@@ -415,16 +434,98 @@ def _discover_test_roots(repo: Path) -> list[str]:
         return _shallow_test_roots(repo)
 
 
-def _estate_status_views() -> list[Any]:
-    """What ``forge status --json`` reads: the status projection, no filter.
+#: A callable that runs a command and hands back the finished process. It is a
+#: parameter, not a hard-wired ``subprocess.run``, so the tests can answer for
+#: docker without docker being installed, running, or touched.
+Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
-    ``forge status --json`` is ``_read_status_views`` plus a JSON dump
-    (``cli/status.py:914-919``); this calls the same reader in-process so the
-    gate cannot disagree with the command it quotes.
+
+def _run_command(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    """Run a command and capture its output. Reads only; changes nothing."""
+    return subprocess.run(
+        list(argv),
+        capture_output=True,
+        text=True,
+        timeout=DOCKER_READ_TIMEOUT,
+        check=False,
+    )
+
+
+def _forge_prod_is_running(run: Runner) -> bool:
+    """Is there a container called forge-prod, and is it up?
+
+    ``docker inspect`` answers both questions in one read: a missing container
+    is a non-zero exit, a stopped one prints ``false``.
     """
-    from forge.cli.status import _read_status_views, _resolve_db_path
+    try:
+        result = run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{.State.Running}}",
+                FORGE_PROD_CONTAINER,
+            ]
+        )
+    except (OSError, subprocess.SubprocessError):
+        # No docker on this machine, or it did not answer. Not an error: the
+        # next branch reads the ledger a different way.
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
 
-    return list(_read_status_views(_resolve_db_path(None), None))
+
+def _terminal_status_values() -> set[str]:
+    """The terminal build states, by name (``cli/status.py:95-100``)."""
+    from forge.cli.status import _TERMINAL_STATES
+
+    return {str(state.value) for state in _TERMINAL_STATES}
+
+
+def _not_terminal_in_container(run: Runner) -> int:
+    """How many builds the forge-prod ledger shows as not terminal.
+
+    The read is exactly the recreate script's gate of record, in its JSON
+    spelling: ``docker exec forge-prod forge --config /var/forge/forge.yaml
+    status --json``. It runs inside the container, so it reads the ledger the
+    estate actually builds against, and it starts, stops and changes nothing.
+    """
+    result = run(
+        [
+            "docker",
+            "exec",
+            FORGE_PROD_CONTAINER,
+            "forge",
+            "--config",
+            FORGE_PROD_CONFIG,
+            "status",
+            "--json",
+        ]
+    )
+    if result.returncode != 0:
+        said = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            said[-1]
+            if said
+            else f"'forge status' in {FORGE_PROD_CONTAINER} exited {result.returncode}"
+        )
+    rows = json.loads(result.stdout)
+    if not isinstance(rows, list):
+        raise RuntimeError("'forge status --json' did not print a list of builds")
+    terminal = _terminal_status_values()
+    return sum(1 for row in rows if str(row.get("status", "")) not in terminal)
+
+
+def _read_ledger_views(db_path: Path) -> list[Any]:
+    """The status projection from a ledger file, opened read-only.
+
+    ``read_only_connect`` is a ``mode=ro`` handle: a path that is not already a
+    database is an error here, never a new empty one. This command must never
+    bring a ledger into being — an invented ledger would show no builds and the
+    gate would say "all terminal" about an estate it had not read.
+    """
+    from forge.cli.status import _read_status_views
+
+    return list(_read_status_views(db_path, None))
 
 
 def _all_terminal(views: Iterable[Any]) -> bool:
@@ -432,6 +533,46 @@ def _all_terminal(views: Iterable[Any]) -> bool:
     from forge.cli.status import _all_terminal as existing
 
     return existing(views)
+
+
+def _waiting_step(waiting: int) -> Step:
+    """``estate ok`` when nothing is in flight, ``estate wait <n>`` otherwise."""
+    if waiting <= 0:
+        return Step("estate", "ok", "all builds terminal")
+    subject = "build is" if waiting == 1 else "builds are"
+    return Step("estate", "wait", f"{waiting} {subject} not terminal")
+
+
+def _estate_step(runner: Runner | None = None) -> Step:
+    """The estate gate's one line. Reads; never starts, stops or creates anything.
+
+    In the order the recreate gate of record uses:
+
+    1. a running ``forge-prod`` container — ask it, the way the recreate script
+       asks it;
+    2. otherwise ``FORGE_DB_PATH``, read-only;
+    3. otherwise say plainly that the ledger could not be read.
+
+    Any failure along the way is a warn, not a refusal: registering a
+    repository is not made wrong by a gate that could not see the queue, and
+    the human still gets the recreate command with the warning above it.
+    """
+    run = runner or _run_command
+    try:
+        if _forge_prod_is_running(run):
+            return _waiting_step(_not_terminal_in_container(run))
+        raw = os.environ.get(FORGE_DB_PATH_ENV, "").strip()
+        if raw:
+            views = _read_ledger_views(Path(raw).expanduser())
+            return _waiting_step(sum(1 for v in views if not _all_terminal([v])))
+        return Step(
+            "estate",
+            "warn",
+            "could not read the build ledger (no forge-prod container and "
+            "FORGE_DB_PATH unset)",
+        )
+    except Exception as exc:  # noqa: BLE001 — an unreadable ledger is a warn
+        return Step("estate", "warn", f"could not read the build ledger: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +708,20 @@ def _resolve_config_path(ctx: click.Context) -> Path:
     )
 
 
+def _has_path_separator(name: str) -> bool:
+    """Does this name carry a separator any filesystem here would act on?
+
+    ``/`` is checked outright rather than only through :data:`os.sep`, because
+    the repository-map keys are built with a literal ``/`` whatever platform
+    this runs on, and a backslash is checked because it is a separator on one
+    of them.
+    """
+    separators = {"/", "\\", os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    return any(sep in name for sep in separators)
+
+
 def _repo_base() -> Path:
     raw = os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
     return Path(raw).expanduser().resolve()
@@ -655,6 +810,21 @@ def register_repo_cmd(
     config_path = _resolve_config_path(ctx)
     if config is None:
         config = _load(config_path)
+
+    # ---- the name is checked first, before anything at all is read from disk
+    # or written to it. A name is not free text: it becomes two repository-map
+    # keys, part of the backup file's name, and the folder name the build side
+    # resolves under the base. A separator in it would mint the key
+    # ``guardkit/a/b``, which nothing looks up, and would send the dated backup
+    # into some other directory — so it is refused here, where nothing has yet
+    # been written and there is nothing to undo.
+    if name_opt is not None and _has_path_separator(name_opt):
+        refuse(
+            "name",
+            f"--name {name_opt!r} contains a path separator — the name becomes "
+            "a folder name and two repository-map keys, so it must be a plain "
+            "name with no slashes in it",
+        )
 
     # ---- rule 2: the checks that refuse (nothing is written when any fails)
     repo = Path(repo_path).expanduser()
@@ -915,19 +1085,7 @@ def register_repo_cmd(
         steps.append(Step("config", "unchanged", f"{config_path.name} untouched"))
 
     # ---- rule 7: the estate gate. Prints the recreate command, never runs it.
-    try:
-        views = _estate_status_views()
-    except Exception as exc:  # noqa: BLE001 — an unreadable ledger is a warn
-        steps.append(
-            Step("estate", "warn", f"could not read the build ledger: {exc}")
-        )
-    else:
-        if _all_terminal(views):
-            steps.append(Step("estate", "ok", "all builds terminal"))
-        else:
-            waiting = sum(1 for v in views if not _all_terminal([v]))
-            subject = "build is" if waiting == 1 else "builds are"
-            steps.append(Step("estate", "wait", f"{waiting} {subject} not terminal"))
+    steps.append(_estate_step())
 
     _emit(steps, as_json=as_json, tail=_tail(name))
 

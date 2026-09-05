@@ -14,6 +14,11 @@
 # The two state binds below are fixed and stay as they are. If the map cannot be read, this script
 # refuses to recreate rather than start forge-prod with the wrong set of repositories.
 #
+# That read runs as 'uv run --frozen --no-sync', deliberately: --frozen so reading the map can never
+# rewrite the forge checkout's uv.lock, and --no-sync so it never re-installs the virtual environment
+# (and never reaches the network to resolve dependencies) in the seconds before 'docker rm -f'. The
+# container comes down only after a read that changes nothing.
+#
 # Usage:  bash ops/forge-prod-recreate.sh            # gate, remove the old container, run the new one
 #         DRY_RUN=1 bash ops/forge-prod-recreate.sh  # print the docker command (names only), change nothing
 #         FORGE_CONFIG=/path/forge.yaml bash ...     # read the repository map from another config
@@ -39,7 +44,7 @@ ENV_FLAGS=""; for n in "${NAMES[@]}"; do ENV_FLAGS+=" -e $n"; done
 # distinct checkout path; the map's two key spellings for the same repository collapse to one bind.
 FORGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORGE_CONFIG="${FORGE_CONFIG:-$HOME/forge-state/forge.yaml}"
-REPO_PATHS=$(uv run --project "$FORGE_ROOT" forge repo-paths --config "$FORGE_CONFIG") || {
+REPO_PATHS=$(uv run --frozen --no-sync --project "$FORGE_ROOT" forge repo-paths --config "$FORGE_CONFIG") || {
   echo "could not read the repository map from $FORGE_CONFIG ('forge repo-paths' failed) - refusing to recreate forge-prod" >&2
   exit 1
 }
