@@ -9,6 +9,8 @@ Public surface
 - :func:`admit_fix_row` — the queue's path into the same function: it mints
   the task id, writes the fix-task YAML beside the target repository's
   features, and then calls :func:`admit_fix_build`.
+- :func:`republish_build_queued` — says a written-but-never-announced
+  build's queued event again, rebuilt from the build row itself.
 - :class:`FixAdmission` — what a successful admission hands back.
 - :class:`FixAdmissionRefused` / :class:`FixPublishFailed` — the two ways it
   can end badly, each with a sentence a person can read.
@@ -88,12 +90,18 @@ SOURCE_ID: str = "forge"
 #: The events-row action written on the queue row when its build is open.
 ADMITTED_BUILD_ACTION: str = "admitted_build"
 
+#: The events-row action written on the queue row when the queue says a
+#: written-but-never-dispatched build's queued event again (close-out item 2).
+REPUBLISHED_ACTION: str = "republished"
+
+#: The refusal reason that means "there is already a build for this".
+DUPLICATE_REASON: str = "duplicate"
 
 #: The refusals that mean "not now" rather than "not ever". Everything else a
 #: refusal can say — an unknown repository, an uncapped profile, a malformed
 #: fix-task file, a row that names no build — will say the same thing on the
 #: next tick, so the queue closes the row instead of asking again for ever.
-TRANSIENT_REFUSAL_REASONS: frozenset[str] = frozenset({"duplicate"})
+TRANSIENT_REFUSAL_REASONS: frozenset[str] = frozenset({DUPLICATE_REASON})
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +606,96 @@ async def admit_fix_row(
     return admission
 
 
+async def republish_build_queued(
+    build: Any,
+    *,
+    publish: Callable[[str, bytes], Any],
+) -> str:
+    """Say the queued event again for a build row that was never announced.
+
+    The write comes before the publish, deliberately, so a publish that fails
+    leaves a real build row that nothing was ever told about. Everything the
+    event says is on that row, so this rebuilds the SAME event from the row —
+    same feature, same repository, same fix-task file, same correlation id,
+    same task, same queued moment — and says it on the same subject. Saying it
+    twice is safe: the build row it names already exists and is keyed by
+    ``(feature_id, correlation_id)``, so a second hearing finds the same
+    build rather than starting another one.
+
+    Args:
+        build: The ``builds`` row, however the caller reads rows — a
+            ``sqlite3.Row``, a mapping, or the typed ``BuildRow``.
+        publish: ``(subject, body) -> None`` or an awaitable of the same, the
+            caller's own transport.
+
+    Returns:
+        The subject it published on.
+    """
+    from nats_core.envelope import EventType, MessageEnvelope
+    from nats_core.events import BuildQueuedPayload
+
+    feature_id = str(_row_value(build, "feature_id", ""))
+    correlation_id = str(_row_value(build, "correlation_id", ""))
+    queued_at = _as_datetime(_row_value(build, "queued_at"))
+    mode = _row_value(build, "mode", "mode-c")
+    payload = BuildQueuedPayload(
+        feature_id=feature_id,
+        repo=str(_row_value(build, "repo", "")),
+        branch=str(_row_value(build, "branch", "main")),
+        feature_yaml_path=str(_row_value(build, "feature_yaml_path", "")),
+        max_turns=int(_row_value(build, "max_turns", 5)),
+        sdk_timeout_seconds=int(_row_value(build, "sdk_timeout_seconds", 1800)),
+        triggered_by=str(_row_value(build, "triggered_by", "forge-internal")),
+        originating_adapter=_row_value(build, "originating_adapter"),
+        originating_user=_row_value(build, "originating_user"),
+        correlation_id=correlation_id,
+        parent_request_id=_row_value(build, "parent_request_id"),
+        requested_at=queued_at,
+        queued_at=queued_at,
+        mode=str(getattr(mode, "value", mode)),
+        task_id=_row_value(build, "task_id"),
+    )
+    envelope = MessageEnvelope(
+        source_id=SOURCE_ID,
+        event_type=EventType.BUILD_QUEUED,
+        correlation_id=correlation_id,
+        payload=payload.model_dump(mode="json"),
+    )
+    subject = f"{BUILD_QUEUED_SUBJECT_PREFIX}.{feature_id}"
+    result = publish(subject, envelope.model_dump_json().encode("utf-8"))
+    if inspect.isawaitable(result):
+        await result
+    logger.info(
+        "fix admission: said the queued event again for %s (%s, correlation "
+        "id %s) — it was written and never announced",
+        _row_value(build, "build_id", feature_id),
+        feature_id,
+        correlation_id,
+    )
+    return subject
+
+
+def _row_value(row: Any, name: str, default: Any = None) -> Any:
+    """One field of a build row, whether it reads like a mapping or an object."""
+    try:
+        value = row[name]
+    except (KeyError, IndexError, TypeError):
+        value = getattr(row, name, None)
+    return default if value is None else value
+
+
+def _as_datetime(value: Any) -> datetime:
+    """A moment from a build row: a datetime as it is, a string parsed, else now."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return datetime.now(UTC)
+
+
 def _record_admitted_build(
     store: Any,
     *,
@@ -694,6 +792,8 @@ def _one_line(text: str) -> str:
 
 __all__ = [
     "ADMITTED_BUILD_ACTION",
+    "DUPLICATE_REASON",
+    "REPUBLISHED_ACTION",
     "TRANSIENT_REFUSAL_REASONS",
     "BUILD_QUEUED_SUBJECT_PREFIX",
     "FEATURES_DIR_PARTS",
@@ -711,5 +811,6 @@ __all__ = [
     "path_in_allowlist",
     "read_parent_feature",
     "repo_slug",
+    "republish_build_queued",
     "write_fix_task_yaml",
 ]

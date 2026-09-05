@@ -48,6 +48,7 @@ from forge.pipeline.fix_admission import (
     features_dir,
     mint_fix_task_id,
     read_parent_feature,
+    republish_build_queued,
     write_fix_task_yaml,
 )
 from forge.pipeline.fix_row_producer import (
@@ -800,3 +801,85 @@ class TestARepairIsNeverAPlanningRun:
             "SELECT COUNT(*) FROM planning_runs"
         ).fetchone()
         assert runs[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Saying a written-but-never-announced build's event again
+# ---------------------------------------------------------------------------
+
+
+class TestSayingTheQueuedEventAgain:
+    """A publish that failed left a real build nobody was told about.
+
+    The row is deliberately kept, so the event has to be sayable again from
+    the row itself. It must be the SAME event: same subject, same
+    correlation id, same feature, same fix-task file, same task, mode-c.
+    """
+
+    def _write_the_row_and_lose_the_publish(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> sqlite3.Row:
+        seed_failed_build(pool)
+        with pytest.raises(FixPublishFailed):
+            asyncio.run(
+                admit_fix_build(
+                    config=config,
+                    persistence=pool,
+                    task_id="TASK-44A8FIX1",
+                    fix_task_yaml=write_fix_task(repo_root),
+                    repo_path=repo_root,
+                    correlation_id=fix_correlation_id(SOURCE_BUILD),
+                    publish=Publisher(fail_with=RuntimeError("broker unreachable")),
+                    profile=FIX_JOURNEY_PROFILE_NAME,
+                )
+            )
+        written = [row for row in build_rows(pool) if row["build_id"] != SOURCE_BUILD]
+        assert len(written) == 1
+        assert written[0]["status"] == "QUEUED"
+        return written[0]
+
+    def test_the_event_said_again_is_the_event_that_was_lost(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        row = self._write_the_row_and_lose_the_publish(config, pool, repo_root)
+        publisher = Publisher()
+
+        subject = asyncio.run(republish_build_queued(row, publish=publisher))
+
+        assert subject == f"pipeline.build-queued.{FEATURE_ID}"
+        assert [s for s, _ in publisher.published] == [subject]
+        payload = publisher.payloads[0]
+        assert payload["feature_id"] == FEATURE_ID
+        assert payload["correlation_id"] == fix_correlation_id(SOURCE_BUILD)
+        assert payload["task_id"] == "TASK-44A8FIX1"
+        assert payload["mode"] == BuildMode.MODE_C.value
+        assert payload["repo"] == row["repo"]
+        assert payload["feature_yaml_path"] == row["feature_yaml_path"]
+        # It parses as the wire's own payload, which is the real assertion:
+        # a mode-c event with no task id would be refused by the validator.
+        assert BuildQueuedPayload.model_validate(payload).task_id == "TASK-44A8FIX1"
+
+    def test_saying_it_again_writes_no_second_build(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        row = self._write_the_row_and_lose_the_publish(config, pool, repo_root)
+        before = len(build_rows(pool))
+
+        asyncio.run(republish_build_queued(row, publish=Publisher()))
+
+        assert len(build_rows(pool)) == before
+
+    def test_a_publish_that_fails_again_is_not_swallowed(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        row = self._write_the_row_and_lose_the_publish(config, pool, repo_root)
+
+        with pytest.raises(RuntimeError, match="broker unreachable"):
+            asyncio.run(
+                republish_build_queued(
+                    row, publish=Publisher(fail_with=RuntimeError("broker unreachable"))
+                )
+            )

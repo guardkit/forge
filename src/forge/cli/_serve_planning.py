@@ -1246,7 +1246,10 @@ async def compose_planning_consumer_and_dispatch(
         # the "next I'd pick" line can name them, and nothing starts.
         from forge.config.models import FIX_JOURNEY_PROFILE_NAME
         from forge.lifecycle.persistence import SqliteLifecyclePersistence
-        from forge.pipeline.fix_admission import admit_fix_row
+        from forge.pipeline.fix_admission import (
+            admit_fix_row,
+            republish_build_queued,
+        )
 
         lifecycle_pool = SqliteLifecyclePersistence(
             connection=pool, db_path=db_path
@@ -1286,6 +1289,16 @@ async def compose_planning_consumer_and_dispatch(
                 clock=clock_fn,
             )
 
+        async def _republish_fix_build(build: Any) -> None:
+            """Say a written-but-never-announced build's queued event again.
+
+            The write comes before the publish, so a publish that failed
+            leaves a build row the pipeline was never told about. The event is
+            rebuilt from that row, so it is the same event on the same
+            subject under the same correlation id.
+            """
+            await republish_build_queued(build, publish=_publish_build_queued)
+
         queue_loop = WorkQueueLoop(
             queue_store,
             count_in_flight=lambda: count_in_flight(pool),
@@ -1298,6 +1311,7 @@ async def compose_planning_consumer_and_dispatch(
             clock=clock_fn,
             start_fix=_start_fix_journey,
             fix_build=_fix_build,
+            republish_build=_republish_fix_build,
             admit_fix_rows=config.conductor.admit_fix_rows,
         )
         queue_loop_task = asyncio.create_task(queue_loop.run())

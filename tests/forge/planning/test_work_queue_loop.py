@@ -39,6 +39,7 @@ from forge.planning.work_queue_loop import (
     Admission,
     WorkQueueLoop,
     count_in_flight,
+    first_sentence,
     paused_repositories,
     shadow_line,
 )
@@ -170,8 +171,9 @@ def build_loop(
     max_in_flight: int = 1,
     stale_after_days: int = 7,
     admit_fix_rows: bool = False,
-    fix_maker: RunMaker | None = None,
+    fix_maker: Any | None = None,
     builds: dict[str, dict[str, Any]] | None = None,
+    republisher: Any | None = None,
 ) -> tuple[WorkQueueLoop, RunMaker]:
     maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
@@ -186,6 +188,7 @@ def build_loop(
         clock=clock.now,
         start_fix=fix_maker,
         fix_build=(lambda cid: (builds or {}).get(cid)) if builds is not None else None,
+        republish_build=republisher,
         admit_fix_rows=admit_fix_rows,
     )
     return loop, maker
@@ -1838,8 +1841,9 @@ class TestARefusalThatWillNotChange:
         await loop.tick()  # and again, in case it wants to repeat itself
 
         assert notifier.messages == [
-            f"#{queue_id} cannot be started: {UNKNOWN_REPO} It is out of the "
-            "queue; drop it or fix the cause and send it again."
+            f"#{queue_id} cannot be started: I don't know a repository called "
+            "'api-test'. It is out of the queue; drop it or fix the cause and "
+            "send it again."
         ]
 
     @pytest.mark.asyncio
@@ -2031,3 +2035,409 @@ def _waiting_lines(caplog: pytest.LogCaptureFixture) -> int:
             if "is waiting and nothing may be started" in record.getMessage()
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# The channel line is one sentence, whatever the refusal is
+# ---------------------------------------------------------------------------
+
+
+def cap_law_refusal() -> str:
+    """The real cap-law refusal — a runbook with a YAML snippet in it."""
+    from forge.config.conductor import mode_c_cap_refusal
+
+    refusal = mode_c_cap_refusal(profile_name="fix-journey", guards=object())
+    assert refusal is not None
+    return refusal.message
+
+
+class TestTheChannelLineIsOneSentence:
+    """A refusal can be a runbook. The channel gets its first sentence.
+
+    THE CAP LAW's refusal is about seven hundred characters over several
+    paragraphs, ending in a YAML snippet for forge.yaml. Flattened into one
+    Slack line that is unreadable, and an unreadable line is a defect. The
+    channel is told what happened in one sentence; the whole refusal is
+    written on the row and in the row's events, where anyone who wants the
+    runbook can read it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_runbook_refusal_says_only_its_first_sentence(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = cap_law_refusal()
+        assert len(message) > 500 and "max_review_cycles" in message
+
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        said = notifier.messages[0]
+        assert len(said) < 300
+        assert said == (
+            f"#{queue_id} cannot be started: the fix journey is refused: its "
+            "profile sets no cap. It is out of the queue; drop it or fix the "
+            "cause and send it again."
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_whole_refusal_stays_on_the_row_and_in_its_events(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = cap_law_refusal()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == message
+        blocked = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "blocked"
+        ]
+        assert "max_review_cycles" in str(blocked[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_of_several_paragraphs_ends_at_the_first_break(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = (
+            "the fix journey is refused: its profile sets no cap\n"
+            "Budget profile 'fix-journey' sets no review-cycle cap at all.\n"
+            "The fix: give the profile a review-cycle cap, e.g.\n"
+            "    budget:\n      profiles:\n        fix-journey:\n"
+            "          max_review_cycles: 2\n"
+        )
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        assert notifier.messages == [
+            f"#{queue_id} cannot be started: the fix journey is refused: its "
+            "profile sets no cap. It is out of the queue; drop it or fix the "
+            "cause and send it again."
+        ]
+        assert store.get(queue_id)["closed_reason"] == message
+
+    def test_the_first_sentence_of_one_ordinary_sentence_is_all_of_it(
+        self,
+    ) -> None:
+        assert first_sentence("nothing to say here.") == "nothing to say here"
+        assert first_sentence("one. two. three.") == "one"
+        assert first_sentence("  ") == ""
+
+
+# ---------------------------------------------------------------------------
+# A repair whose build was already written (close-out item 2)
+# ---------------------------------------------------------------------------
+
+
+DUPLICATE_MESSAGE = (
+    "duplicate build refused: duplicate build: feature_id='FEAT-44A8' "
+    "correlation_id='fix-build-1' (Group B)."
+)
+
+
+def a_build(correlation_id: str, status: str, *, error: str | None = None) -> dict:
+    """One ``builds`` row as the loop's reader hands it over."""
+    return {
+        "build_id": "build-FEAT-44A8-1",
+        "feature_id": "FEAT-44A8",
+        "correlation_id": correlation_id,
+        "status": status,
+        "error": error,
+        "repo": "appmilla_github/api_test",
+        "branch": "main",
+        "feature_yaml_path": "/tmp/TASK-FEAT44A8FIX1.yaml",
+        "task_id": "TASK-FEAT44A8FIX1",
+        "mode": "mode-c",
+        "queued_at": "2026-09-05T12:00:00+00:00",
+        "max_turns": 5,
+        "sdk_timeout_seconds": 1800,
+        "triggered_by": "forge-internal",
+        "originating_adapter": "slack",
+        "originating_user": USER,
+        "parent_request_id": THREAD,
+    }
+
+
+class Republisher:
+    """Stands in for saying a written build's queued event again."""
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        self.calls: list[Any] = []
+        self._fail_with = fail_with
+
+    async def __call__(self, build: Any) -> None:
+        self.calls.append(build)
+        if self._fail_with is not None:
+            raise self._fail_with
+
+
+class LosesThePublish:
+    """The admission whose build row landed and whose publish did not.
+
+    First call: the build row appears and the publish fails, exactly as the
+    real admission behaves — write first, then publish. Every call after
+    that: the row is already there, so the admission refuses the duplicate.
+    """
+
+    def __init__(self, builds: dict[str, dict[str, Any]]) -> None:
+        self.builds = builds
+        self.calls = 0
+
+    async def __call__(self, admission: Admission) -> None:
+        self.calls += 1
+        correlation_id = admission.correlation_id
+        if correlation_id not in self.builds:
+            self.builds[correlation_id] = a_build(correlation_id, "QUEUED")
+            raise publish_failed()
+        raise refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+
+
+class TestARepairWhoseBuildWasAlreadyWritten:
+    """A duplicate that is the row's OWN build is settled, not asked again.
+
+    The write comes before the publish, so a publish that fails leaves a real
+    build row nobody was told about. Until now the next tick was refused as a
+    duplicate and the row went back in the queue — every ten seconds, for
+    ever, with the whole queue waiting behind it. The loop now reads that
+    build and answers in its terms.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_lost_publish_is_said_again_once_and_the_row_is_admitted(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        maker = LosesThePublish(builds)
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=maker,
+            builds=builds,
+            republisher=republisher,
+        )
+
+        await loop.tick()  # the build row lands, the publish fails
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert republisher.calls == []
+
+        await loop.tick()  # the duplicate is this row's own build
+        assert len(republisher.calls) == 1
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+        await loop.tick()  # and it is not said a third time
+        assert len(republisher.calls) == 1
+        assert store.get(queue_id)["status"] == "ADMITTED"
+        assert maker.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_the_saying_again_is_written_down(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=LosesThePublish(builds),
+            builds=builds,
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+        await loop.tick()
+
+        said_again = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "republished"
+        ]
+        assert len(said_again) == 1
+        assert said_again[0]["actor_identity"] == LOOP_ACTOR
+        assert "build-FEAT-44A8-1" in str(said_again[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_a_build_already_under_way_leaves_the_row_admitted(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The work is happening. Nothing is published, and nothing is asked again."""
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "RUNNING")},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "ADMITTED"
+        assert republisher.calls == []
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_build_that_already_finished_closes_the_row_done(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "COMPLETE")},
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "DONE"
+
+    @pytest.mark.asyncio
+    async def test_a_build_that_already_failed_blocks_the_row_in_its_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "FAILED")},
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+
+        row = store.get(queue_id)
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "the fix journey failed"
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_that_is_not_this_rows_build_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Somebody else's build for the same feature really does clear."""
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert republisher.calls == []
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_say_it_again_the_row_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The honest degrade: no republisher, so the old behaviour stands."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "QUEUED")},
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_saying_that_fails_puts_the_row_back_for_the_next_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The broker is still down. Try again in ten seconds, not never."""
+        republisher = Republisher(fail_with=RuntimeError("broker unreachable"))
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "QUEUED")},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert len(republisher.calls) == 2

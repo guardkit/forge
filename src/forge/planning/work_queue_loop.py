@@ -38,8 +38,16 @@ What the loop does, in order, every tick
    for a reason that will not change — a repository the configuration does
    not know, a budget profile with no cap, a row that names no build — is
    closed BLOCKED with that refusal as its reason and said once in the
-   channel. A refusal that only means "not now", and a transport failure,
-   go back in the queue for the next tick as before.
+   channel — the channel gets the refusal's FIRST SENTENCE, the whole of it
+   stays on the row. A transport failure goes back in the queue for the next
+   tick as before.
+5. **Settles a repair whose build was already written.** "Another build for
+   this is already in flight" used to mean "try again next tick", for ever,
+   even when the build in flight was this row's OWN — written by an earlier
+   tick whose publish failed after it. The loop now reads that build and
+   answers in its terms: written but never dispatched, say its queued event
+   again and leave the row admitted; running, leave the row admitted; over,
+   close the row to match.
 
 Beside every admission it works out which row a class order would have taken
 — fixes first, then anything whose repository has a card waiting on Rich, then
@@ -72,7 +80,11 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli.status import _TERMINAL_STATES as _BUILD_TERMINAL_STATES
 from forge.lifecycle.persistence import ACTIVE_STATES as _BUILD_ACTIVE_STATES
-from forge.pipeline.fix_admission import FixAdmissionRefused
+from forge.pipeline.fix_admission import (
+    DUPLICATE_REASON,
+    REPUBLISHED_ACTION,
+    FixAdmissionRefused,
+)
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     age_phrase,
@@ -129,6 +141,10 @@ BUILD_TERMINAL_STATES: frozenset[str] = frozenset(
 #: The kind of row that is a repair rather than a piece of new work. A repair
 #: does not start a planning run: it opens a fix journey (a mode-c build).
 FIX_KIND: str = "fix"
+
+#: The build state that means the row was written and nothing has picked it
+#: up yet — the state a build sits in when its queued event never went out.
+BUILD_WRITTEN_STATE: str = "QUEUED"
 
 #: The build state that means a repair finished and the work happened.
 BUILD_SUCCESS_STATES: frozenset[str] = frozenset({"COMPLETE"})
@@ -305,6 +321,7 @@ class WorkQueueLoop:
         start_fix: Callable[[Admission], Awaitable[None]] | None = None,
         fix_build: Callable[[str], Mapping[str, Any] | sqlite3.Row | None]
         | None = None,
+        republish_build: Callable[[Any], Awaitable[None]] | None = None,
         admit_fix_rows: bool = False,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
@@ -338,6 +355,12 @@ class WorkQueueLoop:
             journey has finished. ``None`` leaves repair rows uncollected:
             they stay ADMITTED until something else closes them, which is
             the honest degrade when nothing can read a build.
+        republish_build:
+            Says one build's queued event again, given the build row. Used for
+            exactly one thing: a build that was written and whose publish then
+            failed, so the pipeline was never told about work that exists.
+            ``None`` means nothing here can re-announce a build, and such a row
+            goes back in the queue as it used to.
         admit_fix_rows:
             Whether a repair row may be STARTED (conductor rewire rule 4).
             False — the default and the shipped posture — leaves repair
@@ -356,6 +379,7 @@ class WorkQueueLoop:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._start_fix = start_fix
         self._fix_build = fix_build
+        self._republish_build = republish_build
         self._admit_fix_rows = admit_fix_rows
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, and the set of repair
@@ -595,6 +619,10 @@ class WorkQueueLoop:
         try:
             await starter(admission)
         except FixAdmissionRefused as refusal:
+            if refusal.reason == DUPLICATE_REASON and await self._settle_duplicate(
+                taken
+            ):
+                return None
             if refusal.permanent:
                 if self._close_refused(taken, refusal):
                     await self._say(
@@ -649,6 +677,146 @@ class WorkQueueLoop:
             waiting.queue_id,
             waiting.label(),
         )
+
+    async def _settle_duplicate(self, row: sqlite3.Row) -> bool:
+        """Answer a repair whose build already exists. True when it is settled.
+
+        "Another build for this is already in flight" is usually right and
+        clears by itself, so the row goes back in the queue. It is wrong for
+        ever in one case: the build in flight is this row's OWN, written by an
+        earlier tick whose publish failed after the write. Nothing will ever
+        finish that build, nothing will ever stop refusing this row, and the
+        queue behind it never moves.
+
+        So the loop reads the build under this row's correlation id and
+        answers in the build's own terms:
+
+        - **written, never dispatched** — say its queued event again and leave
+          the row admitted;
+        - **running** — the work is happening; leave the row admitted, and the
+          closing pass will collect it when it ends;
+        - **over** — close the row DONE or BLOCKED to match, the same way the
+          closing pass would have.
+
+        Returns False when this is somebody else's build after all — nothing
+        here reads builds, or there is no build under this correlation id — and
+        putting the row back for the next tick is right.
+        """
+        if self._fix_build is None:
+            return False
+        queue_id = int(row["id"])
+        correlation_id = str(row["correlation_id"])
+        build = self._fix_build(correlation_id)
+        if build is None:
+            return False
+        status = str(_build_field(build, "status") or "")
+        name = str(_build_field(build, "build_id") or correlation_id)
+
+        if status == BUILD_WRITTEN_STATE:
+            return await self._say_the_build_again(row, build, name)
+        if status in BUILD_ACTIVE_STATES:
+            logger.info(
+                "work queue: #%d already has a build under way (%s, %s); "
+                "leaving it admitted",
+                queue_id,
+                name,
+                status,
+            )
+            return True
+        if status in BUILD_TERMINAL_STATES:
+            if status in BUILD_SUCCESS_STATES:
+                self._store.close(
+                    queue_id, status="DONE", actor_identity=LOOP_ACTOR
+                )
+                logger.info(
+                    "work queue: #%d's build (%s) had already finished; "
+                    "closing the row done",
+                    queue_id,
+                    name,
+                )
+            else:
+                reason = self._failure_reason(build, status, is_fix=True)
+                self._store.close(
+                    queue_id,
+                    status="BLOCKED",
+                    actor_identity=LOOP_ACTOR,
+                    reason=reason,
+                )
+                logger.warning(
+                    "work queue: #%d's build (%s) was already over — %s",
+                    queue_id,
+                    name,
+                    reason,
+                )
+            return True
+
+        logger.warning(
+            "work queue: #%d's build (%s) is in a state this loop does not "
+            "know (%s); putting the row back for the next tick",
+            queue_id,
+            name,
+            status,
+        )
+        return False
+
+    async def _say_the_build_again(
+        self, row: sqlite3.Row, build: Any, name: str
+    ) -> bool:
+        """Re-announce a build that was written and never dispatched.
+
+        The same event, rebuilt from the build row: same feature, same
+        correlation id, same subject. The build row already exists, so a
+        second hearing finds it rather than starting another one. The row
+        stays admitted and an events row says the announcement was repeated.
+        """
+        queue_id = int(row["id"])
+        if self._republish_build is None:
+            logger.warning(
+                "work queue: #%d's build (%s) was written and never "
+                "announced, and nothing here can say its queued event again; "
+                "putting the row back for the next tick",
+                queue_id,
+                name,
+            )
+            return False
+        try:
+            await self._republish_build(build)
+        except Exception as exc:  # noqa: BLE001 — the broker may still be down
+            logger.warning(
+                "work queue: could not say #%d's build (%s) again (%s: %s); "
+                "putting the row back for the next tick",
+                queue_id,
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        try:
+            self._store.record_event(
+                queue_id=queue_id,
+                action=REPUBLISHED_ACTION,
+                actor_identity=LOOP_ACTOR,
+                details={
+                    "build_id": name,
+                    "correlation_id": str(row["correlation_id"]),
+                    "status": BUILD_WRITTEN_STATE,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — a note never costs the work
+            logger.warning(
+                "work queue: could not write the republished note for #%d "
+                "(%s: %s)",
+                queue_id,
+                type(exc).__name__,
+                exc,
+            )
+        logger.info(
+            "work queue: #%d's build (%s) was written and never announced; "
+            "said its queued event again and leaving the row admitted",
+            queue_id,
+            name,
+        )
+        return True
 
     def _close_refused(
         self, row: sqlite3.Row, refusal: FixAdmissionRefused
@@ -933,12 +1101,35 @@ class WorkQueueLoop:
             await sleeper(interval_seconds)
 
 
+def first_sentence(text: str) -> str:
+    """The first sentence of a refusal, with no full stop left on the end.
+
+    A refusal is not always a sentence. THE CAP LAW's refusal is a runbook of
+    about seven hundred characters with a YAML snippet in it, and all of that
+    flattened into one Slack line is a line nobody reads. The sentence ends at
+    the first full stop followed by a space, or at the first line break,
+    whichever comes first.
+    """
+    raw = str(text).strip()
+    if not raw:
+        return ""
+    line = raw.split("\n", 1)[0]
+    head, stop, _rest = line.partition(". ")
+    sentence = head if stop else line
+    return " ".join(sentence.split()).rstrip(".")
+
+
 def refusal_line(queue_id: int, reason: str) -> str:
-    """The one line the channel gets when a row is refused for good."""
-    trimmed = " ".join(str(reason).split()).rstrip(".")
+    """The one line the channel gets when a row is refused for good.
+
+    The refusal's FIRST sentence only — what happened, in one line. The whole
+    of the refusal, runbook and all, is written on the row itself
+    (``closed_reason``) and in the row's events, which is where anyone who
+    wants the rest of it looks.
+    """
     return (
-        f"#{queue_id} cannot be started: {trimmed}. It is out of the queue; "
-        "drop it or fix the cause and send it again."
+        f"#{queue_id} cannot be started: {first_sentence(reason)}. It is out "
+        "of the queue; drop it or fix the cause and send it again."
     )
 
 
@@ -948,6 +1139,14 @@ def shadow_line(shadow: Pick, taken_id: int) -> str:
         f"next I'd pick #{shadow.queue_id} ({shadow.label()}), "
         f"because {shadow.reason}; taking #{taken_id} as things stand."
     )
+
+
+def _build_field(build: Any, name: str) -> Any:
+    """One field of a build, whether it reads like a row or like a mapping."""
+    try:
+        return build[name]
+    except (KeyError, IndexError, TypeError):
+        return None
 
 
 def _parse(moment: str) -> datetime:
@@ -967,6 +1166,7 @@ __all__ = [
     "BUILD_FAILURE_STATES",
     "BUILD_SUCCESS_STATES",
     "BUILD_TERMINAL_STATES",
+    "BUILD_WRITTEN_STATE",
     "FIX_KIND",
     "LOOP_ACTOR",
     "PLANNING_FAILURE_STATES",
@@ -978,6 +1178,7 @@ __all__ = [
     "TAKE_NEXT_INTERVAL_SECONDS",
     "WorkQueueLoop",
     "count_in_flight",
+    "first_sentence",
     "paused_repositories",
     "refusal_line",
     "shadow_line",
