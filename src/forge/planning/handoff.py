@@ -54,6 +54,7 @@ from pydantic import BaseModel
 from forge.adapters.git.models import GitOpResult
 from forge.config.models import PlanningConfig
 from forge.planning.states import PlanningState
+from forge.planning.target_repos import format_known_repos
 
 logger = logging.getLogger(__name__)
 
@@ -378,15 +379,21 @@ class PlannedHandoffHandler:
         # AC-004: Resolve repo path from config
         repo_path = self._config.target_repo_paths.get(target_repo)
         if repo_path is None:
+            known = format_known_repos(self._config.target_repo_paths)
             logger.error(
-                "Target repo %s not in target_repo_paths (correlation_id=%s)",
+                "Target repo %s not in target_repo_paths (correlation_id=%s); "
+                "known repos: %s",
                 target_repo,
                 correlation_id,
+                known,
             )
             return {
                 **run_data,
                 "state": PlanningState.FAILED.value,
-                "failure_reason": f"Target repository {target_repo} not found in configuration",
+                "failure_reason": (
+                    f"Target repository {target_repo} not found in "
+                    f"configuration; known repos: {known}"
+                ),
                 "notification_type": "failure",
             }
 

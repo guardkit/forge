@@ -324,6 +324,9 @@ class TestTargetRepoResolution:
 
         assert result["state"] == PlanningState.FAILED.value
         assert "unknown-repo" in result["failure_reason"].lower()
+        # 2026-09-05 rule 4 — the failure says what IS known, so the reader
+        # can pick a name that works instead of guessing again.
+        assert "known repos: org/known-repo" in result["failure_reason"]
         assert git_runner.call_count == 0  # No GitRunner invocation
 
 

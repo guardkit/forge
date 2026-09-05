@@ -818,3 +818,124 @@ class TestOnRecordedCallback:
         await handle_planning_message(msg, deps)  # must not raise
 
         msg.ack.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# The sentence names its repository (2026-09-05 spec, rules 3 and 4)
+# ---------------------------------------------------------------------------
+
+
+class TestNamedTargetRepository:
+    """A sentence may name the repository; an unknown name is refused.
+
+    NOTE on coverage: the wire payload's own validator (nats-core
+    ``PlanningQueuedPayload._validate_target_repo``) accepts only ``org/name``,
+    so a SHORT name never reaches this consumer today. The short-name half of
+    rule 3 is therefore proved directly against the resolver in
+    ``tests/forge/planning/test_target_repos.py``, and this class proves what
+    the wire can carry.
+    """
+
+    @staticmethod
+    def _payload(target_repo: str | None) -> dict[str, Any]:
+        payload = _valid_planning_payload()
+        payload["target_repo"] = target_repo
+        return payload
+
+    @staticmethod
+    def _deps_with_paths(
+        store: SqlitePlanningRunStore,
+        paths: dict[str, str],
+        notifications: list[tuple[str, str]],
+        on_recorded: Any = None,
+    ) -> PlanningConsumerDeps:
+        from forge.config.models import PlanningConfig
+
+        async def publish(correlation_id: str, message: str) -> None:
+            notifications.append((correlation_id, message))
+
+        return PlanningConsumerDeps(
+            store=store,
+            publish_notification=publish,
+            on_recorded=on_recorded,
+            planning_config=PlanningConfig(target_repo_paths=paths),
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_target_repo_refused_with_allowed_names(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """An unknown name fails the run at once and lists what IS known."""
+        notifications: list[tuple[str, str]] = []
+        kicked: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            kicked.append(correlation_id)
+
+        deps = self._deps_with_paths(
+            store,
+            {
+                "guardkit/api_test": "/srv/repos/api_test",
+                "appmilla/study-tutor": "/srv/repos/study-tutor",
+            },
+            notifications,
+            on_recorded=on_recorded,
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("elsewhere/nowhere")))
+        await handle_planning_message(msg, deps)
+
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None, "the run row is recorded, then failed"
+        assert run["state"] == "FAILED"
+
+        assert notifications == [
+            (
+                CORRELATION_ID,
+                "I don't know a repository called elsewhere/nowhere. "
+                "I can build in: guardkit/api_test, appmilla/study-tutor.",
+            )
+        ]
+        assert kicked == [], "a refused sentence must start no planning leg"
+        msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_known_target_repo_is_recorded_and_drives(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """A name the forge knows is recorded and the driver is kicked."""
+        notifications: list[tuple[str, str]] = []
+        kicked: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            kicked.append(correlation_id)
+
+        deps = self._deps_with_paths(
+            store,
+            {"appmilla/example": "/srv/repos/example"},
+            notifications,
+            on_recorded=on_recorded,
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("appmilla/example")))
+        await handle_planning_message(msg, deps)
+
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None
+        assert run["state"] == "QUEUED"
+        assert run["target_repo"] == "appmilla/example"
+        assert notifications == []
+        assert kicked == [CORRELATION_ID]
+
+    @pytest.mark.asyncio
+    async def test_no_config_records_the_name_as_it_arrives(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """With no planning config wired, intake behaves exactly as before."""
+        msg = _make_msg(_envelope_bytes(self._payload("appmilla/example")))
+        await handle_planning_message(msg, _make_deps(store))
+
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None
+        assert run["state"] == "QUEUED"
+        assert run["target_repo"] == "appmilla/example"
