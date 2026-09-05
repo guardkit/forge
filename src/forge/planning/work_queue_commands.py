@@ -27,11 +27,17 @@ References
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from forge.planning.work_queue_store import FiledRow, WorkQueueStore
+from forge.planning.work_queue_store import (
+    OPEN_STATUSES,
+    FiledRow,
+    WorkQueueStore,
+    valid_queue_id,
+)
 
 
 #: The verbs the forge acts on. Anything else is answered with one line and
@@ -78,6 +84,34 @@ _CLOSED_WORDS: Mapping[str, str] = {
     "WITHDRAWN": "withdrawn",
     "BLOCKED": "blocked",
 }
+
+
+def notifier_takes_parent_request_id(notifier: Callable[..., Any] | None) -> bool:
+    """True when this notifier can be told which conversation to answer in.
+
+    Read once, when the notifier is wired up, and remembered — never worked
+    out by calling it and catching the complaint. Catching a ``TypeError``
+    around an awaited call cannot tell "this notifier takes two arguments"
+    from "the notifier ran and something inside it went wrong", and the
+    second one would then be sent a second time.
+    """
+    if notifier is None:
+        return False
+    try:
+        signature = inspect.signature(notifier)
+    except (TypeError, ValueError):
+        # Something not introspectable (a C callable, a strange mock): keep
+        # to the two arguments every notifier has always taken.
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "parent_request_id" and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
 
 
 def _count_phrase(count: int) -> str:
@@ -140,7 +174,16 @@ def list_reply(rows: list[sqlite3.Row], *, now: datetime) -> str:
     return "\n".join(lines)
 
 
-def _no_such_row(queue_id: Any) -> str:
+#: What the forge says when what arrived where a row number should be could
+#: never be one: nought, a negative, an absurd number, or something that is
+#: not a number at all. Jarvis only checks the shape of what was typed, so
+#: this is where such a thing stops.
+NOT_A_ROW_NUMBER: str = (
+    "That is not a row number I can use, so I have changed nothing."
+)
+
+
+def _no_such_row(queue_id: int) -> str:
     return f"There is no #{queue_id} in the queue."
 
 
@@ -150,12 +193,13 @@ def _closed_row(row: sqlite3.Row) -> str:
 
 
 def _reply_for_missing(store: WorkQueueStore, queue_id: Any) -> str:
-    """One line for an id that cannot be moved: unknown, or already closed."""
-    if not isinstance(queue_id, int):
-        return _no_such_row(queue_id)
-    row = store.get(queue_id)
+    """One line for an id that cannot be moved: unknown, closed, or no id."""
+    checked = valid_queue_id(queue_id)
+    if checked is None:
+        return NOT_A_ROW_NUMBER
+    row = store.get(checked)
     if row is None:
-        return _no_such_row(queue_id)
+        return _no_such_row(checked)
     return _closed_row(row)
 
 
@@ -186,20 +230,31 @@ def execute_command(
     """
     now = (clock or (lambda: datetime.now(timezone.utc)))()
     verb = str(command.get("verb") or "")
-    queue_id = command.get("id")
     if verb not in COMMAND_VERBS:
         return "I do not know that queue command, so I have changed nothing."
 
     if verb == "list":
         return list_reply(store.list_open(), now=now)
 
+    # Every verb below names a row. Jarvis matched the shape of what was
+    # typed and forwarded it as it found it, so the number is checked here,
+    # once, before anything is looked up or written.
+    queue_id = valid_queue_id(command.get("id"))
+
     if verb in ("add_front", "add_before"):
         sentence = str(command.get("sentence") or "").strip()
         if not sentence:
             return "That command had no sentence in it, so I have queued nothing."
         if verb == "add_before":
-            if not isinstance(queue_id, int) or store.get(queue_id) is None:
+            if queue_id is None:
+                return NOT_A_ROW_NUMBER
+            named = store.get(queue_id)
+            if named is None:
                 return _no_such_row(queue_id)
+            if str(named["status"]) not in OPEN_STATUSES:
+                # Nothing is filed: a row asked for in front of one that is
+                # already finished has to be told, not quietly put last.
+                return _closed_row(named)
         filed: FiledRow = store.file_sentence(
             correlation_id=correlation_id,
             sentence=sentence,
@@ -217,41 +272,49 @@ def execute_command(
             ahead=filed.ahead,
         )
 
+    if queue_id is None:
+        return NOT_A_ROW_NUMBER
+
     if verb == "promote":
-        if isinstance(queue_id, int) and store.promote(
-            queue_id, actor_identity=actor_identity
-        ):
+        if store.promote(queue_id, actor_identity=actor_identity):
             return f"#{queue_id} is next."
         return _reply_for_missing(store, queue_id)
 
     if verb == "link":
-        after = command.get("after")
-        if not isinstance(queue_id, int) or not isinstance(after, int):
+        after = valid_queue_id(command.get("after"))
+        if after is None:
+            return NOT_A_ROW_NUMBER
+        if store.get(queue_id) is None:
             return _no_such_row(queue_id)
         if store.get(after) is None:
             return _no_such_row(after)
+        if queue_id == after:
+            return f"#{queue_id} cannot wait for itself."
+        if store.waits_on(after, queue_id):
+            return (
+                f"#{queue_id} cannot wait for #{after}, because #{after} is "
+                f"already waiting on #{queue_id}."
+            )
         if store.link(queue_id, after, actor_identity=actor_identity):
             return f"#{queue_id} will wait until #{after} is done."
         return _reply_for_missing(store, queue_id)
 
     if verb == "keep":
-        if isinstance(queue_id, int) and store.keep(
-            queue_id, actor_identity=actor_identity
-        ):
+        if store.keep(queue_id, actor_identity=actor_identity):
             return f"#{queue_id} stays in the queue."
         return _reply_for_missing(store, queue_id)
 
     # drop — the row closes WITHDRAWN and is never deleted.
-    if isinstance(queue_id, int) and store.drop(
-        queue_id, actor_identity=actor_identity
-    ):
+    if store.drop(queue_id, actor_identity=actor_identity):
         return f"#{queue_id} is out of the queue. Nothing was deleted."
     return _reply_for_missing(store, queue_id)
 
 
 __all__ = [
     "COMMAND_VERBS",
+    "NOT_A_ROW_NUMBER",
     "age_phrase",
+    "notifier_takes_parent_request_id",
     "execute_command",
     "list_reply",
     "queued_reply",

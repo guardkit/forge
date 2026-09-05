@@ -1197,7 +1197,7 @@ async def compose_planning_consumer_and_dispatch(
         async def _on_recorded(correlation_id: str) -> None:
             _spawn_drive(correlation_id)
 
-        async def _notify_two_arg(
+        async def _notify_in_thread(
             correlation_id: str,
             message: str,
             *,
@@ -1209,7 +1209,7 @@ async def compose_planning_consumer_and_dispatch(
 
         consumer_deps = PlanningConsumerDeps(
             store=store,
-            publish_notification=_notify_two_arg,
+            publish_notification=_notify_in_thread,
             on_recorded=_on_recorded,
             # Lane B stage one: a sentence becomes a queue row here, and the
             # take-next loop creates the planning run later.
@@ -1243,7 +1243,7 @@ async def compose_planning_consumer_and_dispatch(
             planning_run=store.get_run,
             paused_repositories=lambda: paused_repositories(pool),
             start_run=_start_queued_run,
-            notify=_notify_two_arg,
+            notify=_notify_in_thread,
             max_in_flight=config.queue.max_in_flight,
             stale_after_days=config.queue.stale_after_days,
             clock=clock_fn,

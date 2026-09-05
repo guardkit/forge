@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 from nats_core.envelope import MessageEnvelope
@@ -45,7 +45,11 @@ from forge.planning.target_repos import (
     refusal_message,
     resolve_target_repo,
 )
-from forge.planning.work_queue_commands import execute_command, queued_reply
+from forge.planning.work_queue_commands import (
+    execute_command,
+    notifier_takes_parent_request_id,
+    queued_reply,
+)
 from forge.planning.work_queue_store import KINDS, WorkQueueStore
 
 logger = logging.getLogger(__name__)
@@ -219,6 +223,18 @@ class PlanningConsumerDeps:
     planning_config: Any | None = None
     queue_store: WorkQueueStore | None = None
 
+    #: Whether ``publish_notification`` can be told which conversation to
+    #: answer in. Read from the callable once, here, when the consumer is
+    #: wired up — never by calling it and catching the complaint.
+    notifier_takes_thread: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "notifier_takes_thread",
+            notifier_takes_parent_request_id(self.publish_notification),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Telling the sender
@@ -235,23 +251,21 @@ async def _notify_best_effort(
     """Send one sentence to whoever asked; never let it block the ack.
 
     ``parent_request_id`` is the conversation the message arrived in. The
-    notifier normally reads that anchor off the planning run row, and a queued
+    notifier normally reads that thread off the planning run row, and a queued
     sentence has no planning run yet — so the queue replies hand it over
-    directly. A notifier that does not take the argument (an older callable, a
-    test double) still gets the two-argument call.
+    directly. Whether this notifier takes the argument was settled when the
+    consumer was wired up; a notifier that does not (an older callable, a test
+    double) gets the two-argument call.
     """
     if deps.publish_notification is None:
         return
     try:
-        if parent_request_id is None:
+        if parent_request_id is None or not deps.notifier_takes_thread:
             await deps.publish_notification(correlation_id, message)
         else:
-            try:
-                await deps.publish_notification(  # type: ignore[call-arg]
-                    correlation_id, message, parent_request_id=parent_request_id
-                )
-            except TypeError:
-                await deps.publish_notification(correlation_id, message)
+            await deps.publish_notification(  # type: ignore[call-arg]
+                correlation_id, message, parent_request_id=parent_request_id
+            )
     except Exception as exc:  # noqa: BLE001 — a notification never blocks the ack
         logger.warning(
             "planning_consumer: publish_notification raised (%s) for "

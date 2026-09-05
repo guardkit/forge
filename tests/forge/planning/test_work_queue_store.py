@@ -20,7 +20,11 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
-from forge.planning.work_queue_store import RANK_EPSILON, WorkQueueStore
+from forge.planning.work_queue_store import (
+    RANK_EPSILON,
+    WorkQueueStore,
+    valid_queue_id,
+)
 
 USER = "U-RICH"
 
@@ -379,3 +383,213 @@ class TestLookups:
 
     def test_an_empty_queue_lists_nothing(self, store: WorkQueueStore) -> None:
         assert store.list_open() == []
+
+
+# ---------------------------------------------------------------------------
+# Row numbers that could never name a row (coaches' correction, 2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+IMPOSSIBLE_IDS = [0, -1, 10**12, "\u0661\u0662", "12", 12.0, None, True, [1]]
+
+
+class TestRowNumbersThatCouldNeverNameARow:
+    """Jarvis checks the shape of what was typed; the store checks the number.
+
+    ``"\u0661\u0662"`` is twelve in Arabic-Indic digits — ``int()`` reads it
+    happily — so anything that is not already a plain whole number is refused
+    rather than quietly turned into one.
+    """
+
+    @pytest.mark.parametrize("value", IMPOSSIBLE_IDS)
+    def test_they_are_not_row_numbers(self, value: object) -> None:
+        assert valid_queue_id(value) is None
+
+    def test_an_ordinary_row_number_is_one(self) -> None:
+        assert valid_queue_id(7) == 7
+
+    @pytest.mark.parametrize("value", [0, -1, 10**12, "\u0661\u0662"])
+    def test_every_door_into_the_store_refuses_them(
+        self, store: WorkQueueStore, value: object
+    ) -> None:
+        filed = _file(store, "plan-1")
+        assert store.get(value) is None
+        assert store.promote(value, actor_identity=USER) is False
+        assert store.keep(value, actor_identity=USER) is False
+        assert store.drop(value, actor_identity=USER) is False
+        assert store.admit(value, actor_identity=USER) is False
+        assert store.requeue(value, actor_identity=USER) is False
+        assert store.close(value, status="DONE", actor_identity=USER) is False
+        assert store.link(filed.queue_id, value, actor_identity=USER) is False
+        assert store.link(value, filed.queue_id, actor_identity=USER) is False
+        store.mark_stale_pinged(value, at="2026-09-05T12:00:00+00:00")
+        # Nothing moved, and nothing was written down about a row that
+        # nobody named.
+        row = store.get(filed.queue_id)
+        assert row["status"] == "QUEUED" and row["after_id"] is None
+        assert [e["action"] for e in store.list_events(filed.queue_id)] == ["queued"]
+
+
+# ---------------------------------------------------------------------------
+# Waits that would never end
+# ---------------------------------------------------------------------------
+
+
+class TestLinksThatWouldNeverEnd:
+    def test_a_row_cannot_wait_for_itself(self, store: WorkQueueStore) -> None:
+        filed = _file(store, "plan-1")
+        assert store.link(filed.queue_id, filed.queue_id, actor_identity=USER) is False
+        assert store.get(filed.queue_id)["after_id"] is None
+        assert [e["action"] for e in store.list_events(filed.queue_id)] == ["queued"]
+
+    def test_two_rows_cannot_wait_for_each_other(self, store: WorkQueueStore) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        assert store.link(first.queue_id, second.queue_id, actor_identity=USER) is True
+        assert store.link(second.queue_id, first.queue_id, actor_identity=USER) is False
+        assert store.get(second.queue_id)["after_id"] is None
+        assert [e["action"] for e in store.list_events(second.queue_id)] == ["queued"]
+
+    def test_a_longer_circle_is_refused_too(self, store: WorkQueueStore) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        third = _file(store, "plan-3")
+        store.link(first.queue_id, second.queue_id, actor_identity=USER)
+        store.link(second.queue_id, third.queue_id, actor_identity=USER)
+        assert store.link(third.queue_id, first.queue_id, actor_identity=USER) is False
+        assert store.get(third.queue_id)["after_id"] is None
+
+    def test_a_chain_that_does_not_close_is_allowed(
+        self, store: WorkQueueStore
+    ) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        third = _file(store, "plan-3")
+        assert store.link(second.queue_id, first.queue_id, actor_identity=USER) is True
+        assert store.link(third.queue_id, second.queue_id, actor_identity=USER) is True
+        assert store.waits_on(third.queue_id, first.queue_id) is True
+        assert store.waits_on(first.queue_id, third.queue_id) is False
+
+
+# ---------------------------------------------------------------------------
+# A change and the note of who made it commit together
+# ---------------------------------------------------------------------------
+
+
+def _break_the_events_table(store: WorkQueueStore, monkeypatch) -> None:
+    """Make writing an events row fail, the way a full disk would."""
+
+    def boom(**_: object) -> int:
+        raise sqlite3.OperationalError("the events table is unavailable")
+
+    monkeypatch.setattr(store, "_record_event", boom)
+
+
+class TestOneTransaction:
+    """If the note cannot be written, the change does not happen either."""
+
+    def test_a_filing_leaves_no_row_behind(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            _file(store, "plan-1")
+        assert store.get_by_correlation_id("plan-1") is None
+        assert _order(store) == []
+
+    def test_a_promote_does_not_move_the_row(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.promote(second.queue_id, actor_identity=USER)
+        assert _order(store) == [first.queue_id, second.queue_id]
+
+    def test_a_link_does_not_record_the_wait(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        first = _file(store, "plan-1")
+        second = _file(store, "plan-2")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.link(second.queue_id, first.queue_id, actor_identity=USER)
+        assert store.get(second.queue_id)["after_id"] is None
+
+    def test_a_keep_does_not_count(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        filed = _file(store, "plan-1")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.keep(filed.queue_id, actor_identity=USER)
+        assert store.get(filed.queue_id)["keep_count"] == 0
+
+    def test_a_drop_leaves_the_row_in_the_queue(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        filed = _file(store, "plan-1")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.drop(filed.queue_id, actor_identity=USER)
+        assert store.get(filed.queue_id)["status"] == "QUEUED"
+
+    def test_a_close_leaves_the_row_open(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        filed = _file(store, "plan-1")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.close(filed.queue_id, status="DONE", actor_identity="forge")
+        assert store.get(filed.queue_id)["status"] == "QUEUED"
+
+    def test_an_admission_does_not_take_the_row(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        filed = _file(store, "plan-1")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.admit(filed.queue_id, actor_identity="forge")
+        assert store.get(filed.queue_id)["status"] == "QUEUED"
+
+    def test_a_requeue_leaves_the_row_admitted(
+        self, store: WorkQueueStore, monkeypatch
+    ) -> None:
+        filed = _file(store, "plan-1")
+        store.admit(filed.queue_id, actor_identity="forge")
+        _break_the_events_table(store, monkeypatch)
+        with pytest.raises(sqlite3.OperationalError):
+            store.requeue(filed.queue_id, actor_identity="forge")
+        assert store.get(filed.queue_id)["status"] == "ADMITTED"
+
+
+# ---------------------------------------------------------------------------
+# "In front of that one" when that one is gone
+# ---------------------------------------------------------------------------
+
+
+class TestFilingInFrontOfARowThatIsGone:
+    def test_a_closed_row_is_refused_not_answered_with_the_back(
+        self, store: WorkQueueStore
+    ) -> None:
+        first = _file(store, "plan-1")
+        store.drop(first.queue_id, actor_identity=USER)
+        with pytest.raises(ValueError):
+            _file(store, "plan-2", position="before", before_id=first.queue_id)
+        assert store.get_by_correlation_id("plan-2") is None
+        assert _order(store) == []
+
+    def test_an_unknown_row_is_refused(self, store: WorkQueueStore) -> None:
+        _file(store, "plan-1")
+        with pytest.raises(ValueError):
+            _file(store, "plan-2", position="before", before_id=404)
+        assert store.get_by_correlation_id("plan-2") is None
+
+    def test_a_number_that_could_never_be_a_row_is_refused(
+        self, store: WorkQueueStore
+    ) -> None:
+        _file(store, "plan-1")
+        with pytest.raises(ValueError):
+            _file(store, "plan-2", position="before", before_id=0)
+        assert store.get_by_correlation_id("plan-2") is None

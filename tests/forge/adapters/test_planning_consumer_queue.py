@@ -475,3 +475,127 @@ class TestTheRunCreationTheLoopWillCall:
         assert row["originating_user"] == USER
         assert row["parent_request_id"] == THREAD
         kick.assert_awaited_once_with(CORRELATION_ID)
+
+
+# ---------------------------------------------------------------------------
+# How the notifier is called is settled when it is wired up (2026-09-05)
+# ---------------------------------------------------------------------------
+
+
+class TwoArgumentNotifier:
+    """An older notifier that knows nothing about threads."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, correlation_id: str, message: str) -> None:
+        self.calls.append((correlation_id, message))
+
+
+class ThreadAwareNotifier:
+    """The notifier the forge wires up today."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    async def __call__(
+        self,
+        correlation_id: str,
+        message: str,
+        *,
+        parent_request_id: str | None = None,
+    ) -> None:
+        self.calls.append((correlation_id, message, parent_request_id))
+
+
+class BrokenNotifier(ThreadAwareNotifier):
+    """Takes the thread, then breaks on its own account."""
+
+    async def __call__(
+        self,
+        correlation_id: str,
+        message: str,
+        *,
+        parent_request_id: str | None = None,
+    ) -> None:
+        self.calls.append((correlation_id, message, parent_request_id))
+        raise TypeError("something inside the notifier broke")
+
+
+def _deps_with(
+    run_store: SqlitePlanningRunStore,
+    queue_store: WorkQueueStore,
+    notifier: Any,
+) -> PlanningConsumerDeps:
+    return PlanningConsumerDeps(
+        store=run_store,
+        publish_notification=notifier,
+        on_recorded=AsyncMock(),
+        queue_store=queue_store,
+    )
+
+
+class TestTheNotifierIsReadOnce:
+    def test_a_notifier_that_takes_the_thread_is_recognised(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        deps = _deps_with(run_store, queue_store, ThreadAwareNotifier())
+        assert deps.notifier_takes_thread is True
+
+    def test_an_older_notifier_is_recognised_too(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        deps = _deps_with(run_store, queue_store, TwoArgumentNotifier())
+        assert deps.notifier_takes_thread is False
+
+    def test_no_notifier_at_all(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        deps = _deps_with(run_store, queue_store, None)
+        assert deps.notifier_takes_thread is False
+
+    @pytest.mark.asyncio
+    async def test_an_older_notifier_still_gets_the_reply(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        notifier = TwoArgumentNotifier()
+        deps = _deps_with(run_store, queue_store, notifier)
+        msg = _msg(_payload())
+
+        await handle_planning_message(msg, deps)
+
+        assert len(notifier.calls) == 1
+        assert notifier.calls[0][1] == (
+            "Queued as #1 (api_test · feature). Nothing ahead of it."
+        )
+        msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_thread_goes_to_a_notifier_that_takes_it(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        notifier = ThreadAwareNotifier()
+        deps = _deps_with(run_store, queue_store, notifier)
+
+        await handle_planning_message(_msg(_payload()), deps)
+
+        assert notifier.calls[0][2] == THREAD
+
+    @pytest.mark.asyncio
+    async def test_a_notifier_that_breaks_is_not_called_a_second_time(
+        self, run_store: SqlitePlanningRunStore, queue_store: WorkQueueStore
+    ) -> None:
+        # The old code found out how to call the notifier by calling it and
+        # catching TypeError, so a TypeError from inside the notifier looked
+        # like an older notifier and the same sentence went out twice.
+        notifier = BrokenNotifier()
+        deps = _deps_with(run_store, queue_store, notifier)
+        msg = _msg(_payload())
+
+        await handle_planning_message(msg, deps)
+
+        assert len(notifier.calls) == 1
+        # The sentence is still filed and the message still acked: a broken
+        # notifier never wedges the intake.
+        assert queue_store.get_by_correlation_id(CORRELATION_ID) is not None
+        msg.ack.assert_awaited_once()
