@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "m5_line",
     "status_cmd",
 ]
 
@@ -763,6 +764,45 @@ def _watch_loop(
 
 
 # ---------------------------------------------------------------------------
+# M5 — the self-closed defect rate
+# ---------------------------------------------------------------------------
+
+
+def m5_line(numerator: int, denominator: int, *, since: str) -> str:
+    """The one line ``forge status --m5`` prints.
+
+    Two shapes and no third. With no repair row filed since the cutoff there
+    is no rate to state — saying "0 of 0" would read as a failure when in
+    fact nothing has been asked of the conductor yet — so the line says so
+    in words instead.
+    """
+    if denominator == 0:
+        return f"no repair rows yet since {since}"
+    return f"self-closed defects: {numerator} of {denominator} since {since}"
+
+
+def _emit_m5(db_path: Path, *, out: Console) -> None:
+    """Read the rate and print the line; say plainly if there is no queue."""
+    from forge.lifecycle.metrics import M5_SINCE, self_closed_defect_rate
+
+    cx = read_only_connect(db_path)
+    try:
+        numerator, denominator = self_closed_defect_rate(cx)
+    except sqlite3.OperationalError as exc:
+        if "work_queue" in str(exc):
+            # A database from before the work queue existed. That is not a
+            # rate of zero and it is not an error the operator caused.
+            out.print(
+                "this database has no work queue yet, so there is nothing to count."
+            )
+            return
+        raise
+    finally:
+        cx.close()
+    out.print(m5_line(numerator, denominator, since=M5_SINCE))
+
+
+# ---------------------------------------------------------------------------
 # Click command
 # ---------------------------------------------------------------------------
 
@@ -810,6 +850,17 @@ def _watch_loop(
     ),
 )
 @click.option(
+    "--m5",
+    "m5",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print one line: how many repair jobs the factory closed by "
+        "itself, out of how many it took on, since 2026-09-05. Ignores "
+        "the table flags."
+    ),
+)
+@click.option(
     "--in-flight",
     "in_flight",
     is_flag=True,
@@ -829,6 +880,7 @@ def status_cmd(
     as_json: bool,
     db_path_opt: str | None,
     in_flight: bool,
+    m5: bool,
 ) -> None:
     """Show current and recent Forge builds.
 
@@ -842,6 +894,7 @@ def status_cmd(
     * ``--watch``: poll every 2s and re-render via ``rich.live``.
     * ``--full``: include up to 5 ``stage_log`` entries per build.
     * ``--json``: emit a JSON array suitable for piping.
+    * ``--m5``: print the self-closed defect rate — one line, no table.
     * ``--in-flight`` (TASK-FRR-PEB-012): replace the builds-table view
       with the lifecycle bridge in-flight registry. Read-only; combines
       cleanly with ``--json``, ``--db-path`` and a positional
@@ -862,6 +915,13 @@ def status_cmd(
     console = Console(width=160)
 
     try:
+        if m5:
+            # One line and nothing else. The spec is silent on combining
+            # --m5 with the table flags, so the smallest thing is to answer
+            # the question that was asked and return.
+            _emit_m5(db_path, out=console)
+            return
+
         if in_flight:
             # AC-001 (TASK-FRR-PEB-012): the --in-flight surface reads
             # from the lifecycle_bridge_registry rather than the builds
