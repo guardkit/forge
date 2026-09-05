@@ -244,6 +244,47 @@ class TestTheInFlightCount:
         _insert_build(connection, "b-1", "QUEUED")
         assert count_in_flight(connection) == 2
 
+    def test_an_interrupted_build_is_not_in_flight(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """The live ledger of 2026-09-05 held 28 builds marked INTERRUPTED by boot
+        recovery. Nothing is happening for them; counting them as in flight kept
+        the cap of one full for ever and the first real sentence was never
+        admitted. Only the forge's own active states count."""
+        for i in range(28):
+            _insert_build(connection, f"dead-{i}", "INTERRUPTED")
+        _insert_build(connection, "b-skipped", "SKIPPED")
+        _insert_build(connection, "b-cancelled", "CANCELLED")
+        assert count_in_flight(connection) == 0
+
+    def test_every_active_build_state_counts(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        for i, status in enumerate(["QUEUED", "PREPARING", "RUNNING", "PAUSED", "FINALISING"]):
+            _insert_build(connection, f"b-{i}", status)
+        assert count_in_flight(connection) == 5
+
+    def test_every_active_planning_state_counts_and_the_rest_do_not(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        active = [
+            PlanningState.QUEUED.value,
+            PlanningState.RUNNING.value,
+            PlanningState.PAUSED.value,
+            PlanningState.FEATURE_SPEC.value,
+            PlanningState.FEATURE_PLAN.value,
+        ]
+        for i, state in enumerate(active):
+            _insert_run(connection, f"active-{i}", state)
+        for i, state in enumerate([
+            PlanningState.BUILD_QUEUED.value,
+            PlanningState.PLANNED_HANDOFF.value,
+            PlanningState.CANCELLED.value,
+            PlanningState.TIMED_OUT.value,
+        ]):
+            _insert_run(connection, f"over-{i}", state)
+        assert count_in_flight(connection) == len(active)
+
     def test_a_paused_run_names_its_repository(
         self, connection: sqlite3.Connection
     ) -> None:

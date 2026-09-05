@@ -65,6 +65,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli.status import _TERMINAL_STATES as _BUILD_TERMINAL_STATES
+from forge.lifecycle.persistence import ACTIVE_STATES as _BUILD_ACTIVE_STATES
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     age_phrase,
@@ -127,6 +128,29 @@ BUILD_SUCCESS_STATES: frozenset[str] = frozenset({"COMPLETE"})
 
 #: The build states that mean a repair is over and the work did not happen.
 BUILD_FAILURE_STATES: frozenset[str] = BUILD_TERMINAL_STATES - BUILD_SUCCESS_STATES
+
+#: The states that mean a build is running NOW — the forge's own list
+#: (``lifecycle/persistence.py``): queued, preparing, running, paused, finalising.
+#: This is what the in-flight count uses, NOT "everything that is not terminal":
+#: on the live ledger of 2026-09-05 twenty-eight builds sat INTERRUPTED (dead until
+#: boot re-cards them, at which point they become PAUSED and count), and "not
+#: terminal" counted every one of them, so the cap of one was full for ever and
+#: the first real sentence through the queue was never admitted. Found by Rich at
+#: his Slack surface; the coaches had tested on fresh databases.
+BUILD_ACTIVE_STATES: frozenset[str] = frozenset(
+    state.value for state in _BUILD_ACTIVE_STATES
+)
+
+#: The planning states that mean a run is happening now.
+PLANNING_ACTIVE_STATES: frozenset[str] = frozenset(
+    {
+        PlanningState.QUEUED.value,
+        PlanningState.RUNNING.value,
+        PlanningState.PAUSED.value,
+        PlanningState.FEATURE_SPEC.value,
+        PlanningState.FEATURE_PLAN.value,
+    }
+)
 
 #: How a run that ended badly is described in the row's closing reason.
 _FAILURE_WORDS: Mapping[str, str] = {
@@ -202,16 +226,32 @@ def _count_not_in(
     return int(row[0]) if row else 0
 
 
+def _count_in(connection: sqlite3.Connection, table: str, column: str, values: list[str]) -> int:
+    """Rows of ``table`` whose ``column`` is one of ``values`` (0 when the table is absent)."""
+    placeholders = ",".join("?" for _ in values)
+    try:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {column} IN ({placeholders})", values
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+    return int(row[0]) if row else 0
+
+
 def count_in_flight(connection: sqlite3.Connection) -> int:
     """How many pieces of work the factory has running right now.
 
-    Planning runs that have not reached a terminal state, plus builds that
-    have not reached one — the two lists the rest of the forge already uses,
-    not a new definition of "busy".
+    Planning runs in an active state plus builds in an active state — the
+    forge's own lists of "running now". Rows that are neither running nor
+    terminal (a build marked INTERRUPTED by boot recovery, waiting to be
+    re-carded) are not in flight: nothing is happening for them, and when
+    boot recovery re-cards one it becomes PAUSED and counts from then on.
     """
-    return _count_not_in(
-        connection, "planning_runs", "state", sorted(PLANNING_TERMINAL_STATES)
-    ) + _count_not_in(connection, "builds", "status", sorted(BUILD_TERMINAL_STATES))
+    return _count_in(
+        connection, "planning_runs", "state", sorted(PLANNING_ACTIVE_STATES)
+    ) + _count_in(connection, "builds", "status", sorted(BUILD_ACTIVE_STATES))
 
 
 def paused_repositories(connection: sqlite3.Connection) -> set[str]:
@@ -459,12 +499,17 @@ class WorkQueueLoop:
         """Admit one row if the factory has room. Return the id, or None."""
         in_flight = self._count_in_flight()
         if in_flight >= self._max_in_flight:
-            logger.debug(
-                "work queue: %d in flight, cap %d — taking nothing",
-                in_flight,
-                self._max_in_flight,
-            )
+            # Said once per change of the number, at INFO, so a queue that never
+            # admits anything is visible in the log rather than silent (2026-09-05).
+            if getattr(self, "_last_hold", None) != in_flight:
+                self._last_hold = in_flight
+                logger.info(
+                    "work queue: holding — %d piece(s) of work in flight against a cap of %d",
+                    in_flight,
+                    self._max_in_flight,
+                )
             return None
+        self._last_hold = None
 
         open_rows = self._store.list_open()
         eligible = [row for row in open_rows if self._is_eligible(row)]

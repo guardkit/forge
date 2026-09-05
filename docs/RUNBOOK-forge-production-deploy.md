@@ -158,6 +158,7 @@ PY
 | Workdir / User | `/home/forge` / `forge` |
 | Network / Restart | `host` / `unless-stopped` |
 | Mounts (6) | `~/forge-state → /var/forge` · `~/forge-prod-state/.forge → /home/forge/.forge` · the **api_test**, **jarvis**, **study-tutor** and **ts-api-test** working copies, each bind-mounted rw at its own host path |
+| | Since 2026-09-05 the recreate script no longer lists those working copies by hand: it derives one bind per checkout from the repository map in `forge.yaml` (`uv run forge repo-paths`), so registering a repository is all it takes for the container to get its bind — and the script refuses to recreate if that map cannot be read. |
 | Env (15 operator-supplied) | `FLEET_MEMORY_EMBED_DIMS` · `FLEET_MEMORY_EMBED_MODEL` · `FLEET_MEMORY_EMBED_URL` · `FLEET_MEMORY_ENABLED` · `FLEET_MEMORY_PG_DSN` · `FORGE_AUTOBUILD_RUNNER_URL` · `FORGE_HEALTHZ_PORT` · `FORGE_LOG_LEVEL` · `FORGE_NATS_URL` · `GIT_AUTHOR_EMAIL` · `GIT_AUTHOR_NAME` · `GIT_COMMITTER_EMAIL` · `GIT_COMMITTER_NAME` · `OPENAI_API_KEY` · `OPENAI_BASE_URL` |
 | Healthcheck | an **override**, see G4 |
 
