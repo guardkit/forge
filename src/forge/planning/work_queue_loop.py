@@ -1,0 +1,617 @@
+"""The take-next loop: what turns a queued sentence into a planning run.
+
+Public surface
+==============
+
+- :class:`WorkQueueLoop` — one object with three things it does: a ``tick``
+  every ten seconds, a ``stale_tick`` once a week, and a ``run`` that drives
+  both forever.
+- :func:`count_in_flight` — how much work the factory has running right now.
+- :func:`paused_repositories` — the repositories with a card waiting on Rich.
+- :class:`Admission` — the four facts an admission hands to the run maker,
+  plus the three that keep the Slack thread alive.
+
+What the loop does, in order, every tick
+----------------------------------------
+
+1. **Closes what has finished.** Every admitted row's planning run is read;
+   a run that ended well closes the row done, a run that ended badly closes
+   it blocked with the reason. There is no callback on the planning store's
+   terminal transition to hook, so the loop polls — the spec allows this and
+   asks that it be said out loud, and this is it being said.
+2. **Asks about a broken chain.** A row told to wait for another one whose
+   antecedent failed or was withdrawn is never taken on its own. The loop
+   asks once — "#14 failed and #12 was waiting on it — hold or go?" — and
+   then holds until someone types ``#12 next`` (go) or ``drop 12``.
+3. **Takes the next one.** If fewer pieces of work are in flight than the cap
+   allows, the lowest-ranked eligible row is admitted and its planning run is
+   created with the row's ORIGINAL correlation id. Nothing is re-published and
+   no new id is minted, so every downstream receipt and the Slack thread keep
+   working.
+
+Beside every admission it works out which row a class order would have taken
+— fixes first, then anything whose repository has a card waiting on Rich, then
+features, then questions — writes both picks in the log and against the
+admitted row, and when the two differ says so once in the channel. It never
+acts on that pick. That is what "shadow" means: the order is on trial, and
+this stage only lets it talk.
+
+Design notes
+------------
+
+Everything the loop touches from the outside world arrives as a callable, so
+a test drives it with a fake clock and a recorder and never opens a socket:
+the clock, the sleep, the in-flight count, the planning-run reader, the
+paused-repository reader, the run maker, and the notifier.
+
+References
+----------
+- ``docs/work-queue-spec-2026-09-05.md`` contracts 6, 7, 8 and 9.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Mapping, Sequence
+
+from forge.cli.status import _TERMINAL_STATES as _BUILD_TERMINAL_STATES
+from forge.planning.states import PlanningState
+from forge.planning.work_queue_commands import age_phrase
+from forge.planning.work_queue_store import WorkQueueStore
+
+logger = logging.getLogger(__name__)
+
+
+#: How often the loop looks at the queue (contract 6).
+TAKE_NEXT_INTERVAL_SECONDS: float = 10.0
+
+#: How often the loop asks about sentences that have been waiting (contract 8).
+STALE_TICK_INTERVAL_SECONDS: float = 7 * 24 * 60 * 60.0
+
+#: Who the loop is, on the events rows it writes.
+LOOP_ACTOR: str = "forge-work-queue"
+
+#: Planning states that mean the run finished and the work happened.
+PLANNING_SUCCESS_STATES: frozenset[str] = frozenset(
+    {PlanningState.PLANNED_HANDOFF.value, PlanningState.BUILD_QUEUED.value}
+)
+
+#: Planning states that mean the run is over and the work did not happen.
+PLANNING_FAILURE_STATES: frozenset[str] = frozenset(
+    {
+        PlanningState.FAILED.value,
+        PlanningState.CANCELLED.value,
+        PlanningState.TIMED_OUT.value,
+    }
+)
+
+#: Every terminal planning state — the two sets above, together. This is the
+#: same list the planning run store uses to decide a run is over.
+PLANNING_TERMINAL_STATES: frozenset[str] = (
+    PLANNING_SUCCESS_STATES | PLANNING_FAILURE_STATES
+)
+
+#: Terminal build states, reused verbatim from ``forge status``'s
+#: ``_all_terminal`` (``cli/status.py``) as the spec's seam table asks.
+BUILD_TERMINAL_STATES: frozenset[str] = frozenset(
+    state.value for state in _BUILD_TERMINAL_STATES
+)
+
+#: How a run that ended badly is described in the row's closing reason.
+_FAILURE_WORDS: Mapping[str, str] = {
+    PlanningState.FAILED.value: "the planning run failed",
+    PlanningState.CANCELLED.value: "the planning run was cancelled",
+    PlanningState.TIMED_OUT.value: "the planning run ran out of time",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Admission:
+    """Everything the run maker needs to start the run this row asked for."""
+
+    queue_id: int
+    correlation_id: str
+    request_text: str
+    target_repo: str | None
+    originating_user: str
+    parent_request_id: str | None = None
+    originating_adapter: str | None = None
+    triggered_by: str = "jarvis"
+
+
+@dataclass(frozen=True, slots=True)
+class Pick:
+    """One row the loop considered taking, and why it would have taken it."""
+
+    queue_id: int
+    kind: str
+    target_repo: str | None
+    reason: str
+
+    def label(self) -> str:
+        """``fix · api_test``, or just ``fix`` when no repository is named."""
+        if self.target_repo:
+            return f"{self.kind} · {self.target_repo}"
+        return self.kind
+
+
+# ---------------------------------------------------------------------------
+# Reading the estate: how busy is the factory, and what is waiting on Rich
+# ---------------------------------------------------------------------------
+
+
+def _count_not_in(
+    connection: sqlite3.Connection, table: str, column: str, values: Sequence[str]
+) -> int:
+    """Count rows whose ``column`` is outside ``values``; 0 if no such table."""
+    placeholders = ", ".join("?" for _ in values)
+    try:
+        row = connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {column} NOT IN ({placeholders})",
+            tuple(values),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+    return int(row[0]) if row else 0
+
+
+def count_in_flight(connection: sqlite3.Connection) -> int:
+    """How many pieces of work the factory has running right now.
+
+    Planning runs that have not reached a terminal state, plus builds that
+    have not reached one — the two lists the rest of the forge already uses,
+    not a new definition of "busy".
+    """
+    return _count_not_in(
+        connection, "planning_runs", "state", sorted(PLANNING_TERMINAL_STATES)
+    ) + _count_not_in(connection, "builds", "status", sorted(BUILD_TERMINAL_STATES))
+
+
+def paused_repositories(connection: sqlite3.Connection) -> set[str]:
+    """The repositories that have a planning run paused on one of Rich's cards."""
+    try:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT target_repo FROM planning_runs
+            WHERE state = ? AND target_repo IS NOT NULL
+            """,
+            (PlanningState.PAUSED.value,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return set()
+        raise
+    return {str(row[0]) for row in rows if row[0]}
+
+
+# ---------------------------------------------------------------------------
+# The loop
+# ---------------------------------------------------------------------------
+
+
+class WorkQueueLoop:
+    """Admits one queued sentence at a time, and says what it is doing."""
+
+    def __init__(
+        self,
+        store: WorkQueueStore,
+        *,
+        count_in_flight: Callable[[], int],
+        planning_run: Callable[[str], Mapping[str, Any] | sqlite3.Row | None],
+        paused_repositories: Callable[[], set[str]],
+        start_run: Callable[[Admission], Awaitable[None]],
+        notify: Callable[..., Awaitable[None]],
+        max_in_flight: int = 1,
+        stale_after_days: int = 7,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        """Wire the loop to the store and to the rest of the estate.
+
+        Parameters
+        ----------
+        count_in_flight:
+            How many pieces of work are running; the loop admits nothing while
+            this is at or above ``max_in_flight``.
+        planning_run:
+            Reads one planning run by correlation id — the loop polls it to
+            know when an admitted row has finished.
+        paused_repositories:
+            The repositories with a card waiting on Rich; the shadow order
+            puts their rows second.
+        start_run:
+            Creates and starts the planning run for an admitted row. This is
+            the same in-process step the intake took before the queue existed.
+        notify:
+            Says one sentence in Slack: ``notify(correlation_id, message)``,
+            optionally with ``parent_request_id=`` for the thread.
+        """
+        self._store = store
+        self._count_in_flight = count_in_flight
+        self._planning_run = planning_run
+        self._paused_repositories = paused_repositories
+        self._start_run = start_run
+        self._notify = notify
+        self._max_in_flight = max_in_flight
+        self._stale_after_days = stale_after_days
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    # -- one pass --------------------------------------------------------
+
+    async def tick(self) -> None:
+        """Close what finished, ask about a broken chain, take the next one."""
+        self.close_finished()
+        await self.ask_hold_or_go()
+        await self.take_next()
+
+    # -- 1. closing ------------------------------------------------------
+
+    def close_finished(self) -> int:
+        """Close every admitted row whose planning run has ended. Count closed.
+
+        Polled rather than hooked: the planning run store has no callback on a
+        terminal transition, so there is nothing to hang one off. Ten seconds
+        late is not late for a queue whose cap is one.
+        """
+        closed = 0
+        for row in self._store.list_open():
+            if str(row["status"]) != "ADMITTED":
+                continue
+            run = self._planning_run(str(row["correlation_id"]))
+            if run is None:
+                continue
+            state = str(run["state"])
+            queue_id = int(row["id"])
+            if state in PLANNING_SUCCESS_STATES:
+                if self._store.close(
+                    queue_id, status="DONE", actor_identity=LOOP_ACTOR
+                ):
+                    closed += 1
+                    logger.info("work queue: #%d is done", queue_id)
+            elif state in PLANNING_FAILURE_STATES:
+                reason = self._failure_reason(run, state)
+                if self._store.close(
+                    queue_id,
+                    status="BLOCKED",
+                    actor_identity=LOOP_ACTOR,
+                    reason=reason,
+                ):
+                    closed += 1
+                    logger.warning(
+                        "work queue: #%d is blocked — %s", queue_id, reason
+                    )
+        return closed
+
+    @staticmethod
+    def _failure_reason(run: Any, state: str) -> str:
+        """Why the row is blocked, in words a person reads."""
+        error: Any = None
+        try:
+            error = run["error"]
+        except (KeyError, IndexError, TypeError):
+            error = None
+        if error:
+            return str(error)
+        return _FAILURE_WORDS.get(state, f"the planning run ended {state.lower()}")
+
+    # -- 2. the broken chain ---------------------------------------------
+
+    async def ask_hold_or_go(self) -> None:
+        """Ask once about every row whose antecedent failed or was withdrawn."""
+        for row in self._store.list_open():
+            after_id = row["after_id"]
+            if after_id is None:
+                continue
+            antecedent = self._store.get(int(after_id))
+            if antecedent is None:
+                continue
+            if str(antecedent["status"]) not in ("BLOCKED", "WITHDRAWN"):
+                continue
+            queue_id = int(row["id"])
+            if self._store.has_event(queue_id, "hold_or_go"):
+                continue
+            self._store.record_event(
+                queue_id=queue_id,
+                action="hold_or_go",
+                actor_identity=LOOP_ACTOR,
+                details={"after_id": int(after_id)},
+            )
+            message = (
+                f"#{int(after_id)} failed and #{queue_id} was waiting on it "
+                f"— hold or go?"
+            )
+            logger.info("work queue: %s", message)
+            await self._say(row, message)
+
+    # -- 3. taking the next one ------------------------------------------
+
+    async def take_next(self) -> int | None:
+        """Admit one row if the factory has room. Return the id, or None."""
+        in_flight = self._count_in_flight()
+        if in_flight >= self._max_in_flight:
+            logger.debug(
+                "work queue: %d in flight, cap %d — taking nothing",
+                in_flight,
+                self._max_in_flight,
+            )
+            return None
+
+        open_rows = self._store.list_open()
+        eligible = [row for row in open_rows if self._is_eligible(row)]
+        if not eligible:
+            return None
+
+        taken = eligible[0]  # list_open is already lowest rank first, then oldest
+        taken_id = int(taken["id"])
+        shadow = self._class_pick(eligible)
+        fifo = self._as_pick(taken, "it has been waiting longest")
+
+        logger.info(
+            "work queue: taking #%d (%s); the class order would take #%d (%s), "
+            "because %s",
+            fifo.queue_id,
+            fifo.label(),
+            shadow.queue_id,
+            shadow.label(),
+            shadow.reason,
+        )
+
+        if not self._store.admit(taken_id, actor_identity=LOOP_ACTOR):
+            # Someone dropped it, or another loop got there first.
+            return None
+
+        self._store.record_event(
+            queue_id=taken_id,
+            action="shadow_pick",
+            actor_identity=LOOP_ACTOR,
+            details={
+                "taken": fifo.queue_id,
+                "shadow": shadow.queue_id,
+                "shadow_kind": shadow.kind,
+                "shadow_target_repo": shadow.target_repo,
+                "reason": shadow.reason,
+            },
+        )
+
+        if len(open_rows) >= 2 and shadow.queue_id != fifo.queue_id:
+            await self._say(taken, shadow_line(shadow, fifo.queue_id))
+
+        admission = self._admission_for(taken)
+        try:
+            await self._start_run(admission)
+        except Exception as exc:  # noqa: BLE001 — never lose the sentence
+            logger.exception(
+                "work queue: starting the planning run for #%d failed (%s); "
+                "putting it back in the queue for the next tick",
+                taken_id,
+                exc,
+            )
+            self._store.requeue(
+                taken_id, actor_identity=LOOP_ACTOR, reason=str(exc)
+            )
+            return None
+        return taken_id
+
+    def _is_eligible(self, row: sqlite3.Row) -> bool:
+        """True when this row may be taken right now."""
+        if str(row["status"]) != "QUEUED":
+            return False
+        after_id = row["after_id"]
+        if after_id is None:
+            return True
+        antecedent = self._store.get(int(after_id))
+        if antecedent is None:
+            return True  # the row it named is gone; nothing left to wait for
+        status = str(antecedent["status"])
+        if status == "DONE":
+            return True
+        if status in ("BLOCKED", "WITHDRAWN"):
+            return self._go_was_given(int(row["id"]))
+        return False
+
+    def _go_was_given(self, queue_id: int) -> bool:
+        """True when someone typed ``#12 next`` after being asked hold or go."""
+        asked = self._store.latest_event_at(queue_id, "hold_or_go")
+        if asked is None:
+            return False
+        promoted = self._store.latest_event_at(queue_id, "promote")
+        return promoted is not None and promoted >= asked
+
+    def _class_pick(self, eligible: Sequence[sqlite3.Row]) -> Pick:
+        """Which row the class order would take — fixes, cards, features, questions."""
+        paused = self._paused_repositories()
+
+        def rank(row: sqlite3.Row) -> int:
+            if str(row["kind"]) == "fix":
+                return 0
+            repo = row["target_repo"]
+            if repo and str(repo) in paused:
+                return 1
+            if str(row["kind"]) == "feature":
+                return 2
+            return 3
+
+        reasons = {
+            0: "fixes go first",
+            1: "its repository has a card waiting on you",
+            2: "features come before questions",
+            3: "questions come last, and it is all that is waiting",
+        }
+        # The index breaks ties, so equals stay in first-in-first-out order.
+        best_row = min(
+            enumerate(eligible), key=lambda pair: (rank(pair[1]), pair[0])
+        )[1]
+        return self._as_pick(best_row, reasons[rank(best_row)])
+
+    @staticmethod
+    def _as_pick(row: sqlite3.Row, reason: str) -> Pick:
+        repo = row["target_repo"]
+        return Pick(
+            queue_id=int(row["id"]),
+            kind=str(row["kind"]),
+            target_repo=str(repo) if repo else None,
+            reason=reason,
+        )
+
+    def _admission_for(self, row: sqlite3.Row) -> Admission:
+        """The row's own facts, exactly as they arrived from Slack."""
+        origin = self._store.origin_details(int(row["id"]))
+        repo = row["target_repo"]
+        return Admission(
+            queue_id=int(row["id"]),
+            correlation_id=str(row["correlation_id"]),
+            request_text=str(row["sentence"]),
+            target_repo=str(repo) if repo else None,
+            originating_user=str(row["originating_user"]),
+            parent_request_id=origin.get("parent_request_id"),
+            originating_adapter=origin.get("originating_adapter"),
+            triggered_by=str(origin.get("triggered_by") or "jarvis"),
+        )
+
+    # -- staleness -------------------------------------------------------
+
+    async def stale_tick(self) -> list[int]:
+        """Ask, in one message, about every sentence that has waited too long."""
+        now = self._clock()
+        threshold = timedelta(days=self._stale_after_days)
+        stale = [
+            row
+            for row in self._store.list_open()
+            if str(row["status"]) == "QUEUED"
+            and (now - self._waiting_since(row)) >= threshold
+        ]
+        if not stale:
+            return []
+
+        lines = ["These have been waiting a while:"]
+        for row in stale:
+            repo = row["target_repo"]
+            label = f"{str(row['kind'])} · {repo}" if repo else str(row["kind"])
+            lines.append(
+                f"#{int(row['id'])} ({label}) — asked for "
+                f"{age_phrase(str(row['queued_at']), now)}"
+            )
+        lines.append(
+            'Reply "keep <n>" or "drop <n>", or ignore me and '
+            "I'll ask again next week."
+        )
+        await self._say(stale[0], "\n".join(lines))
+
+        stamped = now.isoformat()
+        for row in stale:
+            self._store.mark_stale_pinged(int(row["id"]), at=stamped)
+        return [int(row["id"]) for row in stale]
+
+    def _waiting_since(self, row: sqlite3.Row) -> datetime:
+        """When this row's staleness clock last started.
+
+        The clock starts when the sentence was filed, and starts again every
+        time someone says ``keep`` or the forge has already asked about it —
+        so nobody is asked about the same row twice in one week.
+        """
+        moments = [str(row["queued_at"])]
+        if row["stale_pinged_at"]:
+            moments.append(str(row["stale_pinged_at"]))
+        kept = self._store.latest_event_at(int(row["id"]), "keep")
+        if kept:
+            moments.append(kept)
+        return max(_parse(moment) for moment in moments)
+
+    # -- saying things ---------------------------------------------------
+
+    async def _say(self, row: sqlite3.Row, message: str) -> None:
+        """One sentence in the thread the row's sentence arrived in."""
+        origin = self._store.origin_details(int(row["id"]))
+        try:
+            await self._notify(
+                str(row["correlation_id"]),
+                message,
+                parent_request_id=origin.get("parent_request_id"),
+            )
+        except TypeError:
+            # A notifier that takes only the two arguments (an older callable,
+            # a test double) still gets its message.
+            await self._notify(str(row["correlation_id"]), message)
+        except Exception as exc:  # noqa: BLE001 — a message never stops the queue
+            logger.warning(
+                "work queue: could not say %r about #%s (%s)",
+                message,
+                row["id"],
+                exc,
+            )
+
+    # -- forever ---------------------------------------------------------
+
+    async def run(
+        self,
+        *,
+        interval_seconds: float = TAKE_NEXT_INTERVAL_SECONDS,
+        stale_interval_seconds: float = STALE_TICK_INTERVAL_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        iterations: int | None = None,
+    ) -> None:
+        """Tick every ten seconds forever, and ask about stale rows weekly.
+
+        ``sleep`` and the clock are injectable so a test drives real time
+        without waiting for it; ``iterations`` bounds the loop for the same
+        reason. A tick that raises is logged and the loop carries on — a
+        single bad row must never stop the queue.
+        """
+        sleeper = sleep or asyncio.sleep
+        next_stale = self._clock() + timedelta(seconds=stale_interval_seconds)
+        done = 0
+        while iterations is None or done < iterations:
+            try:
+                await self.tick()
+                if self._clock() >= next_stale:
+                    await self.stale_tick()
+                    next_stale = self._clock() + timedelta(
+                        seconds=stale_interval_seconds
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the loop outlives one bad tick
+                logger.exception("work queue: tick raised; carrying on")
+            done += 1
+            await sleeper(interval_seconds)
+
+
+def shadow_line(shadow: Pick, taken_id: int) -> str:
+    """The one line the loop says when the class order disagrees with the queue."""
+    return (
+        f"next I'd pick #{shadow.queue_id} ({shadow.label()}), "
+        f"because {shadow.reason}; taking #{taken_id} as things stand."
+    )
+
+
+def _parse(moment: str) -> datetime:
+    """An ISO timestamp from the database, always with a timezone on it."""
+    try:
+        parsed = datetime.fromisoformat(moment)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+__all__ = [
+    "Admission",
+    "BUILD_TERMINAL_STATES",
+    "LOOP_ACTOR",
+    "PLANNING_FAILURE_STATES",
+    "PLANNING_SUCCESS_STATES",
+    "PLANNING_TERMINAL_STATES",
+    "Pick",
+    "STALE_TICK_INTERVAL_SECONDS",
+    "TAKE_NEXT_INTERVAL_SECONDS",
+    "WorkQueueLoop",
+    "count_in_flight",
+    "paused_repositories",
+    "shadow_line",
+]

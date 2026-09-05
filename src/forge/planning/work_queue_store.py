@@ -42,7 +42,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 #: Statuses that mean "still in the queue" — waiting, or handed to the chain
@@ -86,10 +86,21 @@ class WorkQueueStore:
     the same discipline as :class:`~forge.planning.run_store.SqlitePlanningRunStore`.
     """
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        """Initialise the store with a writable connection (schema v10+)."""
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        """Initialise the store with a writable connection (schema v10+).
+
+        ``clock`` reads the current time for every timestamp the store writes.
+        It defaults to the wall clock; a test hands in one it can move, so the
+        staleness week can pass without anyone waiting a week.
+        """
         self._connection = connection
         self._connection.row_factory = sqlite3.Row
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     # -- reads ----------------------------------------------------------
 
@@ -136,6 +147,36 @@ class WorkQueueStore:
         )
         return list(cursor.fetchall())
 
+    #: The actions that mean "this row was filed" — the event that carries
+    #: where the sentence came from (see :meth:`origin_details`).
+    _FILING_ACTIONS: tuple[str, ...] = ("queued", "add_front", "add_before")
+
+    def origin_details(self, queue_id: int) -> dict[str, Any]:
+        """Where the sentence came from, as written down when it was filed.
+
+        The queue table has no column for the Slack thread anchor, the adapter
+        or the trigger — the spec's table does not carry them — so the filing
+        event's ``details_json`` does, and this reads it back. An empty dict
+        when nothing was recorded, so the caller falls back to its defaults.
+        """
+        for row in self.list_events(queue_id):
+            if str(row["action"]) in self._FILING_ACTIONS and row["details_json"]:
+                loaded = json.loads(str(row["details_json"]))
+                return loaded if isinstance(loaded, dict) else {}
+        return {}
+
+    def latest_event_at(self, queue_id: int, action: str) -> str | None:
+        """When ``action`` was last written against the row, or None."""
+        latest: str | None = None
+        for row in self.list_events(queue_id):
+            if str(row["action"]) == action:
+                latest = str(row["recorded_at"])
+        return latest
+
+    def has_event(self, queue_id: int, action: str) -> bool:
+        """True when ``action`` has ever been written against the row."""
+        return self.latest_event_at(queue_id, action) is not None
+
     # -- filing ---------------------------------------------------------
 
     def file_sentence(
@@ -150,6 +191,9 @@ class WorkQueueStore:
         before_id: int | None = None,
         actor_identity: str | None = None,
         action: str | None = None,
+        parent_request_id: str | None = None,
+        originating_adapter: str | None = None,
+        triggered_by: str | None = None,
     ) -> FiledRow:
         """File one sentence and return its id and how many are ahead of it.
 
@@ -166,6 +210,12 @@ class WorkQueueStore:
         action:
             The events-row action; defaults to ``queued`` / ``add_front`` /
             ``add_before`` to match ``position``.
+        parent_request_id, originating_adapter, triggered_by:
+            Where the sentence came from. The table in the spec has no column
+            for these three, but the planning run the take-next loop creates
+            later needs them or the person's Slack thread goes quiet — so they
+            ride along in the filing event's ``details_json`` and
+            :meth:`origin_details` reads them back at admission time.
         """
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r}; expected one of {KINDS}")
@@ -221,7 +271,13 @@ class WorkQueueStore:
             queue_id=queue_id,
             action=action or default_action,
             actor_identity=actor_identity or originating_user,
-            details={"kind": kind, "target_repo": target_repo},
+            details={
+                "kind": kind,
+                "target_repo": target_repo,
+                "parent_request_id": parent_request_id,
+                "originating_adapter": originating_adapter,
+                "triggered_by": triggered_by,
+            },
         )
         return FiledRow(
             queue_id=queue_id, ahead=self.count_ahead(queue_id), created=True
@@ -263,6 +319,66 @@ class WorkQueueStore:
             details={"after_id": after_id},
         )
         return True
+
+    # -- admission (the take-next loop) ---------------------------------
+
+    def admit(self, queue_id: int, *, actor_identity: str) -> bool:
+        """Mark a QUEUED row ADMITTED — the loop is about to start its run.
+
+        Compare-and-swap on QUEUED, so two loops (or a loop racing a drop)
+        can never both admit the same row. False when the row was not QUEUED.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE work_queue
+                SET status = 'ADMITTED', admitted_at = ?
+                WHERE id = ? AND status = 'QUEUED'
+                """,
+                (self._now(), queue_id),
+            )
+        if cursor.rowcount != 1:
+            return False
+        self.record_event(
+            queue_id=queue_id, action="admitted", actor_identity=actor_identity
+        )
+        return True
+
+    def requeue(
+        self, queue_id: int, *, actor_identity: str, reason: str | None = None
+    ) -> bool:
+        """Put an ADMITTED row back in the queue, so the next tick retries it.
+
+        Used when starting the planning run itself failed: the sentence is
+        still wanted, and leaving it ADMITTED with no run behind it would stop
+        the queue for good.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE work_queue
+                SET status = 'QUEUED', admitted_at = NULL
+                WHERE id = ? AND status = 'ADMITTED'
+                """,
+                (queue_id,),
+            )
+        if cursor.rowcount != 1:
+            return False
+        self.record_event(
+            queue_id=queue_id,
+            action="requeued",
+            actor_identity=actor_identity,
+            details={"reason": reason} if reason else None,
+        )
+        return True
+
+    def mark_stale_pinged(self, queue_id: int, *, at: str) -> None:
+        """Record that the forge has just asked about this row's age."""
+        with self._connection:
+            self._connection.execute(
+                "UPDATE work_queue SET stale_pinged_at = ? WHERE id = ?",
+                (at, queue_id),
+            )
 
     # -- keeping and closing --------------------------------------------
 
@@ -347,9 +463,8 @@ class WorkQueueStore:
 
     # -- internals -------------------------------------------------------
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+    def _now(self) -> str:
+        return self._clock().isoformat()
 
     def _close(self, queue_id: int, *, status: str, reason: str | None) -> bool:
         row = self.get(queue_id)
