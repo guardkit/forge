@@ -848,7 +848,11 @@ class PlanningConfig(BaseModel):
             "Wait time for escalated approval (seconds, non-negative). "
             "4h ratified by Rich 2026-07-06 (ASSUM-004 amendment, "
             "TASK-MP-012): bounds the escalated window inside a working "
-            "day; TIMED_OUT is cheap (resubmission is one Slack message)."
+            "day; TIMED_OUT is cheap (resubmission is one Slack message). "
+            "This second window belongs to a run that is durably PAUSED. "
+            "The spec-review card and the sign-in card wait INLINE instead: "
+            "one window on the person who asked, and then the run stops. "
+            "Changing this number changes nothing those two cards do or say."
         ),
     )
     defer_cap: int = Field(
