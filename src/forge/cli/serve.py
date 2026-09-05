@@ -534,6 +534,59 @@ def bind_production_dispatch_chain(
                 exc,
             )
 
+        # Conductor revival — the daemon seam, now ACTIVATED (Stage 2,
+        # shakeout item 3).
+        #
+        # ``build_conductor_router`` returns ``None`` whenever the
+        # conductor is switched off (the default), which leaves the
+        # dequeue path byte-for-byte today's: every accepted build goes
+        # straight to the routine autobuild launch. That is checked here
+        # before anything else is built, so with the flag OFF this block
+        # composes NOTHING — it is a literal pass-through, which is the
+        # regression the flag-off pin asserts at this level.
+        #
+        # With the flag ON, Stage 1's honest gap closes: the router was
+        # called with no ``supervisor_factory`` and therefore stayed inert
+        # even when switched on ("the daemon composes no Supervisor
+        # today"). It composes one now, plus the driver deps that Stage 1
+        # left all-``None`` — without which the first non-terminal turn
+        # died WAIT_EXPIRED with no receipts.
+        #
+        # Composed under DDR-007 boot protection so a conductor defect can
+        # never brick intake.
+        #
+        # RE-ENTRY (conductor rewire rule 5): this composition sits ABOVE
+        # the boot-rearm sweep on purpose. The sweep re-cards every PAUSED
+        # build and launches the approved ones through
+        # ``build_serve_resume_launcher``, so the router has to exist
+        # before that sweep runs or a re-approved fix journey has nothing
+        # to be handed to — which is the refusal this lane replaces.
+        # Composition is pure (it constructs objects and subscribes to
+        # nothing), so moving it earlier changes no boot behaviour beyond
+        # giving the sweep a router.
+        conductor_router = None
+        try:
+            from forge.config.conductor import conductor_enabled
+
+            if conductor_enabled(forge_config):
+                conductor_router = _compose_conductor_router(
+                    sqlite_pool=sqlite_pool,
+                    forge_config=forge_config,
+                    lifecycle_emitter=emitter,
+                    gate_parts=gate_parts,
+                    gate_repository=gate_repository,
+                    gate_state_machine=gate_state_machine,
+                    clock=_gate_wall_clock,
+                    nats_client=client,
+                )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            conductor_router = None
+            logger.error(
+                "forge-serve: conductor router composition FAILED (%s) — the "
+                "conductor stays INERT; every build takes the routine path",
+                exc,
+            )
+
         # TASK-GATE-D659 §D4.2 — re-arm every PAUSED build's approval
         # round-trip. Spawned AFTER bind_gate_parts so a LIVE response
         # subscriber exists before ANY PAUSED approval is re-emitted
@@ -547,6 +600,10 @@ def bind_production_dispatch_chain(
                     forge_config,
                     lifecycle_emitter=emitter,
                     async_task_starter=async_task_starter,
+                    # The re-approved fix journey's way back in. ``None``
+                    # (the conductor switched off) leaves the guard exactly
+                    # as it was: refuse, never routine-launch.
+                    conductor_router=conductor_router,
                 )
                 await _serve_gate_activation.rearm_paused_gates(
                     parts=gate_parts,
@@ -678,48 +735,6 @@ def bind_production_dispatch_chain(
                 exc,
             )
 
-        # Conductor revival — the daemon seam, now ACTIVATED (Stage 2,
-        # shakeout item 3).
-        #
-        # ``build_conductor_router`` returns ``None`` whenever the
-        # conductor is switched off (the default), which leaves the
-        # dequeue path byte-for-byte today's: every accepted build goes
-        # straight to the routine autobuild launch. That is checked here
-        # before anything else is built, so with the flag OFF this block
-        # composes NOTHING — it is a literal pass-through, which is the
-        # regression the flag-off pin asserts at this level.
-        #
-        # With the flag ON, Stage 1's honest gap closes: the router was
-        # called with no ``supervisor_factory`` and therefore stayed inert
-        # even when switched on ("the daemon composes no Supervisor
-        # today"). It composes one now, plus the driver deps that Stage 1
-        # left all-``None`` — without which the first non-terminal turn
-        # died WAIT_EXPIRED with no receipts.
-        #
-        # Composed under DDR-007 boot protection so a conductor defect can
-        # never brick intake.
-        conductor_router = None
-        try:
-            from forge.config.conductor import conductor_enabled
-
-            if conductor_enabled(forge_config):
-                conductor_router = _compose_conductor_router(
-                    sqlite_pool=sqlite_pool,
-                    forge_config=forge_config,
-                    lifecycle_emitter=emitter,
-                    gate_parts=gate_parts,
-                    gate_repository=gate_repository,
-                    gate_state_machine=gate_state_machine,
-                    clock=_gate_wall_clock,
-                    nats_client=client,
-                )
-        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
-            conductor_router = None
-            logger.error(
-                "forge-serve: conductor router composition FAILED (%s) — the "
-                "conductor stays INERT; every build takes the routine path",
-                exc,
-            )
 
         deps = build_pipeline_consumer_deps(
             client,

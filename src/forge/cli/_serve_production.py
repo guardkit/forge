@@ -613,9 +613,11 @@ def _build_consumer_reconcile_seam(
         report = await _consumer_reconcile(deps)
         logger.info(
             "forge-serve: consumer reconcile complete (restarted=%d "
-            "acked_terminal=%d paused_scan_suppressed=%d) — PAUSED owned by "
+            "restarted_interrupted=%d acked_terminal=%d "
+            "paused_scan_suppressed=%d) — PAUSED owned by "
             "rearm_paused_gates; redelivery drain deferred to live consumer",
             report.restarted_in_flight,
+            report.restarted_interrupted,
             report.acked_terminal,
             report.paused_scan_re_emitted,
         )

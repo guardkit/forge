@@ -23,6 +23,8 @@ Lifecycle:
 
 On crash recovery (INTERRUPTED): `rm -rf` any `/var/forge/builds/{interrupted_build_id}/` the crashed process left behind (SQLite knows the id) → fresh clone on retry.
 
+**Amendment, 2026-09-05 (the conductor rewire, rule 5).** The fix journey (mode c) is the one exception, and it is deliberate: a journey that is restarted from scratch REUSES its own working tree — the per-journey `fix/<task_id>-<build8>` worktree under the registered checkout — rather than being given a new one, because the tree is the journey's only record of the work in progress and a state-preserving resume (which would need a turn cursor the driver does not have) is not built. The writer recognises the journey's own tree by path and branch and answers `reused=True`; anybody else's tree on that path or branch is still refused, never taken over.
+
 Permissions (ADR-ARCH-023) include `/var/forge/builds/*` in both `allow_read` and `allow_write` — scoped, no parent-dir access.
 
 ## Consequences
