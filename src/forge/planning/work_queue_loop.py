@@ -118,11 +118,31 @@ BUILD_TERMINAL_STATES: frozenset[str] = frozenset(
     state.value for state in _BUILD_TERMINAL_STATES
 )
 
+#: The kind of row that is a repair rather than a piece of new work. A repair
+#: does not start a planning run: it opens a fix journey (a mode-c build).
+FIX_KIND: str = "fix"
+
+#: The build state that means a repair finished and the work happened.
+BUILD_SUCCESS_STATES: frozenset[str] = frozenset({"COMPLETE"})
+
+#: The build states that mean a repair is over and the work did not happen.
+BUILD_FAILURE_STATES: frozenset[str] = BUILD_TERMINAL_STATES - BUILD_SUCCESS_STATES
+
 #: How a run that ended badly is described in the row's closing reason.
 _FAILURE_WORDS: Mapping[str, str] = {
     PlanningState.FAILED.value: "the planning run failed",
     PlanningState.CANCELLED.value: "the planning run was cancelled",
     PlanningState.TIMED_OUT.value: "the planning run ran out of time",
+}
+
+#: The same, for a repair — whose work is a BUILD, not a planning run. Kept
+#: apart from the planning words because the two vocabularies spell some
+#: states the same (``FAILED``, ``CANCELLED``) and mean different things by
+#: them, and a row's closing reason should say which one it was.
+_FIX_FAILURE_WORDS: Mapping[str, str] = {
+    "FAILED": "the fix journey failed",
+    "CANCELLED": "the fix journey was cancelled",
+    "SKIPPED": "the fix journey never ran",
 }
 
 
@@ -138,6 +158,10 @@ class Admission:
     parent_request_id: str | None = None
     originating_adapter: str | None = None
     triggered_by: str = "jarvis"
+    #: ``feature``, ``fix`` or ``question`` — which of the two starters this
+    #: admission goes to. A repair goes to the fix journey, never to a
+    #: planning run.
+    kind: str = "feature"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +251,10 @@ class WorkQueueLoop:
         max_in_flight: int = 1,
         stale_after_days: int = 7,
         clock: Callable[[], datetime] | None = None,
+        start_fix: Callable[[Admission], Awaitable[None]] | None = None,
+        fix_build: Callable[[str], Mapping[str, Any] | sqlite3.Row | None]
+        | None = None,
+        admit_fix_rows: bool = False,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
 
@@ -249,6 +277,21 @@ class WorkQueueLoop:
             optionally with ``parent_request_id=`` for the thread. Whether
             this one takes that argument is read from it here, once, and
             remembered.
+        start_fix:
+            Opens the fix journey for an admitted repair row — the mode-c
+            build, not a planning run. ``None`` means no repair can be
+            started whatever ``admit_fix_rows`` says.
+        fix_build:
+            Reads one BUILD by correlation id, the way ``planning_run``
+            reads one planning run. It is how a repair row learns its
+            journey has finished. ``None`` leaves repair rows uncollected:
+            they stay ADMITTED until something else closes them, which is
+            the honest degrade when nothing can read a build.
+        admit_fix_rows:
+            Whether a repair row may be STARTED (conductor rewire rule 4).
+            False — the default and the shipped posture — leaves repair
+            rows QUEUED where they can be read and listed, and the class
+            order's "next I'd pick" line may still name one.
         """
         self._store = store
         self._count_in_flight = count_in_flight
@@ -260,6 +303,9 @@ class WorkQueueLoop:
         self._stale_after_days = stale_after_days
         self._notify_takes_thread = notifier_takes_parent_request_id(notify)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._start_fix = start_fix
+        self._fix_build = fix_build
+        self._admit_fix_rows = admit_fix_rows
 
     # -- one pass --------------------------------------------------------
 
@@ -285,7 +331,12 @@ class WorkQueueLoop:
         for row in self._store.list_open():
             if str(row["status"]) != "ADMITTED":
                 continue
-            if self._planning_run(str(row["correlation_id"])) is not None:
+            reader = self._reader_for(row)
+            if reader is None:
+                # Nothing here can read what this row started, so nothing
+                # here may decide it was never started either.
+                continue
+            if reader(str(row["correlation_id"])) is not None:
                 continue
             queue_id = int(row["id"])
             if self._store.requeue(
@@ -302,6 +353,14 @@ class WorkQueueLoop:
                 recovered.append(queue_id)
         return recovered
 
+    def _reader_for(
+        self, row: sqlite3.Row
+    ) -> Callable[[str], Mapping[str, Any] | sqlite3.Row | None] | None:
+        """Whatever reads the work this row started — a run, or a build."""
+        if str(row["kind"]) == FIX_KIND:
+            return self._fix_build
+        return self._planning_run
+
     # -- 1. closing ------------------------------------------------------
 
     def close_finished(self) -> int:
@@ -315,19 +374,28 @@ class WorkQueueLoop:
         for row in self._store.list_open():
             if str(row["status"]) != "ADMITTED":
                 continue
-            run = self._planning_run(str(row["correlation_id"]))
+            reader = self._reader_for(row)
+            if reader is None:
+                continue
+            run = reader(str(row["correlation_id"]))
             if run is None:
                 continue
-            state = str(run["state"])
+            is_fix = str(row["kind"]) == FIX_KIND
+            # A planning run keeps its state in ``state`` and a build keeps
+            # its in ``status``; the words themselves differ too. Read the
+            # one this row actually started.
+            state = str(run["status"] if is_fix else run["state"])
+            success = BUILD_SUCCESS_STATES if is_fix else PLANNING_SUCCESS_STATES
+            failure = BUILD_FAILURE_STATES if is_fix else PLANNING_FAILURE_STATES
             queue_id = int(row["id"])
-            if state in PLANNING_SUCCESS_STATES:
+            if state in success:
                 if self._store.close(
                     queue_id, status="DONE", actor_identity=LOOP_ACTOR
                 ):
                     closed += 1
                     logger.info("work queue: #%d is done", queue_id)
-            elif state in PLANNING_FAILURE_STATES:
-                reason = self._failure_reason(run, state)
+            elif state in failure:
+                reason = self._failure_reason(run, state, is_fix=is_fix)
                 if self._store.close(
                     queue_id,
                     status="BLOCKED",
@@ -341,7 +409,7 @@ class WorkQueueLoop:
         return closed
 
     @staticmethod
-    def _failure_reason(run: Any, state: str) -> str:
+    def _failure_reason(run: Any, state: str, *, is_fix: bool = False) -> str:
         """Why the row is blocked, in words a person reads."""
         error: Any = None
         try:
@@ -350,6 +418,10 @@ class WorkQueueLoop:
             error = None
         if error:
             return str(error)
+        if is_fix:
+            return _FIX_FAILURE_WORDS.get(
+                state, f"the fix journey ended {state.lower()}"
+            )
         return _FAILURE_WORDS.get(state, f"the planning run ended {state.lower()}")
 
     # -- 2. the broken chain ---------------------------------------------
@@ -399,7 +471,24 @@ class WorkQueueLoop:
         if not eligible:
             return None
 
-        taken = eligible[0]  # list_open is already lowest rank first, then oldest
+        # THE FIX BRANCH IS SHUT BY DEFAULT (conductor rewire rule 4). A
+        # repair row stays eligible — so the class order can still name it,
+        # and the "next I'd pick" line still tells the truth about what the
+        # factory would do — but it is not taken until the owner has said
+        # repairs may start.
+        takeable = [row for row in eligible if self._is_takeable(row)]
+        if not takeable:
+            waiting = self._class_pick(eligible)
+            logger.info(
+                "work queue: #%d (%s) is waiting and nothing may be started "
+                "— repairs are not admitted yet (conductor.admit_fix_rows is "
+                "off)",
+                waiting.queue_id,
+                waiting.label(),
+            )
+            return None
+
+        taken = takeable[0]  # list_open is already lowest rank first, then oldest
         taken_id = int(taken["id"])
         shadow = self._class_pick(eligible)
         fifo = self._as_pick(taken, "it has been waiting longest")
@@ -435,8 +524,21 @@ class WorkQueueLoop:
             await self._say(taken, shadow_line(shadow, fifo.queue_id))
 
         admission = self._admission_for(taken)
+        starter = self._starter_for(taken)
+        if starter is None:
+            logger.error(
+                "work queue: #%d is a repair and nothing is wired to open a "
+                "fix journey; putting it back in the queue",
+                taken_id,
+            )
+            self._store.requeue(
+                taken_id,
+                actor_identity=LOOP_ACTOR,
+                reason="no fix journey opener is wired",
+            )
+            return None
         try:
-            await self._start_run(admission)
+            await starter(admission)
         except Exception as exc:  # noqa: BLE001 — never lose the sentence
             logger.exception(
                 "work queue: starting the planning run for #%d failed (%s); "
@@ -449,6 +551,24 @@ class WorkQueueLoop:
             )
             return None
         return taken_id
+
+    def _is_takeable(self, row: sqlite3.Row) -> bool:
+        """True when this row may be STARTED, not merely chosen.
+
+        The one rule that separates the two: a repair is started only when
+        ``conductor.admit_fix_rows`` is on.
+        """
+        if str(row["kind"]) != FIX_KIND:
+            return True
+        return self._admit_fix_rows
+
+    def _starter_for(
+        self, row: sqlite3.Row
+    ) -> Callable[[Admission], Awaitable[None]] | None:
+        """Which opener this row's work goes to — a planning run, or a journey."""
+        if str(row["kind"]) == FIX_KIND:
+            return self._start_fix
+        return self._start_run
 
     def _is_eligible(self, row: sqlite3.Row) -> bool:
         """True when this row may be taken right now."""
@@ -529,6 +649,7 @@ class WorkQueueLoop:
             parent_request_id=origin.get("parent_request_id"),
             originating_adapter=origin.get("originating_adapter"),
             triggered_by=str(origin.get("triggered_by") or "jarvis"),
+            kind=str(row["kind"]),
         )
 
     # -- staleness -------------------------------------------------------
@@ -685,7 +806,10 @@ def _parse(moment: str) -> datetime:
 
 __all__ = [
     "Admission",
+    "BUILD_FAILURE_STATES",
+    "BUILD_SUCCESS_STATES",
     "BUILD_TERMINAL_STATES",
+    "FIX_KIND",
     "LOOP_ACTOR",
     "PLANNING_FAILURE_STATES",
     "PLANNING_SUCCESS_STATES",

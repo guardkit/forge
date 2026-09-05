@@ -64,6 +64,7 @@ from forge.lifecycle.state_machine import (
     InvalidTransitionError,
     transition_chain,
 )
+from forge.pipeline.fix_row_producer import SOURCE_BUILD_FAILED, maybe_mint_fix_row
 
 if TYPE_CHECKING:
     from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -242,5 +243,35 @@ def build_build_state_recorder(
                     exc,
                 )
                 return
+
+        # A BUILD THAT ENDED BADLY BECOMES A REPAIR JOB (conductor rewire
+        # rule 1). This is the moment the factory learns a build failed, and
+        # until now nothing acted on it: every repair since 4 August was
+        # done by an attended session. The producer files one ``work_queue``
+        # row of kind ``fix`` — once per failure, whatever redelivery does,
+        # because the queue's correlation id is UNIQUE and always spells
+        # ``fix-<build id>``.
+        #
+        # It runs AFTER the last hop landed, so a row is only filed for a
+        # build that really is FAILED on the record. It never raises — and
+        # this call site catches anyway, because this function is the SOLE
+        # writer of ``builds.status`` and nothing it calls may be allowed to
+        # break that.
+        if target is BuildState.FAILED:
+            try:
+                maybe_mint_fix_row(
+                    pool=persistence,
+                    build_id=build_id,
+                    source=SOURCE_BUILD_FAILED,
+                    detail=getattr(event, "failure_reason", None),
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail the write
+                logger.warning(
+                    "build_state_recorder: filing a repair row for %s "
+                    "raised (%s: %s); the build's FAILED ending stands",
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
 
     return _record

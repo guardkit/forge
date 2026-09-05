@@ -188,8 +188,16 @@ class WorkQueueStore:
         return list(cursor.fetchall())
 
     #: The actions that mean "this row was filed" — the event that carries
-    #: where the sentence came from (see :meth:`origin_details`).
-    _FILING_ACTIONS: tuple[str, ...] = ("queued", "add_front", "add_before")
+    #: where the sentence came from (see :meth:`origin_details`). ``minted``
+    #: is the fix producer's filing action (conductor rewire rule 1): a
+    #: repair row is filed by the factory rather than typed by a person, and
+    #: its filing event carries the failed build it came from.
+    _FILING_ACTIONS: tuple[str, ...] = (
+        "queued",
+        "add_front",
+        "add_before",
+        "minted",
+    )
 
     def origin_details(self, queue_id: int) -> dict[str, Any]:
         """Where the sentence came from, as written down when it was filed.
@@ -234,6 +242,7 @@ class WorkQueueStore:
         parent_request_id: str | None = None,
         originating_adapter: str | None = None,
         triggered_by: str | None = None,
+        extra_details: dict[str, Any] | None = None,
     ) -> FiledRow:
         """File one sentence and return its id and how many are ahead of it.
 
@@ -256,6 +265,11 @@ class WorkQueueStore:
             later needs them or the person's Slack thread goes quiet — so they
             ride along in the filing event's ``details_json`` and
             :meth:`origin_details` reads them back at admission time.
+        extra_details:
+            Anything else worth writing down about where this row came from,
+            merged into the same filing event. The fix producer puts the
+            failed build's id and the path of its failure pack here, so the
+            row and the evidence behind it commit together.
         """
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r}; expected one of {KINDS}")
@@ -315,17 +329,20 @@ class WorkQueueStore:
                 )
                 queue_id = int(cursor.lastrowid or 0)
                 self._place(queue_id, position=position, before_id=before_id)
+                details: dict[str, Any] = {
+                    "kind": kind,
+                    "target_repo": target_repo,
+                    "parent_request_id": parent_request_id,
+                    "originating_adapter": originating_adapter,
+                    "triggered_by": triggered_by,
+                }
+                if extra_details:
+                    details.update(extra_details)
                 self._record_event(
                     queue_id=queue_id,
                     action=action or default_action,
                     actor_identity=actor_identity or originating_user,
-                    details={
-                        "kind": kind,
-                        "target_repo": target_repo,
-                        "parent_request_id": parent_request_id,
-                        "originating_adapter": originating_adapter,
-                        "triggered_by": triggered_by,
-                    },
+                    details=details,
                 )
         except sqlite3.IntegrityError:
             # Race: another worker filed this correlation id between the read

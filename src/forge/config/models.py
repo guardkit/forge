@@ -1183,6 +1183,18 @@ class ConductorConfig(BaseModel):
             "time. True = the fix journey is activated."
         ),
     )
+    admit_fix_rows: bool = Field(
+        default=False,
+        description=(
+            "Whether the work queue may START a repair by itself. False (the "
+            "default) = shadow: a failed build still files its repair row, "
+            "the row sits in the queue where it can be read and listed, and "
+            "the 'next I'd pick' line may name it, but nothing is started. "
+            "True = a repair row is admitted like any other piece of work, "
+            "and the owner's two card taps are unchanged. Flipping this is "
+            "the owner's word and an attended restart."
+        ),
+    )
     seat: str | None = Field(
         default=None,
         description=(
