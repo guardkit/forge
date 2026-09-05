@@ -319,6 +319,44 @@ async def execute_merge_deploy(
             )
         )
 
+    def _record_report(payload: StageCompletePayload, completed: datetime) -> None:
+        """Put the merge report on the build's own record, not only on the bus.
+
+        The published report is a message and the receipt is a file, and
+        neither can be read back by a query. So the same report is also
+        appended to ``stage_log``, with its outcome word at the top level of
+        the details as ``result`` — that is what the self-closed defect rate
+        reads to tell a repair that merged, deployed and stayed green from
+        one that stopped at a red step (``lifecycle/metrics.py``).
+
+        A dry run never gets here: it leaves no durable rows on purpose.
+        Never raises — the bus report and the receipt on disk are the record,
+        and a row that cannot be written must not cost them.
+        """
+        try:
+            deps.pool.record_stage(
+                StageLogEntry(
+                    build_id=build_id,
+                    stage_label=MERGE_REPORT_STAGE_LABEL,
+                    target_kind="local_tool",
+                    target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                    status=payload.status,
+                    gate_mode=None,
+                    started_at=completed,
+                    completed_at=completed,
+                    duration_secs=float(payload.duration_secs or 0.0),
+                    details=payload.model_dump(mode="json"),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — a row never costs a report
+            logger.error(
+                "merge-executor: could not record the merge report for %s "
+                "(%s: %s) — the published report and the receipt stand",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         completed = deps.clock()
         conformance_warning = digest_conformance.get("warning")
@@ -367,6 +405,7 @@ async def execute_merge_deploy(
                 exc,
             )
         _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
+        _record_report(payload, completed)
         # A MERGE THAT DID NOT STAY GREEN BECOMES A REPAIR JOB (conductor
         # rewire rule 1). The three red endings below are the ones where the
         # merge itself landed and what came after it went red — the live

@@ -46,12 +46,14 @@ A note on where the merge report is read from
 
 The merge report is a ``stage-complete`` message the merge executor
 publishes (``merge_executor._publish_report``), and its outcome word lives
-in the report's ``result`` field. This function looks for it as a
-``merge-deploy`` row in ``stage_log`` whose details name that word. Today
-nothing writes that row: the executor publishes the report to the bus and
-keeps the receipt on disk, so until a merge report is also recorded to
-``stage_log`` this numerator can only ever read zero. That is a gap in the
-wiring, not in the definition, and it is named in the lane's report.
+in the report's ``result`` field. A message cannot be queried and neither
+can the receipt file beside it, so the executor also writes the report to
+``stage_log`` as a ``merge-deploy`` row identified ``merge_deploy_executor``
+— this function reads the outcome word out of that row's ``result`` field
+by name. Reading the field, not searching the whole details blob, is
+deliberate: the report also carries a free-text ``detail`` line, and a
+failure whose prose happened to mention ``merged-and-running`` must never
+be counted as a success. A dry run writes no row, so it can never count.
 
 References
 ----------
@@ -77,6 +79,10 @@ MERGE_READY_TARGET_IDENTIFIER: str = "merge_ready_checkpoint"
 #: (``pipeline/merge_executor.py``).
 MERGE_REPORT_STAGE_LABEL: str = "merge-deploy"
 
+#: The report row's own identity under that label — the merge and deploy
+#: step rows share the label but are not the report.
+MERGE_REPORT_TARGET_IDENTIFIER: str = "merge_deploy_executor"
+
 #: The one outcome word that means the repair closed itself: merged,
 #: deployed, and still green afterwards.
 MERGED_AND_RUNNING: str = "merged-and-running"
@@ -92,9 +98,12 @@ SELECT COUNT(*)
 """
 
 #: Of those, the ones whose build reached a merge-ready checkpoint and then
-#: reported ``merged-and-running``. ``report`` must come after ``gate``:
-#: later in wall-clock time, or — when a seeded or same-second pair shares a
-#: timestamp — later in the stage log's own insertion order.
+#: reported ``merged-and-running``. The outcome word is read out of the
+#: report's own ``result`` field by name — never searched for across the
+#: whole details blob, which also holds a free-text ``detail`` line that can
+#: quote the word while saying the opposite. ``report`` must come after
+#: ``gate``: later in wall-clock time, or — when a seeded or same-second
+#: pair shares a timestamp — later in the stage log's own insertion order.
 NUMERATOR_SQL: str = """
 SELECT COUNT(*)
   FROM work_queue AS q
@@ -110,7 +119,8 @@ SELECT COUNT(*)
            JOIN stage_log AS report
              ON report.build_id = b.build_id
             AND report.stage_label = ?
-            AND report.details_json LIKE '%' || ? || '%'
+            AND report.target_identifier = ?
+            AND json_extract(report.details_json, '$.result') = ?
             AND (
                   report.started_at > gate.started_at
                   OR (report.started_at = gate.started_at
@@ -163,6 +173,7 @@ def self_closed_defect_rate(pool: Any, since: str = M5_SINCE) -> tuple[int, int]
                 since,
                 MERGE_READY_TARGET_IDENTIFIER,
                 MERGE_REPORT_STAGE_LABEL,
+                MERGE_REPORT_TARGET_IDENTIFIER,
                 MERGED_AND_RUNNING,
             ),
         ).fetchone()[0]
@@ -176,6 +187,7 @@ __all__ = [
     "MERGED_AND_RUNNING",
     "MERGE_READY_TARGET_IDENTIFIER",
     "MERGE_REPORT_STAGE_LABEL",
+    "MERGE_REPORT_TARGET_IDENTIFIER",
     "NUMERATOR_SQL",
     "self_closed_defect_rate",
 ]
