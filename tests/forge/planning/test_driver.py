@@ -11,6 +11,7 @@ two-phase escalation policy.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -247,6 +248,29 @@ def _queue_run(store: SqlitePlanningRunStore) -> None:
     )
 
 
+#: A raw chat member id as it appears in text: "U03QR8WKT29", "U0RIGINATOR".
+#: Nothing a person reads may contain one (2026-09-05 defect).
+_RAW_CHAT_ID = re.compile(r"\bU[0-9A-Z]{8,}\b")
+
+
+def _assert_no_raw_chat_ids(notifications: list[tuple[str, str, str]]) -> None:
+    """Grep every line the run sent a person for a raw chat id."""
+    for _cid, message, _level in notifications:
+        found = _RAW_CHAT_ID.findall(message)
+        assert not found, f"raw chat id {found} in a line a person reads: {message}"
+
+
+class _NamedResponse(ApprovalResponsePayload):
+    """An answer that DOES carry the answerer's display name.
+
+    The live payload model declares no such field and drops undeclared ones, so
+    this subclass is the only way to prove the day one travels — which is
+    exactly the day the sentences must stop saying "you" and say the name.
+    """
+
+    decided_by_name: str
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -324,6 +348,74 @@ class TestDecisions:
         assert run["state"] == PlanningState.CANCELLED.value
         assert ctx["git"].calls == []
         assert any("rejected" in m for _, m, _ in ctx["notifications"])
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_line_says_you_not_a_raw_chat_id(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """THE DEFECT, second door: "rejected by U03QR8WKT29" named nobody.
+
+        No display name travels with a live response, so the person is "you" —
+        the line is read by the person who was asked.
+        """
+        _queue_run(store)
+        driver, ctx = _make_driver(
+            store,
+            subscriber_scripts=[
+                [
+                    ApprovalResponsePayload(
+                        request_id=_request_id(0),
+                        decision="reject",
+                        decided_by=ORIGINATOR,
+                    )
+                ]
+            ],
+        )
+
+        await driver.drive(CID)
+
+        said = [m for _c, m, _l in ctx["notifications"] if "rejected" in m]
+        assert said == [f"Planning run {CID} was rejected by you."]
+        _assert_no_raw_chat_ids(ctx["notifications"])
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_line_uses_a_display_name_when_one_travels(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """The day a name rides the answer, the line says the name."""
+        _queue_run(store)
+        driver, ctx = _make_driver(
+            store,
+            subscriber_scripts=[
+                [
+                    _NamedResponse(
+                        request_id=_request_id(0),
+                        decision="reject",
+                        decided_by=ORIGINATOR,
+                        decided_by_name="Rich",
+                    )
+                ]
+            ],
+        )
+
+        await driver.drive(CID)
+
+        said = [m for _c, m, _l in ctx["notifications"] if "rejected" in m]
+        assert said == [f"Planning run {CID} was rejected by Rich."]
+        _assert_no_raw_chat_ids(ctx["notifications"])
+
+    @pytest.mark.asyncio
+    async def test_no_notification_this_chain_sends_carries_a_chat_id(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """The grep, on the happy path: every line a person is sent, swept."""
+        _queue_run(store)
+        driver, ctx = _make_driver(store, subscriber_scripts=[[_approve(attempt=0)]])
+
+        await driver.drive(CID)
+
+        assert ctx["notifications"], "the run sent nobody anything"
+        _assert_no_raw_chat_ids(ctx["notifications"])
 
     @pytest.mark.asyncio
     async def test_wrong_responder_is_refused_and_wait_continues(
