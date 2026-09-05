@@ -171,7 +171,15 @@ def _parse_merge_report(result: Any) -> dict[str, Any] | None:
 
 
 _FAILURE_STATUS_WORDS = frozenset(
-    {"refused", "refusal", "conflict", "failed", "error", "verify-failed", "verify_failed"}
+    {
+        "refused",
+        "refusal",
+        "conflict",
+        "failed",
+        "error",
+        "verify-failed",
+        "verify_failed",
+    }
 )
 
 
@@ -391,9 +399,7 @@ async def execute_merge_deploy(
                 "no stage-complete published for %s",
                 build_id,
             )
-            _write_receipt(
-                "merge_deploy_report.json", payload.model_dump(mode="json")
-            )
+            _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
             return outcome
         try:
             await deps.pipeline_publisher.publish_stage_complete(payload)
@@ -484,9 +490,7 @@ async def execute_merge_deploy(
             try:
                 baseline_path.parent.mkdir(parents=True, exist_ok=True)
                 baseline_path.write_text(
-                    json.dumps(
-                        {"failing": baseline_failing}, indent=2, sort_keys=True
-                    ),
+                    json.dumps({"failing": baseline_failing}, indent=2, sort_keys=True),
                     encoding="utf-8",
                 )
                 args += ["--baseline-json", str(baseline_path)]
@@ -518,13 +522,8 @@ async def execute_merge_deploy(
         if result_status != "success" and not merged_in_report:
             stderr = (getattr(result, "stderr", None) or "").strip()
             tail = (getattr(result, "stdout_tail", "") or "").strip()
-            refusal = (
-                f"the merge command did not succeed (status={result_status})"
-                + (
-                    f": {stderr[-400:]}"
-                    if stderr
-                    else (f": {tail[-400:]}" if tail else "")
-                )
+            refusal = f"the merge command did not succeed (status={result_status})" + (
+                f": {stderr[-400:]}" if stderr else (f": {tail[-400:]}" if tail else "")
             )
         elif report is not None and not merged_in_report:
             refusal = _report_refusal(report)
@@ -596,11 +595,7 @@ async def execute_merge_deploy(
                             or report.get("verify_status")
                             or "verification failed"
                         )
-                        + (
-                            f" — {len(charged)} charged failure(s)"
-                            if charged
-                            else ""
-                        )
+                        + (f" — {len(charged)} charged failure(s)" if charged else "")
                         + ". The deploy was not dispatched."
                     ),
                     checks_passed=checks_passed,
@@ -741,7 +736,7 @@ async def execute_merge_deploy(
             verdict=str(verdict) if verdict is not None else None,
             detail=(
                 (
-                    f"dry run — nothing merged; the deploy ended "
+                    "dry run — nothing merged; the deploy ended "
                     if dry_run
                     else f"{feature_id} merged, but the deploy ended "
                 )
@@ -854,9 +849,12 @@ def _deploy_task_id(feature_id: str) -> str:
     """
     from datetime import datetime, timezone
 
-    suffix = "".join(
-        ch for ch in feature_id.upper().removeprefix("FEAT-") if ch.isalnum()
-    )[:6] or "MERGE"
+    suffix = (
+        "".join(ch for ch in feature_id.upper().removeprefix("FEAT-") if ch.isalnum())[
+            :6
+        ]
+        or "MERGE"
+    )
     stamp = datetime.now(timezone.utc).strftime("%H%M%S")
     return f"TASK-{(suffix + stamp)[:12]}"
 
@@ -905,9 +903,8 @@ class MergeApprovalConsumer:
             )
             return
         request_id = payload.request_id
-        if (
-            not request_id.startswith(REQUEST_ID_PREFIX)
-            or len(request_id) <= len(REQUEST_ID_PREFIX)
+        if not request_id.startswith(REQUEST_ID_PREFIX) or len(request_id) <= len(
+            REQUEST_ID_PREFIX
         ):
             # Expected traffic, not a refusal: the wildcard subscription sees
             # EVERY forge approval response (gate taps included) — skip the
@@ -922,16 +919,13 @@ class MergeApprovalConsumer:
             stages = self._deps.pool.read_stages(build_id)
         except Exception as exc:  # noqa: BLE001 — trust boundary
             logger.warning(
-                "merge-executor: refusing %s — could not read its stage log "
-                "(%s)",
+                "merge-executor: refusing %s — could not read its stage log (%s)",
                 request_id,
                 exc,
             )
             return
         offers = [
-            s
-            for s in stages
-            if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+            s for s in stages if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
         ]
         if not offers:
             logger.warning(
@@ -967,10 +961,7 @@ class MergeApprovalConsumer:
                 envelope.correlation_id,
             )
             return
-        if any(
-            s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
-            for s in stages
-        ):
+        if any(s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER for s in stages):
             logger.warning(
                 "merge-executor: refusing %s — a decision is already on "
                 "record (restart can never double-run)",
