@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import difflib
 import hashlib
 import inspect
 import json
@@ -60,6 +61,7 @@ from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
     PlanningEscalationContext,
     _dispatch_approval_response,
+    _person_words,
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
@@ -536,6 +538,165 @@ def _reject_word_split(note: str) -> tuple[bool, str]:
     return True, rest.lstrip(" \t.,:;!?-\u2013\u2014").strip()
 
 
+def _responder_display_name(response: Any) -> str | None:
+    """The answerer's display name, when the response carries one.
+
+    The approval payload does not declare such a field today and its model
+    ignores undeclared ones, so this is ``None`` on every live response — and
+    the sentences fall back to "you". It is read rather than assumed absent so
+    that the day a name does travel, the card and the pings use it without
+    another change here.
+    """
+    for attr in ("decided_by_name", "display_name", "decided_by_display_name"):
+        value = getattr(response, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
+def _card_sentences(card: Mapping[str, Any] | None) -> list[str]:
+    """The plain sentences a digest card lists, in order — the list itself."""
+    out: list[str] = []
+    for entry in (card or {}).get("what_it_will_do") or []:
+        if isinstance(entry, Mapping):
+            out.append(str(entry.get("sentence") or ""))
+    return out
+
+
+def _card_assumptions(card: Mapping[str, Any] | None) -> list[tuple[str, str]]:
+    """The assumptions a digest card lists, in order, with their reasons."""
+    out: list[tuple[str, str]] = []
+    for entry in (card or {}).get("what_the_machine_assumed") or []:
+        if isinstance(entry, Mapping):
+            out.append((str(entry.get("assumption") or ""), str(entry.get("why") or "")))
+    return out
+
+
+def _card_sign_in_check(card: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """The sign-in question a digest card carries, or ``None`` when it carries none.
+
+    This block is a QUESTION the reader answers with the same tap that
+    approves the spec, so a rewrite that made it appear or vanish changed what
+    the person is being asked — even when every sentence in the list is word
+    for word what it was.
+    """
+    block = (card or {}).get("sign_in_check")
+    return block if isinstance(block, Mapping) else None
+
+
+def _sign_in_change_phrase(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> str:
+    """How the sign-in question changed between two cards; "" when it did not."""
+    before = _card_sign_in_check(previous)
+    after = _card_sign_in_check(current)
+    if before == after:
+        return ""
+    if before is None:
+        return "the sign-in question was added"
+    if after is None:
+        return "the sign-in question is gone"
+    return "the sign-in question changed"
+
+
+def _list_change_phrases(
+    before: list[Any], after: list[Any], *, singular: str, plural: str
+) -> list[str]:
+    """How one list changed, counted in plain words ("2 examples changed").
+
+    An ordinary line-diff, nothing clever: a run of replaced entries is
+    "changed" as far as it goes and "added"/"removed" for the remainder. The
+    first phrase carries the noun and the rest do not, so the phrases join into
+    a sentence a person reads once ("2 examples changed, 1 removed").
+    """
+    changed = added = removed = 0
+    matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_n, new_n = i2 - i1, j2 - j1
+        if tag == "replace":
+            changed += min(old_n, new_n)
+            added += max(0, new_n - old_n)
+            removed += max(0, old_n - new_n)
+        elif tag == "insert":
+            added += new_n
+        elif tag == "delete":
+            removed += old_n
+    phrases: list[str] = []
+    for count, word in ((changed, "changed"), (added, "added"), (removed, "removed")):
+        if not count:
+            continue
+        if phrases:
+            phrases.append(f"{count} {word}")
+        else:
+            phrases.append(f"{count} {singular if count == 1 else plural} {word}")
+    return phrases
+
+
+def _plain_card_changes(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> str:
+    """What changed between two digest cards, in plain words; "" when nothing did."""
+    examples = _list_change_phrases(
+        _card_sentences(previous),
+        _card_sentences(current),
+        singular="example",
+        plural="examples",
+    )
+    assumptions = _list_change_phrases(
+        _card_assumptions(previous),
+        _card_assumptions(current),
+        singular="assumption",
+        plural="assumptions",
+    )
+    parts = [", ".join(group) for group in (examples, assumptions) if group]
+    # The sign-in question is part of what the card asks, so a rewrite that
+    # added or dropped it is a change the reader is told about (coach finding,
+    # 2026-09-05: without this a sign-in-only rewrite was called "the same
+    # list").
+    sign_in = _sign_in_change_phrase(previous, current)
+    if sign_in:
+        parts.append(sign_in)
+    return "; ".join(parts)
+
+
+def _cards_say_the_same_thing(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    """True when a rewrite came back with the same list the owner just rejected.
+
+    "The same" means the whole of what the reader is asked: the sentences, the
+    assumptions, AND the sign-in question, which is answered by the same tap.
+    A rewrite whose only visible change was that question appearing or
+    disappearing used to be reported as the same list (coach finding,
+    2026-09-05).
+    """
+    return (
+        _card_sentences(previous) == _card_sentences(current)
+        and _card_assumptions(previous) == _card_assumptions(current)
+        and _card_sign_in_check(previous) == _card_sign_in_check(current)
+    )
+
+
+#: What the card says when the rewrite changed nothing the owner can see. The
+#: 2026-09-05 defect in one sentence: the second card was identical line for
+#: line to the first and said nothing about it, so a note that did nothing
+#: looked exactly like a note that worked.
+_SAME_LIST_CARD_TEXT = (
+    'The rewrite came back with the same list. Your note was: "{note}". '
+    "Approve anyway, send another note, or reject."
+)
+
+#: The same fact as ONE sentence, for the notification that opens that round.
+_SAME_LIST_NOTIFICATION = (
+    "Planning run {correlation_id}: the rewrite came back with the same list "
+    '— your note was "{note}" — so approve anyway, send another note, or reject.'
+)
+
+#: The one line added to an otherwise unchanged card when the rewrite DID
+#: change something: what changed, counted, in the words of the list itself.
+_CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
+
+
 @dataclass(frozen=True)
 class _DoorAnswer:
     """What came back through an inline confirmation door.
@@ -557,6 +718,12 @@ class _DoorAnswer:
     outcome: str
     request_id: str
     decided_by: str | None = None
+    #: The answerer's DISPLAY NAME when the response carried one — the words a
+    #: person reads, as opposed to ``decided_by``, which is the chat system's
+    #: internal member id. ``None`` for every response today (the payload model
+    #: ignores fields it does not declare), and the sentences a person reads
+    #: fall back to "you", never to the id.
+    decided_by_name: str | None = None
     decision: str | None = None
     notes: str | None = None
     item_answers: Mapping[str, str] = field(default_factory=dict)
@@ -1426,7 +1593,7 @@ class PlanningRunDriver:
                 await self._notify(
                     correlation_id,
                     f"Planning run {correlation_id} was rejected by "
-                    f"{response.decided_by}.",
+                    f"{_person_words(_responder_display_name(response))}.",
                     level="warning",
                 )
                 return "cancelled"
@@ -2067,6 +2234,32 @@ class PlanningRunDriver:
             return None
         digest_obj, card = proof
 
+        # DID THE NOTE ACTUALLY CHANGE ANYTHING? On a rewrite round the owner
+        # has already read one of these lists and said what was wrong with it.
+        # On 2026-09-05 the rewrite came back with the same six sentences and
+        # the second card said nothing about it, so a note that did nothing
+        # looked exactly like a note that worked. The card now says which it
+        # was, and it says so on the card the owner is about to read — the
+        # comparison is made HERE, before the draft row is written, so a
+        # restart replays the same words.
+        rewrite: dict[str, Any] | None = None
+        if notes:
+            previous = self._previous_digest_card(correlation_id)
+            if previous is not None:
+                note = str(notes[-1])
+                if _cards_say_the_same_thing(previous, card):
+                    rewrite = {"repeat": True, "note": note, "changes": ""}
+                    card = dict(card)
+                    card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
+                else:
+                    changes = _plain_card_changes(previous, card)
+                    rewrite = {"repeat": False, "note": note, "changes": changes}
+                    card = dict(card)
+                    card["what_happened"] = (
+                        f"{card.get('what_happened', '')} "
+                        + _CHANGED_LIST_CARD_LINE.format(changes=changes)
+                    ).strip()
+
         draft: dict[str, Any] = {
             "slug": slug,
             "spec_files": sorted(files),
@@ -2081,6 +2274,12 @@ class PlanningRunDriver:
             "assumption_count": len(digest_obj.get("assumptions") or []),
             "cycle": len(notes) + 1,
         }
+        if rewrite is not None:
+            # Persisted on the draft row, not on the card: the door's opening
+            # notification reads it, and a restart that re-opens the draft
+            # re-reads it rather than re-deriving it from a branch that has
+            # moved on. A renderer never sees it.
+            draft["rewrite"] = rewrite
         # Status ``drafted``, deliberately NOT ``approved``: this row is the
         # door's restart sentinel, never the leg's.
         deps.store._record_event(
@@ -2323,6 +2522,26 @@ class PlanningRunDriver:
             latest = dict(record) if isinstance(record, Mapping) else None
         return latest
 
+    def _previous_digest_card(self, correlation_id: str) -> dict[str, Any] | None:
+        """The card the owner read LAST ROUND, or ``None`` on the first round.
+
+        Read off the durable draft rows rather than held in memory, which is
+        what makes it right after a restart: the row for round n-1 is still
+        there whether or not this process wrote it.
+        """
+        latest: dict[str, Any] | None = None
+        for event in self._deps.store.list_events(correlation_id):
+            if event["stage_label"] != _SPEC_DRAFT_STAGE:
+                continue
+            try:
+                details = json.loads(event["details_json"] or "{}") or {}
+            except (json.JSONDecodeError, ValueError):
+                continue
+            record = details.get("spec_draft")
+            if isinstance(record, Mapping) and isinstance(record.get("card"), Mapping):
+                latest = dict(record["card"])
+        return latest
+
     @staticmethod
     def _sign_in_answer(
         draft: Mapping[str, Any], answer: "_DoorAnswer"
@@ -2555,7 +2774,7 @@ class PlanningRunDriver:
                     # to stop.
                     await self._notify(
                         correlation_id,
-                        f"Planning run {correlation_id}: {answer.decided_by} "
+                        f"Planning run {correlation_id}: {_person_words(answer.decided_by_name)} "
                         "said yes to the spec, and did not confirm that this "
                         "feature is free of signing in. The machine will write "
                         "the task plan and then stop, so a person can register "
@@ -2565,7 +2784,8 @@ class PlanningRunDriver:
                     return
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {answer.decided_by} said yes "
+                    f"Planning run {correlation_id}: "
+                    f"{_person_words(answer.decided_by_name)} said yes "
                     "to the spec. Writing the task plan and the quality "
                     "checklist next — nothing is built until you give the "
                     "go-ahead.",
@@ -2574,9 +2794,10 @@ class PlanningRunDriver:
             elif answer.outcome == "revise":
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {answer.decided_by} sent a "
-                    "note. Rewriting the spec from it and coming back with a "
-                    "fresh list.",
+                    f"Planning run {correlation_id}: "
+                    f"{_person_words(answer.decided_by_name)} "
+                    "sent a note. Rewriting the spec from it and coming back "
+                    "with a fresh list.",
                     level="info",
                 )
 
@@ -2596,8 +2817,12 @@ class PlanningRunDriver:
             receipt_keys=(),
             rehydrate=_rehydrate,
             decide=_decide,
-            open_message=lambda approver, wait: self._digest_door_open_message(
-                correlation_id, expected_approver=approver, wait_seconds=wait
+            # ``_approver`` is the chat id the door routes by; the line it
+            # writes never prints one, so it is not passed on.
+            open_message=lambda _approver, wait: self._digest_door_open_message(
+                correlation_id,
+                wait_seconds=wait,
+                rewrite=draft.get("rewrite"),
             ),
             log_noun="spec digest review door",
             on_close=_closed,
@@ -2765,18 +2990,36 @@ class PlanningRunDriver:
         return card
 
     def _digest_door_open_message(
-        self, correlation_id: str, *, expected_approver: str | None, wait_seconds: int
+        self,
+        correlation_id: str,
+        *,
+        wait_seconds: int,
+        rewrite: Mapping[str, Any] | None = None,
     ) -> str:
-        """The plain-language ping that says the run is WAITING, not broken."""
-        who = expected_approver or "the run's approver"
+        """The plain-language ping that says the run is WAITING, not broken.
+
+        ``rewrite`` is the draft row's record of the round: present from the
+        second card onward, and when it says the rewrite came back with the
+        same list the ping says THAT instead, in one sentence. A ping that read
+        the same as the first one is how a note that did nothing stayed
+        invisible.
+        """
+        if rewrite is not None and rewrite.get("repeat"):
+            return _SAME_LIST_NOTIFICATION.format(
+                correlation_id=correlation_id, note=str(rewrite.get("note") or "")
+            )
+        # No name travels this far — the door routes by a chat id, and an id is
+        # never printed — so this reads "You have a card…".
+        who = _person_words(None)
+        subject, verb = ("You", "have") if who == "you" else (who, "has")
         return (
-            f"Planning run {correlation_id}: the spec is written. {who} has a "
-            "card listing, in one sentence each, everything this build will be "
-            "checked against. Say yes and the machine writes the task plan and "
-            "the quality checklist; send a note and it rewrites the spec from "
-            f"what you say. No answer within {self._plain_wait(wait_seconds)} "
-            "stops the run — nothing is built either way until you give the "
-            "go-ahead."
+            f"Planning run {correlation_id}: the spec is written. {subject} "
+            f"{verb} a card listing, in one sentence each, everything this "
+            "build will be checked against. Say yes and the machine writes the "
+            "task plan and the quality checklist; send a note and it rewrites "
+            f"the spec from what you say. No answer within "
+            f"{self._plain_wait(wait_seconds)} stops the run — nothing is built "
+            "either way until you give the go-ahead."
         )
 
     async def _escalate_spec_review(
@@ -4244,6 +4487,7 @@ class PlanningRunDriver:
                 outcome=decide(response),
                 request_id=request_id,
                 decided_by=response.decided_by,
+                decided_by_name=_responder_display_name(response),
                 decision=str(response.decision),
                 notes=(str(response.notes) if getattr(response, "notes", None) else None),
                 item_answers=_item_answers(response),
@@ -4304,7 +4548,8 @@ class PlanningRunDriver:
             if answer.outcome == "confirmed":
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {answer.decided_by} "
+                    f"Planning run {correlation_id}: "
+                    f"{_person_words(answer.decided_by_name)} "
                     "confirmed there is no sign-in here — registering the "
                     "quality checklist as authless and carrying on with the build.",
                     level="info",
@@ -4348,8 +4593,10 @@ class PlanningRunDriver:
             receipt_keys=("basis_lines",),
             rehydrate=_rehydrate,
             decide=_decide,
-            open_message=lambda approver, wait: self._auth_door_open_message(
-                correlation_id, expected_approver=approver, wait_seconds=wait
+            # ``_approver`` is the chat id the door routes by; the line it
+            # writes never prints one, so it is not passed on.
+            open_message=lambda _approver, wait: self._auth_door_open_message(
+                correlation_id, wait_seconds=wait
             ),
             log_noun="auth-surface confirmation door",
             on_close=_closed,
@@ -4537,17 +4784,25 @@ class PlanningRunDriver:
         return card
 
     def _auth_door_open_message(
-        self, correlation_id: str, *, expected_approver: str | None, wait_seconds: int
+        self, correlation_id: str, *, wait_seconds: int
     ) -> str:
-        """The plain-language ping that says the run is WAITING, not broken."""
-        who = expected_approver or "the run's approver"
+        """The plain-language ping that says the run is WAITING, not broken.
+
+        It takes no approver: the id this door routes by is never printed. The
+        line used to open "U03QR8WKT29 has a card to decide", which named
+        nobody (2026-09-05 defect, third door). It is the person reading it.
+        """
+        # Only an id is held here, and an id is never printed.
+        who = _person_words(None)
+        subject, verb = ("You", "have") if who == "you" else (who, "has")
         return (
             f"Planning run {correlation_id}: the spec checker flagged this "
             "feature as sitting behind a sign-in, which is often a false alarm "
             "— nothing has failed. "
-            f"{who} has a card to decide: confirm there is no sign-in and the "
-            "quality checklist registers as authless and the build carries on; "
-            "reject and the run stops so they can be registered attended. No "
+            f"{subject} {verb} a card to decide: confirm there is no sign-in "
+            "and the quality checklist registers as authless and the build "
+            "carries on; reject and the run stops so the checklist is "
+            "registered by hand. No "
             f"answer within {self._plain_wait(wait_seconds)} stops the run too."
         )
 

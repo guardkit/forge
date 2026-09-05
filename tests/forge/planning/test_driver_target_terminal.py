@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -1581,6 +1582,28 @@ def _auth_door_answer(
     )
 
 
+#: A raw chat member id as it appears in text ("U03QR8WKT29"). Nothing a
+#: person reads may contain one (2026-09-05 defect).
+_RAW_CHAT_ID = re.compile(r"\bU[0-9A-Z]{8,}\b")
+
+
+def _assert_no_raw_chat_ids(notifications: list[tuple[str, str, str]]) -> None:
+    """Grep every line the run sent a person for a raw chat id."""
+    for _cid, message, _level in notifications:
+        found = _RAW_CHAT_ID.findall(message)
+        assert not found, f"raw chat id {found} in a line a person reads: {message}"
+
+
+class _NamedAnswer(ApprovalResponsePayload):
+    """An answer that DOES carry the answerer's display name.
+
+    The live payload declares no such field and drops undeclared ones, so this
+    subclass is the only way to prove the day one travels.
+    """
+
+    decided_by_name: str
+
+
 def _auth_door_card(h: _Harness) -> dict[str, Any]:
     """The ONE auth-confirmation card the run put in front of the owner."""
     cards = [
@@ -1744,6 +1767,53 @@ async def test_auth_flagged_seed_confirmed_resumes_exactly_as_unflagged(
     assert confirmation["request_id"] == _auth_door_request_id(0)
     bars_receipt = _leg_details(store, "qa-pass-bars")
     assert bars_receipt["auth_confirmation"]["decided_by"] == ORIGINATOR
+
+
+@pytest.mark.asyncio
+async def test_the_sign_in_confirmation_line_says_you_not_a_raw_chat_id(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """THE DEFECT, third door: "U03QR8WKT29 confirmed there is no sign-in here"
+    named nobody. No display name travels with a live answer, so it is "you"."""
+    h, _repo = await _auth_flagged_harness(
+        store, tmp_path, script=[_auth_door_answer("approve")]
+    )
+
+    await h.driver.drive(CID)
+
+    said = [m for _c, m, _l in h.ctx["notifications"] if "no sign-in here" in m]
+    assert said == [
+        f"Planning run {CID}: you confirmed there is no sign-in here — "
+        "registering the quality checklist as authless and carrying on with "
+        "the build."
+    ]
+    _assert_no_raw_chat_ids(h.ctx["notifications"])
+    # The id is still on the durable record, where the machine routes by it.
+    assert _door_events(store)[-1][1]["auth_confirmation"]["decided_by"] == ORIGINATOR
+
+
+@pytest.mark.asyncio
+async def test_the_sign_in_confirmation_line_uses_a_display_name_when_one_travels(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The day a name rides the answer, the line says the name."""
+    named = _NamedAnswer(
+        request_id=_auth_door_request_id(0),
+        decision="approve",
+        decided_by=ORIGINATOR,
+        decided_by_name="Rich",
+    )
+    h, _repo = await _auth_flagged_harness(store, tmp_path, script=[named])
+
+    await h.driver.drive(CID)
+
+    said = [m for _c, m, _l in h.ctx["notifications"] if "no sign-in here" in m]
+    assert said == [
+        f"Planning run {CID}: Rich confirmed there is no sign-in here — "
+        "registering the quality checklist as authless and carrying on with "
+        "the build."
+    ]
+    _assert_no_raw_chat_ids(h.ctx["notifications"])
 
 
 @pytest.mark.asyncio
