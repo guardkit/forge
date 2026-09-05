@@ -295,7 +295,16 @@ class TestApprovalYamlRoundTrip:
             # a first-class config section, so the unfiltered round-trip dump
             # always includes both keys and this exhaustive fixture must
             # declare them.
-            "conductor": {"enabled": False, "seat": None},
+            # ``admit_fix_rows`` joined this section with the conductor
+            # rewire (2026-09-05): whether the work queue may START a
+            # repair by itself. Default off — repairs are filed and
+            # left in the queue — and the round-trip dump always
+            # includes it, so this exhaustive fixture declares it.
+            "conductor": {
+                "enabled": False,
+                "admit_fix_rows": False,
+                "seat": None,
+            },
             # ``merge_executor`` — the merge word's activation switch
             # (make-merge-work build spec 2026-08-24). Default-OFF: no merge
             # card is offered and no approval response is consumed. A

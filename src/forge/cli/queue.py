@@ -330,47 +330,14 @@ def _resolve_originating_user() -> str | None:
 def _path_in_allowlist(repo: Path, allowlist: list[Path]) -> bool:
     """Return ``True`` when ``repo`` matches an entry in ``allowlist``.
 
-    Comparison is done against the *resolved* absolute path so a
-    relative ``--repo`` is matched against canonical allowlist entries.
-
-    A bare/empty ``allowlist`` (the schema default — see
-    :class:`forge.config.models.QueueConfig`) means "no restriction" per
-    the model docstring; in that case every repo passes.
+    One statement, two callers: the rule itself lives in
+    :func:`forge.pipeline.fix_admission.path_in_allowlist`, because the work
+    queue's in-process admission has to apply exactly the same allowlist
+    this command does.
     """
-    if not allowlist:
-        return True
-    repo_resolved = Path(repo).expanduser().resolve()
-    for entry in allowlist:
-        try:
-            entry_resolved = Path(entry).expanduser().resolve()
-        except (OSError, RuntimeError):
-            # Defensive — pathological symlink loops should not crash
-            # the CLI. Skip the bad entry; the operator can re-run after
-            # cleaning up ``forge.yaml``.
-            logger.warning("repo_allowlist entry %r could not be resolved", entry)
-            continue
-        if repo_resolved == entry_resolved:
-            return True
-        # Allow nested checkouts — a queue against
-        # ``/work/repos/foo/sub`` passes when ``/work/repos/foo`` is
-        # allowlisted.
-        try:
-            repo_resolved.relative_to(entry_resolved)
-        except ValueError:
-            continue
-        return True
-    return False
+    from forge.pipeline.fix_admission import path_in_allowlist
 
-
-#: Permitted characters in a slug segment after sanitisation. Mirrors the
-#: ``REPO_PATTERN`` in :mod:`nats_core.events._pipeline` so the derived
-#: ``BuildQueuedPayload.repo`` value never trips the upstream validator.
-_REPO_SEGMENT_FORBIDDEN_CHARS = " /\\:;,'\""
-
-
-def _sanitise_segment(segment: str) -> str:
-    """Replace any character outside ``[A-Za-z0-9._-]`` with ``_``."""
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in segment)
+    return path_in_allowlist(repo, allowlist)
 
 
 def _path_to_repo_slug(repo: Path) -> str:
@@ -379,87 +346,21 @@ def _path_to_repo_slug(repo: Path) -> str:
     The CLI's ``--repo`` flag is a filesystem path (it has to be — we
     need to allowlist-check it and pass it to GuardKit), but the wire
     payload requires an ``org/name`` GitHub-shaped slug
-    (``REPO_PATTERN`` in :mod:`nats_core.events._pipeline`). We bridge
-    the two by taking the resolved path's last two components and
-    sanitising any character outside ``[A-Za-z0-9._-]`` to ``_``.
-
-    A single-component path (e.g. ``/tmp``) is mapped to ``local/{name}``
-    so the slug is always a valid two-segment string.
+    (``REPO_PATTERN`` in :mod:`nats_core.events._pipeline`). The bridge
+    lives in :func:`forge.pipeline.fix_admission.repo_slug` so both this
+    command and the queue's admission derive the same slug.
     """
-    resolved = Path(repo).expanduser().resolve()
-    name = _sanitise_segment(resolved.name) or "repo"
-    parent = resolved.parent.name
-    org = _sanitise_segment(parent) if parent else "local"
-    if not org:
-        org = "local"
-    return f"{org}/{name}"
+    from forge.pipeline.fix_admission import repo_slug
+
+    return repo_slug(repo)
 
 
-#: Regex that gates the Mode C positional argument at the CLI boundary
-#: (TASK-F8-002 / F008-VAL-002). Mirrors the canonical
-#: ``TASK_ID_PATTERN`` in :mod:`nats_core.events._pipeline` so an
-#: operator-supplied task_id is refused at the boundary rather than at
-#: the Pydantic wire-validation layer one stack frame deeper.
+#: Regex that gates the Mode C positional argument (TASK-F8-002 /
+#: F008-VAL-002). Kept here as a name older modules reference; the pattern
+#: itself is stated once, in :data:`forge.pipeline.fix_admission.TASK_ID_REGEX`,
+#: which is what actually refuses a badly shaped subject on both the CLI's
+#: path and the work queue's.
 _TASK_ID_REGEX: re.Pattern[str] = re.compile(r"^TASK-[A-Z0-9]{3,12}$")
-
-
-def _load_parent_feature_from_fix_task_yaml(yaml_path: Path) -> str:
-    """Read the ``parent_feature`` field from a fix-task YAML.
-
-    Mode C dispatches carry a per-fix-task identifier on the wire
-    alongside the parent feature_id. The fix-task YAML at
-    ``--feature-yaml`` is the canonical source for the parent feature
-    reference — the same artefact a developer reads when running
-    ``/task-work TASK-XXX`` — so resolving it here keeps Mode C from
-    having to thread a duplicate ``--parent-feature`` flag.
-
-    Args:
-        yaml_path: Path to the fix-task YAML supplied via
-            ``--feature-yaml``. The CLI has already verified the file
-            exists via Click's ``type=click.Path(exists=True)``.
-
-    Returns:
-        The raw ``parent_feature`` string (the caller is responsible
-        for running it through :func:`validate_feature_id` and the
-        wire-layer regex).
-
-    Raises:
-        click.UsageError: When the YAML is malformed, the top-level
-            value is not a mapping, or ``parent_feature`` is missing
-            or not a string.
-    """
-    # ``yaml`` is imported lazily — the queue CLI's import surface is
-    # otherwise stdlib + click + nats-core, and YAML parsing only runs
-    # on the Mode C branch.
-    import yaml
-
-    try:
-        text = Path(yaml_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise click.UsageError(
-            f"Cannot read fix-task YAML {str(yaml_path)!r}: {exc}"
-        ) from exc
-
-    try:
-        data = yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        raise click.UsageError(
-            f"Fix-task YAML {str(yaml_path)!r} is malformed: {exc}"
-        ) from exc
-
-    if not isinstance(data, dict):
-        raise click.UsageError(
-            f"Fix-task YAML {str(yaml_path)!r} must be a YAML mapping "
-            "at the top level"
-        )
-
-    parent = data.get("parent_feature")
-    if not isinstance(parent, str) or not parent.strip():
-        raise click.UsageError(
-            "Mode C requires the fix-task YAML to declare a non-empty "
-            f"'parent_feature' field (string); got {parent!r} in {yaml_path}"
-        )
-    return parent
 
 
 def _envelope_bytes(payload: Any, correlation_id: str) -> bytes:
@@ -533,6 +434,99 @@ def _require_forge_config(config: Any) -> ForgeConfig:
 # ---------------------------------------------------------------------------
 # Click command
 # ---------------------------------------------------------------------------
+
+
+#: Which exit code each of the shared admission's refusals gets on the CLI.
+#: The reasons come from :class:`forge.pipeline.fix_admission.FixAdmissionRefused`.
+_FIX_REFUSAL_EXIT_CODES: dict[str, int] = {
+    "cap": EXIT_MODE_USAGE,
+    "task-id": EXIT_INVALID_IDENTIFIER,
+    "parent-feature": EXIT_INVALID_IDENTIFIER,
+    "repo-not-allowed": EXIT_PATH_REFUSED,
+    "duplicate": EXIT_DUPLICATE,
+}
+
+
+def _admit_fix_journey(
+    *,
+    config: ForgeConfig,
+    positional_id: str,
+    repo_path: Path,
+    branch: str,
+    feature_yaml: Path,
+    correlation_id: str,
+    profile_name: str | None,
+    uncapped_acknowledged: bool,
+    max_turns: int,
+    sdk_timeout_seconds: int,
+) -> None:
+    """Open a fix journey through the shared admission, then exit.
+
+    The CLI's half of :func:`forge.pipeline.fix_admission.admit_fix_build`:
+    translate the module's two failure shapes into the exit codes and
+    sentences ``forge queue`` has always used, and print the same
+    confirmation line on success. Always exits; it never returns.
+
+    The publish seam stays the module-level :func:`publish` — resolved at
+    call time so a test that monkey-patches it still sees every byte — and
+    is handed to the admission on a worker thread, because that seam opens
+    its own event loop and the admission runs inside one.
+    """
+    import asyncio
+
+    from forge.pipeline.fix_admission import (
+        FixAdmissionRefused,
+        FixPublishFailed,
+        admit_fix_build,
+    )
+
+    persistence = make_persistence(config)
+
+    async def _publish(subject: str, body: bytes) -> None:
+        await asyncio.to_thread(publish, subject, body)
+
+    try:
+        admission = asyncio.run(
+            admit_fix_build(
+                config=config,
+                persistence=persistence,
+                task_id=positional_id,
+                fix_task_yaml=feature_yaml,
+                repo_path=repo_path,
+                correlation_id=correlation_id,
+                publish=_publish,
+                branch=branch,
+                profile=profile_name,
+                uncapped_acknowledged=uncapped_acknowledged,
+                max_turns=max_turns,
+                sdk_timeout_seconds=sdk_timeout_seconds,
+                originating_user=_resolve_originating_user(),
+                triggered_by="cli",
+                originating_adapter="cli-wrapper",
+            )
+        )
+    except FixAdmissionRefused as exc:
+        if exc.reason == "fix-task-yaml":
+            # Click owns this one's formatting and exit code, exactly as the
+            # fix-task YAML reader has always been surfaced.
+            raise click.UsageError(exc.message) from exc
+        message = exc.message
+        if exc.reason == "cap":
+            message = f"{message}\nNothing was queued."
+        click.echo(message, err=True)
+        sys.exit(_FIX_REFUSAL_EXIT_CODES.get(exc.reason, EXIT_PUBLISH_FAILED))
+    except FixPublishFailed as exc:
+        # AC-007: do NOT roll back the SQLite row; surface the messaging-layer
+        # cause (Group H) and exit 1. The on-boot reconciler redrives the row.
+        click.echo(exc.message, err=True)
+        sys.exit(EXIT_PUBLISH_FAILED)
+
+    click.echo(
+        f"Queued {admission.feature_id} (build pending) "
+        f"mode={BuildMode.MODE_C.value} "
+        f"correlation_id={admission.correlation_id}"
+    )
+    sys.exit(EXIT_OK)
 
 
 @click.command(name="queue")
@@ -795,45 +789,15 @@ def queue_cmd(
             err=True,
         )
 
-    # 1. Resolve ``feature_id`` and (Mode C only) ``task_id`` BEFORE any
-    #    side effect (AC-003 / sc_003). Mode A/B reuse the existing
-    #    discipline; Mode C interprets the positional as a TASK-XXX
-    #    dispatch target and resolves the parent feature_id from the
-    #    fix-task YAML's ``parent_feature`` field (TASK-F8-002 AC-8 / 9).
-    task_id: str | None
-    if build_mode is BuildMode.MODE_C:
-        # 1a. Mode C positional must be TASK-XXX. The wire layer will
-        # also enforce this regex, but refusing at the CLI boundary
-        # gives a clearer error before any persistence/publish work.
-        if not _TASK_ID_REGEX.match(positional_id):
-            click.echo(
-                "Mode C requires positional argument to match "
-                f"{_TASK_ID_REGEX.pattern}; got {positional_id!r}",
-                err=True,
-            )
-            sys.exit(EXIT_INVALID_IDENTIFIER)
-        task_id = positional_id
-        # 1b. Parent feature_id comes from the fix-task YAML.
-        try:
-            raw_parent = _load_parent_feature_from_fix_task_yaml(Path(feature_yaml))
-        except click.UsageError:
-            # Click handles UsageError formatting + exit code on its own
-            # — re-raise so the operator sees the canonical message
-            # rather than a swallow-and-re-format here.
-            raise
-        try:
-            feature_id = validate_feature_id(raw_parent)
-        except InvalidIdentifierError as exc:
-            click.echo(
-                f"Invalid parent_feature in fix-task YAML ({exc.reason}): "
-                f"{exc.value!r}",
-                err=True,
-            )
-            sys.exit(EXIT_INVALID_IDENTIFIER)
-    else:
-        # Mode A / Mode B: positional is the feature_id (existing
-        # contract); no per-fix-task identifier rides on the wire.
-        task_id = None
+    # 1. Resolve ``feature_id`` BEFORE any side effect (AC-003 / sc_003).
+    #    Mode A / Mode B: the positional IS the feature_id. Mode C's subject
+    #    is a TASK identifier and its parent feature comes out of the
+    #    fix-task YAML — both are resolved inside the shared admission
+    #    (:mod:`forge.pipeline.fix_admission`) at step 3c below, which is
+    #    also what the work queue calls when it admits a repair itself.
+    task_id: str | None = None
+    feature_id = ""
+    if build_mode is not BuildMode.MODE_C:
         try:
             feature_id = validate_feature_id(positional_id)
         except InvalidIdentifierError as exc:
@@ -863,6 +827,29 @@ def queue_cmd(
         else config.queue.default_sdk_timeout_seconds
     )
     effective_correlation_id = correlation_id or str(uuid.uuid4())
+
+    # 3c. THE FIX JOURNEY GOES THROUGH THE SHARED ADMISSION.
+    #     Everything a fix journey needs — the cap law, the TASK-id check,
+    #     the fix-task YAML's parent_feature, the build row and the publish —
+    #     lives in one module now, because the work queue admits repairs by
+    #     itself and a second statement of any of those rules would be a
+    #     future lie. The cap law is read there again, from the same
+    #     ``forge.config.conductor`` statement the belt at step 0b read,
+    #     so a refusal cannot depend on which door the journey came through.
+    if build_mode is BuildMode.MODE_C:
+        _admit_fix_journey(
+            config=config,
+            positional_id=positional_id,
+            repo_path=repo_path,
+            branch=branch,
+            feature_yaml=Path(feature_yaml),
+            correlation_id=effective_correlation_id,
+            profile_name=profile_name,
+            uncapped_acknowledged=uncapped_acknowledged,
+            max_turns=effective_max_turns,
+            sdk_timeout_seconds=effective_timeout,
+        )
+        return  # pragma: no cover - _admit_fix_journey always exits
 
     # 4. Build the wire payload. ``nats_core.events`` is imported lazily
     #    so this module's import surface stays small.

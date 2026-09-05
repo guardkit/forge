@@ -351,6 +351,7 @@ def build_serve_resume_launcher(
     *,
     lifecycle_emitter: PipelineLifecycleEmitter,
     async_task_starter: AsyncTaskStarter | None,
+    conductor_router: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Compose the boot-time rearm resume launcher (TASK-GATE-D659 §D4.2).
 
@@ -370,16 +371,33 @@ def build_serve_resume_launcher(
 
     **SILENT-DOWNGRADE SEAM 2 (activation design §4.2).** The returned
     closure is GUARDED. The rearm sweep's approve path consults no router
-    at all — it holds only this launcher — so a mode-c build that was
+    of its own — it holds only this launcher — so a mode-c build that was
     carded, then met a daemon restart, then got approved, launched down
     the ROUTINE autobuild path against a TASK-xxx subject. The guard reads
-    the same ``builds.mode`` the router reads and refuses a mode-c row
-    loudly (FAILED with the reason on the row + a ``build-failed`` emit)
-    instead of routine-launching it. Journey RE-ENTRY proper — resuming
-    the interrupted fix journey rather than refusing it — stays ledgered
-    (design §7: a restart mid-journey orphans it; the monitored-
-    supervision lane's first production item). The ack rides the FAILED
-    row: the still-held build-queued message redelivers, the consumer's
+    the same ``builds.mode`` the router reads and never routine-launches a
+    mode-c row.
+
+    **RE-ENTRY (conductor rewire rule 5).** ``conductor_router`` is the
+    way back IN, and it is what the guard now does with a fix journey
+    first: a re-approved mode-c row is handed to the same router the
+    dequeue path uses (``serve.py``'s composed conductor), which reuses
+    the journey's own worktree and drives it. The router speaks the
+    taken-and-terminal vocabulary
+    (:mod:`forge.cli._conductor_outcome`):
+
+    * ``TAKEN_RUNNING`` — the turn loop is driving it; nothing else
+      happens here (the journey owns its own terminal).
+    * ``TakenTerminal(reason=...)`` — taken and already over; the router
+      has written the reason onto the row, and this closure emits the
+      ``build-failed`` that carries it.
+    * ``DECLINED``, a router that raised, or NO router at all (the
+      conductor switched off) — the ledgered REFUSAL, unchanged: FAILED
+      with the reason on the row plus a ``build-failed`` emit, never a
+      routine launch. There is exactly one refusal statement and this is
+      it; the router branch replaced the old unconditional one.
+
+    On every arm that ends the build the ack rides the FAILED row: the
+    still-held build-queued message redelivers, the consumer's
     duplicate-terminal filter sees a terminal row and acks (the
     self-healing arm ``_rearm_dispatch`` already relies on for a gate
     reject).
@@ -406,26 +424,73 @@ def build_serve_resume_launcher(
         **launch_kwargs: Any,
     ) -> Any:
         if is_mode_c_build(sqlite_pool, build_id, log=logger):
-            summary = (
-                "a fix-journey (mode-c) build was approved on the boot-rearm "
-                "path, which has no conductor to hand it to — refused, never "
-                "downgraded onto the routine autobuild path"
-            )
-            logger.error(
-                "rearm resume: build_id=%s feature_id=%s is a fix journey; "
-                "REFUSING the routine resume launch (the rearm path consults "
-                "no router — running a fix task as a routine autobuild is the "
-                "silent downgrade). Journey re-entry is ledgered, not built.",
-                build_id,
-                feature_id,
-            )
-            reason = fail_mode_c_build(
-                sqlite_pool,
-                build_id,
-                summary=summary,
-                what="a mode-c row on the boot-rearm resume path",
-                log=logger,
-            )
+            outcome: Any = DECLINED
+            if conductor_router is not None:
+                try:
+                    outcome = await conductor_router(
+                        build_id=build_id,
+                        feature_id=feature_id,
+                        correlation_id=correlation_id,
+                        **launch_kwargs,
+                    )
+                except Exception as exc:  # noqa: BLE001 — refuse, never routine
+                    logger.error(
+                        "rearm resume: conductor_router raised (%s) for "
+                        "build_id=%s; the re-approved fix journey is REFUSED "
+                        "(it is never downgraded onto the routine path)",
+                        exc,
+                        build_id,
+                    )
+                    outcome = DECLINED
+                # Outside the try on purpose, exactly as ``dispatch_build``
+                # does it: a contract error caught by the rail above would be
+                # read as DECLINED — the silent downgrade the vocabulary
+                # exists to abolish. Out here it propagates and is loud.
+                outcome = check_router_outcome(outcome, build_id=build_id)
+
+            if outcome is TAKEN_RUNNING:
+                logger.info(
+                    "rearm resume: build_id=%s feature_id=%s is a fix journey "
+                    "that was re-approved after a restart; handed to the "
+                    "conductor's turn loop, which reuses the journey's own "
+                    "worktree — NOT launched as a routine autobuild",
+                    build_id,
+                    feature_id,
+                )
+                return None
+
+            if isinstance(outcome, TakenTerminal):
+                # The router took it and it is already over; the reason is
+                # already on the row. Only the terminal emit is owed.
+                reason = outcome.reason
+                logger.error(
+                    "rearm resume: the conductor took build_id=%s and it is "
+                    "already terminal (%s); emitting build-failed",
+                    build_id,
+                    reason,
+                )
+            else:
+                summary = (
+                    "a fix-journey (mode-c) build was approved on the "
+                    "boot-rearm path with no conductor to hand it to — "
+                    "refused, never downgraded onto the routine autobuild path"
+                )
+                logger.error(
+                    "rearm resume: build_id=%s feature_id=%s is a fix journey "
+                    "and no conductor took it (the conductor is switched off, "
+                    "or its router declined or raised); REFUSING the routine "
+                    "resume launch — running a fix task as a routine autobuild "
+                    "is the silent downgrade.",
+                    build_id,
+                    feature_id,
+                )
+                reason = fail_mode_c_build(
+                    sqlite_pool,
+                    build_id,
+                    summary=summary,
+                    what="a mode-c row on the boot-rearm resume path",
+                    log=logger,
+                )
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 

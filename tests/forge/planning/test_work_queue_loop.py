@@ -27,6 +27,11 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
+from forge.pipeline.fix_admission import (
+    FixAdmission,
+    FixAdmissionRefused,
+    FixPublishFailed,
+)
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_loop import (
     LOOP_ACTOR,
@@ -34,6 +39,7 @@ from forge.planning.work_queue_loop import (
     Admission,
     WorkQueueLoop,
     count_in_flight,
+    first_sentence,
     paused_repositories,
     shadow_line,
 )
@@ -164,6 +170,10 @@ def build_loop(
     paused: set[str] | None = None,
     max_in_flight: int = 1,
     stale_after_days: int = 7,
+    admit_fix_rows: bool = False,
+    fix_maker: Any | None = None,
+    builds: dict[str, dict[str, Any]] | None = None,
+    republisher: Any | None = None,
 ) -> tuple[WorkQueueLoop, RunMaker]:
     maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
@@ -176,6 +186,10 @@ def build_loop(
         max_in_flight=max_in_flight,
         stale_after_days=stale_after_days,
         clock=clock.now,
+        start_fix=fix_maker,
+        fix_build=(lambda cid: (builds or {}).get(cid)) if builds is not None else None,
+        republish_build=republisher,
+        admit_fix_rows=admit_fix_rows,
     )
     return loop, maker
 
@@ -703,9 +717,24 @@ class TestTheShadowOrder:
     async def test_it_says_nothing_when_the_two_agree(
         self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
     ) -> None:
+        """Repairs admitted, the fix row is first anyway — nothing to say.
+
+        ``admit_fix_rows`` is on here because with it off the two picks
+        genuinely disagree: the class order wants the repair and the queue
+        may not start one. That disagreement is worth a line, and it has its
+        own test below.
+        """
         file_row(store, "plan-1", kind="fix")
         file_row(store, "plan-2", kind="feature")
-        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
 
         await loop.take_next()
 
@@ -926,6 +955,223 @@ class TestRunningForever:
         await loop.run(sleep=clock.sleep, iterations=3)
 
         assert calls["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# The fix branch (conductor rewire spec 2026-09-05, rules 2 and 4)
+# ---------------------------------------------------------------------------
+
+
+class TestTheFixBranch:
+    """A repair is not a planning run, and it is shut by default.
+
+    ``conductor.admit_fix_rows`` is False in the shipped configuration, so a
+    repair row is FILED and LEFT: it can be listed, it can be named by the
+    "next I'd pick" line, and nothing about it starts. With the owner's word
+    the same row goes to the fix journey — never to the planning-run path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_repair_is_left_alone_while_repairs_are_shut(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        fix_maker = RunMaker()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            fix_maker=fix_maker,
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert maker.admissions == []
+        assert fix_maker.admissions == []
+
+    @pytest.mark.asyncio
+    async def test_the_shadow_line_still_names_the_repair_that_is_waiting(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Shut does not mean silent: the queue says what it would pick."""
+        feature = file_row(store, "plan-1", kind="feature")
+        fix = file_row(store, "fix-build-1", kind="fix")
+        loop, maker = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        taken = await loop.take_next()
+
+        assert taken == feature
+        assert notifier.messages == [
+            f"next I'd pick #{fix} (fix · api_test), because fixes go first; "
+            f"taking #{feature} as things stand."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_with_the_word_given_the_repair_goes_to_the_fix_journey(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        fix_maker = RunMaker()
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=fix_maker,
+            builds={},
+        )
+
+        assert await loop.take_next() == queue_id
+
+        # The fix journey opened it; the planning-run path never saw it.
+        assert [a.queue_id for a in fix_maker.admissions] == [queue_id]
+        assert maker.admissions == []
+        assert fix_maker.admissions[0].kind == "fix"
+        assert fix_maker.admissions[0].correlation_id == "fix-build-1"
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "ADMITTED"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_never_creates_a_planning_run(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        assert runs == {}
+
+    @pytest.mark.asyncio
+    async def test_a_feature_beside_a_repair_is_still_taken_while_repairs_are_shut(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The queue does not stop behind a row it may not start."""
+        file_row(store, "fix-build-1", kind="fix")
+        feature = file_row(store, "plan-1", kind="feature")
+        loop, maker = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        assert await loop.take_next() == feature
+        assert [a.queue_id for a in maker.admissions] == [feature]
+
+    @pytest.mark.asyncio
+    async def test_a_repair_closes_on_its_build_not_on_a_planning_run(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds=builds,
+        )
+        await loop.take_next()
+
+        builds["fix-build-1"] = {"status": "RUNNING", "error": None}
+        loop.close_finished()
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+        builds["fix-build-1"] = {"status": "COMPLETE", "error": None}
+        loop.close_finished()
+        assert store.get(queue_id)["status"] == "DONE"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_journey_blocks_the_row_in_its_own_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds=builds,
+        )
+        await loop.take_next()
+
+        builds["fix-build-1"] = {"status": "FAILED", "error": None}
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "the fix journey failed"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_admitted_with_no_build_behind_it_is_put_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The forge stopped between admitting the row and opening the build."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        store.admit(queue_id, actor_identity="test")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds={},
+        )
+
+        assert loop.recover_admitted() == [queue_id]
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_open_a_journey_the_row_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """A misconfiguration loses no work: the row returns to the queue."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=None,
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_repair_row_is_never_put_back_when_nothing_reads_builds(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """No build reader wired: the loop must not decide the row never ran."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        store.admit(queue_id, actor_identity="test")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, admit_fix_rows=True
+        )
+
+        assert loop.recover_admitted() == []
+        assert store.get(queue_id)["status"] == "ADMITTED"
 
 
 # ---------------------------------------------------------------------------
@@ -1505,3 +1751,693 @@ class TestGoIsJudgedByTheClock:
 
         assert await loop.take_next() == second
         assert [a.correlation_id for a in maker.admissions] == ["plan-2"]
+
+
+# ---------------------------------------------------------------------------
+# A refusal that will say the same thing next tick takes the row out
+# ---------------------------------------------------------------------------
+
+
+def refused(reason: str, message: str, *, permanent: bool) -> FixAdmissionRefused:
+    return FixAdmissionRefused(message, reason=reason, permanent=permanent)
+
+
+def publish_failed() -> FixPublishFailed:
+    """The transport half: the build row landed, the pipeline was not told."""
+    return FixPublishFailed(
+        "Queued FEAT-44A8 (build pending) but pipeline NOT NOTIFIED — publish "
+        "failed (messaging-layer): connection refused",
+        admission=FixAdmission(
+            build_id="build-FEAT-44A8-1",
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id="FEAT-44A8",
+            correlation_id="fix-build-1",
+            repo="appmilla_github/api_test",
+            fix_task_path="/tmp/TASK-FEAT44A8FIX1.yaml",
+        ),
+    )
+
+
+UNKNOWN_REPO = (
+    "I don't know a repository called 'api-test'. The ones I know are: "
+    "api_test, forge."
+)
+
+
+class TestARefusalThatWillNotChange:
+    """A row nothing can ever start leaves the queue, and says so once.
+
+    An unknown repository, a budget profile with no cap, a row that names no
+    build: the admission refuses each of those the same way every ten
+    seconds for ever, and with a cap of one in flight everything behind it
+    waits for ever too. So the row closes BLOCKED with the refusal's own
+    sentence, and the channel is told once. A refusal that only means "not
+    now" — another build for the same feature is running — still goes back
+    in the queue.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_repository_takes_the_row_out_of_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == UNKNOWN_REPO
+
+    @pytest.mark.asyncio
+    async def test_the_channel_is_told_once_in_the_words_the_spec_gives(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        await loop.tick()
+        await loop.tick()  # and again, in case it wants to repeat itself
+
+        assert notifier.messages == [
+            f"#{queue_id} cannot be started: I don't know a repository called "
+            "'api-test'. It is out of the queue; drop it or fix the cause and "
+            "send it again."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_closing_is_written_down_as_blocked(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("cap", "the profile has no cap", permanent=True)
+            ),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        blocked = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "blocked"
+        ]
+        assert len(blocked) == 1
+        assert blocked[0]["actor_identity"] == LOOP_ACTOR
+        assert "the profile has no cap" in str(blocked[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_the_row_behind_it_goes_on_the_next_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The whole point: one bad row must not stop the queue for ever."""
+        fix = file_row(store, "fix-build-1", kind="fix")
+        feature = file_row(store, "plan-1", kind="feature")
+        loop, maker = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("repo-unknown", UNKNOWN_REPO, permanent=True)
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(fix)["status"] == "BLOCKED"
+
+        assert await loop.take_next() == feature
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_that_only_means_not_now_goes_back_in_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused(
+                    "duplicate",
+                    "duplicate build refused: an active build for FEAT-44A8 "
+                    "is already in flight (Group C).",
+                    permanent=False,
+                )
+            ),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_goes_back_in_the_queue(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The build row landed and the broker did not hear about it. Try again."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=publish_failed()),
+            builds={},
+        )
+
+        assert await loop.take_next() is None
+
+        row = store.get(queue_id)
+        assert row is not None and row["status"] == "QUEUED"
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_feature_row_refused_by_its_own_starter_still_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Nothing here changes for the planning-run path."""
+        queue_id = file_row(store, "plan-1")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            run_maker=RunMaker(fail_with=RuntimeError("the driver is asleep")),
+        )
+
+        assert await loop.take_next() is None
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+
+# ---------------------------------------------------------------------------
+# The waiting line is said once, not every ten seconds
+# ---------------------------------------------------------------------------
+
+
+class TestTheWaitingLineIsSaidOnce:
+    """A queue holding only repairs, with repairs shut, is quiet in the log.
+
+    The line is worth saying — otherwise a queue that never admits anything
+    looks like a queue with nothing in it — but at one tick every ten seconds
+    it would be written eight and a half thousand times a day, and a log
+    nobody can read is the same as no log. It is said once per change of the
+    repair rows that are open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ten_ticks_say_it_once(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.run(iterations=10, sleep=clock.sleep)
+
+        assert clock.slept == [10.0] * 10
+        assert _waiting_lines(caplog) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_new_repair_arriving_is_said(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Once per CHANGE: the queue is a different queue now."""
+        file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, builds={}
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.take_next()
+            await loop.take_next()
+            file_row(store, "fix-build-2", kind="fix")
+            await loop.take_next()
+            await loop.take_next()
+
+        assert _waiting_lines(caplog) == 2
+
+
+def _waiting_lines(caplog: pytest.LogCaptureFixture) -> int:
+    return len(
+        [
+            record
+            for record in caplog.records
+            if "is waiting and nothing may be started" in record.getMessage()
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The channel line is one sentence, whatever the refusal is
+# ---------------------------------------------------------------------------
+
+
+def cap_law_refusal() -> str:
+    """The real cap-law refusal — a runbook with a YAML snippet in it."""
+    from forge.config.conductor import mode_c_cap_refusal
+
+    refusal = mode_c_cap_refusal(profile_name="fix-journey", guards=object())
+    assert refusal is not None
+    return refusal.message
+
+
+class TestTheChannelLineIsOneSentence:
+    """A refusal can be a runbook. The channel gets its first sentence.
+
+    THE CAP LAW's refusal is about seven hundred characters over several
+    paragraphs, ending in a YAML snippet for forge.yaml. Flattened into one
+    Slack line that is unreadable, and an unreadable line is a defect. The
+    channel is told what happened in one sentence; the whole refusal is
+    written on the row and in the row's events, where anyone who wants the
+    runbook can read it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_runbook_refusal_says_only_its_first_sentence(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = cap_law_refusal()
+        assert len(message) > 500 and "max_review_cycles" in message
+
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        said = notifier.messages[0]
+        assert len(said) < 300
+        assert said == (
+            f"#{queue_id} cannot be started: the fix journey is refused: its "
+            "profile sets no cap. It is out of the queue; drop it or fix the "
+            "cause and send it again."
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_whole_refusal_stays_on_the_row_and_in_its_events(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = cap_law_refusal()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == message
+        blocked = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "blocked"
+        ]
+        assert "max_review_cycles" in str(blocked[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_of_several_paragraphs_ends_at_the_first_break(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        message = (
+            "the fix journey is refused: its profile sets no cap\n"
+            "Budget profile 'fix-journey' sets no review-cycle cap at all.\n"
+            "The fix: give the profile a review-cycle cap, e.g.\n"
+            "    budget:\n      profiles:\n        fix-journey:\n"
+            "          max_review_cycles: 2\n"
+        )
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(fail_with=refused("cap", message, permanent=True)),
+            builds={},
+        )
+
+        await loop.take_next()
+
+        assert notifier.messages == [
+            f"#{queue_id} cannot be started: the fix journey is refused: its "
+            "profile sets no cap. It is out of the queue; drop it or fix the "
+            "cause and send it again."
+        ]
+        assert store.get(queue_id)["closed_reason"] == message
+
+    def test_the_first_sentence_of_one_ordinary_sentence_is_all_of_it(
+        self,
+    ) -> None:
+        assert first_sentence("nothing to say here.") == "nothing to say here"
+        assert first_sentence("one. two. three.") == "one"
+        assert first_sentence("  ") == ""
+
+
+# ---------------------------------------------------------------------------
+# A repair whose build was already written (close-out item 2)
+# ---------------------------------------------------------------------------
+
+
+DUPLICATE_MESSAGE = (
+    "duplicate build refused: duplicate build: feature_id='FEAT-44A8' "
+    "correlation_id='fix-build-1' (Group B)."
+)
+
+
+def a_build(correlation_id: str, status: str, *, error: str | None = None) -> dict:
+    """One ``builds`` row as the loop's reader hands it over."""
+    return {
+        "build_id": "build-FEAT-44A8-1",
+        "feature_id": "FEAT-44A8",
+        "correlation_id": correlation_id,
+        "status": status,
+        "error": error,
+        "repo": "appmilla_github/api_test",
+        "branch": "main",
+        "feature_yaml_path": "/tmp/TASK-FEAT44A8FIX1.yaml",
+        "task_id": "TASK-FEAT44A8FIX1",
+        "mode": "mode-c",
+        "queued_at": "2026-09-05T12:00:00+00:00",
+        "max_turns": 5,
+        "sdk_timeout_seconds": 1800,
+        "triggered_by": "forge-internal",
+        "originating_adapter": "slack",
+        "originating_user": USER,
+        "parent_request_id": THREAD,
+    }
+
+
+class Republisher:
+    """Stands in for saying a written build's queued event again."""
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        self.calls: list[Any] = []
+        self._fail_with = fail_with
+
+    async def __call__(self, build: Any) -> None:
+        self.calls.append(build)
+        if self._fail_with is not None:
+            raise self._fail_with
+
+
+class LosesThePublish:
+    """The admission whose build row landed and whose publish did not.
+
+    First call: the build row appears and the publish fails, exactly as the
+    real admission behaves — write first, then publish. Every call after
+    that: the row is already there, so the admission refuses the duplicate.
+    """
+
+    def __init__(self, builds: dict[str, dict[str, Any]]) -> None:
+        self.builds = builds
+        self.calls = 0
+
+    async def __call__(self, admission: Admission) -> None:
+        self.calls += 1
+        correlation_id = admission.correlation_id
+        if correlation_id not in self.builds:
+            self.builds[correlation_id] = a_build(correlation_id, "QUEUED")
+            raise publish_failed()
+        raise refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+
+
+class TestARepairWhoseBuildWasAlreadyWritten:
+    """A duplicate that is the row's OWN build is settled, not asked again.
+
+    The write comes before the publish, so a publish that fails leaves a real
+    build row nobody was told about. Until now the next tick was refused as a
+    duplicate and the row went back in the queue — every ten seconds, for
+    ever, with the whole queue waiting behind it. The loop now reads that
+    build and answers in its terms.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_lost_publish_is_said_again_once_and_the_row_is_admitted(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        maker = LosesThePublish(builds)
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=maker,
+            builds=builds,
+            republisher=republisher,
+        )
+
+        await loop.tick()  # the build row lands, the publish fails
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert republisher.calls == []
+
+        await loop.tick()  # the duplicate is this row's own build
+        assert len(republisher.calls) == 1
+        assert store.get(queue_id)["status"] == "ADMITTED"
+
+        await loop.tick()  # and it is not said a third time
+        assert len(republisher.calls) == 1
+        assert store.get(queue_id)["status"] == "ADMITTED"
+        assert maker.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_the_saying_again_is_written_down(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=LosesThePublish(builds),
+            builds=builds,
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+        await loop.tick()
+
+        said_again = [
+            event
+            for event in store.list_events(queue_id)
+            if str(event["action"]) == "republished"
+        ]
+        assert len(said_again) == 1
+        assert said_again[0]["actor_identity"] == LOOP_ACTOR
+        assert "build-FEAT-44A8-1" in str(said_again[0]["details_json"])
+
+    @pytest.mark.asyncio
+    async def test_a_build_already_under_way_leaves_the_row_admitted(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The work is happening. Nothing is published, and nothing is asked again."""
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "RUNNING")},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "ADMITTED"
+        assert republisher.calls == []
+        assert notifier.messages == []
+
+    @pytest.mark.asyncio
+    async def test_a_build_that_already_finished_closes_the_row_done(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "COMPLETE")},
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "DONE"
+
+    @pytest.mark.asyncio
+    async def test_a_build_that_already_failed_blocks_the_row_in_its_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "FAILED")},
+            republisher=Republisher(),
+        )
+
+        await loop.tick()
+
+        row = store.get(queue_id)
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "the fix journey failed"
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_that_is_not_this_rows_build_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Somebody else's build for the same feature really does clear."""
+        republisher = Republisher()
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert republisher.calls == []
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_say_it_again_the_row_goes_back(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The honest degrade: no republisher, so the old behaviour stands."""
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "QUEUED")},
+        )
+
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_a_saying_that_fails_puts_the_row_back_for_the_next_tick(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The broker is still down. Try again in ten seconds, not never."""
+        republisher = Republisher(fail_with=RuntimeError("broker unreachable"))
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(
+                fail_with=refused("duplicate", DUPLICATE_MESSAGE, permanent=False)
+            ),
+            builds={"fix-build-1": a_build("fix-build-1", "QUEUED")},
+            republisher=republisher,
+        )
+
+        await loop.tick()
+        await loop.tick()
+
+        assert store.get(queue_id)["status"] == "QUEUED"
+        assert len(republisher.calls) == 2
