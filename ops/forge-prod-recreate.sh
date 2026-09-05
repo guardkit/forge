@@ -8,8 +8,20 @@
 # Rule (binding): only run when every forge build is terminal. The script checks this itself when
 # a forge-prod container is present and refuses otherwise.
 #
+# The repository binds are NOT written here. They are derived from the repository map in forge.yaml
+# ('planning.target_repo_paths', read with 'forge repo-paths'), so registering a repository adds its
+# bind automatically and the map stays the single source (register-repo spec 2026-09-05, rule 9).
+# The two state binds below are fixed and stay as they are. If the map cannot be read, this script
+# refuses to recreate rather than start forge-prod with the wrong set of repositories.
+#
+# That read runs as 'uv run --frozen --no-sync', deliberately: --frozen so reading the map can never
+# rewrite the forge checkout's uv.lock, and --no-sync so it never re-installs the virtual environment
+# (and never reaches the network to resolve dependencies) in the seconds before 'docker rm -f'. The
+# container comes down only after a read that changes nothing.
+#
 # Usage:  bash ops/forge-prod-recreate.sh            # gate, remove the old container, run the new one
 #         DRY_RUN=1 bash ops/forge-prod-recreate.sh  # print the docker command (names only), change nothing
+#         FORGE_CONFIG=/path/forge.yaml bash ...     # read the repository map from another config
 #
 # To change a setting (for example the LiteLLM base URL or key): sops ~/.config/fleet-secrets/forge/forge-prod.enc.env
 set -euo pipefail
@@ -28,13 +40,27 @@ NAMES=(
 )
 ENV_FLAGS=""; for n in "${NAMES[@]}"; do ENV_FLAGS+=" -e $n"; done
 
-RUN="docker run -d --name forge-prod --network host --restart unless-stopped --user forge --workdir /home/forge --entrypoint forge${ENV_FLAGS} \
- -v /home/richardwoollcott/Projects/appmilla_github/jarvis:/home/richardwoollcott/Projects/appmilla_github/jarvis:rw \
- -v /home/richardwoollcott/Projects/appmilla_github/study-tutor:/home/richardwoollcott/Projects/appmilla_github/study-tutor:rw \
- -v /home/richardwoollcott/Projects/appmilla_github/ts-api-test:/home/richardwoollcott/Projects/appmilla_github/ts-api-test:rw \
+# The repositories the container can build in, straight from the repository map. One '-v' per
+# distinct checkout path; the map's two key spellings for the same repository collapse to one bind.
+FORGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FORGE_CONFIG="${FORGE_CONFIG:-$HOME/forge-state/forge.yaml}"
+REPO_PATHS=$(uv run --frozen --no-sync --project "$FORGE_ROOT" forge repo-paths --config "$FORGE_CONFIG") || {
+  echo "could not read the repository map from $FORGE_CONFIG ('forge repo-paths' failed) - refusing to recreate forge-prod" >&2
+  exit 1
+}
+REPO_BINDS=""
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  REPO_BINDS+=" -v $p:$p:rw"
+done <<< "$REPO_PATHS"
+[ -n "$REPO_BINDS" ] || {
+  echo "the repository map in $FORGE_CONFIG names no checkouts, so forge-prod would have nowhere to build - refusing" >&2
+  exit 1
+}
+
+RUN="docker run -d --name forge-prod --network host --restart unless-stopped --user forge --workdir /home/forge --entrypoint forge${ENV_FLAGS}${REPO_BINDS} \
  -v /home/richardwoollcott/forge-state:/var/forge:rw \
  -v /home/richardwoollcott/forge-prod-state/.forge:/home/forge/.forge:rw \
- -v /home/richardwoollcott/Projects/appmilla_github/api_test:/home/richardwoollcott/Projects/appmilla_github/api_test:rw \
  $IMAGE --config /var/forge/forge.yaml serve"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then echo "$RUN"; exit 0; fi
