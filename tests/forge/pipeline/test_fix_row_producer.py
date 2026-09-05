@@ -34,6 +34,7 @@ from nats_core.events import BuildFailedPayload, BuildQueuedPayload
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations as lifecycle_migrations
+from forge.lifecycle.modes import BuildMode
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import BuildState
 from forge.lifecycle_bridge.build_state_recorder import build_build_state_recorder
@@ -88,6 +89,7 @@ def queue_a_build(
     correlation_id: str = CORRELATION_ID,
     repo: str = "appmilla_github/api_test",
     queued_at: datetime | None = None,
+    mode: BuildMode | str | None = None,
 ) -> str:
     now = queued_at or datetime.now(UTC)
     return pool.record_pending_build(
@@ -100,7 +102,8 @@ def queue_a_build(
             correlation_id=correlation_id,
             requested_at=now,
             queued_at=now,
-        )
+        ),
+        mode=mode,
     )
 
 
@@ -327,6 +330,95 @@ class TestNoRowWithoutEvidence:
         assert (
             maybe_mint_fix_row(
                 pool=pool, build_id="build-NOPE-1", source=SOURCE_BUILD_FAILED
+            )
+            is None
+        )
+        assert queue_rows(pool) == []
+
+
+# ---------------------------------------------------------------------------
+# No repair of a repair
+# ---------------------------------------------------------------------------
+
+
+class TestNoRepairOfARepair:
+    """A repair journey that fails is not itself repaired by another one.
+
+    Mode c IS the repair journey. If a failed one filed a repair of its own,
+    the factory would go round in a circle — journey two reviews journey
+    one's failure, fails in its turn, files journey three — and every one of
+    them would burn a seat. The circle stops at the first failed journey and
+    a person reads it.
+    """
+
+    def test_a_failed_repair_journey_files_nothing_even_with_a_pack(
+        self, pool: SqliteLifecyclePersistence, receipts: Path
+    ) -> None:
+        build_id = queue_a_build(pool, mode=BuildMode.MODE_C)
+        write_pack(receipts, build_id)  # evidence and all
+
+        assert (
+            maybe_mint_fix_row(
+                pool=pool,
+                build_id=build_id,
+                source=SOURCE_BUILD_FAILED,
+                detail="the fix journey ran out of turns",
+            )
+            is None
+        )
+        assert queue_rows(pool) == []
+
+    def test_it_says_which_build_and_why(
+        self,
+        pool: SqliteLifecyclePersistence,
+        receipts: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        build_id = queue_a_build(pool, mode=BuildMode.MODE_C)
+        write_pack(receipts, build_id)
+
+        with caplog.at_level("INFO", logger="forge.pipeline.fix_row_producer"):
+            maybe_mint_fix_row(
+                pool=pool, build_id=build_id, source=SOURCE_BUILD_FAILED
+            )
+
+        said = [record.getMessage() for record in caplog.records]
+        assert len(said) == 1
+        assert build_id in said[0]
+        assert "repair of a repair" in said[0]
+
+    def test_a_failed_mode_b_build_still_files_one_row(
+        self, pool: SqliteLifecyclePersistence, receipts: Path
+    ) -> None:
+        """The rule is about repairs only: ordinary work still gets repaired."""
+        build_id = queue_a_build(pool, mode=BuildMode.MODE_B)
+        write_pack(receipts, build_id)
+
+        queue_id = maybe_mint_fix_row(
+            pool=pool,
+            build_id=build_id,
+            source=SOURCE_BUILD_FAILED,
+            detail="task 004 never finished",
+        )
+
+        rows = queue_rows(pool)
+        assert queue_id is not None
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "fix"
+        assert rows[0]["correlation_id"] == fix_correlation_id(build_id)
+
+    def test_a_merge_of_a_repair_that_goes_red_files_nothing_either(
+        self, pool: SqliteLifecyclePersistence, receipts: Path
+    ) -> None:
+        """The same circle, entered from the other hook."""
+        build_id = queue_a_build(pool, mode=BuildMode.MODE_C)
+
+        assert (
+            maybe_mint_fix_row(
+                pool=pool,
+                build_id=build_id,
+                source=SOURCE_MERGE_REPORT,
+                detail="merged-deploy-reverted",
             )
             is None
         )

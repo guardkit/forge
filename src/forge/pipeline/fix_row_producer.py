@@ -44,6 +44,13 @@ no evidence would review blind. The merge half is different on purpose — a
 merged build *succeeded*, so it has no failure pack, and the red live check
 IS the evidence.
 
+**No repair of a repair.** A mode-c build IS a repair journey. When one
+of those fails, filing a repair of it would put the factory in a circle:
+journey two reviews journey one's failure, fails in its turn, and files
+journey three. So a source build whose mode is ``mode-c`` files nothing,
+and says so in one log line naming the build. A person reads the failed
+journey and decides what to do.
+
 **It never raises.** Both callers are on a terminal write path: the build
 state recorder is the single writer of ``builds.status``, and the merge
 executor's report is the only durable record of what the merge did. A defect
@@ -79,6 +86,11 @@ PRODUCER_ACTOR: str = "forge-fix-producer"
 
 #: The filing event's action, as the spec names it.
 MINTED_ACTION: str = "minted"
+
+#: The build mode that IS a repair journey. A build of this mode never gets a
+#: repair of its own (see the module docstring): the circle has to stop
+#: somewhere and it stops at the first failed journey.
+FIX_JOURNEY_MODE: str = "mode-c"
 
 #: Longest sentence the producer will write. A failure reason can be a whole
 #: stack trace; the queue's list is read by a person, so the sentence is cut
@@ -196,6 +208,17 @@ def maybe_mint_fix_row(
             )
             return None
 
+        if _is_fix_journey(row):
+            logger.info(
+                "fix producer: %s is itself a repair journey (mode-c) that "
+                "ended badly (%s) — filing no repair row: a repair of a "
+                "repair would go round in a circle, so this one is for a "
+                "person to read",
+                build_id,
+                source,
+            )
+            return None
+
         pack_path = _pack_path(build_id, receipts_root=receipts_root)
         if source == SOURCE_BUILD_FAILED and pack_path is None:
             logger.info(
@@ -281,6 +304,20 @@ def _build_row(pool: Any, build_id: str) -> Any:
     return reader(build_id)
 
 
+def _is_fix_journey(row: Any) -> bool:
+    """Whether this build was itself a repair journey (mode c).
+
+    Reads the row's ``mode`` however it is spelled — the enum member, its
+    value, or the raw text a database row hands back — because the two
+    callers hand over whatever their own layer had.
+    """
+    mode = getattr(row, "mode", None)
+    if mode is None:
+        return False
+    spelled = str(getattr(mode, "value", mode)).strip().lower().replace("_", "-")
+    return spelled == FIX_JOURNEY_MODE
+
+
 def _connection(pool: Any) -> Any:
     """The writer connection the queue tables live on, or None."""
     return getattr(pool, "connection", None)
@@ -323,6 +360,7 @@ def _one_line(detail: str | None) -> str:
 
 __all__ = [
     "FIX_CORRELATION_PREFIX",
+    "FIX_JOURNEY_MODE",
     "MAX_SENTENCE_CHARS",
     "MINTED_ACTION",
     "PRODUCER_ACTOR",
