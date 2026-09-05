@@ -2206,3 +2206,121 @@ def test_the_sign_in_cards_own_words_about_silence_match_the_same_one_wait(
     for words in (json.dumps(card).lower(), ping.lower()):
         assert "remind" not in words
         assert "4 hours" not in words
+
+
+@pytest.mark.parametrize(
+    ("wait_seconds", "in_words"),
+    [(3600, "1 hour"), (600, "10 minutes")],
+)
+def test_all_four_silence_sentences_name_the_one_wait_the_config_sets(
+    store: SqlitePlanningRunStore, wait_seconds: int, in_words: str
+) -> None:
+    """The wait is READ, not written into the words.
+
+    Four surfaces say what silence does — the spec card and the line that
+    opens it, the sign-in card and the line that opens it. All four are built
+    straight from the driver here at two different settings, so a number typed
+    into a sentence instead of read from the setting fails this.
+
+    The live setting is an hour; ten minutes is the same sentence with a
+    different setting behind it. Neither ever mentions the four-hour escalated
+    window, because no card this door sends is affected by it.
+    """
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=wait_seconds,
+    )
+
+    spec_card = h.driver._digest_review_card(
+        CID,
+        digest_obj={
+            "scenarios": [{"sentence": "the list comes back in order", "tags": []}],
+            "assumptions": [],
+        },
+        feature_text="Feature: anything\n",
+    )
+    spec_ping = h.driver._digest_door_open_message(CID, wait_seconds=wait_seconds)
+    auth_card = h.driver._auth_confirmation_card(
+        seed={"feature_slug": SLUG},
+        basis_lines=["the spec mentions a token while explaining it needs none"],
+        wait_seconds=wait_seconds,
+    )
+    auth_ping = h.driver._auth_door_open_message(CID, wait_seconds=wait_seconds)
+
+    said = [
+        spec_card["no_answer_means"],
+        spec_ping,
+        auth_card["no_answer_means"],
+        auth_ping,
+    ]
+    for sentence in said:
+        assert "No answer within " + in_words in sentence
+        # The whole promise, in one window: silence ends the run.
+        assert "stops" in sentence
+
+    # Nothing anywhere on either card, or in either line, offers a reminder or
+    # a second window. The escalated wait is four hours and is never reached.
+    for words in (
+        json.dumps(spec_card).lower(),
+        spec_ping.lower(),
+        json.dumps(auth_card).lower(),
+        auth_ping.lower(),
+    ):
+        assert "remind" not in words
+        assert "4 hours" not in words
+        assert "try again" not in words
+
+
+def test_no_sentence_in_the_driver_promises_a_reminder_nobody_sends() -> None:
+    """A FIFTH surface cannot quietly make the promise the first four don't.
+
+    The tests above build the four sentences that exist today. This one reads
+    the driver's own source — the code, not its explanations — and holds every
+    "…answer within…" sentence in it to the same two rules: the wait is
+    rendered from the run's own window through ``_plain_wait``, and the
+    sentence does not offer a reminder. A card added later is caught here even
+    if nobody thinks to test its words.
+    """
+    import ast
+
+    from forge.planning import driver as driver_module
+
+    source = Path(driver_module.__file__).read_text(encoding="utf-8")
+    lines = source.splitlines()
+
+    # The explanations are not the promise: skip every docstring, so a
+    # paragraph that DESCRIBES the rule is not read as breaking it.
+    prose: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(
+            node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        ):
+            continue
+        body = getattr(node, "body", None) or []
+        first = body[0] if body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            prose.update(range(first.lineno - 1, (first.end_lineno or first.lineno)))
+
+    sites = [
+        i
+        for i, line in enumerate(lines)
+        if "answer within" in line and i not in prose and not line.lstrip().startswith("#")
+    ]
+    # The four that exist today: the spec card and its line, the sign-in card
+    # and its line. A floor, not a cap — a fifth is checked, not banned.
+    assert len(sites) >= 4
+
+    for index in sites:
+        sentence = " ".join(lines[index : index + 3])
+        assert "_plain_wait(wait_seconds)" in sentence, (
+            f"line {index + 1} writes a wait into the words instead of reading "
+            "it from the run's own window"
+        )
+        assert "remind" not in sentence.lower(), (
+            f"line {index + 1} promises a reminder; this door sends none"
+        )
