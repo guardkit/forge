@@ -1,15 +1,36 @@
 # Runbook: Forge Production Service — Capture, Rebuild, Promote, Redeploy
 
-**Status:** **Verified** — first green walkthrough 2026-08-23 on `promaxgb10-41b1`, deploying the
-specification-path change (forge `f580e20`/`bb3336e`). Every gate below fired on that run, and
-**two of them were written because they caught a live failure during it** (G4 and G7).
+**Status:** **Verified**, and **CORRECTED 2026-09-05.** First green walkthrough 2026-08-23 on
+`promaxgb10-41b1`, deploying the specification-path change (forge `f580e20`/`bb3336e`).
 
-**Purpose:** Rebuild the `forge` image from the working tree and put it into production **without
-losing the container's configuration**. That last clause is the whole reason this file exists:
-`forge-prod` is started by a **plain `docker run` with no compose file and no deploy script**, so
-the ONLY record of how it runs is the running container itself. Stop it without capturing that
-first and the configuration is gone — six bind mounts, fifteen environment variables, host
-networking, and a health-check override that is **not** in the image.
+> **What changed since, and why this file was wrong until 2026-09-05.** Both follow-ups this
+> runbook owed have since been done, and it had not caught up:
+>
+> * **The image's health check was fixed** (commit `907ac58`, "healthcheck probes the port forge
+>   actually serves on"). It now reads `${FORGE_HEALTHZ_PORT:-8080}`, so a recreate no longer needs
+>   an override. The trap that G4 was written for **no longer exists** — kept below as history,
+>   because the gate is still worth running.
+> * **The run configuration is committed**: `ops/forge-prod-recreate.sh`, with the settings of
+>   record sops-encrypted at `~/.config/fleet-secrets/forge/forge-prod.enc.env`. So the claim that
+>   "the only record is the running container" is **false as of 2026-09-03**, and Phase 1 is now a
+>   fallback rather than the main path.
+>
+> **The correction that mattered most:** this file told you to `docker stop forge-prod` with no
+> check that the estate was quiet. That contradicts a binding rule — *never restart forge-prod
+> unless every build is terminal; PAUSED is not quiet.* The committed script enforces it; this file
+> did not. Phase 4 now does.
+
+**Purpose:** Rebuild the `forge` image from the working tree and put it into production.
+
+**Since 2026-09-03 there is a committed recreate script** — `ops/forge-prod-recreate.sh` — which
+reads the settings of record from a sops-encrypted file at run time, passes no value through its
+own output, and **refuses to touch the container while any build is RUNNING, PAUSED or QUEUED**.
+Use it. Phase 4 is a thin wrapper around it.
+
+This runbook still exists for the parts the script does not cover: recon, the build, the image
+promotion (which `build-image.sh` deliberately does not perform), and the gates that prove the
+deploy actually worked. Phase 1 — capturing a running container's configuration — is now a
+**fallback** for the case where the settings file is unavailable, not the main path.
 
 ```
 Slack sentence
@@ -43,6 +64,8 @@ PINS (runbook v1, set 2026-08-23)
   image tag (build)     forge:production-validation     ← what build-image.sh actually produces
   rollback tag format   forge:rollback-YYYYMMDD-pre-<thing>
   build script          scripts/build-image.sh          ← Contract A: the ONLY place buildx is invoked
+  recreate script       ops/forge-prod-recreate.sh      ← the settings of record, committed (2026-09-03)
+  settings file         ~/.config/fleet-secrets/forge/forge-prod.enc.env   (sops; NEVER decrypted to disk)
   entrypoint            forge
   command               --config /var/forge/forge.yaml serve
   workdir               /home/forge
@@ -226,9 +249,27 @@ docker images forge --format '{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}' | hea
 
 ## Phase 4: Redeploy
 
+**Use the committed script.** It gates the estate itself, reads the settings from sops, and prints
+no value:
+
 ```bash
-docker stop forge-prod && docker rm forge-prod
-bash "$OUT/forge-recreate.sh"
+cd ~/Projects/appmilla_github/forge
+DRY_RUN=1 bash ops/forge-prod-recreate.sh     # names only, changes nothing — read it first
+bash ops/forge-prod-recreate.sh
+```
+
+> **✋ THE ESTATE GATE — binding, and the script enforces it.** It refuses while any forge build is
+> `RUNNING`, `PAUSED` or `QUEUED`. **`PAUSED` is not quiet**: a paused build is mid-flight, and
+> recreating under it drops the branch so the runner "succeeds" in two seconds having done nothing.
+> If the script refuses, that is the gate working — let the builds finish, do not force it.
+
+**Fallback only** — if the settings file is unavailable and you are recreating from a Phase 1
+capture, you must apply the same gate by hand, because the generated script does not contain it:
+
+```bash
+docker exec forge-prod forge --config /var/forge/forge.yaml status | grep -qE 'RUNNING|PAUSED|QUEUED' \
+  && echo "HALT — a build is in flight; do not recreate" \
+  || { docker stop forge-prod && docker rm forge-prod && bash "$OUT/forge-recreate.sh"; }
 sleep 20 && docker ps --format '{{.Names}}\t{{.Status}}' | grep forge-prod
 ```
 
@@ -255,8 +296,14 @@ echo "health=$s"; [ "$s" = "healthy" ] && echo PASS || echo "FAIL — see the no
 > `docker inspect forge:latest --format '{{json .Config.Healthcheck.Test}}'` — **they differ, and
 > that difference is the whole point of Phase 1.**
 >
-> Owed upstream fix: the image's healthcheck should read `${FORGE_HEALTHZ_PORT:-8080}` so it
-> survives a recreate without an override. Until then, G1 protects it.
+> **FIXED 2026-09-05 — this trap no longer exists.** Commit `907ac58` changed the image's health
+> check to read `${FORGE_HEALTHZ_PORT:-8080}`, so it now survives a recreate without an override.
+> Verified: the live image and the running container both carry the port-aware form, and the
+> committed recreate script deliberately passes **no** health-check override because it no longer
+> needs one.
+>
+> The gate stays, because "healthy, not merely up" is worth asserting on every deploy whatever the
+> cause. The history is kept because it explains why Phase 1 captures the health check at all.
 
 **GATE G5 — the endpoint answers.**
 
@@ -325,19 +372,36 @@ eight gate results, and anything Phase 0 recon flagged. **Never the environment 
 
 ```bash
 docker tag forge:rollback-<YYYYMMDD>-pre-<thing> forge:latest
-docker stop forge-prod && docker rm forge-prod
-bash "$OUT/forge-recreate.sh"     # the SAME capture — configuration is image-independent
+bash ops/forge-prod-recreate.sh   # gates the estate, reads the settings, image-independent
 ```
+
+The recreate script is image-independent — it carries the container's configuration, not the
+image's — so rolling back is a tag swap plus a recreate. **The estate gate applies to a rollback
+exactly as it does to a deploy**; if a build is in flight, the rollback waits.
 
 Then re-run G4, G5, G7, G8. The recreate script is reusable because it carries the container's
 configuration, not the image's — which is why Phase 1 is worth its own phase.
 
 ## Appendix B: If the container is already gone
 
-Phase 1 cannot capture what is not running. Rebuild the recreate script from the PINS block plus a
-previous `forge-prod-inspect-*.json` under `~/forge-deploy-receipts`. **If neither exists, the
-environment values are lost** and must be reconstructed from the operator's own records — which is
-the failure mode this runbook exists to prevent.
+Phase 1 cannot capture what is not running — but since 2026-09-03 it does not need to.
+`ops/forge-prod-recreate.sh` plus the sops settings file reconstruct the container from nothing:
 
-**Owed follow-up:** forge's run configuration should be a committed compose file or script. Today
-its only copy is the running container and whatever this runbook captured.
+```bash
+bash ops/forge-prod-recreate.sh
+```
+
+Only if the settings file itself is also gone do you fall back to a previous
+`forge-prod-inspect-*.json` under `~/forge-deploy-receipts`, and only then are values at risk.
+
+---
+
+## Both follow-ups this runbook owed are DONE
+
+| Owed | Done | Evidence |
+|---|---|---|
+| The image's health check should read the port variable so it survives a recreate without an override | **2026-09-05** | commit `907ac58`; live image and container both carry `${FORGE_HEALTHZ_PORT:-8080}` |
+| Forge's run configuration should be a committed file, not only the running container | **2026-09-03** | `ops/forge-prod-recreate.sh` + sops settings of record; first real use 2026-09-04, healthy |
+
+Nothing is outstanding. This section stays so the next reader can see the loop closed rather than
+wonder whether it ever was.
