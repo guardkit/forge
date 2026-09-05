@@ -572,6 +572,33 @@ def _card_assumptions(card: Mapping[str, Any] | None) -> list[tuple[str, str]]:
     return out
 
 
+def _card_sign_in_check(card: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """The sign-in question a digest card carries, or ``None`` when it carries none.
+
+    This block is a QUESTION the reader answers with the same tap that
+    approves the spec, so a rewrite that made it appear or vanish changed what
+    the person is being asked — even when every sentence in the list is word
+    for word what it was.
+    """
+    block = (card or {}).get("sign_in_check")
+    return block if isinstance(block, Mapping) else None
+
+
+def _sign_in_change_phrase(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> str:
+    """How the sign-in question changed between two cards; "" when it did not."""
+    before = _card_sign_in_check(previous)
+    after = _card_sign_in_check(current)
+    if before == after:
+        return ""
+    if before is None:
+        return "the sign-in question was added"
+    if after is None:
+        return "the sign-in question is gone"
+    return "the sign-in question changed"
+
+
 def _list_change_phrases(
     before: list[Any], after: list[Any], *, singular: str, plural: str
 ) -> list[str]:
@@ -622,16 +649,32 @@ def _plain_card_changes(
         plural="assumptions",
     )
     parts = [", ".join(group) for group in (examples, assumptions) if group]
+    # The sign-in question is part of what the card asks, so a rewrite that
+    # added or dropped it is a change the reader is told about (coach finding,
+    # 2026-09-05: without this a sign-in-only rewrite was called "the same
+    # list").
+    sign_in = _sign_in_change_phrase(previous, current)
+    if sign_in:
+        parts.append(sign_in)
     return "; ".join(parts)
 
 
 def _cards_say_the_same_thing(
     previous: Mapping[str, Any], current: Mapping[str, Any]
 ) -> bool:
-    """True when a rewrite came back with the same list the owner just rejected."""
-    return _card_sentences(previous) == _card_sentences(current) and _card_assumptions(
-        previous
-    ) == _card_assumptions(current)
+    """True when a rewrite came back with the same list the owner just rejected.
+
+    "The same" means the whole of what the reader is asked: the sentences, the
+    assumptions, AND the sign-in question, which is answered by the same tap.
+    A rewrite whose only visible change was that question appearing or
+    disappearing used to be reported as the same list (coach finding,
+    2026-09-05).
+    """
+    return (
+        _card_sentences(previous) == _card_sentences(current)
+        and _card_assumptions(previous) == _card_assumptions(current)
+        and _card_sign_in_check(previous) == _card_sign_in_check(current)
+    )
 
 
 #: What the card says when the rewrite changed nothing the owner can see. The
@@ -1550,7 +1593,7 @@ class PlanningRunDriver:
                 await self._notify(
                     correlation_id,
                     f"Planning run {correlation_id} was rejected by "
-                    f"{response.decided_by}.",
+                    f"{_person_words(_responder_display_name(response))}.",
                     level="warning",
                 )
                 return "cancelled"
@@ -2731,7 +2774,7 @@ class PlanningRunDriver:
                     # to stop.
                     await self._notify(
                         correlation_id,
-                        f"Planning run {correlation_id}: {_person_words(answer.decided_by, answer.decided_by_name)} "
+                        f"Planning run {correlation_id}: {_person_words(answer.decided_by_name)} "
                         "said yes to the spec, and did not confirm that this "
                         "feature is free of signing in. The machine will write "
                         "the task plan and then stop, so a person can register "
@@ -2742,7 +2785,7 @@ class PlanningRunDriver:
                 await self._notify(
                     correlation_id,
                     f"Planning run {correlation_id}: "
-                    f"{_person_words(answer.decided_by, answer.decided_by_name)} said yes "
+                    f"{_person_words(answer.decided_by_name)} said yes "
                     "to the spec. Writing the task plan and the quality "
                     "checklist next — nothing is built until you give the "
                     "go-ahead.",
@@ -2752,7 +2795,7 @@ class PlanningRunDriver:
                 await self._notify(
                     correlation_id,
                     f"Planning run {correlation_id}: "
-                    f"{_person_words(answer.decided_by, answer.decided_by_name)} "
+                    f"{_person_words(answer.decided_by_name)} "
                     "sent a note. Rewriting the spec from it and coming back "
                     "with a fresh list.",
                     level="info",
@@ -2774,9 +2817,10 @@ class PlanningRunDriver:
             receipt_keys=(),
             rehydrate=_rehydrate,
             decide=_decide,
-            open_message=lambda approver, wait: self._digest_door_open_message(
+            # ``_approver`` is the chat id the door routes by; the line it
+            # writes never prints one, so it is not passed on.
+            open_message=lambda _approver, wait: self._digest_door_open_message(
                 correlation_id,
-                expected_approver=approver,
                 wait_seconds=wait,
                 rewrite=draft.get("rewrite"),
             ),
@@ -2949,7 +2993,6 @@ class PlanningRunDriver:
         self,
         correlation_id: str,
         *,
-        expected_approver: str | None,
         wait_seconds: int,
         rewrite: Mapping[str, Any] | None = None,
     ) -> str:
@@ -2965,7 +3008,9 @@ class PlanningRunDriver:
             return _SAME_LIST_NOTIFICATION.format(
                 correlation_id=correlation_id, note=str(rewrite.get("note") or "")
             )
-        who = _person_words(expected_approver)
+        # No name travels this far — the door routes by a chat id, and an id is
+        # never printed — so this reads "You have a card…".
+        who = _person_words(None)
         subject, verb = ("You", "have") if who == "you" else (who, "has")
         return (
             f"Planning run {correlation_id}: the spec is written. {subject} "
@@ -4503,7 +4548,8 @@ class PlanningRunDriver:
             if answer.outcome == "confirmed":
                 await self._notify(
                     correlation_id,
-                    f"Planning run {correlation_id}: {answer.decided_by} "
+                    f"Planning run {correlation_id}: "
+                    f"{_person_words(answer.decided_by_name)} "
                     "confirmed there is no sign-in here — registering the "
                     "quality checklist as authless and carrying on with the build.",
                     level="info",
@@ -4547,8 +4593,10 @@ class PlanningRunDriver:
             receipt_keys=("basis_lines",),
             rehydrate=_rehydrate,
             decide=_decide,
-            open_message=lambda approver, wait: self._auth_door_open_message(
-                correlation_id, expected_approver=approver, wait_seconds=wait
+            # ``_approver`` is the chat id the door routes by; the line it
+            # writes never prints one, so it is not passed on.
+            open_message=lambda _approver, wait: self._auth_door_open_message(
+                correlation_id, wait_seconds=wait
             ),
             log_noun="auth-surface confirmation door",
             on_close=_closed,
@@ -4736,17 +4784,25 @@ class PlanningRunDriver:
         return card
 
     def _auth_door_open_message(
-        self, correlation_id: str, *, expected_approver: str | None, wait_seconds: int
+        self, correlation_id: str, *, wait_seconds: int
     ) -> str:
-        """The plain-language ping that says the run is WAITING, not broken."""
-        who = expected_approver or "the run's approver"
+        """The plain-language ping that says the run is WAITING, not broken.
+
+        It takes no approver: the id this door routes by is never printed. The
+        line used to open "U03QR8WKT29 has a card to decide", which named
+        nobody (2026-09-05 defect, third door). It is the person reading it.
+        """
+        # Only an id is held here, and an id is never printed.
+        who = _person_words(None)
+        subject, verb = ("You", "have") if who == "you" else (who, "has")
         return (
             f"Planning run {correlation_id}: the spec checker flagged this "
             "feature as sitting behind a sign-in, which is often a false alarm "
             "— nothing has failed. "
-            f"{who} has a card to decide: confirm there is no sign-in and the "
-            "quality checklist registers as authless and the build carries on; "
-            "reject and the run stops so they can be registered attended. No "
+            f"{subject} {verb} a card to decide: confirm there is no sign-in "
+            "and the quality checklist registers as authless and the build "
+            "carries on; reject and the run stops so the checklist is "
+            "registered by hand. No "
             f"answer within {self._plain_wait(wait_seconds)} stops the run too."
         )
 

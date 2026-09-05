@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1824,6 +1825,11 @@ _DIGEST_TWO_REWORDED = (
 #: for a reader and must survive the raw-id sweep — reading only ``summary``
 #: is what let ``action_description`` keep saying "for U0RIGINATOR's word"
 #: while the sweep passed (coach finding, 2026-09-05).
+#: A raw chat member id as it appears in text ("U03QR8WKT29", "U0RIGINATOR").
+#: The SHAPE of one, not one particular id, so a sentence that interpolates a
+#: different member's id is caught by the same sweep.
+_RAW_CHAT_ID = re.compile(r"\bU[0-9A-Z]{8,}\b")
+
 _MACHINE_ONLY_TOP_LEVEL = frozenset({"request_id", "agent_id"})
 _MACHINE_ONLY_DETAILS = frozenset(
     {
@@ -1987,6 +1993,96 @@ async def test_an_assumption_that_changed_is_counted_too(
     assert second["what_happened"] == (
         _ROUND_ONE_TEXT + " What changed since your note: 1 assumption removed."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_only_dropped_the_sign_in_question_is_a_change(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The sign-in question is part of what the card ASKS — it is answered by
+    the same tap — so a rewrite whose only visible change is that question
+    disappearing is a change, not "the same list" (coach finding, 2026-09-05).
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED), _spec_reply(seed=_AUTHLESS_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    cards = _digest_cards(h)
+    first, second = (c.payload["details"]["summary"] for c in cards)
+    # Every sentence and every assumption is word for word what it was...
+    assert first["what_it_will_do"] == second["what_it_will_do"]
+    assert first["what_the_machine_assumed"] == second["what_the_machine_assumed"]
+    # ...and the question is gone, so the card says so rather than "same list".
+    assert "sign_in_check" in first and "sign_in_check" not in second
+    assert second["what_happened"] == (
+        _ROUND_ONE_TEXT + " What changed since your note: the sign-in question "
+        "is gone."
+    )
+    said = " ".join(m for _c, m, _l in h.ctx["notifications"])
+    assert "same list" not in said
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_only_added_the_sign_in_question_is_a_change(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The other direction: a question that was not there before is a change."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTHLESS_SEED), _spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    first, second = (
+        c.payload["details"]["summary"] for c in _digest_cards(h)
+    )
+    assert first["what_it_will_do"] == second["what_it_will_do"]
+    assert "sign_in_check" not in first and "sign_in_check" in second
+    assert second["what_happened"] == (
+        _ROUND_ONE_TEXT + " What changed since your note: the sign-in question "
+        "was added."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_line_this_door_sends_carries_a_chat_id(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The grep: every line the door sent a person, swept for a raw member id.
+
+    ``ORIGINATOR`` is one particular id; this is the shape of ALL of them, so a
+    new sentence that interpolates a different one is caught too.
+    """
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[_spec_reply(seed=_AUTH_SEED), _spec_reply(seed=_AUTH_SEED)],
+    )
+
+    await h.driver.drive(CID)
+
+    assert h.ctx["notifications"], "the run sent nobody anything"
+    for _cid, message, _level in h.ctx["notifications"]:
+        found = _RAW_CHAT_ID.findall(message)
+        assert not found, f"raw chat id {found} in a line a person reads: {message}"
+    for card in _digest_cards(h):
+        found = _RAW_CHAT_ID.findall(_card_text(card))
+        assert not found, f"raw chat id {found} on a card a person reads"
 
 
 @pytest.mark.asyncio

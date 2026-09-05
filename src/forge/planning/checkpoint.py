@@ -70,7 +70,7 @@ __all__ = [
     "SecondOpinionProvider",
 ]
 
-def _person_words(identity: str | None, display_name: str | None = None) -> str:
+def _person_words(display_name: str | None) -> str:
     """The person, in words a reader recognises — never a raw chat id.
 
     A card and its notifications are read by the person who was asked, and on
@@ -79,10 +79,16 @@ def _person_words(identity: str | None, display_name: str | None = None) -> str:
     it is the only identity the approval payload carries today (``decided_by``
     and the run's ``expected_approver`` are both that id).
 
-    So: a display name if one ever travels with the answer, and otherwise the
-    word "you" — the person reading the line IS the person who was asked, since
-    the card is threaded to them. The raw id never reaches a sentence a person
-    reads; it stays on the durable row, where it belongs.
+    So the ONLY argument is the display name: the words a person is called,
+    when any travelled with the answer. There is deliberately no parameter for
+    the id — an earlier version took one and never read it, which is an
+    invitation to pass the id and expect it to be printed. Callers that hold
+    only an id pass ``None``.
+
+    With no name, the answer is the word "you": the person reading the line IS
+    the person who was asked, since the card is threaded to them. The raw id
+    never reaches a sentence a person reads; it stays on the durable row, where
+    it belongs.
 
     This lives here, beside the envelope builder, because the card copy that
     builder writes needs it too — the id was still on ``action_description``
@@ -94,11 +100,9 @@ def _person_words(identity: str | None, display_name: str | None = None) -> str:
     return "you"
 
 
-def _person_possessive_words(
-    identity: str | None, display_name: str | None = None
-) -> str:
+def _person_possessive_words(display_name: str | None) -> str:
     """The same person, in the possessive — "your word" / "Rich's word"."""
-    words = _person_words(identity, display_name)
+    words = _person_words(display_name)
     return "your" if words == "you" else f"{words}'s"
 
 
@@ -424,7 +428,9 @@ def build_planning_approval_envelope(
         # every machine that consumes it.
         action_description=(
             f"The full journey is waiting at {plain_stage_name(stage_label)} "
-            f"for {_person_possessive_words(expected_approver)} word "
+            # No display name travels with ``expected_approver`` — it is the
+            # chat id — so this reads "your word", never the id.
+            f"for {_person_possessive_words(None)} word "
             f"(planning run {plan_run_id})."
         ),
         risk_level="medium",
