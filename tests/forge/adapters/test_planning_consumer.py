@@ -25,7 +25,7 @@ from forge.adapters.nats.planning_consumer import (
     PlanningConsumerDeps,
     handle_planning_message,
 )
-from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -826,14 +826,13 @@ class TestOnRecordedCallback:
 
 
 class TestNamedTargetRepository:
-    """A sentence may name the repository; an unknown name is refused.
+    """A sentence may name the repository; a name that will not resolve is
+    refused out loud.
 
-    NOTE on coverage: the wire payload's own validator (nats-core
-    ``PlanningQueuedPayload._validate_target_repo``) accepts only ``org/name``,
-    so a SHORT name never reaches this consumer today. The short-name half of
-    rule 3 is therefore proved directly against the resolver in
-    ``tests/forge/planning/test_target_repos.py``, and this class proves what
-    the wire can carry.
+    Both shapes a person may type arrive here: the short name and the full
+    ``org/name`` key. (The wire validator was widened for exactly that — a
+    short name refused at the wire would be dropped with no reply at all,
+    which is the one outcome the intake never allows.)
     """
 
     @staticmethod
@@ -894,6 +893,163 @@ class TestNamedTargetRepository:
                 CORRELATION_ID,
                 "I don't know a repository called elsewhere/nowhere. "
                 "I can build in: guardkit/api_test, appmilla/study-tutor.",
+            )
+        ]
+        assert kicked == [], "a refused sentence must start no planning leg"
+        msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_short_name_resolves_to_its_configuration_key(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """The short name a person types reaches the resolver and resolves.
+
+        The row records the CONFIGURATION KEY, which is what every later leg
+        looks up — not the short name that arrived.
+        """
+        notifications: list[tuple[str, str]] = []
+        kicked: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            kicked.append(correlation_id)
+
+        deps = self._deps_with_paths(
+            store,
+            {
+                "guardkit/study-tutor": "/srv/repos/study-tutor",
+                "appmilla_github/study-tutor": "/srv/repos/study-tutor",
+            },
+            notifications,
+            on_recorded=on_recorded,
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("study-tutor")))
+        await handle_planning_message(msg, deps)
+
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None
+        assert run["state"] == "QUEUED"
+        assert run["target_repo"] == "guardkit/study-tutor"
+        assert notifications == []
+        assert kicked == [CORRELATION_ID]
+
+    @pytest.mark.asyncio
+    async def test_unknown_short_name_is_refused_with_allowed_names(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """``target: nowhere`` gets the refusal, not a silent loss."""
+        notifications: list[tuple[str, str]] = []
+        deps = self._deps_with_paths(
+            store,
+            {"guardkit/api_test": "/srv/repos/api_test"},
+            notifications,
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("nowhere")))
+        await handle_planning_message(msg, deps)
+
+        run = store.get_run(CORRELATION_ID)
+        assert run is not None
+        assert run["state"] == "FAILED"
+        assert notifications == [
+            (
+                CORRELATION_ID,
+                "I don't know a repository called nowhere. "
+                "I can build in: guardkit/api_test.",
+            )
+        ]
+        msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_short_name_asks_which_one(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """Two checkouts share the short name: the forge asks, it does not
+        claim never to have heard of a name it knows twice over."""
+        notifications: list[tuple[str, str]] = []
+        deps = self._deps_with_paths(
+            store,
+            {
+                "guardkit/api_test": "/srv/repos/guardkit-api_test",
+                "appmilla/api_test": "/srv/repos/appmilla-api_test",
+            },
+            notifications,
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("api_test")))
+        await handle_planning_message(msg, deps)
+
+        assert store.get_run(CORRELATION_ID)["state"] == "FAILED"
+        assert notifications == [
+            (
+                CORRELATION_ID,
+                "More than one repository is called api_test. Say which one "
+                "you mean: guardkit/api_test, appmilla/api_test.",
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_recorded_as_the_intakes_not_the_drivers(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """A refusal at the door must not read later as a driver failure."""
+        notifications: list[tuple[str, str]] = []
+        deps = self._deps_with_paths(
+            store, {"guardkit/api_test": "/srv/repos/api_test"}, notifications
+        )
+
+        msg = _make_msg(_envelope_bytes(self._payload("nowhere")))
+        await handle_planning_message(msg, deps)
+
+        actors = [
+            row["actor_identity"]
+            for row in store._connection.execute(
+                "SELECT actor_identity FROM planning_run_events "
+                "WHERE correlation_id = ? AND stage_label = ?",
+                (CORRELATION_ID, "planning-intake"),
+            )
+        ]
+        assert actors, "the refusal is written to the event log"
+        assert set(actors) == {"planning-intake"}
+        assert "planning-driver" not in actors
+
+    @pytest.mark.asyncio
+    async def test_a_refused_transition_still_tells_the_sender(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """If the row cannot be moved to be failed, nobody is left in silence.
+
+        The run stays as it is and no leg is kicked — but the person who
+        asked is told their name was refused, and the message is acked.
+        """
+        notifications: list[tuple[str, str]] = []
+        kicked: list[str] = []
+
+        async def on_recorded(correlation_id: str) -> None:
+            kicked.append(correlation_id)
+
+        deps = self._deps_with_paths(
+            store,
+            {"guardkit/api_test": "/srv/repos/api_test"},
+            notifications,
+            on_recorded=on_recorded,
+        )
+
+        def refuse(**kwargs: Any) -> TransitionRefused:
+            return TransitionRefused(
+                current_state="CANCELLED", requested_state=str(kwargs["to_state"])
+            )
+
+        store.transition = refuse  # type: ignore[method-assign]
+
+        msg = _make_msg(_envelope_bytes(self._payload("nowhere")))
+        await handle_planning_message(msg, deps)
+
+        assert notifications == [
+            (
+                CORRELATION_ID,
+                "I don't know a repository called nowhere. "
+                "I can build in: guardkit/api_test.",
             )
         ]
         assert kicked == [], "a refused sentence must start no planning leg"

@@ -879,3 +879,34 @@ class TestRepositoryIsNamedOutLoud:
         assert (
             "known repos: guardkit/api_test, appmilla/study-tutor" in run["error"]
         )
+
+    @pytest.mark.asyncio
+    async def test_a_driver_failure_is_still_recorded_as_the_drivers(
+        self, store: SqlitePlanningRunStore
+    ) -> None:
+        """The intake names itself; the driver keeps its own name.
+
+        Both end a run through one piece of code, so the durable row is the
+        only thing that says which of them did it.
+        """
+        _queue_run(store)
+        store.transition(
+            correlation_id=CID,
+            to_state=PlanningState.RUNNING,
+            actor_identity="test",
+        )
+        driver, _ = _make_driver(store, config=self._config())
+
+        await driver._resolve_repo(
+            {"target_repo": "elsewhere/nowhere"}, CID, stage_label="feature-spec"
+        )
+
+        actors = [
+            row["actor_identity"]
+            for row in store._connection.execute(
+                "SELECT actor_identity FROM planning_run_events "
+                "WHERE correlation_id = ? AND stage_label = ?",
+                (CID, "feature-spec"),
+            )
+        ]
+        assert actors == ["planning-driver"]

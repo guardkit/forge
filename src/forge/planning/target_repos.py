@@ -5,7 +5,9 @@ a person types is short ("study-tutor"); the configuration key is long
 ("guardkit/study-tutor"), and two keys sometimes point at the SAME checkout
 (the same repo under two org names). This module is the single place that
 turns a typed name into a configuration key, and the single place that
-writes the list of names a person is allowed to type.
+writes what a person is told when it will not resolve: the names they may
+type when the forge has never heard of the name, and a question when the
+name fits more than one checkout and the forge cannot choose.
 
 Both are needed in three places — the intake consumer (refuse an unknown
 name before any leg runs), the chain driver and the handoff handler (name
@@ -23,8 +25,10 @@ from typing import Mapping
 
 __all__ = [
     "RepoResolution",
+    "ambiguous_repo_message",
     "format_known_repos",
     "known_repo_names",
+    "refusal_message",
     "resolve_target_repo",
     "unknown_repo_message",
 ]
@@ -39,10 +43,16 @@ class RepoResolution:
             be resolved.
         reason: The machine reason for the durable row when ``name`` is
             None; empty when the name resolved.
+        matches: The configuration keys the name matched when it matched
+            more than one checkout — empty in every other outcome. A name
+            with matches is one the forge KNOWS and cannot choose between,
+            which is a different thing to say to a person than a name it
+            has never heard of.
     """
 
     name: str | None
     reason: str = ""
+    matches: tuple[str, ...] = ()
 
 
 def _basename(key: str) -> str:
@@ -87,6 +97,28 @@ def unknown_repo_message(name: str, target_repo_paths: Mapping[str, str]) -> str
     )
 
 
+def ambiguous_repo_message(name: str, matches: tuple[str, ...]) -> str:
+    """What a person is told when the name fits more than one checkout.
+
+    Saying "I don't know a repository called api_test" and then listing two
+    of them would not be true: the forge knows both and cannot choose. It
+    asks instead.
+    """
+    return (
+        f"More than one repository is called {name}. "
+        f"Say which one you mean: {', '.join(matches)}."
+    )
+
+
+def refusal_message(
+    name: str, resolution: RepoResolution, target_repo_paths: Mapping[str, str]
+) -> str:
+    """The sentence for whichever way a name failed to resolve."""
+    if resolution.matches:
+        return ambiguous_repo_message(name, resolution.matches)
+    return unknown_repo_message(name, target_repo_paths)
+
+
 def resolve_target_repo(
     name: str, target_repo_paths: Mapping[str, str]
 ) -> RepoResolution:
@@ -123,4 +155,5 @@ def resolve_target_repo(
             f"ambiguous target repository {name}: "
             f"{', '.join(matches)} are different checkouts"
         ),
+        matches=tuple(matches),
     )
