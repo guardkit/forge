@@ -41,7 +41,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import click
 import yaml
@@ -364,11 +364,55 @@ def _run_guardkit_init(repo: Path, template: str) -> subprocess.CompletedProcess
     )
 
 
-def _discover_test_roots(repo: Path) -> list[str]:
-    """Forge's own ``discover_target_test_roots`` (``target_terminal_tools.py:487``)."""
-    from forge.planning.target_terminal_tools import discover_target_test_roots
+#: Directory names that are never test roots, guardkit's own list verbatim
+#: (``installer/core/commands/lib/smoke_gates_nudge.py:32``).
+_TEST_ROOT_SKIP_NAMES = frozenset({"__pycache__", ".pytest_cache", "node_modules"})
 
-    return list(discover_target_test_roots(repo))
+
+def _shallow_test_roots(repo: Path) -> list[str]:
+    """``tests/<name>`` for every immediate subdirectory of ``tests/``.
+
+    guardkit's own rule, rewritten here rather than imported: one level deep,
+    directories only, skipping names that begin with a dot and the three cache
+    and build directories guardkit skips, sorted
+    (``smoke_gates_nudge.py:40-82``). It is used only when guardkit is not
+    importable, which is the ordinary case on the surface Rich runs this
+    command from: forge's venv carries the guardkit CLI on PATH, not the
+    guardkit package.
+    """
+    tests_dir = Path(repo) / "tests"
+    if not tests_dir.is_dir():
+        return []
+    try:
+        return sorted(
+            f"tests/{child.name}"
+            for child in tests_dir.iterdir()
+            if child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in _TEST_ROOT_SKIP_NAMES
+        )
+    except OSError:
+        return []
+
+
+def _discover_test_roots(repo: Path) -> list[str]:
+    """Forge's own ``discover_target_test_roots`` (``target_terminal_tools.py:487``).
+
+    That function imports guardkit's discovery and raises
+    ``TargetTestRootsUnresolved`` when guardkit is not importable — which is
+    what happens every time this command is run the way the spec says Rich runs
+    it, from the forge checkout, whose venv has the guardkit CLI on PATH but no
+    guardkit package. Reporting "not available here" there would be useless to
+    the reader, so the plain directory scan above answers instead: it is the
+    same rule guardkit applies, and it gives the same answer for the shapes
+    this check exists to catch.
+    """
+    try:
+        from forge.planning.target_terminal_tools import discover_target_test_roots
+
+        return list(discover_target_test_roots(repo))
+    except Exception:  # noqa: BLE001 — no guardkit here; scan the tree instead
+        return _shallow_test_roots(repo)
 
 
 def _estate_status_views() -> list[Any]:
@@ -592,7 +636,18 @@ def register_repo_cmd(
     ctx = click.get_current_context()
     steps: list[Step] = []
 
+    #: Undo actions for everything already written, newest first. A refusal is
+    #: "nothing was registered", so it must also be "nothing was left changed":
+    #: the repository's config goes back to what it said and the dated backup,
+    #: now standing behind no change at all, is removed.
+    rollbacks: list[Callable[[], None]] = []
+
     def refuse(step: str, detail: str) -> None:
+        for undo in reversed(rollbacks):
+            try:
+                undo()
+            except OSError:  # pragma: no cover — a failed undo must not mask why
+                pass
         steps.append(Step(step, "refused", detail))
         _emit(steps, as_json=as_json)
         raise click.ClickException(detail)
@@ -655,6 +710,38 @@ def register_repo_cmd(
             "--toolchain-test 'the command that runs the tests'; without it the "
             "merge-ready gate has nothing to run",
         )
+
+    # ---- rule 4, first half: measure what forge.yaml needs and take the dated
+    # backup. This happens HERE, before the guardkit scaffold and before the
+    # repository's own config is written, because the spec says the backup is
+    # taken before the first mutation and the repository-side write is the
+    # first mutation. (The guardkit scaffold, when one is created, is left in
+    # place on a refusal: deleting a whole scaffold is a bigger act than the
+    # one that failed. Everything else undoes.)
+    original_text = config_path.read_text(encoding="utf-8")
+    lines = _split_lines(original_text)
+
+    allowlist = [
+        str(Path(entry).expanduser())
+        for entry in getattr(
+            getattr(getattr(config, "permissions", None), "filesystem", None),
+            "allowlist",
+            [],
+        )
+        or []
+    ]
+    allowlist_needed = str(repo) not in allowlist
+    map_needed = [key for key in map_keys if key not in existing_map]
+
+    if not allowlist_needed and not map_needed:
+        backup_step = Step("backup", "unchanged", "nothing to change, no backup taken")
+    elif dry_run:
+        backup_step = Step("backup", "would-add", _backup_path(config_path, name).name)
+    else:
+        backup_file = _backup_path(config_path, name)
+        backup_file.write_text(original_text, encoding="utf-8")
+        rollbacks.append(lambda: backup_file.unlink(missing_ok=True))
+        backup_step = Step("backup", "ok", backup_file.name)
 
     # ---- rule 3: the checks that warn and carry on
     remote = _git_remote(repo)
@@ -726,23 +813,34 @@ def register_repo_cmd(
 
     if repo_changed and not dry_run:
         repo_config.parent.mkdir(parents=True, exist_ok=True)
+        existed_before = repo_config.is_file()
+        previous_text = repo_text if existed_before else None
         text = _join_lines(repo_lines)
         if text and not text.endswith("\n"):
             text += "\n"
         repo_config.write_text(text, encoding="utf-8")
+
+        def _restore_repo_config(
+            path: Path = repo_config, previous: str | None = previous_text
+        ) -> None:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(previous, encoding="utf-8")
+
+        rollbacks.append(_restore_repo_config)
 
     steps.append(Step("project-id", "ok", identifier))
 
     # ---- rule 6: what the repository has and lacks
     try:
         roots = _discover_test_roots(repo)
-    except Exception:  # noqa: BLE001 — a discovery failure is a warn, not a stop
+    except Exception as exc:  # noqa: BLE001 — a failure here warns, never stops
         steps.append(
             Step(
                 "test-roots",
                 "warn",
-                "guardkit's test-root discovery is not available here, so the "
-                "repository's test roots could not be listed",
+                f"the repository's test roots could not be listed ({exc})",
             )
         )
     else:
@@ -772,30 +870,9 @@ def register_repo_cmd(
         else:
             steps.append(Step(step_name, "warn", missing_sentence))
 
-    # ---- rule 4: the forge config, by surgical line insertion
-    original_text = config_path.read_text(encoding="utf-8")
-    lines = _split_lines(original_text)
-
-    allowlist = [
-        str(Path(entry).expanduser())
-        for entry in getattr(
-            getattr(getattr(config, "permissions", None), "filesystem", None),
-            "allowlist",
-            [],
-        )
-        or []
-    ]
-    allowlist_needed = str(repo) not in allowlist
-    map_needed = [key for key in map_keys if key not in existing_map]
-
-    if not allowlist_needed and not map_needed:
-        steps.append(Step("backup", "unchanged", "nothing to change, no backup taken"))
-    elif dry_run:
-        steps.append(Step("backup", "would-add", _backup_path(config_path, name).name))
-    else:
-        backup = _backup_path(config_path, name)
-        backup.write_text(original_text, encoding="utf-8")
-        steps.append(Step("backup", "ok", backup.name))
+    # ---- rule 4, second half: the forge config, by surgical line insertion.
+    # The file was read and the backup taken above, before the first mutation.
+    steps.append(backup_step)
 
     allowlist_status = (
         "unchanged" if not allowlist_needed else ("would-add" if dry_run else "added")
@@ -849,7 +926,8 @@ def register_repo_cmd(
             steps.append(Step("estate", "ok", "all builds terminal"))
         else:
             waiting = sum(1 for v in views if not _all_terminal([v]))
-            steps.append(Step("estate", "wait", f"{waiting} builds not terminal"))
+            subject = "build is" if waiting == 1 else "builds are"
+            steps.append(Step("estate", "wait", f"{waiting} {subject} not terminal"))
 
     _emit(steps, as_json=as_json, tail=_tail(name))
 
@@ -874,9 +952,10 @@ def _backup_path(config_path: Path, name: str) -> Path:
 def _write_toolchain_block(lines: list[str], command: str, timeout: int) -> list[str]:
     """Add ``test:`` to the repository's toolchain declaration without overwriting.
 
-    When there is no ``toolchain:`` key the minimal block is appended whole; when
-    there is one that simply has no ``test:``, the two lines are inserted into
-    it. Nothing that is already declared is rewritten.
+    When there is no ``toolchain:`` key the minimal block is appended whole.
+    When there is one that simply has no ``test:``, only the keys the block does
+    not already declare are inserted into it. Nothing that is already declared
+    is rewritten, and no key is ever written twice.
     """
     lines = list(lines)
     if locate(lines, ("toolchain",)) is None:
@@ -886,8 +965,16 @@ def _write_toolchain_block(lines: list[str], command: str, timeout: int) -> list
             lines.append("")
         lines.extend(["toolchain:", f"  test: {command}", f"  test_timeout: {timeout}"])
         return lines
+    # The block is there but declares no ``test``. Insert that — and insert
+    # ``test_timeout`` ONLY when the block declares none. Writing it
+    # unconditionally appends a SECOND ``test_timeout:`` beside the
+    # repository's own; PyYAML takes the last key, so a repository that had
+    # declared 900 would silently be run at 300, and stricter parsers reject a
+    # file carrying duplicate keys at all. Never overwrite a declaration.
+    declares_timeout = locate(lines, ("toolchain", "test_timeout")) is not None
     set_mapping_entry(lines, ("toolchain",), "test", command)
-    set_mapping_entry(lines, ("toolchain",), "test_timeout", str(timeout))
+    if not declares_timeout:
+        set_mapping_entry(lines, ("toolchain",), "test_timeout", str(timeout))
     return lines
 
 
