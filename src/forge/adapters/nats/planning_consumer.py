@@ -27,8 +27,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 from nats_core.envelope import MessageEnvelope
 from nats_core.events import PlanningQueuedPayload
@@ -45,6 +45,12 @@ from forge.planning.target_repos import (
     refusal_message,
     resolve_target_repo,
 )
+from forge.planning.work_queue_commands import (
+    execute_command,
+    notifier_takes_parent_request_id,
+    queued_reply,
+)
+from forge.planning.work_queue_store import KINDS, WorkQueueStore
 
 logger = logging.getLogger(__name__)
 
@@ -202,12 +208,32 @@ class PlanningConsumerDeps:
             default) means no resolution is attempted and the payload's
             repository name is recorded as it arrives — the behaviour before
             names could be typed.
+        queue_store: The work queue (Lane B stage one). When present, a
+            sentence that passes the gates becomes a ``work_queue`` row and
+            NO planning run — the take-next loop creates the run later, with
+            the sentence's original correlation id — and a message carrying a
+            ``queue_command`` is executed against the queue and answered in
+            the thread. None (the default) is the behaviour before the queue
+            existed: the sentence becomes a planning run here and now.
     """
 
     store: SqlitePlanningRunStore
     publish_notification: PublishNotification | None = None
     on_recorded: Callable[[str], Awaitable[None]] | None = None
     planning_config: Any | None = None
+    queue_store: WorkQueueStore | None = None
+
+    #: Whether ``publish_notification`` can be told which conversation to
+    #: answer in. Read from the callable once, here, when the consumer is
+    #: wired up — never by calling it and catching the complaint.
+    notifier_takes_thread: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "notifier_takes_thread",
+            notifier_takes_parent_request_id(self.publish_notification),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -216,19 +242,208 @@ class PlanningConsumerDeps:
 
 
 async def _notify_best_effort(
-    deps: PlanningConsumerDeps, correlation_id: str, message: str
+    deps: PlanningConsumerDeps,
+    correlation_id: str,
+    message: str,
+    *,
+    parent_request_id: str | None = None,
 ) -> None:
-    """Send one sentence to whoever asked; never let it block the ack."""
+    """Send one sentence to whoever asked; never let it block the ack.
+
+    ``parent_request_id`` is the conversation the message arrived in. The
+    notifier normally reads that thread off the planning run row, and a queued
+    sentence has no planning run yet — so the queue replies hand it over
+    directly. Whether this notifier takes the argument was settled when the
+    consumer was wired up; a notifier that does not (an older callable, a test
+    double) gets the two-argument call.
+    """
     if deps.publish_notification is None:
         return
     try:
-        await deps.publish_notification(correlation_id, message)
+        if parent_request_id is None or not deps.notifier_takes_thread:
+            await deps.publish_notification(correlation_id, message)
+        else:
+            await deps.publish_notification(  # type: ignore[call-arg]
+                correlation_id, message, parent_request_id=parent_request_id
+            )
     except Exception as exc:  # noqa: BLE001 — a notification never blocks the ack
         logger.warning(
             "planning_consumer: publish_notification raised (%s) for "
             "correlation_id=%s; continuing",
             exc,
             correlation_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Creating the planning run (the queue's admission calls this)
+# ---------------------------------------------------------------------------
+
+
+async def create_and_start_planning_run(
+    deps: PlanningConsumerDeps,
+    *,
+    correlation_id: str,
+    request_text: str,
+    originating_user: str,
+    triggered_by: str,
+    originating_adapter: str | None = None,
+    parent_request_id: str | None = None,
+    target_repo: str | None = None,
+) -> DuplicateRun | None:
+    """Record a planning run and start the chain — the intake's own two steps.
+
+    This is exactly what the intake does for an accepted sentence today
+    (``store.record_queued`` then the driver kick), lifted into a function so
+    the take-next loop can admit a queued row by calling it with the row's
+    ORIGINAL correlation id. Nothing is re-published and no new id is minted,
+    which is what keeps the Slack thread and every downstream receipt working.
+
+    Returns the store's duplicate sentinel when the correlation id already has
+    a run, or None when a fresh run was recorded. A terminal duplicate is NOT
+    re-kicked: that run is over.
+    """
+    result = deps.store.record_queued(
+        correlation_id=correlation_id,
+        originating_user=originating_user,
+        expected_approver=originating_user,
+        request_text=request_text,
+        triggered_by=triggered_by,
+        originating_adapter=originating_adapter,
+        parent_request_id=parent_request_id,
+        target_repo=target_repo,
+    )
+    if isinstance(result, DuplicateRun) and result.is_terminal:
+        return result
+    await _kick_driver(deps, correlation_id, context="queue admission")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# The queue takes the sentence (contract 5)
+# ---------------------------------------------------------------------------
+
+
+def _kind_from(payload: Any) -> str:
+    """The kind a sentence carries — ``feature`` unless jarvis said otherwise."""
+    extras = getattr(payload, "model_extra", None) or {}
+    kind = str(extras.get("kind") or "feature")
+    return kind if kind in KINDS else "feature"
+
+
+def _queue_command_from(payload: Any) -> Mapping[str, Any] | None:
+    """The forwarded command, or None when the message is a plain sentence."""
+    extras = getattr(payload, "model_extra", None) or {}
+    command = extras.get("queue_command")
+    return command if isinstance(command, Mapping) else None
+
+
+async def _handle_with_queue(
+    msg: _MsgLike,
+    deps: PlanningConsumerDeps,
+    payload: Any,
+    recorded_repo: str | None,
+) -> None:
+    """File the sentence, or run the command, and say one line back.
+
+    Two outcomes, and neither starts a planning run:
+
+    - a **command** is executed against the queue and answered in the thread;
+      a command that fails is acked and logged, because a person can simply
+      type it again and a redelivery loop would say the same broken thing
+      forever;
+    - a **sentence** becomes one QUEUED row under its own correlation id and
+      is answered once. Filing is idempotent, so a redelivered message adds no
+      second row and says nothing a second time. A store failure is NOT acked
+      — the sentence must not be lost.
+    """
+    queue_store = deps.queue_store
+    assert queue_store is not None  # guarded by the caller
+    correlation_id = payload.correlation_id
+    identity = payload.originating_user
+    kind = _kind_from(payload)
+    command = _queue_command_from(payload)
+
+    if command is not None:
+        try:
+            reply = execute_command(
+                queue_store,
+                command,
+                actor_identity=identity,
+                correlation_id=correlation_id,
+                originating_user=identity,
+                target_repo=recorded_repo,
+                kind=kind,
+            )
+        except Exception:  # noqa: BLE001 — a bad command never wedges intake
+            logger.exception(
+                "planning_consumer: queue command %r failed for "
+                "correlation_id=%s; acking and changing nothing",
+                command,
+                correlation_id,
+            )
+            await msg.ack()
+            return
+        logger.info(
+            "planning_consumer: queue command %r from %s for correlation_id=%s",
+            command.get("verb"),
+            identity,
+            correlation_id,
+        )
+        await _notify_best_effort(
+            deps,
+            correlation_id,
+            reply,
+            parent_request_id=payload.parent_request_id,
+        )
+        await msg.ack()
+        return
+
+    try:
+        filed = queue_store.file_sentence(
+            correlation_id=correlation_id,
+            sentence=payload.request_text,
+            originating_user=identity,
+            target_repo=recorded_repo,
+            kind=kind,
+            # Where it came from, kept for the take-next loop: the planning
+            # run it creates later needs the same thread anchor and trigger
+            # this message carried, or the person's Slack thread goes quiet.
+            parent_request_id=payload.parent_request_id,
+            originating_adapter=payload.originating_adapter,
+            triggered_by=payload.triggered_by,
+        )
+    except Exception as exc:  # noqa: BLE001 — never drop a sentence
+        logger.error(
+            "planning_consumer: work queue file_sentence raised (%s) for "
+            "correlation_id=%s; requesting redelivery (nak/no-ack)",
+            exc,
+            correlation_id,
+        )
+        await _nak_or_leave_unacked(msg, correlation_id)
+        return
+
+    logger.info(
+        "planning_consumer: queued #%d for correlation_id=%s (%s · %s), "
+        "%d ahead of it; no planning run yet",
+        filed.queue_id,
+        correlation_id,
+        recorded_repo,
+        kind,
+        filed.ahead,
+    )
+    await msg.ack()
+    if filed.created:
+        await _notify_best_effort(
+            deps,
+            correlation_id,
+            queued_reply(
+                queue_id=filed.queue_id,
+                target_repo=recorded_repo,
+                kind=kind,
+                ahead=filed.ahead,
+            ),
+            parent_request_id=payload.parent_request_id,
         )
 
 
@@ -274,6 +489,12 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
        No store write, no wedge.
     2. *Invalid correlation_id* → ack + log rejection (RT-03).
        No store write, no wedge.
+    2b. *A queue is wired in and the repository resolved* → the message goes
+       to the queue: a sentence becomes one QUEUED ``work_queue`` row and no
+       planning run; a forwarded ``queue_command`` is executed and answered
+       in the thread. Outcomes (3)-(5) below are then the behaviour of a
+       forge with no queue wired in, and the path an unknown repository name
+       still takes.
     3. *Duplicate non-terminal run* → ack + driver re-kick (TASK-MP-014).
        No second row, no notification; the re-kick resumes a lost-kick
        run and is deduped per-cid by the composition when a drive is
@@ -344,6 +565,17 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
         )
         if resolution.name is not None:
             recorded_repo = resolution.name
+
+    # --- 3c. The queue takes it from here (Lane B stage one, contract 5) --
+    # With a queue wired in, a sentence that passes the gates becomes a
+    # work_queue row and NOT a planning run — the take-next loop creates the
+    # run later, with this same correlation id. A message that names a
+    # repository the forge does not know still goes down the refusal path
+    # below, because that refusal is the target fix's and is unchanged.
+    unknown_repo = resolution is not None and resolution.name is None
+    if deps.queue_store is not None and not unknown_repo:
+        await _handle_with_queue(msg, deps, payload, recorded_repo)
+        return
 
     # --- 4. Record queued run (idempotent on correlation_id) -------------
     try:
@@ -485,6 +717,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
 __all__ = [
     "CORRELATION_ID_PATTERN",
     "INTAKE_ACTOR",
+    "create_and_start_planning_run",
     "UNKNOWN_REPO_STAGE_LABEL",
     "NAK_REDELIVERY_DELAY_SECONDS",
     "PLANNING_DURABLE_NAME",
