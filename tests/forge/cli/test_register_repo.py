@@ -19,11 +19,16 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from forge.cli import register_repo
 from forge.cli.main import main
 from forge.config.loader import load_config
+
+#: The real discovery seam, captured before the autouse fixture stubs it, so the
+#: fallback below can be exercised end to end.
+_REAL_DISCOVER = register_repo._discover_test_roots
 
 # A comment on nearly every block: this is what must survive the edit.
 FIXTURE_CONFIG = """\
@@ -399,6 +404,57 @@ def test_an_existing_toolchain_declaration_is_never_overwritten(_isolate, tmp_pa
     assert _status_of(result, "toolchain") == ["unchanged"]
 
 
+def test_a_toolchain_block_that_declares_only_a_timeout_keeps_that_timeout(
+    _isolate, tmp_path
+):
+    """The blocker: a block with ``test_timeout`` but no ``test``.
+
+    Writing ``test_timeout`` unconditionally appended a second key; PyYAML takes
+    the last one, so the repository's declared 900 silently became 300 and the
+    file carried a duplicate key that stricter parsers reject.
+    """
+    repo = _make_repo(
+        _isolate,
+        "bench-one",
+        toolchain="toolchain:\n  test_timeout: 900\n  lint: ruff check\n",
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--toolchain-test", "uv run pytest", "--json")
+
+    assert result.exit_code == 0, result.output
+    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
+    assert body.count("test_timeout:") == 1
+    assert "  test: uv run pytest" in body
+    assert "  lint: ruff check" in body
+    declared = yaml.safe_load(body)["toolchain"]
+    assert declared == {
+        "test": "uv run pytest",
+        "test_timeout": 900,
+        "lint": "ruff check",
+    }
+    assert _status_of(result, "toolchain") == ["added"]
+
+
+def test_a_toolchain_block_without_a_timeout_gets_the_default_once(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  lint: ruff check\n"
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--toolchain-test", "uv run pytest", "--json")
+
+    assert result.exit_code == 0, result.output
+    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
+    assert yaml.safe_load(body)["toolchain"] == {
+        "test": "uv run pytest",
+        "test_timeout": 300,
+        "lint": "ruff check",
+    }
+
+
 def test_the_minimal_toolchain_block_is_written_when_absent(_isolate, tmp_path):
     repo = _make_repo(_isolate, "bench-one", toolchain=None)
     config = _write_config(tmp_path)
@@ -485,6 +541,7 @@ def test_a_failing_guardkit_init_refuses_before_the_config_is_touched(
     assert result.exit_code == 1
     assert "guardkit init default failed" in result.output
     assert config.read_text(encoding="utf-8") == before
+    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -542,8 +599,21 @@ def test_the_estate_gate_reports_non_terminal_builds_and_still_prints_the_comman
 
     assert result.exit_code == 0, result.output
     assert "estate" in result.output
-    assert "2 builds not terminal" in result.output
+    assert "2 builds are not terminal" in result.output
     assert "run: bash ops/forge-prod-recreate.sh" in result.output
+
+
+def test_one_non_terminal_build_reads_as_a_sentence(_isolate, tmp_path, monkeypatch):
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    config = _write_config(tmp_path)
+    monkeypatch.setattr(register_repo, "_estate_status_views", lambda: ["a"])
+    monkeypatch.setattr(register_repo, "_all_terminal", lambda views: False)
+
+    result = _run(config, str(repo))
+
+    assert result.exit_code == 0, result.output
+    assert "1 build is not terminal" in result.output
+    assert "1 builds" not in result.output
 
 
 def test_an_unreadable_build_ledger_warns_rather_than_stopping(
@@ -624,3 +694,154 @@ def test_locate_walks_indentation_to_a_nested_key():
     assert block is not None
     assert lines[block.key_line].strip() == "allowlist:"
     assert block.child_indent == 4
+
+
+# ---------------------------------------------------------------------------
+# The backup really is taken before the first mutation, and a refusal undoes
+# ---------------------------------------------------------------------------
+
+
+def test_the_backup_is_taken_before_the_repository_is_touched(
+    _isolate, tmp_path, monkeypatch
+):
+    repo = _make_repo(_isolate, "bench-one", guardkit=False)
+    config = _write_config(tmp_path)
+    backup_existed_at_init: list[bool] = []
+
+    def _init(repo_arg, template):
+        backup_existed_at_init.append(
+            bool(list(tmp_path.glob("forge.yaml.bak-*-pre-register-bench-one")))
+        )
+        (repo_arg / ".guardkit").mkdir()
+        (repo_arg / ".guardkit" / "config.yaml").write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(["guardkit", "init"], 0, "", "")
+
+    monkeypatch.setattr(register_repo, "_run_guardkit_init", _init)
+
+    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
+
+    assert result.exit_code == 0, result.output
+    assert backup_existed_at_init == [True]
+
+
+def test_a_refused_yaml_edit_undoes_the_repository_write_and_the_backup(
+    _isolate, tmp_path, monkeypatch
+):
+    """A refusal is "nothing was registered", so nothing may be left changed."""
+    repo = _make_repo(_isolate, "bench-one", toolchain=None)
+    config = _write_config(tmp_path)
+    repo_config = repo / ".guardkit" / "config.yaml"
+    repo_before = repo_config.read_text(encoding="utf-8")
+    config_before = config.read_text(encoding="utf-8")
+
+    def _refuse(lines, path, value):
+        raise register_repo.YamlEditRefused(
+            "the allowlist has a value on the same line — edit the file by hand"
+        )
+
+    monkeypatch.setattr(register_repo, "append_sequence_item", _refuse)
+
+    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
+
+    assert result.exit_code == 1
+    assert "edit the file by hand" in result.output
+    assert repo_config.read_text(encoding="utf-8") == repo_before
+    assert config.read_text(encoding="utf-8") == config_before
+    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
+
+
+def test_a_refused_map_edit_undoes_a_repository_config_it_created(
+    _isolate, tmp_path, monkeypatch
+):
+    repo = _make_repo(_isolate, "bench-one", guardkit=False)
+    (repo / ".guardkit").mkdir()
+    config = _write_config(tmp_path)
+
+    def _refuse(lines, path, key, value):
+        raise register_repo.YamlEditRefused("the map cannot be edited safely")
+
+    monkeypatch.setattr(register_repo, "set_mapping_entry", _refuse)
+
+    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
+
+    assert result.exit_code == 1
+    assert not (repo / ".guardkit" / "config.yaml").exists()
+    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
+
+
+# ---------------------------------------------------------------------------
+# Test roots on the surface Rich actually runs the command from
+# ---------------------------------------------------------------------------
+
+
+def test_test_roots_fall_back_to_a_plain_scan_when_guardkit_is_absent(
+    _isolate, tmp_path, monkeypatch
+):
+    """forge's venv has the guardkit CLI, not the guardkit package.
+
+    Forge's own discovery raises there, and the report used to say the roots
+    could not be listed on every real run. The plain scan answers instead.
+    """
+    from forge.planning import target_terminal_tools
+
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    (repo / "tests" / "unit").mkdir(parents=True)
+    (repo / "tests" / "__pycache__").mkdir(parents=True)
+    (repo / "tests" / "conftest.py").write_text("", encoding="utf-8")
+    config = _write_config(tmp_path)
+
+    def _no_guardkit(path, **kwargs):
+        raise target_terminal_tools.TargetTestRootsUnresolved("no guardkit here")
+
+    monkeypatch.setattr(
+        target_terminal_tools, "discover_target_test_roots", _no_guardkit
+    )
+    monkeypatch.setattr(register_repo, "_discover_test_roots", _REAL_DISCOVER)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _status_of(result, "test-roots") == ["ok"]
+    detail = [d for step, _, d in _steps(result) if step == "test-roots"][0]
+    assert detail == "tests/smoke, tests/unit"
+
+
+def test_the_fallback_still_gives_the_spec_sentence_on_an_empty_tests_tree(
+    _isolate, tmp_path, monkeypatch
+):
+    from forge.planning import target_terminal_tools
+
+    repo = _make_repo(
+        _isolate, "bench-one", extras=False, toolchain="toolchain:\n  test: pytest\n"
+    )
+    (repo / "tests").mkdir()
+    config = _write_config(tmp_path)
+
+    def _no_guardkit(path, **kwargs):
+        raise target_terminal_tools.TargetTestRootsUnresolved("no guardkit here")
+
+    monkeypatch.setattr(
+        target_terminal_tools, "discover_target_test_roots", _no_guardkit
+    )
+    monkeypatch.setattr(register_repo, "_discover_test_roots", _REAL_DISCOVER)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    detail = [d for step, _, d in _steps(result) if step == "test-roots"][0]
+    assert detail == (
+        "tests/ holds no subdirectory, so plans that name smoke gates will "
+        "fail plan-containment; add tests/<area>/"
+    )
+
+
+def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "tests" / "unit").mkdir(parents=True)
+    (repo / "tests" / "smoke").mkdir()
+    (repo / "tests" / ".cache").mkdir()
+    (repo / "tests" / "node_modules").mkdir()
+    (repo / "tests" / "test_it.py").write_text("", encoding="utf-8")
+
+    assert register_repo._shallow_test_roots(repo) == ["tests/smoke", "tests/unit"]
+    assert register_repo._shallow_test_roots(tmp_path / "nothing") == []
