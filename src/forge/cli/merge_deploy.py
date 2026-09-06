@@ -67,13 +67,19 @@ async def _aopen_backends(
     """
     import nats  # type: ignore[import-not-found]
 
-    from forge.adapters.guardkit.run import run as guardkit_run
+    from forge.cli.serve import compose_merge_guardkit_run
     from forge.adapters.nats.pipeline_publisher import PipelinePublisher
     from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
 
     servers = os.environ.get("FORGE_NATS_URL", "nats://127.0.0.1:4222")
     client = await nats.connect(servers=servers)
     publisher = PipelinePublisher(client)
+    # The same chooser the daemon uses: the merge word's checks run on the
+    # host through the deploy sidecar when one is configured. 2026-09-06:
+    # this attended command still ran guardkit inside the container after
+    # the daemon had moved to the host, and the first press it carried
+    # merged and then said "test runner could not start".
+    guardkit_run = compose_merge_guardkit_run(config)
     dispatcher = build_in_daemon_deploy_dispatcher(
         config=config, nats_client=client, db_path=_resolve_db_path()
     )
