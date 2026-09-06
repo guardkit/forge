@@ -20,6 +20,13 @@ Make-merge-work build spec (2026-08-24). Two halves:
 Any refusal, conflict, or verify failure stops the run with nothing
 half-done: the branch is always kept, and the report says plainly which step
 failed and why.
+
+WHERE THE DEPLOY RAN (2026-09-06 decision): a repository whose deploy profile
+carries a ``sandbox`` block is deployed into its own Docker Sandbox. When it
+does, the report carries ``deployed_in: "docker-sandbox"``, which is how the
+line Rich reads after a successful press comes to say the feature is running in
+its Docker Sandbox. No sandbox block ⇒ no such field ⇒ the report is exactly
+what it was.
 """
 
 from __future__ import annotations
@@ -65,6 +72,7 @@ __all__ = [
     "RED_MERGE_ENDINGS",
     "build_in_daemon_deploy_dispatcher",
     "execute_merge_deploy",
+    "deployed_in_for",
     "merge_wall_seconds",
     "merged_after_all_sha",
 ]
@@ -152,6 +160,11 @@ class MergeDeployOutcome:
     verdict: str | None = None
     checks_passed: int | None = None
     checks_total: int | None = None
+    #: Where the deploy ran, when it ran somewhere worth naming.
+    #: ``"docker-sandbox"`` when the repository's profile carries a sandbox
+    #: block; None otherwise, which is every case that behaved as it always
+    #: did. Jarvis reads it to say "running in its Docker Sandbox".
+    deployed_in: str | None = None
     #: What the post-merge checks did, in guardkit's own word: "failed" when
     #: they ran and something went red, "unverified" when they could not run at
     #: all. ``None`` for every ending that is not about the checks.
@@ -299,6 +312,23 @@ def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
 RED_MERGE_ENDINGS: frozenset[str] = frozenset(
     {"merged-verify-failed", "merged-deploy-reverted", "merged-deploy-failed"}
 )
+
+
+def deployed_in_for(repo_root: Path) -> str | None:
+    """Where a deploy of this repository runs — a Docker Sandbox, or nowhere named.
+
+    Returns ``"docker-sandbox"`` when the repository's ``deploy/profile.yaml``
+    carries a sandbox block, and None otherwise — including when there is no
+    profile, or it cannot be read. This only decides a word on a card, so an
+    unreadable profile must never be the thing that fails a merge.
+    """
+    try:
+        from forge.deploy.profile import load_deploy_profile
+
+        profile = load_deploy_profile(Path(repo_root) / "deploy" / "profile.yaml")
+    except Exception:  # noqa: BLE001 — a word on a card, never a failure
+        return None
+    return "docker-sandbox" if profile.sandbox is not None else None
 
 
 def _mint_repair_row(
@@ -554,6 +584,10 @@ async def execute_merge_deploy(
             detail=outcome.detail,
             digest_conformance_warning=conformance_warning,
             dry_run=dry_run,
+            # Additive, and only when there is something to say: a deploy that
+            # ran nowhere special sends no field at all, so every payload that
+            # was written before Docker Sandboxes existed is unchanged.
+            **({"deployed_in": outcome.deployed_in} if outcome.deployed_in else {}),
         )
         if dry_run:
             logger.info(
@@ -940,6 +974,7 @@ async def execute_merge_deploy(
             checks_total=checks_total,
         )
     elif d_outcome == "complete":
+        deployed_in = deployed_in_for(repo_root)
         checks = (
             f" — checks {checks_passed}/{checks_total}"
             if checks_passed is not None and checks_total is not None
@@ -956,6 +991,7 @@ async def execute_merge_deploy(
             ),
             checks_passed=checks_passed,
             checks_total=checks_total,
+            deployed_in=deployed_in,
         )
     elif d_outcome == "reverted":
         outcome = MergeDeployOutcome(
@@ -971,6 +1007,7 @@ async def execute_merge_deploy(
             ),
             checks_passed=checks_passed,
             checks_total=checks_total,
+            deployed_in=deployed_in_for(repo_root),
         )
     else:
         outcome = MergeDeployOutcome(
@@ -990,6 +1027,7 @@ async def execute_merge_deploy(
             ),
             checks_passed=checks_passed,
             checks_total=checks_total,
+            deployed_in=deployed_in_for(repo_root),
         )
     return await _publish_report(outcome)
 

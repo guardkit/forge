@@ -1408,3 +1408,130 @@ class TestARefusalSpeaksTheMergeCommandsOwnSentence:
         assert outcome.result == "merge-refused"
         assert outcome.detail == "the working tree is dirty"
         assert dp.calls == []
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Where the deploy ran (the 2026-09-06 decision)
+#
+# A repository whose deploy profile carries a sandbox block is deployed into
+# its own Docker Sandbox, and the outcome says so. Jarvis reads that word to
+# say "running in its Docker Sandbox" on the one line Rich sees after a press.
+# No block ⇒ no word ⇒ the report is exactly what it was.
+# ---------------------------------------------------------------------------
+
+
+SANDBOX_PROFILE = """\
+env_id: local
+compose:
+  file: docker-compose.yml
+  script: deploy/sandbox-deploy.sh
+cwd: /somewhere/api_test
+sandbox:
+  name: api-test-deploy
+  memory: 6g
+  cpus: 4
+  publish: ["127.0.0.1:8901:8901", "127.0.0.1:8902:8902"]
+  allow_network: ["pypi.org"]
+"""
+
+PLAIN_PROFILE = """\
+env_id: local
+compose:
+  file: docker-compose.yml
+  script: deploy/deploy.sh
+cwd: /somewhere/api_test
+"""
+
+
+def _write_deploy_profile(repo_root: Path, text: str) -> None:
+    (repo_root / "deploy").mkdir(parents=True, exist_ok=True)
+    (repo_root / "deploy" / "profile.yaml").write_text(text, encoding="utf-8")
+
+
+class TestWhereTheDeployRan:
+    @pytest.mark.asyncio
+    async def test_a_sandbox_profile_says_docker_sandbox(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_deploy_profile(repo_root, SANDBOX_PROFILE)
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert outcome.deployed_in == "docker-sandbox"
+        assert publisher.reports[0].deployed_in == "docker-sandbox"
+
+    @pytest.mark.asyncio
+    async def test_it_rides_the_payload_jarvis_reads(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_deploy_profile(repo_root, SANDBOX_PROFILE)
+        deps, publisher, gk, dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+        raw = publisher.reports[0].model_dump(mode="json")
+        assert raw["deployed_in"] == "docker-sandbox"
+
+    @pytest.mark.asyncio
+    async def test_a_revert_still_says_where_it_ran(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_deploy_profile(repo_root, SANDBOX_PROFILE)
+        deps, publisher, gk, dp = _deps(
+            config, pool, deploy=_FakeDeploy(outcome="reverted", verdict="fail")
+        )
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-reverted"
+        assert outcome.deployed_in == "docker-sandbox"
+
+    @pytest.mark.asyncio
+    async def test_a_profile_without_the_block_says_nothing(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_deploy_profile(repo_root, PLAIN_PROFILE)
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert outcome.deployed_in is None
+        assert "deployed_in" not in publisher.reports[0].model_dump(mode="json")
+
+    @pytest.mark.asyncio
+    async def test_no_profile_at_all_says_nothing_and_fails_nothing(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert outcome.deployed_in is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_profile_never_fails_a_merge(
+        self, config, pool, repo_root
+    ) -> None:
+        # Where the deploy ran is a word on a card. A profile nobody can read
+        # must cost that word, and nothing else.
+        _write_deploy_profile(repo_root, "this: [is not: valid yaml")
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert outcome.deployed_in is None
+
+    @pytest.mark.asyncio
+    async def test_a_deploy_that_never_ran_claims_no_sandbox(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_deploy_profile(repo_root, SANDBOX_PROFILE)
+        deps, publisher, gk, dp = _deps(config, pool, deploy=_FakeDeploy(outcome=None))
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.deployed_in is None
+
+    def test_the_question_answered_on_its_own(self, tmp_path) -> None:
+        from forge.pipeline.merge_executor import deployed_in_for
+
+        _write_deploy_profile(tmp_path, SANDBOX_PROFILE)
+        assert deployed_in_for(tmp_path) == "docker-sandbox"
+        _write_deploy_profile(tmp_path, PLAIN_PROFILE)
+        assert deployed_in_for(tmp_path) is None
+        assert deployed_in_for(tmp_path / "nowhere") is None

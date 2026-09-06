@@ -1,0 +1,29 @@
+# @@NAME@@ candidate overlay — written by `forge register-repo --deploy-port @@APP_PORT@@`.
+#
+# The candidate leg stands the new build up as a THROWAWAY copy, on its own
+# port, and checks it there. Only a copy that passes is allowed to take the
+# live name. deploy/deploy.sh layers this file on top of docker-compose.yml for
+# that leg and for nothing else:
+#
+#   docker compose -p @@PROJECT@@-cand \
+#     -f docker-compose.yml -f deploy/docker-compose.candidate.yml up -d --build
+#
+# It changes exactly ONE thing: the host port the app is published on. The app
+# still listens on @@APP_PORT@@ inside its container, so any health check the
+# container runs on itself is unchanged; only the port on the host moves.
+#
+# Nothing else needs overriding here. The `-p @@PROJECT@@-cand` project already
+# gives the candidate its own compose network and its own copy of every other
+# service in the file, so a database or a cache the app depends on is a separate
+# one, isolated from the live copy, with no extra lines here.
+#
+# `ports: !override` REPLACES the base file's port list rather than adding to
+# it, which is what compose does by default when the same short-form `ports`
+# key appears in two files. Without it the candidate would also try to publish
+# the live port @@APP_PORT@@, which the live copy already holds, and `up` would
+# fail with "address already in use". Needs Compose 2.24.4 or newer, which is
+# where the !override merge tag arrived.
+services:
+  app:
+    ports: !override
+      - "${CANDIDATE_PORT:-@@CANDIDATE_PORT@@}:@@APP_PORT@@"
