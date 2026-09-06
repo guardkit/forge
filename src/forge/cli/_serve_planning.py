@@ -1313,6 +1313,10 @@ async def compose_planning_consumer_and_dispatch(
                 pool, merge_offer_hold_seconds=merge_hold_seconds
             ),
             planning_run=store.get_run,
+            # The run's own events, so a run Rich rejected at the spec card closes as
+            # "rejected by you" rather than "blocked" (2026-09-06; the reject is only
+            # written on the terminal event, not on the run row).
+            run_events=store.list_events,
             paused_repositories=lambda: paused_repositories(pool),
             start_run=_start_queued_run,
             notify=_notify_in_thread,
