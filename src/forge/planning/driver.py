@@ -50,7 +50,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 import yaml
 
@@ -695,6 +695,85 @@ _SAME_LIST_NOTIFICATION = (
 #: The one line added to an otherwise unchanged card when the rewrite DID
 #: change something: what changed, counted, in the words of the list itself.
 _CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
+
+# ---------------------------------------------------------------------------
+# The machine rewrites on a refusal before it asks (2026-09-06).
+#
+# Two of Rich's sentences that weekend stopped at the plan stage because the
+# spec writer wrote worked examples the routing law could not prove — examples
+# about a migration or a column instead of about what a caller sees at the
+# endpoint. The law was right to refuse; the machine was wrong to ask a person
+# to fix what it could have fixed itself. So the plan leg now sends the
+# refused examples back to the spec writer ONCE, as its own note, exactly as
+# an owner's note is sent, and stamps again. Only a second refusal asks.
+# ---------------------------------------------------------------------------
+
+#: The machine's note to the spec writer — the refused titles verbatim, one
+#: per line, and one ask. Rule 2 of the lane's spec; the words are the spec's.
+_MACHINE_REWRITE_NOTE = (
+    "These worked examples cannot be proven as written, because they describe "
+    "the database or the code rather than what a caller sees:\n"
+    "{titles}\n"
+    "\n"
+    "Rewrite each of them as a request to the endpoint and the reply it gets: "
+    "the method and path, the status code, and what is in the body. Keep every "
+    "other worked example exactly as it is."
+)
+
+#: The note's author on every receipt: the machine, never a person.
+_MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
+
+#: The ONE un-mentioned line the owner reads when the rewrite stamped clean
+#: (rule 5). The spec card is not shown again; the three touches stand.
+_MACHINE_REWRITE_LINE = (
+    "{n} of the worked examples could not be proven as written, so the machine "
+    "asked the spec writer to rewrite them as what the endpoint does. What "
+    "changed: {changes}. The plan carries on."
+)
+
+#: The one sentence at the top of the plan-stop card when the rewrite did not
+#: get there (rule 6). ``{why}`` is one of the two outcomes the plan leg can
+#: see for itself: "changed nothing" (the rewrite's digest said the same
+#: thing) or "still could not be proven" (the second stamping refused titles).
+#: A rewrite the checker refused never reaches this card: the spec leg says
+#: that itself, in the note-refused sentence below (rule 23), with "the
+#: machine's note" as the author.
+_MACHINE_REWRITE_STOP_SENTENCE = (
+    "The machine already asked the spec writer once to rewrite these as what "
+    "the endpoint does; the rewrite {why}."
+)
+_REWRITE_CHANGED_NOTHING = "changed nothing"
+_REWRITE_STILL_UNPROVEN = "still could not be proven"
+
+#: What the owner reads when the spec writer's revision round is refused by
+#: the checker after a note (rule 23) — theirs or the machine's. It says what
+#: happened, that nothing was built, and what to do, and it quotes the note so
+#: the reader does not have to find it.
+_NOTE_REFUSED_MESSAGE = (
+    "Planning run {correlation_id} stopped at the spec: the spec writer could "
+    'not honour {whose} "{note}" — the checker refused the rewrite twice '
+    "({reason}). Nothing was built. To try again, send the sentence again "
+    "with the note folded into it."
+)
+
+
+@dataclass(frozen=True)
+class _PlanAttempt:
+    """One pass of the plan leg's work: read the spec, write the plan, stamp.
+
+    ``committed`` — the plan tree is on the branch (validate green, stamps
+    written) and the caller finishes the leg. Otherwise the stamp normalizer
+    stopped the commit where the routing law is enforced: ``stamps`` says how,
+    and the caller decides between the machine's one rewrite and the card. A
+    pass that failed the run loudly for any other reason is not an attempt
+    record at all — the helper returns ``None`` after ``_fail_leg``.
+    """
+
+    committed: bool
+    stamps: "StampNormalizerOutcome | None"
+    files: Mapping[str, str]
+    slug: str
+    sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2030,6 +2109,7 @@ class PlanningRunDriver:
         branch: str,
         plan_run_id: str,
         notes: list[str],
+        note_from_machine: bool = False,
     ) -> dict[str, Any] | None:
         """Dispatch the spec-writer, commit the spec, record the DRAFT row.
 
@@ -2038,6 +2118,14 @@ class PlanningRunDriver:
         with the prior artifact set as ``revision_of`` — discharging the C5
         channel that has been vocabulary since it was designed. A first-round
         dispatch passes neither and is byte-identical to the call that shipped.
+
+        ``note_from_machine`` (2026-09-06): the newest note is the machine's
+        own — the plan leg sending refused worked examples back for one
+        rewrite — not a person's. The round runs exactly as an owner's note
+        round does (same dispatch, same coach, same must-pass criterion); what
+        differs is the words: the owner's message when the checker refuses the
+        rewrite names "the machine's note", and the card is not annotated,
+        because nobody is shown it again.
 
         Returns the draft record (the same dict the door and the approved row
         read), or ``None`` when the leg has already failed loudly.
@@ -2075,8 +2163,32 @@ class PlanningRunDriver:
             return None
         ok, reason = self._dispatch_ok(result)
         if not ok:
+            # After a note, a not-ok dispatch is the checker refusing the
+            # rewrite (the must-pass "what the note asks must change, and
+            # nothing else may move without reason"). The owner is told what
+            # happened, whose note it was, and what to do — rule 23,
+            # 2026-09-06. A first-round failure keeps the plain default.
+            owner_message = (
+                self._note_refused_message(
+                    correlation_id,
+                    note=str(notes[-1]),
+                    note_from_machine=note_from_machine,
+                    reason=getattr(result, "reason", None),
+                )
+                if notes
+                else None
+            )
             await self._fail_leg(
-                correlation_id, _FEATURE_SPEC_STAGE, f"007 dispatch {reason}"
+                correlation_id,
+                _FEATURE_SPEC_STAGE,
+                f"007 dispatch {reason}"
+                + (
+                    " (the checker refused the revision round after "
+                    f"{'the machine' if note_from_machine else 'the owner'}'s note)"
+                    if notes
+                    else ""
+                ),
+                owner_message=owner_message,
             )
             return None
 
@@ -2249,15 +2361,25 @@ class PlanningRunDriver:
                 note = str(notes[-1])
                 if _cards_say_the_same_thing(previous, card):
                     rewrite = {"repeat": True, "note": note, "changes": ""}
-                    card = dict(card)
-                    card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
                 else:
                     changes = _plain_card_changes(previous, card)
                     rewrite = {"repeat": False, "note": note, "changes": changes}
+                if note_from_machine:
+                    # The machine's own round (2026-09-06): the comparison is
+                    # what the plan leg reads to decide between carrying on
+                    # and stopping, and the receipt names the author. The
+                    # card itself is NOT annotated — nobody is shown it
+                    # again, and "Your note was" would be a lie on a row a
+                    # person may read later.
+                    rewrite["author"] = _MACHINE_NOTE_AUTHOR
+                elif rewrite["repeat"]:
+                    card = dict(card)
+                    card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
+                else:
                     card = dict(card)
                     card["what_happened"] = (
                         f"{card.get('what_happened', '')} "
-                        + _CHANGED_LIST_CARD_LINE.format(changes=changes)
+                        + _CHANGED_LIST_CARD_LINE.format(changes=rewrite["changes"])
                     ).strip()
 
         draft: dict[str, Any] = {
@@ -2291,12 +2413,17 @@ class PlanningRunDriver:
         )
         logger.info(
             "planning driver: run %s feature-spec drafted (slug=%s, %d files, "
-            "%d worked example(s), pass-bar seed %s) — showing the digest",
+            "%d worked example(s), pass-bar seed %s) — %s",
             correlation_id,
             slug,
             len(files),
             draft["scenario_count"],
             "captured" if pass_bar_seed is not None else "ABSENT",
+            (
+                "the machine's rewrite round (round 1); the digest is not shown again"
+                if note_from_machine
+                else "showing the digest"
+            ),
         )
         return draft
 
@@ -2468,6 +2595,98 @@ class PlanningRunDriver:
             len(record["spec_files"]),
         )
         return self._advance_after_spec(correlation_id)
+
+    def _record_spec_approved_after_machine_rewrite(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        *,
+        branch: str,
+        note: str,
+        refused_titles: Sequence[str],
+        changes: str,
+    ) -> dict[str, Any]:
+        """Record the spec's ``approved`` row AGAIN after the machine's rewrite.
+
+        Rule 4 of the rewrite-on-refusal lane (2026-09-06): the owner's decision
+        is carried, not lost. The latest approved row is copied forward whole —
+        ``spec_review`` (who said yes, the sign-in answer) unchanged, which the
+        pass-bars leg reads from this row and must still find — with the file
+        list, sha, seed and digest replaced by the rewritten spec's, plus
+        ``rewritten_by_machine``: the round, the note, the refused titles and
+        the what-changed sentence. Its presence is ALSO how a re-drive knows
+        the one rewrite has happened (rule 7): read from this row, never from
+        memory. Returns the block it wrote, for the plan receipt.
+
+        No transition: the run is already at FEATURE_PLAN.
+        """
+        record = dict(self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE))
+        record.update(
+            {
+                "slug": draft.get("slug"),
+                "spec_files": list(draft.get("spec_files") or []),
+                "target_repo": draft.get("target_repo"),
+                "repo_path": draft.get("repo_path"),
+                "branch": draft.get("branch") or branch,
+                "sha": draft.get("sha"),
+                "pass_bar_seed": draft.get("pass_bar_seed"),
+                "digest": draft.get("digest"),
+            }
+        )
+        block: dict[str, Any] = {
+            "round": 1,
+            "author": _MACHINE_NOTE_AUTHOR,
+            "note": note,
+            "refused_titles": list(refused_titles),
+            "changes": changes,
+        }
+        record["rewritten_by_machine"] = block
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_FEATURE_SPEC_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(record),
+        )
+        logger.info(
+            "planning driver: run %s feature-spec approved row re-recorded after "
+            "the machine's rewrite (round 1; slug=%s, %d files; the owner's "
+            "decision carried forward %s)",
+            correlation_id,
+            record.get("slug"),
+            len(record["spec_files"]),
+            "with the sign-in answer"
+            if (record.get("spec_review") or {}).get("sign_in_answer")
+            else "unchanged",
+        )
+        return block
+
+    @staticmethod
+    def _machine_rewrite_note(refused_titles: Sequence[str]) -> str:
+        """The machine's note to the spec writer: every refused title verbatim,
+        one per line, and the one ask (rule 2, the spec's own words)."""
+        titles = "\n".join(f"- {title}" for title in refused_titles)
+        return _MACHINE_REWRITE_NOTE.format(titles=titles)
+
+    @staticmethod
+    def _note_refused_message(
+        correlation_id: str,
+        *,
+        note: str,
+        note_from_machine: bool,
+        reason: Any,
+    ) -> str:
+        """The owner's sentence when the checker refused a revision round
+        (rule 23): whose note it was, the note itself, the checker's reason in
+        one sentence, that nothing was built, and what to do next."""
+        whose = "the machine's note" if note_from_machine else "your note"
+        one_sentence = " ".join(str(reason or "").split()).rstrip(".").strip()
+        return _NOTE_REFUSED_MESSAGE.format(
+            correlation_id=correlation_id,
+            whose=whose,
+            note=note,
+            reason=one_sentence or "the checker gave no reason",
+        )
 
     def _advance_after_spec(self, correlation_id: str) -> bool:
         """Transition FEATURE_SPEC → FEATURE_PLAN (idempotent-resume safe)."""
@@ -3091,6 +3310,23 @@ class PlanningRunDriver:
         durable ``feature-plan`` approved event short-circuits a re-drive
         (no re-dispatch — returns True so the build trigger still runs, which is
         what makes a crash between the plan commit and BUILD_QUEUED recover).
+
+        THE MACHINE'S ONE REWRITE (2026-09-06). The work — read the approved
+        spec back, dispatch the plan-writer, stamp in the pre-commit step — is
+        :meth:`_plan_attempt`, and it runs up to twice. When the routing law is
+        enforced and the stamp normalizer refuses worked examples on the first
+        pass, the driver sends those examples back to the spec writer as its
+        own note (exactly as an owner's note goes: same dispatch, same coach,
+        same must-pass criterion), re-records the approved spec row with the
+        owner's decision carried forward, and runs the attempt again from the
+        top. A clean second stamping tells the owner in ONE un-mentioned line
+        and carries on; a rewrite that changed nothing, or a second refusal,
+        stops with the plan-stop card plus one sentence saying the machine
+        already tried; a rewrite the checker refused stops with the spec leg's
+        own sentence saying what to do. Never a third try; whether the one
+        rewrite has happened is read from the durable row, so a re-drive
+        after a crash does the right thing either side of it. Off by
+        ``planning.rewrite_on_refusal: false``, which is the 2026-09-05 path.
         """
         deps = self._deps
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
@@ -3115,9 +3351,123 @@ class PlanningRunDriver:
         target_repo, repo_path = resolved
         branch = f"planning/{correlation_id}"
         plan_run_id = f"plan-{correlation_id}"
+        # The feature id is minted ONCE per run (rule 3): the machine's rewrite
+        # redoes the plan work on the same id and the same branch.
+        feature_id = self._mint_feature_id(correlation_id)
+
+        first = await self._plan_attempt(
+            correlation_id,
+            target_repo=target_repo,
+            repo_path=repo_path,
+            branch=branch,
+            plan_run_id=plan_run_id,
+            feature_id=feature_id,
+            round_label="first",
+        )
+        if first is None:
+            return False  # already loud and terminal
+        attempt = first
+        rewrite: dict[str, Any] | None = None
+        if not first.committed:
+            stamps = first.stamps
+            if stamps is None:  # pragma: no cover — not committed ⇒ stamps stopped it
+                return False
+            if not self._machine_rewrite_allowed(correlation_id, stamps):
+                # Today's stop — or, on a re-drive after the one rewrite was
+                # already recorded (rule 7), the stop that says so.
+                already = self._leg_event_details(
+                    correlation_id, _FEATURE_SPEC_STAGE
+                ).get("rewritten_by_machine")
+                return await self._stop_at_stamps(
+                    correlation_id,
+                    feature_id,
+                    stamps,
+                    after_rewrite=(
+                        _REWRITE_STILL_UNPROVEN
+                        if already and stamps.refused_titles
+                        else None
+                    ),
+                )
+            rewrite = await self._machine_rewrite_after_refusal(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                stamps=stamps,
+            )
+            if rewrite is None:
+                return False  # the spec leg said why (rule 23) — already loud
+            if rewrite["repeat"]:
+                return await self._stop_at_stamps(
+                    correlation_id,
+                    feature_id,
+                    stamps,
+                    after_rewrite=_REWRITE_CHANGED_NOTHING,
+                )
+            second = await self._plan_attempt(
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                feature_id=feature_id,
+                round_label="second (after the machine's rewrite, round 1)",
+            )
+            if second is None:
+                return False
+            attempt = second
+            if not second.committed:
+                stamps2 = second.stamps
+                if stamps2 is None:  # pragma: no cover
+                    return False
+                # Rule 6: never a third try. The refused titles get the
+                # sentence; a normalizer that could not RUN the second time
+                # is a different thing and keeps today's cannot-run card.
+                return await self._stop_at_stamps(
+                    correlation_id,
+                    feature_id,
+                    stamps2,
+                    after_rewrite=(
+                        _REWRITE_STILL_UNPROVEN if stamps2.refused_titles else None
+                    ),
+                )
+        return await self._finish_feature_plan(
+            correlation_id,
+            attempt,
+            feature_id=feature_id,
+            target_repo=target_repo,
+            branch=branch,
+            rewrite=rewrite,
+        )
+
+    async def _plan_attempt(
+        self,
+        correlation_id: str,
+        *,
+        target_repo: str,
+        repo_path: str,
+        branch: str,
+        plan_run_id: str,
+        feature_id: str,
+        round_label: str,
+    ) -> "_PlanAttempt | None":
+        """One pass of the plan leg's work, from the top: read the approved spec
+        back off the branch, dispatch the plan-writer, write the tree with the
+        stamp normalizer + validate in the pre-commit step.
+
+        Runs once today; twice when the machine's one rewrite is in play
+        (2026-09-06) — the second pass reads the REWRITTEN spec, because it
+        reads the latest approved spec row, which the rewrite re-recorded.
+
+        Returns the attempt record, or ``None`` after failing the run loudly
+        for any reason other than the normalizer's stop (which the caller
+        decides on).
+        """
+        deps = self._deps
         spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         slug = str(spec_details.get("slug") or self._slug_of({}, correlation_id))
-        feature_id = self._mint_feature_id(correlation_id)
 
         # The 008 contract needs the CONTENTS of the committed spec triple, not
         # paths. Read them back off the planning branch (they are no longer in
@@ -3136,7 +3486,7 @@ class PlanningRunDriver:
                 f"(.feature / _summary.md) off branch {branch} "
                 f"(spec_files={sorted(spec_files)})",
             )
-            return False
+            return None
         target_repo_descriptor = self._build_target_repo_descriptor(
             target_repo, repo_path
         )
@@ -3151,6 +3501,13 @@ class PlanningRunDriver:
         spec_feature_paths = [
             str(rel) for rel in spec_files if str(rel).endswith(".feature")
         ]
+        logger.info(
+            "planning driver: run %s plan attempt (%s) for %s from spec %s",
+            correlation_id,
+            round_label,
+            feature_id,
+            spec_feature_paths,
+        )
 
         try:
             result = await deps.dispatch_feature_plan(
@@ -3169,13 +3526,13 @@ class PlanningRunDriver:
                 _FEATURE_PLAN_STAGE,
                 f"008 dispatch raised {type(exc).__name__}: {exc}",
             )
-            return False
+            return None
         ok, reason = self._dispatch_ok(result)
         if not ok:
             await self._fail_leg(
                 correlation_id, _FEATURE_PLAN_STAGE, f"008 dispatch {reason}"
             )
-            return False
+            return None
 
         role_output = self._role_output_of(result)
         # RV-1: assert the SUPPLIED feature id, not filename self-consistency.
@@ -3187,7 +3544,7 @@ class PlanningRunDriver:
                 f"feature id mismatch (RV-1): forge supplied {feature_id}, "
                 f"the plan declares {declared}",
             )
-            return False
+            return None
 
         files = self._plan_tree_files(role_output)
         if not files:
@@ -3196,7 +3553,7 @@ class PlanningRunDriver:
                 _FEATURE_PLAN_STAGE,
                 "008 returned no plan tree (invalid artifacts)",
             )
-            return False
+            return None
 
         # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
         # same posture as the 007 leg above. The REAL oracle for the plan tree
@@ -3261,36 +3618,208 @@ class PlanningRunDriver:
                 _FEATURE_PLAN_STAGE,
                 f"plan write raised {type(exc).__name__}: {exc}",
             )
-            return False
+            return None
         if gitres.status == "failed":
             stamps = stamp_state.get("outcome")
             if stamps is not None and stamps.stops_the_run:
-                # The normalizer stopped the run — the card names the refused
-                # titles VERBATIM (or the reason it could not run); the
-                # machine record keeps the internal reason.
-                await self._fail_leg(
-                    correlation_id,
-                    _FEATURE_PLAN_STAGE,
-                    f"stamp normalizer {stamps.status} for {feature_id}: "
-                    f"{stamps.detail}"
-                    + (
-                        f"; refused titles: {list(stamps.refused_titles)!r}"
-                        if stamps.refused_titles
-                        else ""
-                    ),
-                    owner_message=self._stamp_normalizer_card(
-                        correlation_id, feature_id, stamps
-                    ),
+                # The normalizer stopped the commit — the caller decides
+                # between the machine's one rewrite and the card.
+                return _PlanAttempt(
+                    committed=False, stamps=stamps, files=files, slug=slug
                 )
-                return False
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
                 f"plan write / feature validate failed: {gitres.stderr}",
             )
-            return False
+            return None
+        return _PlanAttempt(
+            committed=True,
+            stamps=stamp_state.get("outcome"),
+            files=files,
+            slug=slug,
+            sha=gitres.sha,
+        )
 
-        stamps = stamp_state.get("outcome")
+    def _machine_rewrite_allowed(
+        self, correlation_id: str, stamps: "StampNormalizerOutcome"
+    ) -> bool:
+        """Rule 1: does the machine get its one rewrite here?
+
+        Yes only when ALL of: the switch is on (``planning.rewrite_on_refusal``,
+        on by default); the routing law is enforced for this repo/feature; the
+        normalizer came back ``refused`` or ``partial`` WITH refused titles (a
+        ``failed`` or cannot-run normalizer is not a refusal of examples, and
+        titles that could not be read back cannot be sent back); and the
+        latest approved spec row does not already carry ``rewritten_by_machine``
+        — the fence is read from the durable row, never from memory (rule 7).
+        """
+        cfg = self._deps.planning_config
+        if not bool(getattr(cfg, "rewrite_on_refusal", True)):
+            return False
+        if stamps.status not in ("refused", "partial") or not stamps.refused_titles:
+            return False
+        if not stamps.enforced:
+            return False
+        if self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE).get(
+            "rewritten_by_machine"
+        ):
+            return False
+        return True
+
+    async def _machine_rewrite_after_refusal(
+        self,
+        row: Any,
+        correlation_id: str,
+        *,
+        target_repo: str,
+        repo_path: str,
+        branch: str,
+        plan_run_id: str,
+        stamps: "StampNormalizerOutcome",
+    ) -> dict[str, Any] | None:
+        """The machine's one rewrite: compose the note, run the spec writer's
+        revision round with it, and — unless the rewrite changed nothing —
+        re-record the approved row (rules 2, 3, 4).
+
+        Returns the rewrite record (round, author, note, refused titles, the
+        what-changed sentence, and ``repeat``), or ``None`` when the spec leg
+        already failed the run loudly (a checker refusal speaks rule 23's
+        sentence with "the machine's note"; a write or digest failure speaks
+        its own). A ``repeat`` record is returned WITHOUT re-recording the
+        approved row: the caller stops the run, and the spec of record stays
+        the one the owner approved.
+        """
+        refused_titles = list(stamps.refused_titles)
+        note = self._machine_rewrite_note(refused_titles)
+        logger.info(
+            "planning driver: run %s — %d worked example(s) refused by rule "
+            "where the law is enforced; the machine sends them back to the "
+            "spec writer once (round 1): %s",
+            correlation_id,
+            len(refused_titles),
+            refused_titles,
+        )
+        draft = await self._draft_spec(
+            row,
+            correlation_id,
+            target_repo=target_repo,
+            repo_path=repo_path,
+            branch=branch,
+            plan_run_id=plan_run_id,
+            notes=[*self._spec_review_notes(correlation_id), note],
+            note_from_machine=True,
+        )
+        if draft is None:
+            return None
+        compared = draft.get("rewrite")
+        if not isinstance(compared, Mapping):
+            # Unreachable in practice: the plan leg only runs after an approved
+            # draft, so there is always a card to compare against. Said aloud
+            # rather than guessed at.
+            logger.warning(
+                "planning driver: run %s — the machine's rewrite could not be "
+                "compared with the approved list (no prior card on record); "
+                "carrying on with the rewrite as written",
+                correlation_id,
+            )
+            compared = {"repeat": False, "changes": "not recorded"}
+        changes = str(compared.get("changes") or "")
+        repeat = bool(compared.get("repeat")) or not changes
+        record: dict[str, Any] = {
+            "round": 1,
+            "author": _MACHINE_NOTE_AUTHOR,
+            "note": note,
+            "refused_titles": refused_titles,
+            "changes": changes,
+            "repeat": repeat,
+        }
+        if repeat:
+            logger.warning(
+                "planning driver: run %s — the machine's rewrite (round 1) "
+                "changed nothing on the list; the run stops with the card",
+                correlation_id,
+            )
+            return record
+        self._record_spec_approved_after_machine_rewrite(
+            correlation_id,
+            draft,
+            branch=branch,
+            note=note,
+            refused_titles=refused_titles,
+            changes=changes,
+        )
+        logger.info(
+            "planning driver: run %s — the machine's rewrite (round 1) landed "
+            "(%s); stamping again from the top of the plan leg",
+            correlation_id,
+            changes,
+        )
+        return record
+
+    async def _stop_at_stamps(
+        self,
+        correlation_id: str,
+        feature_id: str,
+        stamps: "StampNormalizerOutcome",
+        *,
+        after_rewrite: str | None = None,
+    ) -> bool:
+        """The normalizer stopped the run — the card names the refused titles
+        VERBATIM (or the reason it could not run); the machine record keeps
+        the internal reason and, after the machine's rewrite, names the round
+        and how it went (rule 6, rule 9)."""
+        reason = self._stamps_reason(feature_id, stamps)
+        if after_rewrite:
+            reason = (
+                f"{reason}; after the machine's rewrite (round 1): the rewrite "
+                f"{after_rewrite}"
+            )
+        return await self._fail_leg(
+            correlation_id,
+            _FEATURE_PLAN_STAGE,
+            reason,
+            owner_message=self._stamp_normalizer_card(
+                correlation_id, feature_id, stamps, after_rewrite=after_rewrite
+            ),
+        )
+
+    @staticmethod
+    def _stamps_reason(feature_id: str, stamps: "StampNormalizerOutcome") -> str:
+        """The machine record's reason for a normalizer stop. When the model
+        fallback was in fact asked, the record must not say "no fallback
+        home" (rule 16) — the outcome's own detail already says what the
+        model said, and a detail built elsewhere is corrected here."""
+        detail = stamps.detail
+        if stamps.model_was_asked and "no fallback home" in detail:
+            detail = detail.replace(
+                "no fallback home", "the model fallback was asked and could not settle them"
+            )
+        return (
+            f"stamp normalizer {stamps.status} for {feature_id}: {detail}"
+            + (
+                f"; refused titles: {list(stamps.refused_titles)!r}"
+                if stamps.refused_titles
+                else ""
+            )
+        )
+
+    async def _finish_feature_plan(
+        self,
+        correlation_id: str,
+        attempt: "_PlanAttempt",
+        *,
+        feature_id: str,
+        target_repo: str,
+        branch: str,
+        rewrite: Mapping[str, Any] | None,
+    ) -> bool:
+        """The plan is on the branch: receipts, the one line about the machine's
+        rewrite when there was one (rule 5), the approved row, and on to the
+        build trigger."""
+        deps = self._deps
+        stamps = attempt.stamps
+        files = attempt.files
         # The plan receipts carry the normalizer's outcome whichever way it
         # went — written / nothing-to-do / partial / refused / failed /
         # unavailable / not-wired — so a plan committed WITHOUT (all its)
@@ -3334,13 +3863,51 @@ class PlanningRunDriver:
                     if sent == "no-notifier"
                     else "line not sent (publish failed)"
                 )
+        # THE MACHINE'S REWRITE (2026-09-06, rules 5 and 9). Read from the
+        # approved spec row when this drive did not do it itself — a re-drive
+        # after the row was written still receipts it and still tells the
+        # owner, because nobody has yet.
+        if rewrite is None:
+            recorded = self._leg_event_details(
+                correlation_id, _FEATURE_SPEC_STAGE
+            ).get("rewritten_by_machine")
+            rewrite = dict(recorded) if isinstance(recorded, Mapping) else None
+        if rewrite is not None:
+            line = _MACHINE_REWRITE_LINE.format(
+                n=len(rewrite.get("refused_titles") or []),
+                changes=str(rewrite.get("changes") or "not recorded"),
+            )
+            sent = await self._notify(correlation_id, line, level="info", mention=False)
+            receipt_block = {
+                "round": rewrite.get("round", 1),
+                "author": rewrite.get("author", _MACHINE_NOTE_AUTHOR),
+                "note": rewrite.get("note"),
+                "refused_titles": list(rewrite.get("refused_titles") or []),
+                "changes": rewrite.get("changes"),
+                "owner_line": line,
+                "owner_line_sent": (
+                    "sent"
+                    if sent == "sent"
+                    else "line not sent (no notifier)"
+                    if sent == "no-notifier"
+                    else "line not sent (publish failed)"
+                ),
+            }
+            stamp_receipt = dict(stamp_receipt or {})
+            stamp_receipt["rewrite"] = receipt_block
+            logger.info(
+                "planning driver: run %s — the machine's rewrite (round 1) "
+                "stamped clean; the owner's line %s",
+                correlation_id,
+                receipt_block["owner_line_sent"],
+            )
         details: dict[str, Any] = {
             "feature_id": feature_id,
-            "slug": slug,
+            "slug": attempt.slug,
             "plan_files": sorted(files),
             "target_repo": target_repo,
             "branch": branch,
-            "sha": gitres.sha,
+            "sha": attempt.sha,
         }
         if stamp_receipt is not None:
             details["stamp_normalizer"] = stamp_receipt
@@ -3593,25 +4160,68 @@ class PlanningRunDriver:
         return ""
 
     @staticmethod
+    def _model_fallback_sentence(stamps: "StampNormalizerOutcome") -> str | None:
+        """The one sentence after the titles about the MODEL FALLBACK (rule 16,
+        2026-09-06): what it reported about itself, in the spec's words —
+        asked and could not answer, answer rejected, not asked because no
+        endpoint is configured, or decided some. ``None`` when the normalizer
+        said nothing about it (an older guardkit) — nothing is invented."""
+        outcome = stamps.model_outcome
+        if not outcome:
+            return None
+        status = str(outcome.get("status") or "")
+        detail = " ".join(str(outcome.get("detail") or "").split()).rstrip(".")
+        if status == "asked_and_failed":
+            return f"The model fallback was asked and could not answer: {detail or 'no reason was given'}."
+        if status == "answer_rejected":
+            return f"The model fallback's answer was rejected: {detail or 'no reason was given'}."
+        if status == "not_configured":
+            return "The model fallback was not asked: no endpoint is configured."
+        if status == "decided":
+            count: Any = outcome.get("count")
+            if not isinstance(count, int) or isinstance(count, bool):
+                m = re.search(r"\b(\d+)\b", detail)
+                count = int(m.group(1)) if m else "some"
+            return f"The model fallback decided {count} of them; these could not be decided."
+        return None
+
+    @staticmethod
     def _stamp_normalizer_card(
-        correlation_id: str, feature_id: str, stamps: "StampNormalizerOutcome"
+        correlation_id: str,
+        feature_id: str,
+        stamps: "StampNormalizerOutcome",
+        *,
+        after_rewrite: str | None = None,
     ) -> str:
         """The owner's card when THE STAMP NORMALIZER stops the run — which
         it does ONLY where the routing law is enforced for the repo/feature
         (coordinator condition 5).
 
         Names every refused title VERBATIM (the rule could not decide which
-        verifier proves it and there is no fallback home; partial and refused
-        alike — no rule ids on the face), says nothing was stamped on the
-        branch and nothing was built, says the repo enforces the law, and
-        says what a person does next — in plain words, the vocabulary named
-        once. A cannot-run failure names the reason instead.
+        verifier proves it; partial and refused alike — no rule ids on the
+        face), says what the model fallback said about itself when it said
+        anything (rule 16, 2026-09-06 — and "no fallback home" is only said
+        when the model was NOT asked), says nothing was stamped on the branch
+        and nothing was built, says the repo enforces the law, and says what a
+        person does next — in plain words, the vocabulary named once. A
+        cannot-run failure names the reason instead.
+
+        ``after_rewrite`` (rule 6, 2026-09-06): the machine already spent its
+        one rewrite; the card opens with the sentence that says so and how the
+        rewrite went ("changed nothing" / "still could not be proven").
         """
         from forge.pipeline.routing_stamps import VERIFIER_HOMES
 
         head = (
             f"Planning run {correlation_id} stopped at "
             f"{plain_stage_name(_FEATURE_PLAN_STAGE)}"
+        )
+        lead = (
+            f"{head}. "
+            + _MACHINE_REWRITE_STOP_SENTENCE.format(why=after_rewrite)
+            + " The"
+            if after_rewrite
+            else f"{head}: the"
         )
         if stamps.status in ("refused", "partial") and stamps.refused_titles:
             titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
@@ -3622,13 +4232,20 @@ class PlanningRunDriver:
                 if stamps.titles_recovered_from_console_echo
                 else ""
             )
+            fallback_clause = (
+                "the model fallback could not settle them"
+                if stamps.model_was_asked
+                else "there is no fallback home"
+            )
+            model_sentence = PlanningRunDriver._model_fallback_sentence(stamps)
             return (
-                f"{head}: the verifier stamps could not all be minted by rule for "
+                f"{lead} verifier stamps could not all be minted by rule for "
                 f"feature {feature_id}. {n} scenario(s) had no rule to decide "
-                f"which verifier proves them, and there is no fallback home, so "
+                f"which verifier proves them, and {fallback_clause}, so "
                 f"nothing was stamped and nothing was built{recovered}:\n"
                 f"{titles}\n"
-                f"This repo enforces the routing law: every scenario needs a "
+                + (f"{model_sentence}\n" if model_sentence else "")
+                + f"This repo enforces the routing law: every scenario needs a "
                 f"verifier before its plan can be committed. "
                 f"What to do: give each of these scenarios a verifier by hand in "
                 f".guardkit/features/{feature_id}.yaml under scenarios: — one of "
@@ -3636,7 +4253,7 @@ class PlanningRunDriver:
                 f"work, never as a default) — then re-run the request."
             )
         return (
-            f"{head}: the verifier-stamp normalizer could not run for feature "
+            f"{lead} verifier-stamp normalizer could not run for feature "
             f"{feature_id}, so the plan was not stamped and nothing was built "
             f"(this repo enforces the routing law). Reason: {stamps.detail}"
         )

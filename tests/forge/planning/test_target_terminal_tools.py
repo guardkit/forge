@@ -2148,3 +2148,198 @@ def test_classifier_disagreements_absent_when_the_normalizer_sent_none() -> None
         "FEAT-X", status="success", exit_code=0, stdout_tail=json.dumps(payload, indent=2), stderr=""
     )
     assert out.disagreements == () and "disagreements" not in out.receipt()
+
+
+# -- the model fallback reports its own outcome (rule 16, 2026-09-06) ----------
+
+import json  # noqa: E402
+
+from forge.planning.target_terminal_tools import (  # noqa: E402
+    model_outcome_from_console_echo,
+)
+
+_MODEL_ASKED_AND_FAILED = {
+    "status": "asked_and_failed",
+    "detail": "HTTPStatusError: 502 Bad Gateway from localhost:4000",
+    "endpoint": "localhost:4000",
+    "model": "workhorse",
+}
+
+
+def _exit3_json(model_outcome: Any = "absent") -> str:
+    """The exit-3 JSON as guardkit prints it (indent=2), with or without the
+    ``model_outcome`` key, followed by the rich echo that always trails it."""
+    payload: dict[str, Any] = {
+        "feature": "FEAT-TIME",
+        "stamped": {"Reading the current server time": "hurl"},
+        "rules": {"Reading the current server time": "R9"},
+        "already_stamped": [],
+        "refused": [_MOON, "Another undecidable one"],
+        "written": True,
+    }
+    if model_outcome != "absent":
+        payload["model_outcome"] = model_outcome
+    return json.dumps(payload, indent=2) + "\n! normalize-stamps PARTIAL: 2 scenario(s) undecidable by rule\n"
+
+
+def _with_model_line_where_guardkit_prints_it(line: str) -> str:
+    """The fixture's stderr with the fallback's line where guardkit prints it:
+    among the logger lines, BEFORE the rich ``! normalize-stamps PARTIAL:``
+    block that closes the stream (the fallback runs during normalization; the
+    echo prints at the end)."""
+    text = _fixture("partial-stderr.txt")
+    marker = "! normalize-stamps PARTIAL:"
+    idx = text.index(marker)
+    return text[:idx] + line + "\n" + text[idx:]
+
+
+def test_classify_reads_the_model_outcome_from_the_json() -> None:
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3,
+        stdout_tail=_exit3_json(_MODEL_ASKED_AND_FAILED), stderr="",
+    )
+    assert out.status == "partial"
+    assert out.model_outcome == _MODEL_ASKED_AND_FAILED
+    assert out.model_was_asked
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    # The machine record no longer says "no fallback home" when the model was asked.
+    assert "no fallback home" not in out.detail
+    assert "the model fallback was asked and could not answer" in out.detail
+    assert out.receipt()["model_outcome"] == _MODEL_ASKED_AND_FAILED
+
+
+def test_classify_reads_the_model_outcome_from_a_clipped_json_tail() -> None:
+    """The head was clipped past ``stamped`` — the ``model_outcome`` block at
+    the tail still reads whole, like ``refused`` and ``rules`` do."""
+    text = _exit3_json(_MODEL_ASKED_AND_FAILED)
+    clipped = text[text.index('"rules"') :]
+    payload = parse_normalizer_payload(clipped)
+    assert payload is not None and payload.get("partial") is True
+    assert payload["model_outcome"] == _MODEL_ASKED_AND_FAILED
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail=clipped, stderr=""
+    )
+    assert out.model_outcome == _MODEL_ASKED_AND_FAILED
+
+
+def test_classify_refused_exit2_carries_the_model_outcome_too() -> None:
+    payload = json.dumps(
+        {
+            "refused": [_MOON, "Another undecidable one"],
+            "written": False,
+            "model_outcome": {"status": "not_configured", "detail": "no model endpoint is configured"},
+        },
+        indent=2,
+    )
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=2, stdout_tail=payload, stderr=""
+    )
+    assert out.status == "refused"
+    assert out.model_outcome == {"status": "not_configured", "detail": "no model endpoint is configured"}
+    assert not out.model_was_asked
+    assert "no fallback home" in out.detail  # true: the model was NOT asked
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (
+            "WARNING:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+            "feature FEAT-TIME: the model could not be asked about 2 title(s) no rule "
+            "could decide — no model endpoint is configured (set GUARDKIT_STAMP_MODEL_URL, "
+            "or OPENAI_BASE_URL, to something like http://localhost:4000/v1). The titles "
+            "stay refused and nothing was stamped.",
+            {"status": "not_configured"},
+        ),
+        (
+            "WARNING:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+            "feature FEAT-TIME: the model could not be asked about 2 title(s) no rule "
+            "could decide (ConnectError: connection refused at localhost:4000). The "
+            "titles stay refused and nothing was stamped.",
+            {"status": "asked_and_failed", "endpoint": "localhost:4000"},
+        ),
+        (
+            "WARNING:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+            "feature FEAT-TIME: the model's answer was rejected — 'maybe' is not one "
+            "of the allowed words. The 2 title(s) stay refused and nothing was stamped.",
+            {"status": "answer_rejected"},
+        ),
+        (
+            "INFO:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+            "feature FEAT-TIME: the model decided 1 title(s) no rule could decide: "
+            "'Reading the current server time' -> hurl",
+            {"status": "decided", "count": 1},
+        ),
+        (
+            # The lane's own sentence shape: the status word, the endpoint, the model.
+            "STAMP NORMALIZER: model fallback asked_and_failed — HTTPStatusError: 502 "
+            "Bad Gateway from 10.0.0.7:4000 (model workhorse)",
+            {"status": "asked_and_failed", "endpoint": "10.0.0.7:4000", "model": "workhorse"},
+        ),
+    ],
+)
+def test_the_model_outcome_is_read_from_the_stderr_echo_when_only_that_survived(
+    line: str, expected: dict[str, Any]
+) -> None:
+    """The JSON was lost; the fallback's one plain stderr line says the same
+    thing. Every shape the guardkit half prints today, and the lane's own."""
+    stderr = _with_model_line_where_guardkit_prints_it(line)
+    echoed = model_outcome_from_console_echo(stderr)
+    assert echoed is not None
+    for key, value in expected.items():
+        assert echoed[key] == value
+    assert echoed["detail"] and not echoed["detail"].startswith("feature FEAT-TIME")
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail="", stderr=stderr
+    )
+    assert out.status == "partial"
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.model_outcome is not None and out.model_outcome["status"] == expected["status"]
+    assert out.receipt()["model_outcome"]["status"] == expected["status"]
+    assert out.model_was_asked == (expected["status"] != "not_configured")
+    assert ("no fallback home" in out.detail) == (expected["status"] == "not_configured")
+
+
+def test_a_logger_line_after_the_title_block_is_never_read_as_a_wrapped_title() -> None:
+    """Found by the first run of these tests (2026-09-06): a logger line that
+    landed AFTER the rich title block was re-joined into the last title,
+    because only a bare ``STAMP NORMALIZER:`` at column 0 ended the block. A
+    ``WARNING:…:`` prefixed line is a logger line wherever it lands."""
+    stderr = _fixture("partial-stderr.txt") + (
+        "WARNING:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+        "feature FEAT-TIME: the model's answer was rejected — 'maybe' is not one "
+        "of the allowed words. The 2 title(s) stay refused and nothing was stamped.\n"
+    )
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail="", stderr=stderr
+    )
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.model_outcome is not None and out.model_outcome["status"] == "answer_rejected"
+
+
+def test_the_model_outcome_is_absent_when_the_normalizer_said_nothing_about_it() -> None:
+    """An older guardkit: no JSON key, no model line on stderr — ``None``, the
+    receipt has no such key, and the detail says "no fallback home" as it
+    always did (a clock time in a log line is never read as an endpoint)."""
+    assert model_outcome_from_console_echo(_fixture("partial-stderr.txt")) is None
+    assert model_outcome_from_console_echo("") is None
+    assert model_outcome_from_console_echo("STAMP NORMALIZER: feature FEAT-X — at 10:00 nothing happened\n") is None
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3,
+        stdout_tail=_fixture("partial-stdout.txt"), stderr=_fixture("partial-stderr.txt"),
+    )
+    assert out.model_outcome is None
+    assert not out.model_was_asked
+    assert "model_outcome" not in out.receipt()
+    assert "no fallback home" in out.detail
+
+
+def test_an_unknown_model_outcome_status_is_not_invented_into_one() -> None:
+    payload = json.dumps(
+        {"refused": [_MOON], "written": False, "model_outcome": {"status": "shrug", "detail": "?"}},
+        indent=2,
+    )
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=2, stdout_tail=payload, stderr=""
+    )
+    assert out.model_outcome is None

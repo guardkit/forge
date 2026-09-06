@@ -931,6 +931,17 @@ class PlanningConfig(BaseModel):
             "to always_ask=True: the card always asks."
         ),
     )
+    rewrite_on_refusal: bool = Field(
+        default=True,
+        description=(
+            "True (default) = when the plan stage cannot prove some of the "
+            "spec's worked examples (the routing law is enforced and the stamp "
+            "normalizer refused them), the machine sends those examples back "
+            "to the spec writer once, as its own note, and stamps again; only "
+            "a second refusal stops the run and asks a person. False = the "
+            "first refusal stops the run, exactly as before 2026-09-06."
+        ),
+    )
 
     @field_validator("default_target_repo")
     @classmethod

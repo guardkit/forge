@@ -2324,3 +2324,99 @@ def test_no_sentence_in_the_driver_promises_a_reminder_nobody_sends() -> None:
         assert "remind" not in sentence.lower(), (
             f"line {index + 1} promises a reminder; this door sends none"
         )
+
+
+# ---------------------------------------------------------------------------
+# When the rewrite is refused, forge says what to do (rule 23, 2026-09-06)
+# ---------------------------------------------------------------------------
+
+
+def _refused_reply(reason: str) -> Any:
+    """The spec writer's revision round coming back NOT ok: the checker
+    refused the rewrite (the must-pass "what the note asks must change, and
+    nothing else may move without reason")."""
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="error"), role_output={}, reason=reason
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_rewrite_after_your_note_says_what_to_do(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The owner sent a note; the checker refused the rewrite. The thread says
+    whose note it was, quotes it, gives the checker's reason in one sentence,
+    says nothing was built, and says what to do — one message, no card."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("reject", notes=_THE_NOTE)]),
+        spec_replies=[
+            _spec_reply(),
+            _refused_reply(
+                "the rewrite changed the first example, which the note did not mention."
+            ),
+        ],
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert len(_digest_cards(h)) == 1  # no second card
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert errors == [
+        f"Planning run {CID} stopped at the spec: the spec writer could not "
+        f'honour your note "{_THE_NOTE}" — the checker refused the rewrite twice '
+        "(the rewrite changed the first example, which the note did not "
+        "mention). Nothing was built. To try again, send the sentence again "
+        "with the note folded into it."
+    ]
+    # The machine record keeps the internal reason and names whose note it was.
+    error = store.get_run(CID)["error"] or ""
+    assert error.startswith("007 dispatch error: the rewrite changed the first example")
+    assert "the checker refused the revision round after the owner's note" in error
+
+
+@pytest.mark.asyncio
+async def test_a_refused_first_round_keeps_todays_plain_sentence(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """No note yet, so nothing to honour: the first-round failure keeps the
+    default sentence (the plain stage name plus the leg's reason)."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        spec_replies=[_refused_reply("no specialist was reachable")],
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert len(errors) == 1
+    assert errors[0].startswith(f"Planning run {CID} stopped at writing the spec: ")
+    assert "could not honour" not in errors[0]
+    assert "007 dispatch error: no specialist was reachable" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_with_no_reason_still_says_what_to_do(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("reject", notes=_THE_NOTE)]),
+        spec_replies=[_spec_reply(), _refused_reply("")],
+    )
+
+    await h.driver.drive(CID)
+
+    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert errors == [
+        f"Planning run {CID} stopped at the spec: the spec writer could not "
+        f'honour your note "{_THE_NOTE}" — the checker refused the rewrite twice '
+        "(the checker gave no reason). Nothing was built. To try again, send "
+        "the sentence again with the note folded into it."
+    ]
