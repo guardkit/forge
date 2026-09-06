@@ -331,7 +331,6 @@ def deployed_in_for(repo_root: Path) -> str | None:
     return "docker-sandbox" if profile.sandbox is not None else None
 
 
-def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") -> None:
 def _mint_repair_row(
     pool: Any,
     build_id: str,
