@@ -515,7 +515,11 @@ async def execute_merge_deploy(
             try:
                 baseline_path.parent.mkdir(parents=True, exist_ok=True)
                 baseline_path.write_text(
-                    json.dumps({"failing": baseline_failing}, indent=2, sort_keys=True),
+                    json.dumps(
+                        {"failing_node_ids": baseline_failing},
+                        indent=2,
+                        sort_keys=True,
+                    ),
                     encoding="utf-8",
                 )
                 args += ["--baseline-json", str(baseline_path)]

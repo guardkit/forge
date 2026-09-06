@@ -14,7 +14,6 @@ import json
 import stat
 import threading
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -65,7 +64,16 @@ def guardkit_on_the_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
         "baseline = None\n"
         "if '--baseline-json' in argv:\n"
         "    with open(argv[argv.index('--baseline-json') + 1]) as fh:\n"
-        "        baseline = json.load(fh)\n"
+        "        data = json.load(fh)\n"
+        # The real command accepts a bare list or an object carrying a
+        # failing_node_ids list, and stops with an error for anything else.
+        "    if isinstance(data, list):\n"
+        "        baseline = [str(x) for x in data]\n"
+        "    elif isinstance(data.get('failing_node_ids'), list):\n"
+        "        baseline = [str(x) for x in data['failing_node_ids']]\n"
+        "    else:\n"
+        "        sys.stderr.write('is an object without a failing_node_ids list')\n"
+        "        sys.exit(1)\n"
         "print(json.dumps({\n"
         "    'outcome': 'merged', 'post_sha': 'd' * 40, 'verify_ok': True,\n"
         "    'verify_status': 'passed', 'charged_failures': [],\n"
@@ -227,7 +235,9 @@ async def test_the_baseline_travels_inline_not_as_a_path(
     container_file = tmp_path / "container-only" / "merge-baseline.json"
     container_file.parent.mkdir()
     failing = ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
-    container_file.write_text(json.dumps({"failing": failing}), encoding="utf-8")
+    container_file.write_text(
+        json.dumps({"failing_node_ids": failing}), encoding="utf-8"
+    )
 
     run = _run(sidecar, repo)
     result = await run(
@@ -239,11 +249,41 @@ async def test_the_baseline_travels_inline_not_as_a_path(
         with_nats_streaming=False,
     )
     report = json.loads(result.stdout_tail)
-    assert report["baseline_seen"] == {"failing": failing}
+    assert result.status == "success"
+    # The command on the host read the list, so the file the sidecar wrote is
+    # in a shape the real merge command accepts.
+    assert report["baseline_seen"] == failing
     # The host's own copy is the one the command was pointed at.
     on_host = Path(report["argv"][report["argv"].index("--baseline-json") + 1])
     assert on_host == repo / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE}.json"
     assert on_host != container_file
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_file_written_the_old_way_is_still_read(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path, tmp_path: Path
+) -> None:
+    """Earlier versions of forge wrote the list under the name "failing".
+
+    A build whose baseline file was written before this change still has its
+    list carried across, so an upgrade never silently drops a baseline.
+    """
+    container_file = tmp_path / "old-shape" / "merge-baseline.json"
+    container_file.parent.mkdir()
+    failing = ["tests/test_a.py::test_one"]
+    container_file.write_text(json.dumps({"failing": failing}), encoding="utf-8")
+
+    run = _run(sidecar, repo)
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args(str(container_file)),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=900,
+        with_nats_streaming=False,
+    )
+    assert result.status == "success"
+    assert json.loads(result.stdout_tail)["baseline_seen"] == failing
 
 
 @pytest.mark.asyncio
