@@ -716,6 +716,78 @@ class TestTheQueueWaitsForTheMergeWord:
         assert unanswered_merge_cards(connection) != []
 
     @pytest.mark.asyncio
+    async def test_starting_up_says_nothing_about_old_unanswered_cards(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The shape the real record has: twenty-eight cards from a campaign
+        that was parked, all offered weeks ago and never answered. Starting
+        the service must not fill the log with news about them — nobody was
+        waiting for them, and this loop never was."""
+        for i in range(28):
+            _finished_build_with_an_open_card(
+                connection,
+                build_id=f"build-OLD{i:02d}",
+                feature_id=f"FEAT-OLD{i:02d}",
+                offered_at=START - timedelta(days=20),
+            )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+            await loop.tick()
+
+        assert "was not answered within" not in caplog.text
+        assert "is waiting for a press" not in caplog.text
+        # They hold nothing either, so the queue gets on with the next one.
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_only_the_card_the_queue_was_waiting_for_is_spoken_about(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One old card nobody was waiting for, and one the queue really was
+        holding behind. When the day passes, exactly one of them is named."""
+        _finished_build_with_an_open_card(
+            connection,
+            build_id="build-OLD00",
+            feature_id="FEAT-OLD00",
+            offered_at=START - timedelta(days=20),
+        )
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+        await loop.tick()
+        assert maker.admissions == []
+
+        clock.advance(A_DAY)
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+
+        lapsed = [
+            line
+            for line in caplog.text.splitlines()
+            if "was not answered within" in line
+        ]
+        assert len(lapsed) == 1
+        assert "FEAT-3ABD" in lapsed[0]
+        assert "FEAT-OLD00" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_nought_seconds_means_the_queue_never_waits_for_a_card(
         self,
         connection: sqlite3.Connection,

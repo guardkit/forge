@@ -550,12 +550,14 @@ class WorkQueueLoop:
         self._merge_offer_hold_seconds = merge_offer_hold_seconds
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, the set of repair
-        # rows it last reported as waiting, the set of merge cards it last
-        # said it was holding for, and the cards whose lapse it has said.
+        # rows it last reported as waiting, and the set of merge cards it
+        # last said it was holding for. The last one is also how the loop
+        # knows which cards it was actually waiting on, so it only speaks
+        # about a card running out of time if it was waiting for that card.
         self._last_hold: int | None = None
         self._waiting_said_for: frozenset[int] | None = None
         self._merge_hold_said_for: frozenset[str] | None = None
-        self._lapse_said: set[str] = set()
+        self._cards_waited_on: set[str] = set()
 
     # -- one pass --------------------------------------------------------
 
@@ -833,11 +835,18 @@ class WorkQueueLoop:
             return []
 
     def _release_lapsed_merge_cards(self) -> list[MergeCard]:
-        """Say once about every card that ran out of time; return the rest.
+        """Say once about every card the queue was waiting for that ran out
+        of time; return the cards it is still waiting for.
 
         A card that has waited longer than the window stops holding the
         queue. Nothing is cancelled: the branch is still there and a decision
         that arrives later is still honoured by the merge executor.
+
+        Only a card this loop was itself waiting for is spoken about. Old
+        cards nobody was waiting on — the record already holds a run of them
+        from a campaign that was parked — are simply not counted and not
+        mentioned, so starting the service does not fill the log with news
+        about cards that ran out of time weeks ago.
         """
         now = self._clock()
         waiting: list[MergeCard] = []
@@ -849,18 +858,18 @@ class WorkQueueLoop:
                 waiting.append(card)
 
         for card in lapsed:
-            if card.build_id in self._lapse_said:
+            if card.build_id not in self._cards_waited_on:
                 continue
-            self._lapse_said.add(card.build_id)
             logger.info(
                 "work queue: the merge card for %s was not answered within "
                 "%s; the queue moves on. Its branch is kept.",
                 card.feature_id,
                 plain_duration(self._merge_offer_hold_seconds),
             )
-        # A card that has been answered leaves the list altogether; forget it,
-        # so nothing here grows for ever.
-        self._lapse_said &= {card.build_id for card in lapsed}
+        # Remember exactly the cards the queue is waiting for now. A card that
+        # has run out of time or been answered drops out of this, so it is
+        # spoken about once and nothing here grows for ever.
+        self._cards_waited_on = {card.build_id for card in waiting}
         return waiting
 
     def _say_holding(
