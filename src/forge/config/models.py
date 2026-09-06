@@ -448,6 +448,20 @@ class QueueConfig(BaseModel):
             "once, in the channel, whether to keep it or drop it."
         ),
     )
+    merge_offer_hold_seconds: int = Field(
+        default=86400,
+        ge=0,
+        description=(
+            "How long the queue waits for the merge word before it moves on, "
+            "in seconds. A build that finished clean and whose merge card has "
+            "not been pressed counts as one piece of work in flight for this "
+            "long, so the next thing the factory plans is planned against a "
+            "main that already contains it. The default is a day — the same "
+            "day the card itself is kept. 0 means do not wait for a card at "
+            "all. Nothing is cancelled when the wait ends: the branch is kept "
+            "and a decision that arrives later is still honoured."
+        ),
+    )
 
 
 class BudgetGuards(BaseModel):

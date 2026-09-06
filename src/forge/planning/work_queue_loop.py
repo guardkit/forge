@@ -7,6 +7,8 @@ Public surface
   every ten seconds, a ``stale_tick`` once a week, and a ``run`` that drives
   both forever.
 - :func:`count_in_flight` — how much work the factory has running right now.
+- :func:`unanswered_merge_cards` — the merge cards that have been offered and
+  not yet answered, one per build.
 - :func:`paused_repositories` — the repositories with a card waiting on Rich.
 - :class:`Admission` — the four facts an admission hands to the run maker,
   plus the three that keep the Slack thread alive.
@@ -33,7 +35,9 @@ What the loop does, in order, every tick
    allows, the lowest-ranked eligible row is admitted and its planning run is
    created with the row's ORIGINAL correlation id. Nothing is re-published and
    no new id is minted, so every downstream receipt and the Slack thread keep
-   working.
+   working. A build whose merge card is still waiting for Rich's word is one
+   of those pieces of work: the queue holds behind it for up to a day, says
+   so once, and moves on when the card is answered or the day passes.
 4. **Takes out what can never be started.** A repair the admission refuses
    for a reason that will not change — a repository the configuration does
    not know, a budget profile with no cap, a row that names no build — is
@@ -85,6 +89,8 @@ from forge.pipeline.fix_admission import (
     REPUBLISHED_ACTION,
     FixAdmissionRefused,
 )
+from forge.pipeline.merge_executor import MERGE_DECISION_TARGET_IDENTIFIER
+from forge.pipeline.merge_offer import MERGE_OFFER_TARGET_IDENTIFIER
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     age_phrase,
@@ -179,6 +185,14 @@ PLANNING_ACTIVE_STATES: frozenset[str] = frozenset(
 #: leaves the queue (conductor rewire, coach item 2).
 BLOCKED_ACTION: str = "blocked"
 
+#: The stage row written when the merge card is put in front of Rich
+#: (``pipeline/merge_offer.py``), and the one written when he answers it
+#: either way (``pipeline/merge_executor.py`` — PASSED when he says merge,
+#: SKIPPED when he says no). The queue reads both by these names, so it is
+#: reading the rows the live ledger really has.
+MERGE_OFFER_ROW: str = MERGE_OFFER_TARGET_IDENTIFIER
+MERGE_DECISION_ROW: str = MERGE_DECISION_TARGET_IDENTIFIER
+
 #: How a run that ended badly is described in the row's closing reason.
 _FAILURE_WORDS: Mapping[str, str] = {
     PlanningState.FAILED.value: "the planning run failed",
@@ -267,18 +281,158 @@ def _count_in(connection: sqlite3.Connection, table: str, column: str, values: l
     return int(row[0]) if row else 0
 
 
-def count_in_flight(connection: sqlite3.Connection) -> int:
+@dataclass(frozen=True, slots=True)
+class MergeCard:
+    """One merge card that has been offered and has not been answered yet."""
+
+    build_id: str
+    feature_id: str
+    #: When the card was put in front of Rich.
+    offered_at: datetime
+
+    def has_lapsed(self, hold_seconds: int, now: datetime) -> bool:
+        """Has the card been waiting longer than the queue is willing to wait?"""
+        return (now - self.offered_at).total_seconds() >= hold_seconds
+
+
+def unanswered_merge_cards(connection: sqlite3.Connection) -> list[MergeCard]:
+    """Every build whose merge card has been offered and not yet answered.
+
+    One entry per build however many offer rows it has, and the earliest
+    offer is the moment the card started waiting. A build with a decision row
+    is not here at all: Rich pressed merge (the row says PASSED) or said no
+    (SKIPPED), and either way the card is answered and holds nothing.
+    """
+    try:
+        rows = connection.execute(
+            """
+            SELECT offer.build_id, builds.feature_id, MIN(offer.started_at)
+              FROM stage_log AS offer
+              JOIN builds ON builds.build_id = offer.build_id
+             WHERE offer.target_identifier = ?
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM stage_log AS decision
+                    WHERE decision.build_id = offer.build_id
+                      AND decision.target_identifier = ?
+               )
+             GROUP BY offer.build_id, builds.feature_id
+            """,
+            (MERGE_OFFER_ROW, MERGE_DECISION_ROW),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+    cards: list[MergeCard] = []
+    for row in rows:
+        offered_at = _read_time(row[2])
+        if offered_at is None:
+            # A card whose time cannot be read holds nothing: better the
+            # queue moves on than that one unreadable row stops it for ever.
+            logger.warning(
+                "work queue: the merge card for %s has an unreadable offer "
+                "time (%r), so it is not holding the queue",
+                row[1],
+                row[2],
+            )
+            continue
+        cards.append(MergeCard(str(row[0]), str(row[1]), offered_at))
+    return cards
+
+
+def _read_time(value: Any) -> datetime | None:
+    """A stage row's timestamp as a moment in time, or None if it is unreadable."""
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def open_merge_cards(
+    connection: sqlite3.Connection,
+    *,
+    hold_seconds: int,
+    now: datetime | None = None,
+) -> list[MergeCard]:
+    """The unanswered merge cards the queue is still willing to wait for.
+
+    ``hold_seconds`` of nought (or less) means the queue does not wait for a
+    merge card at all, so nothing is ever open.
+    """
+    if hold_seconds <= 0:
+        return []
+    moment = now or datetime.now(timezone.utc)
+    return [
+        card
+        for card in unanswered_merge_cards(connection)
+        if not card.has_lapsed(hold_seconds, moment)
+    ]
+
+
+def plain_duration(seconds: int) -> str:
+    """A waiting time in words: ``a day``, ``2 days``, ``an hour``, ``30 minutes``."""
+    if seconds >= 86400:
+        days = seconds // 86400
+        return "a day" if days == 1 else f"{days} days"
+    if seconds >= 3600:
+        hours = seconds // 3600
+        return "an hour" if hours == 1 else f"{hours} hours"
+    if seconds >= 60:
+        minutes = seconds // 60
+        return "a minute" if minutes == 1 else f"{minutes} minutes"
+    return "1 second" if seconds == 1 else f"{seconds} seconds"
+
+
+def merge_hold_line(cards: Sequence[MergeCard], now: datetime) -> str:
+    """Why the queue is holding, when an unanswered merge card is the reason."""
+    return "; ".join(
+        f"the merge card for {card.feature_id} is waiting for a press "
+        f"(offered {age_phrase(card.offered_at.isoformat(), now)})"
+        for card in cards
+    )
+
+
+def count_in_flight(
+    connection: sqlite3.Connection,
+    *,
+    merge_offer_hold_seconds: int = 0,
+    now: datetime | None = None,
+) -> int:
     """How many pieces of work the factory has running right now.
 
-    Planning runs in an active state plus builds in an active state — the
-    forge's own lists of "running now". Rows that are neither running nor
-    terminal (a build marked INTERRUPTED by boot recovery, waiting to be
-    re-carded) are not in flight: nothing is happening for them, and when
-    boot recovery re-cards one it becomes PAUSED and counts from then on.
+    Planning runs in an active state, plus builds in an active state — the
+    forge's own lists of "running now" — plus every build whose merge card
+    is still waiting for Rich's word.
+
+    **Why an open merge card is a piece of work in flight.** Rich's rule is
+    one piece of work at a time, and his decision of 24 August 2026 is that
+    merge means merge AND deploy. A build that finished clean but whose card
+    has not been pressed has not landed on main, so the next thing the
+    factory plans would be planned against a main that does not contain it —
+    which is exactly wrong for a ladder where each rung builds on the one
+    before. So the card counts, until it is answered or until
+    ``merge_offer_hold_seconds`` has passed (nought means do not wait at
+    all). A card answered either way never holds anything.
+
+    Rows that are neither running nor terminal (a build marked INTERRUPTED by
+    boot recovery, waiting to be re-carded) are not in flight: nothing is
+    happening for them, and when boot recovery re-cards one it becomes PAUSED
+    and counts from then on.
     """
-    return _count_in(
-        connection, "planning_runs", "state", sorted(PLANNING_ACTIVE_STATES)
-    ) + _count_in(connection, "builds", "status", sorted(BUILD_ACTIVE_STATES))
+    return (
+        _count_in(connection, "planning_runs", "state", sorted(PLANNING_ACTIVE_STATES))
+        + _count_in(connection, "builds", "status", sorted(BUILD_ACTIVE_STATES))
+        + len(
+            open_merge_cards(
+                connection, hold_seconds=merge_offer_hold_seconds, now=now
+            )
+        )
+    )
 
 
 def paused_repositories(connection: sqlite3.Connection) -> set[str]:
@@ -323,6 +477,8 @@ class WorkQueueLoop:
         | None = None,
         republish_build: Callable[[Any], Awaitable[None]] | None = None,
         admit_fix_rows: bool = False,
+        merge_cards: Callable[[], Sequence[MergeCard]] | None = None,
+        merge_offer_hold_seconds: int = 0,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
 
@@ -366,6 +522,15 @@ class WorkQueueLoop:
             False — the default and the shipped posture — leaves repair
             rows QUEUED where they can be read and listed, and the class
             order's "next I'd pick" line may still name one.
+        merge_cards:
+            Reads the merge cards that have been offered and not answered.
+            It is how the loop puts a name and an age on the card it is
+            waiting for. ``None`` means nothing here can read them, so the
+            loop never says a card is the reason it is holding.
+        merge_offer_hold_seconds:
+            How long the loop waits for a merge card before it moves on, and
+            the same window ``count_in_flight`` uses. Nought — the default
+            here — means do not wait for a card at all.
         """
         self._store = store
         self._count_in_flight = count_in_flight
@@ -381,11 +546,18 @@ class WorkQueueLoop:
         self._fix_build = fix_build
         self._republish_build = republish_build
         self._admit_fix_rows = admit_fix_rows
+        self._merge_cards = merge_cards
+        self._merge_offer_hold_seconds = merge_offer_hold_seconds
         # What the loop has already said, so it does not say it every ten
-        # seconds: the number it was last holding at, and the set of repair
-        # rows it last reported as waiting.
+        # seconds: the number it was last holding at, the set of repair
+        # rows it last reported as waiting, and the set of merge cards it
+        # last said it was holding for. The last one is also how the loop
+        # knows which cards it was actually waiting on, so it only speaks
+        # about a card running out of time if it was waiting for that card.
         self._last_hold: int | None = None
         self._waiting_said_for: frozenset[int] | None = None
+        self._merge_hold_said_for: frozenset[str] | None = None
+        self._cards_waited_on: set[str] = set()
 
     # -- one pass --------------------------------------------------------
 
@@ -537,19 +709,13 @@ class WorkQueueLoop:
 
     async def take_next(self) -> int | None:
         """Admit one row if the factory has room. Return the id, or None."""
+        waiting_cards = self._release_lapsed_merge_cards()
         in_flight = self._count_in_flight()
         if in_flight >= self._max_in_flight:
-            # Said once per change of the number, at INFO, so a queue that never
-            # admits anything is visible in the log rather than silent (2026-09-05).
-            if self._last_hold != in_flight:
-                self._last_hold = in_flight
-                logger.info(
-                    "work queue: holding — %d piece(s) of work in flight against a cap of %d",
-                    in_flight,
-                    self._max_in_flight,
-                )
+            self._say_holding(in_flight, waiting_cards)
             return None
         self._last_hold = None
+        self._merge_hold_said_for = None
 
         open_rows = self._store.list_open()
         eligible = [row for row in open_rows if self._is_eligible(row)]
@@ -651,6 +817,91 @@ class WorkQueueLoop:
             )
             return None
         return taken_id
+
+    # -- the merge card the queue waits for ------------------------------
+
+    def _unanswered_merge_cards(self) -> list[MergeCard]:
+        """The offered-and-unanswered merge cards, or none if nothing reads them."""
+        if self._merge_cards is None or self._merge_offer_hold_seconds <= 0:
+            return []
+        try:
+            return list(self._merge_cards())
+        except Exception as exc:  # noqa: BLE001 — a read never stops the loop
+            logger.warning(
+                "work queue: could not read the merge cards (%s); nothing is "
+                "held for one this tick",
+                exc,
+            )
+            return []
+
+    def _release_lapsed_merge_cards(self) -> list[MergeCard]:
+        """Say once about every card the queue was waiting for that ran out
+        of time; return the cards it is still waiting for.
+
+        A card that has waited longer than the window stops holding the
+        queue. Nothing is cancelled: the branch is still there and a decision
+        that arrives later is still honoured by the merge executor.
+
+        Only a card this loop was itself waiting for is spoken about. Old
+        cards nobody was waiting on — the record already holds a run of them
+        from a campaign that was parked — are simply not counted and not
+        mentioned, so starting the service does not fill the log with news
+        about cards that ran out of time weeks ago.
+        """
+        now = self._clock()
+        waiting: list[MergeCard] = []
+        lapsed: list[MergeCard] = []
+        for card in self._unanswered_merge_cards():
+            if card.has_lapsed(self._merge_offer_hold_seconds, now):
+                lapsed.append(card)
+            else:
+                waiting.append(card)
+
+        for card in lapsed:
+            if card.build_id not in self._cards_waited_on:
+                continue
+            logger.info(
+                "work queue: the merge card for %s was not answered within "
+                "%s; the queue moves on. Its branch is kept.",
+                card.feature_id,
+                plain_duration(self._merge_offer_hold_seconds),
+            )
+        # Remember exactly the cards the queue is waiting for now. A card that
+        # has run out of time or been answered drops out of this, so it is
+        # spoken about once and nothing here grows for ever.
+        self._cards_waited_on = {card.build_id for card in waiting}
+        return waiting
+
+    def _say_holding(
+        self, in_flight: int, waiting_cards: Sequence[MergeCard]
+    ) -> None:
+        """Say once — not every ten seconds — why nothing is being taken.
+
+        Said once per change of what is being waited for, at INFO, so a queue
+        that never admits anything is visible in the log rather than silent
+        (2026-09-05). When an unanswered merge card is among the work in
+        flight, the line names the card instead of counting pieces of work:
+        the card is the thing a person can do something about.
+        """
+        if waiting_cards:
+            said_for = frozenset(card.build_id for card in waiting_cards)
+            if self._merge_hold_said_for != said_for:
+                self._merge_hold_said_for = said_for
+                logger.info(
+                    "work queue: holding — %s",
+                    merge_hold_line(waiting_cards, self._clock()),
+                )
+            self._last_hold = in_flight
+            return
+
+        self._merge_hold_said_for = None
+        if self._last_hold != in_flight:
+            self._last_hold = in_flight
+            logger.info(
+                "work queue: holding — %d piece(s) of work in flight against a cap of %d",
+                in_flight,
+                self._max_in_flight,
+            )
 
     def _say_nothing_may_start(
         self, open_rows: Sequence[sqlite3.Row], eligible: Sequence[sqlite3.Row]
@@ -1170,6 +1421,7 @@ __all__ = [
     "BUILD_WRITTEN_STATE",
     "FIX_KIND",
     "LOOP_ACTOR",
+    "MergeCard",
     "PLANNING_FAILURE_STATES",
     "PLANNING_SUCCESS_STATES",
     "PLANNING_TERMINAL_STATES",
@@ -1180,7 +1432,11 @@ __all__ = [
     "WorkQueueLoop",
     "count_in_flight",
     "first_sentence",
+    "merge_hold_line",
+    "open_merge_cards",
     "paused_repositories",
+    "plain_duration",
     "refusal_line",
     "shadow_line",
+    "unanswered_merge_cards",
 ]
