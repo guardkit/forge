@@ -751,9 +751,22 @@ _REWRITE_STILL_UNPROVEN = "still could not be proven"
 #: the reader does not have to find it.
 _NOTE_REFUSED_MESSAGE = (
     "Planning run {correlation_id} stopped at the spec: the spec writer could "
-    'not honour {whose} "{note}" — the checker refused the rewrite twice '
+    'not honour your note "{note}" — the checker refused the rewrite twice '
     "({reason}). Nothing was built. To try again, send the sentence again "
     "with the note folded into it."
+)
+
+#: The same event when the note was the MACHINE's (Part A, rule 6): the note
+#: is a list of titles and an instruction, so quoting it back would be noise.
+#: The owner reads how many examples could not be proven, that the machine
+#: tried once, why the checker refused, and the shape of sentence that works.
+_MACHINE_NOTE_REFUSED_MESSAGE = (
+    "Planning run {correlation_id} stopped at {stage}: {count} of the worked "
+    "examples could not be proven as written, and when the machine asked the "
+    "spec writer to rewrite them as what the endpoint does, the checker refused "
+    "the rewrite twice ({reason}). Nothing was built. To try again, send the "
+    "sentence as what the endpoint does: the method and path, the status code, "
+    "and what is in the reply."
 )
 
 
@@ -2679,13 +2692,23 @@ class PlanningRunDriver:
         """The owner's sentence when the checker refused a revision round
         (rule 23): whose note it was, the note itself, the checker's reason in
         one sentence, that nothing was built, and what to do next."""
-        whose = "the machine's note" if note_from_machine else "your note"
         one_sentence = " ".join(str(reason or "").split()).rstrip(".").strip()
+        reason_words = one_sentence or "the checker gave no reason"
+        if note_from_machine:
+            # The machine's note lists the refused titles one per "- " line
+            # (:meth:`_machine_rewrite_note`); count them rather than quote them.
+            titles = [ln for ln in note.splitlines() if ln.strip().startswith("- ")]
+            count = str(len(titles)) if titles else "some"
+            return _MACHINE_NOTE_REFUSED_MESSAGE.format(
+                correlation_id=correlation_id,
+                stage=plain_stage_name(_FEATURE_PLAN_STAGE),
+                count=count,
+                reason=reason_words,
+            )
         return _NOTE_REFUSED_MESSAGE.format(
             correlation_id=correlation_id,
-            whose=whose,
             note=note,
-            reason=one_sentence or "the checker gave no reason",
+            reason=reason_words,
         )
 
     def _advance_after_spec(self, correlation_id: str) -> bool:

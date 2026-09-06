@@ -5058,8 +5058,10 @@ async def test_a_refused_rewrite_stops_with_the_words_that_say_what_to_do(
 ) -> None:
     """Rule 23 with the machine as the author: the checker refused the
     revision round (the dispatch came back not ok after the machine's note).
-    The owner reads whose note it was, the note itself, the checker's reason,
-    that nothing was built, and what to do. One message, no card."""
+    The owner reads how many examples could not be proven, that the machine
+    tried once, the checker's reason, that nothing was built, and the shape of
+    sentence that works. One message, no card; the machine's note (a list of
+    titles) is not quoted back."""
     repo, git = _enforced_repo(tmp_path)
     _queue(store)
     sink: dict[str, Any] = {}
@@ -5080,11 +5082,13 @@ async def test_a_refused_rewrite_stops_with_the_words_that_say_what_to_do(
     assert h.ctx["counters"]["spec"] == 2
     assert h.ctx["counters"]["plan"] == 1
     assert _error_cards(h) == [
-        f"Planning run {CID} stopped at the spec: the spec writer could not "
-        f'honour the machine\'s note "{_MACHINE_NOTE_FOR_TITLES}" — the checker '
+        f"Planning run {CID} stopped at writing the task plan: 2 of the worked "
+        "examples could not be proven as written, and when the machine asked the "
+        "spec writer to rewrite them as what the endpoint does, the checker "
         "refused the rewrite twice (the rewrite moved two examples the note did "
-        "not name). Nothing was built. To try again, send the sentence again "
-        "with the note folded into it."
+        "not name). Nothing was built. To try again, send the sentence as what "
+        "the endpoint does: the method and path, the status code, and what is "
+        "in the reply."
     ]
     error = store.get_run(CID)["error"] or ""
     assert error.startswith("007 dispatch error: the rewrite moved two examples")
