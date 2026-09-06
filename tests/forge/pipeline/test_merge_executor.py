@@ -913,3 +913,291 @@ class TestTheReportIsOnTheBuildsRecord:
         assert outcome.result == "merged-and-running"
 
         assert self_closed_defect_rate(pool.connection) == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# The merge word's checks: "could not run" is not "did not pass"
+# ---------------------------------------------------------------------------
+
+
+def _repair_rows(pool: SqliteLifecyclePersistence) -> list[str]:
+    """Every repair sentence sitting in the work queue."""
+    rows = pool.connection.execute(
+        "SELECT sentence FROM work_queue WHERE kind = 'fix' ORDER BY id"
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+class TestChecksThatCouldNotRun:
+    """The first real press of a merge card (FEAT-3ABD, 2026-09-06) merged the
+    branch and then said "the post-merge checks did not pass: test runner could
+    not start" — and filed a repair row for a failure no code could fix. Both
+    halves of that are fixed here."""
+
+    def _report(self, verify_status: str, **extra: Any) -> dict[str, Any]:
+        report = {
+            "outcome": "merged",
+            "post_sha": "c" * 40,
+            "verify_ok": False,
+            "verify_status": verify_status,
+            "verify_detail": "test runner could not start",
+            "charged_failures": [],
+        }
+        report.update(extra)
+        return report
+
+    @pytest.mark.asyncio
+    async def test_checks_that_could_not_run_say_so(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(status="failed", report=self._report("unverified"))
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "unverified"
+        assert "could not run: test runner could not start" in outcome.detail
+        assert "did not pass" not in outcome.detail
+        assert "The deploy was not dispatched." in outcome.detail
+        assert dp.calls == []
+        assert publisher.reports[0].verify_status == "unverified"
+
+    @pytest.mark.asyncio
+    async def test_checks_that_could_not_run_file_no_repair(
+        self, config, pool, repo_root, caplog
+    ) -> None:
+        gk = _FakeGuardKit(status="failed", report=self._report("unverified"))
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        with caplog.at_level("INFO"):
+            outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert _repair_rows(pool) == []
+        assert any(
+            "could not run, so no repair was filed" in record.getMessage()
+            and FEATURE_ID in record.getMessage()
+            for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_checks_that_ran_and_went_red_still_say_did_not_pass(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            status="failed",
+            report=self._report(
+                "failed",
+                verify_detail="2 charged failures",
+                charged_failures=[
+                    "tests/test_a.py::test_one",
+                    "tests/test_b.py::test_two",
+                ],
+            ),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.verify_status == "failed"
+        assert "did not pass" in outcome.detail
+        assert "could not run" not in outcome.detail
+        assert "2 charged failure(s)" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_checks_that_ran_and_went_red_file_a_repair(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            status="failed",
+            report=self._report(
+                "failed", charged_failures=["tests/test_a.py::test_one"]
+            ),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        await _run_executor(deps, repo_root)
+
+        rows = _repair_rows(pool)
+        assert len(rows) == 1
+        assert FEATURE_ID in rows[0]
+
+    @pytest.mark.asyncio
+    async def test_a_report_with_no_word_about_the_checks_still_files(
+        self, config, pool, repo_root
+    ) -> None:
+        """An older merge report says only verify_ok=false. The checks ran as
+        far as anyone can tell, so the repair is still filed."""
+        gk = _FakeGuardKit(
+            status="failed",
+            report={
+                "outcome": "merged",
+                "post_sha": "c" * 40,
+                "verify_ok": False,
+                "verify_detail": "3 tests failed",
+            },
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.verify_status == "failed"
+        assert len(_repair_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_reverted_deploy_still_files_a_repair(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(
+            config, pool, deploy=_FakeDeploy(outcome="reverted", verdict="fail")
+        )
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-reverted"
+        assert len(_repair_rows(pool)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The merge run through the deploy sidecar reads exactly the same
+# ---------------------------------------------------------------------------
+
+
+class TestTheSameMergeThroughTheSidecar:
+    """The whole point of moving the checks to the host is that NOTHING else
+    changes. Drive the executor twice on the same merge report — once with the
+    in-container run faked, once through a REAL deploy sidecar on an ephemeral
+    loopback port running a REAL fake guardkit executable — and compare the
+    outcome and the receipts."""
+
+    REPORT = {
+        "outcome": "merged",
+        "post_sha": "e" * 40,
+        "verify_ok": True,
+        "verify_status": "passed",
+        "charged_failures": [],
+        "checks_passed": 17,
+        "checks_total": 17,
+    }
+
+    @staticmethod
+    def _fresh_pool(path: Path) -> SqliteLifecyclePersistence:
+        cx = sqlite_connect.connect_writer(path)
+        migrations.apply_at_boot(cx)
+        return SqliteLifecyclePersistence(connection=cx)
+
+    @staticmethod
+    def _normalise(receipt: dict[str, Any]) -> dict[str, Any]:
+        """Take out the three things that cannot be equal across two runs: how
+        long each took, when each finished, and the newline a real command
+        prints at the end of its report where a fake in-process one does not.
+        Everything else — the report, the sha, the counts, the outcome — is
+        compared exactly."""
+        cleaned = dict(receipt)
+        for key in ("duration_secs", "completed_at"):
+            cleaned.pop(key, None)
+        if isinstance(cleaned.get("stdout_tail"), str):
+            cleaned["stdout_tail"] = cleaned["stdout_tail"].strip()
+        return cleaned
+
+    @pytest.mark.asyncio
+    async def test_same_outcome_and_receipts_either_way(
+        self, config, pool, repo_root, tmp_path, monkeypatch
+    ) -> None:
+        import stat as stat_module
+        import threading
+
+        from forge.adapters.guardkit.run_via_sidecar import (
+            build_sidecar_guardkit_run,
+        )
+        from forge.deploy_sidecar.service import (
+            GUARDKIT_PATH_ENV,
+            build_server,
+        )
+
+        baseline = ["tests/test_known_red.py::test_password"]
+
+        # --- run one: the in-container guardkit, faked ---------------------
+        in_container_receipts = tmp_path / "receipts-in-container"
+        in_container_pool = self._fresh_pool(tmp_path / "in-container.db")
+        publisher_a = _FakePublisher()
+        deps_a = MergeExecutorDeps(
+            config=config,
+            pool=in_container_pool,
+            pipeline_publisher=publisher_a,
+            guardkit_run=_FakeGuardKit(report=dict(self.REPORT)),
+            deploy_dispatcher=_FakeDeploy(),
+            receipts_root_fn=lambda: in_container_receipts,
+        )
+        outcome_a = await _run_executor(
+            deps_a, repo_root, baseline_failing=baseline
+        )
+
+        # --- run two: the same report, through a real sidecar --------------
+        report_file = tmp_path / "merge-report.json"
+        report_file.write_text(json.dumps(self.REPORT), encoding="utf-8")
+        fake_guardkit = tmp_path / "bin" / "guardkit"
+        fake_guardkit.parent.mkdir(parents=True, exist_ok=True)
+        fake_guardkit.write_text(
+            "#!/usr/bin/env python3\n"
+            f"print(open({str(report_file)!r}).read())\n",
+            encoding="utf-8",
+        )
+        fake_guardkit.chmod(
+            fake_guardkit.stat().st_mode | stat_module.S_IXUSR | stat_module.S_IXOTH
+        )
+        monkeypatch.setenv(GUARDKIT_PATH_ENV, str(fake_guardkit))
+
+        server = build_server(port=0, config_loader=lambda: config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address[:2]
+            sidecar_receipts = tmp_path / "receipts-sidecar"
+            sidecar_pool = self._fresh_pool(tmp_path / "sidecar.db")
+            publisher_b = _FakePublisher()
+            deps_b = MergeExecutorDeps(
+                config=config,
+                pool=sidecar_pool,
+                pipeline_publisher=publisher_b,
+                guardkit_run=build_sidecar_guardkit_run(
+                    base_url=f"http://{host}:{port}",
+                    repo_paths={REPO: str(repo_root)},
+                ),
+                deploy_dispatcher=_FakeDeploy(),
+                receipts_root_fn=lambda: sidecar_receipts,
+            )
+            outcome_b = await _run_executor(
+                deps_b, repo_root, baseline_failing=baseline
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # The merge really did run on the host, through the sidecar.
+        host_baseline = (
+            repo_root / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE_ID}.json"
+        )
+        assert json.loads(host_baseline.read_text(encoding="utf-8")) == {
+            "failing": baseline
+        }
+
+        # The outcome a person reads is identical.
+        assert outcome_a.result == outcome_b.result == "merged-and-running"
+        assert outcome_a.detail == outcome_b.detail
+        assert outcome_a.merged_sha == outcome_b.merged_sha == "e" * 40
+        assert outcome_a.checks_passed == outcome_b.checks_passed == 17
+        assert outcome_a.checks_total == outcome_b.checks_total == 17
+        assert outcome_a.verify_status == outcome_b.verify_status
+
+        # And so are the receipts, once the clock is taken out of them.
+        for name in (
+            "merge_deploy_merge.json",
+            "digest_conformance.json",
+            "merge_deploy_deploy.json",
+            "merge_deploy_report.json",
+        ):
+            left = json.loads(
+                (in_container_receipts / f"merge-{BUILD_ID}" / name).read_text(
+                    encoding="utf-8"
+                )
+            )
+            right = json.loads(
+                (sidecar_receipts / f"merge-{BUILD_ID}" / name).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert self._normalise(left) == self._normalise(right), name
