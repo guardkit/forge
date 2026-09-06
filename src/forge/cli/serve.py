@@ -259,6 +259,45 @@ async def _default_open_fleet_client(nats_url: str) -> Any:
 open_fleet_client: FleetClientOpenerFn = _default_open_fleet_client
 
 
+def compose_merge_guardkit_run(forge_config: Any) -> Any:
+    """Choose where the merge word's post-merge checks run, and say so.
+
+    The checks used to run inside the forge container, which has no host
+    virtual environment — so a repository's own test command exited 127 and the
+    merge could only report that the test runner would not start. When the
+    deploy sidecar has an address, the checks go to it and run on the host,
+    beside the builds' own tests; when it has none, they run in the container
+    exactly as before.
+
+    Returns the callable the merge executor uses as its ``guardkit_run``, and
+    logs one line naming which of the two was chosen.
+    """
+    deploy_settings = getattr(forge_config, "deploy", None)
+    sidecar_url = str(getattr(deploy_settings, "sidecar_url", "") or "").strip()
+    if not sidecar_url:
+        from forge.adapters.guardkit.run import run as in_container_run
+
+        logger.info(
+            "forge-serve: the merge word runs its checks inside the forge "
+            "container (no deploy sidecar configured)"
+        )
+        return in_container_run
+
+    from forge.adapters.guardkit.run_via_sidecar import (
+        build_sidecar_guardkit_run,
+    )
+
+    logger.info(
+        "forge-serve: the merge word runs its checks on the host through the "
+        "deploy sidecar at %s",
+        sidecar_url,
+    )
+    return build_sidecar_guardkit_run(
+        base_url=sidecar_url,
+        repo_paths=dict(forge_config.planning.target_repo_paths),
+    )
+
+
 def bind_production_dispatch_chain(
     *,
     forge_config: Any,
@@ -699,7 +738,6 @@ def bind_production_dispatch_chain(
         try:
             _merge_cfg = getattr(forge_config, "merge_executor", None)
             if _merge_cfg is not None and _merge_cfg.enabled:
-                from forge.adapters.guardkit.run import run as _merge_guardkit_run
                 from forge.adapters.nats.envelope_subscribe import (
                     EnvelopeSubscribeClient,
                 )
@@ -714,7 +752,7 @@ def bind_production_dispatch_chain(
                         config=forge_config,
                         pool=sqlite_pool,
                         pipeline_publisher=publisher,
-                        guardkit_run=_merge_guardkit_run,
+                        guardkit_run=compose_merge_guardkit_run(forge_config),
                         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
                             config=forge_config,
                             nats_client=client,

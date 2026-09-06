@@ -49,6 +49,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_DETAILS_KEY,
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
+    git_rev_parse_main,
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
 from forge.receipts import receipts_root
@@ -62,6 +63,9 @@ __all__ = [
     "MERGE_RESPONSE_SUBJECT_FILTER",
     "MERGE_STEP_DEPLOY_TARGET_IDENTIFIER",
     "MERGE_STEP_MERGE_TARGET_IDENTIFIER",
+    "MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS",
+    "MERGE_WALL_CAP_SECONDS",
+    "MERGE_WALL_MERGE_ALLOWANCE_SECONDS",
     "MergeApprovalConsumer",
     "MergeDeployOutcome",
     "MergeExecutorDeps",
@@ -69,6 +73,8 @@ __all__ = [
     "build_in_daemon_deploy_dispatcher",
     "execute_merge_deploy",
     "deployed_in_for",
+    "merge_wall_seconds",
+    "merged_after_all_sha",
 ]
 
 #: CORE subscription filter — one token per feature (``merge-FEAT-X``).
@@ -92,8 +98,43 @@ MERGE_STEP_DEPLOY_TARGET_IDENTIFIER: str = "merge_deploy_deploy"
 MERGE_REPORT_STAGE_LABEL: str = "merge-deploy"
 MERGE_REPORT_TARGET_IDENTIFIER: str = "merge_deploy_executor"
 
-#: Hard wall on the guardkit merge+verify subprocess.
-MERGE_TIMEOUT_SECONDS: int = 900
+#: How long one run of the post-merge checks may take when the configuration
+#: does not say (``merge_executor.verify_timeout_seconds``).
+MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS: int = 600
+
+#: Seconds allowed for the merge itself, on top of the two check runs, when
+#: sizing the wall around the whole command.
+MERGE_WALL_MERGE_ALLOWANCE_SECONDS: int = 180
+
+#: The longest wall the deploy sidecar will accept. Written out here rather
+#: than imported so this module does not depend on the sidecar; a test pins
+#: the two together (``deploy_sidecar.service.MERGE_TIMEOUT_MAX``).
+MERGE_WALL_CAP_SECONDS: int = 1800
+
+
+def merge_wall_seconds(verify_timeout_seconds: int) -> int:
+    """How long the whole merge command may take, given one check run's limit.
+
+    The merge command may run the checks TWICE — once on main to see what was
+    already failing, once on the merged tree — and merges in between. So the
+    wall around the whole thing holds two check runs plus three minutes, and
+    never more than the deploy sidecar will accept. Sized any smaller, the
+    outer wall fires first and the merge is killed mid-flight: the branch is
+    on main and nothing says so.
+    """
+    wall = 2 * int(verify_timeout_seconds) + MERGE_WALL_MERGE_ALLOWANCE_SECONDS
+    return min(wall, MERGE_WALL_CAP_SECONDS)
+
+
+def _verify_timeout_from(config: Any) -> int:
+    """Read ``merge_executor.verify_timeout_seconds``, falling back plainly."""
+    value = getattr(
+        getattr(config, "merge_executor", None), "verify_timeout_seconds", None
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS
+    return value
+
 
 #: ``details_json`` key on the decision row.
 MERGE_DECISION_DETAILS_KEY: str = "merge_decision"
@@ -124,6 +165,10 @@ class MergeDeployOutcome:
     #: block; None otherwise, which is every case that behaved as it always
     #: did. Jarvis reads it to say "running in its Docker Sandbox".
     deployed_in: str | None = None
+    #: What the post-merge checks did, in guardkit's own word: "failed" when
+    #: they ran and something went red, "unverified" when they could not run at
+    #: all. ``None`` for every ending that is not about the checks.
+    verify_status: str | None = None
 
 
 @dataclass
@@ -214,6 +259,45 @@ def _report_refusal(report: dict[str, Any]) -> str | None:
     return None
 
 
+def _last_sentence(text: str | None, limit: int = 300) -> str:
+    """The last non-empty line of ``text``, whole words only.
+
+    A command's stderr ends with the sentence that matters (the stopper's
+    "stopped after N seconds", the missing-runner sentence) after however
+    many log lines came before it. A raw character slice of the tail cut
+    that sentence mid-word on Rich's merge card (seam coach, 2026-09-06);
+    the last line, trimmed at a word boundary, reads as a sentence.
+    """
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    if len(last) <= limit:
+        return last
+    cut = last[-limit:]
+    # Drop the leading partial word so the sentence starts on a whole one.
+    _first_space, _sep, rest = cut.partition(" ")
+    return rest or cut
+
+
+def _conflict_sentence(report: dict[str, Any]) -> str | None:
+    """One plain sentence for a report that stopped on a merge conflict."""
+    if str(report.get("outcome", "")).strip().lower() != "conflict" and not report.get(
+        "conflict_files"
+    ):
+        return None
+    files = [str(f) for f in (report.get("conflict_files") or []) if str(f).strip()]
+    if files:
+        shown = ", ".join(files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
+        return (
+            f"the merge stopped on a conflict in {shown}; nothing was merged and "
+            "the branch is kept"
+        )
+    return "the merge stopped on a conflict; nothing was merged and the branch is kept"
+
+
 def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
     if not report:
         return None
@@ -248,12 +332,33 @@ def deployed_in_for(repo_root: Path) -> str | None:
 
 
 def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") -> None:
+def _mint_repair_row(
+    pool: Any,
+    build_id: str,
+    outcome: "MergeDeployOutcome",
+    *,
+    feature_id: str | None = None,
+) -> None:
     """File one repair row for a merge whose checks went red. Never raises.
+
+    A repair is only worth filing when the checks RAN and something came back
+    red — there is code to fix then. When the checks could not run at all, the
+    thing that is broken is the check itself, and no amount of building will
+    mend it; the first real press of a merge card filed exactly such a repair
+    for a failure no code could fix. So that case files nothing and says so in
+    one line instead.
 
     The producer already swallows everything; this call site catches too,
     because the merge report is the only durable record of what the merge
     did and a queue row must never be able to cost it.
     """
+    if outcome.result == "merged-verify-failed" and outcome.verify_status != "failed":
+        logger.info(
+            "merge-executor: the checks for %s could not run, so no repair was "
+            "filed — a person must look at the check itself",
+            feature_id or build_id,
+        )
+        return
     try:
         from forge.pipeline.fix_row_producer import (
             SOURCE_MERGE_REPORT,
@@ -274,6 +379,63 @@ def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") ->
             type(exc).__name__,
             exc,
         )
+
+
+async def _git_exit_code(repo_root: Path, *args: str) -> int | None:
+    """Run one git command in ``repo_root`` and return its exit code.
+
+    ``None`` when git could not be run at all. The same guardkit-free path the
+    offer uses to read main's sha: plain git, no shell, nothing written.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=str(repo_root),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
+        logger.warning(
+            "merge-executor: git %s could not be run in %s (%s)",
+            " ".join(args),
+            repo_root,
+            exc,
+        )
+        return None
+    return proc.returncode
+
+
+async def merged_after_all_sha(
+    repo_root: Path, feature_id: str, expect_main_sha: str
+) -> str | None:
+    """Did the merge land even though the command gave no answer?
+
+    When the merge command is killed — a timeout, or a crash after git had
+    already done the merge — it exits without printing its report. Calling
+    that "the merge was refused" is a lie the first small-scale drive caught:
+    the branch was on main and the report said nothing had happened.
+
+    So ask git itself, the same way the merge card pins its target commit
+    (:func:`forge.pipeline.merge_offer.git_rev_parse_main`). If main has moved
+    off the commit the merge was pinned to, AND main now contains the tip of
+    ``autobuild/<feature>``, the merge landed: return main's new commit.
+    Anything else — main unmoved, main moved for some other reason, git not
+    answering — returns ``None`` and the merge is reported as refused, which
+    is then the truth.
+    """
+    new_main = await git_rev_parse_main(repo_root)
+    pinned = (expect_main_sha or "").strip().lower()
+    if not new_main or new_main.strip().lower() == pinned:
+        return None
+    branch = f"autobuild/{feature_id}"
+    contains = await _git_exit_code(
+        repo_root, "merge-base", "--is-ancestor", branch, new_main
+    )
+    if contains != 0:
+        return None
+    return new_main
 
 
 def _report_sha(report: dict[str, Any] | None) -> str | None:
@@ -419,6 +581,7 @@ async def execute_merge_deploy(
             verdict=outcome.verdict,
             checks_passed=outcome.checks_passed,
             checks_total=outcome.checks_total,
+            verify_status=outcome.verify_status,
             detail=outcome.detail,
             digest_conformance_warning=conformance_warning,
             dry_run=dry_run,
@@ -453,7 +616,7 @@ async def execute_merge_deploy(
         # them: nothing changed, so there is nothing to repair. The dry run
         # is not one either: it changed nothing on purpose.
         if not dry_run and outcome.result in RED_MERGE_ENDINGS:
-            _mint_repair_row(deps.pool, build_id, outcome)
+            _mint_repair_row(deps.pool, build_id, outcome, feature_id=feature_id)
         return outcome
 
     # ------------------------------------------------------------------
@@ -507,6 +670,8 @@ async def execute_merge_deploy(
             },
         )
 
+        verify_timeout = _verify_timeout_from(deps.config)
+        merge_wall = merge_wall_seconds(verify_timeout)
         args = [
             "merge",
             feature_id,
@@ -514,6 +679,10 @@ async def execute_merge_deploy(
             "main",
             "--expect-main-sha",
             expect_main_sha,
+            # How long ONE run of the checks may take. The wall below holds
+            # the whole command: two such runs plus the merge between them.
+            "--verify-timeout",
+            str(verify_timeout),
             "--json",
         ]
         baseline_path: Path | None = None
@@ -524,7 +693,11 @@ async def execute_merge_deploy(
             try:
                 baseline_path.parent.mkdir(parents=True, exist_ok=True)
                 baseline_path.write_text(
-                    json.dumps({"failing": baseline_failing}, indent=2, sort_keys=True),
+                    json.dumps(
+                        {"failing_node_ids": baseline_failing},
+                        indent=2,
+                        sort_keys=True,
+                    ),
                     encoding="utf-8",
                 )
                 args += ["--baseline-json", str(baseline_path)]
@@ -542,7 +715,7 @@ async def execute_merge_deploy(
             args=args,
             repo_path=repo_root,
             read_allowlist=[repo_root],
-            timeout_seconds=MERGE_TIMEOUT_SECONDS,
+            timeout_seconds=merge_wall,
             with_nats_streaming=False,
         )
         report = _parse_merge_report(result)
@@ -553,14 +726,55 @@ async def execute_merge_deploy(
         merged_in_report = bool(report and report.get("outcome") == "merged")
         refusal: str | None = None
         result_status = getattr(result, "status", "failed")
-        if result_status != "success" and not merged_in_report:
-            stderr = (getattr(result, "stderr", None) or "").strip()
-            tail = (getattr(result, "stdout_tail", "") or "").strip()
-            refusal = f"the merge command did not succeed (status={result_status})" + (
-                f": {stderr[-400:]}" if stderr else (f": {tail[-400:]}" if tail else "")
+        stderr = (getattr(result, "stderr", None) or "").strip()
+        tail = (getattr(result, "stdout_tail", "") or "").strip()
+        # Whatever the sidecar or guardkit itself said about the trouble, in
+        # its own words — the timeout sentence, the missing-command sentence.
+        own_sentence = (
+            _last_sentence(stderr)
+            or _last_sentence(tail)
+            or f"the merge command did not succeed (status={result_status})"
+        )
+        if not merged_in_report:
+            generic: str | None = None
+            if result_status != "success":
+                generic = (
+                    f"the merge command did not succeed (status={result_status})"
+                    + (
+                        f": {_last_sentence(stderr)}"
+                        if stderr
+                        else (f": {_last_sentence(tail)}" if tail else "")
+                    )
+                )
+            if report is not None:
+                # A REPORT THAT PARSED SPEAKS FOR ITSELF. Guardkit writes one
+                # plain sentence saying why it would not merge (a dirty tree,
+                # a target that moved, a missing branch); passing that through
+                # verbatim beats wrapping it in words of our own.
+                spoken = report.get("refusal_reason")
+                if isinstance(spoken, str) and spoken.strip():
+                    refusal = spoken.strip()
+                else:
+                    # A conflict report carries no refusal sentence of its
+                    # own, only the files; say those in words rather than
+                    # the last 400 characters of the JSON (seam coach,
+                    # 2026-09-06 — a slice cut mid-word on Rich's card).
+                    refusal = (
+                        _conflict_sentence(report)
+                        or _report_refusal(report)
+                        or generic
+                    )
+            else:
+                refusal = generic
+
+        # THE MERGE MAY HAVE LANDED ANYWAY. A command that was killed, or that
+        # died before it could print its report, leaves no answer at all — but
+        # git knows. Ask git before calling a landed merge refused.
+        landed_sha: str | None = None
+        if refusal and report is None and result_status != "success":
+            landed_sha = await merged_after_all_sha(
+                repo_root, feature_id, expect_main_sha
             )
-        elif report is not None and not merged_in_report:
-            refusal = _report_refusal(report)
 
         _write_receipt(
             "merge_deploy_merge.json",
@@ -570,10 +784,26 @@ async def execute_merge_deploy(
                 "exit_code": getattr(result, "exit_code", None),
                 "refusal": refusal,
                 "report": report,
+                "landed_sha": landed_sha,
                 "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
                 "baseline_file": str(baseline_path) if baseline_path else None,
             },
         )
+        if refusal and landed_sha:
+            return await _publish_report(
+                MergeDeployOutcome(
+                    result="merged-verify-failed",
+                    status="FAILED",
+                    merged_sha=landed_sha,
+                    failed_step="verify",
+                    detail=(
+                        f"{feature_id} merged ({landed_sha[:10]}), but the "
+                        f"post-merge checks could not finish: {own_sentence}. "
+                        "The deploy was not dispatched."
+                    ),
+                    verify_status="unverified",
+                )
+            )
         if refusal:
             return await _publish_report(
                 MergeDeployOutcome(
@@ -615,25 +845,41 @@ async def execute_merge_deploy(
 
         if merged_in_report and report.get("verify_ok") is False:
             charged = report.get("charged_failures") or []
+            # Guardkit says "unverified" when the checks could not START at
+            # all — a missing interpreter, a command that is not there. That
+            # is not a failing test, and calling it one sent Rich looking for
+            # a red test that did not exist. Say which of the two happened.
+            could_not_run = (
+                str(report.get("verify_status") or "").strip().lower() == "unverified"
+            )
+            why = str(
+                report.get("verify_detail")
+                or report.get("verify_status")
+                or "verification failed"
+            )
+            if could_not_run:
+                detail = (
+                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                    f"post-merge checks could not run: {why}. "
+                    "The deploy was not dispatched."
+                )
+            else:
+                detail = (
+                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                    f"post-merge checks did not pass: {why}"
+                    + (f" — {len(charged)} charged failure(s)" if charged else "")
+                    + ". The deploy was not dispatched."
+                )
             return await _publish_report(
                 MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
                     merged_sha=merged_sha,
                     failed_step="verify",
-                    detail=(
-                        f"{feature_id} merged ({(merged_sha or '')[:10]}), "
-                        "but the post-merge checks did not pass: "
-                        + str(
-                            report.get("verify_detail")
-                            or report.get("verify_status")
-                            or "verification failed"
-                        )
-                        + (f" — {len(charged)} charged failure(s)" if charged else "")
-                        + ". The deploy was not dispatched."
-                    ),
+                    detail=detail,
                     checks_passed=checks_passed,
                     checks_total=checks_total,
+                    verify_status="unverified" if could_not_run else "failed",
                 )
             )
 
