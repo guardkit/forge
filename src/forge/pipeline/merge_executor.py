@@ -496,10 +496,22 @@ async def execute_merge_deploy(
             )
 
     def _has_step(target_identifier: str) -> bool:
-        return any(
-            s.target_identifier == target_identifier
+        """Is this step on the build's record as claimed or done?
+
+        The LAST row for the step decides. A merge that refused before it
+        touched anything releases its claim with a SKIPPED row (2026-09-06:
+        Rich's press refused over a dirty tree and the build could never be
+        pressed again, although nothing had merged), so a released step is
+        free to run once more; a claimed or completed step is not.
+        """
+        rows = [
+            s
             for s in deps.pool.read_stages(build_id)
-        )
+            if s.target_identifier == target_identifier
+        ]
+        if not rows:
+            return False
+        return str(rows[-1].status or "").upper() != "SKIPPED"
 
     def _claim_step(target_identifier: str, details: dict[str, Any]) -> None:
         now = deps.clock()
@@ -515,6 +527,27 @@ async def execute_merge_deploy(
                 completed_at=now,
                 duration_secs=0.0,
                 details=details,
+            )
+        )
+
+    def _release_step(target_identifier: str, reason: str) -> None:
+        """Give a claimed step back: nothing happened, so the build may be
+        pressed again. Written as a SKIPPED row carrying the reason, after
+        the claim, so the record says both that it was claimed and why it
+        was let go."""
+        now = deps.clock()
+        deps.pool.record_stage(
+            StageLogEntry(
+                build_id=build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=target_identifier,
+                status="SKIPPED",
+                gate_mode="MANDATORY_HUMAN_APPROVAL",
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"merge_step": {"released": True, "reason": reason}},
             )
         )
 
@@ -804,6 +837,9 @@ async def execute_merge_deploy(
                 )
             )
         if refusal:
+            # Nothing landed (main did not move), so the merge step goes
+            # back: the next press may run it again once the cause is gone.
+            _release_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER, refusal)
             return await _publish_report(
                 MergeDeployOutcome(
                     result="merge-refused",
