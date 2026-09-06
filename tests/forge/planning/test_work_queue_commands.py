@@ -15,11 +15,14 @@ import pytest
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
 from forge.planning.work_queue_commands import (
+    REJECTED_BY_OWNER,
     age_phrase,
+    closed_word,
     execute_command,
     NOT_A_ROW_NUMBER,
     list_reply,
     queued_reply,
+    was_rejected_by_owner,
 )
 from forge.planning.work_queue_store import WorkQueueStore
 
@@ -386,6 +389,35 @@ class TestBeforeARowThatIsGone:
         )
         assert store.get_by_correlation_id("plan-before") is None
 
+    def test_a_row_rich_rejected_is_said_as_that_not_as_blocked(
+        self, store: WorkQueueStore
+    ) -> None:
+        """Rule 26 (2026-09-06): a blocked row whose reason starts with the
+        reject words is spoken as his reject wherever a closed row's status
+        is spoken; the stored status stays BLOCKED."""
+        filed = _file(store, "plan-1")
+        store.close(
+            filed.queue_id,
+            status="BLOCKED",
+            actor_identity="forge-work-queue",
+            reason="rejected by you: wrong endpoint",
+        )
+        reply = _run(
+            store,
+            {
+                "verb": "add_before",
+                "id": filed.queue_id,
+                "sentence": "do this one sooner",
+            },
+            correlation_id="plan-before",
+        )
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it was rejected by you."
+        )
+        assert store.get_by_correlation_id("plan-before") is None
+        row = store.get(filed.queue_id)
+        assert row is not None and row["status"] == "BLOCKED"
+
     def test_it_never_goes_to_the_back_of_the_queue(
         self, store: WorkQueueStore
     ) -> None:
@@ -504,3 +536,100 @@ class TestLinksThatWouldNeverEnd:
             f"#{second.queue_id} will wait until #{first.queue_id} is done."
         )
         assert store.get(second.queue_id)["after_id"] == first.queue_id
+
+
+# ---------------------------------------------------------------------------
+# How a closed row's status is spoken (rule 26, 2026-09-06)
+# ---------------------------------------------------------------------------
+
+
+class TestHowAClosedRowIsSpoken:
+    """One helper speaks every closed row; the reject is the one case where
+    the stored status (BLOCKED) and the spoken word differ."""
+
+    def test_the_reject_words_are_as_the_spec_writes_them(self) -> None:
+        assert REJECTED_BY_OWNER == "rejected by you"
+
+    @pytest.mark.parametrize(
+        ("status", "reason", "expected"),
+        [
+            ("DONE", None, "done"),
+            ("WITHDRAWN", None, "withdrawn"),
+            ("BLOCKED", "the planning run failed", "blocked"),
+            ("BLOCKED", None, "blocked"),
+            ("BLOCKED", "rejected by you", "rejected by you"),
+            ("BLOCKED", "rejected by you: wrong endpoint", "rejected by you"),
+            # The words have to START the reason; a failure that merely
+            # mentions them is still a failure.
+            ("BLOCKED", "the run was not rejected by you", "blocked"),
+            # Only a BLOCKED row can be his reject; the loop writes it there.
+            ("WITHDRAWN", "rejected by you", "withdrawn"),
+        ],
+    )
+    def test_the_word_for_each_closed_row(
+        self, status: str, reason: str | None, expected: str
+    ) -> None:
+        row = {"status": status, "closed_reason": reason}
+        assert closed_word(row) == expected
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            ("rejected by you", True),
+            ("rejected by you: wrong endpoint", True),
+            ("the run was not rejected by you", False),
+            ("the planning run failed", False),
+            (None, False),
+        ],
+    )
+    def test_the_reason_alone_says_whether_he_rejected_it(
+        self, reason: str | None, expected: bool
+    ) -> None:
+        assert was_rejected_by_owner({"closed_reason": reason}) is expected
+
+    def test_a_row_with_no_reason_field_is_not_his_reject(self) -> None:
+        assert closed_word({"status": "BLOCKED"}) == "blocked"
+        assert was_rejected_by_owner({"status": "BLOCKED"}) is False
+
+    def test_a_real_store_row_reads_the_same_way(self, store: WorkQueueStore) -> None:
+        filed = _file(store, "plan-1")
+        store.close(
+            filed.queue_id,
+            status="BLOCKED",
+            actor_identity="forge-work-queue",
+            reason="rejected by you: wrong endpoint",
+        )
+        row = store.get(filed.queue_id)
+        assert row is not None
+        assert closed_word(row) == "rejected by you"
+        assert row["status"] == "BLOCKED"
+
+    def test_promote_on_a_rejected_row_says_the_same(
+        self, store: WorkQueueStore
+    ) -> None:
+        filed = _file(store, "plan-1")
+        store.close(
+            filed.queue_id,
+            status="BLOCKED",
+            actor_identity="forge-work-queue",
+            reason="rejected by you",
+        )
+        reply = _run(store, {"verb": "promote", "id": filed.queue_id})
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it was rejected by you."
+        )
+
+    def test_a_machine_blocked_row_still_says_blocked(
+        self, store: WorkQueueStore
+    ) -> None:
+        filed = _file(store, "plan-1")
+        store.close(
+            filed.queue_id,
+            status="BLOCKED",
+            actor_identity="forge-work-queue",
+            reason="the planning run was cancelled",
+        )
+        reply = _run(store, {"verb": "keep", "id": filed.queue_id})
+        assert reply == (
+            f"#{filed.queue_id} is not in the queue any more — it is blocked."
+        )

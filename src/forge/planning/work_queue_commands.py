@@ -85,6 +85,42 @@ _CLOSED_WORDS: Mapping[str, str] = {
     "BLOCKED": "blocked",
 }
 
+#: How a run Rich rejected at the spec card is described. The loop writes
+#: these words at the front of the row's closing reason (followed by his own
+#: reason, when he gave one), and everywhere the queue speaks that row's
+#: status back to him it says these words and never "blocked". The stored
+#: status stays BLOCKED — that is a store enum, and nothing else reads it
+#: differently. 2026-09-06: the queue used to tell Rich that his own reject
+#: had "blocked" the row, which reads as a machine failure he did not cause.
+REJECTED_BY_OWNER: str = "rejected by you"
+
+
+def _field(row: sqlite3.Row | Mapping[str, Any], name: str) -> Any:
+    """One field of a row, or None when the row has no such field."""
+    try:
+        return row[name]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def was_rejected_by_owner(row: sqlite3.Row | Mapping[str, Any]) -> bool:
+    """True when this closed row's reason starts with the reject words."""
+    reason = _field(row, "closed_reason")
+    return str(reason or "").startswith(REJECTED_BY_OWNER)
+
+
+def closed_word(row: sqlite3.Row | Mapping[str, Any]) -> str:
+    """How a closed row's status is spoken: done, withdrawn, blocked — or
+    ``rejected by you`` for a blocked row that closed on Rich's own reject.
+
+    Every surface that tells Rich what became of a closed row goes through
+    here, so the reject is spoken the same way on all of them.
+    """
+    status = str(_field(row, "status") or "")
+    if status == "BLOCKED" and was_rejected_by_owner(row):
+        return REJECTED_BY_OWNER
+    return _CLOSED_WORDS.get(status, status.lower())
+
 
 def notifier_takes_parent_request_id(notifier: Callable[..., Any] | None) -> bool:
     """True when this notifier can be told which conversation to answer in.
@@ -188,7 +224,11 @@ def _no_such_row(queue_id: int) -> str:
 
 
 def _closed_row(row: sqlite3.Row) -> str:
-    word = _CLOSED_WORDS.get(str(row["status"]), str(row["status"]).lower())
+    word = closed_word(row)
+    if word == REJECTED_BY_OWNER:
+        # His own stop, in the past tense it happened in: "it was rejected
+        # by you", not "it is rejected by you".
+        return f"#{int(row['id'])} is not in the queue any more — it was {word}."
     return f"#{int(row['id'])} is not in the queue any more — it is {word}."
 
 
@@ -313,9 +353,12 @@ def execute_command(
 __all__ = [
     "COMMAND_VERBS",
     "NOT_A_ROW_NUMBER",
+    "REJECTED_BY_OWNER",
     "age_phrase",
+    "closed_word",
     "notifier_takes_parent_request_id",
     "execute_command",
     "list_reply",
     "queued_reply",
+    "was_rejected_by_owner",
 ]

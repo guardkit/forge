@@ -18,6 +18,7 @@ uses.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -188,6 +189,7 @@ def build_loop(
     in_flight_fn: Any | None = None,
     merge_cards: Any | None = None,
     merge_offer_hold_seconds: int = 0,
+    run_events: Any | None = None,
 ) -> tuple[WorkQueueLoop, RunMaker]:
     maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
@@ -206,6 +208,7 @@ def build_loop(
         admit_fix_rows=admit_fix_rows,
         merge_cards=merge_cards,
         merge_offer_hold_seconds=merge_offer_hold_seconds,
+        run_events=run_events,
     )
     return loop, maker
 
@@ -1064,6 +1067,34 @@ class TestHoldOrGo:
         ]
 
     @pytest.mark.asyncio
+    async def test_an_antecedent_rich_rejected_is_said_as_that_not_as_failed(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Rule 26 (2026-09-06): the hold-or-go line names his reject, so he
+        is not told a failure stopped a run he stopped himself."""
+        first = file_row(store, "plan-1")
+        second = file_row(store, "plan-2")
+        store.link(second, first, actor_identity=USER)
+        store.admit(first, actor_identity=LOOP_ACTOR)
+        store.close(
+            first,
+            status="BLOCKED",
+            actor_identity=LOOP_ACTOR,
+            reason="rejected by you: wrong endpoint",
+        )
+        loop, _ = build_loop(store, clock=clock, notifier=notifier, runs=runs)
+
+        await loop.ask_hold_or_go()
+
+        assert notifier.messages == [
+            f"#{first} was rejected by you and #{second} was waiting on it "
+            "— hold or go?"
+        ]
+        # The row is still blocked in the store; only the words changed.
+        antecedent = store.get(first)
+        assert antecedent is not None and antecedent["status"] == "BLOCKED"
+
+    @pytest.mark.asyncio
     async def test_it_holds_until_someone_says_go(
         self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
     ) -> None:
@@ -1214,6 +1245,346 @@ class TestClosingAdmittedRows:
         await loop.tick()
 
         assert [a.correlation_id for a in maker.admissions] == ["plan-1", "plan-2"]
+
+
+# ---------------------------------------------------------------------------
+# A run Rich rejected at the spec card closes as "rejected by you" (2026-09-06)
+# ---------------------------------------------------------------------------
+
+#: The driver's own words for a reject that had nothing after the word.
+NO_REJECT_REASON = "no reason was given beyond the reject itself"
+
+
+def _rejected_event(reason: str) -> dict[str, Any]:
+    """The terminal event the driver writes when Rich types "reject" at the
+    spec card (``_cancel_run_at_digest_door``): CANCELLED, with the
+    digest-review outcome and his reason in the details."""
+    return {
+        "status": PlanningState.CANCELLED.value,
+        "stage_label": "feature-spec-digest-review",
+        "actor_identity": "U-RICH",
+        "details_json": json.dumps(
+            {
+                "digest_review": {
+                    "outcome": "cancelled",
+                    "reason": reason,
+                    "decided_by": "U-RICH",
+                }
+            }
+        ),
+    }
+
+
+class TestARunRichRejected:
+    """Rule 25: the reason is "rejected by you", then his own words when he
+    gave any. Rule 26: the stored status stays BLOCKED. No other run's words
+    change — a machine cancel reads exactly as it did."""
+
+    async def _admitted(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        *,
+        events: dict[str, list[dict[str, Any]]] | None,
+        reader: Any | None = None,
+    ) -> tuple[int, WorkQueueLoop]:
+        queue_id = file_row(store, "plan-1")
+        run_events = reader
+        if run_events is None and events is not None:
+            run_events = lambda cid: events.get(cid, [])  # noqa: E731
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, run_events=run_events
+        )
+        await loop.take_next()
+        return queue_id, loop
+
+    @pytest.mark.asyncio
+    async def test_with_his_reason_the_row_closes_rejected_by_you_and_says_why(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": "wrong endpoint, it should be under /users",
+        }
+        events["plan-1"] = [
+            {"status": PlanningState.RUNNING.value, "details_json": None},
+            _rejected_event("wrong endpoint, it should be under /users"),
+        ]
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == (
+            "rejected by you: wrong endpoint, it should be under /users"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_a_reason_the_row_closes_rejected_by_you_alone(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": NO_REJECT_REASON,
+        }
+        events["plan-1"] = [_rejected_event(NO_REJECT_REASON)]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "rejected by you"
+
+    @pytest.mark.asyncio
+    async def test_a_machine_cancelled_run_still_reads_as_today(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The gate adapter's cancel writes the reason on the run and no
+        details on the event, so the row closes with the reason as before."""
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": "cancelled by the operator",
+        }
+        events["plan-1"] = [
+            {
+                "status": PlanningState.CANCELLED.value,
+                "stage_label": "transition-to-cancelled",
+                "actor_identity": "user-cancel",
+                "details_json": None,
+            }
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "cancelled by the operator"
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_with_no_reason_and_no_details_keeps_the_plain_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.CANCELLED.value, "error": None}
+        events["plan-1"] = [
+            {"status": PlanningState.CANCELLED.value, "details_json": None}
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["closed_reason"] == "the planning run was cancelled"
+
+    @pytest.mark.asyncio
+    async def test_a_digest_review_that_was_not_a_reject_is_not_his_reject(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Only the outcome "cancelled" on the terminal event is his reject;
+        another digest-review block on an earlier event is not."""
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.CANCELLED.value, "error": "timed out"}
+        events["plan-1"] = [
+            {
+                "status": PlanningState.PAUSED.value,
+                "details_json": json.dumps(
+                    {"digest_review": {"outcome": "approved", "decided_by": "U-RICH"}}
+                ),
+            },
+            {"status": PlanningState.CANCELLED.value, "details_json": None},
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["closed_reason"] == "timed out"
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_read_events_the_words_are_todays(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=None
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": "wrong endpoint",
+        }
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "wrong endpoint"
+
+    @pytest.mark.asyncio
+    async def test_a_reader_that_fails_does_not_stop_the_close(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        def broken(_cid: str) -> list[dict[str, Any]]:
+            raise sqlite3.OperationalError("database is locked")
+
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=None, reader=broken
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": "wrong endpoint",
+        }
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "wrong endpoint"
+
+    @pytest.mark.asyncio
+    async def test_details_that_do_not_parse_keep_the_plain_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.CANCELLED.value, "error": None}
+        events["plan-1"] = [
+            {"status": PlanningState.CANCELLED.value, "details_json": "{not json"}
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["closed_reason"] == "the planning run was cancelled"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_never_reads_the_events(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Only a cancelled run can be his reject; the events are read for
+        that and for nothing else."""
+        reads: list[str] = []
+
+        def reader(cid: str) -> list[dict[str, Any]]:
+            reads.append(cid)
+            return []
+
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=None, reader=reader
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+
+        loop.close_finished()
+
+        assert reads == []
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    async def test_against_the_real_planning_run_store(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+    ) -> None:
+        """The reject as the driver really records it, read back through the
+        planning run store's own ``get_run`` and ``list_events`` — the two
+        readers the composition root hands the loop."""
+        from forge.planning.run_store import SqlitePlanningRunStore
+
+        run_store = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
+        queue_id = file_row(store, "plan-1")
+        loop = WorkQueueLoop(
+            store,
+            count_in_flight=lambda: 0,
+            planning_run=run_store.get_run,
+            paused_repositories=set,
+            start_run=RunMaker(),
+            notify=notifier,
+            clock=clock.now,
+            run_events=run_store.list_events,
+        )
+        store.admit(queue_id, actor_identity=LOOP_ACTOR)
+        assert (
+            run_store.record_queued(
+                correlation_id="plan-1",
+                originating_user=USER,
+                expected_approver=USER,
+                request_text="build a login page",
+                triggered_by="jarvis",
+            )
+            is None
+        )
+        for state in (PlanningState.RUNNING, PlanningState.FEATURE_SPEC):
+            assert run_store.transition("plan-1", state, "planning-driver") is None
+        # Exactly what ``_cancel_run_at_digest_door`` writes.
+        assert (
+            run_store.transition(
+                correlation_id="plan-1",
+                to_state=PlanningState.CANCELLED,
+                actor_identity=USER,
+                stage_label="feature-spec-digest-review",
+                error="the examples are about the column, not the endpoint",
+                details_json=json.dumps(
+                    {
+                        "digest_review": {
+                            "outcome": "cancelled",
+                            "reason": "the examples are about the column, not the endpoint",
+                            "decided_by": USER,
+                        }
+                    }
+                ),
+            )
+            is None
+        )
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == (
+            "rejected by you: the examples are about the column, not the endpoint"
+        )
+
+    def test_the_no_reason_words_are_the_drivers_own(self) -> None:
+        """The loop mirrors the driver's placeholder rather than importing
+        the driver; this keeps the two from drifting apart."""
+        import inspect
+
+        from forge.planning.driver import PlanningRunDriver
+        from forge.planning.work_queue_loop import _NO_REJECT_REASON
+
+        source = inspect.getsource(PlanningRunDriver._cancel_run_at_digest_door)
+        assert _NO_REJECT_REASON == NO_REJECT_REASON
+        assert f'"{_NO_REJECT_REASON}"' in source
 
 
 # ---------------------------------------------------------------------------
