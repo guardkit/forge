@@ -246,6 +246,45 @@ def _report_refusal(report: dict[str, Any]) -> str | None:
     return None
 
 
+def _last_sentence(text: str | None, limit: int = 300) -> str:
+    """The last non-empty line of ``text``, whole words only.
+
+    A command's stderr ends with the sentence that matters (the stopper's
+    "stopped after N seconds", the missing-runner sentence) after however
+    many log lines came before it. A raw character slice of the tail cut
+    that sentence mid-word on Rich's merge card (seam coach, 2026-09-06);
+    the last line, trimmed at a word boundary, reads as a sentence.
+    """
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    if len(last) <= limit:
+        return last
+    cut = last[-limit:]
+    # Drop the leading partial word so the sentence starts on a whole one.
+    _first_space, _sep, rest = cut.partition(" ")
+    return rest or cut
+
+
+def _conflict_sentence(report: dict[str, Any]) -> str | None:
+    """One plain sentence for a report that stopped on a merge conflict."""
+    if str(report.get("outcome", "")).strip().lower() != "conflict" and not report.get(
+        "conflict_files"
+    ):
+        return None
+    files = [str(f) for f in (report.get("conflict_files") or []) if str(f).strip()]
+    if files:
+        shown = ", ".join(files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
+        return (
+            f"the merge stopped on a conflict in {shown}; nothing was merged and "
+            "the branch is kept"
+        )
+    return "the merge stopped on a conflict; nothing was merged and the branch is kept"
+
+
 def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
     if not report:
         return None
@@ -657,8 +696,8 @@ async def execute_merge_deploy(
         # Whatever the sidecar or guardkit itself said about the trouble, in
         # its own words — the timeout sentence, the missing-command sentence.
         own_sentence = (
-            stderr[-400:]
-            or tail[-400:]
+            _last_sentence(stderr)
+            or _last_sentence(tail)
             or f"the merge command did not succeed (status={result_status})"
         )
         if not merged_in_report:
@@ -667,9 +706,9 @@ async def execute_merge_deploy(
                 generic = (
                     f"the merge command did not succeed (status={result_status})"
                     + (
-                        f": {stderr[-400:]}"
+                        f": {_last_sentence(stderr)}"
                         if stderr
-                        else (f": {tail[-400:]}" if tail else "")
+                        else (f": {_last_sentence(tail)}" if tail else "")
                     )
                 )
             if report is not None:
@@ -681,7 +720,15 @@ async def execute_merge_deploy(
                 if isinstance(spoken, str) and spoken.strip():
                     refusal = spoken.strip()
                 else:
-                    refusal = generic or _report_refusal(report)
+                    # A conflict report carries no refusal sentence of its
+                    # own, only the files; say those in words rather than
+                    # the last 400 characters of the JSON (seam coach,
+                    # 2026-09-06 — a slice cut mid-word on Rich's card).
+                    refusal = (
+                        _conflict_sentence(report)
+                        or _report_refusal(report)
+                        or generic
+                    )
             else:
                 refusal = generic
 

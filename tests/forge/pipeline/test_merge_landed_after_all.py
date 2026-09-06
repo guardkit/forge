@@ -497,3 +497,87 @@ async def test_the_checks_time_limit_reaches_the_command_on_the_host(
     assert "--verify-timeout" in argv
     assert argv[argv.index("--verify-timeout") + 1] == "300"
     assert receipt["report"]["cwd"] == str(repo.resolve())
+
+
+#: The real command's conflict report: no sentence of its own, only the files.
+CONFLICTS_ON_ONE_FILE = """
+import json, sys
+print(json.dumps({
+    "outcome": "conflict",
+    "refusal_reason": None,
+    "conflict_files": ["src/users/service.py"],
+    "branch": "autobuild/" + sys.argv[3],
+    "pre_sha": None, "post_sha": None,
+}))
+sys.exit(3)
+"""
+
+#: Merges, then dies after a log line and one real sentence on stderr.
+MERGES_THEN_DIES_TALKING = f"""
+import subprocess, sys
+argv = sys.argv[1:]
+feature = argv[2]
+git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+       "-c", "commit.gpgsign=false"]
+subprocess.run(git + ["merge", "--no-ff", "-m", "merge " + feature,
+                      "autobuild/" + feature], check=True)
+sys.stderr.write("INFO resolve_verify_command: repository toolchain declaration: "
+                 + "/some/very/long/venv/path/bin/python -m pytest -q tests/ (cwd=/x, timeout=600s)\\n")
+sys.stderr.write({KILLED_SENTENCE!r} + "\\n")
+sys.exit(124)
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_conflict_is_said_in_words_naming_the_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,
+    sidecar: str,
+) -> None:
+    _write_guardkit(tmp_path, monkeypatch, CONFLICTS_ON_ONE_FILE)
+
+    outcome, publisher, deploy = await _press_merge(
+        config=config,
+        pool=pool,
+        sidecar_url=sidecar,
+        repo=repo,
+        expect_main_sha=_main_sha(repo),
+    )
+
+    assert outcome.result == "merge-refused"
+    assert outcome.detail == (
+        "the merge stopped on a conflict in src/users/service.py; nothing was "
+        "merged and the branch is kept"
+    )
+    assert "{" not in outcome.detail and "status=" not in outcome.detail
+    assert deploy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_killed_command_is_quoted_by_its_last_sentence_not_a_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,
+    sidecar: str,
+) -> None:
+    _write_guardkit(tmp_path, monkeypatch, MERGES_THEN_DIES_TALKING)
+
+    outcome, publisher, deploy = await _press_merge(
+        config=config,
+        pool=pool,
+        sidecar_url=sidecar,
+        repo=repo,
+        expect_main_sha=_main_sha(repo),
+    )
+
+    assert outcome.result == "merged-verify-failed"
+    assert outcome.verify_status == "unverified"
+    assert f"could not finish: {KILLED_SENTENCE}." in outcome.detail
+    # The log line before the sentence never reaches the card, whole or cut.
+    assert "resolve_verify_command" not in outcome.detail
+    assert "laration" not in outcome.detail
