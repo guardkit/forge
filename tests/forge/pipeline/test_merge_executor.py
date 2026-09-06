@@ -1261,3 +1261,150 @@ class TestTheSameMergeThroughTheSidecar:
                 )
             )
             assert self._normalise(left) == self._normalise(right), name
+
+
+class TestTheTwoTimeLimits:
+    """One limit holds each run of the checks; the other holds the whole
+    command. They have to compose, or the outer one fires first and kills a
+    merge that has already landed — which is exactly what the small-scale
+    drive of this lane caught.
+    """
+
+    def test_the_wall_holds_two_check_runs_and_the_merge(self) -> None:
+        from forge.pipeline.merge_executor import (
+            MERGE_WALL_MERGE_ALLOWANCE_SECONDS,
+            merge_wall_seconds,
+        )
+
+        assert MERGE_WALL_MERGE_ALLOWANCE_SECONDS == 180
+        # The merge command may run the checks twice: once on main to see what
+        # was already failing, once on the merged tree.
+        assert merge_wall_seconds(600) == 2 * 600 + 180
+        assert merge_wall_seconds(60) == 2 * 60 + 180
+
+    def test_the_wall_never_asks_for_more_than_is_allowed(self) -> None:
+        from forge.pipeline.merge_executor import (
+            MERGE_WALL_CAP_SECONDS,
+            merge_wall_seconds,
+        )
+
+        assert merge_wall_seconds(1000) == MERGE_WALL_CAP_SECONDS
+        assert merge_wall_seconds(9999) == MERGE_WALL_CAP_SECONDS
+
+    def test_the_cap_written_here_is_the_one_the_sidecar_enforces(self) -> None:
+        """A wall bigger than the sidecar's cap is refused outright, so the
+        number forge works to must be the number the sidecar keeps."""
+        from forge.deploy_sidecar.service import MERGE_TIMEOUT_MAX
+        from forge.pipeline.merge_executor import MERGE_WALL_CAP_SECONDS
+
+        assert float(MERGE_WALL_CAP_SECONDS) == MERGE_TIMEOUT_MAX
+
+    @pytest.mark.asyncio
+    async def test_the_default_limits_are_ten_minutes_and_a_wall_that_holds_two(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+
+        args = gk.calls[0]["args"]
+        assert "--verify-timeout" in args
+        assert args[args.index("--verify-timeout") + 1] == "600"
+        assert gk.calls[0]["timeout_seconds"] == 2 * 600 + 180
+
+    @pytest.mark.asyncio
+    async def test_a_longer_limit_for_the_checks_widens_the_wall(
+        self, pool, repo_root, tmp_path
+    ) -> None:
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "approval": {"expected_approver": "rich"},
+                "merge_executor": {
+                    "enabled": True,
+                    "verify_timeout_seconds": 300,
+                },
+            }
+        )
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+
+        args = gk.calls[0]["args"]
+        assert args[args.index("--verify-timeout") + 1] == "300"
+        assert gk.calls[0]["timeout_seconds"] == 2 * 300 + 180
+
+    @pytest.mark.asyncio
+    async def test_a_very_long_limit_is_held_to_the_cap(
+        self, pool, repo_root
+    ) -> None:
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "approval": {"expected_approver": "rich"},
+                "merge_executor": {
+                    "enabled": True,
+                    "verify_timeout_seconds": 1200,
+                },
+            }
+        )
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+
+        assert gk.calls[0]["timeout_seconds"] == 1800
+
+
+class TestARefusalSpeaksTheMergeCommandsOwnSentence:
+    """When the merge command explains itself, forge repeats it word for word
+    instead of wrapping it in words of its own."""
+
+    @pytest.mark.asyncio
+    async def test_the_reports_own_reason_is_used_verbatim(
+        self, config, pool, repo_root
+    ) -> None:
+        sentence = "main has moved since the checks ran; the merge was refused"
+        gk = _FakeGuardKit(
+            status="failed",
+            report={"outcome": "refused", "refusal_reason": sentence},
+            stderr="Refused: exit code 2",
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.detail == sentence
+        assert "status=" not in outcome.detail
+        assert dp.calls == []
+        assert publisher.reports[0].detail == sentence
+
+    @pytest.mark.asyncio
+    async def test_an_empty_reason_falls_back_to_the_existing_words(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            status="failed",
+            report={"outcome": "refused", "refusal_reason": "   "},
+            stderr="the branch autobuild/FEAT-MX1 does not exist",
+        )
+        deps, _publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert "the merge command did not succeed" in outcome.detail
+        assert "does not exist" in outcome.detail
+        assert dp.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_report_with_no_reason_at_all_still_reads_plainly(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            status="success",
+            report={"status": "refused", "detail": "the working tree is dirty"},
+        )
+        deps, _publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.detail == "the working tree is dirty"
+        assert dp.calls == []

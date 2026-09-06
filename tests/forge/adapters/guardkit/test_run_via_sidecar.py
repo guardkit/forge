@@ -374,3 +374,70 @@ async def test_a_sidecar_that_is_not_listening_is_reported_plainly(
     assert result.status == "failed"
     assert "could not be reached" in (result.stderr or "")
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# The limit on one run of the checks travels too
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_checks_time_limit_is_carried_to_the_host(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    """The sidecar builds the command itself, so ``--verify-timeout`` cannot
+    simply ride along in the argument list: it is read out and sent as its own
+    field, and the sidecar puts it back on the command line. Dropped, the
+    checks would fall back to guardkit's own default while forge's outer wall
+    was sized for a smaller number."""
+    run = _run(sidecar, repo)
+    args = _executor_args()
+    args = args[:-1] + ["--verify-timeout", "300", "--json"]
+    result = await run(
+        subcommand="autobuild",
+        args=args,
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=780,
+        with_nats_streaming=False,
+    )
+    assert result.status == "success"
+    argv = json.loads(result.stdout_tail)["argv"]
+    assert argv[argv.index("--verify-timeout") + 1] == "300"
+
+
+@pytest.mark.asyncio
+async def test_no_checks_time_limit_leaves_the_command_alone(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    run = _run(sidecar, repo)
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args(),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=900,
+        with_nats_streaming=False,
+    )
+    assert "--verify-timeout" not in json.loads(result.stdout_tail)["argv"]
+
+
+@pytest.mark.asyncio
+async def test_a_checks_time_limit_that_is_not_a_number_is_a_mistake_to_fix(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    """Nonsense on the command line is a programming mistake, not a merge
+    outcome, so it is raised rather than reported."""
+    run = _run(sidecar, repo)
+    args = _executor_args()
+    args = args[:-1] + ["--verify-timeout", "ten minutes", "--json"]
+    with pytest.raises(MergeCallRefused) as caught:
+        await run(
+            subcommand="autobuild",
+            args=args,
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=900,
+            with_nats_streaming=False,
+        )
+    assert "whole number of seconds" in str(caught.value)

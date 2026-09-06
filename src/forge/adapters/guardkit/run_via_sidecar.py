@@ -257,6 +257,20 @@ def build_sidecar_guardkit_run(
             "expect_main_sha": expect_main_sha,
             "timeout_seconds": float(timeout_seconds),
         }
+        # THE TWO WALLS TRAVEL TOGETHER. ``timeout_seconds`` is the wall around
+        # the whole command; ``--verify-timeout`` is how long ONE run of the
+        # checks may take. The sidecar builds the command itself, so the inner
+        # limit has to be carried across as its own field or it is lost and
+        # the checks quietly fall back to guardkit's own default.
+        verify_timeout = _flag_value(args, "--verify-timeout")
+        if verify_timeout is not None:
+            try:
+                body["verify_timeout_seconds"] = int(verify_timeout)
+            except ValueError:
+                raise MergeCallRefused(
+                    "--verify-timeout must be a whole number of seconds; got "
+                    f"{verify_timeout!r}"
+                ) from None
         baseline_path = _flag_value(args, "--baseline-json")
         if baseline_path:
             failing = _read_baseline_failing(baseline_path)
