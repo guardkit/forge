@@ -344,6 +344,19 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# 2026-09-06 — the live gate's Hurl twins run in this container (the live-gate
+# driver is an in-process subprocess here), and the first real deploy into a
+# Docker Sandbox reported "hurl binary not on PATH" for exactly that reason.
+# Same version as the host (hurl 8.0.1, aarch64); the release tarball ships a
+# static binary, installed to /usr/local/bin and proven to run in this layer.
+ARG HURL_VERSION=8.0.1
+RUN curl -fsSL "https://github.com/Orange-OpenSource/hurl/releases/download/${HURL_VERSION}/hurl-${HURL_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+        -o /tmp/hurl.tar.gz \
+    && tar -xzf /tmp/hurl.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/hurl-${HURL_VERSION}-aarch64-unknown-linux-gnu/bin/hurl" /usr/local/bin/hurl \
+    && rm -rf /tmp/hurl.tar.gz "/tmp/hurl-${HURL_VERSION}-aarch64-unknown-linux-gnu" \
+    && hurl --version | grep -q "hurl ${HURL_VERSION}"
+
 # 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
 # track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
 # nothing shells the vendored checker any more. ``nodejs`` and the flag below
