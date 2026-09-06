@@ -43,6 +43,17 @@ _REF_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 #: non-secret strings only (base URLs and the like); secrets stay register REFS.
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+#: A deployment sandbox NAME (``sandbox.name``): the name ``sbx`` is given for
+#: the repository's one long-lived sandbox. Lower-case letters, digits and
+#: hyphens, 2 to 63 characters, starting with a letter or a digit — the shape
+#: ``sbx`` accepts and the shape a host name may take.
+_SANDBOX_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+
+#: One host in a ``sandbox.allow_network`` rule: a name (``pypi.org``), a
+#: leading-wildcard name (``*.debian.org``) or an address (``172.30.1.253``).
+#: No scheme, no path, no spaces — the policy takes a host, not a URL.
+_SANDBOX_HOST_RE = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
 __all__ = [
     "DeployProfile",
     "DeployHost",
@@ -53,6 +64,7 @@ __all__ = [
     "Reservation",
     "DeployLiveGate",
     "DeployCandidate",
+    "DeploySandbox",
     "DeployProfileError",
     "load_deploy_profile",
 ]
@@ -187,6 +199,45 @@ class DeployCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class DeploySandbox:
+    """The Docker Sandbox this repository deploys into (2026-09-06 decision).
+
+    Every merge deploys the feature into a Docker Sandbox — a small virtual
+    machine with its own kernel and its own Docker engine, made by Docker's
+    ``sbx`` tool. Each deployable repository owns one long-lived sandbox that
+    bind-mounts the checkout at its host path, so the profile's absolute
+    ``cwd`` is the same inside the sandbox and out. The repository's existing
+    deploy script then runs unchanged against the sandbox's own Docker engine.
+
+    This block is the single source for that sandbox's settings. Absent from a
+    profile ⇒ ``None`` ⇒ everything behaves exactly as it did before this
+    block existed (the host's own Docker engine, no sandbox anywhere).
+
+    Attributes:
+        name: The sandbox's name, e.g. ``api-test-deploy``. Lower-case
+            letters, digits and hyphens, 2 to 63 characters.
+        memory: How much memory the sandbox gets, written the way ``sbx``
+            takes it (``6g``, ``512m``). None ⇒ ``sbx``'s own default.
+        cpus: How many processors the sandbox gets. None ⇒ ``sbx``'s default.
+        publish: The ports the sandbox publishes to the host, each written
+            ``[[HOST_ADDRESS:]HOST_PORT:]SANDBOX_PORT`` — for example
+            ``127.0.0.1:8901:8901``. The health checks and the live gate keep
+            running from the host against these published ports.
+        allow_network: The hosts the sandbox is allowed to reach, each a host
+            name or an address, optionally with ``:port``. A sandbox reaches
+            nothing off its own network without a rule here — the Debian
+            mirrors, the Python index, and (for a repository whose app talks to
+            a model) the model door's address and port on this box.
+    """
+
+    name: str
+    memory: str | None = None
+    cpus: int | None = None
+    publish: tuple[str, ...] = ()
+    allow_network: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class DeployProfile:
     """A parsed, validated deploy profile — the DEPLOY stage's input.
 
@@ -222,6 +273,9 @@ class DeployProfile:
             ⇒ byte-identical to the direct-live flow (deploy → gate → O-32
             revert). Present ⇒ the stage stands the build up under a ``-cand``
             project, gates it, and promotes only on a PASS (S2F).
+        sandbox: The Docker Sandbox this repository deploys into, or None.
+            Absent ⇒ the deploy runs against the host's own Docker engine
+            exactly as it did before sandboxes existed.
         source_ref: Path the profile was loaded from (for deploy_profile_ref).
     """
 
@@ -239,6 +293,7 @@ class DeployProfile:
     cwd: str | None = None
     live_gate: DeployLiveGate | None = None
     candidate: DeployCandidate | None = None
+    sandbox: DeploySandbox | None = None
     source_ref: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -545,6 +600,156 @@ def _parse_candidate(raw: Any) -> DeployCandidate | None:
     return DeployCandidate(env=env, keep=keep)
 
 
+def _parse_port(value: str, *, what: str) -> str:
+    """Return ``value`` when it is a port number, or raise with one sentence."""
+    if not value.isdigit() or not (1 <= int(value) <= 65535):
+        raise DeployProfileError(
+            f"{what} is {value!r}, which is not a port number — a port is a "
+            "whole number from 1 to 65535"
+        )
+    return value
+
+
+def _parse_sandbox_publish(raw: Any) -> tuple[str, ...]:
+    """Parse ``sandbox.publish`` — the ports the sandbox opens to the host."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise DeployProfileError(
+            "sandbox.publish must be a list of port rules, each written "
+            "'[[HOST_ADDRESS:]HOST_PORT:]SANDBOX_PORT' (for example "
+            "'127.0.0.1:8901:8901')"
+        )
+    rules: list[str] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise DeployProfileError(
+                f"sandbox.publish[{i}] must be a non-empty port rule written "
+                "'[[HOST_ADDRESS:]HOST_PORT:]SANDBOX_PORT'"
+            )
+        rule = item.strip()
+        parts = rule.split(":")
+        if len(parts) == 1:
+            _parse_port(parts[0], what=f"sandbox.publish[{i}]")
+        elif len(parts) == 2:
+            _parse_port(parts[0], what=f"sandbox.publish[{i}] host port")
+            _parse_port(parts[1], what=f"sandbox.publish[{i}] sandbox port")
+        elif len(parts) == 3:
+            if not _SANDBOX_HOST_RE.match(parts[0]):
+                raise DeployProfileError(
+                    f"sandbox.publish[{i}] starts with {parts[0]!r}, which is "
+                    "not a host address — write the rule as "
+                    "'HOST_ADDRESS:HOST_PORT:SANDBOX_PORT', for example "
+                    "'127.0.0.1:8901:8901'"
+                )
+            _parse_port(parts[1], what=f"sandbox.publish[{i}] host port")
+            _parse_port(parts[2], what=f"sandbox.publish[{i}] sandbox port")
+        else:
+            raise DeployProfileError(
+                f"sandbox.publish[{i}]={rule!r} has too many parts — a port "
+                "rule is written '[[HOST_ADDRESS:]HOST_PORT:]SANDBOX_PORT'"
+            )
+        if "," in rule:
+            raise DeployProfileError(
+                f"sandbox.publish[{i}]={rule!r} contains a comma — the rules "
+                "are joined with commas when they are handed to the deploy "
+                "script, so a comma inside one would split it in two"
+            )
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _parse_sandbox_allow_network(raw: Any) -> tuple[str, ...]:
+    """Parse ``sandbox.allow_network`` — the hosts the sandbox may reach."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise DeployProfileError(
+            "sandbox.allow_network must be a list of hosts, each a host name "
+            "or an address, optionally with ':port' (for example 'pypi.org' "
+            "or '172.30.1.253:4000')"
+        )
+    rules: list[str] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise DeployProfileError(
+                f"sandbox.allow_network[{i}] must be a non-empty host name or "
+                "address, optionally with ':port'"
+            )
+        rule = item.strip()
+        if "," in rule:
+            raise DeployProfileError(
+                f"sandbox.allow_network[{i}]={rule!r} contains a comma — the "
+                "rules are joined with commas when they are handed to the "
+                "deploy script, so a comma inside one would split it in two"
+            )
+        if "/" in rule:
+            raise DeployProfileError(
+                f"sandbox.allow_network[{i}]={rule!r} looks like a web address "
+                "— write just the host (and ':port' if you need one), with no "
+                "'http://' and no path, for example 'pypi.org'"
+            )
+        host, sep, port = rule.partition(":")
+        if sep:
+            _parse_port(port, what=f"sandbox.allow_network[{i}] port")
+        if not _SANDBOX_HOST_RE.match(host):
+            raise DeployProfileError(
+                f"sandbox.allow_network[{i}]={rule!r} is not a host — write a "
+                "host name or an address (a leading '*.' is allowed), with no "
+                "scheme and no path, for example 'pypi.org', '*.debian.org' "
+                "or '172.30.1.253:4000'"
+            )
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _parse_sandbox(raw: Any) -> DeploySandbox | None:
+    """Parse the optional ``sandbox`` block (the 2026-09-06 decision).
+
+    Absent ⇒ ``None`` ⇒ the deploy behaves exactly as it did before Docker
+    Sandboxes existed. Present ⇒ every setting is checked here, so a bad name,
+    port or rule is refused on load with one plain sentence rather than
+    surfacing as a puzzling failure inside a deploy.
+    """
+    if raw is None:
+        return None
+    m = _require_mapping(raw, "sandbox")
+
+    name = m.get("name")
+    if not isinstance(name, str) or not _SANDBOX_NAME_RE.match(name):
+        raise DeployProfileError(
+            f"sandbox.name must be the sandbox's name — 2 to 63 characters of "
+            "lower-case letters, digits and hyphens, starting with a letter or "
+            f"a digit (for example 'api-test-deploy'); got {name!r}"
+        )
+
+    memory = m.get("memory")
+    if memory is not None:
+        if not isinstance(memory, str) or not memory.strip():
+            raise DeployProfileError(
+                "sandbox.memory must be written the way sbx takes it — a size "
+                "string such as '6g' or '512m'"
+            )
+        memory = memory.strip()
+
+    cpus = m.get("cpus")
+    if cpus is not None and (
+        not isinstance(cpus, int) or isinstance(cpus, bool) or cpus <= 0
+    ):
+        raise DeployProfileError(
+            "sandbox.cpus must be a whole number of processors greater than "
+            "zero when present"
+        )
+
+    return DeploySandbox(
+        name=name,
+        memory=memory,
+        cpus=cpus,
+        publish=_parse_sandbox_publish(m.get("publish")),
+        allow_network=_parse_sandbox_allow_network(m.get("allow_network")),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
@@ -597,6 +802,7 @@ def parse_deploy_profile(
         "cwd",
         "live_gate",
         "candidate",
+        "sandbox",
     }
     extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -617,6 +823,7 @@ def parse_deploy_profile(
         cwd=data.get("cwd"),
         live_gate=_parse_live_gate(data.get("live_gate")),
         candidate=_parse_candidate(data.get("candidate")),
+        sandbox=_parse_sandbox(data.get("sandbox")),
         source_ref=source_ref,
         extra=extra,
     )

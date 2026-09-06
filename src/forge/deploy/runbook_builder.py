@@ -36,6 +36,7 @@ __all__ = [
     "build_revert_runbook",
     "build_candidate_teardown_runbook",
     "deploy_runbook_step_types",
+    "sandbox_env",
 ]
 
 
@@ -46,6 +47,41 @@ def _step(step_type: str, params: dict[str, Any], index: int) -> Step:
         status=StepStatus.pending,
         sequence_index=index,
     )
+
+
+def sandbox_env(profile: DeployProfile) -> dict[str, str]:
+    """The five sandbox settings, as the environment the deploy script reads.
+
+    A repository that deploys into a Docker Sandbox carries a ``sandbox`` block
+    in its profile (the 2026-09-06 decision). Its vetted wrapper reads the
+    sandbox's settings from the environment — never by reading YAML in bash —
+    so the settings are threaded into every step that runs a script: the
+    deploy, the promote, the revert, the candidate teardown, and the health
+    checks. The two lists are joined with commas.
+
+    No ``sandbox`` block ⇒ an empty mapping ⇒ nothing is added to any step and
+    every runbook is exactly what it was before sandboxes existed.
+    """
+    sandbox = profile.sandbox
+    if sandbox is None:
+        return {}
+    return {
+        "SANDBOX_NAME": sandbox.name,
+        "SANDBOX_MEMORY": sandbox.memory or "",
+        "SANDBOX_CPUS": str(sandbox.cpus) if sandbox.cpus is not None else "",
+        "SANDBOX_PUBLISH": ",".join(sandbox.publish),
+        "SANDBOX_ALLOW_NETWORK": ",".join(sandbox.allow_network),
+    }
+
+
+def _merged_env(
+    profile: DeployProfile, overlay: dict[str, str] | None
+) -> dict[str, str]:
+    """The sandbox settings plus the caller's own overlay (the overlay wins)."""
+    merged = sandbox_env(profile)
+    if overlay:
+        merged.update(overlay)
+    return merged
 
 
 def deploy_runbook_step_types(profile: DeployProfile) -> list[str]:
@@ -98,6 +134,11 @@ def build_deploy_runbook(
         check_extra_env: Same, for the ``health_check`` step — the candidate.env
             overlay so the candidate-leg checks hit the ``-cand`` port. ``None``
             (direct-live + promote leg's "no overlay" health check) ⇒ unchanged.
+
+    When the profile carries a ``sandbox`` block, the sandbox's five settings
+    (:func:`sandbox_env`) are added underneath both overlays, so the vetted
+    wrapper knows which Docker Sandbox to run the deploy inside. No block ⇒
+    nothing is added and both steps are exactly what they were.
 
     Returns:
         A :class:`Runbook` of typed, ordered, ``pending`` steps.
@@ -181,8 +222,9 @@ def build_deploy_runbook(
         compose_params["script"] = profile.compose.script
     if profile.compose.env_file is not None:
         compose_params["env_file"] = profile.compose.env_file
-    if compose_extra_env:
-        compose_params["extra_env"] = dict(compose_extra_env)
+    compose_env = _merged_env(profile, compose_extra_env)
+    if compose_env:
+        compose_params["extra_env"] = compose_env
     steps.append(_step("deploy_compose", compose_params, idx))
     idx += 1
 
@@ -194,8 +236,9 @@ def build_deploy_runbook(
                 for h in profile.health_checks
             ],
         }
-        if check_extra_env:
-            check_params["extra_env"] = dict(check_extra_env)
+        check_env = _merged_env(profile, check_extra_env)
+        if check_env:
+            check_params["extra_env"] = check_env
         steps.append(_step("health_check", check_params, idx))
         idx += 1
 
@@ -229,6 +272,10 @@ def build_revert_runbook(
     intent (the hermetic gate) and the profile's deploy script consumes it (env /
     compose IMAGE var) on a live revert.
 
+    When the profile carries a ``sandbox`` block, the sandbox's five settings
+    (:func:`sandbox_env`) ride in the step's ``extra_env`` too — a revert runs
+    inside the same Docker Sandbox the deploy ran in.
+
     Args:
         profile: The parsed deploy profile (its compose invocation is reused).
         runbook_id: Unique id for this runbook (typically ``revert-<deploy_run_id>``).
@@ -243,6 +290,9 @@ def build_revert_runbook(
         "rollback_image_ref": rollback_image_ref,
         "revert": True,
     }
+    revert_env = sandbox_env(profile)
+    if revert_env:
+        compose_params["extra_env"] = revert_env
     if profile.compose.script is not None:
         compose_params["script"] = profile.compose.script
     if profile.compose.env_file is not None:
@@ -273,7 +323,10 @@ def build_candidate_teardown_runbook(
     The teardown signal + candidate addressing ride in the step's ``extra_env``
     ({CANDIDATE_DOWN:"1", **candidate.env}) so the vetted script brings DOWN the
     ``-cand`` project (``down -v``) rather than re-deploying it. Deliberately a
-    single focused step — no pre-flight, no health check.
+    single focused step — no pre-flight, no health check. When the profile
+    carries a ``sandbox`` block, the sandbox's five settings
+    (:func:`sandbox_env`) ride alongside, so the teardown happens inside the
+    same Docker Sandbox.
 
     Args:
         profile: The parsed deploy profile (its compose invocation is reused).
@@ -287,7 +340,7 @@ def build_candidate_teardown_runbook(
         "compose_file": profile.compose.file,
         "compose_profile": profile.compose.profile,
         "candidate_down": True,
-        "extra_env": dict(extra_env),
+        "extra_env": _merged_env(profile, extra_env),
     }
     if profile.compose.script is not None:
         compose_params["script"] = profile.compose.script
