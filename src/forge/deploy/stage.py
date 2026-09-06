@@ -26,6 +26,20 @@ Config-gated: the DeployStageRunner is only *constructed and driven* when
 runner itself carries a ``dry_run`` flag so the fleet-memory exemplar can be
 dry-run with zero blast radius (the B8 gate).
 
+DEPLOYING INTO A DOCKER SANDBOX (2026-09-06 decision): when the target repo's
+profile carries a ``sandbox`` block, every step that runs a script — the
+candidate deploy, the promote, the revert, the candidate teardown and the
+health checks — carries the sandbox's five settings (``SANDBOX_NAME``,
+``SANDBOX_MEMORY``, ``SANDBOX_CPUS``, ``SANDBOX_PUBLISH``,
+``SANDBOX_ALLOW_NETWORK``) in its environment, alongside the ``CANDIDATE`` /
+``PROMOTE`` / ``CANDIDATE_DOWN`` mode signal and the candidate addressing
+overlay this runner already threads. The repository's vetted wrapper reads them
+and runs the repository's own unchanged deploy script inside that sandbox. The
+threading itself lives one file over, in
+:mod:`forge.deploy.runbook_builder` (:func:`~forge.deploy.runbook_builder.sandbox_env`),
+because that is where the steps are minted. No ``sandbox`` block ⇒ nothing is
+added ⇒ every runbook is byte-identical to what it was.
+
 Irreversible-edge escalation reuses the EXISTING approval-gate machinery
 (Gate G1-proven) — not re-implemented here: a profile step that needs approval
 emits an ``awaiting_approval`` outcome, which the executor already routes to the
