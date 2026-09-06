@@ -33,6 +33,15 @@ from forge.pipeline.fix_admission import (
     FixPublishFailed,
 )
 from forge.planning.states import PlanningState
+from forge.lifecycle.persistence import (
+    SqliteLifecyclePersistence,
+    StageLogEntry,
+)
+from forge.pipeline.merge_executor import MERGE_DECISION_TARGET_IDENTIFIER
+from forge.pipeline.merge_offer import (
+    MERGE_OFFER_STAGE_LABEL,
+    MERGE_OFFER_TARGET_IDENTIFIER,
+)
 from forge.planning.work_queue_loop import (
     LOOP_ACTOR,
     STALE_TICK_INTERVAL_SECONDS,
@@ -41,7 +50,9 @@ from forge.planning.work_queue_loop import (
     count_in_flight,
     first_sentence,
     paused_repositories,
+    plain_duration,
     shadow_line,
+    unanswered_merge_cards,
 )
 from forge.planning.work_queue_store import WorkQueueStore
 
@@ -174,11 +185,14 @@ def build_loop(
     fix_maker: Any | None = None,
     builds: dict[str, dict[str, Any]] | None = None,
     republisher: Any | None = None,
+    in_flight_fn: Any | None = None,
+    merge_cards: Any | None = None,
+    merge_offer_hold_seconds: int = 0,
 ) -> tuple[WorkQueueLoop, RunMaker]:
     maker = run_maker or RunMaker(runs=runs)
     loop = WorkQueueLoop(
         store,
-        count_in_flight=lambda: in_flight,
+        count_in_flight=in_flight_fn or (lambda: in_flight),
         planning_run=lambda cid: runs.get(cid),
         paused_repositories=lambda: set(paused or set()),
         start_run=maker,
@@ -190,6 +204,8 @@ def build_loop(
         fix_build=(lambda cid: (builds or {}).get(cid)) if builds is not None else None,
         republish_build=republisher,
         admit_fix_rows=admit_fix_rows,
+        merge_cards=merge_cards,
+        merge_offer_hold_seconds=merge_offer_hold_seconds,
     )
     return loop, maker
 
@@ -300,6 +316,531 @@ class TestTheInFlightCount:
             connection, "plan-1", PlanningState.PAUSED.value, target_repo="api_test"
         )
         assert paused_repositories(connection) == {"api_test"}
+
+
+# ---------------------------------------------------------------------------
+# The queue waits for the merge word (spec 2026-09-06)
+# ---------------------------------------------------------------------------
+
+#: The window the shipped configuration keeps: a day.
+A_DAY = 24 * 60 * 60
+
+
+def _offer_merge_card(
+    connection: sqlite3.Connection,
+    build_id: str,
+    *,
+    offered_at: datetime,
+) -> None:
+    """Put a merge card on the record the way the real offer does.
+
+    Through ``record_stage`` and the same target name the offer writes, so
+    the queue is reading the row the live ledger really has.
+    """
+    pool = SqliteLifecyclePersistence(connection=connection)
+    pool.record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label=MERGE_OFFER_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
+            status="GATED",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            started_at=offered_at,
+            completed_at=offered_at,
+            duration_secs=0.0,
+            details={
+                "merge_offer": {
+                    "build_id": build_id,
+                    "request_id": f"merge-{build_id}",
+                    "resume_options": ["approve", "reject"],
+                }
+            },
+        )
+    )
+
+
+def _answer_merge_card(
+    connection: sqlite3.Connection,
+    build_id: str,
+    *,
+    answered_at: datetime,
+    decision: str = "approve",
+) -> None:
+    """Record Rich's answer the way the merge executor records it."""
+    pool = SqliteLifecyclePersistence(connection=connection)
+    pool.record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label=MERGE_OFFER_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_DECISION_TARGET_IDENTIFIER,
+            status="PASSED" if decision == "approve" else "SKIPPED",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            started_at=answered_at,
+            completed_at=answered_at,
+            duration_secs=0.0,
+            details={"merge_decision": {"decision": decision, "decided_by": USER}},
+        )
+    )
+
+
+def _finished_build_with_an_open_card(
+    connection: sqlite3.Connection,
+    *,
+    build_id: str = "build-3ABD",
+    feature_id: str = "FEAT-3ABD",
+    offered_at: datetime,
+) -> None:
+    """A build that finished clean and whose merge card is still waiting."""
+    _insert_build(connection, build_id, "COMPLETE", feature_id=feature_id)
+    _offer_merge_card(connection, build_id, offered_at=offered_at)
+
+
+class TestAnOpenMergeCardIsWorkInFlight:
+    """Rich's rule is one piece of work at a time, and merge means merge and
+    deploy (his decision of 24 August 2026). A build that finished clean but
+    whose card has not been pressed has not landed on main, so it still
+    counts."""
+
+    def test_a_card_waiting_for_a_press_counts_as_one_piece_of_work(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 1
+        )
+
+    def test_without_the_setting_a_card_holds_nothing(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Nought seconds means do not wait for a card at all — and nought is
+        what every existing caller of ``count_in_flight`` still passes."""
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+
+        assert count_in_flight(connection) == 0
+        assert (
+            count_in_flight(connection, merge_offer_hold_seconds=0, now=START) == 0
+        )
+
+    def test_a_pressed_card_holds_nothing(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """MUTATION CHECK — remove the answered-card exclusion from the query
+        and this goes red."""
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        _answer_merge_card(
+            connection,
+            "build-3ABD",
+            answered_at=START - timedelta(minutes=1),
+            decision="approve",
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 0
+        )
+        assert unanswered_merge_cards(connection) == []
+
+    def test_a_rejected_card_holds_nothing_either(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Reject is an answer too: the executor writes SKIPPED, and either
+        way the card is done with."""
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        _answer_merge_card(
+            connection,
+            "build-3ABD",
+            answered_at=START - timedelta(minutes=1),
+            decision="reject",
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 0
+        )
+
+    def test_a_card_older_than_the_window_holds_nothing(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """MUTATION CHECK — remove the window from the query and this goes
+        red: an unanswered card would hold the queue for ever."""
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(hours=25)
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 0
+        )
+        # It is still unanswered — it just no longer holds anything.
+        assert [card.feature_id for card in unanswered_merge_cards(connection)] == [
+            "FEAT-3ABD"
+        ]
+
+    def test_a_card_just_inside_the_window_still_holds(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(hours=23)
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 1
+        )
+
+    def test_two_offers_for_one_build_count_once(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        _offer_merge_card(
+            connection, "build-3ABD", offered_at=START - timedelta(minutes=2)
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 1
+        )
+
+    def test_the_card_is_added_to_the_runs_and_builds_already_counted(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        _insert_run(connection, "plan-1", PlanningState.RUNNING.value)
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 2
+        )
+
+    def test_the_earliest_offer_is_when_the_card_started_waiting(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        _offer_merge_card(
+            connection, "build-3ABD", offered_at=START - timedelta(minutes=2)
+        )
+
+        cards = unanswered_merge_cards(connection)
+        assert [card.offered_at for card in cards] == [START - timedelta(minutes=12)]
+
+
+class TestTheQueueWaitsForTheMergeWord:
+    """The three outcomes, driven through the loop on a real database."""
+
+    def _loop_over(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        *,
+        hold_seconds: int = A_DAY,
+    ) -> tuple[WorkQueueLoop, RunMaker]:
+        return build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            in_flight_fn=lambda: count_in_flight(
+                connection,
+                merge_offer_hold_seconds=hold_seconds,
+                now=clock.now(),
+            ),
+            merge_cards=lambda: unanswered_merge_cards(connection),
+            merge_offer_hold_seconds=hold_seconds,
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_the_queue_names_the_card_it_is_waiting_for(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+
+        assert maker.admissions == []
+        assert (
+            "work queue: holding — the merge card for FEAT-3ABD is waiting "
+            "for a press (offered 12 minutes ago)" in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_the_line_is_said_once_not_every_tick(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, _ = self._loop_over(connection, store, clock, notifier, runs)
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+            await loop.tick()
+            await loop.tick()
+
+        said = [
+            line
+            for line in caplog.text.splitlines()
+            if "is waiting for a press" in line
+        ]
+        assert len(said) == 1
+
+    @pytest.mark.asyncio
+    async def test_released_by_a_press_the_queue_takes_the_next_one(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+        await loop.tick()
+        assert maker.admissions == []
+
+        _answer_merge_card(connection, "build-3ABD", answered_at=START)
+        await loop.tick()
+
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_released_by_lapse_the_queue_says_so_once_and_moves_on(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+        await loop.tick()
+        assert maker.admissions == []
+
+        clock.advance(A_DAY)
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+            await loop.tick()
+
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+        lapsed = [
+            line
+            for line in caplog.text.splitlines()
+            if "was not answered within" in line
+        ]
+        assert len(lapsed) == 1
+        assert (
+            "work queue: the merge card for FEAT-3ABD was not answered within "
+            "a day; the queue moves on. Its branch is kept." in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_lapsed_card_says_nothing_about_a_branch_being_lost(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+    ) -> None:
+        """Nothing is cancelled and nothing is said in the channel: the loop
+        only stops waiting."""
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(hours=25)
+        )
+        file_row(store, "plan-1")
+        loop, _ = self._loop_over(connection, store, clock, notifier, runs)
+
+        await loop.tick()
+
+        assert notifier.messages == []
+        assert unanswered_merge_cards(connection) != []
+
+    @pytest.mark.asyncio
+    async def test_starting_up_says_nothing_about_old_unanswered_cards(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The shape the real record has: twenty-eight cards from a campaign
+        that was parked, all offered weeks ago and never answered. Starting
+        the service must not fill the log with news about them — nobody was
+        waiting for them, and this loop never was."""
+        for i in range(28):
+            _finished_build_with_an_open_card(
+                connection,
+                build_id=f"build-OLD{i:02d}",
+                feature_id=f"FEAT-OLD{i:02d}",
+                offered_at=START - timedelta(days=20),
+            )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+            await loop.tick()
+
+        assert "was not answered within" not in caplog.text
+        assert "is waiting for a press" not in caplog.text
+        # They hold nothing either, so the queue gets on with the next one.
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+
+    @pytest.mark.asyncio
+    async def test_only_the_card_the_queue_was_waiting_for_is_spoken_about(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One old card nobody was waiting for, and one the queue really was
+        holding behind. When the day passes, exactly one of them is named."""
+        _finished_build_with_an_open_card(
+            connection,
+            build_id="build-OLD00",
+            feature_id="FEAT-OLD00",
+            offered_at=START - timedelta(days=20),
+        )
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(connection, store, clock, notifier, runs)
+        await loop.tick()
+        assert maker.admissions == []
+
+        clock.advance(A_DAY)
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+
+        lapsed = [
+            line
+            for line in caplog.text.splitlines()
+            if "was not answered within" in line
+        ]
+        assert len(lapsed) == 1
+        assert "FEAT-3ABD" in lapsed[0]
+        assert "FEAT-OLD00" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_nought_seconds_means_the_queue_never_waits_for_a_card(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _finished_build_with_an_open_card(
+            connection, offered_at=START - timedelta(minutes=12)
+        )
+        file_row(store, "plan-1")
+        loop, maker = self._loop_over(
+            connection, store, clock, notifier, runs, hold_seconds=0
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+
+        assert [a.correlation_id for a in maker.admissions] == ["plan-1"]
+        assert "is waiting for a press" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_old_counting_line_is_still_said_when_no_card_is_open(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Rule 5 — nothing else moves. A busy factory with no open card says
+        exactly what it said before."""
+        file_row(store, "plan-1")
+        loop, maker = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, in_flight=1
+        )
+
+        with caplog.at_level("INFO", logger="forge.planning.work_queue_loop"):
+            await loop.tick()
+
+        assert maker.admissions == []
+        assert (
+            "work queue: holding — 1 piece(s) of work in flight against a "
+            "cap of 1" in caplog.text
+        )
+
+    def test_the_window_is_said_in_plain_words(self) -> None:
+        assert plain_duration(A_DAY) == "a day"
+        assert plain_duration(2 * A_DAY) == "2 days"
+        assert plain_duration(3600) == "an hour"
+        assert plain_duration(1800) == "30 minutes"
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1748,11 @@ def _insert_run(
 
 
 def _insert_build(
-    connection: sqlite3.Connection, build_id: str, status: str
+    connection: sqlite3.Connection,
+    build_id: str,
+    status: str,
+    *,
+    feature_id: str | None = None,
 ) -> None:
     connection.execute(
         """
@@ -1219,7 +1764,7 @@ def _insert_build(
         """,
         (
             build_id,
-            f"FEAT-{build_id}",
+            feature_id or f"FEAT-{build_id}",
             "/tmp/api_test",
             "main",
             "feature.yaml",

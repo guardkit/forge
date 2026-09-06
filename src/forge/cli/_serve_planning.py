@@ -67,6 +67,8 @@ from forge.planning.work_queue_loop import (
     WorkQueueLoop,
     count_in_flight,
     paused_repositories,
+    plain_duration,
+    unanswered_merge_cards,
 )
 from forge.planning.work_queue_store import WorkQueueStore
 from forge.planning.states import PlanningState
@@ -1299,9 +1301,17 @@ async def compose_planning_consumer_and_dispatch(
             """
             await republish_build_queued(build, publish=_publish_build_queued)
 
+        # A build whose merge card has not been pressed is a piece of work in
+        # flight, for as long as ``queue.merge_offer_hold_seconds`` says — the
+        # queue waits for the merge word Rich already gives, and adds no new
+        # thing for him to do.
+        merge_hold_seconds = config.queue.merge_offer_hold_seconds
+
         queue_loop = WorkQueueLoop(
             queue_store,
-            count_in_flight=lambda: count_in_flight(pool),
+            count_in_flight=lambda: count_in_flight(
+                pool, merge_offer_hold_seconds=merge_hold_seconds
+            ),
             planning_run=store.get_run,
             paused_repositories=lambda: paused_repositories(pool),
             start_run=_start_queued_run,
@@ -1313,14 +1323,22 @@ async def compose_planning_consumer_and_dispatch(
             fix_build=_fix_build,
             republish_build=_republish_fix_build,
             admit_fix_rows=config.conductor.admit_fix_rows,
+            merge_cards=lambda: unanswered_merge_cards(pool),
+            merge_offer_hold_seconds=merge_hold_seconds,
         )
         queue_loop_task = asyncio.create_task(queue_loop.run())
         _supervise(queue_loop_task, "work-queue-take-next")
         logger.info(
             "planning composition: the work queue is live — one sentence at a "
-            "time up to %d in flight, order %s; repairs are %s",
+            "time up to %d in flight, order %s; %s; repairs are %s",
             config.queue.max_in_flight,
             config.queue.order,
+            (
+                "an unanswered merge card holds the queue for "
+                + plain_duration(merge_hold_seconds)
+                if merge_hold_seconds > 0
+                else "the queue does not wait for a merge card"
+            ),
             (
                 "STARTED by the queue"
                 if config.conductor.admit_fix_rows
