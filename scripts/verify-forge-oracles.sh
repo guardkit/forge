@@ -254,6 +254,8 @@ docker run --rm --entrypoint python "${IMAGE}" -c "${PRODUCER_PROG}"
 # --- seam 2: the guardkit CLI binary answers at the frozen absolute path ------
 # forge.adapters.guardkit.run._GUARDKIT_BINARY == /usr/local/bin/guardkit.
 docker run --rm --entrypoint /usr/local/bin/guardkit "${IMAGE}" feature validate --help >/dev/null
+# 2026-09-06: the live gate's Hurl twins run inside this image.
+docker run --rm --entrypoint hurl "${IMAGE}" --version | grep -q "hurl 8.0.1"
 echo "  OK  cli         /usr/local/bin/guardkit feature validate --help"
 
 # The headless review leg the conductor spawns as ``task-review`` — same binary,
