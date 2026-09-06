@@ -13,6 +13,18 @@ The narrow contract:
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
     POST /run  {repo, script, env, timeout_seconds}
               -> {exit_code, output_tail}
+    POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
+                           timeout_seconds, verify_timeout_seconds}
+              -> {exit_code, stdout, stderr_tail}
+
+The second operation exists because the merge word's post-merge checks must run
+where the builds run. The forge container has no host virtual environment, so a
+check resolved to ``<repo>/.venv/bin/python`` exits 127 inside it and the merge
+answers "the test runner could not start" (this happened on the first real press
+of a merge card, 2026-09-06). The sidecar already runs on the host as Rich's
+user, so the merge command runs here instead. It is deny-by-default in the same
+way: one fixed command, one known repository, a feature name and a target commit
+that must both be well formed.
 
 THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 
@@ -30,11 +42,19 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 5. The server binds ``127.0.0.1`` ONLY.
 6. There is NO shell: execution goes through the existing
    :func:`forge.executor.shell_steps._run_script_step` subprocess core (reused
-   with ``extra_env``) — never a second executor, never freehand shell.
+   with ``extra_env``) — never a second executor, never freehand shell. The
+   merge operation has no vetted script to run, so it runs ONE fixed argument
+   list (:func:`run_merge_command`) — still no shell, and on a timeout the whole
+   process group is killed, not just the command's own process.
+7. The merge operation runs ``guardkit autobuild merge`` and nothing else. The
+   repository key, the feature name (``FEAT-`` plus three to twelve capitals or
+   digits) and the forty-character target commit are all checked before any
+   process starts, and the timeout may not exceed half an hour.
 
-The request-processing core (:func:`process_run_request`) is a pure function
-``(payload, config, script_runner) -> (http_status, body)`` so every law is
-unit-testable without a live socket. It **never raises** past its boundary.
+Each request-processing core (:func:`process_run_request` and
+:func:`process_guardkit_merge_request`) is a pure function
+``(payload, config, runner) -> (http_status, body)`` so every law is
+unit-testable without a live socket. Neither **ever raises** past its boundary.
 """
 
 from __future__ import annotations
@@ -42,6 +62,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
+import signal
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +78,7 @@ from forge.deploy.profile import (
     load_deploy_profile,
 )
 from forge.executor.shell_steps import _run_script_step
+from forge.memory.redaction import scrub_process_output
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +125,59 @@ OUTPUT_TAIL_CHARS: int = 65_536
 _TAIL_MARKER = "... [OUTPUT HEAD TRUNCATED] ...\n"
 
 
+# --- the merge operation's own constants -----------------------------------
+
+#: Default wall on the merge command, in seconds (fifteen minutes).
+MERGE_TIMEOUT_DEFAULT: float = 900.0
+
+#: Hard cap on a caller-supplied merge timeout, in seconds (half an hour). A
+#: request asking for longer is refused, not quietly shortened, so nobody can
+#: believe they asked for something the sidecar did not do.
+MERGE_TIMEOUT_MAX: float = 1800.0
+
+#: How long the merge command's process group gets to stop politely after a
+#: timeout before it is killed outright.
+MERGE_KILL_GRACE_SECONDS: float = 5.0
+
+#: How long to keep reading a killed command's output before giving up on it.
+MERGE_POST_KILL_READ_SECONDS: float = 10.0
+
+#: Exit code reported when the merge command ran out of time (the shell
+#: convention the rest of the estate already uses).
+MERGE_TIMEOUT_EXIT_CODE: int = 124
+
+#: Exit code reported when the merge command could not be started at all.
+MERGE_NOT_STARTED_EXIT_CODE: int = 127
+
+#: Maximum characters of merge stdout returned. The merge report is printed
+#: last, so the TAIL is the part worth keeping.
+MERGE_STDOUT_CHARS: int = 262_144
+
+#: Maximum characters of merge stderr returned as ``stderr_tail``.
+MERGE_STDERR_TAIL_CHARS: int = 16_384
+
+#: The shape a feature name must have. This is the wire's own pattern
+#: (``nats_core.events._pipeline.FEATURE_ID_PATTERN``), written out here rather
+#: than imported because that module does not export it.
+FEATURE_ID_PATTERN = re.compile(r"^FEAT-[A-Z0-9]{3,12}$")
+
+#: The shape a target commit must have: a full forty-character git hash.
+MAIN_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+
+#: Where the operator can name the guardkit command explicitly. The same knob
+#: the build runner already honours, so one setting configures both.
+GUARDKIT_PATH_ENV: str = "FORGE_GUARDKIT_PATH"
+
+#: The command's name, as looked up on PATH when the env var is unset. The
+#: sidecar unit's PATH puts ``~/.agentecflow/bin`` first, which is where the
+#: host's guardkit lives.
+GUARDKIT_BINARY_NAME: str = "guardkit"
+
+#: Where the sidecar writes its own copy of the pre-merge baseline, relative to
+#: the target repository.
+MERGE_BASELINE_DIR: tuple[str, str] = (".guardkit", "tmp")
+
+
 # ---------------------------------------------------------------------------
 # The script-runner protocol (signature-compatible with _run_script_step)
 # ---------------------------------------------------------------------------
@@ -122,6 +199,22 @@ class ScriptRunner(Protocol):
         timeout: float = ...,
         extra_env: dict[str, str] | None = ...,
     ) -> tuple[int, str]: ...
+
+
+class MergeRunner(Protocol):
+    """A callable that runs one fixed argument list and reports what happened.
+
+    Injected so tests can record exactly what the sidecar would have run
+    without starting a process. Returns ``(exit_code, stdout, stderr)``.
+    """
+
+    def __call__(
+        self,
+        *,
+        argv: list[str],
+        cwd: str,
+        timeout: float = ...,
+    ) -> tuple[int, str, str]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +473,350 @@ def process_run_request(
 
 
 # ---------------------------------------------------------------------------
+# The merge operation — one fixed command, run where the builds run
+# ---------------------------------------------------------------------------
+
+
+def resolve_guardkit_command() -> str | None:
+    """Return the path of the ``guardkit`` command, or ``None`` if there is none.
+
+    Two rungs, the same two the build runner walks:
+
+    1. the ``FORGE_GUARDKIT_PATH`` setting, when it names a file that can be
+       run;
+    2. a lookup of ``guardkit`` on PATH — the sidecar unit's PATH puts
+       ``~/.agentecflow/bin`` first, which is where the host's guardkit lives.
+
+    A setting that names something unusable is reported in the log and the PATH
+    lookup is tried anyway, so a stale setting cannot stop the merge on its own.
+    """
+    override = os.environ.get(GUARDKIT_PATH_ENV, "").strip()
+    if override:
+        candidate = os.path.abspath(os.path.expanduser(override))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        logger.warning(
+            "forge-deploy-sidecar: %s=%r does not name a file this user can "
+            "run — looking for %r on PATH instead",
+            GUARDKIT_PATH_ENV,
+            override,
+            GUARDKIT_BINARY_NAME,
+        )
+    found = shutil.which(GUARDKIT_BINARY_NAME)
+    return os.path.abspath(found) if found else None
+
+
+def _kill_process_group(process: "subprocess.Popen[bytes]") -> None:
+    """Stop the command AND everything it started. Never raises.
+
+    A test run starts children of its own; killing only the command we spawned
+    would leave those children holding the output pipes open, and the read that
+    follows would never end. So the whole process group is stopped politely,
+    then killed outright if it is still there after the grace window.
+    """
+    try:
+        group = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        return
+    for sig, wait_for in (
+        (signal.SIGTERM, MERGE_KILL_GRACE_SECONDS),
+        (signal.SIGKILL, 0.0),
+    ):
+        try:
+            os.killpg(group, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        if wait_for <= 0:
+            return
+        try:
+            process.wait(timeout=wait_for)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_merge_command(
+    *,
+    argv: list[str],
+    cwd: str,
+    timeout: float = MERGE_TIMEOUT_DEFAULT,
+) -> tuple[int, str, str]:
+    """Run one fixed argument list with no shell; return exit code and output.
+
+    The command is started in a session of its own so a timeout can stop the
+    whole process group (see :func:`_kill_process_group`). Output is captured
+    separately — the caller needs the report on stdout intact — decoded, and
+    passed through the same credential scrub the deploy scripts already use.
+
+    Never raises: a command that cannot be started comes back as a non-zero
+    exit code with a plain sentence saying so.
+    """
+    try:
+        process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            argv,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        return (
+            MERGE_NOT_STARTED_EXIT_CODE,
+            "",
+            f"the merge command could not be started: {exc}",
+        )
+    except NotADirectoryError as exc:
+        return (
+            MERGE_NOT_STARTED_EXIT_CODE,
+            "",
+            f"the merge command could not be started: {exc}",
+        )
+    except PermissionError as exc:
+        return (126, "", f"the merge command could not be run: {exc}")
+    except OSError as exc:
+        return (1, "", f"the merge command could not be started: {exc}")
+
+    timed_out = False
+    try:
+        raw_out, raw_err = process.communicate(timeout=timeout)
+        exit_code = process.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_process_group(process)
+        try:
+            raw_out, raw_err = process.communicate(
+                timeout=MERGE_POST_KILL_READ_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            raw_out, raw_err = b"", b""
+        exit_code = MERGE_TIMEOUT_EXIT_CODE
+
+    stdout = scrub_process_output((raw_out or b"").decode("utf-8", errors="replace"))
+    stderr = scrub_process_output((raw_err or b"").decode("utf-8", errors="replace"))
+    if timed_out:
+        stderr += (
+            f"\nthe merge command was stopped after {timeout:g} seconds and "
+            "everything it had started was stopped with it"
+        )
+    return exit_code, stdout, stderr
+
+
+def _tail_chars(text: str, limit: int) -> str:
+    """Return the last ``limit`` characters of ``text``, marked when trimmed."""
+    if len(text) <= limit:
+        return text
+    return _TAIL_MARKER + text[-limit:]
+
+
+def process_guardkit_merge_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    merge_runner: MergeRunner = run_merge_command,
+    command_resolver: Callable[[], str | None] = resolve_guardkit_command,
+) -> tuple[int, dict[str, Any]]:
+    """Validate and run a ``/guardkit-merge`` payload; return ``(status, body)``.
+
+    Everything is checked before a process starts: the repository must be one
+    the forge configuration names, the feature name and the target commit must
+    both be well formed, the timeout must be a positive number no larger than
+    half an hour, and a pre-merge baseline, if one is sent, must be a list of
+    test names. A refusal is a 4xx with one plain sentence saying what was
+    wrong. A permitted run is a 200 carrying ``{exit_code, stdout, stderr_tail}``
+    — the exit code is data, exactly as it is for a deploy script, because
+    "merged but the checks failed" is an answer, not a transport failure.
+
+    Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+
+    # The repository must be one the forge configuration already names.
+    repo = payload.get("repo")
+    paths = config.planning.target_repo_paths
+    if not isinstance(repo, str) or not repo.strip():
+        return 400, {
+            "error": (
+                "'repo' is required (an org/name key from "
+                "planning.target_repo_paths)"
+            )
+        }
+    if repo not in paths:
+        known = ", ".join(sorted(paths)) or "(none configured)"
+        return 400, {
+            "error": (
+                f"unknown target repo {repo!r} — not in "
+                f"planning.target_repo_paths. Known keys: {known}"
+            )
+        }
+    repo_path = Path(paths[repo])
+
+    # The feature name must have the shape the rest of the estate uses.
+    feature_id = payload.get("feature_id")
+    if not isinstance(feature_id, str) or not FEATURE_ID_PATTERN.match(feature_id):
+        return 400, {
+            "error": (
+                f"'feature_id' must look like FEAT-ABC1 (the letters FEAT, a "
+                f"dash, then three to twelve capitals or digits); got "
+                f"{feature_id!r}"
+            )
+        }
+
+    # The target commit must be a full git hash — a short one would let the
+    # merge run against a branch that has moved since the checks ran.
+    expect_main_sha = payload.get("expect_main_sha")
+    if not isinstance(expect_main_sha, str) or not MAIN_SHA_PATTERN.match(
+        expect_main_sha
+    ):
+        return 400, {
+            "error": (
+                "'expect_main_sha' must be a full forty-character commit hash; "
+                f"got {expect_main_sha!r}"
+            )
+        }
+
+    # The timeout must be a positive number, and no longer than the cap.
+    timeout_seconds = payload.get("timeout_seconds")
+    timeout = MERGE_TIMEOUT_DEFAULT
+    if timeout_seconds is not None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            return 400, {"error": "'timeout_seconds' must be a positive number"}
+        if float(timeout_seconds) > MERGE_TIMEOUT_MAX:
+            return 400, {
+                "error": (
+                    f"'timeout_seconds' may not be longer than "
+                    f"{MERGE_TIMEOUT_MAX:g} seconds; got {timeout_seconds}"
+                )
+            }
+        timeout = float(timeout_seconds)
+
+    # How long ONE run of the post-merge checks may take. It is separate from
+    # the wall above: that one holds the whole command, this one holds each
+    # check run inside it, and the merge command needs to be told it or the
+    # checks fall back to guardkit's own default.
+    verify_timeout_seconds = payload.get("verify_timeout_seconds")
+    verify_timeout: int | None = None
+    if verify_timeout_seconds is not None:
+        if (
+            isinstance(verify_timeout_seconds, bool)
+            or not isinstance(verify_timeout_seconds, (int, float))
+            or not float(verify_timeout_seconds).is_integer()
+            or int(verify_timeout_seconds) < 1
+        ):
+            return 400, {
+                "error": (
+                    "'verify_timeout_seconds' must be a positive whole number "
+                    "of seconds"
+                )
+            }
+        if float(verify_timeout_seconds) > MERGE_TIMEOUT_MAX:
+            return 400, {
+                "error": (
+                    f"'verify_timeout_seconds' may not be longer than "
+                    f"{MERGE_TIMEOUT_MAX:g} seconds; got {verify_timeout_seconds}"
+                )
+            }
+        verify_timeout = int(verify_timeout_seconds)
+
+    # A pre-merge baseline, when one is sent, is a list of test names.
+    baseline_failing = payload.get("baseline_failing")
+    if baseline_failing is not None:
+        if not isinstance(baseline_failing, list):
+            return 400, {
+                "error": (
+                    "'baseline_failing' must be a list of test names; got "
+                    f"{type(baseline_failing).__name__}"
+                )
+            }
+        for entry in baseline_failing:
+            if not isinstance(entry, str):
+                return 400, {
+                    "error": (
+                        "every entry in 'baseline_failing' must be a test name "
+                        f"written as text; got {type(entry).__name__}"
+                    )
+                }
+
+    command = command_resolver()
+    if not command:
+        return 500, {
+            "error": (
+                "this host has no guardkit command to run — set "
+                f"{GUARDKIT_PATH_ENV} to its path, or put {GUARDKIT_BINARY_NAME} "
+                "on the service's PATH"
+            )
+        }
+
+    argv = [
+        command,
+        "autobuild",
+        "merge",
+        feature_id,
+        "--target",
+        "main",
+        "--expect-main-sha",
+        expect_main_sha,
+        "--json",
+    ]
+    if verify_timeout is not None:
+        argv += ["--verify-timeout", str(verify_timeout)]
+
+    # The sidecar writes its OWN copy of the baseline: the caller's file lives
+    # inside the forge container and is not on this host at all. Failing to
+    # write it stops the run, because a merge that quietly loses its baseline
+    # would blame the feature for tests that were already red.
+    if baseline_failing is not None:
+        baseline_path = repo_path.joinpath(*MERGE_BASELINE_DIR) / (
+            f"merge-baseline-{feature_id}.json"
+        )
+        try:
+            baseline_path.parent.mkdir(parents=True, exist_ok=True)
+            baseline_path.write_text(
+                json.dumps(
+                    {"failing_node_ids": list(baseline_failing)}, indent=2
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return 500, {
+                "error": (
+                    "the sidecar could not write the list of tests that were "
+                    f"already failing to {baseline_path}: {exc}"
+                )
+            }
+        argv += ["--baseline-json", str(baseline_path)]
+
+    logger.info(
+        "forge-deploy-sidecar: running the merge word's checks for %s in %s "
+        "(up to %g seconds)",
+        feature_id,
+        repo_path,
+        timeout,
+    )
+    try:
+        exit_code, stdout, stderr = merge_runner(
+            argv=argv, cwd=str(repo_path), timeout=timeout
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Config resolution (re-read per request so path changes are picked up)
 # ---------------------------------------------------------------------------
 
@@ -422,10 +859,12 @@ class _SidecarServer(ThreadingHTTPServer):
         *,
         config_loader: ConfigLoader,
         script_runner: ScriptRunner,
+        merge_runner: MergeRunner = run_merge_command,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.config_loader = config_loader
         self.script_runner = script_runner
+        self.merge_runner = merge_runner
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -460,7 +899,8 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         try:
-            if self.path.split("?", 1)[0] != "/run":
+            route = self.path.split("?", 1)[0]
+            if route not in ("/run", "/guardkit-merge"):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -475,11 +915,18 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             except SidecarConfigError as exc:
                 self._write_json(500, {"error": str(exc)})
                 return
-            status, body = process_run_request(
-                payload,
-                config=config,
-                script_runner=self.server.script_runner,  # type: ignore[attr-defined]
-            )
+            if route == "/guardkit-merge":
+                status, body = process_guardkit_merge_request(
+                    payload,
+                    config=config,
+                    merge_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                )
+            else:
+                status, body = process_run_request(
+                    payload,
+                    config=config,
+                    script_runner=self.server.script_runner,  # type: ignore[attr-defined]
+                )
             self._write_json(status, body)
         except Exception as exc:  # noqa: BLE001 — never crash the server
             logger.exception("sidecar POST handler error")
@@ -500,6 +947,7 @@ def build_server(
     port: int = DEFAULT_PORT,
     config_loader: ConfigLoader = default_config_loader,
     script_runner: ScriptRunner = _run_script_step,
+    merge_runner: MergeRunner = run_merge_command,
 ) -> _SidecarServer:
     """Build (but do not start) the loopback-only sidecar HTTP server.
 
@@ -511,6 +959,7 @@ def build_server(
         DeploySidecarHandler,
         config_loader=config_loader,
         script_runner=script_runner,
+        merge_runner=merge_runner,
     )
 
 
@@ -520,6 +969,7 @@ def serve(
     port: int = DEFAULT_PORT,
     config_loader: ConfigLoader = default_config_loader,
     script_runner: ScriptRunner = _run_script_step,
+    merge_runner: MergeRunner = run_merge_command,
 ) -> None:
     """Run the sidecar forever (the ``python -m forge.deploy_sidecar`` body)."""
     logging.basicConfig(level=logging.INFO)
@@ -528,6 +978,7 @@ def serve(
         port=port,
         config_loader=config_loader,
         script_runner=script_runner,
+        merge_runner=merge_runner,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info(
@@ -554,13 +1005,27 @@ __all__ = [
     "ENV_ALLOWLIST_BASE",
     "OUTPUT_TAIL_CHARS",
     "SIDECAR_CODE_VERSION",
+    "MERGE_TIMEOUT_DEFAULT",
+    "MERGE_TIMEOUT_MAX",
+    "MERGE_TIMEOUT_EXIT_CODE",
+    "MERGE_NOT_STARTED_EXIT_CODE",
+    "MERGE_STDOUT_CHARS",
+    "MERGE_STDERR_TAIL_CHARS",
+    "FEATURE_ID_PATTERN",
+    "MAIN_SHA_PATTERN",
+    "GUARDKIT_PATH_ENV",
+    "GUARDKIT_BINARY_NAME",
     "ScriptRunner",
+    "MergeRunner",
     "SidecarConfigError",
     "ConfigLoader",
     "resolve_code_version",
+    "resolve_guardkit_command",
+    "run_merge_command",
     "allowed_scripts",
     "allowed_env_keys",
     "process_run_request",
+    "process_guardkit_merge_request",
     "default_config_loader",
     "DeploySidecarHandler",
     "build_server",
