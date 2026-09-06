@@ -16,11 +16,11 @@ What it does, in order:
    merge-ready gate to run.
 2. Warns and carries on for the things that are merely thin: no git remote, no
    test roots, no ``deploy/profile.yaml``, no ``docs/architecture-rules.yaml``.
-   With ``--deploy-port`` it writes the three deploy files instead of warning:
+   With ``--deploy-port`` it writes the four deploy files instead of warning:
    a ``deploy/profile.yaml`` naming this repository's Docker Sandbox, the
-   wrapper that brings that sandbox up, and the deploy script that runs inside
-   it. Without the flag nothing about deploys is written and the warning
-   stands.
+   wrapper that brings that sandbox up, the deploy script that runs inside it,
+   and the candidate overlay that puts the throwaway copy on its own port.
+   Without the flag nothing about deploys is written and the warning stands.
 3. Scaffolds guardkit in the repository when it has none, writes the minimal
    ``toolchain:`` block when the repository declares none (it NEVER overwrites a
    declaration that is already there), and records the fleet-memory project id.
@@ -107,9 +107,10 @@ _IDENTIFIER_SANITISER = re.compile(r"[^A-Za-z0-9_]+")
 #: (``guardkit/orchestrator/toolchain_declaration.py:205``).
 DEFAULT_TEST_TIMEOUT: int = 300
 
-#: Where the two shell templates for a new repository's deploy live. They are
-#: real shell files, not Python strings, so they can be read and diffed like
-#: the shell they are (the same reasoning as the lifecycle schema's ``.sql``).
+#: Where the shipped files for a new repository's deploy live: two shell
+#: scripts and the candidate overlay. They are real files, not Python strings,
+#: so they can be read and diffed as what they are (the same reasoning as the
+#: lifecycle schema's ``.sql``).
 DEPLOY_TEMPLATE_PACKAGE: str = "forge.cli.deploy_templates"
 
 #: The hosts every repository's sandbox is allowed to reach: the Debian
@@ -129,11 +130,12 @@ DEFAULT_SANDBOX_ALLOW_NETWORK: tuple[str, ...] = (
 DEFAULT_SANDBOX_MEMORY: str = "6g"
 DEFAULT_SANDBOX_CPUS: int = 4
 
-#: The three files ``--deploy-port`` writes, in the order they are reported.
+#: The four files ``--deploy-port`` writes, in the order they are reported.
 DEPLOY_FILES: tuple[str, ...] = (
     "deploy/profile.yaml",
     "deploy/sandbox-deploy.sh",
     "deploy/deploy.sh",
+    "deploy/docker-compose.candidate.yml",
 )
 
 
@@ -764,7 +766,8 @@ def _repo_base() -> Path:
 
 # ---------------------------------------------------------------------------
 # The deploy files (--deploy-port) — the Docker Sandbox this repository
-# deploys into, the wrapper that brings it up, and the script that runs inside
+# deploys into, the wrapper that brings it up, the script that runs inside,
+# and the overlay that puts the candidate copy on its own port
 # ---------------------------------------------------------------------------
 
 
@@ -786,7 +789,7 @@ def sandbox_name_for(name: str) -> str:
 
 
 def _read_deploy_template(filename: str) -> str:
-    """Read one of the two shell templates shipped beside this module."""
+    """Read one of the deploy files shipped beside this module."""
     return (
         importlib.resources.files(DEPLOY_TEMPLATE_PACKAGE)
         .joinpath(filename)
@@ -801,7 +804,7 @@ def render_deploy_files(
     app_port: int,
     allow_extra: str | None = None,
 ) -> dict[str, str]:
-    """Render the three deploy files for a repository, as {path: text}.
+    """Render the four deploy files for a repository, as {path: text}.
 
     Args:
         name: The repository's registered name.
@@ -878,9 +881,16 @@ sandbox:
         "@@CANDIDATE_PORT@@": str(candidate_port),
     }
     rendered: dict[str, str] = {"deploy/profile.yaml": profile}
+    # The wrapper is copied exactly as it is shipped. It is the same file
+    # api_test deploys with, byte for byte: every value it needs — the sandbox
+    # name, its memory, its processors, its ports and the hosts it may reach —
+    # arrives in its environment from the profile above, so there is nothing in
+    # it to fill in for this repository.
+    rendered["deploy/sandbox-deploy.sh"] = _read_deploy_template("sandbox-deploy.sh")
+    # These two do carry this repository's own names and ports.
     for path, template in (
-        ("deploy/sandbox-deploy.sh", "sandbox-deploy.sh"),
         ("deploy/deploy.sh", "deploy.sh"),
+        ("deploy/docker-compose.candidate.yml", "docker-compose.candidate.yml"),
     ):
         text = _read_deploy_template(template)
         for token, value in replacements.items():
@@ -973,10 +983,11 @@ def register_repo_cmd(
     fleet-memory project id, reports what the repository has and lacks, checks
     that no build is running, and prints the one command left for a human.
 
-    With ``--deploy-port`` it also writes the three files a repository needs to
+    With ``--deploy-port`` it also writes the four files a repository needs to
     be deployed into its own Docker Sandbox: the profile that names the
-    sandbox, the wrapper that brings it up, and the deploy script that runs
-    inside it.
+    sandbox, the wrapper that brings it up, the deploy script that runs inside
+    it, and the candidate overlay that puts the throwaway copy on its own
+    port.
     """
     ctx = click.get_current_context()
     steps: list[Step] = []
@@ -1229,6 +1240,7 @@ def register_repo_cmd(
             _parse_written_profile(rendered["deploy/profile.yaml"])
         except Exception as exc:  # noqa: BLE001 — the parser's own sentence
             refuse("deploy-files", f"the deploy profile would not load: {exc}")
+        added_any = False
         for relative in DEPLOY_FILES:
             target = repo / relative
             if target.exists():
@@ -1247,13 +1259,17 @@ def register_repo_cmd(
                 lambda path=target: path.unlink(missing_ok=True)  # type: ignore[misc]
             )
             steps.append(Step("deploy-files", "added", relative))
+            added_any = True
+        # The closing line reports the profile that is now ON DISK, never the
+        # ports this run asked for: a profile someone wrote by hand is left
+        # alone, and saying "on ports 8911 and 8912" about a repository whose
+        # own profile deploys on 9000 would be a plain lie.
         if not dry_run:
             steps.append(
                 Step(
                     "deploy-files",
                     "ok",
-                    f"sandbox {sandbox_name_for(name)} on ports {deploy_port} "
-                    f"and {deploy_port + 1}",
+                    _deploy_profile_sentence(repo, added_any=added_any),
                 )
             )
 
@@ -1359,6 +1375,58 @@ def _parse_written_profile(text: str) -> Any:
     from forge.deploy.profile import parse_deploy_profile
 
     return parse_deploy_profile(yaml.safe_load(text))
+
+
+def _deploy_profile_sentence(repo: Path, *, added_any: bool) -> str:
+    """One plain sentence about the deploy profile this repository now has.
+
+    Read back from disk after the files are written, so what is reported is
+    what the repository really carries. A profile that was already there keeps
+    its own sandbox and its own ports, and those are the ones named.
+
+    Args:
+        repo: The checkout.
+        added_any: Whether this run wrote any deploy file at all.
+    """
+    path = repo / "deploy" / "profile.yaml"
+    sandbox = None
+    try:
+        profile = _parse_written_profile(path.read_text(encoding="utf-8"))
+        sandbox = profile.sandbox
+    except Exception:  # noqa: BLE001 — an unreadable profile is reported, not raised
+        sandbox = None
+
+    ports = _host_ports_of(sandbox.publish) if sandbox is not None else []
+    if sandbox is not None and ports:
+        return f"sandbox {sandbox.name} on {_ports_phrase(ports)}"
+    if not added_any:
+        return "deploy files already present, unchanged"
+    if sandbox is not None:
+        return f"sandbox {sandbox.name}, whose profile publishes no port"
+    return "the deploy profile already here names no sandbox"
+
+
+def _host_ports_of(publish: tuple[str, ...]) -> list[str]:
+    """The host-side port of each publish rule, in the order they are written.
+
+    A rule is written ``PORT``, ``HOST_PORT:SANDBOX_PORT`` or
+    ``HOST_ADDRESS:HOST_PORT:SANDBOX_PORT``; the host port is the last part
+    but one, except in the one-part form where it is the only part.
+    """
+    ports: list[str] = []
+    for rule in publish:
+        parts = rule.split(":")
+        port = parts[0] if len(parts) == 1 else parts[-2]
+        if port and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _ports_phrase(ports: list[str]) -> str:
+    """``port 8911`` / ``ports 8911 and 8912`` / ``ports 1, 2 and 3``."""
+    if len(ports) == 1:
+        return f"port {ports[0]}"
+    return f"ports {', '.join(ports[:-1])} and {ports[-1]}"
 
 
 def _load(config_path: Path) -> Any:

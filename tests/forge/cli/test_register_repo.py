@@ -1065,8 +1065,9 @@ def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# --deploy-port — the three files a repository needs to be deployed into its
-# own Docker Sandbox (the 2026-09-06 decision, rule 7)
+# --deploy-port — the four files a repository needs to be deployed into its
+# own Docker Sandbox (the 2026-09-06 decision, rule 7, and rule 14 of the
+# 15:10Z amendment)
 #
 # None of these tests runs sbx, creates a sandbox, or asks systemd for
 # anything: the wrapper is driven with a fake sbx and a fake systemctl first
@@ -1074,7 +1075,12 @@ def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-DEPLOY_FILE_LIST = ("deploy/profile.yaml", "deploy/sandbox-deploy.sh", "deploy/deploy.sh")
+DEPLOY_FILE_LIST = (
+    "deploy/profile.yaml",
+    "deploy/sandbox-deploy.sh",
+    "deploy/deploy.sh",
+    "deploy/docker-compose.candidate.yml",
+)
 
 
 def _load_written_profile(repo: Path):
@@ -1083,7 +1089,7 @@ def _load_written_profile(repo: Path):
     return load_deploy_profile(repo / "deploy" / "profile.yaml")
 
 
-def test_deploy_port_writes_the_three_files(_isolate, tmp_path):
+def test_deploy_port_writes_the_four_files(_isolate, tmp_path):
     repo = _make_repo(
         _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
     )
@@ -1094,7 +1100,7 @@ def test_deploy_port_writes_the_three_files(_isolate, tmp_path):
     assert result.exit_code == 0, result.output
     for relative in DEPLOY_FILE_LIST:
         assert (repo / relative).is_file(), relative
-    assert _status_of(result, "deploy-files").count("added") == 3
+    assert _status_of(result, "deploy-files").count("added") == 4
 
 
 def test_the_written_profile_names_the_sandbox_and_both_ports(_isolate, tmp_path):
@@ -1254,7 +1260,7 @@ def test_a_dry_run_writes_no_deploy_file(_isolate, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert not (repo / "deploy").exists()
-    assert _status_of(result, "deploy-files") == ["would-add"] * 3
+    assert _status_of(result, "deploy-files") == ["would-add"] * 4
 
 
 def test_deploy_allow_without_deploy_port_is_refused(_isolate, tmp_path):
@@ -1339,16 +1345,39 @@ def test_the_name_becomes_the_project_and_the_sandbox(_isolate, tmp_path):
 
 
 FAKE_SBX = """#!/usr/bin/env bash
+# A stand-in for Docker's `sbx`, put first on PATH by the test. It writes down
+# every argument it is given and answers the way the test told it to. It never
+# creates, starts, stops or looks at a real sandbox, and it never runs the real
+# tool: no test in this file goes anywhere near the sandbox daemon.
+#
+# It models the three forms the real 0.39.0 tool actually has:
+#   sbx ls                                                  lists the sandboxes
+#   sbx policy check network --sandbox NAME TARGET           read-only question
+#   sbx policy allow network --sandbox NAME RULES            adds the rules
+# and `sbx create shell ...` and `sbx exec ...`.
+#
+# THE ANSWER TO THE QUESTION IS THE EXIT CODE: 0 means the target is allowed,
+# anything else means it is not. The test names the allowed targets in
+# SBX_ALLOWED (comma separated); SBX_POLICY_CHECK_STATUS forces one answer for
+# every target, which is how "the tool could not answer at all" is played.
 printf '%s\\n' "$*" >> "$SBX_LOG"
-case "$1 $2" in
-  "ls ")
+case "$1" in
+  ls)
     printf '%s\\n' "${SBX_LS:-}"
     ;;
-  "policy show")
-    printf '%s\\n' "${SBX_POLICY_SHOWN:-}"
-    exit "${SBX_POLICY_SHOW_STATUS:-0}"
+  policy)
+    if [ "$2 $3" = "check network" ]; then
+      if [ -n "${SBX_POLICY_CHECK_STATUS:-}" ]; then
+        exit "${SBX_POLICY_CHECK_STATUS}"
+      fi
+      target="${@: -1}"
+      case ",${SBX_ALLOWED:-}," in
+        *",${target},"*) exit 0 ;;
+        *) exit 1 ;;
+      esac
+    fi
     ;;
-  "exec "*)
+  exec)
     exit "${SBX_EXEC_STATUS:-0}"
     ;;
 esac
@@ -1356,6 +1385,8 @@ exit 0
 """
 
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
+# A stand-in for systemctl. It writes down what it was asked to do and does
+# nothing: no unit is started, stopped or reloaded by any test in this file.
 printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
 exit 0
 """
@@ -1457,6 +1488,27 @@ def test_the_network_rules_are_added_once_in_one_call(wrapper_repo, tmp_path):
     ]
 
 
+def test_each_address_is_asked_about_one_at_a_time(wrapper_repo, tmp_path):
+    # The real tool judges a bare host name as if it were being reached over
+    # HTTPS on port 443, but the Debian mirrors are fetched over plain HTTP, so
+    # a bare host has to be asked about as an http:// address. An entry that
+    # already names a port is asked about exactly as it is written.
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo,
+        tmp_path,
+        SBX_LS="bench-one-deploy   running",
+        SANDBOX_ALLOW_NETWORK="pypi.org,172.30.1.253:4000",
+        SBX_ALLOWED="http://pypi.org,172.30.1.253:4000",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [line for line in sbx if line.startswith("policy check ")] == [
+        "policy check network --sandbox bench-one-deploy http://pypi.org",
+        "policy check network --sandbox bench-one-deploy 172.30.1.253:4000",
+    ]
+    assert [line for line in sbx if line.startswith("policy allow ")] == []
+
+
 def test_the_rules_are_not_added_again_when_they_are_already_allowed(
     wrapper_repo, tmp_path
 ):
@@ -1464,8 +1516,7 @@ def test_the_rules_are_not_added_again_when_they_are_already_allowed(
         wrapper_repo,
         tmp_path,
         SBX_LS="bench-one-deploy   running",
-        SBX_POLICY_SHOWN="allow pypi.org\nallow *.debian.org",
-        SBX_POLICY_SHOW_STATUS="0",
+        SBX_ALLOWED="http://pypi.org,http://*.debian.org",
     )
 
     assert result.returncode == 0, result.stderr
@@ -1477,22 +1528,23 @@ def test_a_missing_rule_means_the_whole_set_is_added(wrapper_repo, tmp_path):
         wrapper_repo,
         tmp_path,
         SBX_LS="bench-one-deploy   running",
-        SBX_POLICY_SHOWN="allow pypi.org",
-        SBX_POLICY_SHOW_STATUS="0",
+        SBX_ALLOWED="http://pypi.org",
     )
 
     assert result.returncode == 0, result.stderr
     assert len([line for line in sbx if line.startswith("policy allow ")]) == 1
 
 
-def test_rules_are_added_when_the_policy_cannot_be_read(wrapper_repo, tmp_path):
-    # An older sbx that cannot answer the question must not leave a sandbox
-    # walled off — adding a rule that is already there changes nothing.
+def test_rules_are_added_when_the_question_cannot_be_answered(
+    wrapper_repo, tmp_path
+):
+    # A tool that cannot answer the question must not leave a sandbox walled
+    # off — adding a rule that is already there changes nothing.
     result, sbx, _ = _drive_wrapper(
         wrapper_repo,
         tmp_path,
         SBX_LS="bench-one-deploy   running",
-        SBX_POLICY_SHOW_STATUS="1",
+        SBX_POLICY_CHECK_STATUS="2",
     )
 
     assert result.returncode == 0, result.stderr
@@ -1530,7 +1582,7 @@ def test_the_inner_exit_code_comes_back_unchanged(wrapper_repo, tmp_path, status
     )
 
     assert result.returncode == int(status), result.stderr
-    assert f"exit code {status}" in result.stdout
+    assert f"exited {status}" in result.stdout
 
 
 def test_no_sandbox_name_means_it_refuses_and_touches_nothing(wrapper_repo, tmp_path):
@@ -1539,7 +1591,7 @@ def test_no_sandbox_name_means_it_refuses_and_touches_nothing(wrapper_repo, tmp_
     )
 
     assert result.returncode == 2
-    assert "no SANDBOX_NAME" in result.stdout
+    assert "SANDBOX_NAME is not set" in result.stdout
     assert sbx == []
     assert systemctl == []
 
@@ -1566,3 +1618,212 @@ def test_settings_left_empty_are_left_off_the_create(wrapper_repo, tmp_path):
     assert result.returncode == 0, result.stderr
     created = [line for line in sbx if line.startswith("create ")][0]
     assert created == f"create shell {wrapper_repo[0]} --name bench-one-deploy"
+
+
+# ---------------------------------------------------------------------------
+# The candidate overlay (rule 14) — the file that puts the throwaway copy on
+# its own port. deploy/deploy.sh has always layered this file on top of
+# docker-compose.yml for the candidate leg; until now register-repo did not
+# write it, so a repository born by this command could not run that leg.
+# ---------------------------------------------------------------------------
+
+
+def test_the_candidate_overlay_is_written_with_this_repository_s_ports(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    overlay = (repo / "deploy" / "docker-compose.candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    # The candidate publishes on the port above the app's, and the app still
+    # listens on its own port inside the container.
+    assert '- "${CANDIDATE_PORT:-8912}:8911"' in overlay
+    # !override REPLACES the base file's port list. Without it the candidate
+    # would also try to publish the live port and `up` would fail.
+    assert "ports: !override" in overlay
+    assert "@@" not in overlay
+
+
+def test_the_overlay_is_the_file_the_deploy_script_looks_for(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    script = (repo / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    assert "deploy/docker-compose.candidate.yml" in script
+    assert (repo / "deploy" / "docker-compose.candidate.yml").is_file()
+
+
+def test_the_overlay_is_compose_yaml_that_names_only_the_app_s_ports(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    text = (repo / "deploy" / "docker-compose.candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    # `!override` is compose's own merge tag, which plain YAML does not know,
+    # so it is read here with the tag ignored — the point of the check is the
+    # shape of the file: one service, one key changed, nothing else.
+    class _IgnoreTags(yaml.SafeLoader):
+        pass
+
+    _IgnoreTags.add_constructor(
+        "!override", lambda loader, node: loader.construct_sequence(node)
+    )
+    parsed = yaml.load(text, Loader=_IgnoreTags)
+    assert list(parsed) == ["services"]
+    assert list(parsed["services"]) == ["app"]
+    assert list(parsed["services"]["app"]) == ["ports"]
+
+
+# ---------------------------------------------------------------------------
+# The wrapper is ONE file (rule 13 of the 15:10Z amendment)
+#
+# api_test and every repository born by this command deploy with the same
+# wrapper, byte for byte. It holds no value belonging to any one repository:
+# the sandbox's name, size, ports and rules all reach it in its environment.
+# ---------------------------------------------------------------------------
+
+
+def _api_test_wrapper() -> Path | None:
+    """api_test's own wrapper, if a checkout of it sits beside this one."""
+    estate = Path(__file__).resolve().parents[3].parent
+    for checkout in ("api_test-wt-sandbox", "api_test"):
+        candidate = estate / checkout / "deploy" / "sandbox-deploy.sh"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def test_the_shipped_wrapper_is_api_test_s_wrapper_byte_for_byte():
+    theirs = _api_test_wrapper()
+    if theirs is None:
+        pytest.skip(
+            "no api_test checkout beside this one, so there is nothing to "
+            "compare the shipped wrapper with"
+        )
+    ours = (
+        Path(register_repo.__file__).resolve().parent
+        / "deploy_templates"
+        / "sandbox-deploy.sh"
+    )
+    assert ours.read_bytes() == theirs.read_bytes(), (
+        f"{ours} and {theirs} have drifted apart; they are meant to be one "
+        "file, so whichever changed should be copied over the other"
+    )
+
+
+def test_the_wrapper_written_into_a_repository_is_the_shipped_file_unchanged(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    shipped = (
+        Path(register_repo.__file__).resolve().parent
+        / "deploy_templates"
+        / "sandbox-deploy.sh"
+    )
+    written = repo / "deploy" / "sandbox-deploy.sh"
+    assert written.read_bytes() == shipped.read_bytes()
+    # Nothing in it is filled in for this repository — not even its name.
+    assert "bench-one" not in written.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The closing line (rule 14) — it reports the profile that is on disk, never
+# the ports the run happened to ask for.
+# ---------------------------------------------------------------------------
+
+
+def _closing_line(result) -> str:
+    return [
+        detail
+        for name, status, detail in _steps(result)
+        if name == "deploy-files" and status == "ok"
+    ][0]
+
+
+def test_the_closing_line_names_the_sandbox_and_the_ports_just_written(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _closing_line(result) == "sandbox bench-one-deploy on ports 8911 and 8912"
+
+
+def test_a_re_run_reports_the_ports_the_profile_on_disk_carries(_isolate, tmp_path):
+    # The profile that is already there is left alone, so the ports it names
+    # are the ports this repository really deploys on — reporting the ones the
+    # command was asked for would name ports nothing uses.
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+    assert _run(config, str(repo), "--deploy-port", "9000").exit_code == 0
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _closing_line(result) == "sandbox bench-one-deploy on ports 9000 and 9001"
+    assert _status_of(result, "deploy-files").count("added") == 0
+
+
+def test_a_hand_written_profile_with_no_sandbox_is_reported_as_unchanged(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+    assert _run(config, str(repo), "--deploy-port", "8911").exit_code == 0
+    # Someone replaces the profile with one that deploys on the host, with no
+    # sandbox block at all. There are then no sandbox ports to report.
+    (repo / "deploy" / "profile.yaml").write_text(
+        'format_version: "1.0"\nenv_id: local\ncompose:\n  file: docker-compose.yml\n',
+        encoding="utf-8",
+    )
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _closing_line(result) == "deploy files already present, unchanged"
+
+
+def test_the_ports_sentence_reads_plainly_for_one_port_and_for_three():
+    assert register_repo._ports_phrase(["8911"]) == "port 8911"
+    assert register_repo._ports_phrase(["8911", "8912"]) == "ports 8911 and 8912"
+    assert register_repo._ports_phrase(["1", "2", "3"]) == "ports 1, 2 and 3"
+
+
+def test_the_host_port_is_read_from_every_shape_a_publish_rule_takes():
+    assert register_repo._host_ports_of(
+        ("8080", "9000:8080", "127.0.0.1:8911:8901")
+    ) == ["8080", "9000", "8911"]
+    assert register_repo._host_ports_of(()) == []
