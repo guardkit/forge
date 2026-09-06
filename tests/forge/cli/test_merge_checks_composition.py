@@ -89,3 +89,34 @@ async def test_the_composed_sidecar_run_carries_only_the_merge(tmp_path) -> None
             timeout_seconds=60,
             with_nats_streaming=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_the_attended_merge_command_uses_the_same_chooser(monkeypatch) -> None:
+    """2026-09-06: ``forge merge-deploy`` ran guardkit in the container after
+    the daemon had moved the merge word's checks to the host. Both must go
+    through one chooser."""
+    import sys
+    import types
+    from forge.cli import merge_deploy as cmd
+
+    class _Client:
+        async def drain(self) -> None:
+            return None
+
+    async def _connect(servers=None):
+        return _Client()
+
+    monkeypatch.setitem(sys.modules, "nats", types.SimpleNamespace(connect=_connect))
+    monkeypatch.setattr(cmd, "_resolve_db_path", lambda: ":memory:")
+    monkeypatch.setattr(
+        "forge.pipeline.merge_executor.build_in_daemon_deploy_dispatcher",
+        lambda **kw: object(),
+    )
+    _publisher, guardkit_run, _dispatcher, close = await cmd._aopen_backends(
+        _config("http://127.0.0.1:9")
+    )
+    await close()
+    assert guardkit_run is not in_container_run
+    assert guardkit_run.__name__ == "run_merge_via_sidecar"
+
