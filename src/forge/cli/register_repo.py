@@ -16,6 +16,11 @@ What it does, in order:
    merge-ready gate to run.
 2. Warns and carries on for the things that are merely thin: no git remote, no
    test roots, no ``deploy/profile.yaml``, no ``docs/architecture-rules.yaml``.
+   With ``--deploy-port`` it writes the four deploy files instead of warning:
+   a ``deploy/profile.yaml`` naming this repository's Docker Sandbox, the
+   wrapper that brings that sandbox up, the deploy script that runs inside it,
+   and the candidate overlay that puts the throwaway copy on its own port.
+   Without the flag nothing about deploys is written and the warning stands.
 3. Scaffolds guardkit in the repository when it has none, writes the minimal
    ``toolchain:`` block when the repository declares none (it NEVER overwrites a
    declaration that is already there), and records the fleet-memory project id.
@@ -38,6 +43,7 @@ with a plain sentence saying which check said no.
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import os
 import re
@@ -100,6 +106,37 @@ _IDENTIFIER_SANITISER = re.compile(r"[^A-Za-z0-9_]+")
 #: The default test timeout guardkit's declaration schema itself uses
 #: (``guardkit/orchestrator/toolchain_declaration.py:205``).
 DEFAULT_TEST_TIMEOUT: int = 300
+
+#: Where the shipped files for a new repository's deploy live: two shell
+#: scripts and the candidate overlay. They are real files, not Python strings,
+#: so they can be read and diffed as what they are (the same reasoning as the
+#: lifecycle schema's ``.sql``).
+DEPLOY_TEMPLATE_PACKAGE: str = "forge.cli.deploy_templates"
+
+#: The hosts every repository's sandbox is allowed to reach: the Debian
+#: mirrors it installs system packages from and the Python index it installs
+#: Python packages from. A sandbox reaches nothing off its own network without
+#: a rule, so without these an image build inside it cannot fetch anything.
+DEFAULT_SANDBOX_ALLOW_NETWORK: tuple[str, ...] = (
+    "deb.debian.org",
+    "security.debian.org",
+    "*.debian.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+)
+
+#: How much memory and how many processors a new repository's sandbox gets.
+#: The same settings the first sandbox on this box was proven with.
+DEFAULT_SANDBOX_MEMORY: str = "6g"
+DEFAULT_SANDBOX_CPUS: int = 4
+
+#: The four files ``--deploy-port`` writes, in the order they are reported.
+DEPLOY_FILES: tuple[str, ...] = (
+    "deploy/profile.yaml",
+    "deploy/sandbox-deploy.sh",
+    "deploy/deploy.sh",
+    "deploy/docker-compose.candidate.yml",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +765,141 @@ def _repo_base() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# The deploy files (--deploy-port) — the Docker Sandbox this repository
+# deploys into, the wrapper that brings it up, the script that runs inside,
+# and the overlay that puts the candidate copy on its own port
+# ---------------------------------------------------------------------------
+
+
+def compose_project_for(name: str) -> str:
+    """The compose project name for a repository, from its own name.
+
+    Lower case, with anything that is not a letter or a digit becoming a
+    hyphen, because that is what a compose project name and a sandbox name may
+    both contain. Returns an empty string when nothing usable is left.
+    """
+    cleaned = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", cleaned)
+
+
+def sandbox_name_for(name: str) -> str:
+    """The sandbox name for a repository: its compose project plus ``-deploy``."""
+    project = compose_project_for(name)
+    return f"{project}-deploy" if project else ""
+
+
+def _read_deploy_template(filename: str) -> str:
+    """Read one of the deploy files shipped beside this module."""
+    return (
+        importlib.resources.files(DEPLOY_TEMPLATE_PACKAGE)
+        .joinpath(filename)
+        .read_text(encoding="utf-8")
+    )
+
+
+def render_deploy_files(
+    *,
+    name: str,
+    repo: Path,
+    app_port: int,
+    allow_extra: str | None = None,
+) -> dict[str, str]:
+    """Render the four deploy files for a repository, as {path: text}.
+
+    Args:
+        name: The repository's registered name.
+        repo: The checkout's absolute path — the profile's ``cwd``, and the
+            path the sandbox bind-mounts, so it reads the same inside and out.
+        app_port: The port the app is published on. The candidate copy is
+            published on the next port up.
+        allow_extra: One more host the sandbox may reach, written ``host:port``
+            — the model door on this box for a repository whose app talks to a
+            model. None ⇒ only the Debian and Python rules.
+    """
+    project = compose_project_for(name)
+    sandbox = sandbox_name_for(name)
+    candidate_port = app_port + 1
+    allow = list(DEFAULT_SANDBOX_ALLOW_NETWORK)
+    if allow_extra:
+        allow.append(allow_extra)
+    allow_yaml = ", ".join(f'"{host}"' for host in allow)
+
+    profile = f"""\
+# How the factory deploys {name}.
+#
+# Every merge deploys this repository into its own Docker Sandbox — a small
+# virtual machine with its own kernel and its own Docker engine. The sandbox
+# bind-mounts this checkout at the path below, so the path is the same inside
+# it and out, and publishes the app port and the candidate port back to the
+# host, so the health checks and the live gate keep running from the host.
+#
+# Written by `forge register-repo --deploy-port {app_port}`. Edit it freely; the
+# command never rewrites a profile that is already here.
+format_version: "1.0"
+env_id: local
+compose:
+  file: docker-compose.yml
+  # The only script the deploy step runs. It makes sure the sandbox below is
+  # up and awake, then runs deploy/deploy.sh inside it and returns that
+  # script's exit code unchanged.
+  script: deploy/sandbox-deploy.sh
+hosts:
+  - host: localhost
+    role: app
+secret_injection: []
+models_required: []
+# Add a health check when this repository has one — a script path, never a
+# command line, because the script's exit code is the verdict:
+# health_checks:
+#   - cmd: "deploy/healthcheck.sh"
+# The image kept so a failed deploy can be put back. deploy/deploy.sh keeps it.
+rollback_image_ref: "{project}-app:rollback-pre-deploy"
+# This checkout's absolute path. The deploy step resolves the script above
+# relative to it, and the sandbox mounts this same path inside itself.
+cwd: "{repo}"
+# The candidate copy: the build stands up on the port below first and is
+# checked there, and only a pass takes the live port. `keep: false` tears the
+# candidate down again afterwards.
+candidate:
+  env:
+    CANDIDATE_PORT: "{candidate_port}"
+  keep: false
+# This repository's Docker Sandbox.
+sandbox:
+  name: {sandbox}
+  memory: {DEFAULT_SANDBOX_MEMORY}
+  cpus: {DEFAULT_SANDBOX_CPUS}
+  publish: ["127.0.0.1:{app_port}:{app_port}", "127.0.0.1:{candidate_port}:{candidate_port}"]
+  allow_network: [{allow_yaml}]
+"""
+
+    replacements = {
+        "@@NAME@@": name,
+        "@@PROJECT@@": project,
+        "@@SANDBOX@@": sandbox,
+        "@@APP_PORT@@": str(app_port),
+        "@@CANDIDATE_PORT@@": str(candidate_port),
+    }
+    rendered: dict[str, str] = {"deploy/profile.yaml": profile}
+    # The wrapper is copied exactly as it is shipped. It is the same file
+    # api_test deploys with, byte for byte: every value it needs — the sandbox
+    # name, its memory, its processors, its ports and the hosts it may reach —
+    # arrives in its environment from the profile above, so there is nothing in
+    # it to fill in for this repository.
+    rendered["deploy/sandbox-deploy.sh"] = _read_deploy_template("sandbox-deploy.sh")
+    # These two do carry this repository's own names and ports.
+    for path, template in (
+        ("deploy/deploy.sh", "deploy.sh"),
+        ("deploy/docker-compose.candidate.yml", "docker-compose.candidate.yml"),
+    ):
+        text = _read_deploy_template(template)
+        for token, value in replacements.items():
+            text = text.replace(token, value)
+        rendered[path] = text
+    return rendered
+
+
+# ---------------------------------------------------------------------------
 # The command
 # ---------------------------------------------------------------------------
 
@@ -757,6 +929,27 @@ def _repo_base() -> Path:
     ),
 )
 @click.option(
+    "--deploy-port",
+    "deploy_port",
+    type=int,
+    default=None,
+    help=(
+        "Write the repository's deploy files, publishing the app on this port "
+        "and its candidate copy on the next one up. Without this nothing "
+        "about deploys is written."
+    ),
+)
+@click.option(
+    "--deploy-allow",
+    "deploy_allow",
+    default=None,
+    help=(
+        "One more host the deployment sandbox may reach, written host:port — "
+        "the model door on this box for a repository whose app talks to a "
+        "model. Needs --deploy-port."
+    ),
+)
+@click.option(
     "--dry-run",
     "dry_run",
     is_flag=True,
@@ -777,6 +970,8 @@ def register_repo_cmd(
     name_opt: str | None,
     template: str,
     toolchain_test: str | None,
+    deploy_port: int | None,
+    deploy_allow: str | None,
     dry_run: bool,
     as_json: bool,
 ) -> None:
@@ -787,6 +982,12 @@ def register_repo_cmd(
     repository's guardkit config when it has none, derives and prints the
     fleet-memory project id, reports what the repository has and lacks, checks
     that no build is running, and prints the one command left for a human.
+
+    With ``--deploy-port`` it also writes the four files a repository needs to
+    be deployed into its own Docker Sandbox: the profile that names the
+    sandbox, the wrapper that brings it up, the deploy script that runs inside
+    it, and the candidate overlay that puts the throwaway copy on its own
+    port.
     """
     ctx = click.get_current_context()
     steps: list[Step] = []
@@ -824,6 +1025,24 @@ def register_repo_cmd(
             f"--name {name_opt!r} contains a path separator — the name becomes "
             "a folder name and two repository-map keys, so it must be a plain "
             "name with no slashes in it",
+        )
+
+    # ---- the deploy flags are checked here too, before anything is written.
+    # A port that cannot be a port, or a name that cannot be a sandbox name,
+    # would only surface later as a file this repository could not deploy with.
+    if deploy_allow is not None and deploy_port is None:
+        refuse(
+            "deploy-files",
+            "--deploy-allow says what else the deployment sandbox may reach, "
+            "so it only means something with --deploy-port, which is what "
+            "writes the sandbox — pass both, or neither",
+        )
+    if deploy_port is not None and not (1 <= deploy_port <= 65534):
+        refuse(
+            "deploy-files",
+            f"--deploy-port {deploy_port} is not a port the app and its "
+            "candidate copy can share — pass a whole number from 1 to 65534, "
+            "because the candidate copy takes the next port up",
         )
 
     # ---- rule 2: the checks that refuse (nothing is written when any fails)
@@ -871,6 +1090,14 @@ def register_repo_cmd(
                 f"{key} already points at {current}, not {repo} — pick another "
                 "--name or fix the map by hand",
             )
+
+    if deploy_port is not None and not sandbox_name_for(name):
+        refuse(
+            "deploy-files",
+            f"{name} does not reduce to a name a Docker Sandbox can carry — a "
+            "sandbox name is lower-case letters, digits and hyphens, so pick "
+            "another --name",
+        )
 
     declared_test = _declared_test_command(repo)
     if declared_test is None and not toolchain_test:
@@ -1002,6 +1229,50 @@ def register_repo_cmd(
 
     steps.append(Step("project-id", "ok", identifier))
 
+    # ---- the deploy files. Only written when --deploy-port asks for them,
+    # and never over a file that is already there: a profile someone wrote by
+    # hand is the record of how this repository actually deploys.
+    if deploy_port is not None:
+        rendered = render_deploy_files(
+            name=name, repo=repo, app_port=deploy_port, allow_extra=deploy_allow
+        )
+        try:
+            _parse_written_profile(rendered["deploy/profile.yaml"])
+        except Exception as exc:  # noqa: BLE001 — the parser's own sentence
+            refuse("deploy-files", f"the deploy profile would not load: {exc}")
+        added_any = False
+        for relative in DEPLOY_FILES:
+            target = repo / relative
+            if target.exists():
+                steps.append(
+                    Step("deploy-files", "unchanged", f"{relative} is already there")
+                )
+                continue
+            if dry_run:
+                steps.append(Step("deploy-files", "would-add", relative))
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(rendered[relative], encoding="utf-8")
+            if relative.endswith(".sh"):
+                target.chmod(0o755)
+            rollbacks.append(
+                lambda path=target: path.unlink(missing_ok=True)  # type: ignore[misc]
+            )
+            steps.append(Step("deploy-files", "added", relative))
+            added_any = True
+        # The closing line reports the profile that is now ON DISK, never the
+        # ports this run asked for: a profile someone wrote by hand is left
+        # alone, and saying "on ports 8911 and 8912" about a repository whose
+        # own profile deploys on 9000 would be a plain lie.
+        if not dry_run:
+            steps.append(
+                Step(
+                    "deploy-files",
+                    "ok",
+                    _deploy_profile_sentence(repo, added_any=added_any),
+                )
+            )
+
     # ---- rule 6: what the repository has and lacks
     try:
         roots = _discover_test_roots(repo)
@@ -1093,6 +1364,69 @@ def register_repo_cmd(
 # ---------------------------------------------------------------------------
 # Small helpers used by the command
 # ---------------------------------------------------------------------------
+
+
+def _parse_written_profile(text: str) -> Any:
+    """Prove the profile just rendered is one the deploy step can read.
+
+    Uses the deploy step's own loader, so the file this command writes is held
+    to exactly the rules the deploy step will hold it to.
+    """
+    from forge.deploy.profile import parse_deploy_profile
+
+    return parse_deploy_profile(yaml.safe_load(text))
+
+
+def _deploy_profile_sentence(repo: Path, *, added_any: bool) -> str:
+    """One plain sentence about the deploy profile this repository now has.
+
+    Read back from disk after the files are written, so what is reported is
+    what the repository really carries. A profile that was already there keeps
+    its own sandbox and its own ports, and those are the ones named.
+
+    Args:
+        repo: The checkout.
+        added_any: Whether this run wrote any deploy file at all.
+    """
+    path = repo / "deploy" / "profile.yaml"
+    sandbox = None
+    try:
+        profile = _parse_written_profile(path.read_text(encoding="utf-8"))
+        sandbox = profile.sandbox
+    except Exception:  # noqa: BLE001 — an unreadable profile is reported, not raised
+        sandbox = None
+
+    ports = _host_ports_of(sandbox.publish) if sandbox is not None else []
+    if sandbox is not None and ports:
+        return f"sandbox {sandbox.name} on {_ports_phrase(ports)}"
+    if not added_any:
+        return "deploy files already present, unchanged"
+    if sandbox is not None:
+        return f"sandbox {sandbox.name}, whose profile publishes no port"
+    return "the deploy profile already here names no sandbox"
+
+
+def _host_ports_of(publish: tuple[str, ...]) -> list[str]:
+    """The host-side port of each publish rule, in the order they are written.
+
+    A rule is written ``PORT``, ``HOST_PORT:SANDBOX_PORT`` or
+    ``HOST_ADDRESS:HOST_PORT:SANDBOX_PORT``; the host port is the last part
+    but one, except in the one-part form where it is the only part.
+    """
+    ports: list[str] = []
+    for rule in publish:
+        parts = rule.split(":")
+        port = parts[0] if len(parts) == 1 else parts[-2]
+        if port and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _ports_phrase(ports: list[str]) -> str:
+    """``port 8911`` / ``ports 8911 and 8912`` / ``ports 1, 2 and 3``."""
+    if len(ports) == 1:
+        return f"port {ports[0]}"
+    return f"ports {', '.join(ports[:-1])} and {ports[-1]}"
 
 
 def _load(config_path: Path) -> Any:

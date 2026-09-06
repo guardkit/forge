@@ -1,0 +1,56 @@
+# forge-sandbox-keeper@.service — keeps one deployment sandbox awake
+#
+# WHAT: a Docker Sandbox stops itself about thirty seconds after its last
+#   session ends. A deployment sandbox must outlive that: the live compose
+#   project runs inside it, and the health checks and the live gate reach it
+#   from the host through its published ports. This unit holds one session open
+#   in the named sandbox, and nothing else. Holding a session is all it takes —
+#   the sandbox stays up for as long as the session lives.
+#
+#   It is a TEMPLATE unit: the part after the '@' is the sandbox's name, so one
+#   file serves every repository.
+#
+#       systemctl --user start forge-sandbox-keeper@api-test-deploy
+#       systemctl --user stop  forge-sandbox-keeper@api-test-deploy
+#
+#   Starting it is what the repository's own deploy wrapper does, every deploy;
+#   starting an already-running unit does nothing. Stopping it lets that
+#   sandbox go back to sleep, which is the ordinary way to put one down.
+#
+# SCOPE: a systemd USER unit, exactly like the deploy sidecar beside it. It
+#   holds a session; it never creates, removes or reconfigures a sandbox, and it
+#   knows nothing about deploys. Installed once by hand, attended:
+#
+#       mkdir -p ~/.config/systemd/user
+#       cp ops/systemd/forge-sandbox-keeper@.service ~/.config/systemd/user/
+#       systemctl --user daemon-reload
+#
+#   There is nothing to enable: the wrapper starts an instance when it needs
+#   one. Installing this file is an attended step and is NOT done by any build.
+#
+# BEFORE IT CAN WORK: the sandbox daemon must be running for this user
+#   (`sbx daemon start -d --policy balanced`), and Rich's Docker sign-in must
+#   have been done once on this box. See ops/README.md.
+#
+# WHY KillMode=process: stopping the unit should end the held session and
+#   nothing else. The sandbox's own contents are not this unit's business.
+
+[Unit]
+Description=Keeps the %i Docker Sandbox awake for the factory's deploys
+Documentation=file:///home/richardwoollcott/Projects/appmilla_github/forge/ops/README.md
+Documentation=file:///home/richardwoollcott/Projects/appmilla_github/ai-transition/docs/deploy-into-docker-sandboxes-spec-2026-09-06.md
+
+[Service]
+Type=simple
+# The same PATH the deploy sidecar unit carries, so sbx and the tools it
+# reaches for are found under systemd's otherwise minimal environment.
+Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/sbx exec %i sleep infinity
+Restart=always
+RestartSec=5
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

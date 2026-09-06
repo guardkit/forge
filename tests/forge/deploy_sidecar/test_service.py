@@ -285,6 +285,86 @@ def test_candidate_down_env_key_allowed(repo: Path) -> None:
     assert runner.calls[0]["extra_env"]["CANDIDATE_DOWN"] == "1"
 
 
+SANDBOX_ENV_KEYS = (
+    "SANDBOX_NAME",
+    "SANDBOX_MEMORY",
+    "SANDBOX_CPUS",
+    "SANDBOX_PUBLISH",
+    "SANDBOX_ALLOW_NETWORK",
+)
+
+
+def test_the_five_sandbox_env_keys_are_allowed(repo: Path) -> None:
+    """Deploying into a Docker Sandbox (2026-09-06): the five settings get in.
+
+    The deploy step puts them in every script step's environment; the sidecar
+    is what actually runs those scripts, so if it refused them the whole
+    arrangement would 400 at the first deploy. They name a sandbox and its
+    size, ports and network rules — no secret, no new privilege.
+    """
+    for key in SANDBOX_ENV_KEYS:
+        assert key in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {
+                "SANDBOX_NAME": "api-test-deploy",
+                "SANDBOX_MEMORY": "6g",
+                "SANDBOX_CPUS": "4",
+                "SANDBOX_PUBLISH": "127.0.0.1:8901:8901,127.0.0.1:8902:8902",
+                "SANDBOX_ALLOW_NETWORK": "pypi.org,*.debian.org",
+                "CANDIDATE": "1",
+            },
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    extra = runner.calls[0]["extra_env"]
+    assert extra["SANDBOX_NAME"] == "api-test-deploy"
+    assert extra["SANDBOX_PUBLISH"] == "127.0.0.1:8901:8901,127.0.0.1:8902:8902"
+    assert extra["SANDBOX_ALLOW_NETWORK"] == "pypi.org,*.debian.org"
+    assert extra["CANDIDATE"] == "1"
+
+
+def test_the_five_keys_ride_the_base_list_not_the_profile(repo: Path) -> None:
+    """They are allowed whatever the profile says — the profile that named the
+    sandbox is on the forge side; the sidecar's own list is what admits them."""
+    # This repo's profile carries no sandbox block at all.
+    cfg = _config({"appmilla/api_test": str(repo)})
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {"SANDBOX_NAME": "api-test-deploy"},
+        },
+        config=cfg,
+        script_runner=_RecordingRunner(),
+    )
+    assert status == 200
+
+
+def test_a_near_miss_sandbox_key_is_still_refused(repo: Path) -> None:
+    """The five names are the five names — nothing that merely looks like one."""
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {"SANDBOX_COMMAND": "rm -rf /"},
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "not allowlisted" in body["error"]
+    assert runner.calls == []
+
+
 def test_live_gate_env_key_allowed(repo: Path) -> None:
     _write_profile(
         repo,

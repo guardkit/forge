@@ -35,9 +35,11 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    profile does not name. The ONLY runnable scripts are ``compose.script``,
    each ``health_checks[].cmd``, and the ``live_gate.driver`` script path.
 3. Every env key must be in the allowlist
-   ``{REVERT, ROLLBACK_IMAGE_REF, ENV_FILE, CANDIDATE, PROMOTE}`` UNION the
-   profile's ``live_gate.env`` and ``candidate.env`` key names; anything else is
-   refused loudly. Values must be strings.
+   ``{REVERT, ROLLBACK_IMAGE_REF, ENV_FILE, CANDIDATE, PROMOTE, CANDIDATE_DOWN,
+   SANDBOX_NAME, SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_PUBLISH,
+   SANDBOX_ALLOW_NETWORK}`` UNION the profile's ``live_gate.env`` and
+   ``candidate.env`` key names; anything else is refused loudly. Values must be
+   strings.
 4. ``timeout_seconds`` is capped (default 600, max 1800).
 5. The server binds ``127.0.0.1`` ONLY.
 6. There is NO shell: execution goes through the existing
@@ -113,6 +115,17 @@ ENV_ALLOWLIST_BASE: frozenset[str] = frozenset(
         # Without it every sidecar-surface run leaks the candidate stack on
         # :8902 — the teardown request's env key was refused 400.
         "CANDIDATE_DOWN",
+        # Deploying into a Docker Sandbox (2026-09-06 decision). The five
+        # settings of the repository's own deployment sandbox, threaded by the
+        # deploy stage and read by the repository's vetted wrapper. They name a
+        # sandbox and its size, ports and network rules — they carry no secret
+        # and grant no new privilege, and a repository whose profile has no
+        # sandbox block never sends them.
+        "SANDBOX_NAME",
+        "SANDBOX_MEMORY",
+        "SANDBOX_CPUS",
+        "SANDBOX_PUBLISH",
+        "SANDBOX_ALLOW_NETWORK",
     }
 )
 

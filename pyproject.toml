@@ -185,6 +185,10 @@ where = ["src"]
 # (not a Python string constant) so DBAs and DDR-003 reviewers can
 # diff the schema directly.
 "forge.lifecycle" = ["*.sql"]
+# Ship the files `forge register-repo --deploy-port` writes into a new
+# repository: the two shell scripts and the candidate overlay. They are real
+# files, not Python strings, so they can be read and diffed as what they are.
+"forge.cli.deploy_templates" = ["*.sh", "*.yml"]
 
 [tool.pytest.ini_options]
 # Source layout: production code lives under ``src/forge``. Pytest
