@@ -1346,11 +1346,28 @@ class StampNormalizerOutcome:
     enforcement: str | None = None
     enforcement_source: str = ""
     enforcement_detail: str = ""
+    #: What the normalizer's MODEL FALLBACK reported about itself (2026-09-06,
+    #: rule 16 of the rewrite-on-refusal lane): a map with ``status`` (one of
+    #: ``not_configured`` / ``asked_and_failed`` / ``answer_rejected`` /
+    #: ``decided``), ``detail`` (one plain sentence), and when known
+    #: ``endpoint`` (host:port, never a key) and ``model``. Read from the
+    #: result JSON's ``model_outcome`` key, or from the one plain
+    #: ``STAMP NORMALIZER:`` line on stderr when only that survived; ``None``
+    #: when the normalizer said nothing about it (an older guardkit).
+    model_outcome: Mapping[str, Any] | None = None
 
     @property
     def is_failure(self) -> bool:
         """The normalizer did not fully succeed: partial / refused / failed."""
         return self.status in ("partial", "refused", "failed")
+
+    @property
+    def model_was_asked(self) -> bool:
+        """True when the model fallback was in fact asked about the refused
+        titles (asked and failed, answered and rejected, or decided some) —
+        the case where "no fallback home" would be the wrong thing to say."""
+        status = str((self.model_outcome or {}).get("status") or "")
+        return status in MODEL_OUTCOME_ASKED_STATUSES
 
     @property
     def enforced(self) -> bool:
@@ -1428,6 +1445,8 @@ class StampNormalizerOutcome:
             rec["enforcement_source"] = self.enforcement_source
             rec["enforcement_detail"] = self.enforcement_detail
             rec["stops_the_run"] = self.stops_the_run
+        if self.model_outcome is not None:
+            rec["model_outcome"] = dict(self.model_outcome)
         return rec
 
 
@@ -1460,6 +1479,145 @@ _NORMALIZER_JSON_RULES_RE = re.compile(
 )
 _NORMALIZER_JSON_ERROR_RE = re.compile(r'^  "error": (".*"),?$', re.MULTILINE)
 _NORMALIZER_JSON_WRITTEN_RE = re.compile(r'^  "written": (true|false),?$', re.MULTILINE)
+_NORMALIZER_JSON_MODEL_OUTCOME_RE = re.compile(
+    r'^  "model_outcome": (null|\{\}|\{\n(?:    .*\n)*?  \})', re.MULTILINE
+)
+
+#: The four things the model fallback can say about itself (guardkit
+#: ``decide_refused_titles``, rule 14 of the rewrite-on-refusal lane).
+MODEL_OUTCOME_STATUSES: tuple[str, ...] = (
+    "not_configured",
+    "asked_and_failed",
+    "answer_rejected",
+    "decided",
+)
+#: The three of them where the model WAS asked — "no fallback home" is then the
+#: wrong sentence, on the card and in the machine record alike.
+MODEL_OUTCOME_ASKED_STATUSES: frozenset[str] = frozenset(
+    {"asked_and_failed", "answer_rejected", "decided"}
+)
+#: The one plain stderr line the fallback prints (its logger prefixes it with
+#: the level and logger name; the line itself starts at the marker).
+_MODEL_OUTCOME_ECHO_MARKER = "STAMP NORMALIZER:"
+#: A Python logging line as the seam captures it ("WARNING:logger.name:…") —
+#: never a wrapped continuation of a scenario title.
+_LOG_LEVEL_PREFIX_RE = re.compile(r"^(?:CRITICAL|ERROR|WARNING|INFO|DEBUG):")
+#: A ``host:port`` the fallback's sentence may name (never a key).
+#: An IPv4 address or a host name whose last label starts with a letter, then
+#: a port — so a clock time in a log line ("at 10:00") is never read as one.
+_MODEL_OUTCOME_ENDPOINT_RE = re.compile(
+    r"\b((?:\d{1,3}(?:\.\d{1,3}){3}|(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*):\d{2,5})\b"
+)
+#: The model's name only when the line NAMES it — ``model=workhorse``,
+#: ``model: workhorse`` or ``(model workhorse)`` — never the word "model" in
+#: prose ("the model could not be asked", "model fallback").
+_MODEL_OUTCOME_MODEL_RE = re.compile(
+    r"\bmodel(?: alias)?\s*[=:]\s*['\"]?([A-Za-z0-9_.:/-]+)['\"]?"
+    r"|\(model\s+['\"]?([A-Za-z0-9_.:/-]+)['\"]?\)"
+)
+_MODEL_OUTCOME_COUNT_RE = re.compile(r"\bdecided (\d+)\b")
+
+
+def _coerce_model_outcome(raw: Any) -> dict[str, Any] | None:
+    """The normalizer's ``model_outcome`` value → a str-keyed map, or ``None``.
+
+    A map with a recognised ``status`` is kept (``detail`` / ``endpoint`` /
+    ``model`` copied as strings when present); anything else — absent, null,
+    an unknown status, a non-map — is ``None``. A receipt reader, never a
+    decider: nothing here invents a status the fallback did not report.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    status = str(raw.get("status") or "").strip()
+    if status not in MODEL_OUTCOME_STATUSES:
+        return None
+    out: dict[str, Any] = {"status": status, "detail": str(raw.get("detail") or "").strip()}
+    for key in ("endpoint", "model"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            out[key] = str(value)
+    count = raw.get("count", raw.get("decided_count"))
+    if isinstance(count, int) and not isinstance(count, bool):
+        out["count"] = count
+    return out
+
+
+def model_outcome_from_console_echo(stderr: str) -> dict[str, Any] | None:
+    """Recover the fallback's outcome from its ONE plain stderr line, else ``None``.
+
+    The last resort behind the JSON (rule 16, 2026-09-06): when the seam's
+    stdout tail lost the ``model_outcome`` key, the ``STAMP NORMALIZER:`` line
+    the fallback logs on stderr says the same thing in words. Read
+    defensively — the guardkit half of this lane is built in a sibling
+    worktree, so both its new sentences and the older ones are recognised:
+
+    * "no model endpoint is configured" / "was not asked"  → ``not_configured``
+    * "answer was rejected"                                → ``answer_rejected``
+    * "could not be asked" / "could not answer"            → ``asked_and_failed``
+    * "the model decided N"                                → ``decided`` (+ count)
+
+    The status word itself (``asked_and_failed`` …) is honoured when the line
+    carries it literally. ``detail`` is the line after the marker (and after a
+    ``feature <id>:`` prefix), one sentence; ``endpoint`` / ``model`` when the
+    line names them. The LAST line about the model wins (one run, one
+    outcome). Lines that mention no model at all are not an outcome.
+    """
+    found: dict[str, Any] | None = None
+    for raw_line in (stderr or "").splitlines():
+        idx = raw_line.find(_MODEL_OUTCOME_ECHO_MARKER)
+        if idx < 0:
+            continue
+        line = raw_line[idx + len(_MODEL_OUTCOME_ECHO_MARKER) :].strip()
+        lowered = line.lower()
+        status: str | None = None
+        for word in MODEL_OUTCOME_STATUSES:
+            if re.search(rf"\b{word}\b", lowered):
+                status = word
+                break
+        if status is None:
+            if "model" not in lowered:
+                continue
+            if "no model endpoint is configured" in lowered or "not asked" in lowered:
+                status = "not_configured"
+            elif "answer was rejected" in lowered or "answer rejected" in lowered:
+                status = "answer_rejected"
+            elif "could not be asked" in lowered or "could not answer" in lowered:
+                status = "asked_and_failed"
+            elif re.search(r"\bthe model decided \d+", lowered):
+                status = "decided"
+            else:
+                continue
+        detail = re.sub(r"^feature \S+:\s*", "", line).strip()
+        outcome: dict[str, Any] = {"status": status, "detail": detail}
+        m = _MODEL_OUTCOME_ENDPOINT_RE.search(line)
+        if m:
+            outcome["endpoint"] = m.group(1)
+        m = _MODEL_OUTCOME_MODEL_RE.search(line)
+        if m:
+            outcome["model"] = m.group(1) or m.group(2)
+        m = _MODEL_OUTCOME_COUNT_RE.search(lowered)
+        if m and status == "decided":
+            outcome["count"] = int(m.group(1))
+        found = outcome
+    return found
+
+
+def _fallback_words(model_outcome: Mapping[str, Any] | None) -> str:
+    """The clause that replaces "no fallback home" in the machine record when
+    the model was asked — plain words, the status said as a person would."""
+    status = str((model_outcome or {}).get("status") or "")
+    if status == "asked_and_failed":
+        return "the model fallback was asked and could not answer"
+    if status == "answer_rejected":
+        return "the model fallback's answer was rejected"
+    if status == "decided":
+        count = (model_outcome or {}).get("count")
+        return (
+            f"the model fallback decided {count} and could not decide these"
+            if isinstance(count, int)
+            else "the model fallback decided some and could not decide these"
+        )
+    return "no fallback home"
 #: The exit code guardkit's CLI uses for PARTIAL (decided stamps written,
 #: ``refused`` names the rest) — distinct from 2 (cannot run) and 0 (all
 #: decided). guardkit ``cli/qa.py`` @ a8e5bfa3.
@@ -1526,6 +1684,14 @@ def parse_normalizer_payload(stdout_tail: str, stderr: str = "") -> dict[str, An
     m = _NORMALIZER_JSON_WRITTEN_RE.search(text)
     if m:
         partial["written"] = m.group(1) == "true"
+    m = _NORMALIZER_JSON_MODEL_OUTCOME_RE.search(text)
+    if m:
+        try:
+            block = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            block = None
+        if isinstance(block, dict):
+            partial["model_outcome"] = block
     if partial:
         partial["partial"] = True
         return partial
@@ -1547,7 +1713,13 @@ def _titles_from_console_echo(text: str, marker: str) -> list[str]:
         return []
     titles: list[str] = []
     for line in text[idx:].split("\n")[1:]:
-        if line.startswith("FIX:") or line.startswith("STAMP NORMALIZER:"):
+        if (
+            line.startswith("FIX:")
+            or _MODEL_OUTCOME_ECHO_MARKER in line
+            or _LOG_LEVEL_PREFIX_RE.match(line)
+        ):
+            # A logger line (the model fallback's, or any other) is never a
+            # wrapped continuation of a title, wherever it lands (2026-09-06).
             break
         if line.startswith("  - "):
             titles.append(line[4:].rstrip())
@@ -1620,6 +1792,13 @@ def classify_normalizer_result(
             ),
         )
     payload = parse_normalizer_payload(tail, stderr)
+    # What the model fallback said about itself (rule 16, 2026-09-06): the
+    # JSON key first, the one plain stderr line when only that survived,
+    # else None — an absent signal is "the normalizer said nothing", never
+    # a guessed status.
+    model_outcome = _coerce_model_outcome(
+        (payload or {}).get("model_outcome")
+    ) or model_outcome_from_console_echo(stderr)
     stamped_raw = (payload or {}).get("stamped") or {}
     stamped = {str(k): str(v) for k, v in stamped_raw.items()} if isinstance(stamped_raw, dict) else {}
     rules_raw = (payload or {}).get("rules") or {}
@@ -1642,6 +1821,7 @@ def classify_normalizer_result(
                 already_stamped=already,
                 disagreements=disagreements,
                 written=True,
+                model_outcome=model_outcome,
             )
         if payload is None:
             return StampNormalizerOutcome(
@@ -1663,6 +1843,7 @@ def classify_normalizer_result(
             already_stamped=already,
             disagreements=disagreements,
             written=False,
+            model_outcome=model_outcome,
         )
     if exit_code == NORMALIZER_EXIT_PARTIAL:
         # PARTIAL (guardkit a8e5bfa3): every decided stamp was WRITTEN; the
@@ -1682,12 +1863,16 @@ def classify_normalizer_result(
                 disagreements=disagreements,
                 written=written if isinstance(written, bool) else (True if stamped else None),
                 titles_unreadable=True,
+                model_outcome=model_outcome,
             )
+        # "no fallback home" is only true when the model fallback was NOT
+        # asked; when it was, the record says what it said (rule 16).
+        fallback = _fallback_words(model_outcome)
         return StampNormalizerOutcome(
             status="partial",
             detail=(
-                f"{len(refused)} scenario(s) undecidable by rule — no fallback "
-                f"home, none invented; {len(stamped)} scenario(s) stamped by rule "
+                f"{len(refused)} scenario(s) undecidable by rule — {fallback}, "
+                f"none invented; {len(stamped)} scenario(s) stamped by rule "
                 f"and written, {len(already)} already stamped (untouched)"
             ),
             refused_titles=refused,
@@ -1697,18 +1882,21 @@ def classify_normalizer_result(
             disagreements=disagreements,
             written=written if isinstance(written, bool) else bool(stamped),
             titles_recovered_from_console_echo=from_echo,
+            model_outcome=model_outcome,
         )
     # Non-zero exit (2, or anything else).
     if refused:
+        fallback = _fallback_words(model_outcome)
         return StampNormalizerOutcome(
             status="refused",
             detail=(
-                f"{len(refused)} scenario(s) undecidable by rule (R1–R10) — no "
-                "fallback home; nothing was written"
+                f"{len(refused)} scenario(s) undecidable by rule (R1–R10) — "
+                f"{fallback}; nothing was written"
             ),
             refused_titles=refused,
             written=False,
             titles_recovered_from_console_echo=from_echo,
+            model_outcome=model_outcome,
         )
     error = (payload or {}).get("error")
     if error:
