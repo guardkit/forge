@@ -746,7 +746,9 @@ def process_guardkit_merge_request(
         try:
             baseline_path.parent.mkdir(parents=True, exist_ok=True)
             baseline_path.write_text(
-                json.dumps({"failing": list(baseline_failing)}, indent=2),
+                json.dumps(
+                    {"failing_node_ids": list(baseline_failing)}, indent=2
+                ),
                 encoding="utf-8",
             )
         except OSError as exc:

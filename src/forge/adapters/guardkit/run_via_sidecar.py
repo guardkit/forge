@@ -107,7 +107,13 @@ def _read_baseline_failing(path_text: str) -> list[str] | None:
     if isinstance(data, list):
         failing = data
     elif isinstance(data, dict):
-        failing = data.get("failing")
+        # "failing_node_ids" is the name guardkit itself uses, both in the
+        # baseline file it accepts and in the baseline.json it writes; the
+        # older "failing" is still read so a file written by a previous
+        # version of forge is not thrown away.
+        failing = data.get("failing_node_ids")
+        if failing is None:
+            failing = data.get("failing")
     if not isinstance(failing, list):
         logger.warning(
             "guardkit merge over the sidecar: %s does not carry a list of "

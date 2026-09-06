@@ -606,7 +606,67 @@ class TestExecutorSequencing:
         baseline_path = Path(args[args.index("--baseline-json") + 1])
         assert baseline_path.is_file()
         assert baseline_path.parent == repo_root / ".guardkit" / "tmp"
-        assert json.loads(baseline_path.read_text())["failing"] == ["test_x"]
+        # "failing_node_ids" is the name the merge command's own reader
+        # requires; an object under any other name stops the merge.
+        assert json.loads(baseline_path.read_text()) == {
+            "failing_node_ids": ["test_x"]
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_baseline_file_is_in_a_shape_the_merge_command_accepts(
+        self, config, pool, repo_root, tmp_path
+    ) -> None:
+        """Drive the written file through the merge command's own reader.
+
+        The merge command reads the file as a bare list of test names, or as an
+        object carrying a ``failing_node_ids`` list, and stops with an error for
+        anything else. This runs a stand-in command with exactly that rule over
+        the file the executor wrote: it must be read, not refused.
+        """
+        import stat as stat_module
+        import subprocess
+
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, baseline_failing=["test_x"])
+        args = gk.calls[0]["args"]
+        baseline_path = args[args.index("--baseline-json") + 1]
+
+        reader = tmp_path / "reads-the-baseline-the-real-way"
+        reader.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "data = json.load(open(sys.argv[1]))\n"
+            "if isinstance(data, list):\n"
+            "    print(json.dumps([str(x) for x in data]))\n"
+            "elif isinstance(data.get('failing_node_ids'), list):\n"
+            "    print(json.dumps([str(x) for x in data['failing_node_ids']]))\n"
+            "else:\n"
+            "    sys.stderr.write('is an object without a failing_node_ids list')\n"
+            "    sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        reader.chmod(
+            reader.stat().st_mode | stat_module.S_IXUSR | stat_module.S_IXOTH
+        )
+
+        done = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [str(reader), str(baseline_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == ["test_x"]
+
+        # And the shape it refuses really is refused, so this has teeth.
+        old_shape = tmp_path / "old-shape.json"
+        old_shape.write_text(json.dumps({"failing": ["test_x"]}), encoding="utf-8")
+        refused = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [str(reader), str(old_shape)],
+            capture_output=True,
+            text=True,
+        )
+        assert refused.returncode == 1
+        assert "failing_node_ids" in refused.stderr
 
     @pytest.mark.asyncio
     async def test_restart_probe_refuses_a_second_merge(
@@ -1172,7 +1232,7 @@ class TestTheSameMergeThroughTheSidecar:
             repo_root / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE_ID}.json"
         )
         assert json.loads(host_baseline.read_text(encoding="utf-8")) == {
-            "failing": baseline
+            "failing_node_ids": baseline
         }
 
         # The outcome a person reads is identical.

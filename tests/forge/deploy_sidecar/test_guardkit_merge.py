@@ -77,16 +77,52 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
+# The real guardkit reads --baseline-json with this rule (a bare list of test
+# names, or an object carrying a failing_node_ids list) and stops with an error
+# for anything else, so every stand-in guardkit in these tests reads it the same
+# way. A file the real command would refuse must fail here too.
+REAL_BASELINE_READER = """
+def read_baseline(path):
+    import json
+    with open(path) as fh:
+        data = json.load(fh)
+    if isinstance(data, list):
+        return [str(x) for x in data]
+    if isinstance(data, dict):
+        ids = data.get('failing_node_ids')
+        if isinstance(ids, list):
+            return [str(x) for x in ids]
+        raise ValueError(
+            str(path) + ' is an object without a failing_node_ids list')
+    raise ValueError(
+        str(path) + ' must be a JSON list of node ids or a baseline.json object')
+"""
+
+
 @pytest.fixture
 def fake_guardkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A real executable named guardkit that echoes its arguments as JSON."""
+    """A real executable named guardkit that echoes its arguments as JSON.
+
+    It reads any baseline file the way the real command reads it, so a file
+    written in a shape guardkit refuses stops this stand-in too.
+    """
     binary = tmp_path / "bin" / "guardkit"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
+        + REAL_BASELINE_READER
+        + "argv = sys.argv[1:]\n"
+        "baseline = None\n"
+        "if '--baseline-json' in argv:\n"
+        "    try:\n"
+        "        baseline = read_baseline(argv[argv.index('--baseline-json') + 1])\n"
+        "    except ValueError as exc:\n"
+        "        sys.stderr.write('Unexpected error: ' + str(exc))\n"
+        "        sys.exit(1)\n"
         "print(json.dumps({'outcome': 'merged', 'post_sha': 'b' * 40,\n"
-        "                  'verify_ok': True, 'argv': sys.argv[1:]}))\n",
+        "                  'verify_ok': True, 'argv': argv,\n"
+        "                  'baseline_seen': baseline}))\n",
         encoding="utf-8",
     )
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -334,7 +370,9 @@ def test_baseline_is_written_on_the_host_and_passed(
     assert "--baseline-json" in argv
     written = Path(argv[argv.index("--baseline-json") + 1])
     assert written == repo / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE}.json"
-    assert json.loads(written.read_text(encoding="utf-8")) == {"failing": failing}
+    assert json.loads(written.read_text(encoding="utf-8")) == {
+        "failing_node_ids": failing
+    }
 
 
 def test_an_empty_baseline_is_still_written(repo: Path, fake_guardkit: Path) -> None:
@@ -349,7 +387,61 @@ def test_an_empty_baseline_is_still_written(repo: Path, fake_guardkit: Path) -> 
     argv = runner.calls[0]["argv"]
     assert "--baseline-json" in argv
     written = Path(argv[argv.index("--baseline-json") + 1])
-    assert json.loads(written.read_text(encoding="utf-8")) == {"failing": []}
+    assert json.loads(written.read_text(encoding="utf-8")) == {
+        "failing_node_ids": []
+    }
+
+
+def test_the_shape_guardkit_refuses_really_does_stop_the_merge(
+    repo: Path, fake_guardkit: Path, tmp_path: Path
+) -> None:
+    """Proof the baseline assertions have teeth.
+
+    The real merge command reads the baseline file as a bare list of test names
+    or as an object with a ``failing_node_ids`` list, and stops with an error
+    for anything else. Written the old way — an object with a ``failing`` list —
+    the command exits non-zero and nothing merges. This is why the sidecar
+    writes ``failing_node_ids``.
+    """
+    wrong_shape = tmp_path / "old-shape-baseline.json"
+    wrong_shape.write_text(
+        json.dumps({"failing": ["tests/test_a.py::test_one"]}), encoding="utf-8"
+    )
+    exit_code, _stdout, stderr = run_merge_command(
+        argv=[
+            str(fake_guardkit),
+            "autobuild",
+            "merge",
+            FEATURE,
+            "--json",
+            "--baseline-json",
+            str(wrong_shape),
+        ],
+        cwd=str(repo),
+    )
+    assert exit_code == 1
+    assert "without a failing_node_ids list" in stderr
+
+    # Written the way the sidecar writes it, the same command is happy.
+    right_shape = tmp_path / "baseline.json"
+    right_shape.write_text(
+        json.dumps({"failing_node_ids": ["tests/test_a.py::test_one"]}),
+        encoding="utf-8",
+    )
+    exit_code, stdout, _stderr = run_merge_command(
+        argv=[
+            str(fake_guardkit),
+            "autobuild",
+            "merge",
+            FEATURE,
+            "--json",
+            "--baseline-json",
+            str(right_shape),
+        ],
+        cwd=str(repo),
+    )
+    assert exit_code == 0
+    assert json.loads(stdout)["baseline_seen"] == ["tests/test_a.py::test_one"]
 
 
 def test_no_baseline_means_no_baseline_flag(repo: Path, fake_guardkit: Path) -> None:
@@ -538,8 +630,10 @@ def test_end_to_end_over_loopback(repo: Path, fake_guardkit: Path) -> None:
         assert "--json" in report["argv"]
         baseline = Path(report["argv"][report["argv"].index("--baseline-json") + 1])
         assert json.loads(baseline.read_text(encoding="utf-8")) == {
-            "failing": ["tests/test_a.py::test_one"]
+            "failing_node_ids": ["tests/test_a.py::test_one"]
         }
+        # The command really read it: it did not merely receive a path.
+        assert report["baseline_seen"] == ["tests/test_a.py::test_one"]
     finally:
         server.shutdown()
         server.server_close()
