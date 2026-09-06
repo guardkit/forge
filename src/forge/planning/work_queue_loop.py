@@ -24,7 +24,11 @@ What the loop does, in order, every tick
    move.
 1. **Closes what has finished.** Every admitted row's planning run is read;
    a run that ended well closes the row done, a run that ended badly closes
-   it blocked with the reason. There is no callback on the planning store's
+   it blocked with the reason. A run Rich himself rejected at the spec card
+   closes with the reason "rejected by you" (and his own words after it,
+   when he gave any), and is spoken as that wherever the queue speaks the
+   row's status — never as "blocked", which reads as a machine failure he
+   did not cause (2026-09-06). There is no callback on the planning store's
    terminal transition to hook, so the loop polls — the spec allows this and
    asks that it be said out loud, and this is it being said.
 2. **Asks about a broken chain.** A row told to wait for another one whose
@@ -76,6 +80,7 @@ References
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -93,7 +98,9 @@ from forge.pipeline.merge_executor import MERGE_DECISION_TARGET_IDENTIFIER
 from forge.pipeline.merge_offer import MERGE_OFFER_TARGET_IDENTIFIER
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
+    REJECTED_BY_OWNER,
     age_phrase,
+    closed_word,
     notifier_takes_parent_request_id,
 )
 from forge.planning.work_queue_store import WorkQueueStore
@@ -209,6 +216,20 @@ _FIX_FAILURE_WORDS: Mapping[str, str] = {
     "CANCELLED": "the fix journey was cancelled",
     "SKIPPED": "the fix journey never ran",
 }
+
+#: What the planning driver writes as the reason when Rich typed "reject" at
+#: the spec card and nothing after it (``_cancel_run_at_digest_door``). The
+#: loop reads that as "he gave no reason" and closes the row with the reject
+#: words alone; anything else after the word is his reason and rides along.
+#: The words are the driver's, mirrored here rather than imported: the loop
+#: does not load the driver, and a test pins the two to each other.
+_NO_REJECT_REASON: str = "no reason was given beyond the reject itself"
+
+#: The key on a planning run's terminal event that says the run ended at the
+#: spec card, and the outcome that means Rich rejected it there. Written by
+#: the driver on the CANCELLED transition; read here, nowhere else.
+_DIGEST_REVIEW_KEY: str = "digest_review"
+_DIGEST_REVIEW_REJECTED: str = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +500,8 @@ class WorkQueueLoop:
         admit_fix_rows: bool = False,
         merge_cards: Callable[[], Sequence[MergeCard]] | None = None,
         merge_offer_hold_seconds: int = 0,
+        run_events: Callable[[str], Sequence[Mapping[str, Any] | sqlite3.Row]]
+        | None = None,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
 
@@ -490,6 +513,14 @@ class WorkQueueLoop:
         planning_run:
             Reads one planning run by correlation id — the loop polls it to
             know when an admitted row has finished.
+        run_events:
+            Reads one planning run's events by correlation id, oldest first
+            (the planning run store's ``list_events``). The run's own row
+            says it was cancelled but not by whom; the terminal event's
+            details do. The loop reads them for one thing only: to close a
+            run Rich rejected at the spec card as "rejected by you" rather
+            than "blocked". ``None`` means nothing here can read events, and
+            every cancelled run is closed with today's words.
         paused_repositories:
             The repositories with a card waiting on Rich; the shadow order
             puts their rows second.
@@ -548,6 +579,7 @@ class WorkQueueLoop:
         self._admit_fix_rows = admit_fix_rows
         self._merge_cards = merge_cards
         self._merge_offer_hold_seconds = merge_offer_hold_seconds
+        self._run_events = run_events
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, the set of repair
         # rows it last reported as waiting, and the set of merge cards it
@@ -647,7 +679,14 @@ class WorkQueueLoop:
                     closed += 1
                     logger.info("work queue: #%d is done", queue_id)
             elif state in failure:
-                reason = self._failure_reason(run, state, is_fix=is_fix)
+                rejected = None
+                if not is_fix and state == PlanningState.CANCELLED.value:
+                    rejected = self._rejected_by_owner_reason(
+                        run, str(row["correlation_id"])
+                    )
+                reason = rejected or self._failure_reason(
+                    run, state, is_fix=is_fix
+                )
                 if self._store.close(
                     queue_id,
                     status="BLOCKED",
@@ -655,10 +694,75 @@ class WorkQueueLoop:
                     reason=reason,
                 ):
                     closed += 1
-                    logger.warning(
-                        "work queue: #%d is blocked — %s", queue_id, reason
-                    )
+                    if rejected:
+                        # His own stop, not a failure: say it at INFO and
+                        # in his words, not as "blocked".
+                        logger.info("work queue: #%d was %s", queue_id, reason)
+                    else:
+                        logger.warning(
+                            "work queue: #%d is blocked — %s", queue_id, reason
+                        )
         return closed
+
+    def _rejected_by_owner_reason(self, run: Any, correlation_id: str) -> str | None:
+        """The reject words, with his reason after them, when Rich rejected
+        the run at the spec card; None for every other cancelled run.
+
+        A run Rich rejects at the spec card ends CANCELLED, the same terminal
+        a machine cancel takes, and the run's own row cannot tell the two
+        apart. The driver writes the difference on the terminal event: its
+        details carry ``digest_review`` with the outcome ``cancelled`` and
+        his reason. So the loop reads the run's events, takes the last one
+        that ended it, and answers from that. Nothing that goes wrong in here
+        reaches the caller: no reader wired, a reader that throws, an event
+        without details or with details that do not parse — every one of
+        those is "not his reject", and the row closes with today's words.
+        """
+        if self._run_events is None:
+            return None
+        try:
+            events = list(self._run_events(correlation_id))
+        except Exception as exc:  # noqa: BLE001 — a read never stops the loop
+            logger.warning(
+                "work queue: could not read the events of planning run %s "
+                "(%s: %s); closing the row with the plain words",
+                correlation_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        terminal = next(
+            (
+                event
+                for event in reversed(events)
+                if str(_build_field(event, "status") or "")
+                == PlanningState.CANCELLED.value
+            ),
+            None,
+        )
+        if terminal is None:
+            return None
+        raw = _build_field(terminal, "details_json")
+        if not raw:
+            return None
+        try:
+            details = json.loads(str(raw))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(details, Mapping):
+            return None
+        review = details.get(_DIGEST_REVIEW_KEY)
+        if not isinstance(review, Mapping):
+            return None
+        if str(review.get("outcome") or "") != _DIGEST_REVIEW_REJECTED:
+            return None
+        # His reason is on the event first (the row the rule names) and on
+        # the run's ``error`` too; read the event, fall back to the run.
+        reason = review.get("reason") or _build_field(run, "error")
+        words = " ".join(str(reason or "").split())
+        if not words or words == _NO_REJECT_REASON:
+            return REJECTED_BY_OWNER
+        return f"{REJECTED_BY_OWNER}: {words}"
 
     @staticmethod
     def _failure_reason(run: Any, state: str, *, is_fix: bool = False) -> str:
@@ -698,9 +802,15 @@ class WorkQueueLoop:
                 actor_identity=LOOP_ACTOR,
                 details={"after_id": int(after_id)},
             )
+            # A row Rich himself rejected did not fail; the question names
+            # what he did, so he is not told a machine failure stopped it.
+            if closed_word(antecedent) == REJECTED_BY_OWNER:
+                what_happened = f"was {REJECTED_BY_OWNER}"
+            else:
+                what_happened = "failed"
             message = (
-                f"#{int(after_id)} failed and #{queue_id} was waiting on it "
-                f"— hold or go?"
+                f"#{int(after_id)} {what_happened} and #{queue_id} was "
+                f"waiting on it — hold or go?"
             )
             logger.info("work queue: %s", message)
             await self._say(row, message)
