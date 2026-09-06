@@ -223,3 +223,53 @@ To change a setting (for example `OPENAI_BASE_URL`, today `http://localhost:4000
 LiteLLM factory key in `OPENAI_API_KEY`): `sops ~/.config/fleet-secrets/forge/forge-prod.enc.env`, then
 run the script. The pre-LiteLLM settings (switchboard direct on :9000) are kept encrypted beside it as
 `forge-prod.pre-litellm-2026-09-03.enc.env` for rollback. No plaintext copy is kept anywhere.
+
+## The Docker Sandbox daemon (settings of record, 2026-09-06)
+
+Every merge now deploys the feature into a **Docker Sandbox** — a small virtual
+machine with its own kernel and its own Docker engine, made by Docker's `sbx`
+tool. Each deployable repository owns one long-lived sandbox, named
+`<repo>-deploy` (for example `api-test-deploy`), which bind-mounts the checkout
+at its host path and publishes its app port and its candidate port back to the
+host's loopback. The repository's own deploy script runs unchanged inside it,
+against that sandbox's Docker engine; the health checks and the live gate keep
+running from the host against the published ports. The host's own Docker daemon
+is no longer in the deployment path.
+
+Two things must be true on this box before any of that works, and neither is
+done by a build:
+
+1. **The sandbox daemon runs, per user.** Start it with:
+
+   ```bash
+   sbx daemon start -d --policy balanced
+   ```
+
+   It is per user, not system-wide. A user unit that starts the daemon at login
+   is a follow-up, not part of this work — for now it is started by hand.
+
+2. **Rich's Docker sign-in.** Creating a sandbox needs a Docker sign-in, which
+   Rich has done once on this box. Nothing else needs it, and it is not
+   repeated per sandbox.
+
+### Keeping a sandbox awake — `ops/systemd/forge-sandbox-keeper@.service`
+
+A sandbox stops itself about thirty seconds after its last session ends, which
+would take a deployed app down with it. The keeper is a systemd **user**
+template unit that holds one session open in a named sandbox, and does nothing
+else. Install it once, attended:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ops/systemd/forge-sandbox-keeper@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+There is nothing to enable. The repository's deploy wrapper starts the instance
+it needs (`systemctl --user start forge-sandbox-keeper@api-test-deploy`) on
+every deploy, which does nothing when it is already running. To let a sandbox
+go back to sleep, stop its instance:
+
+```bash
+systemctl --user stop forge-sandbox-keeper@api-test-deploy
+```
