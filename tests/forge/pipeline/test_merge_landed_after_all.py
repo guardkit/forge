@@ -581,3 +581,66 @@ async def test_a_killed_command_is_quoted_by_its_last_sentence_not_a_slice(
     # The log line before the sentence never reaches the card, whole or cut.
     assert "resolve_verify_command" not in outcome.detail
     assert "laration" not in outcome.detail
+
+
+def _merge_step_rows(pool: SqliteLifecyclePersistence) -> list[str]:
+    return [
+        str(s.status)
+        for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == "merge_deploy_merge"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_merged_nothing_gives_the_press_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,
+    sidecar: str,
+) -> None:
+    """2026-09-06: Rich's press refused over a dirty tree and the build could
+    never be pressed again. A refusal that landed nothing releases the merge
+    step, so the next press runs."""
+    _write_guardkit(tmp_path, monkeypatch, REFUSES_WITH_A_SENTENCE)
+    before = _main_sha(repo)
+    first, _, _ = await _press_merge(
+        config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=before
+    )
+    assert first.result == "merge-refused"
+    assert _merge_step_rows(pool) == ["GATED", "SKIPPED"]
+
+    _write_guardkit(tmp_path, monkeypatch, MERGES_AND_ECHOES)
+    second, publisher, deploy = await _press_merge(
+        config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=before
+    )
+    assert second.result != "merge-refused", second.detail
+    assert "already on record" not in (second.detail or "")
+    assert _merge_step_rows(pool)[:3] == ["GATED", "SKIPPED", "GATED"]
+
+
+@pytest.mark.asyncio
+async def test_a_merge_that_landed_is_never_run_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,
+    sidecar: str,
+) -> None:
+    _write_guardkit(tmp_path, monkeypatch, MERGES_THEN_DIES)
+    before = _main_sha(repo)
+    first, _, _ = await _press_merge(
+        config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=before
+    )
+    assert first.result == "merged-verify-failed"
+    assert _merge_step_rows(pool) == ["GATED"]
+
+    _write_guardkit(tmp_path, monkeypatch, MERGES_AND_ECHOES)
+    second, _, _ = await _press_merge(
+        config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=_main_sha(repo)
+    )
+    assert second.result == "merge-refused"
+    assert "already on record" in second.detail
+
