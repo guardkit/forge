@@ -14,7 +14,7 @@ The narrow contract:
     POST /run  {repo, script, env, timeout_seconds}
               -> {exit_code, output_tail}
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
-                           timeout_seconds}
+                           timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
 
 The second operation exists because the merge word's post-merge checks must run
@@ -694,6 +694,34 @@ def process_guardkit_merge_request(
             }
         timeout = float(timeout_seconds)
 
+    # How long ONE run of the post-merge checks may take. It is separate from
+    # the wall above: that one holds the whole command, this one holds each
+    # check run inside it, and the merge command needs to be told it or the
+    # checks fall back to guardkit's own default.
+    verify_timeout_seconds = payload.get("verify_timeout_seconds")
+    verify_timeout: int | None = None
+    if verify_timeout_seconds is not None:
+        if (
+            isinstance(verify_timeout_seconds, bool)
+            or not isinstance(verify_timeout_seconds, (int, float))
+            or not float(verify_timeout_seconds).is_integer()
+            or int(verify_timeout_seconds) < 1
+        ):
+            return 400, {
+                "error": (
+                    "'verify_timeout_seconds' must be a positive whole number "
+                    "of seconds"
+                )
+            }
+        if float(verify_timeout_seconds) > MERGE_TIMEOUT_MAX:
+            return 400, {
+                "error": (
+                    f"'verify_timeout_seconds' may not be longer than "
+                    f"{MERGE_TIMEOUT_MAX:g} seconds; got {verify_timeout_seconds}"
+                )
+            }
+        verify_timeout = int(verify_timeout_seconds)
+
     # A pre-merge baseline, when one is sent, is a list of test names.
     baseline_failing = payload.get("baseline_failing")
     if baseline_failing is not None:
@@ -734,6 +762,8 @@ def process_guardkit_merge_request(
         expect_main_sha,
         "--json",
     ]
+    if verify_timeout is not None:
+        argv += ["--verify-timeout", str(verify_timeout)]
 
     # The sidecar writes its OWN copy of the baseline: the caller's file lives
     # inside the forge container and is not on this host at all. Failing to

@@ -77,10 +77,11 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
-# The real guardkit reads --baseline-json with this rule (a bare list of test
-# names, or an object carrying a failing_node_ids list) and stops with an error
-# for anything else, so every stand-in guardkit in these tests reads it the same
-# way. A file the real command would refuse must fail here too.
+# The baseline reader's shape contract, copied from guardkit's own source
+# (guardkit/cli/autobuild.py, _load_baseline_failing): a bare list of test
+# names, or an object carrying a failing_node_ids list, and an error for
+# anything else. Every stand-in guardkit in these tests reads the file this
+# way, so a file the real command would refuse fails here too.
 REAL_BASELINE_READER = """
 def read_baseline(path):
     import json
@@ -397,11 +398,17 @@ def test_the_shape_guardkit_refuses_really_does_stop_the_merge(
 ) -> None:
     """Proof the baseline assertions have teeth.
 
-    The real merge command reads the baseline file as a bare list of test names
-    or as an object with a ``failing_node_ids`` list, and stops with an error
-    for anything else. Written the old way — an object with a ``failing`` list —
-    the command exits non-zero and nothing merges. This is why the sidecar
-    writes ``failing_node_ids``.
+    This does NOT run the real merge command. It runs a stand-in that reads
+    the baseline file by the rule copied from guardkit's own source
+    (``guardkit/cli/autobuild.py``, ``_load_baseline_failing``): a bare JSON
+    list of test names, or an object carrying a ``failing_node_ids`` list, and
+    a ValueError for anything else. What is proven here is that shape contract
+    and the sidecar's side of it — written the old way, an object with a
+    ``failing`` list, the command exits non-zero and nothing merges; written
+    the way the sidecar writes it, the same command is happy. It was also
+    checked against the real binary by hand on 2026-09-06; if guardkit ever
+    changes that reader, the copy in ``REAL_BASELINE_READER`` must change with
+    it — this test cannot notice on its own.
     """
     wrong_shape = tmp_path / "old-shape-baseline.json"
     wrong_shape.write_text(
@@ -699,3 +706,80 @@ def test_an_unknown_path_is_still_404(repo: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# The feature-name rule is the wire's rule
+# ---------------------------------------------------------------------------
+
+
+def test_the_feature_name_rule_is_the_one_the_wire_uses() -> None:
+    """The sidecar writes the pattern out rather than importing it, because
+    the wire's copy is a private name. Written out means it can drift, so it
+    is pinned here: if the wire ever changes what a feature name looks like,
+    this fails and the copy is corrected."""
+    from nats_core.events._pipeline import (
+        FEATURE_ID_PATTERN as WIRE_FEATURE_ID_PATTERN,
+    )
+    from forge.deploy_sidecar.service import FEATURE_ID_PATTERN
+
+    assert FEATURE_ID_PATTERN.pattern == WIRE_FEATURE_ID_PATTERN.pattern
+    assert FEATURE_ID_PATTERN.flags == WIRE_FEATURE_ID_PATTERN.flags
+
+
+# ---------------------------------------------------------------------------
+# The limit on one run of the checks
+# ---------------------------------------------------------------------------
+
+
+def test_the_checks_time_limit_is_passed_to_the_command(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    runner = _RecordingMergeRunner()
+    status, _body = process_guardkit_merge_request(
+        _payload(verify_timeout_seconds=300),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 200
+    argv = runner.calls[0]["argv"]
+    assert argv[argv.index("--verify-timeout") + 1] == "300"
+
+
+def test_no_checks_time_limit_means_no_flag(repo: Path, fake_guardkit: Path) -> None:
+    """Without one the merge command keeps its own default — the sidecar does
+    not invent a number of its own."""
+    runner = _RecordingMergeRunner()
+    process_guardkit_merge_request(
+        _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=runner
+    )
+    assert "--verify-timeout" not in runner.calls[0]["argv"]
+
+
+@pytest.mark.parametrize("bad", [0, -5, "600", [], True, 1.5])
+def test_a_bad_checks_time_limit_is_refused(
+    repo: Path, fake_guardkit: Path, bad: Any
+) -> None:
+    runner = _RecordingMergeRunner()
+    status, body = process_guardkit_merge_request(
+        _payload(verify_timeout_seconds=bad),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 400
+    assert "positive whole number" in body["error"]
+    assert runner.calls == []  # nothing started
+
+
+def test_a_checks_time_limit_over_the_cap_is_refused(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    runner = _RecordingMergeRunner()
+    status, body = process_guardkit_merge_request(
+        _payload(verify_timeout_seconds=MERGE_TIMEOUT_MAX + 1),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 400
+    assert "may not be longer than" in body["error"]
+    assert runner.calls == []
