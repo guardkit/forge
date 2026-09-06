@@ -1330,14 +1330,14 @@ async def compose_planning_consumer_and_dispatch(
         _supervise(queue_loop_task, "work-queue-take-next")
         logger.info(
             "planning composition: the work queue is live — one sentence at a "
-            "time up to %d in flight, order %s; an unanswered merge card holds "
-            "the queue for %s; repairs are %s",
+            "time up to %d in flight, order %s; %s; repairs are %s",
             config.queue.max_in_flight,
             config.queue.order,
             (
-                plain_duration(merge_hold_seconds)
+                "an unanswered merge card holds the queue for "
+                + plain_duration(merge_hold_seconds)
                 if merge_hold_seconds > 0
-                else "no time at all"
+                else "the queue does not wait for a merge card"
             ),
             (
                 "STARTED by the queue"
