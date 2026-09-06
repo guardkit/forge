@@ -34,6 +34,7 @@ class TestAFileWithoutThemLoadsAsToday:
         assert cfg.queue.max_in_flight == 1
         assert cfg.queue.order == "shadow"
         assert cfg.queue.stale_after_days == 7
+        assert cfg.queue.merge_offer_hold_seconds == 86400
 
     def test_a_queue_block_without_them_still_loads(self, tmp_path: Path) -> None:
         cfg = load_config(
@@ -94,3 +95,37 @@ class TestTheThreeNewSettings:
         """extra='forbid' is intact — a typo is not silently accepted."""
         with pytest.raises(ValidationError):
             QueueConfig(max_in_fligt=2)
+
+
+class TestWaitingForTheMergeWord:
+    """How long the queue waits for a merge card before it moves on."""
+
+    def test_the_default_is_a_day(self) -> None:
+        assert QueueConfig().merge_offer_hold_seconds == 86400
+
+    def test_it_can_be_set_in_the_file(self, tmp_path: Path) -> None:
+        cfg = load_config(
+            _write(
+                tmp_path,
+                {**_MINIMUM, "queue": {"merge_offer_hold_seconds": 3600}},
+            )
+        )
+        assert cfg.queue.merge_offer_hold_seconds == 3600
+
+    def test_nought_is_allowed_and_means_do_not_wait(self, tmp_path: Path) -> None:
+        cfg = load_config(
+            _write(tmp_path, {**_MINIMUM, "queue": {"merge_offer_hold_seconds": 0}})
+        )
+        assert cfg.queue.merge_offer_hold_seconds == 0
+
+    def test_a_negative_wait_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            QueueConfig(merge_offer_hold_seconds=-1)
+
+    def test_the_description_reads_as_a_plain_sentence(self) -> None:
+        description = QueueConfig.model_fields[
+            "merge_offer_hold_seconds"
+        ].description
+        assert description is not None
+        assert "merge word" in description
+        assert "0 means do not wait for a card at all" in description
