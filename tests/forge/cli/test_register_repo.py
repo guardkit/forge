@@ -1062,3 +1062,507 @@ def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
 
     assert register_repo._shallow_test_roots(repo) == ["tests/smoke", "tests/unit"]
     assert register_repo._shallow_test_roots(tmp_path / "nothing") == []
+
+
+# ---------------------------------------------------------------------------
+# --deploy-port — the three files a repository needs to be deployed into its
+# own Docker Sandbox (the 2026-09-06 decision, rule 7)
+#
+# None of these tests runs sbx, creates a sandbox, or asks systemd for
+# anything: the wrapper is driven with a fake sbx and a fake systemctl first
+# on PATH, which record what they were asked to do and answer as told.
+# ---------------------------------------------------------------------------
+
+
+DEPLOY_FILE_LIST = ("deploy/profile.yaml", "deploy/sandbox-deploy.sh", "deploy/deploy.sh")
+
+
+def _load_written_profile(repo: Path):
+    from forge.deploy.profile import load_deploy_profile
+
+    return load_deploy_profile(repo / "deploy" / "profile.yaml")
+
+
+def test_deploy_port_writes_the_three_files(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    for relative in DEPLOY_FILE_LIST:
+        assert (repo / relative).is_file(), relative
+    assert _status_of(result, "deploy-files").count("added") == 3
+
+
+def test_the_written_profile_names_the_sandbox_and_both_ports(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    profile = _load_written_profile(repo)
+    assert profile.sandbox is not None
+    assert profile.sandbox.name == "bench-one-deploy"
+    assert profile.sandbox.publish == (
+        "127.0.0.1:8911:8911",
+        "127.0.0.1:8912:8912",
+    )
+    assert profile.compose.script == "deploy/sandbox-deploy.sh"
+    assert profile.cwd == str(repo)
+    assert profile.candidate is not None
+    assert profile.candidate.env["CANDIDATE_PORT"] == "8912"
+
+
+def test_the_debian_and_python_rules_are_always_there(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    allowed = _load_written_profile(repo).sandbox.allow_network
+    assert "deb.debian.org" in allowed
+    assert "*.debian.org" in allowed
+    assert "pypi.org" in allowed
+    assert "files.pythonhosted.org" in allowed
+
+
+def test_deploy_allow_adds_the_model_door(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "agent-repo", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(
+        config,
+        str(repo),
+        "--deploy-port",
+        "8911",
+        "--deploy-allow",
+        "172.30.1.253:4000",
+    )
+
+    assert "172.30.1.253:4000" in _load_written_profile(repo).sandbox.allow_network
+
+
+def test_without_deploy_allow_no_extra_host_is_reachable(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    allowed = _load_written_profile(repo).sandbox.allow_network
+    assert not any(host.startswith("172.") for host in allowed)
+
+
+def test_the_deploy_script_carries_this_repository_s_project_and_ports(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    script = (repo / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    assert 'COMPOSE_PROJECT="${COMPOSE_PROJECT:-bench-one}"' in script
+    assert "http://localhost:8911/health" in script
+    assert 'CANDIDATE_PORT="${CANDIDATE_PORT:-8912}"' in script
+    # api_test's own names never travel to another repository.
+    assert "apitest-f2" not in script
+
+
+def test_no_placeholder_survives_in_either_script(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    for relative in ("deploy/sandbox-deploy.sh", "deploy/deploy.sh"):
+        assert "@@" not in (repo / relative).read_text(encoding="utf-8"), relative
+
+
+def test_both_scripts_are_runnable(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    _run(config, str(repo), "--deploy-port", "8911")
+
+    for relative in ("deploy/sandbox-deploy.sh", "deploy/deploy.sh"):
+        path = repo / relative
+        assert os.access(path, os.X_OK), relative
+        assert (
+            subprocess.run(["bash", "-n", str(path)]).returncode == 0
+        ), f"{relative} is not valid shell"
+
+
+def test_without_the_flag_nothing_about_deploys_is_written(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    assert not (repo / "deploy").exists()
+    assert _status_of(result, "deploy-files") == []
+    # And the old warning still stands, word for word.
+    assert ("deploy", "warn", "no deploy/profile.yaml") in _steps(result)
+
+
+def test_a_profile_already_there_is_never_rewritten(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    (repo / "deploy").mkdir()
+    written_by_hand = "# mine, thanks\nenv_id: local\ncompose:\n  file: dc.yml\n"
+    (repo / "deploy" / "profile.yaml").write_text(written_by_hand, encoding="utf-8")
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert (repo / "deploy" / "profile.yaml").read_text(
+        encoding="utf-8"
+    ) == written_by_hand
+    assert "unchanged" in _status_of(result, "deploy-files")
+    # The two scripts it did not have are still written.
+    assert (repo / "deploy" / "sandbox-deploy.sh").is_file()
+
+
+def test_a_dry_run_writes_no_deploy_file(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--dry-run", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert not (repo / "deploy").exists()
+    assert _status_of(result, "deploy-files") == ["would-add"] * 3
+
+
+def test_deploy_allow_without_deploy_port_is_refused(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-allow", "172.30.1.253:4000")
+
+    assert result.exit_code != 0
+    assert "--deploy-allow" in result.output
+    assert not (repo / "deploy").exists()
+    # Nothing was registered either.
+    assert "bench-one" not in config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("port", ["0", "65535", "-1"])
+def test_a_port_the_pair_cannot_fit_in_is_refused(_isolate, tmp_path, port):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", port)
+
+    assert result.exit_code != 0
+    assert "--deploy-port" in result.output
+    assert not (repo / "deploy").exists()
+
+
+def test_a_bad_host_in_deploy_allow_is_refused_before_anything_is_written(
+    _isolate, tmp_path
+):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(
+        config, str(repo), "--deploy-port", "8911", "--deploy-allow", "http://door/"
+    )
+
+    assert result.exit_code != 0
+    assert "deploy profile would not load" in result.output
+    assert not (repo / "deploy" / "profile.yaml").exists()
+
+
+def test_a_name_no_sandbox_could_carry_is_refused(_isolate, tmp_path):
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--name", "___", "--deploy-port", "8911")
+
+    assert result.exit_code != 0
+    assert "Docker Sandbox" in result.output
+    assert not (repo / "deploy").exists()
+
+
+def test_the_name_becomes_the_project_and_the_sandbox(_isolate, tmp_path):
+    from forge.cli.register_repo import compose_project_for, sandbox_name_for
+
+    assert compose_project_for("api_test") == "api-test"
+    assert sandbox_name_for("api_test") == "api-test-deploy"
+    assert sandbox_name_for("content-agent-py") == "content-agent-py-deploy"
+    assert sandbox_name_for("Bench.One") == "bench-one-deploy"
+    assert sandbox_name_for("___") == ""
+
+
+# ---------------------------------------------------------------------------
+# The wrapper, driven — with a fake sbx and a fake systemctl first on PATH
+#
+# The wrapper is the only script the deploy step runs. It brings the sandbox
+# up, runs the repository's own deploy script inside it, and hands back that
+# script's exit code unchanged. Every test below drives the real file the
+# command writes; the two fakes record every argument they are given and
+# answer as the test tells them to. No real sbx, no real systemctl, no
+# sandbox, no daemon.
+# ---------------------------------------------------------------------------
+
+
+FAKE_SBX = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SBX_LOG"
+case "$1 $2" in
+  "ls ")
+    printf '%s\\n' "${SBX_LS:-}"
+    ;;
+  "policy show")
+    printf '%s\\n' "${SBX_POLICY_SHOWN:-}"
+    exit "${SBX_POLICY_SHOW_STATUS:-0}"
+    ;;
+  "exec "*)
+    exit "${SBX_EXEC_STATUS:-0}"
+    ;;
+esac
+exit 0
+"""
+
+FAKE_SYSTEMCTL = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
+exit 0
+"""
+
+
+@pytest.fixture
+def wrapper_repo(_isolate, tmp_path):
+    """A registered repository with its deploy files, plus the two fakes."""
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+    result = _run(config, str(repo), "--deploy-port", "8911")
+    assert result.exit_code == 0, result.output
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "sbx").write_text(FAKE_SBX, encoding="utf-8")
+    (fake_bin / "systemctl").write_text(FAKE_SYSTEMCTL, encoding="utf-8")
+    for name in ("sbx", "systemctl"):
+        (fake_bin / name).chmod(0o755)
+    return repo, fake_bin
+
+
+def _drive_wrapper(wrapper_repo, tmp_path, **env):
+    """Run the wrapper with the fakes first on PATH; return (result, sbx, systemctl)."""
+    repo, fake_bin = wrapper_repo
+    sbx_log = tmp_path / "sbx.log"
+    systemctl_log = tmp_path / "systemctl.log"
+    sbx_log.write_text("", encoding="utf-8")
+    systemctl_log.write_text("", encoding="utf-8")
+    run_env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "SBX_LOG": str(sbx_log),
+        "SYSTEMCTL_LOG": str(systemctl_log),
+        "SANDBOX_NAME": "bench-one-deploy",
+        "SANDBOX_MEMORY": "6g",
+        "SANDBOX_CPUS": "4",
+        "SANDBOX_PUBLISH": "127.0.0.1:8911:8911,127.0.0.1:8912:8912",
+        "SANDBOX_ALLOW_NETWORK": "pypi.org,*.debian.org",
+    }
+    run_env.update({k: str(v) for k, v in env.items()})
+    result = subprocess.run(
+        [str(repo / "deploy" / "sandbox-deploy.sh")],
+        cwd=repo,
+        env=run_env,
+        capture_output=True,
+        text=True,
+    )
+    return (
+        result,
+        [line for line in sbx_log.read_text().splitlines() if line.strip()],
+        [line for line in systemctl_log.read_text().splitlines() if line.strip()],
+    )
+
+
+def test_the_wrapper_creates_the_sandbox_when_it_is_not_there(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
+
+    assert result.returncode == 0, result.stderr
+    created = [line for line in sbx if line.startswith("create ")]
+    assert len(created) == 1
+    assert "create shell" in created[0]
+    assert "--name bench-one-deploy" in created[0]
+    assert "--memory 6g" in created[0]
+    assert "--cpus 4" in created[0]
+    assert "--publish 127.0.0.1:8911:8911" in created[0]
+    assert "--publish 127.0.0.1:8912:8912" in created[0]
+
+
+def test_the_wrapper_does_not_create_a_sandbox_that_is_already_there(
+    wrapper_repo, tmp_path
+):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo, tmp_path, SBX_LS="bench-one-deploy   running"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [line for line in sbx if line.startswith("create ")] == []
+
+
+def test_a_similar_name_is_not_mistaken_for_this_sandbox(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo, tmp_path, SBX_LS="bench-one-deploy-old   running"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len([line for line in sbx if line.startswith("create ")]) == 1
+
+
+def test_the_network_rules_are_added_once_in_one_call(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
+
+    assert result.returncode == 0, result.stderr
+    allowed = [line for line in sbx if line.startswith("policy allow ")]
+    assert allowed == [
+        "policy allow network --sandbox bench-one-deploy pypi.org,*.debian.org"
+    ]
+
+
+def test_the_rules_are_not_added_again_when_they_are_already_allowed(
+    wrapper_repo, tmp_path
+):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo,
+        tmp_path,
+        SBX_LS="bench-one-deploy   running",
+        SBX_POLICY_SHOWN="allow pypi.org\nallow *.debian.org",
+        SBX_POLICY_SHOW_STATUS="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [line for line in sbx if line.startswith("policy allow ")] == []
+
+
+def test_a_missing_rule_means_the_whole_set_is_added(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo,
+        tmp_path,
+        SBX_LS="bench-one-deploy   running",
+        SBX_POLICY_SHOWN="allow pypi.org",
+        SBX_POLICY_SHOW_STATUS="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len([line for line in sbx if line.startswith("policy allow ")]) == 1
+
+
+def test_rules_are_added_when_the_policy_cannot_be_read(wrapper_repo, tmp_path):
+    # An older sbx that cannot answer the question must not leave a sandbox
+    # walled off — adding a rule that is already there changes nothing.
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo,
+        tmp_path,
+        SBX_LS="bench-one-deploy   running",
+        SBX_POLICY_SHOW_STATUS="1",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len([line for line in sbx if line.startswith("policy allow ")]) == 1
+
+
+def test_the_keeper_is_started_for_this_sandbox(wrapper_repo, tmp_path):
+    result, _, systemctl = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
+
+    assert result.returncode == 0, result.stderr
+    assert systemctl == ["--user start forge-sandbox-keeper@bench-one-deploy"]
+
+
+def test_the_deploy_script_runs_inside_with_exactly_the_named_settings(
+    wrapper_repo, tmp_path
+):
+    repo, _ = wrapper_repo
+    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
+
+    assert result.returncode == 0, result.stderr
+    ran = [line for line in sbx if line.startswith("exec ")]
+    assert len(ran) == 1
+    assert ran[0] == (
+        f"exec -w {repo} "
+        "-e CANDIDATE -e PROMOTE -e REVERT -e CANDIDATE_DOWN "
+        "-e CANDIDATE_PORT -e ROLLBACK_IMAGE_REF -e ENV_FILE "
+        "bench-one-deploy deploy/deploy.sh"
+    )
+
+
+@pytest.mark.parametrize("status", ["0", "1", "2", "7"])
+def test_the_inner_exit_code_comes_back_unchanged(wrapper_repo, tmp_path, status):
+    result, _, _ = _drive_wrapper(
+        wrapper_repo, tmp_path, SBX_LS="", SBX_EXEC_STATUS=status
+    )
+
+    assert result.returncode == int(status), result.stderr
+    assert f"exit code {status}" in result.stdout
+
+
+def test_no_sandbox_name_means_it_refuses_and_touches_nothing(wrapper_repo, tmp_path):
+    result, sbx, systemctl = _drive_wrapper(
+        wrapper_repo, tmp_path, SBX_LS="", SANDBOX_NAME=""
+    )
+
+    assert result.returncode == 2
+    assert "no SANDBOX_NAME" in result.stdout
+    assert sbx == []
+    assert systemctl == []
+
+
+def test_no_network_rules_means_no_policy_call_at_all(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo, tmp_path, SBX_LS="", SANDBOX_ALLOW_NETWORK=""
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [line for line in sbx if line.startswith("policy ")] == []
+
+
+def test_settings_left_empty_are_left_off_the_create(wrapper_repo, tmp_path):
+    result, sbx, _ = _drive_wrapper(
+        wrapper_repo,
+        tmp_path,
+        SBX_LS="",
+        SANDBOX_MEMORY="",
+        SANDBOX_CPUS="",
+        SANDBOX_PUBLISH="",
+    )
+
+    assert result.returncode == 0, result.stderr
+    created = [line for line in sbx if line.startswith("create ")][0]
+    assert created == f"create shell {wrapper_repo[0]} --name bench-one-deploy"
