@@ -111,6 +111,10 @@ class MergeDeployOutcome:
     verdict: str | None = None
     checks_passed: int | None = None
     checks_total: int | None = None
+    #: What the post-merge checks did, in guardkit's own word: "failed" when
+    #: they ran and something went red, "unverified" when they could not run at
+    #: all. ``None`` for every ending that is not about the checks.
+    verify_status: str | None = None
 
 
 @dataclass
@@ -217,13 +221,33 @@ RED_MERGE_ENDINGS: frozenset[str] = frozenset(
 )
 
 
-def _mint_repair_row(pool: Any, build_id: str, outcome: "MergeDeployOutcome") -> None:
+def _mint_repair_row(
+    pool: Any,
+    build_id: str,
+    outcome: "MergeDeployOutcome",
+    *,
+    feature_id: str | None = None,
+) -> None:
     """File one repair row for a merge whose checks went red. Never raises.
+
+    A repair is only worth filing when the checks RAN and something came back
+    red — there is code to fix then. When the checks could not run at all, the
+    thing that is broken is the check itself, and no amount of building will
+    mend it; the first real press of a merge card filed exactly such a repair
+    for a failure no code could fix. So that case files nothing and says so in
+    one line instead.
 
     The producer already swallows everything; this call site catches too,
     because the merge report is the only durable record of what the merge
     did and a queue row must never be able to cost it.
     """
+    if outcome.result == "merged-verify-failed" and outcome.verify_status != "failed":
+        logger.info(
+            "merge-executor: the checks for %s could not run, so no repair was "
+            "filed — a person must look at the check itself",
+            feature_id or build_id,
+        )
+        return
     try:
         from forge.pipeline.fix_row_producer import (
             SOURCE_MERGE_REPORT,
@@ -389,6 +413,7 @@ async def execute_merge_deploy(
             verdict=outcome.verdict,
             checks_passed=outcome.checks_passed,
             checks_total=outcome.checks_total,
+            verify_status=outcome.verify_status,
             detail=outcome.detail,
             digest_conformance_warning=conformance_warning,
             dry_run=dry_run,
@@ -419,7 +444,7 @@ async def execute_merge_deploy(
         # them: nothing changed, so there is nothing to repair. The dry run
         # is not one either: it changed nothing on purpose.
         if not dry_run and outcome.result in RED_MERGE_ENDINGS:
-            _mint_repair_row(deps.pool, build_id, outcome)
+            _mint_repair_row(deps.pool, build_id, outcome, feature_id=feature_id)
         return outcome
 
     # ------------------------------------------------------------------
@@ -581,25 +606,41 @@ async def execute_merge_deploy(
 
         if merged_in_report and report.get("verify_ok") is False:
             charged = report.get("charged_failures") or []
+            # Guardkit says "unverified" when the checks could not START at
+            # all — a missing interpreter, a command that is not there. That
+            # is not a failing test, and calling it one sent Rich looking for
+            # a red test that did not exist. Say which of the two happened.
+            could_not_run = (
+                str(report.get("verify_status") or "").strip().lower() == "unverified"
+            )
+            why = str(
+                report.get("verify_detail")
+                or report.get("verify_status")
+                or "verification failed"
+            )
+            if could_not_run:
+                detail = (
+                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                    f"post-merge checks could not run: {why}. "
+                    "The deploy was not dispatched."
+                )
+            else:
+                detail = (
+                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                    f"post-merge checks did not pass: {why}"
+                    + (f" — {len(charged)} charged failure(s)" if charged else "")
+                    + ". The deploy was not dispatched."
+                )
             return await _publish_report(
                 MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
                     merged_sha=merged_sha,
                     failed_step="verify",
-                    detail=(
-                        f"{feature_id} merged ({(merged_sha or '')[:10]}), "
-                        "but the post-merge checks did not pass: "
-                        + str(
-                            report.get("verify_detail")
-                            or report.get("verify_status")
-                            or "verification failed"
-                        )
-                        + (f" — {len(charged)} charged failure(s)" if charged else "")
-                        + ". The deploy was not dispatched."
-                    ),
+                    detail=detail,
                     checks_passed=checks_passed,
                     checks_total=checks_total,
+                    verify_status="unverified" if could_not_run else "failed",
                 )
             )
 
