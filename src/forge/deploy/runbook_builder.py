@@ -50,7 +50,7 @@ def _step(step_type: str, params: dict[str, Any], index: int) -> Step:
 
 
 def sandbox_env(profile: DeployProfile) -> dict[str, str]:
-    """The five sandbox settings, as the environment the deploy script reads.
+    """The sandbox settings, as the environment the deploy script reads.
 
     A repository that deploys into a Docker Sandbox carries a ``sandbox`` block
     in its profile (the 2026-09-06 decision). Its vetted wrapper reads the
@@ -59,19 +59,37 @@ def sandbox_env(profile: DeployProfile) -> dict[str, str]:
     deploy, the promote, the revert, the candidate teardown, and the health
     checks. The two lists are joined with commas.
 
+    The five settings every sandbox has always ride, empty when unset. The six
+    that make the sandbox carry the factory's own services (the two service
+    ports, the environment file, the forge and guardkit mounts, the receipts
+    root — the spec's Part O, rule 68) ride only when the profile sets them,
+    so a profile without them threads exactly what it threaded before.
+
     No ``sandbox`` block ⇒ an empty mapping ⇒ nothing is added to any step and
     every runbook is exactly what it was before sandboxes existed.
     """
     sandbox = profile.sandbox
     if sandbox is None:
         return {}
-    return {
+    env = {
         "SANDBOX_NAME": sandbox.name,
         "SANDBOX_MEMORY": sandbox.memory or "",
         "SANDBOX_CPUS": str(sandbox.cpus) if sandbox.cpus is not None else "",
         "SANDBOX_PUBLISH": ",".join(sandbox.publish),
         "SANDBOX_ALLOW_NETWORK": ",".join(sandbox.allow_network),
     }
+    factory_settings = {
+        "SANDBOX_SIDECAR_PUBLISH": sandbox.sidecar_publish,
+        "SANDBOX_RUNNER_PUBLISH": sandbox.runner_publish,
+        "SANDBOX_ENV_FILE": sandbox.env_file,
+        "SANDBOX_FORGE_PATH": sandbox.forge_path,
+        "SANDBOX_GUARDKIT_PATH": sandbox.guardkit_path,
+        "SANDBOX_RECEIPTS_PATH": sandbox.receipts_path,
+    }
+    for name, value in factory_settings.items():
+        if value:
+            env[name] = value
+    return env
 
 
 def _merged_env(
@@ -145,7 +163,7 @@ def build_deploy_runbook(
             runs from the checkout and re-tags the image the candidate built.
             ``None`` ⇒ the profile's ``cwd``, exactly as before.
 
-    When the profile carries a ``sandbox`` block, the sandbox's five settings
+    When the profile carries a ``sandbox`` block, the sandbox's settings
     (:func:`sandbox_env`) are added underneath both overlays, so the vetted
     wrapper knows which Docker Sandbox to run the deploy inside. No block ⇒
     nothing is added and both steps are exactly what they were.
@@ -282,7 +300,7 @@ def build_revert_runbook(
     intent (the hermetic gate) and the profile's deploy script consumes it (env /
     compose IMAGE var) on a live revert.
 
-    When the profile carries a ``sandbox`` block, the sandbox's five settings
+    When the profile carries a ``sandbox`` block, the sandbox's settings
     (:func:`sandbox_env`) ride in the step's ``extra_env`` too — a revert runs
     inside the same Docker Sandbox the deploy ran in.
 
@@ -334,7 +352,7 @@ def build_candidate_teardown_runbook(
     ({CANDIDATE_DOWN:"1", **candidate.env}) so the vetted script brings DOWN the
     ``-cand`` project (``down -v``) rather than re-deploying it. Deliberately a
     single focused step — no pre-flight, no health check. When the profile
-    carries a ``sandbox`` block, the sandbox's five settings
+    carries a ``sandbox`` block, the sandbox's settings
     (:func:`sandbox_env`) ride alongside, so the teardown happens inside the
     same Docker Sandbox.
 

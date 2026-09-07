@@ -8,6 +8,13 @@ up and runs its deploy script inside it. It is copied out exactly as it is
 here — the same file api_test deploys with, byte for byte — because every
 value it needs reaches it in its environment from ``deploy/profile.yaml``.
 
+``sandbox-runner.sh`` is the bootstrap that runs *inside* that sandbox and
+brings up the factory's two services for the repository — the deploy sidecar
+and the build runner — from the read-only forge and guardkit mounts (Rich's
+rule of 2026-09-07: nothing the factory runs on a repository runs on the
+host). It is copied out exactly as it is here too; it reads everything from
+the sandbox's own environment.
+
 ``deploy.sh`` (a copy of api_test's own deploy script) and
 ``docker-compose.candidate.yml`` (the overlay that puts the throwaway
 candidate copy on its own port) do carry the repository's own names and

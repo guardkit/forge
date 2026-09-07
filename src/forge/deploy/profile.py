@@ -228,6 +228,32 @@ class DeploySandbox:
             nothing off its own network without a rule here — the Debian
             mirrors, the Python index, and (for a repository whose app talks to
             a model) the model door's address and port on this box.
+
+    The six settings below make the sandbox carry the factory's own two
+    services for this repository as well — the deploy sidecar and the build
+    runner — on the factory's own clone of the repository (Rich's rule of
+    2026-09-07: nothing the factory runs on a repository runs on the host;
+    the spec's Part O, rule 68). All are optional; with none of them set the
+    sandbox is exactly what it was before.
+
+    Attributes:
+        sidecar_publish: The deploy sidecar's port, written
+            ``HOST_ADDRESS:HOST_PORT:SANDBOX_PORT`` on the host's loopback, for
+            example ``127.0.0.1:8925:8125``. Goes together with
+            ``runner_publish``: both, or neither.
+        runner_publish: The build runner's port, likewise, for example
+            ``127.0.0.1:8924:8124``.
+        env_file: The sandbox's own environment — a file rendered by sops at
+            deploy time (the router's address and key, the bus, the receipts
+            root, the build settings), handed to ``sbx`` when the sandbox is
+            created. Never anyone's shell.
+        forge_path: The forge checkout mounted read-only into the sandbox, so
+            the factory's code is installed from our own tree, never from a
+            registry. None ⇒ the folder ``forge`` beside the checkout.
+        guardkit_path: The guardkit checkout, likewise. None ⇒ ``guardkit``
+            beside the checkout.
+        receipts_path: The receipts root, mounted read-write — data the
+            pipeline reads, never code it runs. None ⇒ not mounted.
     """
 
     name: str
@@ -235,6 +261,12 @@ class DeploySandbox:
     cpus: int | None = None
     publish: tuple[str, ...] = ()
     allow_network: tuple[str, ...] = ()
+    sidecar_publish: str | None = None
+    runner_publish: str | None = None
+    env_file: str | None = None
+    forge_path: str | None = None
+    guardkit_path: str | None = None
+    receipts_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,13 +773,87 @@ def _parse_sandbox(raw: Any) -> DeploySandbox | None:
             "zero when present"
         )
 
+    # The factory's two services. Each port is one full publish rule (host
+    # address, host port, port inside the sandbox); the two go together.
+    sidecar_publish = _parse_sandbox_service_port(
+        m.get("sidecar_publish"), what="sandbox.sidecar_publish"
+    )
+    runner_publish = _parse_sandbox_service_port(
+        m.get("runner_publish"), what="sandbox.runner_publish"
+    )
+    if (sidecar_publish is None) != (runner_publish is None):
+        raise DeployProfileError(
+            "sandbox.sidecar_publish and sandbox.runner_publish go together — "
+            "a sandbox carries both of the factory's services or neither; set "
+            "both (for example '127.0.0.1:8925:8125' and '127.0.0.1:8924:8124') "
+            "or leave both out"
+        )
+
     return DeploySandbox(
         name=name,
         memory=memory,
         cpus=cpus,
         publish=_parse_sandbox_publish(m.get("publish")),
         allow_network=_parse_sandbox_allow_network(m.get("allow_network")),
+        sidecar_publish=sidecar_publish,
+        runner_publish=runner_publish,
+        env_file=_parse_sandbox_path(m.get("env_file"), what="sandbox.env_file"),
+        forge_path=_parse_sandbox_path(m.get("forge_path"), what="sandbox.forge_path"),
+        guardkit_path=_parse_sandbox_path(
+            m.get("guardkit_path"), what="sandbox.guardkit_path"
+        ),
+        receipts_path=_parse_sandbox_path(
+            m.get("receipts_path"), what="sandbox.receipts_path"
+        ),
     )
+
+
+def _parse_sandbox_service_port(raw: Any, *, what: str) -> str | None:
+    """Parse one of the two service ports: one full publish rule, or absent.
+
+    A service port is always written in the three-part form — the host
+    address, the host port and the port inside the sandbox — because the
+    service binds a fixed port inside and forge-prod reaches it on the host's
+    loopback; the shorter forms the app ports allow would leave one of those
+    to a default.
+    """
+    if raw is None:
+        return None
+    shape = (
+        f"{what} must be one port rule written "
+        "'HOST_ADDRESS:HOST_PORT:SANDBOX_PORT', for example '127.0.0.1:8925:8125'"
+    )
+    if not isinstance(raw, str) or not raw.strip():
+        raise DeployProfileError(shape)
+    rule = raw.strip()
+    parts = rule.split(":")
+    if len(parts) != 3 or "," in rule:
+        raise DeployProfileError(f"{shape}; got {rule!r}")
+    host, host_port, sandbox_port = parts
+    if not _SANDBOX_HOST_RE.match(host):
+        raise DeployProfileError(
+            f"{what} starts with {host!r}, which is not a host address — {shape}"
+        )
+    _parse_port(host_port, what=f"{what} host port")
+    _parse_port(sandbox_port, what=f"{what} sandbox port")
+    return rule
+
+
+def _parse_sandbox_path(raw: Any, *, what: str) -> str | None:
+    """Parse one of the sandbox's optional paths: a non-empty string, or absent."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise DeployProfileError(
+            f"{what} must be a path written as a non-empty string when present"
+        )
+    path = raw.strip()
+    if "," in path:
+        raise DeployProfileError(
+            f"{what}={path!r} contains a comma, which the deploy script would "
+            "read as two settings — use a path without one"
+        )
+    return path
 
 
 # ---------------------------------------------------------------------------
