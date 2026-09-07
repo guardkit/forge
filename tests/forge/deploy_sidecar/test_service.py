@@ -148,7 +148,8 @@ def test_compose_script_allowed(repo: Path) -> None:
         script_runner=runner,
     )
     assert status == 200
-    assert body == {"exit_code": 0, "output_tail": "ok"}
+    # The answer says where the script ran (LAW 8's other half).
+    assert body == {"exit_code": 0, "output_tail": "ok", "cwd": str(repo)}
     assert runner.calls[0]["script"] == "deploy.sh"
     assert runner.calls[0]["cwd"] == str(repo)  # cwd resolved to repo root
 
@@ -629,6 +630,32 @@ def test_a_candidate_tree_is_the_working_directory(repo: Path) -> None:
     # The script is still the profile's name — found relative to the tree,
     # so the tree's own copy runs.
     assert runner.calls[0]["script"] == "deploy.sh"
+    # And the answer says so, which is how the client tells a sidecar that
+    # honoured the tree from one running old code that silently ran main.
+    assert body["cwd"] == str(tree.resolve())
+
+
+def test_the_answer_says_where_the_script_ran(repo: Path) -> None:
+    """Every permitted run answers with its working directory: the profile's
+    own for an ordinary run, the candidate tree when one was honoured."""
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": "/ignored-by-sidecar"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body["cwd"] == str(repo)
+    tree = _candidate_tree(repo)
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": str(tree)},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body["cwd"] == str(tree.resolve())
+    assert body["cwd"] == runner.calls[-1]["cwd"]
 
 
 def test_a_relative_candidate_tree_resolves_under_the_repo(repo: Path) -> None:

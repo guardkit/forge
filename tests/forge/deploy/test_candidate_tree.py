@@ -139,6 +139,35 @@ class TestLayingTheTreeOut:
             await materialise_candidate_tree(repo, FEATURE_ID, "")
 
     @pytest.mark.asyncio
+    async def test_a_refused_commit_leaves_no_directory_behind(self, repo: Path) -> None:
+        """Rule 38: a lay-out that fails is the end of the run, and nothing
+        stays in the shared checkout — not even an empty directory (the
+        coach's refutation script, 2026-09-07)."""
+        dest = repo / ".forge-candidates" / FEATURE_ID
+        with pytest.raises(CandidateTreeError, match="git archive"):
+            await materialise_candidate_tree(repo, FEATURE_ID, "f" * 40)
+        assert not dest.exists()
+
+    @pytest.mark.asyncio
+    async def test_an_extraction_that_dies_half_way_leaves_no_directory_behind(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.deploy import candidate_tree as module
+
+        tip = await git_rev_parse(repo, f"autobuild/{FEATURE_ID}")
+        dest = repo / ".forge-candidates" / FEATURE_ID
+
+        def _dies_half_way(*_args: object, **_kwargs: object) -> object:
+            # Half a tree is already on disk when the stream breaks.
+            (dest / "half.txt").write_text("half\n", encoding="utf-8")
+            raise module.tarfile.TarError("the stream ended half way")
+
+        monkeypatch.setattr(module.tarfile, "open", _dies_half_way)
+        with pytest.raises(CandidateTreeError):
+            await materialise_candidate_tree(repo, FEATURE_ID, tip or "")
+        assert not dest.exists()
+
+    @pytest.mark.asyncio
     async def test_the_tree_is_removed(self, repo: Path) -> None:
         tip = await git_rev_parse(repo, f"autobuild/{FEATURE_ID}")
         laid_out = await materialise_candidate_tree(repo, FEATURE_ID, tip or "")

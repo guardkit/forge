@@ -12,7 +12,7 @@ The narrow contract:
 
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
     POST /run  {repo, script, env, timeout_seconds, cwd?}
-              -> {exit_code, output_tail}
+              -> {exit_code, output_tail, cwd}
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
                            timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
@@ -60,7 +60,11 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    directly under it, is refused loudly. Any other value is ignored and the
    profile's own working directory is used, as it always was. The script
    still has to be one the profile names; it is found relative to the
-   working directory, so the candidate's own copy runs.
+   working directory, so the candidate's own copy runs. The answer carries
+   the working directory the script actually ran in (``cwd``), so the
+   caller can tell a sidecar that honoured the candidate tree from one that
+   is running old code or a different checkout path and silently ran the
+   script from the checkout — main, checked and reported as the branch.
 
 Each request-processing core (:func:`process_run_request` and
 :func:`process_guardkit_merge_request`) is a pure function
@@ -404,7 +408,7 @@ def process_run_request(
 
     Enforces every deny-by-default law before any subprocess is spawned. Returns
     a 4xx with a loud ``error`` on a refusal, a 500 on an unexpected internal
-    error, and a 200 with ``{exit_code, output_tail}`` on a permitted run (the
+    error, and a 200 with ``{exit_code, output_tail, cwd}`` on a permitted run (the
     script's non-zero exit is a 200 with a non-zero ``exit_code``, not an HTTP
     error — the script's verdict is data, not a transport failure). Never raises.
     """
@@ -532,7 +536,9 @@ def process_run_request(
             "output_tail": "",
         }
 
-    return 200, {"exit_code": exit_code, "output_tail": _tail(output)}
+    # LAW 8, the other half: say where the script ran, so a caller that named
+    # a candidate tree can tell it was honoured.
+    return 200, {"exit_code": exit_code, "output_tail": _tail(output), "cwd": str(cwd)}
 
 
 # ---------------------------------------------------------------------------

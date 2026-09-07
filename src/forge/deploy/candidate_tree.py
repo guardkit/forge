@@ -23,6 +23,11 @@ tree of the commit. An archive was chosen because:
 * the tree ids compared before the promote (rule 37) are read from the
   checkout with ``git rev-parse``, so the laid-out tree never needs git.
 
+A lay-out that fails leaves NOTHING behind (coach's refutation, 2026-09-07):
+whether git refused the commit or the extraction died half way, the empty or
+half-filled directory is removed before the error is raised. The executor has
+no path to remove at that point, so this module is the only place that can.
+
 The one thing an archive does that a worktree does not: it honours
 ``export-ignore`` attributes. A repository that marks files it needs for its
 build as export-ignore would lay out a tree that builds differently. None of the
@@ -142,6 +147,18 @@ def _materialise_sync(repo_root: Path, dest: Path, sha: str) -> None:
         # A run that died half way left its tree behind; a fresh one replaces it.
         shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=False)
+    try:
+        _extract_archive_into(repo_root, dest, sha)
+    except BaseException:
+        # Rule 38: the tree is removed when the run ends, and a lay-out that
+        # fails IS the end of the run. Nothing stays behind in the shared
+        # checkout — not an empty directory, not a half-extracted one.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+def _extract_archive_into(repo_root: Path, dest: Path, sha: str) -> None:
+    """Stream ``git archive <sha>`` into ``dest``; raise with git's own words."""
     try:
         proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             ["git", "archive", "--format=tar", sha],
