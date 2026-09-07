@@ -71,12 +71,15 @@ __all__ = [
     "normalizer_accepts_rules_only",
     "FeatureFilesFill",
     "classify_normalizer_result",
+    "classify_normalizer_check",
     "declare_feature_files_if_absent",
     "make_normalize_stamps",
     "parse_normalizer_payload",
+    "validate_feature_plan_check",
     "ClassifyScenariosFn",
     "ScenarioProvabilityOutcome",
     "classify_scenarios_result",
+    "classify_scenarios_check",
     "make_classify_scenarios",
     "parse_classify_payload",
     "TargetTestRootsUnresolved",
@@ -1166,6 +1169,37 @@ def make_validate_feature_plan(
     return _validate
 
 
+def validate_feature_plan_check(
+    feature_id: str,
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    timed_out: bool = False,
+    note: str = "",
+) -> ToolOutcome:
+    """Read a ``feature validate`` outcome whose streams are already in memory.
+
+    Sandbox first (2026-09-07, rule 70): the same verdict
+    :func:`make_validate_feature_plan` reaches from the subprocess seam —
+    ``ok`` iff exit 0 and not timed out; otherwise the detail carries both
+    streams, tail-kept, the way the persisted error always has. ``note`` is
+    the front-matter repair receipt when the sidecar's repair fired, exactly
+    where the closure's ``repair_note`` goes.
+    """
+    status = _check_status_word(exit_code, timed_out)
+    if status == "success" and exit_code == 0:
+        return ToolOutcome(ok=True, detail=note or "")
+    streams = _combine_validate_error_streams(stdout_tail=stdout, stderr=stderr)
+    return ToolOutcome(
+        ok=False,
+        detail=(
+            f"guardkit feature validate {status} (exit {exit_code}) for "
+            f"{feature_id}: {streams}"
+        ),
+    )
+
+
 def make_validate_pass_bar(
     *,
     read_allowlist: Sequence[Path] | None = None,
@@ -2004,6 +2038,42 @@ def classify_normalizer_result(
     )
 
 
+def _check_status_word(exit_code: int, timed_out: bool) -> str:
+    """The seam's status word for streams that are already in memory: the
+    same three words :func:`forge.adapters.guardkit.run.run` answers with."""
+    if timed_out:
+        return "timeout"
+    return "success" if exit_code == 0 else "failed"
+
+
+def classify_normalizer_check(
+    feature_id: str,
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    timed_out: bool = False,
+) -> StampNormalizerOutcome:
+    """Read a ``normalize-stamps`` outcome whose streams are already in memory.
+
+    Sandbox first (2026-09-07, rule 70): when the check ran in the
+    repository's sandbox, the driver never held a subprocess — it holds the
+    exit code and the two streams the sidecar sent back. This is the same
+    decision table as :func:`classify_normalizer_result` (which it calls),
+    with the status word derived the way the subprocess seam derives it, so
+    a refusal read this way means exactly what a refusal read from the seam
+    means. The sidecar uses it too, to decide whether a blocking check
+    passed — one rule mints the claim and the thing claimed.
+    """
+    return classify_normalizer_result(
+        feature_id,
+        status=_check_status_word(exit_code, timed_out),
+        exit_code=exit_code,
+        stdout_tail=stdout,
+        stderr=stderr,
+    )
+
+
 _FEATURE_FILES_KEY_RE = re.compile(r"^feature_files\s*:", re.MULTILINE)
 
 #: A YAML document marker at column 0 ends the ``feature_files:`` block even
@@ -2644,6 +2714,20 @@ def classify_scenarios_result(
             f"guardkit qa classify-scenarios exited {exit_code}"
             + (f": {last}" if last else "")
         ),
+    )
+
+
+def classify_scenarios_check(
+    *, exit_code: int, stdout: str, stderr: str, timed_out: bool = False
+) -> ScenarioProvabilityOutcome:
+    """Read a ``classify-scenarios`` outcome whose streams are already in
+    memory — the same table as :func:`classify_scenarios_result`, for a check
+    the repository's sandbox ran (2026-09-07, rule 70)."""
+    return classify_scenarios_result(
+        status=_check_status_word(exit_code, timed_out),
+        exit_code=exit_code,
+        stdout_tail=stdout,
+        stderr=stderr,
     )
 
 

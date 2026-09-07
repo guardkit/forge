@@ -84,6 +84,7 @@ __all__ = [
     "PLANNING_DURABLE_NAME",
     "PLANNING_QUEUED_SUBJECT_FILTER",
     "compose_planning_consumer_and_dispatch",
+    "compose_planning_git_runner",
     "make_drive_spawner",
     "rearm_paused_planning_runs",
     "sweep_interrupted_planning_runs",
@@ -642,6 +643,58 @@ def _latest_po_output(store: SqlitePlanningRunStore, correlation_id: str) -> dic
 # ---------------------------------------------------------------------------
 
 
+def compose_planning_git_runner(
+    planning: PlanningConfig,
+    *,
+    worktree_runner_factory: Callable[[], Any] | None = None,
+) -> tuple[Any, Callable[[str], Any] | None]:
+    """The planning chain's git runner, per repository (sandbox first,
+    2026-09-07, rule 71).
+
+    Returns ``(git_runner, git_runner_for_repo)``:
+
+    * no repository has a sandbox → the in-container ``WorktreeGitRunner``
+      alone and no resolver — byte for byte the composition before this
+      lane;
+    * otherwise a :class:`~forge.planning.sidecar_git_runner.RepoRoutedGitRunner`
+      that sends a sandboxed repository's calls to a
+      :class:`~forge.planning.sidecar_git_runner.SidecarGitRunner` on its
+      sidecar address and every other repository's to the in-container
+      runner, and its ``runner_for`` as the resolver the driver asks by
+      ``org/name`` (which is how the plan leg learns whether to declare its
+      pre-commit checks instead of running them here).
+    """
+    from forge.adapters.git.planning_runner import WorktreeGitRunner
+    from forge.planning.sidecar_git_runner import RepoRoutedGitRunner, SidecarGitRunner
+
+    default = (worktree_runner_factory or WorktreeGitRunner)()
+    if not planning.sandboxes:
+        return default, None
+    runners = {
+        repo: SidecarGitRunner(entry.sidecar_url, repo=repo)
+        for repo, entry in planning.sandboxes.items()
+    }
+    for repo, entry in planning.sandboxes.items():
+        logger.info(
+            "planning git for %s goes to the sidecar in sandbox %s at %s "
+            "(the plan stage's checks run there); other repositories stay "
+            "in the forge container. Only the plan leg's checks are declared "
+            "so far: the spec leg, the pass bars and the feature gate still "
+            "hand a Python function to the git runner, which a sidecar cannot "
+            "run, so give a repository a sandbox only once those legs are "
+            "moved too",
+            repo,
+            entry.name,
+            entry.sidecar_url,
+        )
+    routed = RepoRoutedGitRunner(
+        runners_by_repo=runners,
+        repo_paths=planning.target_repo_paths,
+        default=default,
+    )
+    return routed, routed.runner_for
+
+
 async def compose_planning_consumer_and_dispatch(
     *,
     db_path: Path,
@@ -1150,6 +1203,13 @@ async def compose_planning_consumer_and_dispatch(
         )
 
         # -- the chain driver ----------------------------------------------
+        # The planning chain's git, per repository (sandbox first, rule 71):
+        # a sandboxed repository's commits are made by the sidecar inside its
+        # sandbox; every other repository's by the in-container runner, as
+        # before.
+        planning_git_runner, git_runner_for_repo = compose_planning_git_runner(
+            config.planning, worktree_runner_factory=WorktreeGitRunner
+        )
         driver = PlanningRunDriver(
             PlanningDriverDeps(
                 store=store,
@@ -1159,7 +1219,8 @@ async def compose_planning_consumer_and_dispatch(
                 subscriber_factory=subscriber_factory,
                 dispatch_product_owner=dispatch_product_owner,
                 second_opinion_provider=second_opinion,
-                git_runner=WorktreeGitRunner(),
+                git_runner=planning_git_runner,
+                git_runner_for_repo=git_runner_for_repo,
                 planning_config=config.planning,
                 clock=clock_fn,
                 publish_notification=publish_planning_notification,
