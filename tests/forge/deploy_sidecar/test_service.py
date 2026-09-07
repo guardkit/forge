@@ -148,7 +148,8 @@ def test_compose_script_allowed(repo: Path) -> None:
         script_runner=runner,
     )
     assert status == 200
-    assert body == {"exit_code": 0, "output_tail": "ok"}
+    # The answer says where the script ran (LAW 8's other half).
+    assert body == {"exit_code": 0, "output_tail": "ok", "cwd": str(repo)}
     assert runner.calls[0]["script"] == "deploy.sh"
     assert runner.calls[0]["cwd"] == str(repo)  # cwd resolved to repo root
 
@@ -601,3 +602,161 @@ def test_run_endpoint_refusal_is_http_400(repo: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# LAW 8 — a working directory is honoured only for a candidate tree
+# (protect-main, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+
+def _candidate_tree(repo: Path, feature: str = "FEAT-8A01") -> Path:
+    tree = repo / ".forge-candidates" / feature
+    tree.mkdir(parents=True)
+    return tree
+
+
+def test_a_candidate_tree_is_the_working_directory(repo: Path) -> None:
+    tree = _candidate_tree(repo)
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": str(tree)},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200, body
+    assert runner.calls[0]["cwd"] == str(tree.resolve())
+    # The script is still the profile's name — found relative to the tree,
+    # so the tree's own copy runs.
+    assert runner.calls[0]["script"] == "deploy.sh"
+    # And the answer says so, which is how the client tells a sidecar that
+    # honoured the tree from one running old code that silently ran main.
+    assert body["cwd"] == str(tree.resolve())
+
+
+def test_the_answer_says_where_the_script_ran(repo: Path) -> None:
+    """Every permitted run answers with its working directory: the profile's
+    own for an ordinary run, the candidate tree when one was honoured."""
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": "/ignored-by-sidecar"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body["cwd"] == str(repo)
+    tree = _candidate_tree(repo)
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": str(tree)},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body["cwd"] == str(tree.resolve())
+    assert body["cwd"] == runner.calls[-1]["cwd"]
+
+
+def test_a_relative_candidate_tree_resolves_under_the_repo(repo: Path) -> None:
+    tree = _candidate_tree(repo)
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": ".forge-candidates/FEAT-8A01"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["cwd"] == str(tree.resolve())
+
+
+def test_a_candidate_tree_that_does_not_exist_is_refused(repo: Path) -> None:
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "cwd": str(repo / ".forge-candidates" / "FEAT-GONE"),
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "is not a candidate tree" in body["error"]
+    assert runner.calls == []
+
+
+def test_a_path_deeper_than_a_candidate_tree_is_refused(repo: Path) -> None:
+    tree = _candidate_tree(repo)
+    deeper = tree / "deploy"
+    deeper.mkdir()
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": str(deeper)},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "is not a candidate tree" in body["error"]
+    assert runner.calls == []
+
+
+def test_the_trees_root_itself_is_refused(repo: Path) -> None:
+    _candidate_tree(repo)
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": str(repo / ".forge-candidates")},
+        config=cfg,
+        script_runner=runner,
+    )
+    # The root is not under itself: it is ignored like any other path.
+    assert status == 200
+    assert runner.calls[0]["cwd"] == str(repo)
+
+
+def test_a_dot_dot_cannot_walk_out_of_the_trees(repo: Path, tmp_path: Path) -> None:
+    _candidate_tree(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "cwd": str(repo / ".forge-candidates" / "FEAT-8A01" / ".." / ".." / ".." / "outside"),
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    # Resolved, it is outside the trees: ignored, the profile's cwd stands.
+    assert status == 200
+    assert runner.calls[0]["cwd"] == str(repo)
+
+
+def test_any_other_working_directory_is_ignored_as_before(repo: Path) -> None:
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh", "cwd": "/ignored-by-sidecar"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["cwd"] == str(repo)
+
+
+def test_no_working_directory_is_the_profile_s(repo: Path) -> None:
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["cwd"] == str(repo)

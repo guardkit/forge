@@ -300,3 +300,199 @@ def test_client_never_raises_when_sidecar_unreachable() -> None:
     exit_code, output = client(cwd="/x", script="deploy.sh", env_file=None, timeout=1)
     assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
     assert "unreachable" in output
+
+
+# ---------------------------------------------------------------------------
+# The client sends the working directory; the sidecar honours a candidate
+# tree and ignores anything else (protect-main, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+
+def test_client_sends_the_working_directory_and_a_candidate_tree_is_honoured(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    _write_profile(repo)
+    tree = repo / ".forge-candidates" / "FEAT-C1D0"
+    tree.mkdir(parents=True)
+    seen: list[dict[str, Any]] = []
+
+    class _RecordingCore:
+        def __call__(self, **kwargs: Any) -> tuple[int, str]:
+            seen.append(kwargs)
+            return (0, "ok")
+
+    server = build_server(
+        port=0,
+        config_loader=lambda: _config({"appmilla/api_test": str(repo)}),
+        script_runner=_RecordingCore(),
+    )
+    _serve(server)
+    try:
+        host, port = server.server_address[:2]
+        client = SidecarScriptRunner(
+            base_url=f"http://{host}:{port}", repo="appmilla/api_test"
+        )
+        exit_code, _ = client(
+            cwd=str(tree), script="deploy.sh", env_file=None, timeout=30,
+            extra_env={"CANDIDATE": "1"},
+        )
+        assert exit_code == 0
+        assert seen[-1]["cwd"] == str(tree.resolve())
+        exit_code, _ = client(
+            cwd="/somewhere/else", script="deploy.sh", env_file=None, timeout=30
+        )
+        assert exit_code == 0
+        assert seen[-1]["cwd"] == str(repo)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_client_relays_a_refused_candidate_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    _write_profile(repo)
+    server = build_server(
+        port=0, config_loader=lambda: _config({"appmilla/api_test": str(repo)})
+    )
+    _serve(server)
+    try:
+        host, port = server.server_address[:2]
+        client = SidecarScriptRunner(
+            base_url=f"http://{host}:{port}", repo="appmilla/api_test"
+        )
+        exit_code, output = client(
+            cwd=str(repo / ".forge-candidates" / "FEAT-GONE"),
+            script="deploy.sh", env_file=None, timeout=10,
+        )
+        assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
+        assert "is not a candidate tree" in output
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# The answer must say it ran in the candidate tree (protect-main, 2026-09-07).
+# A sidecar on the host running the code from before the candidate leg
+# ignores the working directory and runs the checkout's main; a sidecar with
+# a different checkout path runs somewhere else. Either would have been
+# called "the branch, checked". The client refuses both, loudly.
+# ---------------------------------------------------------------------------
+
+
+def _fixed_answer_server(answer: dict[str, Any]) -> Any:
+    """A stand-in deploy sidecar that answers every /run with ``answer``."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 — http.server's own name
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            body = json.dumps(answer).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+
+
+def _client_for(server: Any) -> SidecarScriptRunner:
+    host, port = server.server_address[:2]
+    return SidecarScriptRunner(base_url=f"http://{host}:{port}", repo="appmilla/api_test")
+
+
+def test_an_answer_without_cwd_is_refused_for_a_candidate_tree(tmp_path: Path) -> None:
+    """An old sidecar: it ran main and says nothing about where."""
+    tree = tmp_path / "api_test" / ".forge-candidates" / "FEAT-0LD1"
+    tree.mkdir(parents=True)
+    server = _fixed_answer_server({"exit_code": 0, "output_tail": "deployed-ok"})
+    _serve(server)
+    try:
+        exit_code, output = _client_for(server)(
+            cwd=str(tree), script="deploy.sh", env_file=None, timeout=10
+        )
+        assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
+        assert output == (
+            f"the deploy sidecar did not run in the candidate tree {tree} — it did "
+            "not say where it ran, so it is running old code from before the "
+            "candidate check; the candidate was not checked"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_answer_without_cwd_is_accepted_for_the_profiles_own_directory(
+    tmp_path: Path,
+) -> None:
+    """An ordinary run never named a candidate tree, so an old sidecar's
+    answer is as good as it always was."""
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    server = _fixed_answer_server({"exit_code": 0, "output_tail": "deployed-ok"})
+    _serve(server)
+    try:
+        exit_code, output = _client_for(server)(
+            cwd=str(repo), script="deploy.sh", env_file=None, timeout=10
+        )
+        assert (exit_code, output) == (0, "deployed-ok")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_answer_that_names_a_different_directory_is_refused(tmp_path: Path) -> None:
+    """A sidecar whose checkout path differs from the daemon's ran the script
+    from its own checkout, not the tree."""
+    repo = tmp_path / "api_test"
+    tree = repo / ".forge-candidates" / "FEAT-0LD2"
+    tree.mkdir(parents=True)
+    server = _fixed_answer_server(
+        {"exit_code": 0, "output_tail": "deployed-ok", "cwd": str(repo)}
+    )
+    _serve(server)
+    try:
+        exit_code, output = _client_for(server)(
+            cwd=str(tree), script="deploy.sh", env_file=None, timeout=10
+        )
+        assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
+        assert output == (
+            f"the deploy sidecar did not run in the candidate tree {tree} — it ran "
+            f"in {repo}, so it is running a different checkout path; the candidate "
+            "was not checked"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_answer_naming_the_same_tree_spelled_differently_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """The sidecar answers the resolved path; the client may have sent an
+    unresolved one. The same directory either way is honoured."""
+    repo = tmp_path / "api_test"
+    tree = repo / ".forge-candidates" / "FEAT-0LD3"
+    tree.mkdir(parents=True)
+    sent = repo / ".forge-candidates" / "FEAT-0LD3" / "." / ".." / "FEAT-0LD3"
+    server = _fixed_answer_server(
+        {"exit_code": 0, "output_tail": "deployed-ok", "cwd": str(tree.resolve())}
+    )
+    _serve(server)
+    try:
+        exit_code, output = _client_for(server)(
+            cwd=str(sent), script="deploy.sh", env_file=None, timeout=10
+        )
+        assert (exit_code, output) == (0, "deployed-ok")
+    finally:
+        server.shutdown()
+        server.server_close()
