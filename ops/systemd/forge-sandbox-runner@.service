@@ -1,0 +1,78 @@
+# forge-sandbox-runner@.service — keeps the factory's two services running
+#   inside one repository's Docker Sandbox
+#
+# WHAT: Rich's rule (2026-09-07): nothing the factory runs on a repository runs
+#   on the host. So the build runner (the autobuild runner, `langgraph dev`)
+#   and the deploy sidecar for a repository run INSIDE that repository's
+#   sandbox, on the factory's own clone of it. This unit holds one session
+#   open in the named sandbox running deploy/sandbox-runner.sh, the shared
+#   bootstrap in the repository's deploy/ folder, which makes the venv from
+#   the read-only forge and guardkit mounts and then starts and supervises
+#   the two services. The session is the unit's whole job — exactly as the
+#   keeper beside it holds `sleep infinity` open — so the sandbox stays awake
+#   and the services stay up for as long as the unit runs.
+#
+#   It is a TEMPLATE unit: the part after the '@' is the sandbox's name, so one
+#   file serves every repository.
+#
+#       systemctl --user start forge-sandbox-runner@api-test-deploy
+#       systemctl --user stop  forge-sandbox-runner@api-test-deploy
+#
+#   Starting it is what the repository's own deploy wrapper does, every deploy,
+#   when the profile's sandbox block names the two service ports; starting an
+#   already-running unit does nothing. Stopping it stops both services inside
+#   the sandbox (the bootstrap stops them on the signal) and ends the session.
+#
+#   forge-prod reaches the two services over the ports the sandbox publishes
+#   to the host's loopback (the profile's sidecar_publish and runner_publish,
+#   for example 127.0.0.1:8925 -> 8125 and 127.0.0.1:8924 -> 8124). They are
+#   bound on every interface inside the sandbox, and on nothing but loopback
+#   outside it.
+#
+# SCOPE: a systemd USER unit, exactly like the keeper and the host runner
+#   sidecar beside it. It holds a session; it never creates, removes or
+#   reconfigures a sandbox, and it runs nothing of the repository on the host.
+#   Installed once by hand, attended:
+#
+#       mkdir -p ~/.config/systemd/user
+#       cp ops/systemd/forge-sandbox-runner@.service ~/.config/systemd/user/
+#       systemctl --user daemon-reload
+#
+#   There is nothing to enable: the wrapper starts an instance when it needs
+#   one. Installing this file is an attended step and is NOT done by any build.
+#
+# BEFORE IT CAN WORK: the sandbox daemon must be running for this user
+#   (`sbx daemon start -d --policy balanced`), Rich's Docker sign-in must have
+#   been done once on this box, and the sandbox must have been created with
+#   the factory's mounts (deploy/sandbox-deploy.sh does that on the first
+#   deploy after the profile names the two service ports). See ops/README.md
+#   and ops/systemd/README.md.
+#
+# WHY Restart=always: the services inside must come back whether the session
+#   ended cleanly or not — a sandbox that went to sleep, a daemon restart, an
+#   exec that was cut off. The bootstrap is safe to run again: the venv and the
+#   install are made once and reused.
+#
+# WHY KillMode=process: stopping the unit should end the held session and
+#   nothing else. The sandbox's own contents are not this unit's business.
+
+[Unit]
+Description=Keeps the factory's deploy sidecar and build runner up inside the %i Docker Sandbox
+Documentation=file:///home/richardwoollcott/Projects/appmilla_github/forge/ops/systemd/README.md
+Documentation=file:///home/richardwoollcott/Projects/appmilla_github/ai-transition/docs/rewrite-on-refusal-spec-2026-09-06.md
+
+[Service]
+Type=simple
+# The same PATH the keeper and the deploy sidecar unit carry, so sbx and the
+# tools it reaches for are found under systemd's otherwise minimal environment.
+Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

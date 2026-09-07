@@ -13,6 +13,7 @@ byte" is a test, not a nicety.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -1065,9 +1066,10 @@ def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# --deploy-port — the four files a repository needs to be deployed into its
+# --deploy-port — the five files a repository needs to be deployed into its
 # own Docker Sandbox (the 2026-09-06 decision, rule 7, and rule 14 of the
-# 15:10Z amendment)
+# 15:10Z amendment; the fifth, the bootstrap that brings up the factory's
+# services inside the sandbox, from Part O rule 69 of the 2026-09-06 spec)
 #
 # None of these tests runs sbx, creates a sandbox, or asks systemd for
 # anything: the wrapper is driven with a fake sbx and a fake systemctl first
@@ -1078,6 +1080,7 @@ def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
 DEPLOY_FILE_LIST = (
     "deploy/profile.yaml",
     "deploy/sandbox-deploy.sh",
+    "deploy/sandbox-runner.sh",
     "deploy/deploy.sh",
     "deploy/docker-compose.candidate.yml",
 )
@@ -1089,7 +1092,7 @@ def _load_written_profile(repo: Path):
     return load_deploy_profile(repo / "deploy" / "profile.yaml")
 
 
-def test_deploy_port_writes_the_four_files(_isolate, tmp_path):
+def test_deploy_port_writes_the_five_files(_isolate, tmp_path):
     repo = _make_repo(
         _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
     )
@@ -1100,7 +1103,40 @@ def test_deploy_port_writes_the_four_files(_isolate, tmp_path):
     assert result.exit_code == 0, result.output
     for relative in DEPLOY_FILE_LIST:
         assert (repo / relative).is_file(), relative
-    assert _status_of(result, "deploy-files").count("added") == 4
+    assert _status_of(result, "deploy-files").count("added") == 5
+
+
+def test_the_written_profile_carries_the_factory_s_two_services(_isolate, tmp_path):
+    # Part O, rule 68: the sandbox also carries the deploy sidecar and the
+    # build runner for this repository, on ports derived from --deploy-port,
+    # and mounts the factory's code from the checkouts beside this one.
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+
+    assert result.exit_code == 0, result.output
+    sandbox = _load_written_profile(repo).sandbox
+    assert sandbox.sidecar_publish == "127.0.0.1:8935:8125"
+    assert sandbox.runner_publish == "127.0.0.1:8934:8124"
+    assert sandbox.forge_path == str(_isolate / "forge")
+    assert sandbox.guardkit_path == str(_isolate / "guardkit")
+    assert sandbox.receipts_path == str(register_repo.default_receipts_path())
+    assert sandbox.env_file is None
+    bootstrap = repo / "deploy" / "sandbox-runner.sh"
+    assert bootstrap.is_file() and os.access(bootstrap, os.X_OK)
+    lines = [(s, d) for name, s, d in _steps(result) if name == "deploy-files"]
+    assert (
+        "ok",
+        "sandbox bench-one-deploy will carry the factory's build runner on "
+        "127.0.0.1:8934 and deploy sidecar on 127.0.0.1:8935",
+    ) in lines
+    # The checkouts are not beside a tmp_path repository, and the report says
+    # so rather than leaving it to be found at the first deploy.
+    warns = [d for s, d in lines if s == "warn"]
+    assert any(d.startswith("no checkout at ") for d in warns), warns
 
 
 def test_the_written_profile_names_the_sandbox_and_both_ports(_isolate, tmp_path):
@@ -1260,7 +1296,7 @@ def test_a_dry_run_writes_no_deploy_file(_isolate, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert not (repo / "deploy").exists()
-    assert _status_of(result, "deploy-files") == ["would-add"] * 4
+    assert _status_of(result, "deploy-files") == ["would-add"] * 5
 
 
 def test_deploy_allow_without_deploy_port_is_refused(_isolate, tmp_path):
@@ -1698,7 +1734,24 @@ def test_the_overlay_is_compose_yaml_that_names_only_the_app_s_ports(
 # api_test and every repository born by this command deploy with the same
 # wrapper, byte for byte. It holds no value belonging to any one repository:
 # the sandbox's name, size, ports and rules all reach it in its environment.
+#
+# 2026-09-07: the lane that makes a sandbox carry the factory's own services
+# (the deploy sidecar and the build runner, the spec's Part O rule 68) changes
+# the shipped wrapper. forge ships it; a repository's copy is refreshed by
+# copying the shipped file over it, and api_test's is refreshed at the
+# attended go-live, because nothing in a build lane writes into another
+# repository's checkout. So until that copy is made there are exactly two
+# states this check accepts: the same bytes, or api_test still carrying the
+# wrapper as it stood before this lane (the sha256 below). Anything else is
+# real drift and fails.
 # ---------------------------------------------------------------------------
+
+#: api_test's wrapper as it stood before the sandbox carried the factory
+#: (forge commit 74690a4's shipped file, byte for byte). This constant goes
+#: when api_test's copy is refreshed at the go-live.
+WRAPPER_BEFORE_THE_FACTORY_SHA256 = (
+    "e40bb550b8531d0c98f4f9b0a0c81d9dea5cba1e766ecca10196dd46d13d8fd0"
+)
 
 
 def _api_test_wrapper() -> Path | None:
@@ -1712,6 +1765,7 @@ def _api_test_wrapper() -> Path | None:
 
 
 def test_the_shipped_wrapper_is_api_test_s_wrapper_byte_for_byte():
+    """The same bytes, or api_test still one refresh behind (see above)."""
     theirs = _api_test_wrapper()
     if theirs is None:
         pytest.skip(
@@ -1723,9 +1777,14 @@ def test_the_shipped_wrapper_is_api_test_s_wrapper_byte_for_byte():
         / "deploy_templates"
         / "sandbox-deploy.sh"
     )
-    assert ours.read_bytes() == theirs.read_bytes(), (
+    if ours.read_bytes() == theirs.read_bytes():
+        return
+    behind = hashlib.sha256(theirs.read_bytes()).hexdigest()
+    assert behind == WRAPPER_BEFORE_THE_FACTORY_SHA256, (
         f"{ours} and {theirs} have drifted apart; they are meant to be one "
-        "file, so whichever changed should be copied over the other"
+        "file, and this is not the one refresh that is expected to be "
+        f"outstanding — copy {ours} over {theirs}, or copy the other way if "
+        "it is api_test's copy that moved on purpose"
     )
 
 

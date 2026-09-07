@@ -16,10 +16,13 @@ What it does, in order:
    merge-ready gate to run.
 2. Warns and carries on for the things that are merely thin: no git remote, no
    test roots, no ``deploy/profile.yaml``, no ``docs/architecture-rules.yaml``.
-   With ``--deploy-port`` it writes the four deploy files instead of warning:
+   With ``--deploy-port`` it writes the five deploy files instead of warning:
    a ``deploy/profile.yaml`` naming this repository's Docker Sandbox, the
-   wrapper that brings that sandbox up, the deploy script that runs inside it,
-   and the candidate overlay that puts the throwaway copy on its own port.
+   wrapper that brings that sandbox up, the bootstrap that runs inside it and
+   brings up the factory's own two services there (the deploy sidecar and the
+   build runner — Rich's rule of 2026-09-07: nothing the factory runs on a
+   repository runs on the host), the deploy script that runs inside it, and
+   the candidate overlay that puts the throwaway copy on its own port.
    Without the flag nothing about deploys is written and the warning stands.
 3. Scaffolds guardkit in the repository when it has none, writes the minimal
    ``toolchain:`` block when the repository declares none (it NEVER overwrites a
@@ -130,13 +133,31 @@ DEFAULT_SANDBOX_ALLOW_NETWORK: tuple[str, ...] = (
 DEFAULT_SANDBOX_MEMORY: str = "6g"
 DEFAULT_SANDBOX_CPUS: int = 4
 
-#: The four files ``--deploy-port`` writes, in the order they are reported.
+#: The five files ``--deploy-port`` writes, in the order they are reported.
 DEPLOY_FILES: tuple[str, ...] = (
     "deploy/profile.yaml",
     "deploy/sandbox-deploy.sh",
+    "deploy/sandbox-runner.sh",
     "deploy/deploy.sh",
     "deploy/docker-compose.candidate.yml",
 )
+
+#: The factory's two services inside a repository's sandbox (the spec's Part O,
+#: rule 68), and where forge-prod reaches them on the host's loopback. Inside
+#: the sandbox the deploy sidecar listens on 8125 and the build runner on 8124,
+#: as their host-side units always have. On the host each repository gets its
+#: own pair, derived from its app port: the runner 23 above it and the sidecar
+#: 24 above it, so api_test (app 8901, candidate 8902) has its runner on 8924
+#: and its sidecar on 8925, and no two repositories share a port as long as
+#: their app ports are more than 24 apart.
+SIDECAR_PORT_INSIDE: int = 8125
+RUNNER_PORT_INSIDE: int = 8124
+RUNNER_PORT_OFFSET: int = 23
+SIDECAR_PORT_OFFSET: int = 24
+
+#: The highest app port that leaves room for the candidate copy (one above)
+#: and the two service ports (23 and 24 above).
+MAX_DEPLOY_PORT: int = 65535 - SIDECAR_PORT_OFFSET
 
 
 # ---------------------------------------------------------------------------
@@ -797,28 +818,65 @@ def _read_deploy_template(filename: str) -> str:
     )
 
 
+def service_ports_for(app_port: int) -> tuple[int, int]:
+    """The host ports for a repository's build runner and deploy sidecar.
+
+    Derived from the app port so every registered repository gets its own
+    pair: ``(runner, sidecar)`` = ``(app + 23, app + 24)``.
+    """
+    return app_port + RUNNER_PORT_OFFSET, app_port + SIDECAR_PORT_OFFSET
+
+
+def default_receipts_path() -> Path:
+    """Where the factory writes its receipts on this box.
+
+    The same resolution the runner uses on the host: ``FORGE_RECEIPTS_DIR``
+    when set, else ``~/forge-state/receipts``.
+    """
+    from forge.receipts import DEFAULT_RECEIPTS_DIR, RECEIPTS_DIR_ENV
+
+    return Path(os.environ.get(RECEIPTS_DIR_ENV) or DEFAULT_RECEIPTS_DIR).expanduser()
+
+
 def render_deploy_files(
     *,
     name: str,
     repo: Path,
     app_port: int,
     allow_extra: str | None = None,
+    forge_path: Path | None = None,
+    guardkit_path: Path | None = None,
+    receipts_path: Path | None = None,
 ) -> dict[str, str]:
-    """Render the four deploy files for a repository, as {path: text}.
+    """Render the five deploy files for a repository, as {path: text}.
 
     Args:
         name: The repository's registered name.
         repo: The checkout's absolute path — the profile's ``cwd``, and the
             path the sandbox bind-mounts, so it reads the same inside and out.
         app_port: The port the app is published on. The candidate copy is
-            published on the next port up.
+            published on the next port up; the factory's build runner and
+            deploy sidecar for this repository on the ports 23 and 24 up.
         allow_extra: One more host the sandbox may reach, written ``host:port``
             — the model door on this box for a repository whose app talks to a
             model. None ⇒ only the Debian and Python rules.
+        forge_path: The forge checkout the sandbox mounts read-only, so the
+            factory's own code is installed from our tree. None ⇒ the folder
+            ``forge`` beside the checkout, which is where the estate keeps it.
+        guardkit_path: The guardkit checkout, likewise. None ⇒ ``guardkit``
+            beside the checkout.
+        receipts_path: The receipts root the sandbox mounts read-write. None ⇒
+            :func:`default_receipts_path`.
     """
     project = compose_project_for(name)
     sandbox = sandbox_name_for(name)
     candidate_port = app_port + 1
+    runner_port, sidecar_port = service_ports_for(app_port)
+    forge_checkout = forge_path if forge_path is not None else repo.parent / "forge"
+    guardkit_checkout = (
+        guardkit_path if guardkit_path is not None else repo.parent / "guardkit"
+    )
+    receipts_root = receipts_path if receipts_path is not None else default_receipts_path()
     allow = list(DEFAULT_SANDBOX_ALLOW_NETWORK)
     if allow_extra:
         allow.append(allow_extra)
@@ -871,6 +929,26 @@ sandbox:
   cpus: {DEFAULT_SANDBOX_CPUS}
   publish: ["127.0.0.1:{app_port}:{app_port}", "127.0.0.1:{candidate_port}:{candidate_port}"]
   allow_network: [{allow_yaml}]
+  # The sandbox also carries the factory's own two services for this
+  # repository — the deploy sidecar and the build runner — on the factory's
+  # own clone of it, so nothing the factory runs on this repository runs on
+  # the host. forge-prod reaches them on these two loopback ports. Remove
+  # these two lines and the sandbox is a plain deployment sandbox again.
+  sidecar_publish: "127.0.0.1:{sidecar_port}:{SIDECAR_PORT_INSIDE}"
+  runner_publish: "127.0.0.1:{runner_port}:{RUNNER_PORT_INSIDE}"
+  # Where the factory's own code is mounted from, read-only: the two
+  # checkouts, and the folders beside forge that forge's own code needs
+  # (nats-core, fleet-memory, guardkitfactory) come with them.
+  forge_path: "{forge_checkout}"
+  guardkit_path: "{guardkit_checkout}"
+  # Where the receipts are written, mounted read-write.
+  receipts_path: "{receipts_root}"
+  # The sandbox's own environment — the router's address and key, the bus,
+  # the build settings — rendered by sops into a file at deploy time and
+  # never read from anyone's shell. Name the file here once it exists; the
+  # sandbox is created with it, so a changed file means recreating the
+  # sandbox, attended.
+  # env_file: "/run/user/1000/forge-sandbox/{sandbox}.env"
 """
 
     replacements = {
@@ -887,6 +965,10 @@ sandbox:
     # arrives in its environment from the profile above, so there is nothing in
     # it to fill in for this repository.
     rendered["deploy/sandbox-deploy.sh"] = _read_deploy_template("sandbox-deploy.sh")
+    # So is the bootstrap that runs inside the sandbox and brings up the
+    # factory's two services there: it reads everything from the sandbox's
+    # own environment.
+    rendered["deploy/sandbox-runner.sh"] = _read_deploy_template("sandbox-runner.sh")
     # These two do carry this repository's own names and ports.
     for path, template in (
         ("deploy/deploy.sh", "deploy.sh"),
@@ -934,9 +1016,10 @@ sandbox:
     type=int,
     default=None,
     help=(
-        "Write the repository's deploy files, publishing the app on this port "
-        "and its candidate copy on the next one up. Without this nothing "
-        "about deploys is written."
+        "Write the repository's deploy files, publishing the app on this port, "
+        "its candidate copy on the next one up, and the factory's build runner "
+        "and deploy sidecar for it on the ports 23 and 24 up. Without this "
+        "nothing about deploys is written."
     ),
 )
 @click.option(
@@ -983,11 +1066,11 @@ def register_repo_cmd(
     fleet-memory project id, reports what the repository has and lacks, checks
     that no build is running, and prints the one command left for a human.
 
-    With ``--deploy-port`` it also writes the four files a repository needs to
+    With ``--deploy-port`` it also writes the five files a repository needs to
     be deployed into its own Docker Sandbox: the profile that names the
-    sandbox, the wrapper that brings it up, the deploy script that runs inside
-    it, and the candidate overlay that puts the throwaway copy on its own
-    port.
+    sandbox, the wrapper that brings it up, the bootstrap that brings up the
+    factory's two services inside it, the deploy script that runs inside it,
+    and the candidate overlay that puts the throwaway copy on its own port.
     """
     ctx = click.get_current_context()
     steps: list[Step] = []
@@ -1037,12 +1120,14 @@ def register_repo_cmd(
             "so it only means something with --deploy-port, which is what "
             "writes the sandbox — pass both, or neither",
         )
-    if deploy_port is not None and not (1 <= deploy_port <= 65534):
+    if deploy_port is not None and not (1 <= deploy_port <= MAX_DEPLOY_PORT):
         refuse(
             "deploy-files",
-            f"--deploy-port {deploy_port} is not a port the app and its "
-            "candidate copy can share — pass a whole number from 1 to 65534, "
-            "because the candidate copy takes the next port up",
+            f"--deploy-port {deploy_port} is not a port the app, its candidate "
+            f"copy and the factory's two services can share — pass a whole "
+            f"number from 1 to {MAX_DEPLOY_PORT}, because the candidate copy "
+            "takes the next port up and the build runner and deploy sidecar "
+            "take the ports 23 and 24 up",
         )
 
     # ---- rule 2: the checks that refuse (nothing is written when any fails)
@@ -1237,10 +1322,11 @@ def register_repo_cmd(
             name=name, repo=repo, app_port=deploy_port, allow_extra=deploy_allow
         )
         try:
-            _parse_written_profile(rendered["deploy/profile.yaml"])
+            written = _parse_written_profile(rendered["deploy/profile.yaml"])
         except Exception as exc:  # noqa: BLE001 — the parser's own sentence
             refuse("deploy-files", f"the deploy profile would not load: {exc}")
         added_any = False
+        profile_added = False
         for relative in DEPLOY_FILES:
             target = repo / relative
             if target.exists():
@@ -1260,6 +1346,7 @@ def register_repo_cmd(
             )
             steps.append(Step("deploy-files", "added", relative))
             added_any = True
+            profile_added = relative == "deploy/profile.yaml" or profile_added
         # The closing line reports the profile that is now ON DISK, never the
         # ports this run asked for: a profile someone wrote by hand is left
         # alone, and saying "on ports 8911 and 8912" about a repository whose
@@ -1272,6 +1359,35 @@ def register_repo_cmd(
                     _deploy_profile_sentence(repo, added_any=added_any),
                 )
             )
+        # ... and, only when THIS run wrote the profile, where the factory's
+        # own two services for this repository will be reached, and whether
+        # the checkouts they are installed from are there to be mounted.
+        if profile_added and written.sandbox is not None:
+            runner_port, sidecar_port = service_ports_for(deploy_port)
+            steps.append(
+                Step(
+                    "deploy-files",
+                    "ok",
+                    f"sandbox {written.sandbox.name} will carry the factory's "
+                    f"build runner on 127.0.0.1:{runner_port} and deploy sidecar "
+                    f"on 127.0.0.1:{sidecar_port}",
+                )
+            )
+            missing = [
+                path
+                for path in (written.sandbox.forge_path, written.sandbox.guardkit_path)
+                if path and not Path(path).is_dir()
+            ]
+            if missing:
+                steps.append(
+                    Step(
+                        "deploy-files",
+                        "warn",
+                        "no checkout at " + " or ".join(missing) + " — the sandbox "
+                        "mounts the factory's code from there, so it cannot carry "
+                        "the runner and the sidecar until those checkouts exist",
+                    )
+                )
 
     # ---- rule 6: what the repository has and lacks
     try:
