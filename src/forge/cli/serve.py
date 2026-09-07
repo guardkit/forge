@@ -1716,7 +1716,9 @@ def build_conductor_router(
       (:func:`~forge.cli._conductor_worktree.prepare_journey_worktree`,
       activation design §1) before anything is spawned — materialised
       under the registered checkout on ``fix/<task_id>-<build8>`` off
-      ``main`` and recorded on ``builds.worktree_path``, the column three
+      ``main`` — or off the ``repair/<task id>`` branch the build was
+      queued on, so a repair's committed task file is in the tree (Part
+      L, 2026-09-07) — and recorded on ``builds.worktree_path``, the column three
       downstream consumers refuse on when it is NULL. A materialise
       failure is taken-and-terminal for exactly the same reason the cap
       refusal is: never a routine launch.

@@ -56,6 +56,16 @@ is a Stage-2 shakeout item (design pass §d, Stage 2). Until then an
 operator whose fix journeys branch off something else passes it here once,
 at wiring time.
 
+One exception, per build (Part L of the 2026-09-06 spec, added
+2026-09-07): a build queued on a ``repair/<task id>`` branch has its journey
+tree cut from that branch, not from ``main``
+(:func:`forge.cli._conductor_worktree.journey_base_ref`), because the branch
+carries the repair's task file as a committed file. The probe reads the
+row's ``branch`` and counts from it in that case, so the repair's own
+task-file commit is never counted as a leg's work — a journey that changed
+nothing must still end quietly, not be handed back as a fix. Every other row
+branch leaves the wiring-time base in force.
+
 References:
     - design pass §a.3 (`supervisor-revival-design-pass-2026-07-31`).
     - TASK-MBC8-007 — the ``has_commits`` flag's owner.
@@ -72,6 +82,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from forge.adapters.git.operations import ExecuteCallable, _default_execute
 from forge.lifecycle.persistence import Build
+from forge.pipeline.repair_branch import is_repair_branch
 from forge.pipeline.terminal_handlers.mode_c import CommitProbe, CommitProbeResult
 
 logger = logging.getLogger(__name__)
@@ -191,7 +202,13 @@ def make_mode_c_commit_probe(
                     f"build_id={build_id!r}",
                 )
 
-        command = ["git", "rev-list", "--count", f"{base}..HEAD"]
+        # The wiring-time base — unless the build was queued on a repair
+        # branch, whose journey tree is cut from that branch (module
+        # docstring, "The base ref"): counting from main there would count
+        # the repair's own task-file commit as a leg's work.
+        row_branch = getattr(row, "branch", None)
+        range_base = str(row_branch).strip() if is_repair_branch(row_branch) else base
+        command = ["git", "rev-list", "--count", f"{range_base}..HEAD"]
         try:
             result = await execute(
                 command=command,
@@ -233,7 +250,7 @@ def make_mode_c_commit_probe(
         logger.debug(
             "mode_c_commit_probe: build_id=%s range=%s..HEAD count=%d",
             build_id,
-            base,
+            range_base,
             count,
         )
         return CommitProbeResult(count=count, failed=False)

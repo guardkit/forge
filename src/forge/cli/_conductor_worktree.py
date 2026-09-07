@@ -22,7 +22,12 @@ Where the tree goes, and why
 ----------------------------
 
 ``<registered-checkout>/.forge/worktrees/<build_id>`` on branch
-``fix/<task_id>-<build8>`` off ``main``:
+``fix/<task_id>-<build8>`` off ``main`` — or off ``repair/<task id>`` when
+the build was queued on that branch (Part L of the 2026-09-06 spec, added
+2026-09-07: a repair's task file and YAML are committed there, and the
+review leg loads its task from the worktree, so the tree has to be cut from
+the branch that carries the file; a tree cut from ``main`` does not have
+it, and journey one refused in four seconds for exactly that reason):
 
 * The registered checkout is ALREADY inside
   ``permissions.filesystem.allowlist`` and ALREADY bind-mounted
@@ -68,16 +73,20 @@ __all__ = [
     "WorktreeRefused",
     "WorktreeOutcome",
     "JOURNEY_BASE_REF",
+    "journey_base_ref",
     "journey_branch_name",
     "prepare_journey_worktree",
     "short_build_id",
 ]
 
 
-#: The trunk every journey branch is cut from. Matches the commit probe's
-#: ``base_branch`` default (``git rev-list --count main..HEAD`` is the
-#: journey's ONLY commit evidence), so the branch the writer creates and
-#: the base the probe counts against are one statement, not two.
+#: The trunk every journey branch is cut from — unless the build was queued
+#: on a ``repair/<task id>`` branch, which :func:`journey_base_ref` then
+#: names instead. Matches the commit probe's ``base_branch`` default
+#: (``git rev-list --count <base>..HEAD`` is the journey's ONLY commit
+#: evidence), and the probe makes the same repair-branch exception
+#: (:mod:`forge.pipeline.mode_c_commit_probe`), so the branch the writer
+#: creates and the base the probe counts against are one statement, not two.
 JOURNEY_BASE_REF = "main"
 
 #: Directory the writer owns inside a registered checkout. The worktrees
@@ -109,11 +118,14 @@ class WorktreeReady:
         reused: ``True`` when a redelivery found its OWN earlier tree
             (path AND branch matched for this build) and reused it rather
             than materialising a second one.
+        base_ref: What the journey branch was cut from — ``main``, or the
+            ``repair/<task id>`` branch the build was queued on.
     """
 
     path: str
     branch: str
     reused: bool = False
+    base_ref: str = JOURNEY_BASE_REF
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,24 @@ def _ref_safe(value: str) -> str:
 def journey_branch_name(task_id: str, build_id: str) -> str:
     """``fix/<task_id>-<build8>`` — one journey, one branch, forever unique."""
     return f"fix/{_ref_safe(task_id)}-{short_build_id(build_id)}"
+
+
+def journey_base_ref(row_branch: Any) -> str:
+    """The commit-ish the journey branch is cut from.
+
+    ``main`` (:data:`JOURNEY_BASE_REF`), as always — except when the build
+    was queued on a ``repair/<task id>`` branch, which is then the base.
+    That branch carries the repair's task file and YAML as committed files
+    (Part L, rule 48), and the review leg loads its task from the worktree,
+    so a tree cut from ``main`` would not have the file and the journey
+    would refuse in its first leg — which is what journey one did. Any
+    other row branch leaves the base at ``main``, exactly as before.
+    """
+    from forge.pipeline.repair_branch import is_repair_branch
+
+    if is_repair_branch(row_branch):
+        return str(row_branch).strip()
+    return JOURNEY_BASE_REF
 
 
 def _refuse(reason: str, *, log: logging.Logger) -> WorktreeRefused:
@@ -378,7 +408,9 @@ async def prepare_journey_worktree(
        disk — a directory carrying a ``.git`` entry. A registration
        without its tree refuses loudly. ANY other collision refuses too.
     5. **The gitignore guard**, then ``prepare_worktree`` with
-       ``create_branch=True`` off :data:`JOURNEY_BASE_REF`.
+       ``create_branch=True`` off :data:`JOURNEY_BASE_REF` — or off the
+       ``repair/<task id>`` branch the row was queued on
+       (:func:`journey_base_ref`), which must exist in the checkout.
     6. **Record** through ``pool.record_worktree_path``. A recorded path
        is the invariant every downstream consumer enforces, so a write
        that does not land is a refusal too.
@@ -435,6 +467,8 @@ async def prepare_journey_worktree(
             "so its branch cannot be named (fix/<task_id>-<build8>)",
             log=_log,
         )
+    # What the journey branch is cut from: main, or the row's repair branch.
+    base_ref = journey_base_ref(getattr(row, "branch", None))
 
     # 2 — the registered checkout.
     paths = getattr(getattr(config, "planning", None), "target_repo_paths", None) or {}
@@ -531,7 +565,9 @@ async def prepare_journey_worktree(
             recorded = _record(pool, build_id, target_str, log=_log)
             if recorded is not None:
                 return recorded
-            return WorktreeReady(path=target_str, branch=branch, reused=True)
+            return WorktreeReady(
+                path=target_str, branch=branch, reused=True, base_ref=base_ref
+            )
         if same_path:
             return _refuse(
                 f"{target} is already registered as a worktree on branch "
@@ -549,6 +585,38 @@ async def prepare_journey_worktree(
                 log=_log,
             )
 
+    # 4b — a repair branch must exist before a tree can be cut from it. The
+    # refusal names the branch, because "invalid reference" from git would
+    # not say that the build was queued on a branch nobody made.
+    if base_ref != JOURNEY_BASE_REF:
+        try:
+            exists = await _execute(
+                command=[
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{base_ref}",
+                ],
+                cwd=str(checkout),
+            )
+        except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+            return _refuse(
+                f"checking that the branch {base_ref!r} exists in {checkout} "
+                f"raised {type(exc).__name__}: {exc}, so build_id={build_id}'s "
+                "worktree cannot be cut from it",
+                log=_log,
+            )
+        if exists.exit_code != 0:
+            return _refuse(
+                f"build_id={build_id} was queued on the branch {base_ref!r}, but "
+                f"that branch does not exist in {checkout}, so its worktree "
+                "cannot be cut from it (a tree cut from "
+                f"{JOURNEY_BASE_REF} would not carry the repair's task file, and "
+                "the review leg would refuse)",
+                log=_log,
+            )
+
     # 5 — the gitignore guard, then the tree.
     guard_problem = _ensure_forge_gitignore(forge_dir)
     if guard_problem is not None:
@@ -561,13 +629,13 @@ async def prepare_journey_worktree(
         execute=_execute,
         builds_root=builds_root,
         create_branch=True,
-        base_ref=JOURNEY_BASE_REF,
+        base_ref=base_ref,
     )
     if result.status != "success" or not result.worktree_path:
         detail = (result.stderr or "").strip() or "no diagnostic was captured"
         return _refuse(
             f"materialising build_id={build_id}'s worktree at {target} on "
-            f"branch {branch} off {JOURNEY_BASE_REF} FAILED: {detail}",
+            f"branch {branch} off {base_ref} FAILED: {detail}",
             log=_log,
         )
 
@@ -581,9 +649,9 @@ async def prepare_journey_worktree(
         build_id,
         result.worktree_path,
         branch,
-        JOURNEY_BASE_REF,
+        base_ref,
     )
-    return WorktreeReady(path=result.worktree_path, branch=branch)
+    return WorktreeReady(path=result.worktree_path, branch=branch, base_ref=base_ref)
 
 
 def _record(

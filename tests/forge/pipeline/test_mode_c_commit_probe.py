@@ -159,6 +159,40 @@ class TestProbeCommand:
 
         assert execute.calls[0]["command"][-1] == "release/2026-07..HEAD"
 
+    def test_a_row_queued_on_a_repair_branch_counts_from_that_branch(self) -> None:
+        """Part L (2026-09-07): the journey tree of a build queued on
+        ``repair/<task id>`` is cut from that branch, so the probe counts from
+        it too — ``main..HEAD`` would count the repair's own task-file commit
+        as a leg's work. The wiring-time base is not consulted for that row."""
+        execute = _FakeExecute(stdout="0")
+        row = _row()
+        row.branch = "repair/TASK-FEAT39F6FIX1"
+        probe = make_mode_c_commit_probe(
+            _FakePool(row), base_branch="release/2026-07", execute=execute
+        )
+
+        result = _run(probe(_BUILD))
+
+        assert result.failed is False and result.count == 0
+        assert execute.calls[0]["command"] == [
+            "git",
+            "rev-list",
+            "--count",
+            "repair/TASK-FEAT39F6FIX1..HEAD",
+        ]
+
+    def test_any_other_row_branch_leaves_the_wiring_time_base_in_force(self) -> None:
+        execute = _FakeExecute(stdout="0")
+        row = _row()
+        row.branch = "lane/fix-journey"
+        probe = make_mode_c_commit_probe(
+            _FakePool(row), base_branch="release/2026-07", execute=execute
+        )
+
+        _run(probe(_BUILD))
+
+        assert execute.calls[0]["command"][-1] == "release/2026-07..HEAD"
+
     def test_command_is_list_tokens_with_no_shell_metacharacters(self) -> None:
         # Defence against the shell-injection shape: a branch name with
         # metacharacters stays one argv token.

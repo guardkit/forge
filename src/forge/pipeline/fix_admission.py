@@ -55,10 +55,12 @@ The task file on the repair branch (Part L, 2026-09-07)
 
 Journey one refused in four seconds: guardkit's review leg loads its subject
 by id from ``tasks/backlog/**/<TASK-id>*.md`` in the build's worktree, which
-is a detached worktree of the build's branch, so only committed files are
-visible to the legs — and the admission used to write one uncommitted YAML
-into the shared checkout. Now :func:`materialise_repair_task` gathers what
-was observed (the merge report, the gate evidence, the failure pack), renders
+is a branch the conductor cuts from the build's branch
+(:func:`forge.cli._conductor_worktree.prepare_journey_worktree`), so only
+committed files on that branch are visible to the legs — and the admission
+used to write one uncommitted YAML into the shared checkout. Now
+:func:`materialise_repair_task` gathers what was observed (the merge report,
+the gate evidence, the failure pack), renders
 a task file in the repository's own frontmatter shape, and commits it with
 the YAML on ``repair/<task id>``, cut from the build's target branch, through
 :mod:`forge.pipeline.repair_branch`. The build is queued on that branch. Both
@@ -539,8 +541,10 @@ def render_repair_task_file(facts: RepairTaskFacts) -> str:
 
     notes = [
         "- Read the evidence named above before changing code.",
-        f"- This task rides the branch {repair_branch_name(facts.task_id)}, cut "
-        f"from {facts.base_branch}; the merge word takes that branch into main.",
+        f"- This task and its YAML are committed on the branch "
+        f"{repair_branch_name(facts.task_id)}, cut from {facts.base_branch}; the "
+        "fix journey's own branch is cut from there, so both files are in its "
+        "worktree.",
     ]
 
     body = "\n".join(
