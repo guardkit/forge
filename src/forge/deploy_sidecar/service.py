@@ -16,6 +16,18 @@ The narrow contract:
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
                            timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
+    POST /git/prepare-branch-and-write-tree
+              {repo, branch, files, message, checks: [{name, args, blocking}]}
+              -> {status, sha, checks: [{name, blocking, ran, passed, exit_code,
+                                          stdout, stderr_tail, timed_out,
+                                          detail, note}], detail}
+    POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
+    POST /git/rev-parse {repo, ref} -> {sha|null}
+
+The three git operations (sandbox first, 2026-09-07, rule 70) make the
+planning chain's commits where the repository lives: the caller declares the
+pre-commit checks by name and the sidecar runs them with the guardkit beside
+it. See LAW 9 below the merge operation.
 
 The second operation exists because the merge word's post-merge checks must run
 where the builds run. The forge container has no host virtual environment, so a
@@ -74,6 +86,9 @@ unit-testable without a live socket. Neither **ever raises** past its boundary.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import importlib.util
 import json
 import logging
 import os
@@ -81,9 +96,11 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
@@ -95,6 +112,11 @@ from forge.deploy.profile import (
 )
 from forge.executor.shell_steps import _run_script_step
 from forge.memory.redaction import scrub_process_output
+from forge.planning.handoff import (
+    PRE_COMMIT_CHECK_NAMES,
+    PreCommitCheckOutcome,
+    PreCommitResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -886,6 +908,652 @@ def process_guardkit_merge_request(
 
 
 # ---------------------------------------------------------------------------
+# The git operations — the planning chain's commits, made where the
+# repository lives (sandbox first, 2026-09-07, rule 70)
+#
+# Rich's rule: nothing the factory runs on a repository runs on the host. The
+# planning chain's commits (the spec, the plan) used to be made by forge's
+# own git runner in a worktree of the operator's checkout, with the plan
+# stage's pre-commit checks (the stamp normalizer, feature validate) run as a
+# Python closure beside it. In the sandbox, the sidecar makes those commits
+# on the factory's clone instead: the caller declares the checks BY NAME with
+# their arguments, the sidecar materialises the worktree exactly as the
+# in-container runner does (the same class, imported), writes the files, runs
+# each named check with the guardkit installed beside it, and commits only
+# when every check that blocks has passed. The outcomes ride the answer so
+# the caller reads them through the parsers it always used.
+#
+# LAW 9 (the git routes' own): the repository is the same key as everywhere
+# else; a branch, a ref and every file path are shape-checked before git sees
+# them; a check must be one of the three names below (nothing else runs, and
+# ``classify-scenarios`` may never be declared blocking); a check is one
+# fixed argument list through the same no-shell runner the merge uses.
+# ---------------------------------------------------------------------------
+
+#: The three routes.
+GIT_WRITE_TREE_ROUTE: str = "/git/prepare-branch-and-write-tree"
+GIT_READ_FILE_ROUTE: str = "/git/read-file-from-branch"
+GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
+
+#: The checks the sidecar knows how to run — the closed list.
+GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
+
+#: Each check's own time limit when the caller names none: the normalizer
+#: and the provability check are rules over a handful of files (seconds); a
+#: feature validate reads a whole plan tree (the oracle's usual ten minutes).
+GIT_CHECK_TIMEOUT_DEFAULTS: dict[str, float] = {
+    "normalize-stamps": 120.0,
+    "feature-validate": 600.0,
+    "classify-scenarios": 120.0,
+}
+
+#: Whether a check blocks the commit when the caller does not say: the two
+#: the driver's own hook stops on, and never the provability check.
+GIT_CHECK_BLOCKING_DEFAULTS: dict[str, bool] = {
+    "normalize-stamps": True,
+    "feature-validate": True,
+    "classify-scenarios": False,
+}
+
+#: Ceiling on the whole pre-commit step (every check together) — the same
+#: ceiling the in-container runner puts on its closure.
+GIT_HOOK_TIMEOUT_SECONDS: float = 900.0
+
+#: How long a ``rev-parse`` may take.
+GIT_REV_PARSE_TIMEOUT_SECONDS: float = 30.0
+
+#: The shape a branch name or a ref must have before git sees it: it starts
+#: with a letter or digit (never a dash, so it can never be read as an
+#: option), and carries only the characters branch names and revisions use.
+REF_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]*(\^\{[a-z]+\})?$")
+
+
+@dataclass(frozen=True)
+class _DeclaredCheck:
+    """One check as the request declared it, after validation."""
+
+    name: str
+    args: dict[str, Any]
+    blocking: bool
+    timeout: float
+
+
+def _resolve_repo_key(
+    payload: dict[str, Any], config: ForgeConfig
+) -> tuple[Path | None, str | None]:
+    """LAW 1 for the git routes — ``(repo_path, None)`` or ``(None, error)``."""
+    repo = payload.get("repo")
+    paths = config.planning.target_repo_paths
+    if not isinstance(repo, str) or not repo.strip():
+        return None, (
+            "'repo' is required (an org/name key from planning.target_repo_paths)"
+        )
+    if repo not in paths:
+        known = ", ".join(sorted(paths)) or "(none configured)"
+        return None, (
+            f"unknown target repo {repo!r} — not in planning.target_repo_paths. "
+            f"Known keys: {known}"
+        )
+    return Path(paths[repo]), None
+
+
+def _ref_error(value: Any, *, what: str) -> str | None:
+    """A plain sentence when ``value`` is not a usable branch name or ref."""
+    if not isinstance(value, str) or not value.strip():
+        return f"'{what}' is required (a branch name or a commit)"
+    if (
+        not REF_NAME_PATTERN.match(value)
+        or ".." in value
+        or "//" in value
+        or value.endswith("/")
+        or value.endswith(".lock")
+    ):
+        return (
+            f"'{what}' {value!r} is not a branch name or a commit the sidecar "
+            "will pass to git (letters, digits, dots, dashes and slashes, not "
+            "starting with a dash)"
+        )
+    return None
+
+
+def _relative_path_error(value: Any, *, what: str) -> str | None:
+    """A plain sentence when ``value`` is not a relative path inside the tree."""
+    if not isinstance(value, str) or not value.strip():
+        return f"'{what}' must be a relative path inside the repository"
+    if value.startswith("/") or "\\" in value:
+        return f"'{what}' {value!r} must be a relative path inside the repository"
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return (
+            f"'{what}' {value!r} must be a relative path inside the repository "
+            "(no '..', no '.', no empty segments)"
+        )
+    return None
+
+
+def _validate_files(raw: Any) -> tuple[dict[str, str] | None, str | None]:
+    """The files to write: a non-empty object of relative path → text."""
+    if not isinstance(raw, dict) or not raw:
+        return None, "'files' must be a non-empty JSON object of relative path → text"
+    files: dict[str, str] = {}
+    for rel, content in raw.items():
+        error = _relative_path_error(rel, what="files key")
+        if error:
+            return None, error
+        if not isinstance(content, str):
+            return None, (
+                f"the content of {rel!r} must be text, got {type(content).__name__}"
+            )
+        files[rel] = content
+    return files, None
+
+
+def _parse_checks(raw: Any) -> tuple[list[_DeclaredCheck] | None, str | None]:
+    """The declared checks, validated name by name (LAW 9)."""
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return None, "'checks' must be a list of {name, args, blocking} objects"
+    checks: list[_DeclaredCheck] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            return None, f"checks[{index}] must be an object with a 'name'"
+        name = item.get("name")
+        if name not in GIT_CHECK_NAMES:
+            return None, (
+                f"checks[{index}] names {name!r}, which the sidecar does not run "
+                f"— the checks it runs are: {', '.join(GIT_CHECK_NAMES)}"
+            )
+        args = item.get("args")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return None, f"checks[{index}] ({name}): 'args' must be an object"
+        blocking_raw = item.get("blocking")
+        if blocking_raw is None:
+            blocking = GIT_CHECK_BLOCKING_DEFAULTS[name]
+        elif isinstance(blocking_raw, bool):
+            blocking = blocking_raw
+        else:
+            return None, f"checks[{index}] ({name}): 'blocking' must be true or false"
+        if name == "classify-scenarios" and blocking:
+            return None, (
+                "classify-scenarios never blocks a commit — declare it without "
+                "'blocking'"
+            )
+        timeout_raw = item.get("timeout_seconds")
+        timeout = GIT_CHECK_TIMEOUT_DEFAULTS[name]
+        if timeout_raw is not None:
+            if (
+                isinstance(timeout_raw, bool)
+                or not isinstance(timeout_raw, (int, float))
+                or timeout_raw <= 0
+                or float(timeout_raw) > TIMEOUT_MAX
+            ):
+                return None, (
+                    f"checks[{index}] ({name}): 'timeout_seconds' must be a "
+                    f"positive number no larger than {TIMEOUT_MAX:g}"
+                )
+            timeout = float(timeout_raw)
+        clean: dict[str, Any]
+        if name in ("normalize-stamps", "feature-validate"):
+            feature_id = args.get("feature_id")
+            if not isinstance(feature_id, str) or not FEATURE_ID_PATTERN.match(feature_id):
+                return None, (
+                    f"checks[{index}] ({name}): args.feature_id must look like "
+                    f"FEAT-ABC1; got {feature_id!r}"
+                )
+            clean = {"feature_id": feature_id}
+            allowed = {"feature_id"}
+            if name == "normalize-stamps":
+                no_model = args.get("no_model", False)
+                if not isinstance(no_model, bool):
+                    return None, (
+                        f"checks[{index}] (normalize-stamps): args.no_model must "
+                        "be true or false"
+                    )
+                clean["no_model"] = no_model
+                allowed.add("no_model")
+        else:
+            error = _relative_path_error(
+                args.get("feature_file"), what=f"checks[{index}] args.feature_file"
+            )
+            if error:
+                return None, error
+            clean = {"feature_file": str(args["feature_file"])}
+            allowed = {"feature_file"}
+        extra = sorted(set(args) - allowed)
+        if extra:
+            return None, (
+                f"checks[{index}] ({name}) carries arguments the check does not "
+                f"take: {', '.join(extra)}"
+            )
+        checks.append(
+            _DeclaredCheck(name=name, args=clean, blocking=blocking, timeout=timeout)
+        )
+    return checks, None
+
+
+def resolve_check_command(
+    *,
+    command_resolver: Callable[[], str | None] = resolve_guardkit_command,
+    find_spec: Callable[[str], object | None] = importlib.util.find_spec,
+    python_executable: str = sys.executable,
+) -> tuple[str, ...] | None:
+    """The guardkit command the checks run, or ``None`` when there is none.
+
+    Three rungs: the ``FORGE_GUARDKIT_PATH`` setting and a ``guardkit`` on
+    PATH (the same two the merge walks, through :func:`resolve_guardkit_command`),
+    then the module form ``python -m guardkit.cli.main`` when guardkit is
+    importable by the interpreter the sidecar runs under — the way the
+    planning tools resolve their own normalizer, so a sandbox whose guardkit
+    is installed in the sidecar's venv but not on the unit's PATH still has
+    its command.
+    """
+    found = command_resolver()
+    if found:
+        return (found,)
+    try:
+        spec = find_spec("guardkit.cli.main")
+    except (ImportError, ModuleNotFoundError, ValueError):
+        spec = None
+    if spec is not None:
+        return (python_executable, "-m", "guardkit.cli.main")
+    return None
+
+
+def _check_outcome(
+    check: _DeclaredCheck,
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    passed: bool,
+    detail: str,
+    note: str = "",
+) -> PreCommitCheckOutcome:
+    return PreCommitCheckOutcome(
+        name=check.name,
+        blocking=check.blocking,
+        ran=True,
+        passed=passed,
+        exit_code=exit_code,
+        stdout=_tail_chars(stdout, MERGE_STDOUT_CHARS),
+        stderr_tail=_tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        detail=detail,
+        note=note,
+    )
+
+
+def run_declared_check(
+    check: _DeclaredCheck,
+    *,
+    worktree: Path,
+    command: tuple[str, ...],
+    check_runner: MergeRunner = run_merge_command,
+) -> PreCommitCheckOutcome:
+    """Run one declared check in ``worktree`` and judge it the way the
+    driver's closure judged it.
+
+    * ``normalize-stamps`` — the argv :func:`make_normalize_stamps` builds;
+      when ``--no-model`` was asked for and the installed guardkit has no such
+      option, it is run again without it and the outcome's ``note`` says so
+      (the same second run, the same sentence). Passed means the outcome is
+      not a failure — written, nothing to do, or unavailable — read with
+      :func:`classify_normalizer_check`, the parser the driver reads it with.
+    * ``feature-validate`` — the task documents' front matter is repaired
+      first (the closure's own pre-oracle repair; the receipt rides ``note``),
+      then ``guardkit feature validate <id> --json``; passed means exit 0.
+    * ``classify-scenarios`` — ``guardkit qa classify-scenarios``; its verdict
+      is exit 0, and it never blocks.
+
+    Never raises: a runner that blows up is a failed check with the reason.
+    """
+    from forge.planning.target_terminal_tools import (
+        NO_MODEL_OPTION_UNKNOWN_NOTE,
+        _NORMALIZER_NO_MODEL_UNKNOWN_RE,
+        classify_normalizer_check,
+        classify_scenarios_check,
+        repair_plan_task_frontmatter,
+        validate_feature_plan_check,
+    )
+
+    def _run(argv: list[str]) -> tuple[int, str, str]:
+        return check_runner(argv=argv, cwd=str(worktree), timeout=check.timeout)
+
+    try:
+        if check.name == "normalize-stamps":
+            feature_id = str(check.args["feature_id"])
+            no_model = bool(check.args.get("no_model"))
+            argv = [
+                *command,
+                "qa",
+                "normalize-stamps",
+                "--feature",
+                feature_id,
+                "--repo",
+                str(worktree),
+            ]
+            note = ""
+            exit_code, stdout, stderr = _run(argv + (["--no-model"] if no_model else []))
+            if (
+                no_model
+                and exit_code != 0
+                and _NORMALIZER_NO_MODEL_UNKNOWN_RE.search(stderr or "")
+            ):
+                note = NO_MODEL_OPTION_UNKNOWN_NOTE
+                logger.warning(
+                    "forge-deploy-sidecar: normalize-stamps for %s — %s", feature_id, note
+                )
+                exit_code, stdout, stderr = _run(argv)
+            outcome = classify_normalizer_check(
+                feature_id,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
+            )
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=not outcome.is_failure,
+                detail=f"stamp normalizer {outcome.status}: {outcome.detail}",
+                note=note,
+            )
+        if check.name == "feature-validate":
+            feature_id = str(check.args["feature_id"])
+            repair = repair_plan_task_frontmatter(worktree, feature_id)
+            note = repair.receipt(feature_id) if repair.fired else ""
+            if note:
+                logger.warning("forge-deploy-sidecar: feature-validate: %s", note)
+            exit_code, stdout, stderr = _run(
+                [*command, "feature", "validate", feature_id, "--json"]
+            )
+            outcome = validate_feature_plan_check(
+                feature_id,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
+                note=note,
+            )
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=outcome.ok,
+                detail=outcome.detail,
+                note=note,
+            )
+        feature_file = worktree / str(check.args["feature_file"])
+        exit_code, stdout, stderr = _run(
+            [
+                *command,
+                "qa",
+                "classify-scenarios",
+                "--feature-file",
+                str(feature_file),
+                "--repo",
+                str(worktree),
+                "--json",
+            ]
+        )
+        outcome = classify_scenarios_check(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        )
+        return _check_outcome(
+            check,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            passed=exit_code == 0 and outcome.status == "checked",
+            detail=outcome.detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the check
+        logger.exception("forge-deploy-sidecar: check %s raised", check.name)
+        return PreCommitCheckOutcome(
+            name=check.name,
+            blocking=check.blocking,
+            ran=True,
+            passed=False,
+            exit_code=1,
+            detail=f"the check could not be run: {type(exc).__name__}: {exc}",
+        )
+
+
+def _not_run(check: _DeclaredCheck) -> PreCommitCheckOutcome:
+    return PreCommitCheckOutcome(
+        name=check.name,
+        blocking=check.blocking,
+        ran=False,
+        passed=False,
+        exit_code=-1,
+        detail="not run: an earlier check refused the commit",
+    )
+
+
+def _declared_checks_hook(
+    checks: list[_DeclaredCheck],
+    *,
+    command: tuple[str, ...],
+    check_runner: MergeRunner,
+    outcomes: list[PreCommitCheckOutcome],
+) -> Callable[[Path], Awaitable[PreCommitResult]]:
+    """The pre-commit hook the in-container runner takes, built from the
+    declaration: each check in order, in a worker thread (the runner is
+    async, the checks are subprocesses); the first blocking failure refuses
+    the commit and the rest are reported as not run."""
+
+    async def _hook(worktree: Path) -> PreCommitResult:
+        for index, check in enumerate(checks):
+            outcome = await asyncio.to_thread(
+                run_declared_check,
+                check,
+                worktree=worktree,
+                command=command,
+                check_runner=check_runner,
+            )
+            outcomes.append(outcome)
+            if check.blocking and not outcome.passed:
+                outcomes.extend(_not_run(rest) for rest in checks[index + 1 :])
+                return PreCommitResult(ok=False, detail=outcome.detail)
+        return PreCommitResult(ok=True)
+
+    return _hook
+
+
+def _run_coroutine(coro: Awaitable[Any]) -> Any:
+    """Run ``coro`` to completion from synchronous code.
+
+    The request handlers are plain threads with no event loop, so
+    :func:`asyncio.run` is the ordinary path; when a loop is already running
+    in this thread (a test calling the core from async code) the coroutine
+    runs on a fresh thread of its own instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # type: ignore[arg-type]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()  # type: ignore[arg-type]
+
+
+def _git_runner(worktrees_root: Path | None) -> Any:
+    """The in-container planning runner, imported — the sidecar makes its
+    worktrees exactly the way forge's own runner does, never a second way."""
+    from forge.adapters.git.planning_runner import WorktreeGitRunner
+
+    return WorktreeGitRunner(
+        worktrees_root=worktrees_root, hook_timeout_s=GIT_HOOK_TIMEOUT_SECONDS
+    )
+
+
+def process_git_write_tree_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    check_runner: MergeRunner = run_merge_command,
+    command_resolver: Callable[[], tuple[str, ...] | None] = resolve_check_command,
+    worktrees_root: Path | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Validate and perform a ``/git/prepare-branch-and-write-tree`` payload.
+
+    ``{repo, branch, files, message, checks}`` → on a permitted request a 200
+    carrying ``{status, sha, checks, detail}``: ``status`` is the runner's
+    (``success`` with the commit's ``sha``, or ``failed`` with ``detail``
+    saying why — a check that refused the commit is a ``failed`` with the
+    checks' outcomes beside it, data rather than a transport error); every
+    declared check appears in ``checks`` in order, run or not. A refusal of
+    the request itself is a 4xx with one plain sentence; a sidecar with no
+    guardkit to run the checks is a 500 saying so, before any worktree is
+    made. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    branch = payload.get("branch")
+    error = _ref_error(branch, what="branch")
+    if error:
+        return 400, {"error": error}
+    files, error = _validate_files(payload.get("files"))
+    if error or files is None:
+        return 400, {"error": error}
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return 400, {"error": "'message' is required (the commit message)"}
+    checks, error = _parse_checks(payload.get("checks"))
+    if error or checks is None:
+        return 400, {"error": error}
+
+    command: tuple[str, ...] | None = None
+    if checks:
+        command = command_resolver()
+        if not command:
+            return 500, {
+                "error": (
+                    "this sidecar has no guardkit command to run the declared "
+                    f"checks with — set {GUARDKIT_PATH_ENV} to its path, put "
+                    f"{GUARDKIT_BINARY_NAME} on the service's PATH, or install "
+                    "guardkit beside the sidecar"
+                )
+            }
+
+    outcomes: list[PreCommitCheckOutcome] = []
+    hook = (
+        _declared_checks_hook(
+            checks, command=command, check_runner=check_runner, outcomes=outcomes
+        )
+        if checks and command
+        else None
+    )
+    logger.info(
+        "forge-deploy-sidecar: writing %d file(s) onto %s in %s with %d declared "
+        "check(s): %s",
+        len(files),
+        branch,
+        repo_path,
+        len(checks),
+        ", ".join(c.name for c in checks) or "(none)",
+    )
+    try:
+        result = _run_coroutine(
+            _git_runner(worktrees_root).prepare_branch_and_write_tree(
+                repo_path=str(repo_path),
+                branch=str(branch),
+                files=files,
+                message=message,
+                pre_commit=hook,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar git error: {type(exc).__name__}: {exc}",
+            "status": "failed",
+            "sha": None,
+            "checks": [o.to_wire() for o in outcomes],
+            "detail": "",
+        }
+    return 200, {
+        "status": result.status,
+        "sha": result.sha,
+        "checks": [o.to_wire() for o in outcomes],
+        "detail": result.stderr or "",
+    }
+
+
+def process_git_read_file_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    worktrees_root: Path | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, branch, file_path}`` → ``{content}`` (``null`` when the file
+    is not on the branch), through the in-container runner's own read.
+    Never raises."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    branch = payload.get("branch")
+    error = _ref_error(branch, what="branch")
+    if error:
+        return 400, {"error": error}
+    file_path = payload.get("file_path")
+    error = _relative_path_error(file_path, what="file_path")
+    if error:
+        return 400, {"error": error}
+    try:
+        content = _run_coroutine(
+            _git_runner(worktrees_root).read_file_from_branch(
+                repo_path=str(repo_path), branch=str(branch), file_path=str(file_path)
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    return 200, {"content": content}
+
+
+def process_git_rev_parse_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, ref}`` → ``{sha}`` (``null`` when the ref names no commit):
+    ``git rev-parse --verify --quiet <ref>^{commit}``, one fixed argument
+    list, no shell. Never raises."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    ref = payload.get("ref")
+    error = _ref_error(ref, what="ref")
+    if error:
+        return 400, {"error": error}
+    spec = str(ref) if str(ref).endswith("}") else f"{ref}^{{commit}}"
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet", spec],
+            capture_output=True,
+            text=True,
+            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    sha = result.stdout.strip() if result.returncode == 0 else ""
+    return 200, {"sha": sha or None}
+
+
+# ---------------------------------------------------------------------------
 # Config resolution (re-read per request so path changes are picked up)
 # ---------------------------------------------------------------------------
 
@@ -929,11 +1597,18 @@ class _SidecarServer(ThreadingHTTPServer):
         config_loader: ConfigLoader,
         script_runner: ScriptRunner,
         merge_runner: MergeRunner = run_merge_command,
+        check_runner: MergeRunner = run_merge_command,
+        worktrees_root: Path | None = None,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.config_loader = config_loader
         self.script_runner = script_runner
         self.merge_runner = merge_runner
+        # The git routes' seams: the subprocess core the declared checks run
+        # through, and where the worktrees are made (None = the runner's own
+        # default under the temp directory).
+        self.check_runner = check_runner
+        self.worktrees_root = worktrees_root
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -969,7 +1644,13 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         try:
             route = self.path.split("?", 1)[0]
-            if route not in ("/run", "/guardkit-merge"):
+            if route not in (
+                "/run",
+                "/guardkit-merge",
+                GIT_WRITE_TREE_ROUTE,
+                GIT_READ_FILE_ROUTE,
+                GIT_REV_PARSE_ROUTE,
+            ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -990,6 +1671,21 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     config=config,
                     merge_runner=self.server.merge_runner,  # type: ignore[attr-defined]
                 )
+            elif route == GIT_WRITE_TREE_ROUTE:
+                status, body = process_git_write_tree_request(
+                    payload,
+                    config=config,
+                    check_runner=self.server.check_runner,  # type: ignore[attr-defined]
+                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
+                )
+            elif route == GIT_READ_FILE_ROUTE:
+                status, body = process_git_read_file_request(
+                    payload,
+                    config=config,
+                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
+                )
+            elif route == GIT_REV_PARSE_ROUTE:
+                status, body = process_git_rev_parse_request(payload, config=config)
             else:
                 status, body = process_run_request(
                     payload,
@@ -1017,11 +1713,14 @@ def build_server(
     config_loader: ConfigLoader = default_config_loader,
     script_runner: ScriptRunner = _run_script_step,
     merge_runner: MergeRunner = run_merge_command,
+    check_runner: MergeRunner = run_merge_command,
+    worktrees_root: Path | None = None,
 ) -> _SidecarServer:
     """Build (but do not start) the loopback-only sidecar HTTP server.
 
     ``host`` defaults to the loopback constant (LAW 5). Tests pass ``port=0`` to
     claim an ephemeral port and assert the bound address is loopback.
+    ``check_runner`` and ``worktrees_root`` are the git routes' seams.
     """
     return _SidecarServer(
         (host, port),
@@ -1029,6 +1728,8 @@ def build_server(
         config_loader=config_loader,
         script_runner=script_runner,
         merge_runner=merge_runner,
+        check_runner=check_runner,
+        worktrees_root=worktrees_root,
     )
 
 
@@ -1039,6 +1740,7 @@ def serve(
     config_loader: ConfigLoader = default_config_loader,
     script_runner: ScriptRunner = _run_script_step,
     merge_runner: MergeRunner = run_merge_command,
+    check_runner: MergeRunner = run_merge_command,
 ) -> None:
     """Run the sidecar forever (the ``python -m forge.deploy_sidecar`` body)."""
     logging.basicConfig(level=logging.INFO)
@@ -1048,6 +1750,7 @@ def serve(
         config_loader=config_loader,
         script_runner=script_runner,
         merge_runner=merge_runner,
+        check_runner=check_runner,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info(
@@ -1095,6 +1798,19 @@ __all__ = [
     "allowed_env_keys",
     "process_run_request",
     "process_guardkit_merge_request",
+    "GIT_WRITE_TREE_ROUTE",
+    "GIT_READ_FILE_ROUTE",
+    "GIT_REV_PARSE_ROUTE",
+    "GIT_CHECK_NAMES",
+    "GIT_CHECK_TIMEOUT_DEFAULTS",
+    "GIT_CHECK_BLOCKING_DEFAULTS",
+    "GIT_HOOK_TIMEOUT_SECONDS",
+    "REF_NAME_PATTERN",
+    "resolve_check_command",
+    "run_declared_check",
+    "process_git_write_tree_request",
+    "process_git_read_file_request",
+    "process_git_rev_parse_request",
     "default_config_loader",
     "DeploySidecarHandler",
     "build_server",

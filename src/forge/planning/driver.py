@@ -45,7 +45,9 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -73,6 +75,8 @@ from forge.planning.escalation import (
 from forge.planning.failure import fail_run, mark_run_failed
 from forge.planning.handoff import (
     PlannedHandoffHandler,
+    PreCommitCheck,
+    PreCommitChecks,
     PreCommitResult,
     build_feature_spec_input_content,
 )
@@ -107,6 +111,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.planning.checkpoint import SecondOpinionProvider
     from forge.planning.target_terminal_tools import (
         ClassifyScenariosFn,
+        FeatureFilesFill,
         NormalizeFeatureSpecFn,
         NormalizeStampsFn,
         ScenarioProvabilityOutcome,
@@ -905,6 +910,35 @@ class _PlanAttempt:
 
 
 @dataclass(frozen=True)
+class _StampPrelude:
+    """What the stamping step settled BEFORE the normalizer ran (sandbox
+    first, 2026-09-07): the routing law's enforcement for the repo/feature,
+    whether this stamping runs by rule only (and the note when it was asked
+    to and could not), and the ``feature_files:`` fill's receipt. Shared by
+    the closure and the declared form of the plan leg's pre-commit."""
+
+    enforcement: dict[str, str]
+    by_rule_only: bool
+    rules_only_note: str
+    fill: "FeatureFilesFill"
+
+
+@dataclass(frozen=True)
+class _DeclaredPlanChecks:
+    """The plan leg's pre-commit, declared for a sandbox git runner (rule
+    70): the checks by name, the files to commit (the plan YAML with the
+    committed spec path(s) written in when the plan-writer left the key
+    out), the prelude the outcomes are finished with, and — when forge's own
+    check refused the plan before the normalizer — that refusal as the
+    stamping outcome (the normalizer is then not declared)."""
+
+    checks: PreCommitChecks
+    files: dict[str, str]
+    prelude: _StampPrelude
+    stamps: "StampNormalizerOutcome | None" = None
+
+
+@dataclass(frozen=True)
 class _DoorAnswer:
     """What came back through an inline confirmation door.
 
@@ -1116,6 +1150,14 @@ class PlanningDriverDeps:
     planning_config: "PlanningConfig"
     clock: Callable[[], datetime]
     publish_notification: PublishNotificationFn | None = None
+    # Sandbox first (2026-09-07, rule 71) — the git runner BY TARGET REPO. The
+    # composition sets it when any repository has a sandbox: ``org/name`` →
+    # that repository's runner (its sandbox sidecar's, or the in-container
+    # one). None = ``git_runner`` serves every repository, exactly as before.
+    # The plan leg asks it which runner it has, and whether that runner takes
+    # its pre-commit checks declared (``supports_declared_checks``) rather
+    # than as a closure run here.
+    git_runner_for_repo: Callable[[str], Any] | None = None
     # O-27/O-29 (E2-S4) — pre-run resource-headroom preflight. Optional / default
     # None: unwired = no preflight (byte-for-byte no-op). Wired, it is consulted
     # exactly ONCE at the fresh QUEUED→RUNNING run-start boundary; a breach fails
@@ -4261,8 +4303,44 @@ class PlanningRunDriver:
             outcome = await validate(worktree, feature_id)
             return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
 
+        # Sandbox first (2026-09-07, rule 70): a git runner that lives in the
+        # repository's sandbox cannot run the closure above — nothing the
+        # factory runs on a repository runs on the host. For such a runner
+        # the SAME two checks are DECLARED by name (the normalizer with its
+        # feature id and --no-model, then feature validate), the sidecar
+        # runs them in the worktree it materialised, and their outcomes are
+        # read back below through the parsers the closure's collaborators
+        # use — so a refusal, rule 1a's rule-only stamping, rule 6b's second
+        # stamping and every receipt mean exactly what they mean here. The
+        # in-container runner keeps the closure.
+        git_runner = self._git_runner_for(target_repo)
+        declared: _DeclaredPlanChecks | None = None
+        pre_commit: Any = _pre_commit
+        if self._runner_takes_declared_checks(git_runner):
+            declared = await self._declare_plan_checks(
+                git_runner,
+                files,
+                feature_id,
+                spec_feature_paths,
+                rules_only=rules_only,
+                repo_path=repo_path,
+                branch=branch,
+            )
+            files = declared.files
+            if declared.stamps is not None:
+                # forge's own refusal before the normalizer (a plan whose
+                # feature_files: contradicts the committed spec): the check
+                # is not declared, and where the law is enforced the commit
+                # never starts — as the closure returns before the write.
+                stamp_state["outcome"] = declared.stamps
+                if declared.stamps.stops_the_run:
+                    return _PlanAttempt(
+                        committed=False, stamps=declared.stamps, files=files, slug=slug
+                    )
+            pre_commit = declared.checks
+
         try:
-            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+            gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
                 files=files,
@@ -4270,7 +4348,7 @@ class PlanningRunDriver:
                     f"planning: feature plan {feature_id} for {correlation_id} "
                     "(Lane B 008)"
                 ),
-                pre_commit=_pre_commit,
+                pre_commit=pre_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -4279,6 +4357,10 @@ class PlanningRunDriver:
                 f"plan write raised {type(exc).__name__}: {exc}",
             )
             return None
+        if declared is not None:
+            stamps_read = self._stamps_from_declared_checks(gitres, declared, feature_id)
+            if stamps_read is not None:
+                stamp_state["outcome"] = stamps_read
         if gitres.status == "failed":
             stamps = stamp_state.get("outcome")
             if stamps is not None and stamps.stops_the_run:
@@ -4300,6 +4382,190 @@ class PlanningRunDriver:
             slug=slug,
             sha=gitres.sha,
         )
+
+    # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
+
+    def _git_runner_for(self, target_repo: str) -> Any:
+        """The git runner for ``org/name``: the composition's resolver when
+        it set one (a sandboxed repository's sidecar runner, else the
+        in-container one), otherwise the single ``git_runner`` — which is
+        every repository's before this lane and for a composition with no
+        sandboxes."""
+        resolver = self._deps.git_runner_for_repo
+        if resolver is not None:
+            runner = resolver(target_repo)
+            if runner is not None:
+                return runner
+        return self._deps.git_runner
+
+    @staticmethod
+    def _runner_takes_declared_checks(git_runner: Any) -> bool:
+        """Feature-detect the declared form: a runner that says
+        ``supports_declared_checks()`` is true. The in-container runner has
+        no such method and keeps the closure."""
+        probe = getattr(git_runner, "supports_declared_checks", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 — a runner that cannot answer takes closures
+            return False
+
+    async def _declare_plan_checks(
+        self,
+        git_runner: Any,
+        files: Mapping[str, str],
+        feature_id: str,
+        spec_feature_paths: list[str],
+        *,
+        rules_only: bool,
+        repo_path: str,
+        branch: str,
+    ) -> "_DeclaredPlanChecks":
+        """Turn the plan leg's pre-commit closure into a declaration.
+
+        What the closure does BEFORE the normalizer runs — read the routing
+        law's enforcement for this repo/feature, and write the committed spec
+        ``.feature`` path(s) into a plan YAML that declares no
+        ``feature_files:`` — reads and edits the plan's own YAML and the
+        repository's ``.guardkit/config.yaml``. Those are files forge itself
+        is about to commit, plus one flag file read off the branch; no
+        repository code is run. So they are laid out in a temporary directory
+        of forge's own (the plan files from memory, the config from the
+        branch through the runner's read) and the SAME two helpers run on it,
+        unchanged — then the filled YAML goes back into the files to commit.
+
+        The declaration: ``normalize-stamps`` with the feature id and
+        ``no_model`` exactly when the closure would pass ``rules_only``
+        (rule 1a: the law enforced and the rewrite round still possible),
+        blocking exactly when the closure's stop is armed (the law enforced);
+        then ``feature-validate``, always blocking. When forge's own check
+        refuses the plan before the normalizer (a contradicting
+        ``feature_files:``), the normalizer is not declared and the refusal is
+        the stamping outcome, as the closure has it.
+        """
+        from forge.planning.target_terminal_tools import StampNormalizerOutcome
+
+        files_out: dict[str, str] = {str(k): str(v) for k, v in files.items()}
+        with tempfile.TemporaryDirectory(prefix="forge-plan-checks-") as td:
+            shadow = Path(td).resolve()
+            for rel, content in files_out.items():
+                target = (shadow / rel).resolve()
+                if not str(target).startswith(str(shadow) + os.sep):
+                    continue  # the runner refuses an escaping path itself
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            config_rel = ".guardkit/config.yaml"
+            if config_rel not in files_out:
+                # The routing law's own file, off the planning branch — and,
+                # when the branch does not carry it yet (the plan leg is the
+                # first commit on it), off the repository's current tip, which
+                # is what the branch will be cut from. Read it we must: it is
+                # what says whether a refusal stops the run, and a file we
+                # could not read would read as "the law is off".
+                config_text = await git_runner.read_file_from_branch(
+                    repo_path=repo_path, branch=branch, file_path=config_rel
+                )
+                if config_text is None:
+                    config_text = await git_runner.read_file_from_branch(
+                        repo_path=repo_path, branch="HEAD", file_path=config_rel
+                    )
+                if config_text is not None:
+                    config_path = shadow / config_rel
+                    config_path.parent.mkdir(parents=True, exist_ok=True)
+                    config_path.write_text(config_text, encoding="utf-8")
+                else:
+                    logger.warning(
+                        "planning driver: %s — the repository's %s could not be "
+                        "read from %s or from its current tip, so the routing "
+                        "law reads as off for this stamping and a refusal will "
+                        "not stop the run",
+                        feature_id,
+                        config_rel,
+                        branch,
+                    )
+            prelude = self._stamp_normalizer_prelude(
+                shadow,
+                feature_id,
+                spec_feature_paths,
+                rules_only=rules_only,
+                accepts_rules_only=True,
+            )
+            if prelude.fill.fired:
+                files_out[prelude.fill.yaml_rel] = (shadow / prelude.fill.yaml_rel).read_text(
+                    encoding="utf-8"
+                )
+        checks: list[PreCommitCheck] = []
+        stamps: StampNormalizerOutcome | None = None
+        if prelude.fill.inconsistent:
+            logger.error("stamp normalizer hook: %s", prelude.fill.reason)
+            stamps = self._stamp_normalizer_finish(
+                StampNormalizerOutcome(status="refused", detail=prelude.fill.reason),
+                prelude,
+                feature_id,
+            )
+        else:
+            checks.append(
+                PreCommitCheck(
+                    name="normalize-stamps",
+                    args={"feature_id": feature_id, "no_model": prelude.by_rule_only},
+                    blocking=prelude.enforcement["enforcement"] == "enforced",
+                )
+            )
+        checks.append(
+            PreCommitCheck(name="feature-validate", args={"feature_id": feature_id})
+        )
+        logger.info(
+            "planning driver: the plan leg's pre-commit checks for %s are declared "
+            "to the sandbox git runner rather than run here: %s",
+            feature_id,
+            ", ".join(
+                f"{c.name}({'blocking' if c.blocking else 'not blocking'}"
+                + (", --no-model" if c.args.get("no_model") else "")
+                + ")"
+                for c in checks
+            ),
+        )
+        return _DeclaredPlanChecks(
+            checks=PreCommitChecks(tuple(checks)),
+            files=files_out,
+            prelude=prelude,
+            stamps=stamps,
+        )
+
+    def _stamps_from_declared_checks(
+        self, gitres: Any, declared: "_DeclaredPlanChecks", feature_id: str
+    ) -> "StampNormalizerOutcome | None":
+        """Read the stamping outcome off a declared write's result: the
+        ``normalize-stamps`` check's streams through the normalizer's own
+        parser, then the closure's after-the-fact steps (rule-only receipt,
+        the fill, the enforcement) — so the outcome is the one the closure
+        would have produced. ``None`` when the check never ran (the write
+        was refused before the checks, or forge's own refusal stood in for
+        it — that outcome is already recorded)."""
+        from forge.planning.target_terminal_tools import classify_normalizer_check
+
+        if declared.stamps is not None:
+            return declared.stamps
+        outcomes = getattr(gitres, "checks", None) or []
+        check = next((c for c in outcomes if c.name == "normalize-stamps"), None)
+        if check is None or not check.ran:
+            return None
+        outcome = classify_normalizer_check(
+            feature_id,
+            exit_code=check.exit_code,
+            stdout=check.stdout,
+            stderr=check.stderr_tail,
+            timed_out=check.timed_out,
+        )
+        if check.note:
+            # The sidecar ran it again without --no-model (the installed
+            # guardkit has no such option): the same receipt the closure's
+            # collaborator writes for that case.
+            outcome = dataclasses.replace(
+                outcome, rules_only=False, rules_only_note=check.note
+            )
+        return self._stamp_normalizer_finish(outcome, declared.prelude, feature_id)
 
     def _machine_rewrite_allowed(
         self, correlation_id: str, stamps: "StampNormalizerOutcome"
@@ -5049,10 +5315,8 @@ class PlanningRunDriver:
 
         Never raises.
         """
-        from forge.pipeline.routing_stamps import resolve_routing_law
         from forge.planning.target_terminal_tools import (
             StampNormalizerOutcome,
-            declare_feature_files_if_absent,
             normalizer_accepts_rules_only,
         )
 
@@ -5070,6 +5334,67 @@ class PlanningRunDriver:
                     "NOT minted by forge for this plan"
                 ),
             )
+        prelude = self._stamp_normalizer_prelude(
+            worktree,
+            feature_id,
+            spec_feature_paths,
+            rules_only=rules_only,
+            accepts_rules_only=normalizer_accepts_rules_only(normalize),
+        )
+        by_rule_only = prelude.by_rule_only
+        fill = prelude.fill
+        if fill.inconsistent:
+            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
+            # a plan whose feature_files: contradicts forge's own spec commit.
+            logger.error("stamp normalizer hook: %s", fill.reason)
+            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
+        else:
+            try:
+                if by_rule_only:
+                    logger.info(
+                        "stamp normalizer hook: %s — first stamping by rule only "
+                        "(the rewrite round is on); the model fallback is not "
+                        "asked on this call",
+                        feature_id,
+                    )
+                    outcome = await normalize(worktree, feature_id, rules_only=True)
+                else:
+                    outcome = await normalize(worktree, feature_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — collaborator boundary
+                logger.exception("stamp normalizer hook raised for %s", feature_id)
+                outcome = StampNormalizerOutcome(
+                    status="failed",
+                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
+                )
+        return self._stamp_normalizer_finish(outcome, prelude, feature_id)
+
+    def _stamp_normalizer_prelude(
+        self,
+        worktree: Path,
+        feature_id: str,
+        spec_feature_paths: list[str],
+        *,
+        rules_only: bool,
+        accepts_rules_only: bool,
+    ) -> "_StampPrelude":
+        """Everything the stamping step does BEFORE the normalizer runs, on
+        the worktree: read the routing law's enforcement (the mode and the
+        stop both hang on it), settle whether this stamping runs by rule
+        only, and write the committed spec path(s) into a plan YAML that
+        declares no ``feature_files:``. Shared by the closure (the
+        in-container runner) and the declared form (a sandbox runner, on a
+        temporary copy of the same files), so the two cannot drift.
+
+        ``accepts_rules_only`` is whether the party that will run the
+        normalizer takes ``--no-model``: the closure's collaborator says so
+        by its signature; a sandbox sidecar always does (and says so itself
+        when the guardkit beside it turns out not to).
+        """
+        from forge.pipeline.routing_stamps import resolve_routing_law
+        from forge.planning.target_terminal_tools import declare_feature_files_if_absent
+
         # Coordinator condition 5: the STOP is gated on enforcement — and
         # since rule 1a the MODE of the stamping is too, so the law is read
         # first. A resolver defect is "off", said aloud (the law is opt-in).
@@ -5097,7 +5422,7 @@ class PlanningRunDriver:
             }
         by_rule_only = bool(rules_only) and enforcement["enforcement"] == "enforced"
         rules_only_note = ""
-        if by_rule_only and not normalizer_accepts_rules_only(normalize):
+        if by_rule_only and not accepts_rules_only:
             by_rule_only = False
             rules_only_note = (
                 "the first stamping was asked to run by rule only (the rewrite "
@@ -5115,31 +5440,26 @@ class PlanningRunDriver:
                 enforcement["enforcement_detail"],
             )
         fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
-        if fill.inconsistent:
-            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
-            # a plan whose feature_files: contradicts forge's own spec commit.
-            logger.error("stamp normalizer hook: %s", fill.reason)
-            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
-        else:
-            try:
-                if by_rule_only:
-                    logger.info(
-                        "stamp normalizer hook: %s — first stamping by rule only "
-                        "(the rewrite round is on); the model fallback is not "
-                        "asked on this call",
-                        feature_id,
-                    )
-                    outcome = await normalize(worktree, feature_id, rules_only=True)
-                else:
-                    outcome = await normalize(worktree, feature_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — collaborator boundary
-                logger.exception("stamp normalizer hook raised for %s", feature_id)
-                outcome = StampNormalizerOutcome(
-                    status="failed",
-                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
-                )
+        return _StampPrelude(
+            enforcement=enforcement,
+            by_rule_only=by_rule_only,
+            rules_only_note=rules_only_note,
+            fill=fill,
+        )
+
+    def _stamp_normalizer_finish(
+        self,
+        outcome: "StampNormalizerOutcome",
+        prelude: "_StampPrelude",
+        feature_id: str,
+    ) -> "StampNormalizerOutcome":
+        """Everything the stamping step does AFTER the normalizer answered:
+        the rule-only receipt, the fill's receipt, the enforcement, and the
+        log line that says how it went. Shared by both forms."""
+        by_rule_only = prelude.by_rule_only
+        rules_only_note = prelude.rules_only_note
+        fill = prelude.fill
+        enforcement = prelude.enforcement
         if rules_only_note:
             # The driver's own reason: the collaborator does not take the keyword.
             outcome = dataclasses.replace(

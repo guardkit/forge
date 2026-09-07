@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -62,6 +62,10 @@ __all__ = [
     "GitRunner",
     "NotificationPayload",
     "PlannedHandoffHandler",
+    "PRE_COMMIT_CHECK_NAMES",
+    "PreCommitCheck",
+    "PreCommitCheckOutcome",
+    "PreCommitChecks",
     "PreCommitHook",
     "PreCommitResult",
     "TerminalRegistry",
@@ -136,6 +140,124 @@ class PreCommitResult:
 PreCommitHook = Callable[[Path], Awaitable[PreCommitResult]]
 
 
+# ---------------------------------------------------------------------------
+# Declared pre-commit checks (sandbox first, 2026-09-07, rule 70)
+#
+# Rich's rule: nothing the factory runs on a repository runs on the host. A
+# Python closure can only run where the driver runs, so a git runner that
+# lives in the repository's sandbox cannot take one. Instead the driver
+# DECLARES the checks by name, with their arguments, and the sandbox's own
+# guardkit runs them against the worktree it materialised; the outcomes come
+# back with the commit and the driver reads them through the same parsers it
+# always used, so what a refusal means does not change.
+# ---------------------------------------------------------------------------
+
+#: The checks a sandbox git runner knows how to run, by name:
+#:
+#: * ``normalize-stamps``    — ``guardkit qa normalize-stamps --feature <id>
+#:   --repo <worktree> [--no-model]``; args ``feature_id`` and ``no_model``.
+#:   Blocks the commit (when declared blocking) exactly when the driver's own
+#:   hook stops the run: a partial / refused / failed normalizer.
+#: * ``feature-validate``    — ``guardkit feature validate <id> --json``;
+#:   args ``feature_id``. Blocks on a non-zero exit.
+#: * ``classify-scenarios``  — ``guardkit qa classify-scenarios --feature-file
+#:   <path> --repo <worktree> --json``; args ``feature_file``. Never blocks.
+PRE_COMMIT_CHECK_NAMES: tuple[str, ...] = (
+    "normalize-stamps",
+    "feature-validate",
+    "classify-scenarios",
+)
+
+
+@dataclass(frozen=True)
+class PreCommitCheck:
+    """One check to run in the worktree before the commit, named.
+
+    ``blocking`` says whether a failing verdict refuses the commit. The
+    driver sets it from the routing law's enforcement for the stamp
+    normalizer (an unenforced repository proceeds past a refusal, as its
+    closure does) and always for ``feature validate``; ``classify-scenarios``
+    never blocks whatever is declared.
+    """
+
+    name: str
+    args: Mapping[str, Any] = field(default_factory=dict)
+    blocking: bool = True
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"name": self.name, "args": dict(self.args), "blocking": self.blocking}
+
+
+@dataclass(frozen=True)
+class PreCommitChecks:
+    """The declared list of checks, in the order they run. The first blocking
+    failure stops the list and refuses the commit; the checks after it are
+    reported as not run."""
+
+    checks: tuple[PreCommitCheck, ...] = ()
+
+    def to_wire(self) -> list[dict[str, Any]]:
+        return [check.to_wire() for check in self.checks]
+
+
+@dataclass(frozen=True)
+class PreCommitCheckOutcome:
+    """What one declared check did, as the sandbox reported it.
+
+    ``ran`` is false for a check the sidecar never started because an earlier
+    blocking check failed. ``passed`` is the check's own verdict (the same
+    rule the driver's closure applied); ``blocking`` says whether that verdict
+    could refuse the commit. ``stdout`` is the check's whole output (the JSON
+    the parsers read); ``stderr_tail`` the end of its stderr. ``detail`` is
+    the verdict in one sentence, in the words the driver's closure would have
+    used. ``note`` carries one plain sentence when the sidecar had to do
+    something the caller should know about (it ran the normalizer again
+    without ``--no-model`` because the installed guardkit has no such option,
+    or it repaired a task document's front matter before validating).
+    """
+
+    name: str
+    blocking: bool
+    ran: bool
+    passed: bool
+    exit_code: int
+    stdout: str = ""
+    stderr_tail: str = ""
+    timed_out: bool = False
+    detail: str = ""
+    note: str = ""
+
+    @classmethod
+    def from_wire(cls, raw: Mapping[str, Any]) -> "PreCommitCheckOutcome":
+        exit_code = raw.get("exit_code")
+        return cls(
+            name=str(raw.get("name") or ""),
+            blocking=bool(raw.get("blocking")),
+            ran=bool(raw.get("ran")),
+            passed=bool(raw.get("passed")),
+            exit_code=int(exit_code) if isinstance(exit_code, (int, float)) else -1,
+            stdout=str(raw.get("stdout") or ""),
+            stderr_tail=str(raw.get("stderr_tail") or ""),
+            timed_out=bool(raw.get("timed_out")),
+            detail=str(raw.get("detail") or ""),
+            note=str(raw.get("note") or ""),
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "blocking": self.blocking,
+            "ran": self.ran,
+            "passed": self.passed,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr_tail": self.stderr_tail,
+            "timed_out": self.timed_out,
+            "detail": self.detail,
+            "note": self.note,
+        }
+
+
 class GitRunner(Protocol):
     """Protocol for git operations injected into the handoff handler.
 
@@ -177,9 +299,17 @@ class GitRunner(Protocol):
         files: Mapping[str, str],
         message: str,
         *,
-        pre_commit: PreCommitHook | None = None,
+        pre_commit: "PreCommitHook | PreCommitChecks | None" = None,
     ) -> GitOpResult:
         """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
+
+        Since 2026-09-07 (sandbox first, rule 70) ``pre_commit`` may also be
+        a :class:`PreCommitChecks` declaration: a runner that lives in the
+        repository's sandbox runs the named checks with its own guardkit and
+        answers with their outcomes on the result (``checks``); the
+        in-container :class:`~forge.adapters.git.planning_runner.WorktreeGitRunner`
+        keeps taking the closure. A runner says which form it takes through
+        ``supports_declared_checks()`` (absent = closures only).
 
         The additive multi-file sibling of :meth:`prepare_branch_and_write`,
         for the target-terminal spec/plan legs which write the three-file spec
