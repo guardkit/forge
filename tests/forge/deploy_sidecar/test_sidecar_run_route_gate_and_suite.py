@@ -196,6 +196,13 @@ class TestTheScriptAllowlistNamesTheWrappersInnerScript:
 
 
 class TestTheLiveGateDriverMustBeTheDeclaredOne:
+    """The shape as the sidecar INSIDE a sandbox answers it.
+
+    ``inside_sandbox=True`` is what the running service reads out of the
+    environment the in-sandbox bootstrap sets; the host sidecar's refusal of
+    the very same request is the class below.
+    """
+
     def test_the_declared_driver_runs_and_the_answer_says_where(
         self, repo: Path, config: ForgeConfig
     ) -> None:
@@ -210,6 +217,7 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
             },
             config=config,
             command_runner=runner,
+            inside_sandbox=True,
         )
 
         assert status == 200
@@ -238,6 +246,7 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
             {"repo": REPO, "driver": ["python3", "qa/gates/mine.py"]},
             config=config,
             command_runner=runner,
+            inside_sandbox=True,
         )
 
         assert status == 400
@@ -257,6 +266,7 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
             },
             config=config,
             command_runner=runner,
+            inside_sandbox=True,
         )
 
         assert status == 400
@@ -276,6 +286,7 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
             },
             config=config,
             command_runner=runner,
+            inside_sandbox=True,
         )
 
         assert status == 200
@@ -294,10 +305,121 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
             },
             config=config,
             command_runner=_Recorder(),
+            inside_sandbox=True,
         )
 
         assert status == 400
         assert "positive number" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# Neither shape exists on the host (L3b's coach, 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+class TestTheHostSidecarHasNeitherOfTheTwoNewShapes:
+    """The wall Rich's rule of 2026-09-07 puts up, on the route itself.
+
+    Both shapes run a program the REPOSITORY declares — its live-gate driver,
+    its whole test suite — and both exist so that those run where the
+    repository lives. The sidecar on the host must refuse both outright, or
+    this lane would have handed the host two new ways to run a repository's
+    code under the operator's account. The refusal comes before anything is
+    read, resolved or started.
+    """
+
+    def test_the_host_refuses_the_declared_test_command(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        runner = _Recorder()
+
+        status, body = process_run_request(
+            {
+                "repo": REPO,
+                "declared_test": "uv run --frozen pytest -q",
+                "cwd": str(repo / ".forge" / "worktrees" / "build-1"),
+            },
+            config=config,
+            command_runner=runner,
+        )
+
+        assert status == 400
+        assert "running on the host, not inside a repository's sandbox" in (
+            body["error"]
+        )
+        assert runner.calls == []
+
+    def test_the_host_refuses_the_live_gate_driver(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        runner = _Recorder()
+
+        status, body = process_run_request(
+            {
+                "repo": REPO,
+                "driver": ["python3", "qa/gates/local_live_gate.py"],
+                "args": ["--feature", "FEAT-X"],
+            },
+            config=config,
+            command_runner=runner,
+        )
+
+        assert status == 400
+        assert "running on the host, not inside a repository's sandbox" in (
+            body["error"]
+        )
+        assert runner.calls == []
+
+    def test_the_flag_the_bootstrap_sets_is_what_opens_them(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No second switch: the same value that widens the script allowlist
+        is the one that opens these two shapes."""
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        runner = _Recorder((0, "ok", ""))
+        request = {
+            "repo": REPO,
+            "driver": ["python3", "qa/gates/local_live_gate.py"],
+        }
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        refused, _ = process_run_request(
+            dict(request), config=config, command_runner=runner
+        )
+
+        monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
+        allowed, _ = process_run_request(
+            dict(request), config=config, command_runner=runner
+        )
+
+        assert (refused, allowed) == (400, 200)
+        assert len(runner.calls) == 1
+
+    def test_a_request_naming_neither_is_the_route_it_always_was(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A repository without a sandbox changed nothing: the vetted-script
+        request the host sidecar has always served still runs."""
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        ran: list[Any] = []
+
+        status, _body = process_run_request(
+            {"repo": REPO, "script": "deploy/sandbox-deploy.sh"},
+            config=config,
+            script_runner=lambda **kw: ran.append(kw) or (0, "out"),
+        )
+
+        assert status == 200
+        assert len(ran) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -2504,6 +2504,31 @@ class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
         assert gk.calls == []
 
     @pytest.mark.asyncio
+    async def test_a_build_that_already_merged_still_answers_the_double_merge(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        """The question "did this already happen?" is answered first.
+
+        A press replayed on a build that has a merge on record must answer
+        the double-merge refusal, whatever else is true of the repository —
+        so the answer never changes because of anything this lane added
+        (L3b's coach, 2026-09-08).
+        """
+        first, _publisher, _gk, _dp = _deps(config, pool)
+        assert (await _run_executor(first, repo_root)).result == "merged-and-running"
+
+        deps, _publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.detail == (
+            "a merge step is already on record for this build — "
+            "refusing to run it twice"
+        )
+        assert "api-test-factory" not in outcome.detail
+        assert gk.calls == [] and dp.calls == []
+
+    @pytest.mark.asyncio
     async def test_a_repository_without_a_sandbox_presses_exactly_as_before(
         self, config, pool, repo_root, _receipts_env: Path
     ) -> None:

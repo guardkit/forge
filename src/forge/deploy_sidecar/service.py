@@ -409,6 +409,22 @@ def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
     return str(source.get(SIDECAR_IN_SANDBOX_ENV, "")).strip().lower() in _TRUTHY
 
 
+def _not_inside_a_sandbox(what: str) -> str:
+    """The refusal a HOST sidecar gives to the two sandbox-only shapes.
+
+    Written for whoever reads it in a log or a receipt: it says which sidecar
+    answered, why it will not do this, and where the request should have gone.
+    """
+    return (
+        "this sidecar is running on the host, not inside a repository's "
+        f"sandbox, so it will not run a repository's {what}. That is what the "
+        "sidecar inside the repository's sandbox is for: a repository's own "
+        "code runs where the repository lives, never on the host. Send this "
+        "request to that sandbox's sidecar (its address is the repository's "
+        "sidecar_url in planning.sandboxes)."
+    )
+
+
 def allowed_scripts(
     profile: DeployProfile, *, inside_sandbox: bool | None = None
 ) -> set[str]:
@@ -868,6 +884,7 @@ def process_run_request(
     config: ForgeConfig,
     script_runner: ScriptRunner = _run_script_step,
     command_runner: "MergeRunner | None" = None,
+    inside_sandbox: bool | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + execute a ``/run`` payload; return ``(http_status, body)``.
 
@@ -884,6 +901,20 @@ def process_run_request(
     runs the repository's declared test command in a journey worktree
     (:func:`process_declared_test_run`). A request carrying neither is the
     vetted-script request this route has always served, unchanged.
+
+    BOTH of those are refused unless this sidecar is the one INSIDE a
+    repository's sandbox (L3b's coach, 2026-09-08). They exist so that a
+    repository's own code runs where the repository lives; answering them on
+    the host would be the opposite — the host sidecar would run a
+    repository's whole test suite, or its live-gate driver, under the
+    operator's account, which is the wall Rich's rule of 2026-09-07 puts up.
+    The host sidecar therefore still runs exactly what it ran before this
+    lane: the programs ``deploy/profile.yaml`` names, and nothing else.
+
+    ``inside_sandbox`` is the answer to "is this sidecar inside a sandbox?".
+    Left as ``None`` it is read from the bootstrap's own environment value
+    (:func:`sidecar_is_inside_sandbox`), which is how the running service
+    answers it; a caller passes it only in tests.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -912,12 +943,18 @@ def process_run_request(
         }
     repo_path = Path(paths[repo])
 
+    in_sandbox = (
+        sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
+    )
+
     # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
     # command. It is answered BEFORE the deploy profile is read, because a
     # repository can have a fix journey without being deployable at all: what
     # it needs is a toolchain declaration and a journey worktree, not a deploy
     # profile. Its own function checks both.
     if payload.get("declared_test") is not None:
+        if not in_sandbox:
+            return 400, {"error": _not_inside_a_sandbox("declared test command")}
         return process_declared_test_run(
             payload,
             repo_path=repo_path,
@@ -937,6 +974,8 @@ def process_run_request(
     # is reached, so that path is exactly what it always was for every request
     # that does not name a driver.
     if payload.get("driver") is not None:
+        if not in_sandbox:
+            return 400, {"error": _not_inside_a_sandbox("live-gate driver")}
         env_only, error = _allowlisted_env(payload.get("env"), profile)
         if error:
             return 400, {"error": error}
@@ -956,7 +995,7 @@ def process_run_request(
                 "deploy/profile.yaml)"
             )
         }
-    permitted = allowed_scripts(profile)
+    permitted = allowed_scripts(profile, inside_sandbox=in_sandbox)
     if script not in permitted:
         names = ", ".join(sorted(permitted)) or (
             "(none — the profile names no runnable scripts)"

@@ -1074,6 +1074,27 @@ async def execute_merge_deploy(
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began
 
+        if _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
+            logger.error(
+                "merge-executor: %s already has a merge step on record — refusing "
+                "to run the merge twice",
+                build_id,
+            )
+            return MergeDeployOutcome(
+                result="merge-refused",
+                status="FAILED",
+                failed_step="merge",
+                detail=(
+                    "a merge step is already on record for this build — "
+                    "refusing to run it twice"
+                ),
+            )
+
+        # A press replayed on a build that already merged answers the
+        # double-merge refusal above and nothing else — that guard comes
+        # FIRST so the answer to "did this already happen?" never changes
+        # because of anything this lane added (L3b's coach, 2026-09-08).
+
         # ------------------------------------------------------------------
         # SANDBOX FIRST (2026-09-07, rules 62 and 85) — the wall this lane
         # could not move, said out loud rather than met as a puzzle.
@@ -1124,22 +1145,6 @@ async def execute_merge_deploy(
                 status="FAILED",
                 failed_step="merge",
                 detail=sentence,
-            )
-
-        if _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
-            logger.error(
-                "merge-executor: %s already has a merge step on record — refusing "
-                "to run the merge twice",
-                build_id,
-            )
-            return MergeDeployOutcome(
-                result="merge-refused",
-                status="FAILED",
-                failed_step="merge",
-                detail=(
-                    "a merge step is already on record for this build — "
-                    "refusing to run it twice"
-                ),
             )
 
         # ------------------------------------------------------------------

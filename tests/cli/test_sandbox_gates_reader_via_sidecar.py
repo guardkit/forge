@@ -143,7 +143,20 @@ def worktree(clone: Path) -> Path:
 
 
 @pytest.fixture
-def sidecar(clone: Path, plain_checkout: Path):
+def sidecar(clone: Path, plain_checkout: Path, monkeypatch: pytest.MonkeyPatch):
+    """The REAL sidecar, standing where the real one stands: inside the
+    repository's sandbox.
+
+    It says so the way the real one does — the in-sandbox bootstrap sets
+    ``FORGE_SIDECAR_IN_SANDBOX`` — because only a sidecar inside a sandbox
+    will run a repository's own declared test command (L3b's coach,
+    2026-09-08). The host sidecar's refusal of the same request is proved
+    beside the route itself, in
+    ``tests/forge/deploy_sidecar/test_sidecar_run_route_gate_and_suite.py``.
+    """
+    from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+    monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
     holder: dict[str, ForgeConfig] = {}
     srv = build_server(port=0, config_loader=lambda: holder["config"])
     threading.Thread(target=srv.serve_forever, daemon=True).start()
