@@ -64,6 +64,28 @@ stage is two callable legs so the merge word can put the merge BETWEEN them —
 :meth:`DeployStageRunner.run_deploy` — today's one-call shape — is the two
 legs in a row and is kept for the attended ``forge deploy`` command and every
 existing caller; its events, runbooks and results are what they were.
+
+THE CANDIDATE'S GATE RUNS IN THE CANDIDATE'S TREE (coach finding on the lane,
+2026-09-07). The compose and health steps already run in the laid-out tree;
+the live gate did not — the driver ran in the checkout, at main, and checked
+the branch's build against main's gate registry and main's Hurl twins, when
+the per-feature gate is registered ON the branch and only reaches main with
+the merge. Now the candidate leg hands the same working directory to
+:meth:`DeployStageRunner._run_live_gate`, which moves the invoker into the
+tree (``with_repo_path``) before it overlays the candidate's addresses
+(``with_extra_env``). The promote leg and a plain deploy pass no directory,
+so their gate runs in the checkout exactly as before.
+
+Where the candidate gate's evidence goes: the driver writes it under the
+tree's ``qa/gates/evidence/`` and ``qa/gates/history/``, and it is removed
+with the tree when the run ends. It stays there on purpose — the merge that
+follows a green check refuses a dirty checkout, and the tree is the one
+place under the checkout that is excluded from that check. What a person or
+a repair needs leaves the tree before the teardown: the verdict, the number
+of checks, the number passed and the failing checks' names ride the gate
+step's own result in the runbook record, the candidate summary this leg
+returns, the executor's receipt and the merge report — all read from the
+candidate run, none from the tree.
 """
 
 from __future__ import annotations
@@ -94,7 +116,11 @@ from forge.deploy.deploy_record import (
     DeployRecord,
     write_deploy_record,
 )
-from forge.deploy.live_gate import BrokerInspector, LiveGateInvoker
+from forge.deploy.live_gate import (
+    BrokerInspector,
+    LiveGateInvoker,
+    RefusingLiveGateInvoker,
+)
 from forge.deploy.profile import DeployProfile
 from forge.deploy.reservation import (
     ReservationError,
@@ -165,6 +191,9 @@ class _LiveGateRun:
     instrument problem). ``gate_ids`` names every check that ran;
     ``assertions`` carries each check's own results when the invoker reports
     them, so the stage can say which checks failed by name.
+    ``evidence_index_ref`` is the evidence index the driver reported, as the
+    driver wrote it (relative to the directory the gate ran in); empty when
+    it reported none.
     """
 
     verdict: str | None
@@ -172,6 +201,7 @@ class _LiveGateRun:
     failing_verdict_ref: str | None
     gate_ids: tuple[str, ...] = ()
     assertions: tuple[dict[str, Any], ...] = ()
+    evidence_index_ref: str = ""
 
 
 def gate_summary(
@@ -886,6 +916,7 @@ class DeployStageRunner:
         runbook_id: str | None = None,
         driver_env_overlay: dict[str, str] | None = None,
         publish_domain_events: bool = True,
+        driver_cwd_override: str | None = None,
     ) -> _LiveGateRun:
         """Run the LIVE_GATE runbook and publish QAVerdict + LiveGateResult.
 
@@ -901,6 +932,18 @@ class DeployStageRunner:
         so it emits the FMDR runbook step/receipt events (an honest audit trail)
         but NOT the deploy-domain QAVerdict/LiveGateResult, which stay reserved
         for the ONE live deploy. The promote/direct-live leg keeps the defaults.
+
+        ``driver_cwd_override`` (protect-main, rule 38): the directory the
+        gate's driver runs in — the candidate leg passes the feature branch's
+        laid-out tree, so the driver reads that tree's gate registry and Hurl
+        twins and writes its evidence there. The invoker is moved into it
+        (``with_repo_path``) BEFORE the env overlay is applied, since the
+        overlay keeps whatever directory its invoker has. An invoker that
+        cannot be moved does not run the gate at all: the runbook step fails
+        with the reason on record, because a gate that ran in the checkout
+        instead would check main's registry against the branch's build — the
+        defect the candidate check exists to catch. ``None`` (the promote leg,
+        a plain deploy) leaves the invoker where it was composed: the checkout.
         """
         gate_runbook = build_live_gate_runbook(
             profile,
@@ -910,8 +953,30 @@ class DeployStageRunner:
             now=self._clock(),
         )
         invoker_override: LiveGateInvoker | None = None
-        if driver_env_overlay:
-            with_overlay = getattr(self._live_gate_invoker, "with_extra_env", None)
+        if driver_cwd_override is not None:
+            with_cwd = getattr(self._live_gate_invoker, "with_repo_path", None)
+            if callable(with_cwd):
+                invoker_override = with_cwd(driver_cwd_override)
+            else:
+                logger.error(
+                    "live-gate invoker %s cannot be moved into the candidate tree "
+                    "%s (no with_repo_path); the candidate gate is refused rather "
+                    "than run in the checkout",
+                    type(self._live_gate_invoker).__name__,
+                    driver_cwd_override,
+                )
+                invoker_override = RefusingLiveGateInvoker(
+                    f"the live-gate invoker "
+                    f"({type(self._live_gate_invoker).__name__}) cannot run in "
+                    f"the candidate tree {driver_cwd_override}, and a gate run "
+                    "in the checkout would check main's registry, not the "
+                    "branch's"
+                )
+        if driver_env_overlay and not isinstance(
+            invoker_override, RefusingLiveGateInvoker
+        ):
+            base = invoker_override or self._live_gate_invoker
+            with_overlay = getattr(base, "with_extra_env", None)
             if callable(with_overlay):
                 invoker_override = with_overlay(driver_env_overlay)
             else:
@@ -996,6 +1061,7 @@ class DeployStageRunner:
             assertions=tuple(
                 a for a in (payload.get("assertions", []) or []) if isinstance(a, dict)
             ),
+            evidence_index_ref=str(common["evidence_index_ref"]),
         )
 
     async def _run_candidate_leg(
@@ -1026,13 +1092,19 @@ class DeployStageRunner:
 
         ``candidate_cwd`` — protect-main (rule 38): the working directory of
         every candidate step, the feature branch's laid-out tree; ``None`` is
-        the profile's ``cwd``.
+        the profile's ``cwd``. The live gate runs there too, so it checks the
+        tree's own registry and twins, and its evidence is written under the
+        tree (``summary["evidence_index_ref"]`` names the index as the driver
+        reported it, relative to that tree). The evidence goes when the tree
+        goes; the verdict, the counts and the failing names are in this
+        summary and in the gate step's runbook record before that.
         """
         assert profile.candidate is not None  # caller-guarded
         cand_env = dict(profile.candidate.env)
         compose_extra = {"CANDIDATE": "1", **cand_env}
         summary: dict[str, Any] = gate_summary(verdict=None, gate_ids=(), assertions=())
         summary["candidate_cwd"] = candidate_cwd
+        summary["evidence_index_ref"] = None
 
         # --- candidate deploy (separate -cand project) ---
         cand_runbook = build_deploy_runbook(
@@ -1087,6 +1159,7 @@ class DeployStageRunner:
                 runbook_id=f"live-gate-cand-{deploy_run_id}",
                 driver_env_overlay=cand_env,
                 publish_domain_events=False,
+                driver_cwd_override=candidate_cwd,
             )
             verdict = gate.verdict
             summary = {
@@ -1097,6 +1170,7 @@ class DeployStageRunner:
                     assertions=gate.assertions,
                     live_gate_runbook_id=gate.runbook_id,
                 ),
+                "evidence_index_ref": gate.evidence_index_ref or None,
             }
             if verdict != "pass":
                 await self._teardown_candidate(
