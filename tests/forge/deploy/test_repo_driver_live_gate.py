@@ -185,3 +185,93 @@ def test_invalid_envelope_verdict_falls_back_to_exit_code(tmp_path: Path) -> Non
     assert inv.verdict == "pass"  # exit 0 in the driver map
     assert inv.detail["source"] == "exit_code_map"
     assert inv.detail["envelope_verdict"] == "banana"
+
+
+# ---------------------------------------------------------------------------
+# Each check's own result rides the invocation (protect-main, 2026-09-07):
+# the deploy stage names the failing checks before it refuses a merge.
+# ---------------------------------------------------------------------------
+
+
+def _drive(tmp_path: Path, envelope: dict) -> LiveGateInvocation:
+    body = (
+        "import json, sys\n"
+        f"print(json.dumps({envelope!r}))\n"
+        "sys.exit(0 if " + repr(envelope["verdict"] == "pass") + " else 1)\n"
+    )
+    argv = _write_driver(tmp_path, body)
+    invoker = RepoDriverLiveGateInvoker(repo_path=tmp_path, driver_argv=argv)
+    return invoker.invoke(feature="FEAT-1", target="local")
+
+
+def test_per_check_results_are_carried_with_their_gate(tmp_path: Path) -> None:
+    envelope = {
+        "run_id": "r",
+        "verdict": "fail",
+        "gates": [
+            {
+                "gate_id": "health",
+                "exit_code": 0,
+                "assertions": [
+                    {"id": "health::status", "status": "pass", "observed": "200",
+                     "expected": "200", "evidence_ref": "qa/evidence/h.json"},
+                ],
+            },
+            {
+                "gate_id": "users_count",
+                "exit_code": 1,
+                "assertions": [
+                    {"id": "users_count::body", "status": "fail",
+                     "disposition": "counts", "observed": "{}", "expected": "counts"},
+                ],
+            },
+        ],
+    }
+    inv = _drive(tmp_path, envelope)
+    assert inv.verdict == "fail"
+    assert inv.gate_ids == ("health", "users_count")
+    assert inv.assertions == (
+        {"id": "health::status", "gate_id": "health", "status": "pass",
+         "evidence_ref": "qa/evidence/h.json", "observed": "200", "expected": "200"},
+        {"id": "users_count::body", "gate_id": "users_count", "status": "fail",
+         "observed": "{}", "expected": "counts", "disposition": "counts"},
+    )
+
+
+def test_a_gate_red_by_exit_code_alone_gets_one_failing_result(tmp_path: Path) -> None:
+    envelope = {
+        "run_id": "r",
+        "verdict": "fail",
+        "gates": [
+            {"gate_id": "health", "exit_code": 0},
+            {"gate_id": "etag", "exit_code": 2, "assertions": []},
+        ],
+    }
+    inv = _drive(tmp_path, envelope)
+    assert inv.assertions == (
+        {"id": "etag::exit_code", "gate_id": "etag", "status": "fail",
+         "observed": "2", "expected": "0"},
+    )
+
+
+def test_a_disposition_the_wire_does_not_know_is_left_out(tmp_path: Path) -> None:
+    from nats_core.events import AssertionResult
+
+    envelope = {
+        "run_id": "r",
+        "verdict": "fail",
+        "gates": [
+            {"gate_id": "g", "exit_code": 1,
+             "assertions": [{"id": "g::x", "status": "fail", "disposition": "banana"}]},
+        ],
+    }
+    inv = _drive(tmp_path, envelope)
+    assert inv.assertions == ({"id": "g::x", "gate_id": "g", "status": "fail"},)
+    # And what is carried always fits the wire model the stage builds.
+    for entry in inv.assertions:
+        AssertionResult(**entry)
+
+
+def test_no_gates_means_no_results(tmp_path: Path) -> None:
+    inv = _drive(tmp_path, {"run_id": "r", "verdict": "pass", "gates": []})
+    assert inv.assertions == ()

@@ -8,8 +8,12 @@ same ``(exit_code, output)`` return, same **never-raises** posture — so the
 handlers do not know or care which surface executed the script.
 
 The sidecar resolves the working directory itself (from ``repo`` +
-``planning.target_repo_paths``), so the ``cwd`` the handler passes is ignored
-here; the runner is bound to the target ``repo`` (org/name) at construction. A
+``planning.target_repo_paths``); the runner is bound to the target ``repo``
+(org/name) at construction. The ``cwd`` the handler passes rides along as
+``cwd`` in the request, and the sidecar honours it in exactly one case —
+protect-main (2026-09-07): a candidate tree, an existing directory directly
+under ``<checkout>/.forge-candidates/``, so the candidate leg builds the feature
+branch's own tree. Any other value is ignored there, as it always was. A
 transport or sidecar error is returned as a non-zero exit code with a
 descriptive body — never raised — mirroring the local core's contract.
 """
@@ -34,8 +38,8 @@ class SidecarScriptRunner:
 
     Bound to one ``repo`` (org/name) and the sidecar ``base_url``. Each call maps
     the handler's ``(cwd, script, env_file, timeout, extra_env)`` to the sidecar
-    ``/run`` contract ``{repo, script, env, timeout_seconds}`` and unpacks the
-    ``{exit_code, output_tail}`` response.
+    ``/run`` contract ``{repo, script, env, timeout_seconds, cwd}`` and unpacks
+    the ``{exit_code, output_tail}`` response.
     """
 
     def __init__(self, *, base_url: str, repo: str, http_timeout_margin: float = 30.0):
@@ -48,7 +52,7 @@ class SidecarScriptRunner:
     def __call__(
         self,
         *,
-        cwd: str,  # noqa: ARG002 — the sidecar resolves cwd from repo itself
+        cwd: str,
         script: str,
         env_file: str | None,
         timeout: float = 600.0,
@@ -58,12 +62,16 @@ class SidecarScriptRunner:
         env: dict[str, str] = dict(extra_env or {})
         if env_file is not None:
             env["ENV_FILE"] = env_file
-        body = {
+        body: dict[str, object] = {
             "repo": self._repo,
             "script": script,
             "env": env,
             "timeout_seconds": timeout,
         }
+        if isinstance(cwd, str) and cwd.strip():
+            # The sidecar decides: a candidate tree is honoured, anything else
+            # is ignored in favour of the profile's own working directory.
+            body["cwd"] = cwd
         data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base_url}/run",

@@ -11,7 +11,7 @@ Design of record: docs/factory-deploy-execution-surface-design-2026-07-16.md §1
 The narrow contract:
 
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
-    POST /run  {repo, script, env, timeout_seconds}
+    POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail}
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
                            timeout_seconds, verify_timeout_seconds}
@@ -52,6 +52,15 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    repository key, the feature name (``FEAT-`` plus three to twelve capitals or
    digits) and the forty-character target commit are all checked before any
    process starts, and the timeout may not exceed half an hour.
+8. A working directory named by the caller (``cwd``) takes effect in ONE case
+   only — protect-main (2026-09-07): an existing directory directly under
+   ``<repo>/.forge-candidates/``, where the merge word lays out the feature
+   branch's tree so the candidate is built from the exact commit the merge
+   will land. A path under that directory that does not exist, or is not
+   directly under it, is refused loudly. Any other value is ignored and the
+   profile's own working directory is used, as it always was. The script
+   still has to be one the profile names; it is found relative to the
+   working directory, so the candidate's own copy runs.
 
 Each request-processing core (:func:`process_run_request` and
 :func:`process_guardkit_merge_request`) is a pure function
@@ -74,6 +83,7 @@ from typing import Any, Callable, Protocol
 
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
+from forge.deploy.candidate_tree import candidate_trees_root, is_candidate_tree_path
 from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
@@ -340,6 +350,38 @@ def _resolve_cwd(repo_path: Path, profile: DeployProfile) -> Path:
     return repo_path
 
 
+def _resolve_requested_cwd(
+    repo_path: Path, requested: Any
+) -> tuple[Path | None, str | None]:
+    """LAW 8 — the caller's working directory, honoured only for a candidate tree.
+
+    Returns ``(cwd, error)``: a directory to run in when the request names an
+    existing candidate tree; ``(None, None)`` when the value is absent or is
+    anything other than a path under the candidate trees directory (ignored,
+    as before); ``(None, <plain sentence>)`` when it points under that
+    directory but is not an existing directory directly under it.
+    """
+    if not isinstance(requested, str) or not requested.strip():
+        return None, None
+    wanted = Path(requested)
+    if not wanted.is_absolute():
+        wanted = repo_path / wanted
+    try:
+        trees_root = candidate_trees_root(repo_path).resolve()
+        resolved = wanted.resolve()
+    except OSError:
+        return None, None
+    if trees_root not in resolved.parents:
+        return None, None
+    if not is_candidate_tree_path(repo_path, resolved) or not resolved.is_dir():
+        return None, (
+            f"working directory {requested!r} is not a candidate tree — the "
+            "only working directory the sidecar accepts besides the profile's "
+            f"own is an existing directory directly under {trees_root}"
+        )
+    return resolved, None
+
+
 def _tail(output: str) -> str:
     """Return the last :data:`OUTPUT_TAIL_CHARS` chars of ``output``."""
     if len(output) <= OUTPUT_TAIL_CHARS:
@@ -463,6 +505,14 @@ def process_run_request(
     # documented purpose); anything else rides extra_env.
     env_file = extra_env.pop("ENV_FILE", None)
     cwd = _resolve_cwd(repo_path, profile)
+
+    # LAW 8 — a candidate tree named by the caller is the working directory;
+    # anything else the caller names is ignored in favour of the profile's.
+    candidate_cwd, cwd_error = _resolve_requested_cwd(repo_path, payload.get("cwd"))
+    if cwd_error is not None:
+        return 400, {"error": cwd_error}
+    if candidate_cwd is not None:
+        cwd = candidate_cwd
 
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
     # itself never raises, but we still fence it so a stub/HTTP-layer surprise
