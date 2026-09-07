@@ -925,7 +925,7 @@ def process_guardkit_merge_request(
 #
 # LAW 9 (the git routes' own): the repository is the same key as everywhere
 # else; a branch, a ref and every file path are shape-checked before git sees
-# them; a check must be one of the three names below (nothing else runs, and
+# them; a check must be one of the six names below (nothing else runs, and
 # ``classify-scenarios`` may never be declared blocking); a check is one
 # fixed argument list through the same no-shell runner the merge uses.
 # ---------------------------------------------------------------------------
@@ -938,21 +938,39 @@ GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
-#: Each check's own time limit when the caller names none: the normalizer
-#: and the provability check are rules over a handful of files (seconds); a
-#: feature validate reads a whole plan tree (the oracle's usual ten minutes).
+#: Each check's own time limit when the caller names none: the stamp
+#: normalizer and the provability check are rules over a handful of files
+#: (seconds); a feature validate reads a whole plan tree, and the gherkin
+#: normalizer and the two schema checks are the planning oracles' usual ten
+#: minutes — the same budget the driver's own closures give them.
 GIT_CHECK_TIMEOUT_DEFAULTS: dict[str, float] = {
     "normalize-stamps": 120.0,
     "feature-validate": 600.0,
     "classify-scenarios": 120.0,
+    "normalize-feature": 600.0,
+    "validate-pass-bar": 600.0,
+    "validate-gate-registry": 600.0,
 }
 
-#: Whether a check blocks the commit when the caller does not say: the two
-#: the driver's own hook stops on, and never the provability check.
+#: Whether a check blocks the commit when the caller does not say: every
+#: check the driver's own hook stops on, and never the provability check.
 GIT_CHECK_BLOCKING_DEFAULTS: dict[str, bool] = {
     "normalize-stamps": True,
     "feature-validate": True,
     "classify-scenarios": False,
+    "normalize-feature": True,
+    "validate-pass-bar": True,
+    "validate-gate-registry": True,
+}
+
+#: The one argument each path-shaped check takes, by name. Every value is a
+#: repository-relative path, shape-checked before the worktree is joined to
+#: it, exactly as ``classify-scenarios``'s always was.
+GIT_CHECK_PATH_ARGS: dict[str, str] = {
+    "classify-scenarios": "feature_file",
+    "normalize-feature": "feature_file",
+    "validate-pass-bar": "bar_file",
+    "validate-gate-registry": "registry_file",
 }
 
 #: Ceiling on the whole pre-commit step (every check together) — the same
@@ -1115,13 +1133,14 @@ def _parse_checks(raw: Any) -> tuple[list[_DeclaredCheck] | None, str | None]:
                 clean["no_model"] = no_model
                 allowed.add("no_model")
         else:
+            key = GIT_CHECK_PATH_ARGS[name]
             error = _relative_path_error(
-                args.get("feature_file"), what=f"checks[{index}] args.feature_file"
+                args.get(key), what=f"checks[{index}] args.{key}"
             )
             if error:
                 return None, error
-            clean = {"feature_file": str(args["feature_file"])}
-            allowed = {"feature_file"}
+            clean = {key: str(args[key])}
+            allowed = {key}
         extra = sorted(set(args) - allowed)
         if extra:
             return None, (
@@ -1162,6 +1181,38 @@ def resolve_check_command(
     return None
 
 
+#: The check whose command is NOT guardkit's: the gherkin normalizer the spec
+#: leg runs is a guardkit MODULE (``python -m …``), resolved by its own dual
+#: candidate probe.
+NORMALIZER_CHECK_NAME: str = "normalize-feature"
+
+
+def resolve_normalizer_command_for_checks(
+    *, python_executable: str = sys.executable
+) -> tuple[str, ...] | None:
+    """The ``python -m <module>`` prefix the ``normalize-feature`` check runs,
+    or ``None`` when guardkit's normalizer module is not importable here.
+
+    The same resolution the spec leg's own oracle uses
+    (:func:`forge.planning.target_terminal_tools.resolve_normalizer_command`):
+    the wheel layout first, the source checkout second, probed in the
+    interpreter the sidecar runs under — which is the interpreter the
+    subprocess will use, so an importable spec here predicts the subprocess.
+    ``None`` becomes one plain sentence to the caller, before any worktree is
+    made; it is never a silent skip of the normalizer.
+    """
+    from forge.planning.target_terminal_tools import (
+        NormalizerModuleUnresolved,
+        resolve_normalizer_command,
+    )
+
+    try:
+        return resolve_normalizer_command(python_executable=python_executable)
+    except NormalizerModuleUnresolved as exc:
+        logger.error("forge-deploy-sidecar: %s", exc)
+        return None
+
+
 def _check_outcome(
     check: _DeclaredCheck,
     *,
@@ -1192,6 +1243,7 @@ def run_declared_check(
     worktree: Path,
     command: tuple[str, ...],
     check_runner: MergeRunner = run_merge_command,
+    normalizer_command: tuple[str, ...] | None = None,
 ) -> PreCommitCheckOutcome:
     """Run one declared check in ``worktree`` and judge it the way the
     driver's closure judged it.
@@ -1207,12 +1259,24 @@ def run_declared_check(
       then ``guardkit feature validate <id> --json``; passed means exit 0.
     * ``classify-scenarios`` — ``guardkit qa classify-scenarios``; its verdict
       is exit 0, and it never blocks.
+    * ``normalize-feature`` — the spec leg's gherkin normalizer over the
+      committed ``.feature``: the box-drawing divider repair first (the
+      closure's own, in place, its receipt riding ``note``), then
+      ``python -m <the normalizer module> <the file>``; passed means exit 0,
+      and the sentence a failure carries is the closure's word for word.
+    * ``validate-pass-bar`` / ``validate-gate-registry`` — ``guardkit qa
+      validate pass-bar <path>`` and ``guardkit qa validate gate-registry
+      <path>``; passed means exit 0, and the details are the two legs' own
+      sentences (a bar's names the bar first, as the pass-bar leg's loop
+      does).
 
     Never raises: a runner that blows up is a failed check with the reason.
     """
     from forge.planning.target_terminal_tools import (
         NO_MODEL_OPTION_UNKNOWN_NOTE,
         _NORMALIZER_NO_MODEL_UNKNOWN_RE,
+        _check_status_word,
+        _repair_box_drawing_dividers,
         classify_normalizer_check,
         classify_scenarios_check,
         repair_plan_task_frontmatter,
@@ -1289,6 +1353,97 @@ def run_declared_check(
                 detail=outcome.detail,
                 note=note,
             )
+        if check.name == "normalize-feature":
+            feature_rel = str(check.args["feature_file"])
+            target = (worktree / feature_rel).resolve()
+            # The closure's own pre-parse repair, in place, before the parse:
+            # a top-level box-drawing divider becomes a comment so the run
+            # gets a parseable spec instead of dying with no revision loop.
+            repair_note = _repair_box_drawing_dividers(target, feature_rel) or ""
+            if repair_note:
+                logger.warning(
+                    "forge-deploy-sidecar: normalize-feature — %s", repair_note
+                )
+            if not normalizer_command:
+                return _check_outcome(
+                    check,
+                    exit_code=1,
+                    stdout="",
+                    stderr="",
+                    passed=False,
+                    detail=(
+                        "the gherkin normalizer module could not be resolved "
+                        "in this sidecar's interpreter"
+                    ),
+                )
+            exit_code, stdout, stderr = _run([*normalizer_command, str(target)])
+            if exit_code == MERGE_TIMEOUT_EXIT_CODE:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=False,
+                    detail=(
+                        f"normalizer timed out after {check.timeout:g}s "
+                        f"({feature_rel})"
+                    ),
+                    note=repair_note,
+                )
+            if exit_code != 0:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=False,
+                    detail=(
+                        f"normalizer exit {exit_code} for {feature_rel}: "
+                        f"{(stderr or stdout).strip()[:500]}"
+                    ),
+                    note=repair_note,
+                )
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=True,
+                detail=repair_note,
+                note=repair_note,
+            )
+        if check.name in ("validate-pass-bar", "validate-gate-registry"):
+            verb = (
+                "pass-bar" if check.name == "validate-pass-bar" else "gate-registry"
+            )
+            rel = str(check.args[GIT_CHECK_PATH_ARGS[check.name]])
+            exit_code, stdout, stderr = _run([*command, "qa", "validate", verb, rel])
+            status = _check_status_word(exit_code, exit_code == MERGE_TIMEOUT_EXIT_CODE)
+            if status == "success" and exit_code == 0:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=True,
+                    detail="",
+                )
+            detail = (
+                f"guardkit qa validate {verb} {status} (exit {exit_code}) for "
+                f"{rel}: {(stderr or stdout).strip()[:500]}"
+            )
+            if check.name == "validate-pass-bar":
+                # The pass-bar leg's loop names the bar before the oracle's
+                # own sentence; the same words reach the leg from here.
+                detail = f"{rel}: {detail}"
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=False,
+                detail=detail,
+            )
         feature_file = worktree / str(check.args["feature_file"])
         exit_code, stdout, stderr = _run(
             [
@@ -1345,6 +1500,7 @@ def _declared_checks_hook(
     command: tuple[str, ...],
     check_runner: MergeRunner,
     outcomes: list[PreCommitCheckOutcome],
+    normalizer_command: tuple[str, ...] | None = None,
 ) -> Callable[[Path], Awaitable[PreCommitResult]]:
     """The pre-commit hook the in-container runner takes, built from the
     declaration: each check in order, in a worker thread (the runner is
@@ -1359,6 +1515,7 @@ def _declared_checks_hook(
                 worktree=worktree,
                 command=command,
                 check_runner=check_runner,
+                normalizer_command=normalizer_command,
             )
             outcomes.append(outcome)
             if check.blocking and not outcome.passed:
@@ -1401,6 +1558,9 @@ def process_git_write_tree_request(
     config: ForgeConfig,
     check_runner: MergeRunner = run_merge_command,
     command_resolver: Callable[[], tuple[str, ...] | None] = resolve_check_command,
+    normalizer_resolver: Callable[
+        [], tuple[str, ...] | None
+    ] = resolve_normalizer_command_for_checks,
     worktrees_root: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate and perform a ``/git/prepare-branch-and-write-tree`` payload.
@@ -1435,7 +1595,7 @@ def process_git_write_tree_request(
         return 400, {"error": error}
 
     command: tuple[str, ...] | None = None
-    if checks:
+    if any(check.name != NORMALIZER_CHECK_NAME for check in checks):
         command = command_resolver()
         if not command:
             return 500, {
@@ -1446,13 +1606,30 @@ def process_git_write_tree_request(
                     "guardkit beside the sidecar"
                 )
             }
+    normalizer_command: tuple[str, ...] | None = None
+    if any(check.name == NORMALIZER_CHECK_NAME for check in checks):
+        normalizer_command = normalizer_resolver()
+        if not normalizer_command:
+            return 500, {
+                "error": (
+                    "this sidecar cannot resolve guardkit's gherkin normalizer "
+                    "module, so the spec leg's check cannot be run here — "
+                    "install guardkit in the interpreter the sidecar runs "
+                    "under, or provide a checkout with an importable "
+                    "top-level installer package"
+                )
+            }
 
     outcomes: list[PreCommitCheckOutcome] = []
     hook = (
         _declared_checks_hook(
-            checks, command=command, check_runner=check_runner, outcomes=outcomes
+            checks,
+            command=command or (),
+            check_runner=check_runner,
+            outcomes=outcomes,
+            normalizer_command=normalizer_command,
         )
-        if checks and command
+        if checks
         else None
     )
     logger.info(
@@ -1802,8 +1979,11 @@ __all__ = [
     "GIT_READ_FILE_ROUTE",
     "GIT_REV_PARSE_ROUTE",
     "GIT_CHECK_NAMES",
+    "GIT_CHECK_PATH_ARGS",
     "GIT_CHECK_TIMEOUT_DEFAULTS",
     "GIT_CHECK_BLOCKING_DEFAULTS",
+    "NORMALIZER_CHECK_NAME",
+    "resolve_normalizer_command_for_checks",
     "GIT_HOOK_TIMEOUT_SECONDS",
     "REF_NAME_PATTERN",
     "resolve_check_command",
