@@ -19,6 +19,14 @@ The door is deliberately one command wide. It accepts ``autobuild`` with
 ``merge`` as its first argument and refuses everything else loudly, so no other
 guardkit call can wander onto the host this way.
 
+Sandbox first (2026-09-07, rule 75) adds a SECOND door beside it, with the
+same posture: :func:`build_sidecar_leg_run` carries a fix journey's two legs
+(``task-review`` and ``task-work``) to the deploy sidecar inside a
+repository's sandbox, with the journey worktree as their working directory,
+so that the repository's own code is installed and run there and never on the
+host. It is a separate builder rather than a widening of the merge door,
+because each door should be exactly as wide as the work it carries.
+
 The pre-merge baseline — the list of tests the target branch was already
 failing — is sent inline rather than as a path. The executor writes that file
 inside the container, where the sidecar cannot read it; the sidecar writes its
@@ -55,6 +63,12 @@ ALLOWED_VERB: str = "merge"
 #: quietly run against main.
 ALLOWED_TARGET: str = "main"
 
+#: The sidecar operation the fix journey's legs talk to (rule 75).
+LEG_ENDPOINT: str = "/guardkit-leg"
+
+#: The only subcommands the leg door will carry.
+LEG_SUBCOMMANDS: tuple[str, ...] = ("task-review", "task-work")
+
 #: How much longer than the command's own wall the HTTP read waits, in seconds.
 #: The socket must not give up before the sidecar's own timeout fires — the
 #: same discipline the deploy stage's sidecar client uses.
@@ -72,6 +86,16 @@ class MergeCallRefused(ValueError):
     Raised — never returned as a result — because it means a caller tried to
     run something other than the merge word's own command on the host. That is
     a programming mistake to fix, not a merge outcome to report.
+    """
+
+
+class LegCallRefused(ValueError):
+    """The caller asked the leg door for something it does not carry.
+
+    Raised — never returned as a result — for the same reason
+    :class:`MergeCallRefused` is: it means a caller tried to run something
+    other than a fix journey's own legs inside the sandbox. That is a
+    programming mistake to fix, not a leg outcome to report.
     """
 
 
@@ -133,13 +157,39 @@ def _resolve_repo_key(repo_path: Path, repo_paths: Mapping[str, str]) -> str | N
     return None
 
 
+def _resolve_repo_key_for_worktree(
+    worktree: Path, repo_paths: Mapping[str, str]
+) -> str | None:
+    """Return the org/name key of the repository ``worktree`` lives inside.
+
+    A journey worktree is under the repository, not equal to it (it is
+    ``<repo>/.forge/worktrees/<build id>``), so this is containment rather
+    than the equality :func:`_resolve_repo_key` uses for the merge's repo
+    path. The longest matching root wins, so a repository nested inside
+    another's directory is still resolved to itself.
+    """
+    wanted = worktree.resolve(strict=False)
+    best: tuple[int, str] | None = None
+    for key, configured in repo_paths.items():
+        root = Path(configured).resolve(strict=False)
+        if wanted == root or root in wanted.parents:
+            depth = len(root.parts)
+            if best is None or depth > best[0]:
+                best = (depth, key)
+    return best[1] if best else None
+
+
 def _failed_result(
-    *, detail: str, duration_secs: float, warning_code: str
+    *,
+    detail: str,
+    duration_secs: float,
+    warning_code: str,
+    subcommand: str | None = None,
 ) -> GuardKitResult:
     """A failure this side of the wire, in the shape the executor reads."""
     return GuardKitResult(
         status="failed",
-        subcommand=f"{ALLOWED_SUBCOMMAND} {ALLOWED_VERB}",
+        subcommand=subcommand or f"{ALLOWED_SUBCOMMAND} {ALLOWED_VERB}",
         duration_secs=duration_secs,
         stdout_tail="",
         stderr=detail,
@@ -352,6 +402,169 @@ def build_sidecar_guardkit_run(
     return run_merge_via_sidecar
 
 
+def build_sidecar_leg_run(
+    *,
+    base_url: str,
+    repo_paths: Mapping[str, str],
+    http_timeout_margin: float = HTTP_TIMEOUT_MARGIN_SECONDS,
+) -> Callable[..., Awaitable[GuardKitResult]]:
+    """Return a fix-journey ``guardkit_run`` that works through the sidecar.
+
+    Rich's rule, 2026-09-07: nothing the factory runs on a repository runs on
+    the host. A journey's review and work legs install and run the
+    repository's own code, so for a repository that has a sandbox they run
+    inside it, reached through that sandbox's deploy sidecar (sandbox first,
+    rule 75).
+
+    The door is two commands wide — ``task-review`` and ``task-work`` — and
+    refuses anything else loudly, for the same reason the merge door is one
+    command wide: no other guardkit call may wander through it.
+
+    The working directory is the journey worktree. The conductor's dispatcher
+    already passes that path as ``repo_path`` (it is the directory the leg
+    runs in), so this door sends it as the request's ``cwd`` and the sidecar
+    checks it is one of that repository's own journey worktrees before
+    starting anything.
+
+    Args:
+        base_url: Where the sandbox's deploy sidecar listens.
+        repo_paths: ``planning.target_repo_paths``, used to work out which
+            repository a worktree belongs to.
+        http_timeout_margin: Seconds added to the leg's own wall before the
+            socket gives up, so the sidecar's timeout always fires first.
+    """
+    endpoint = f"{base_url.rstrip('/')}{LEG_ENDPOINT}"
+    known_paths = dict(repo_paths)
+
+    async def run_leg_via_sidecar(
+        *,
+        subcommand: str,
+        args: list[str],
+        repo_path: Path,
+        read_allowlist: list[Path] | None = None,  # noqa: ARG001 — the leg runs
+        # inside the sandbox, which is the fence
+        timeout_seconds: int = 1800,
+        with_nats_streaming: bool = False,  # noqa: ARG001 — no broker on this door
+        extra_context_paths: list[str] | None = None,  # noqa: ARG001 — the paths
+        # are already inside the worktree the leg runs in
+    ) -> GuardKitResult:
+        started_at = time.monotonic()
+
+        # THE DOOR IS TWO COMMANDS WIDE. Anything else is a mistake in the
+        # caller, so it is raised rather than reported as a leg outcome.
+        if subcommand not in LEG_SUBCOMMANDS:
+            raise LegCallRefused(
+                "the sandbox sidecar carries the fix journey's two legs "
+                f"({', '.join(LEG_SUBCOMMANDS)}); it was asked to run "
+                f"{subcommand!r}"
+            )
+
+        repo_key = _resolve_repo_key_for_worktree(repo_path, known_paths)
+        if repo_key is None:
+            known = ", ".join(sorted(known_paths)) or "(none configured)"
+            return _failed_result(
+                detail=(
+                    f"the sandbox sidecar does not know which repository "
+                    f"{repo_path} belongs to — it is not inside any of the "
+                    "paths in planning.target_repo_paths. Known repositories: "
+                    f"{known}"
+                ),
+                duration_secs=time.monotonic() - started_at,
+                warning_code="sidecar_repo_not_configured",
+                subcommand=subcommand,
+            )
+
+        body: dict[str, Any] = {
+            "repo": repo_key,
+            "cwd": str(repo_path),
+            "subcommand": subcommand,
+            "args": list(args),
+            "timeout_seconds": float(timeout_seconds),
+        }
+        http_timeout = float(timeout_seconds) + http_timeout_margin
+        try:
+            status, parsed = await asyncio.to_thread(
+                _post, endpoint, body, timeout=http_timeout
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return _failed_result(
+                detail=(
+                    f"the sandbox sidecar at {base_url} could not be reached, "
+                    f"so the {subcommand} leg did not run: {exc}"
+                ),
+                duration_secs=time.monotonic() - started_at,
+                warning_code="sidecar_unreachable",
+                subcommand=subcommand,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return _failed_result(
+                detail=(
+                    f"the sandbox sidecar at {base_url} answered something "
+                    f"that was not JSON, so the {subcommand} leg's result is "
+                    f"unknown: {exc}"
+                ),
+                duration_secs=time.monotonic() - started_at,
+                warning_code="sidecar_bad_answer",
+                subcommand=subcommand,
+            )
+        except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+            return _failed_result(
+                detail=(
+                    f"talking to the sandbox sidecar at {base_url} went wrong, "
+                    f"so the {subcommand} leg's result is unknown: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                duration_secs=time.monotonic() - started_at,
+                warning_code="sidecar_client_error",
+                subcommand=subcommand,
+            )
+
+        duration = time.monotonic() - started_at
+        if status != 200:
+            detail = ""
+            if isinstance(parsed, dict):
+                detail = str(parsed.get("error") or "")
+            return _failed_result(
+                detail=(
+                    f"the sandbox sidecar refused to run the {subcommand} leg "
+                    f"(HTTP {status}): {detail or parsed!r}"
+                ),
+                duration_secs=duration,
+                warning_code="sidecar_refused",
+                subcommand=subcommand,
+            )
+        if (
+            not isinstance(parsed, dict)
+            or not isinstance(parsed.get("exit_code"), int)
+            or isinstance(parsed.get("exit_code"), bool)
+        ):
+            return _failed_result(
+                detail=(
+                    "the sandbox sidecar's answer did not carry an exit code, "
+                    f"so the {subcommand} leg's result is unknown: {parsed!r}"
+                ),
+                duration_secs=duration,
+                warning_code="sidecar_bad_answer",
+                subcommand=subcommand,
+            )
+
+        exit_code = int(parsed["exit_code"])
+        stdout = parsed.get("stdout")
+        stderr = parsed.get("stderr_tail")
+        return GuardKitResult(
+            status="success" if exit_code == 0 else "failed",
+            subcommand=subcommand,
+            duration_secs=duration,
+            # The WHOLE of stdout, not a short tail: the dispatcher reads the
+            # leg's markers out of it.
+            stdout_tail=stdout if isinstance(stdout, str) else "",
+            stderr=stderr if isinstance(stderr, str) else None,
+            exit_code=exit_code,
+        )
+
+    return run_leg_via_sidecar
+
+
 __all__ = [
     "ALLOWED_SUBCOMMAND",
     "ALLOWED_TARGET",
@@ -360,5 +573,9 @@ __all__ = [
     "MERGE_ENDPOINT",
     "TRANSPORT_EXIT_CODE",
     "MergeCallRefused",
+    "LEG_ENDPOINT",
+    "LEG_SUBCOMMANDS",
+    "LegCallRefused",
     "build_sidecar_guardkit_run",
+    "build_sidecar_leg_run",
 ]
