@@ -102,6 +102,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
 from forge.deploy.candidate_tree import candidate_trees_root, is_candidate_tree_path
@@ -2019,6 +2020,15 @@ def _validate_extra_files(raw: Any) -> tuple[dict[str, str], str | None]:
 # other directory; the arguments are passed as one fixed argument list with
 # no shell, exactly as the merge's are; the exit code is data, because "the
 # leg ran and failed" is an answer.
+#
+# A leg is given what it would have been given in the container: the
+# conductor's forward-context paths, the ``--context`` flags the
+# repository's own manifest asks for (read HERE, against the tree the leg
+# runs in), and ``--nats`` when the caller wants progress messages. The
+# answer carries the whole of stdout, whether the leg was stopped at its
+# wall, and anything the manifest reading had to say — so the caller can
+# read the leg's own findings out of it exactly as it reads a leg that ran
+# in the container.
 
 #: The route.
 GUARDKIT_LEG_ROUTE: str = "/guardkit-leg"
@@ -2038,6 +2048,97 @@ LEG_TIMEOUT_MAX: float = 7200.0
 LEG_MAX_ARGS: int = 256
 LEG_MAX_ARG_CHARS: int = 65_536
 
+#: How many paths a leg's ``extra_context_paths`` or ``read_allowlist`` may
+#: carry. The same reason as ``LEG_MAX_ARGS``: generous, and bounded.
+LEG_MAX_PATHS: int = 256
+
+
+def _leg_path_list(value: Any, *, field: str) -> tuple[list[str], str | None]:
+    """Read one of the leg route's path lists; return ``(paths, error)``.
+
+    Absent reads as an empty list. Anything that is not a list of plain text
+    paths is a refusal in one sentence, checked before a process starts.
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"'{field}' must be a list of paths written as text"
+    if len(value) > LEG_MAX_PATHS:
+        return [], (
+            f"'{field}' may carry at most {LEG_MAX_PATHS} paths; got {len(value)}"
+        )
+    paths: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            return [], (
+                f"every entry in '{field}' must be a path written as text; got "
+                f"{type(entry).__name__}"
+            )
+        if len(entry) > LEG_MAX_ARG_CHARS:
+            return [], (
+                f"a path in '{field}' may be at most {LEG_MAX_ARG_CHARS} "
+                f"characters long; one is {len(entry)}"
+            )
+        paths.append(entry)
+    return paths, None
+
+
+def _leg_context_flags(
+    *,
+    cwd: str,
+    repo_path: str,
+    subcommand: str,
+    read_allowlist: list[str],
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Work out the leg's ``--context`` flags from the manifest, in here.
+
+    The in-container runner reads the repository's own
+    ``.guardkit/context-manifest.yaml`` and turns it into ``--context`` flags
+    before it spawns guardkit. A leg run in the sandbox must be told the same
+    thing, and the manifest it must be read from is the one in the sandbox's
+    own tree — so the reading happens here, against the journey worktree the
+    leg will run in, rather than in the forge container where that tree may
+    not exist at all.
+
+    Never raises: a manifest that cannot be read costs the leg its context
+    flags and says so, exactly as it does in the container.
+    """
+    allowlist = [Path(entry) for entry in read_allowlist] or [Path(repo_path)]
+    try:
+        resolved = resolve_context_flags(Path(cwd), subcommand, allowlist)
+    except KeyError:
+        return [], [
+            {
+                "code": "context_resolver_unknown_subcommand",
+                "message": (
+                    f"resolver has no category filter for subcommand "
+                    f"{subcommand!r}; proceeding with no --context flags"
+                ),
+            }
+        ]
+    except Exception as exc:  # noqa: BLE001 — a leg never dies of its context
+        logger.warning(
+            "forge-deploy-sidecar: reading the context manifest under %s "
+            "raised %s: %s — the leg runs with no --context flags",
+            cwd,
+            type(exc).__name__,
+            exc,
+        )
+        return [], [
+            {
+                "code": "context_manifest_unreadable",
+                "message": (
+                    f"could not read the context manifest under {cwd}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        ]
+    warnings = [
+        {"code": warning.code, "message": warning.message}
+        for warning in resolved.warnings
+    ]
+    return list(resolved.flags), warnings
+
 
 def process_guardkit_leg_request(
     payload: Any,
@@ -2048,17 +2149,27 @@ def process_guardkit_leg_request(
 ) -> tuple[int, dict[str, Any]]:
     """Validate and run a ``/guardkit-leg`` payload; return ``(status, body)``.
 
-    ``{repo, cwd, subcommand, args, timeout_seconds}`` → on a permitted
-    request a 200 carrying ``{exit_code, stdout, stderr_tail}``, the same
-    shape the merge route answers with, because the caller reads a leg's
-    result the same way it reads a merge's: the exit code is data.
+    ``{repo, cwd, subcommand, args, timeout_seconds, extra_context_paths,
+    read_allowlist, with_nats_streaming}`` → on a permitted request a 200
+    carrying ``{exit_code, stdout, stderr_tail, timed_out,
+    context_warnings}``. The exit code is data, because "the leg ran and
+    failed" is an answer; ``timed_out`` is separate from it, because a leg
+    stopped at its wall is not a leg that failed.
+
+    The last three fields of the request are how a leg is told what it would
+    have been told in the container: ``extra_context_paths`` are the
+    conductor's own forward-context paths, ``read_allowlist`` bounds which of
+    the manifest's documents may be read (absent: the repository itself), and
+    ``with_nats_streaming`` asks for ``--nats`` so the leg publishes its
+    progress. The manifest's own ``--context`` flags are worked out here,
+    against the tree the leg runs in.
 
     Everything is checked before a process starts: the repository must be one
     the forge configuration names; the working directory must be one of that
     repository's own journey worktrees and must exist; the subcommand must be
-    ``task-review`` or ``task-work``; every argument must be text; the
-    timeout must be a positive number no larger than the cap. A refusal is a
-    4xx with one plain sentence. Never raises.
+    ``task-review`` or ``task-work``; every argument and every path must be
+    text; the timeout must be a positive number no larger than the cap. A
+    refusal is a 4xx with one plain sentence. Never raises.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -2112,6 +2223,30 @@ def process_guardkit_leg_request(
             }
         args.append(entry)
 
+    # THE LEG IS TOLD WHAT IT WOULD HAVE BEEN TOLD IN THE CONTAINER. Rule 75
+    # moves where a leg runs, not what it is given: the conductor's forward
+    # context paths, the manifest's own context flags and the progress switch
+    # all travel with the request, and the flags are assembled below in the
+    # same order the in-container runner assembles them.
+    extra_context_paths, error = _leg_path_list(
+        payload.get("extra_context_paths"), field="extra_context_paths"
+    )
+    if error:
+        return 400, {"error": error}
+    read_allowlist, error = _leg_path_list(
+        payload.get("read_allowlist"), field="read_allowlist"
+    )
+    if error:
+        return 400, {"error": error}
+    with_nats_streaming = payload.get("with_nats_streaming", False)
+    if not isinstance(with_nats_streaming, bool):
+        return 400, {
+            "error": (
+                "'with_nats_streaming' must be true or false; got "
+                f"{type(with_nats_streaming).__name__}"
+            )
+        }
+
     timeout_seconds = payload.get("timeout_seconds")
     timeout = LEG_TIMEOUT_DEFAULT
     if timeout_seconds is not None:
@@ -2140,12 +2275,24 @@ def process_guardkit_leg_request(
             )
         }
 
-    argv = [command, str(subcommand), *args]
+    context_flags, context_warnings = _leg_context_flags(
+        cwd=cwd,
+        repo_path=repo_path,
+        subcommand=str(subcommand),
+        read_allowlist=read_allowlist,
+    )
+    for path in extra_context_paths:
+        context_flags.extend(["--context", path])
+    nats_flag = ["--nats"] if with_nats_streaming else []
+    argv = [command, str(subcommand), *args, *context_flags, *nats_flag]
     logger.info(
-        "forge-deploy-sidecar: running guardkit %s in %s (up to %g seconds)",
+        "forge-deploy-sidecar: running guardkit %s in %s (up to %g seconds, "
+        "%d context paths, progress %s)",
         subcommand,
         cwd,
         timeout,
+        len(context_flags) // 2,
+        "on" if with_nats_streaming else "off",
     )
     try:
         exit_code, stdout, stderr = leg_runner(argv=argv, cwd=cwd, timeout=timeout)
@@ -2160,6 +2307,10 @@ def process_guardkit_leg_request(
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
         "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        # A leg that was stopped at its wall is not a leg that failed, and the
+        # caller can only tell the two apart if this side says which happened.
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "context_warnings": context_warnings,
     }
 
 
@@ -2455,6 +2606,7 @@ __all__ = [
     "LEG_SUBCOMMANDS",
     "LEG_TIMEOUT_DEFAULT",
     "LEG_TIMEOUT_MAX",
+    "LEG_MAX_PATHS",
     "process_guardkit_leg_request",
     "default_config_loader",
     "DeploySidecarHandler",

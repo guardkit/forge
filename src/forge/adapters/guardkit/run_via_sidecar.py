@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
+from forge.adapters.guardkit.parser import parse_guardkit_output
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +403,27 @@ def build_sidecar_guardkit_run(
     return run_merge_via_sidecar
 
 
+def _context_warnings(raw: Any) -> list[GuardKitWarning]:
+    """Turn the sidecar's context-manifest warnings into result warnings.
+
+    The manifest is read inside the sandbox, so anything it had to say — a
+    missing manifest, a document outside the allowlist — reaches forge only
+    if it rides the answer. Anything unreadable here is ignored rather than
+    raised: a warning is never worth losing a leg's result over.
+    """
+    if not isinstance(raw, list):
+        return []
+    warnings: list[GuardKitWarning] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        code = entry.get("code")
+        message = entry.get("message")
+        if isinstance(code, str) and isinstance(message, str):
+            warnings.append(GuardKitWarning(code=code, message=message))
+    return warnings
+
+
 def build_sidecar_leg_run(
     *,
     base_url: str,
@@ -426,6 +448,23 @@ def build_sidecar_leg_run(
     checks it is one of that repository's own journey worktrees before
     starting anything.
 
+    **The leg is told what it would have been told in the container, and its
+    answer is read the same way.** Rule 75 moves where a leg runs, not what
+    it is given: the conductor's forward-context paths
+    (``extra_context_paths``), the allowlist the repository's context
+    manifest is filtered against (``read_allowlist`` — the sandbox reads the
+    manifest itself, against the tree the leg runs in, because that tree may
+    not exist in the forge container at all) and the progress switch
+    (``with_nats_streaming``) all travel with the request, and the sidecar
+    assembles the arguments in the same order
+    :func:`forge.adapters.guardkit.run.run` assembles them. Coming back, the
+    leg's output goes through the very parser the in-container path uses
+    (:func:`forge.adapters.guardkit.parser.parse_guardkit_output`), so the
+    artefacts it wrote, its findings block, the coach's score and a stop at
+    its wall all survive the wire. Without that, a review leg that ran
+    perfectly would be recorded as FAILED for emitting "no readable findings
+    block".
+
     Args:
         base_url: Where the sandbox's deploy sidecar listens.
         repo_paths: ``planning.target_repo_paths``, used to work out which
@@ -441,12 +480,10 @@ def build_sidecar_leg_run(
         subcommand: str,
         args: list[str],
         repo_path: Path,
-        read_allowlist: list[Path] | None = None,  # noqa: ARG001 — the leg runs
-        # inside the sandbox, which is the fence
+        read_allowlist: list[Path] | None = None,
         timeout_seconds: int = 1800,
-        with_nats_streaming: bool = False,  # noqa: ARG001 — no broker on this door
-        extra_context_paths: list[str] | None = None,  # noqa: ARG001 — the paths
-        # are already inside the worktree the leg runs in
+        with_nats_streaming: bool = True,
+        extra_context_paths: list[str] | None = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -474,13 +511,24 @@ def build_sidecar_leg_run(
                 subcommand=subcommand,
             )
 
+        # EVERYTHING THE LEG WOULD HAVE BEEN TOLD IN THE CONTAINER TRAVELS
+        # WITH IT. Rule 75 moves where a leg runs, not what it is given: the
+        # conductor's forward-context paths, the read allowlist the
+        # repository's context manifest is filtered against (the sandbox
+        # reads that manifest itself, against the tree the leg runs in, so
+        # the flags are the manifest's own), and the progress switch.
         body: dict[str, Any] = {
             "repo": repo_key,
             "cwd": str(repo_path),
             "subcommand": subcommand,
             "args": list(args),
             "timeout_seconds": float(timeout_seconds),
+            "with_nats_streaming": bool(with_nats_streaming),
         }
+        if extra_context_paths:
+            body["extra_context_paths"] = [str(path) for path in extra_context_paths]
+        if read_allowlist:
+            body["read_allowlist"] = [str(path) for path in read_allowlist]
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:
             status, parsed = await asyncio.to_thread(
@@ -551,16 +599,27 @@ def build_sidecar_leg_run(
         exit_code = int(parsed["exit_code"])
         stdout = parsed.get("stdout")
         stderr = parsed.get("stderr_tail")
-        return GuardKitResult(
-            status="success" if exit_code == 0 else "failed",
+        # THE LEG'S ANSWER IS READ, NOT THROWN AWAY. A leg says what it found
+        # in its own output — the artefacts it wrote, its findings block, the
+        # coach's score — and the conductor's dispatcher records a review leg
+        # as FAILED when that block is missing. So the answer goes through
+        # the same parser a leg's output goes through in the container, and
+        # the sidecar's own "it was stopped at its wall" travels with it, so
+        # a leg that timed out is reported as a timeout and not as a failure.
+        result = parse_guardkit_output(
             subcommand=subcommand,
-            duration_secs=duration,
-            # The WHOLE of stdout, not a short tail: the dispatcher reads the
-            # leg's markers out of it.
-            stdout_tail=stdout if isinstance(stdout, str) else "",
-            stderr=stderr if isinstance(stderr, str) else None,
+            stdout=stdout if isinstance(stdout, str) else "",
+            stderr=stderr if isinstance(stderr, str) else "",
             exit_code=exit_code,
+            duration_secs=duration,
+            timed_out=parsed.get("timed_out") is True,
         )
+        warnings = _context_warnings(parsed.get("context_warnings"))
+        if warnings:
+            return result.model_copy(
+                update={"warnings": warnings + list(result.warnings)}
+            )
+        return result
 
     return run_leg_via_sidecar
 

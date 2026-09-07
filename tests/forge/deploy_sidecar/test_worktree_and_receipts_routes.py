@@ -613,3 +613,180 @@ def test_a_leg_runs_end_to_end_over_loopback(
     call = _leg_calls(leg_guardkit)[0]
     assert call["argv"][0] == "task-work"
     assert Path(call["cwd"]).resolve() == tree.resolve()
+
+
+# ---------------------------------------------------------------------------
+# The leg is TOLD what it would have been told in the container (rule 75:
+# the legs move, what they are given does not)
+# ---------------------------------------------------------------------------
+
+
+def _manifest_in(tree: Path) -> Path:
+    """Put a context manifest and the document it names in a journey tree."""
+    (tree / ".guardkit").mkdir(parents=True, exist_ok=True)
+    (tree / ".guardkit" / "context-manifest.yaml").write_text(
+        "internal_docs:\n  always_include:\n    - docs/contract.md\n",
+        encoding="utf-8",
+    )
+    (tree / "docs").mkdir(parents=True, exist_ok=True)
+    doc = tree / "docs" / "contract.md"
+    doc.write_text("the contract\n", encoding="utf-8")
+    return doc
+
+
+class TestWhatTheLegIsGiven:
+    def test_the_manifests_context_the_forward_paths_and_progress_all_arrive(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        doc = _manifest_in(tree)
+        pack = str(tree / "failure-pack.md")
+
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-review",
+                "args": ["--task-id", "TASK-WT-001"],
+                "extra_context_paths": [pack],
+                "read_allowlist": [str(tree)],
+                "with_nats_streaming": True,
+            },
+            config=cfg,
+        )
+
+        assert status == 200, body
+        assert _leg_calls(leg_guardkit)[0]["argv"] == [
+            "task-review",
+            "--task-id",
+            "TASK-WT-001",
+            # the manifest's own document first, exactly as the in-container
+            # runner orders them …
+            "--context",
+            str(doc.resolve()),
+            # … then the conductor's forward-context paths …
+            "--context",
+            pack,
+            # … then the progress switch.
+            "--nats",
+        ]
+        assert body["context_warnings"] == []
+        assert body["timed_out"] is False
+
+    def test_no_progress_asked_for_means_no_progress_flag(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        status, _ = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-work",
+                "with_nats_streaming": False,
+            },
+            config=cfg,
+        )
+        assert status == 200
+        assert _leg_calls(leg_guardkit)[0]["argv"] == ["task-work"]
+
+    def test_a_tree_with_no_manifest_says_so_and_still_runs_the_leg(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        status, body = process_guardkit_leg_request(
+            {"repo": REPO_KEY, "cwd": str(tree), "subcommand": "task-work"},
+            config=cfg,
+        )
+        assert status == 200 and body["exit_code"] == 0
+        assert [w["code"] for w in body["context_warnings"]] == [
+            "context_manifest_missing"
+        ]
+        assert _leg_calls(leg_guardkit)[0]["argv"] == ["task-work"]
+
+    def test_a_document_outside_the_allowlist_is_left_out_and_named(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path, tmp_path: Path
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        _manifest_in(tree)
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-review",
+                "read_allowlist": [str(tmp_path / "somewhere-else")],
+            },
+            config=cfg,
+        )
+        assert status == 200
+        assert [w["code"] for w in body["context_warnings"]] == [
+            "context_manifest_path_outside_allowlist"
+        ]
+        assert _leg_calls(leg_guardkit)[0]["argv"] == ["task-review"]
+
+    @pytest.mark.parametrize(
+        "over, wanted",
+        [
+            ({"extra_context_paths": "one"}, "'extra_context_paths' must be a list"),
+            ({"extra_context_paths": [3]}, "every entry in 'extra_context_paths'"),
+            ({"read_allowlist": {"a": 1}}, "'read_allowlist' must be a list"),
+            ({"with_nats_streaming": "yes"}, "must be true or false"),
+        ],
+    )
+    def test_the_new_fields_are_checked_before_anything_runs(
+        self,
+        cfg: ForgeConfig,
+        repo: Path,
+        leg_guardkit: Path,
+        over: dict,
+        wanted: str,
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-review",
+                **over,
+            },
+            config=cfg,
+        )
+        assert status == 400 and wanted in body["error"]
+        assert _leg_calls(leg_guardkit) == []
+
+    def test_a_leg_stopped_at_its_wall_says_it_was_stopped(
+        self, cfg: ForgeConfig, repo: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        binary = tmp_path / "slowbin" / "guardkit"
+        binary.parent.mkdir()
+        binary.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(binary))
+        tree = _worktree_with_receipts(cfg, repo)
+
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-work",
+                "timeout_seconds": 1,
+            },
+            config=cfg,
+        )
+        assert status == 200 and body["timed_out"] is True
+        assert "was stopped after 1 seconds" in body["stderr_tail"]
