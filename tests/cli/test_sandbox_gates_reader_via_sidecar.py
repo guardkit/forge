@@ -503,3 +503,227 @@ class TestTheReaderChoosesPerRepository:
 
         assert report.status is GateStatus.GREEN, report.detail
         assert asked == [str(absent)]
+
+
+# ---------------------------------------------------------------------------
+# Step 5: the routing law's own evidence, read where it lives
+# ---------------------------------------------------------------------------
+#
+# L3b's coach, 2026-09-08: this lane routed steps 3 and 4 into the sandbox and
+# left step 5 — the routing law's stamped-verifier check — reading the host,
+# where a sandbox repository's feature file and gate receipts are not. The
+# check then found nothing, said the feature carried no stamps, had no effect,
+# and a GREEN merge card went out with the law silently unenforced. These
+# tests are that defect and its fix, driven through the REAL sidecar route.
+
+
+def _stamp_the_feature(clone: Path, *, verifier: str, title: str) -> None:
+    """Put a feature YAML carrying one stamped scenario on the clone's main.
+
+    And then REMOVE IT FROM THE WORKING TREE on this side. That models the
+    real thing honestly: for a repository whose factory lives in its sandbox,
+    the plan of record is in the clone in there, and this side has no copy of
+    it to read. A fixture that leaves the file where both sides can see it is
+    exactly how the fail-open hid — the coach's finding, 2026-09-08.
+    """
+    features = clone / ".guardkit" / "features"
+    features.mkdir(parents=True, exist_ok=True)
+    path = features / "FEAT-G88.yaml"
+    path.write_text(
+        "id: FEAT-G88\nscenarios:\n" f'  "{title}": {verifier}\n',
+        encoding="utf-8",
+    )
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "the plan of record")
+    path.unlink()
+
+
+def _write_envelope(
+    worktree: Path, *, gate_id: str, exit_code: int, verdict: str = "pass"
+) -> Path:
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    history = worktree / "qa" / "gates" / "history"
+    history.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc) + timedelta(minutes=5)
+    path = history / "run-1.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "verdict": verdict,
+                "started": started.isoformat(),
+                "feature_id": "FEAT-G88",
+                "gates": [{"gate_id": gate_id, "exit_code": exit_code}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestTheRoutingLawIsReadInsideTheSandbox:
+    def test_a_stamped_scenario_with_no_evidence_publishes_no_card(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        """The regression: this answered GREEN before the repair."""
+        from forge.pipeline.routing_stamps import make_stamps_leg
+
+        _stamp_the_feature(clone, verifier="hurl", title="a caller sees 201")
+        _row(pool, REPO_WITH, worktree)
+
+        # What the leg that reads THIS SIDE says about the same journey: the
+        # feature file is not here, so it finds no stamps, has no effect, and
+        # would let a green suite publish a card with the routing law never
+        # applied. That is the defect this test pins.
+        on_the_host = make_stamps_leg()(
+            feature_id="FEAT-G88",
+            repo_root=clone,
+            worktree=worktree,
+            branch=f"fix/{BUILD_ID}",
+            toolchain_green=True,
+        )
+        assert on_the_host.blocks_card is False
+        assert str(on_the_host.status) == "not-enforced"
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+        assert report.failed_gates == ("routing law: hurl (scenario 'a caller sees 201')",)
+        assert "a caller sees 201" in report.detail
+
+    def test_a_stamped_scenario_whose_gate_really_ran_green_is_a_card(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        _stamp_the_feature(clone, verifier="hurl", title="a caller sees 201")
+        _write_envelope(worktree, gate_id="hurl-twins", exit_code=0)
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN, report.detail
+        assert "all 1 stamped scenario(s)" in report.detail
+
+    def test_a_toolchain_stamp_rides_the_suite_that_ran_in_the_sandbox(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        _stamp_the_feature(clone, verifier="toolchain", title="the suite proves it")
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN, report.detail
+        assert "toolchain: 1" in report.detail
+
+    def test_the_stamps_are_read_from_main_not_from_the_journeys_tree(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        """A journey that deletes its own stamps cannot green itself."""
+        _stamp_the_feature(clone, verifier="hurl", title="a caller sees 201")
+        features = worktree / ".guardkit" / "features"
+        features.mkdir(parents=True, exist_ok=True)
+        (features / "FEAT-G88.yaml").write_text("id: FEAT-G88\n", encoding="utf-8")
+        _git(worktree, "add", "-A")
+        _git(worktree, "commit", "-m", "no stamps here")
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+
+    def test_an_unreadable_answer_is_unknown_never_a_card(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, worktree: Path
+    ) -> None:
+        dead = SimpleNamespace(name="gone", sidecar_url="http://127.0.0.1:9")
+        _row(pool, REPO_WITH, worktree)
+
+        verdict = conductor.read_stamps_in_sandbox(
+            feature_id="FEAT-G88",
+            repo_root=worktree.parent.parent.parent,
+            worktree=worktree,
+            branch=f"fix/{BUILD_ID}",
+            toolchain_green=True,
+            sandbox=dead,
+            repo=REPO_WITH,
+        )
+
+        assert verdict.blocks_card is True
+        assert "could not be reached" in verdict.detail
+
+    def test_a_repository_without_a_sandbox_keeps_the_in_container_leg(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        plain_checkout: Path,
+        tmp_path: Path,
+    ) -> None:
+        plain_worktree = tmp_path / "plain-wt-stamps"
+        plain_worktree.mkdir()
+        _row(pool, REPO_WITHOUT, plain_worktree)
+        asked: list[str] = []
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,
+            declaration_loader=lambda _root: _Declaration("npm test"),
+            command_runner=lambda **kw: (0, "green"),
+            stamps_leg=lambda **kw: (
+                asked.append("in-container")
+                or SimpleNamespace(
+                    status="not-enforced", detail="", blocks_card=False, attended=()
+                )
+            ),
+            sandbox_stamps_leg=lambda **kw: pytest.fail(
+                "a repository with no sandbox must not read its stamps through one"
+            ),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN
+        assert asked == ["in-container"]

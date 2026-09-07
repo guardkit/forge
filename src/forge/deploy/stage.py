@@ -143,8 +143,6 @@ from forge.persistence.repositories.runbook_models import Runbook
 
 logger = logging.getLogger(__name__)
 
-
-
 __all__ = ["DeployStageRunner", "DeployStageResult", "gate_summary"]
 
 

@@ -202,6 +202,14 @@ fi
 export PATH="${VENV}/bin:${PATH}"
 export FORGE_GUARDKIT_PATH="${VENV}/bin/guardkit"
 export GUARDKIT_HARNESS="${GUARDKIT_HARNESS:-langgraph}"
+# This sidecar is the one INSIDE a repository's sandbox, and it says so. The
+# deploy stage sends it the repository's own deploy/deploy.sh rather than the
+# host wrapper deploy/sandbox-deploy.sh, which calls sbx and cannot run from
+# in here; the sidecar's script allowlist permits that inner script only when
+# this value is set, so the sidecar on the HOST — where the wrapper is exactly
+# what keeps the work off the host — still permits the wrapper and nothing
+# else (L3b's coach, 2026-09-08).
+export FORGE_SIDECAR_IN_SANDBOX=1
 if [[ -z "${FORGE_RECEIPTS_DIR:-}" && -n "${SANDBOX_RECEIPTS_PATH:-}" ]]; then
   export FORGE_RECEIPTS_DIR="${SANDBOX_RECEIPTS_PATH}"
 fi
@@ -211,7 +219,7 @@ fi
 unset FORGE_DB_PATH
 
 # Which of the load-bearing settings the services will find. Names only.
-for name in OPENAI_BASE_URL OPENAI_API_KEY FORGE_CONFIG_PATH FORGE_NATS_URL FORGE_RECEIPTS_DIR GUARDKIT_HARNESS; do
+for name in OPENAI_BASE_URL OPENAI_API_KEY FORGE_CONFIG_PATH FORGE_NATS_URL FORGE_RECEIPTS_DIR GUARDKIT_HARNESS FORGE_SIDECAR_IN_SANDBOX; do
   if [[ -n "${!name:-}" ]]; then
     log "setting ${name}: set"
   else

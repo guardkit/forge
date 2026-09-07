@@ -54,6 +54,16 @@ does, the report carries ``deployed_in: "docker-sandbox"``, which is how the
 line Rich reads after a successful press comes to say the feature is running in
 its Docker Sandbox. No sandbox block ⇒ no such field ⇒ the report is exactly
 what it was.
+
+A REPOSITORY WHOSE FACTORY LIVES IN ITS SANDBOX cannot be pressed from here
+yet, and says so (sandbox first, rules 62 and 85). Its build's branch is made
+in the sandbox's own clone, while every git command below — the branch
+look-up, the candidate tree, the ancestry guards, the tree-equality read —
+still runs against the copy of the repository on this side. The deploy leg and
+the live gate DO run inside the sandbox now; the merge's own git is the piece
+that has not moved. Rather than stopping a step later with "the branch was not
+found", the press refuses at once with
+:func:`sandbox_merge_not_wired_sentence` and changes nothing.
 """
 
 from __future__ import annotations
@@ -106,6 +116,7 @@ __all__ = [
     "MergeApprovalConsumer",
     "MergeDeployOutcome",
     "MergeExecutorDeps",
+    "sandbox_merge_not_wired_sentence",
     "RED_MERGE_ENDINGS",
     "build_in_daemon_deploy_dispatcher",
     "execute_merge_deploy",
@@ -572,6 +583,35 @@ async def pinned_main_in_branch(
     return None
 
 
+def sandbox_merge_not_wired_sentence(
+    feature_id: str, *, sandbox_name: str, repo: str, branch: str, repo_root: Any
+) -> str:
+    """The plain refusal when the repository's work is inside its sandbox.
+
+    Sandbox first, 2026-09-07: a repository named in ``planning.sandboxes``
+    has its build worktrees, its branches and its Docker engine inside that
+    sandbox. The merge word's own git — finding the branch, laying its tree
+    out for the candidate check, the ancestry guards, the tree-equality read
+    before the promote — still runs here, against the copy of the repository
+    on this side, which does not have the branch the build made. So the press
+    would stop a step later with a puzzle ("the branch was not found"), and
+    the deploy leg and the live gate this lane routed could never be reached.
+
+    Rather than that, the merge word says the truth in one sentence and
+    changes nothing. Moving the merge itself into the sandbox (rule 62) is
+    the piece of work this names; when it lands, this refusal goes.
+    """
+    return (
+        f"{feature_id} was built inside {sandbox_name}, the sandbox that holds "
+        f"{repo}, so its branch {branch} exists only in there. The merge word's "
+        f"own git still runs against the copy of {repo} on this side "
+        f"({repo_root}), where that branch is not, so nothing could be checked, "
+        "merged or deployed and nothing was. Moving the merge itself into the "
+        "sandbox is the next piece of work; until it lands, a repository with a "
+        "sandbox is built and tested in there but merged by hand."
+    )
+
+
 def moved_main_refusal_sentence(feature_id: str, expect_main_sha: str) -> str:
     """The plain sentence when main moved during the build (before the merge)."""
     return (
@@ -1033,6 +1073,58 @@ async def execute_merge_deploy(
 
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began
+
+        # ------------------------------------------------------------------
+        # SANDBOX FIRST (2026-09-07, rules 62 and 85) — the wall this lane
+        # could not move, said out loud rather than met as a puzzle.
+        #
+        # Everything below this line begins with git in ``repo_root``: the
+        # branch look-up, the candidate tree, the ancestry guards, the
+        # tree-equality read. For a repository with a sandbox that is the
+        # wrong copy of the repository — the build's branch was made in the
+        # sandbox's own clone — so the press cannot start. The deploy leg and
+        # the live gate ARE routed into the sandbox by this lane and are
+        # ready for the day the merge's git follows them.
+        # ------------------------------------------------------------------
+        from forge.config.sandboxes import sandbox_for
+
+        sandbox = sandbox_for(getattr(deps, "config", None), repo)
+        if sandbox is not None:
+            sentence = sandbox_merge_not_wired_sentence(
+                feature_id,
+                sandbox_name=str(getattr(sandbox, "name", "") or "its sandbox"),
+                repo=repo,
+                branch=branch,
+                repo_root=repo_root,
+            )
+            logger.error(
+                "merge-executor: %s is in a sandbox (%s) and the merge word's "
+                "git still runs against %s on this side — refusing the press "
+                "rather than failing a step later; nothing was merged",
+                repo,
+                getattr(sandbox, "name", "?"),
+                repo_root,
+            )
+            _write_receipt(
+                "merge_deploy_merge.json",
+                {
+                    "step": "merge",
+                    "dry_run": dry_run,
+                    "branch": branch,
+                    "refusal": sentence,
+                    "sandbox": str(getattr(sandbox, "name", "") or ""),
+                    "skipped": (
+                        "the repository has a sandbox and the merge word's own "
+                        "git has not moved into it yet"
+                    ),
+                },
+            )
+            return MergeDeployOutcome(
+                result="merge-refused",
+                status="FAILED",
+                failed_step="merge",
+                detail=sentence,
+            )
 
         if _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
             logger.error(

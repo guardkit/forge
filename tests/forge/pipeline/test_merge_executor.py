@@ -2453,3 +2453,63 @@ class TestTheLandedDetectionFollowsTheBranch:
         assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned) == new_main
         assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch=None) == new_main
         assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch="  ") == new_main
+
+
+class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
+    """Sandbox first, rules 62 and 85 — the wall L3b could not move.
+
+    A repository named in ``planning.sandboxes`` has its build worktrees and
+    its branches inside that sandbox. Every git command in the press runs
+    against the copy on this side, which does not have the branch the build
+    made, so the press cannot start. It says so in one plain sentence and
+    changes nothing, rather than stopping a step later on "the branch was not
+    found" (L3b's coach, 2026-09-08).
+    """
+
+    @staticmethod
+    def _sandbox_config(repo_root: Path) -> ForgeConfig:
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(repo_root)},
+                    "sandboxes": {
+                        REPO: {
+                            "name": "api-test-factory",
+                            "sidecar_url": "http://127.0.0.1:8925",
+                            "runner_url": "http://127.0.0.1:8924",
+                        }
+                    },
+                },
+                "approval": {"expected_approver": "rich"},
+                "merge_executor": {"enabled": True},
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_press_refuses_before_it_touches_git_or_the_deploy_stage(
+        self, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.status == "FAILED"
+        assert outcome.failed_step == "merge"
+        assert "api-test-factory" in outcome.detail
+        assert "merged by hand" in outcome.detail
+        # Nothing was checked, merged, deployed or promoted.
+        assert dp.calls == []
+        assert gk.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_repository_without_a_sandbox_presses_exactly_as_before(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-and-running", outcome.detail
+        assert _legs(dp)[0] == "candidate_check"

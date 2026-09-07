@@ -205,9 +205,18 @@ def marker_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def sidecar(clone: Path):
+def sidecar(clone: Path, monkeypatch: pytest.MonkeyPatch):
     """The REAL sidecar on an ephemeral loopback port — the shape inside a
-    sandbox, where the clone lives at the path the repository map names."""
+    sandbox, where the clone lives at the path the repository map names.
+
+    It says it is inside a sandbox the way the real one does: the in-sandbox
+    bootstrap sets ``FORGE_SIDECAR_IN_SANDBOX``, and only a sidecar carrying
+    that value will run the repository's own ``deploy/deploy.sh`` rather than
+    the host wrapper (L3b's coach, 2026-09-08).
+    """
+    from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+    monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
     holder: dict[str, ForgeConfig] = {}
     srv = build_server(port=0, config_loader=lambda: holder["config"])
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -443,6 +452,51 @@ class TestTheDeployStepRunsTheInnerScriptInTheSandbox:
         ran = (marker_dir / "deploy.sh.ran").read_text(encoding="utf-8").split()
         assert [Path(p).resolve() for p in ran] == [tree.resolve()]
         # The host wrapper — the one that calls sbx — was never run.
+        assert not (marker_dir / "sandbox-deploy.sh.ran").exists()
+
+    async def test_a_sidecar_on_the_host_refuses_the_inner_script(
+        self,
+        repository: RunbookRepository,
+        runbook_publisher: AsyncMock,
+        clone: Path,
+        tmp_path: Path,
+        sidecar: Any,
+        marker_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same request, to a sidecar that is NOT inside a sandbox.
+
+        Nothing in the estate sends it — the deploy stage only sends the inner
+        script when the repository has a sandbox, and then it dials that
+        sandbox — but the wall has to be real, or the host sidecar could be
+        asked to run a repository's deploy against the host's Docker engine.
+        """
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        tree = await _lay_out(clone)
+        profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
+        stage = _stage(
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            clone=clone,
+            tmp_path=tmp_path,
+            sidecar_url="http://127.0.0.1:9",
+            sandbox=sidecar.entry,
+            invoker=None,
+        )
+
+        checked = await stage.candidate_check(
+            profile,
+            correlation_id="c",
+            deploy_run_id="run-sbx-host-wall",
+            feature=FEATURE_ID,
+            feat_id=FEATURE_ID,
+            candidate_cwd=str(tree),
+        )
+
+        assert checked.outcome != "complete"
+        assert not (marker_dir / "deploy.sh.ran").exists()
         assert not (marker_dir / "sandbox-deploy.sh.ran").exists()
 
     async def test_without_a_sandbox_the_wrapper_is_what_runs(
