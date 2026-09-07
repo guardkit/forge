@@ -65,6 +65,7 @@ never a silent downgrade onto the routine path.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -77,10 +78,15 @@ __all__ = [
     "WorktreeReady",
     "WorktreeRefused",
     "WorktreeOutcome",
+    "WorktreeCut",
     "JOURNEY_BASE_REF",
+    "WORKTREES_DIR",
+    "cut_worktree_in_checkout",
     "journey_base_ref",
     "journey_branch_name",
+    "journey_worktree_path",
     "prepare_journey_worktree",
+    "remove_journey_worktree",
     "short_build_id",
 ]
 
@@ -99,6 +105,16 @@ JOURNEY_BASE_REF = "main"
 #: at ``<checkout>/.forge/.gitignore``.
 _FORGE_DIR = ".forge"
 _WORKTREES_DIR = "worktrees"
+
+#: The same two names as one relative directory, for the readers outside
+#: this module that have to recognise a journey worktree path: the sidecar's
+#: worktree routes will act on ``<repo>/.forge/worktrees/<build id>`` and on
+#: nothing else (sandbox first, 2026-09-07, rule 76).
+WORKTREES_DIR = f"{_FORGE_DIR}/{_WORKTREES_DIR}"
+
+#: How long cutting one tree over the wire may take. A worktree add is a
+#: checkout of one branch; two minutes is generous and still bounded.
+SIDECAR_WORKTREE_TIMEOUT_S: float = 120.0
 
 #: The guard file's content. ``*`` ignores everything under ``.forge/``
 #: including the nested worktrees, which is exactly the embedded-gitlink
@@ -154,6 +170,36 @@ class WorktreeRefused:
 
 
 WorktreeOutcome = WorktreeReady | WorktreeRefused
+
+
+@dataclass(frozen=True)
+class WorktreeCut:
+    """What cutting (or reusing) one tree in one checkout produced.
+
+    This is the half of the writer that touches the checkout: the reuse
+    look-up, the base-branch check, the gitignore guard and ``git worktree
+    add``. It is a separate answer from :class:`WorktreeOutcome` because
+    the same work now runs in two places — in the forge container for a
+    repository that has no sandbox, and inside the repository's sandbox,
+    behind the deploy sidecar's ``/git/worktree-add`` route, for one that
+    does (sandbox first, 2026-09-07, rule 76). The row-reading and the
+    recording stay in :func:`prepare_journey_worktree` either way.
+
+    Attributes:
+        ok: The tree is there.
+        path: Absolute path of the tree, as the side that made it saw it.
+        branch: The branch checked out in it.
+        base_ref: What that branch was cut from.
+        reused: The tree was already there for this same build.
+        reason: One plain sentence, set only when ``ok`` is ``False``.
+    """
+
+    ok: bool
+    path: str = ""
+    branch: str = ""
+    base_ref: str = JOURNEY_BASE_REF
+    reused: bool = False
+    reason: str = ""
 
 
 def short_build_id(build_id: str) -> str:
@@ -213,6 +259,21 @@ def journey_base_ref(row_branch: Any) -> str:
     """
     base = str(row_branch or "").strip()
     return base or JOURNEY_BASE_REF
+
+
+def _sandbox_for(config: Any, repo: Any) -> Any | None:
+    """The repository's sandbox entry, or ``None`` when it has none.
+
+    ``planning.sandboxes`` is empty by default, and a repository that is not
+    in it is handled exactly as it always was — in the forge container, on
+    the operator's checkout. Never raises: a config shape that carries no
+    such field simply has no sandboxes.
+    """
+    sandboxes = getattr(getattr(config, "planning", None), "sandboxes", None) or {}
+    try:
+        return sandboxes.get(str(repo))
+    except AttributeError:  # pragma: no cover — a mapping is what the model gives
+        return None
 
 
 def _refuse(reason: str, *, log: logging.Logger) -> WorktreeRefused:
@@ -382,6 +443,236 @@ def _parse_worktree_list(porcelain: str) -> "list[tuple[str, str | None]]":
     return entries
 
 
+def journey_worktree_path(checkout: "Path | str", build_id: str) -> Path:
+    """``<checkout>/.forge/worktrees/<build id>`` — the one place a journey's
+    tree is ever made.
+
+    Named in one function because two sides now have to agree on it: this
+    writer, and the deploy sidecar's ``/git/worktree-add`` route, which acts
+    on this path under the repository it was given and refuses every other
+    path (sandbox first, 2026-09-07, rule 76).
+    """
+    return Path(checkout) / _FORGE_DIR / _WORKTREES_DIR / build_id
+
+
+async def cut_worktree_in_checkout(
+    *,
+    checkout: "Path | str",
+    build_id: str,
+    branch: str,
+    base_ref: str = JOURNEY_BASE_REF,
+    execute: Any = None,
+    log: logging.Logger | None = None,
+) -> WorktreeCut:
+    """Make — or recognise as already made — build ``build_id``'s tree.
+
+    This is everything the writer does *inside a checkout*, in the order it
+    has always done it: the reuse look-up against ``git worktree list``, the
+    check that a base branch other than the trunk actually exists, the
+    gitignore guard, and ``git worktree add -b <branch> <path> <base>``.
+
+    It is its own function because the same work now runs in two places. For
+    a repository with no sandbox it runs in the forge container exactly as
+    before. For a repository that has one it runs inside that sandbox,
+    called by the deploy sidecar's ``/git/worktree-add`` route on the
+    factory's own clone — so nothing the factory runs on a repository runs
+    on the host (Rich, 2026-09-07).
+
+    Never raises, and never logs a refusal: the caller owns the wording it
+    puts on the record, and a refusal logged twice reads as two failures.
+
+    Args:
+        checkout: The checkout the worktree is registered against.
+        build_id: The build whose tree this is (also the leaf directory).
+        branch: The journey branch to create.
+        base_ref: The commit-ish that branch is cut from.
+        execute: Injected subprocess primitive.
+        log: Where the reuse note goes.
+    """
+    from forge.adapters.git.operations import _default_execute, prepare_worktree
+
+    _log = log or logger
+    _execute = execute if execute is not None else _default_execute
+    checkout_path = Path(_normalise(checkout))
+    forge_dir = checkout_path / _FORGE_DIR
+    builds_root = forge_dir / _WORKTREES_DIR
+    target = builds_root / build_id
+
+    def _no(reason: str) -> WorktreeCut:
+        return WorktreeCut(ok=False, branch=branch, base_ref=base_ref, reason=reason)
+
+    # 4 — the reuse arm.
+    try:
+        listing = await _execute(
+            command=["git", "worktree", "list", "--porcelain"],
+            cwd=str(checkout_path),
+        )
+    except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+        return _no(
+            f"listing the existing worktrees in {checkout_path} raised "
+            f"{type(exc).__name__}: {exc}, so build_id={build_id}'s worktree "
+            "cannot be materialised without risking a collision"
+        )
+    if listing.exit_code != 0:
+        return _no(
+            f"'git worktree list --porcelain' in {checkout_path} exited "
+            f"{listing.exit_code} ({(listing.stderr or '').strip()}), so "
+            f"build_id={build_id}'s worktree cannot be materialised without "
+            "risking a collision"
+        )
+
+    target_str = _normalise(target)
+    target_real = _realpath(target)
+    for entry_path, entry_branch in _parse_worktree_list(listing.stdout or ""):
+        # Identity, not containment: both sides symlink-resolved because
+        # git's porcelain always reports the realpath (see _realpath).
+        same_path = _realpath(entry_path) == target_real
+        same_branch = entry_branch == branch
+        if same_path and same_branch:
+            hollow = _hollow_worktree_reason(
+                target_str, build_id, branch, checkout_path
+            )
+            if hollow is not None:
+                # A REGISTRATION is not a tree. git keeps the administrative
+                # record in .git/worktrees/<id> long after the directory is
+                # deleted (or emptied) by hand, by a cleanup script, or by a
+                # tmpfs reboot — and 'git worktree add' then refuses the path
+                # as already registered, so re-materialising is not even
+                # available. Handing back reused=True here would report a
+                # ready tree onto builds.worktree_path and the journey would
+                # die several stages later, in the leg, with the real cause
+                # out of sight. Refuse loudly instead, in the lane's posture.
+                return _no(hollow)
+            _log.info(
+                "conductor worktree: build_id=%s already has its own worktree "
+                "at %s on %s — REUSING it (this is a redelivery of the same "
+                "build, not a collision)",
+                build_id,
+                target_str,
+                branch,
+            )
+            return WorktreeCut(
+                ok=True,
+                path=target_str,
+                branch=branch,
+                base_ref=base_ref,
+                reused=True,
+            )
+        if same_path:
+            return _no(
+                f"{target} is already registered as a worktree on branch "
+                f"{entry_branch!r}, not build_id={build_id}'s own "
+                f"{branch!r}; refusing rather than reusing somebody else's "
+                "tree"
+            )
+        if same_branch:
+            return _no(
+                f"branch {branch!r} is already checked out by the worktree at "
+                f"{entry_path}, not at build_id={build_id}'s own {target}; "
+                "refusing rather than materialising a second tree on one "
+                "branch"
+            )
+
+    # 4b — a base other than main must exist before a tree can be cut from
+    # it. The refusal names the branch, because "invalid reference" from git
+    # would not say that the build was queued on a branch nobody made.
+    if base_ref != JOURNEY_BASE_REF:
+        try:
+            exists = await _execute(
+                command=[
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{base_ref}",
+                ],
+                cwd=str(checkout_path),
+            )
+        except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+            return _no(
+                f"checking that the branch {base_ref!r} exists in "
+                f"{checkout_path} raised {type(exc).__name__}: {exc}, so "
+                f"build_id={build_id}'s worktree cannot be cut from it"
+            )
+        if exists.exit_code != 0:
+            return _no(
+                f"build_id={build_id} was queued on the branch {base_ref!r}, but "
+                f"that branch does not exist in {checkout_path}, so its worktree "
+                "cannot be cut from it (a tree cut from "
+                f"{JOURNEY_BASE_REF} would not carry the task file the build was "
+                "queued with, and the review leg would refuse)"
+            )
+
+    # 5 — the gitignore guard, then the tree.
+    guard_problem = _ensure_forge_gitignore(forge_dir)
+    if guard_problem is not None:
+        return _no(guard_problem)
+
+    result = await prepare_worktree(
+        build_id,
+        checkout_path,
+        branch,
+        execute=_execute,
+        builds_root=builds_root,
+        create_branch=True,
+        base_ref=base_ref,
+    )
+    if result.status != "success" or not result.worktree_path:
+        detail = (result.stderr or "").strip() or "no diagnostic was captured"
+        return _no(
+            f"materialising build_id={build_id}'s worktree at {target} on "
+            f"branch {branch} off {base_ref} FAILED: {detail}"
+        )
+    return WorktreeCut(
+        ok=True, path=result.worktree_path, branch=branch, base_ref=base_ref
+    )
+
+
+async def remove_journey_worktree(
+    *,
+    worktree: "Path | str",
+    build_id: str = "",
+    execute: Any = None,
+) -> WorktreeCut:
+    """Remove one journey tree from ``checkout`` — ``git worktree remove
+    --force``, through the adapter the rest of the estate uses.
+
+    The same two-places story as :func:`cut_worktree_in_checkout`: in the
+    forge container for a repository with no sandbox, inside the sandbox
+    behind ``/git/worktree-remove`` for one that has (rule 76). A path that
+    is already gone is a success — there is nothing left to remove — so a
+    second call is safe.
+    """
+    from forge.adapters.git.operations import _default_execute, cleanup_worktree
+
+    target = Path(_normalise(worktree))
+    if not target.exists():
+        return WorktreeCut(ok=True, path=str(target))
+    try:
+        result = await cleanup_worktree(
+            build_id or target.name,
+            target,
+            execute=execute if execute is not None else _default_execute,
+        )
+    except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+        return WorktreeCut(
+            ok=False,
+            path=str(target),
+            reason=(
+                f"removing the worktree at {target} raised "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+    if result.status == "success":
+        return WorktreeCut(ok=True, path=str(target))
+    detail = (result.stderr or "").strip() or "no diagnostic was captured"
+    return WorktreeCut(
+        ok=False,
+        path=str(target),
+        reason=f"removing the worktree at {target} FAILED: {detail}",
+    )
+
+
 async def prepare_journey_worktree(
     pool: Any,
     config: Any,
@@ -389,6 +680,7 @@ async def prepare_journey_worktree(
     *,
     execute: Any = None,
     log: logging.Logger | None = None,
+    post: Any = None,
 ) -> WorktreeOutcome:
     """Materialise (or reuse) the fix journey's worktree and record it.
 
@@ -436,7 +728,7 @@ async def prepare_journey_worktree(
             Defaults to the adapter's own.
         log: Caller's logger, so refusals name the caller's seam.
     """
-    from forge.adapters.git.operations import _default_execute, prepare_worktree
+    from forge.adapters.git.operations import _default_execute
 
     _log = log or logger
     _execute = execute if execute is not None else _default_execute
@@ -491,7 +783,13 @@ async def prepare_journey_worktree(
             log=_log,
         )
     checkout = Path(_normalise(checkout_raw))
-    if not (checkout / ".git").exists():
+    # 2b — does this repository have a sandbox? A repository listed in
+    # planning.sandboxes has its tree cut inside that sandbox, on the
+    # factory's own clone at this same path, so the checkout is NOT expected
+    # to be readable here — forge-prod does not mount it any more. Only a
+    # repository without a sandbox is checked on this host.
+    sandbox = _sandbox_for(config, repo)
+    if sandbox is None and not (checkout / ".git").exists():
         return _refuse(
             f"the registered checkout for repo {repo!r} ({checkout}) is not a "
             "git checkout on this host, so no worktree can be added from it",
@@ -499,9 +797,7 @@ async def prepare_journey_worktree(
         )
 
     branch = journey_branch_name(str(task_id), build_id)
-    forge_dir = checkout / _FORGE_DIR
-    builds_root = forge_dir / _WORKTREES_DIR
-    target = builds_root / build_id
+    target = journey_worktree_path(checkout, build_id)
 
     # 3 — the allowlist, at WRITE time.
     allowlist = list(
@@ -521,148 +817,149 @@ async def prepare_journey_worktree(
             log=_log,
         )
 
-    # 4 — the reuse arm.
-    try:
-        listing = await _execute(
-            command=["git", "worktree", "list", "--porcelain"],
-            cwd=str(checkout),
-        )
-    except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
-        return _refuse(
-            f"listing the existing worktrees in {checkout} raised "
-            f"{type(exc).__name__}: {exc}, so build_id={build_id}'s worktree "
-            "cannot be materialised without risking a collision",
+    # 4, 4b and 5 — the reuse look-up, the base-branch check, the gitignore
+    # guard and the tree itself. In the forge container for a repository with
+    # no sandbox; inside the repository's own sandbox, over its deploy
+    # sidecar's route, for one that has (sandbox first, 2026-09-07, rule 76).
+    if sandbox is None:
+        cut = await cut_worktree_in_checkout(
+            checkout=checkout,
+            build_id=build_id,
+            branch=branch,
+            base_ref=base_ref,
+            execute=_execute,
             log=_log,
         )
-    if listing.exit_code != 0:
-        return _refuse(
-            f"'git worktree list --porcelain' in {checkout} exited "
-            f"{listing.exit_code} ({(listing.stderr or '').strip()}), so "
-            f"build_id={build_id}'s worktree cannot be materialised without "
-            "risking a collision",
+    else:
+        cut = await _cut_in_sandbox(
+            sandbox=sandbox,
+            repo=str(repo),
+            build_id=build_id,
+            worktree=target,
+            branch=branch,
+            base_ref=base_ref,
+            post=post,
             log=_log,
         )
-
-    target_str = _normalise(target)
-    target_real = _realpath(target)
-    for entry_path, entry_branch in _parse_worktree_list(listing.stdout or ""):
-        # Identity, not containment: both sides symlink-resolved because
-        # git's porcelain always reports the realpath (see _realpath).
-        same_path = _realpath(entry_path) == target_real
-        same_branch = entry_branch == branch
-        if same_path and same_branch:
-            hollow = _hollow_worktree_reason(target_str, build_id, branch, checkout)
-            if hollow is not None:
-                # A REGISTRATION is not a tree. git keeps the administrative
-                # record in .git/worktrees/<id> long after the directory is
-                # deleted (or emptied) by hand, by a cleanup script, or by a
-                # tmpfs reboot — and 'git worktree add' then refuses the path
-                # as already registered, so re-materialising is not even
-                # available. Handing back reused=True here would report a
-                # ready tree onto builds.worktree_path and the journey would
-                # die several stages later, in the leg, with the real cause
-                # out of sight. Refuse loudly instead, in the lane's posture.
-                return _refuse(hollow, log=_log)
-            _log.info(
-                "conductor worktree: build_id=%s already has its own worktree "
-                "at %s on %s — REUSING it (this is a redelivery of the same "
-                "build, not a collision)",
-                build_id,
-                target_str,
-                branch,
-            )
-            recorded = _record(pool, build_id, target_str, branch, log=_log)
-            if recorded is not None:
-                return recorded
-            return WorktreeReady(
-                path=target_str, branch=branch, reused=True, base_ref=base_ref
-            )
-        if same_path:
-            return _refuse(
-                f"{target} is already registered as a worktree on branch "
-                f"{entry_branch!r}, not build_id={build_id}'s own "
-                f"{branch!r}; refusing rather than reusing somebody else's "
-                "tree",
-                log=_log,
-            )
-        if same_branch:
-            return _refuse(
-                f"branch {branch!r} is already checked out by the worktree at "
-                f"{entry_path}, not at build_id={build_id}'s own {target}; "
-                "refusing rather than materialising a second tree on one "
-                "branch",
-                log=_log,
-            )
-
-    # 4b — a base other than main must exist before a tree can be cut from
-    # it. The refusal names the branch, because "invalid reference" from git
-    # would not say that the build was queued on a branch nobody made.
-    if base_ref != JOURNEY_BASE_REF:
-        try:
-            exists = await _execute(
-                command=[
-                    "git",
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    f"refs/heads/{base_ref}",
-                ],
-                cwd=str(checkout),
-            )
-        except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
-            return _refuse(
-                f"checking that the branch {base_ref!r} exists in {checkout} "
-                f"raised {type(exc).__name__}: {exc}, so build_id={build_id}'s "
-                "worktree cannot be cut from it",
-                log=_log,
-            )
-        if exists.exit_code != 0:
-            return _refuse(
-                f"build_id={build_id} was queued on the branch {base_ref!r}, but "
-                f"that branch does not exist in {checkout}, so its worktree "
-                "cannot be cut from it (a tree cut from "
-                f"{JOURNEY_BASE_REF} would not carry the task file the build was "
-                "queued with, and the review leg would refuse)",
-                log=_log,
-            )
-
-    # 5 — the gitignore guard, then the tree.
-    guard_problem = _ensure_forge_gitignore(forge_dir)
-    if guard_problem is not None:
-        return _refuse(guard_problem, log=_log)
-
-    result = await prepare_worktree(
-        build_id,
-        checkout,
-        branch,
-        execute=_execute,
-        builds_root=builds_root,
-        create_branch=True,
-        base_ref=base_ref,
-    )
-    if result.status != "success" or not result.worktree_path:
-        detail = (result.stderr or "").strip() or "no diagnostic was captured"
-        return _refuse(
-            f"materialising build_id={build_id}'s worktree at {target} on "
-            f"branch {branch} off {base_ref} FAILED: {detail}",
-            log=_log,
-        )
+    if not cut.ok:
+        return _refuse(cut.reason, log=_log)
 
     # 6 — the record. A path nobody recorded is a path the dispatch refuses,
     # and a branch nobody recorded is a branch the merge word never merges.
-    recorded = _record(pool, build_id, result.worktree_path, branch, log=_log)
+    recorded = _record(pool, build_id, cut.path, branch, log=_log)
     if recorded is not None:
         return recorded
-    _log.info(
-        "conductor worktree: build_id=%s materialised at %s on branch %s "
-        "(cut from %s) and recorded on builds.worktree_path and "
-        "builds.merge_branch",
-        build_id,
-        result.worktree_path,
-        branch,
-        base_ref,
+    if not cut.reused:
+        _log.info(
+            "conductor worktree: build_id=%s materialised at %s on branch %s "
+            "(cut from %s) and recorded on builds.worktree_path and "
+            "builds.merge_branch",
+            build_id,
+            cut.path,
+            branch,
+            base_ref,
+        )
+    return WorktreeReady(
+        path=cut.path, branch=branch, reused=cut.reused, base_ref=base_ref
     )
-    return WorktreeReady(path=result.worktree_path, branch=branch, base_ref=base_ref)
+
+
+async def _cut_in_sandbox(
+    *,
+    sandbox: Any,
+    repo: str,
+    build_id: str,
+    worktree: Path,
+    branch: str,
+    base_ref: str,
+    post: Any = None,
+    log: logging.Logger,
+) -> WorktreeCut:
+    """Ask the sidecar inside ``repo``'s sandbox to cut the journey's tree.
+
+    One POST to ``/git/worktree-add`` with the repository's key, the tree's
+    path, the branch and its base. The sidecar runs the very same function
+    this module runs in the container, on the factory's clone, so there is
+    one statement of what a journey tree is and not two. A refusal comes back
+    as a plain sentence and becomes this writer's refusal unchanged.
+    """
+    # One HTTP seam for the whole estate: the planning chain's sidecar client
+    # already has it, and a second copy here would be a second thing to keep
+    # right.
+    from forge.deploy_sidecar.service import GIT_WORKTREE_ADD_ROUTE
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    sender = post if post is not None else _urllib_post
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_WORKTREE_ADD_ROUTE}"
+    body = {
+        "repo": repo,
+        "path": str(worktree),
+        "branch": branch,
+        "base_ref": base_ref,
+    }
+    log.info(
+        "conductor worktree: build_id=%s cuts its tree inside sandbox %s "
+        "(%s) — the repository's code never comes to the host",
+        build_id,
+        getattr(sandbox, "name", "?"),
+        url,
+    )
+    try:
+        status, decoded = await asyncio.to_thread(
+            sender, url, body, SIDECAR_WORKTREE_TIMEOUT_S
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+        return WorktreeCut(
+            ok=False,
+            branch=branch,
+            base_ref=base_ref,
+            reason=(
+                f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} could "
+                f"not be reached at {url} to cut build_id={build_id}'s "
+                f"worktree: {type(exc).__name__}: {exc}"
+            ),
+        )
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        sentence = str(answer.get("error") or "").strip() or f"HTTP {status}"
+        return WorktreeCut(
+            ok=False,
+            branch=branch,
+            base_ref=base_ref,
+            reason=(
+                f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} "
+                f"refused to cut build_id={build_id}'s worktree: {sentence}"
+            ),
+        )
+    if answer.get("status") != "success":
+        sentence = (
+            str(answer.get("detail") or answer.get("error") or "").strip()
+            or "no reason was given"
+        )
+        return WorktreeCut(
+            ok=False, branch=branch, base_ref=base_ref, reason=sentence
+        )
+    path = str(answer.get("path") or "").strip()
+    if not path:
+        return WorktreeCut(
+            ok=False,
+            branch=branch,
+            base_ref=base_ref,
+            reason=(
+                f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} said "
+                f"build_id={build_id}'s worktree was made but did not say "
+                "where, so there is no path to record"
+            ),
+        )
+    return WorktreeCut(
+        ok=True,
+        path=path,
+        branch=branch,
+        base_ref=base_ref,
+        reused=bool(answer.get("reused")),
+    )
 
 
 def _record(

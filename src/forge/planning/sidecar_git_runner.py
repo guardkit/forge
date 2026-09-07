@@ -26,14 +26,14 @@ any repository has a sandbox: every call routes by the repository path the
 protocol already carries — a sandboxed repository's calls go to its sidecar,
 every other repository's to the in-container runner, byte for byte as today.
 
-What is moved so far, said plainly. Only the PLAN leg's two checks (the stamp
-normalizer and ``guardkit feature validate``) are declared today; those are
-the three checks the sidecar knows how to run. The spec leg, the pass-bar leg
-and the feature-gate leg still hand their oracle over as a Python closure, so
-a sandboxed repository's run of those legs is refused here with the sentence
-below rather than quietly run on the host. Moving them is the next lane's
-work; until it lands, a repository is given a sandbox only once its planning
-legs are all declared, or its spec leg will stop.
+What is moved, said plainly (rule 87, 2026-09-07). EVERY planning leg that
+writes to the branch now declares its checks: the spec leg's gherkin
+normalizer and its provability check, the plan leg's stamp normalizer and
+``guardkit feature validate``, the pass-bar leg's ``qa validate pass-bar``
+(once per minted bar) and the feature-gate leg's ``qa validate
+gate-registry``. Those six names are the closed list the sidecar runs. A
+Python closure is still refused here with the sentence below rather than
+quietly run on the host — that is the fence, not a gap.
 """
 
 from __future__ import annotations

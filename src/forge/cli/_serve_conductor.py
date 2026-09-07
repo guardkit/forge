@@ -136,7 +136,9 @@ __all__ = [
     "load_declared_toolchain",
     "make_conductor_close_out",
     "make_conductor_failure_pack_writer",
+    "make_conductor_guardkit_run_chooser",
     "make_conductor_receipts_exporter",
+    "RECEIPTS_EXPORT_TIMEOUT_S",
     "make_conductor_merge_card_published_probe",
     "make_conductor_subscribe_resume",
     "make_conductor_wait_window_reader",
@@ -868,6 +870,98 @@ def make_merge_ready_checkpoint(
 # ---------------------------------------------------------------------------
 
 
+def make_conductor_guardkit_run_chooser(
+    *,
+    pool: Any,
+    config: Any,
+    in_container_run: Any,
+    build_sidecar_run: Callable[..., Any] | None = None,
+) -> Callable[[str], Any]:
+    """Return ``(build_id) -> guardkit_run`` — where this build's legs run.
+
+    Rich's rule, 2026-09-07: nothing the factory runs on a repository runs on
+    the host. A fix journey's legs (``guardkit task-review``, ``guardkit
+    task-work``) install and run the repository's own code, so for a
+    repository that has a sandbox they run inside it, reached through that
+    sandbox's deploy sidecar, with the journey worktree as their working
+    directory (sandbox first, rule 75). Every other repository keeps today's
+    path exactly: the legs run in the forge container, through
+    :func:`forge.adapters.guardkit.run.run`.
+
+    The choice is per build, not per boot, because one daemon serves every
+    repository and only some of them have a sandbox. With
+    ``planning.sandboxes`` empty — the default, and the estate's state until
+    an operator fills it in — this returns the in-container runner for every
+    build without reading a row at all, which is byte for byte the
+    composition before this lane.
+
+    Args:
+        pool: The lifecycle persistence facade (``get_build_row``).
+        config: The loaded forge config.
+        in_container_run: Today's runner, used for every repository that has
+            no sandbox.
+        build_sidecar_run: ``(base_url, repo_paths) -> runner`` — injected by
+            tests; production uses
+            :func:`forge.adapters.guardkit.run_via_sidecar.build_sidecar_leg_run`,
+            the two-command door that carries ``task-review`` and
+            ``task-work`` to the sandbox with the journey worktree as their
+            working directory.
+    """
+    sandboxes = dict(
+        getattr(getattr(config, "planning", None), "sandboxes", None) or {}
+    )
+    if not sandboxes:
+        def choose_in_container(build_id: str) -> Any:  # noqa: ARG001 — one answer
+            return in_container_run
+
+        return choose_in_container
+
+    repo_paths = dict(
+        getattr(getattr(config, "planning", None), "target_repo_paths", None) or {}
+    )
+
+    def _factory(base_url: str) -> Any:
+        if build_sidecar_run is not None:
+            return build_sidecar_run(base_url=base_url, repo_paths=repo_paths)
+        from forge.adapters.guardkit.run_via_sidecar import build_sidecar_leg_run
+
+        return build_sidecar_leg_run(base_url=base_url, repo_paths=repo_paths)
+
+    runners: dict[str, Any] = {}
+
+    def choose(build_id: str) -> Any:
+        try:
+            row = pool.get_build_row(build_id)
+        except Exception as exc:  # noqa: BLE001 — never break a dispatch
+            logger.warning(
+                "conductor composition: reading build_id=%s to decide where "
+                "its legs run raised %s: %s — the legs run in the forge "
+                "container, as they always did",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return in_container_run
+        repo = str(getattr(row, "repo", "") or "") if row is not None else ""
+        entry = sandboxes.get(repo)
+        if entry is None:
+            return in_container_run
+        if repo not in runners:
+            runners[repo] = _factory(str(entry.sidecar_url))
+            logger.info(
+                "conductor composition: %s has a sandbox (%s), so its fix "
+                "journey's legs run inside it through the sidecar at %s, with "
+                "the journey worktree as their working directory — the "
+                "repository's own code never runs on the host",
+                repo,
+                getattr(entry, "name", "?"),
+                entry.sidecar_url,
+            )
+        return runners[repo]
+
+    return choose
+
+
 def build_conductor_supervisor_factory(
     *,
     pool: Any,
@@ -876,6 +970,7 @@ def build_conductor_supervisor_factory(
     worktree_allowlist: Any,
     read_allowlist: "list[Path]",
     subprocess_runner: Any,
+    subprocess_runner_for_build: Callable[[str], Any] | None = None,
     lifecycle_emitter: Any = None,
     publish_approval_request: Any = None,
     publish_card: Callable[..., Any] | None = None,
@@ -958,6 +1053,14 @@ def build_conductor_supervisor_factory(
     _build = build_supervisor or _default_build_supervisor
     _mode_kwargs = mode_kwargs_builder or build_conductor_mode_kwargs
     _budget_kwargs = budget_kwargs_builder or build_conductor_budget_kwargs
+    # WHERE THIS BUILD'S LEGS RUN (sandbox first, 2026-09-07, rule 75). One
+    # daemon serves every repository and only some have a sandbox, so the
+    # runner is chosen per build rather than per boot. With
+    # planning.sandboxes empty the chooser answers ``subprocess_runner`` for
+    # every build, which is byte for byte the composition before this lane.
+    _runner_for = subprocess_runner_for_build or make_conductor_guardkit_run_chooser(
+        pool=pool, config=config, in_container_run=subprocess_runner
+    )
 
     if stage_log_writer is None:
         from forge.cli._serve_deps_stage_log import (
@@ -1029,7 +1132,7 @@ def build_conductor_supervisor_factory(
             worktree_allowlist=worktree_allowlist,
             forward_context_builder=forward_context_builder,
             stage_log_writer=stage_log_writer,
-            subprocess_runner=subprocess_runner,
+            subprocess_runner=_runner_for(build_id),
             timeout_seconds_by_stage=stage_timeouts,
             leg_model=resolved_leg_model,
             leg_budgets=leg_budgets,
@@ -1136,6 +1239,8 @@ def make_conductor_receipts_exporter(
     *,
     pool: Any,
     receipts_root: "Path | str | None" = None,
+    config: Any = None,
+    post: Any = None,
 ) -> Callable[..., Any]:
     """Build the driver's ``export_stage_receipts`` seam — ONE shape.
 
@@ -1150,8 +1255,32 @@ def make_conductor_receipts_exporter(
 
     A turn that dispatched nothing exports nothing and returns ``None`` —
     receipts belong to stages, not to planning ticks.
+
+    **Where the copying happens** (sandbox first, 2026-09-07, rule 77). For a
+    repository with a sandbox the journey's tree is inside that sandbox and
+    forge-prod cannot read it, so the export runs there, over the sidecar's
+    ``/receipts/export`` route, writing under the receipts root that is
+    mounted read-write — the same files forge-prod reads afterwards. Every
+    other repository copies in the container exactly as before. ``config``
+    absent (a test that passes only a pool) means no sandboxes, hence
+    today's path.
+
+    **The sandbox branch answers with something to await.** The copy is a
+    call over the wire, and this seam is called from the conductor's turn
+    loop, which runs on the daemon's own event loop alongside every other
+    build and journey. So for a sandbox repository the seam hands back a
+    coroutine that does the waiting on a worker thread; the driver already
+    awaits whatever this seam returns
+    (:func:`forge.pipeline.conductor_driver._maybe_await`), so the contract
+    is unchanged and the daemon keeps answering while the receipts copy.
+    The in-container branch returns the stage key directly, exactly as it
+    always has.
     """
     from forge.pipeline.fix_journey_receipts import export_stage_receipts
+
+    sandboxes = dict(
+        getattr(getattr(config, "planning", None), "sandboxes", None) or {}
+    )
 
     def export(*, build_id: str, report: Any) -> Any:
         stage = getattr(report, "chosen_stage", None)
@@ -1160,16 +1289,123 @@ def make_conductor_receipts_exporter(
             return None
         row = pool.get_build_row(build_id)
         rationale = getattr(report, "rationale", "") or ""
+        extra_files = {"turn-rationale.txt": rationale} if rationale else None
+        worktree_path = getattr(row, "worktree_path", None)
+        entry = sandboxes.get(str(getattr(row, "repo", "") or "")) if row else None
+        if entry is not None:
+            # A coroutine, not a key: the driver awaits it, and the wire wait
+            # happens on a worker thread instead of on the daemon's loop.
+            return _export_receipts_in_sandbox(
+                entry=entry,
+                build_id=build_id,
+                stage=stage_name,
+                worktree_path=worktree_path,
+                extra_files=extra_files,
+                post=post,
+            )
         result = export_stage_receipts(
             build_id=build_id,
             stage=stage_name,
-            worktree_path=getattr(row, "worktree_path", None),
+            worktree_path=worktree_path,
             receipts_root=receipts_root,
-            extra_files={"turn-rationale.txt": rationale} if rationale else None,
+            extra_files=extra_files,
         )
         return getattr(result, "stage_key", None)
 
     return export
+
+
+#: How long exporting one stage's receipts over the wire may take. Copying a
+#: worktree's receipt families is file work, not model work; five minutes is
+#: generous and still bounded.
+RECEIPTS_EXPORT_TIMEOUT_S: float = 300.0
+
+
+async def _export_receipts_in_sandbox(
+    *,
+    entry: Any,
+    build_id: str,
+    stage: str,
+    worktree_path: Any,
+    extra_files: "dict[str, str] | None",
+    post: Any = None,
+) -> str | None:
+    """Ask the sidecar inside the repository's sandbox to export the receipts.
+
+    Returns the stage key it wrote, or ``None`` when it could not — the same
+    contract the in-container export has, so a failure to copy never blocks a
+    journey; it is logged and the turn carries on.
+
+    The POST waits on a worker thread (``asyncio.to_thread``), as this lane's
+    two sibling seams do — the tree cut in
+    :mod:`forge.cli._conductor_worktree` and the leg run in
+    :mod:`forge.adapters.guardkit.run_via_sidecar`. A journey turn runs on the
+    daemon's shared event loop, so waiting there would stop the bus
+    subscriptions, the queue and every other build for as long as the copy
+    took, and for the whole five minutes if the sandbox's sidecar were slow.
+    """
+    from forge.deploy_sidecar.service import RECEIPTS_EXPORT_ROUTE
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    if not worktree_path:
+        logger.warning(
+            "conductor receipts: build_id=%s has no worktree path, so there "
+            "is nothing in sandbox %s to export",
+            build_id,
+            getattr(entry, "name", "?"),
+        )
+        return None
+    sender = post if post is not None else _urllib_post
+    url = f"{str(entry.sidecar_url).rstrip('/')}{RECEIPTS_EXPORT_ROUTE}"
+    body: dict[str, Any] = {
+        "build_id": build_id,
+        "stage": stage,
+        "worktree": str(worktree_path),
+    }
+    if extra_files:
+        body["extra_files"] = extra_files
+    try:
+        status, decoded = await asyncio.to_thread(
+            sender, url, body, RECEIPTS_EXPORT_TIMEOUT_S
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never block a turn
+        logger.warning(
+            "conductor receipts: the sidecar in sandbox %s could not be "
+            "reached at %s to export build_id=%s's %s receipts (%s: %s) — the "
+            "journey's outcome is unaffected",
+            getattr(entry, "name", "?"),
+            url,
+            build_id,
+            stage,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200 or answer.get("status") != "success":
+        logger.warning(
+            "conductor receipts: exporting build_id=%s's %s receipts inside "
+            "sandbox %s did not succeed (HTTP %s): %s — the journey's outcome "
+            "is unaffected",
+            build_id,
+            stage,
+            getattr(entry, "name", "?"),
+            status,
+            answer.get("error") or answer.get("detail") or answer,
+        )
+        return None
+    logger.info(
+        "conductor receipts: build_id=%s's %s receipts were exported inside "
+        "sandbox %s to %s",
+        build_id,
+        stage,
+        getattr(entry, "name", "?"),
+        answer.get("dest"),
+    )
+    key = answer.get("stage_key")
+    return str(key) if key else None
 
 
 def make_conductor_failure_pack_writer(
@@ -1517,7 +1753,9 @@ def build_conductor_driver_deps_factory(
     read_window = make_conductor_wait_window_reader(
         pool=pool, config=config, clock=clock
     )
-    export = make_conductor_receipts_exporter(pool=pool, receipts_root=receipts_root)
+    export = make_conductor_receipts_exporter(
+        pool=pool, receipts_root=receipts_root, config=config
+    )
     write_pack = make_conductor_failure_pack_writer(
         pool=pool,
         receipts_root=receipts_root,
