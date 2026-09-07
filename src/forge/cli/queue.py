@@ -458,13 +458,16 @@ def _repair_task_preparer(
 ) -> Callable[[], Any] | None:
     """The materialisation ``forge queue --mode c`` runs when the branch has no task file.
 
-    Rewrite-on-refusal spec Part L, rule 49: guardkit's review leg loads its
-    subject from ``tasks/**/<task id>*.md`` in the build's worktree, a
-    detached worktree of the branch, so a repair queued on a branch without
-    that file refuses in seconds. When ``--branch`` carries no such file the
-    same materialisation the work queue uses writes one from the YAML's own
-    fields on ``repair/<task id>``, cut from ``--branch``, and the build is
-    queued there.
+    Rewrite-on-refusal spec Part L, rule 49, and Part M, rule 56: guardkit's
+    review leg loads its subject from ``tasks/**/<task id>*.md`` in the
+    build's worktree, which the conductor cuts from the branch the build was
+    queued on — whatever ``--branch`` names — so a repair queued on a branch
+    without that file refuses in seconds. When ``--branch`` carries the file
+    the build is queued on it as given and the journey is cut from it; when
+    it carries no such file the same materialisation the work queue uses
+    writes one from the YAML's own fields on ``repair/<task id>``, cut from
+    ``--branch``, and the build is queued there. Either way the review leg's
+    worktree carries the file; a repair is never queued blind.
 
     Returns ``None`` when nothing needs doing — the branch already carries
     the file, or the subject is not a task id at all (the admission refuses
@@ -632,7 +635,13 @@ def _admit_fix_journey(
     "--branch",
     default="main",
     show_default=True,
-    help="Branch the build should target.",
+    help=(
+        "Branch the build should target. For a fix journey (--mode c) it is "
+        "also the branch the journey's tree is cut from, so the task file "
+        "must be on it: when it is not, the machine writes one on "
+        "repair/<task id> cut from this branch and queues the build there, "
+        "or refuses in one sentence."
+    ),
 )
 @click.option(
     "--feature-yaml",

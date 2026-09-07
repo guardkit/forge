@@ -27,7 +27,14 @@ What is pinned:
   tree is cut from THAT branch, so the repair's committed task file is in
   it; the commit probe counts from the same base, so the repair's own
   commit is never a leg's work; a repair branch nobody made refuses
-  plainly; any other row branch is cut from ``main`` exactly as before.
+  plainly;
+* every mode-C row's branch is its base (Part M rule 56, 2026-09-07): a
+  row queued on ``lane/x`` carrying the task file is cut from ``lane/x``
+  and the probe counts from there too; a row saying ``main`` is cut from
+  ``main`` exactly as before;
+* the journey branch the writer cuts is recorded on ``builds.merge_branch``
+  (Part M rule 54), fresh and on reuse, and a record that will not land
+  refuses — the merge word reads that column.
 """
 
 from __future__ import annotations
@@ -364,12 +371,15 @@ class TestARowQueuedOnARepairBranch:
     committed task file was not in the tree and journey one refused in four
     seconds. Now the row's repair branch is the base."""
 
-    def test_the_base_is_the_row_branch_only_when_it_is_a_repair_branch(self) -> None:
+    def test_the_base_is_the_row_branch_whatever_it_is_called(self) -> None:
+        """Part M, rule 56: a row's branch is its base; ``main`` when it says main."""
         assert journey_base_ref("repair/TASK-FEAT39F6FIX1") == "repair/TASK-FEAT39F6FIX1"
         assert journey_base_ref("main") == JOURNEY_BASE_REF
-        assert journey_base_ref("lane/fix-journey") == JOURNEY_BASE_REF
+        assert journey_base_ref("lane/fix-journey") == "lane/fix-journey"
+        assert journey_base_ref("  lane/x  ") == "lane/x"
         assert journey_base_ref(None) == JOURNEY_BASE_REF
         assert journey_base_ref("") == JOURNEY_BASE_REF
+        assert journey_base_ref("   ") == JOURNEY_BASE_REF
 
     @pytest.mark.asyncio
     async def test_the_tree_is_cut_from_the_repair_branch_and_carries_the_task_file(
@@ -464,12 +474,84 @@ class TestARowQueuedOnARepairBranch:
         assert row is not None and row.worktree_path is None
 
     @pytest.mark.asyncio
-    async def test_a_row_on_any_other_branch_is_still_cut_from_main(
+    async def test_a_row_queued_on_lane_x_with_the_task_file_is_cut_from_lane_x(
         self, pool: SqliteLifecyclePersistence, checkout: Path
     ) -> None:
-        """Only a repair branch moves the base; every other row keeps today's path."""
-        _git(checkout, "branch", "lane/something", "main")
-        build_id = _queue_mode_c(pool, "FEAT-WTWU", branch="lane/something")
+        """The Part L coaches' exact case (Part M, rule 56).
+
+        ``forge queue --mode c --branch lane/x`` with the task file committed
+        on ``lane/x`` queues on ``lane/x``; the journey's tree must then be
+        cut from ``lane/x`` so the review leg finds the file. Under Part L's
+        first rule only a ``repair/`` branch moved the base, and this row was
+        cut from ``main`` — without the file.
+        """
+        branch = _cut_task_file_branch(checkout, "lane/something")
+        build_id = _queue_mode_c(pool, "FEAT-WTWU", branch=branch)
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeReady), outcome
+        assert outcome.base_ref == branch
+        tree = Path(outcome.path)
+        assert _git(tree, "rev-parse", "HEAD").strip() == _git(
+            checkout, "rev-parse", branch
+        ).strip()
+        assert (tree / REPAIR_TASK_FILE).is_file()
+        assert (
+            _git(tree, "rev-parse", "--abbrev-ref", "HEAD").strip()
+            == journey_branch_name(TASK_ID, build_id)
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_row_queued_on_lane_x_without_the_branch_refuses_plainly(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """A base nobody made is refused in the writer's own words, not git's."""
+        build_id = _queue_mode_c(pool, "FEAT-WTWV", branch="lane/nobody-made-this")
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeRefused), outcome
+        assert "lane/nobody-made-this" in outcome.reason
+        assert "does not exist" in outcome.reason
+        assert not (checkout / ".forge" / "worktrees" / build_id).exists()
+
+    @pytest.mark.asyncio
+    async def test_the_commit_probe_counts_from_lane_x_not_main(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """The writer's base and the probe's base are one statement (rule 56)."""
+        from forge.lifecycle.persistence import Build
+
+        branch = _cut_task_file_branch(checkout, "lane/probe-base")
+        build_id = _queue_mode_c(pool, "FEAT-WTWW", branch=branch)
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+        assert isinstance(outcome, WorktreeReady), outcome
+        tree = Path(outcome.path)
+        assert _git(tree, "rev-list", "--count", "main..HEAD").strip() == "1"
+
+        probe = make_mode_c_commit_probe(pool)
+        build = Build(build_id=build_id, status=BuildState.RUNNING)
+        before = await probe(build)
+        assert before.failed is False and before.count == 0, before
+
+        (tree / "fix.txt").write_text("the leg's work\n", encoding="utf-8")
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "leg: a fix")
+        after = await probe(build)
+        assert after.failed is False and after.count == 1, after
+
+    @pytest.mark.asyncio
+    async def test_a_row_saying_main_is_cut_from_main_exactly_as_before(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        build_id = _queue_mode_c(pool, "FEAT-WTWX", branch="main")
 
         outcome = await prepare_journey_worktree(
             pool, _config(checkout), build_id
@@ -477,6 +559,159 @@ class TestARowQueuedOnARepairBranch:
 
         assert isinstance(outcome, WorktreeReady), outcome
         assert outcome.base_ref == JOURNEY_BASE_REF
+        assert _git(Path(outcome.path), "rev-parse", "HEAD").strip() == _git(
+            checkout, "rev-parse", "main"
+        ).strip()
+
+
+def _cut_task_file_branch(checkout: Path, branch: str, task_id: str = TASK_ID) -> str:
+    """``<branch>`` off main carrying the task file — what ``--branch lane/x`` names."""
+    _git(checkout, "checkout", "-q", "-b", branch, "main")
+    task_file = checkout / REPAIR_TASK_FILE
+    task_file.parent.mkdir(parents=True, exist_ok=True)
+    task_file.write_text(
+        f"---\nid: {task_id}\ntask_type: fix\n---\n\n"
+        "## Acceptance Criteria\n\n- [ ] the failed checks pass\n",
+        encoding="utf-8",
+    )
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", f"task file for {task_id} on {branch}")
+    _git(checkout, "checkout", "-q", "main")
+    return branch
+
+
+# --------------------------------------------------------------------------- #
+# The branch the merge word merges (Part M, rule 54, 2026-09-07).
+# --------------------------------------------------------------------------- #
+
+
+class TestTheJourneyBranchIsRecordedForTheMergeWord:
+    """The conductor writes the branch it cut onto ``builds.merge_branch``.
+
+    The merge offer, the candidate check, the landed-merge detection and the
+    merge command read that column; empty, they fall back to the feature's
+    own ``autobuild/<feature id>`` — which for a repair is a branch already
+    on main. So the record is part of materialising the tree, not an extra.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_tree_records_its_branch_on_the_row(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        branch = _cut_repair_branch(checkout)
+        build_id = _queue_mode_c(pool, "FEAT-WTMB", branch=branch)
+        assert pool.get_build_row(build_id).merge_branch is None
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeReady), outcome
+        row = pool.get_build_row(build_id)
+        assert row is not None
+        assert row.merge_branch == outcome.branch == journey_branch_name(TASK_ID, build_id)
+        # The queued-on branch is a different fact and is untouched.
+        assert row.branch == branch
+        assert row.status is BuildState.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_a_reused_tree_records_the_same_branch_again(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        build_id = _queue_mode_c(pool, "FEAT-WTMC")
+        first = await prepare_journey_worktree(pool, _config(checkout), build_id)
+        assert isinstance(first, WorktreeReady), first
+        # Something wiped the column between deliveries; the redelivery restores it.
+        pool.connection.execute(
+            "UPDATE builds SET merge_branch = NULL WHERE build_id = ?", (build_id,)
+        )
+        pool.connection.commit()
+
+        again = await prepare_journey_worktree(pool, _config(checkout), build_id)
+
+        assert isinstance(again, WorktreeReady) and again.reused is True, again
+        assert pool.get_build_row(build_id).merge_branch == first.branch
+
+    @pytest.mark.asyncio
+    async def test_a_branch_record_that_will_not_land_refuses(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """An unrecorded branch would send the merge word to the feature's own."""
+        build_id = _queue_mode_c(pool, "FEAT-WTMD")
+
+        class _BranchRefusingPool:
+            def __init__(self, real: Any) -> None:
+                self._real = real
+
+            def get_build_row(self, bid: str) -> Any:
+                return self._real.get_build_row(bid)
+
+            def record_worktree_path(self, bid: str, path: str) -> None:
+                self._real.record_worktree_path(bid, path)
+
+            def record_merge_branch(self, bid: str, branch: str) -> None:
+                raise sqlite3.OperationalError("database is locked")
+
+        outcome = await prepare_journey_worktree(
+            _BranchRefusingPool(pool), _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeRefused), outcome
+        assert "OperationalError" in outcome.reason
+        assert "builds.merge_branch" in outcome.reason
+        assert "feature's own branch" in outcome.reason
+        assert pool.get_build_row(build_id).merge_branch is None
+
+
+class TestRecordMergeBranch:
+    """The narrow persistence write beside ``record_worktree_path``."""
+
+    def test_it_writes_the_column_without_touching_status_or_branch(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        build_id = _queue_mode_c(pool, "FEAT-WTMI", branch="repair/TASK-X")
+        before = pool.get_build_row(build_id)
+        assert before is not None and before.merge_branch is None
+
+        pool.record_merge_branch(build_id, "fix/TASK-X-00000001")
+
+        after = pool.get_build_row(build_id)
+        assert after is not None
+        assert after.merge_branch == "fix/TASK-X-00000001"
+        assert after.branch == "repair/TASK-X"
+        assert after.status is before.status
+
+    def test_a_later_write_wins(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        build_id = _queue_mode_c(pool, "FEAT-WTMJ")
+        pool.record_merge_branch(build_id, "fix/TASK-X-00000001")
+        pool.record_merge_branch(build_id, "fix/TASK-X-00000002")
+        assert pool.get_build_row(build_id).merge_branch == "fix/TASK-X-00000002"
+
+    def test_a_blank_branch_is_refused(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        with pytest.raises(ValueError, match="non-blank"):
+            pool.record_merge_branch("build-x", "   ")
+
+    def test_a_blank_build_id_is_refused(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        with pytest.raises(ValueError, match="build_id"):
+            pool.record_merge_branch("", "fix/x")
+
+    def test_an_unknown_build_id_is_a_quiet_no_op(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        pool.record_merge_branch("build-never-existed", "fix/x")
+
+    def test_a_feature_build_reads_back_empty(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Nothing writes the column for a feature build: the readers fall back."""
+        build_id = pool.record_pending_build(_payload("FEAT-WTMK"))
+        assert pool.get_build_row(build_id).merge_branch is None
 
 
 # --------------------------------------------------------------------------- #

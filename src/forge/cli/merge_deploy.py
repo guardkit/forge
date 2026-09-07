@@ -17,6 +17,12 @@ rule 39): the feature branch is checked in the Docker Sandbox FIRST, and only
 if every check passes does the merge land and that exact build get promoted.
 A branch that fails the check is never merged.
 
+The branch merged is the branch the build made (Part M of the rewrite-on-refusal
+spec): the row's recorded ``merge_branch`` when the conductor cut one (a
+repair's ``fix/<task id>-<build8>``, reachable here with ``--build-id``), else
+the feature's own ``autobuild/<feature id>``; the printed line names it when it
+is not the feature's own.
+
 Exit codes: 0 = checked, merged and running (PASSED); 1 = any other outcome
 (the line printed says plainly which step failed and why).
 """
@@ -158,6 +164,8 @@ async def _arun(
             "unpinned merge"
         )
     baseline_failing = read_baseline_failing(row.build_id)
+    # The branch the build made, when the conductor recorded one (a repair).
+    merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
 
     publisher, guardkit_run, dispatcher, closer = await _aopen_backends(config)
     try:
@@ -182,12 +190,20 @@ async def _arun(
             decided_by=decided_by,
             baseline_failing=baseline_failing,
             dry_run=dry_run,
+            merge_branch=merge_branch,
         )
     finally:
         await closer()
 
+    # The branch is named only when it is not the feature's own (Part M,
+    # rule 55), so a feature build's line reads exactly as before.
+    named = (
+        f"{row.feature_id} (branch {merge_branch})"
+        if merge_branch is not None
+        else row.feature_id
+    )
     click.echo(
-        f"merge-deploy {row.feature_id} @ {row.repo}: result={outcome.result} "
+        f"merge-deploy {named} @ {row.repo}: result={outcome.result} "
         f"status={outcome.status}"
     )
     gate = outcome.gate_before_merge or {}

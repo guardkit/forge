@@ -106,10 +106,14 @@ class _FakeExecute:
         )
 
 
-def _row(worktree_path: str | None = _WORKTREE) -> SimpleNamespace:
+def _row(
+    worktree_path: str | None = _WORKTREE, branch: str | None = "main"
+) -> SimpleNamespace:
+    """A mode-C row. ``branch`` is the branch it was queued ON — ``main`` by
+    default, which leaves the wiring-time base in force (Part M, rule 56)."""
     return SimpleNamespace(
         build_id=_BUILD.build_id,
-        branch="lane/fix-journey",
+        branch=branch,
         worktree_path=worktree_path,
     )
 
@@ -181,17 +185,35 @@ class TestProbeCommand:
             "repair/TASK-FEAT39F6FIX1..HEAD",
         ]
 
-    def test_any_other_row_branch_leaves_the_wiring_time_base_in_force(self) -> None:
+    def test_a_row_queued_on_any_branch_of_its_own_counts_from_that_branch(self) -> None:
+        """Part M, rule 56 (2026-09-07): every mode-C row's branch is its base —
+        the conductor cuts the journey's tree from whatever ``--branch`` named,
+        so the probe counts from the same place, or ``lane/x``'s own commits
+        would be handed back as a leg's work. Under Part L's first rule only a
+        ``repair/`` branch moved the base; this row was counted from main."""
         execute = _FakeExecute(stdout="0")
-        row = _row()
-        row.branch = "lane/fix-journey"
         probe = make_mode_c_commit_probe(
-            _FakePool(row), base_branch="release/2026-07", execute=execute
+            _FakePool(_row(branch="lane/fix-journey")),
+            base_branch="release/2026-07",
+            execute=execute,
         )
 
         _run(probe(_BUILD))
 
-        assert execute.calls[0]["command"][-1] == "release/2026-07..HEAD"
+        assert execute.calls[0]["command"][-1] == "lane/fix-journey..HEAD"
+
+    def test_a_row_saying_main_or_nothing_leaves_the_wiring_time_base_in_force(self) -> None:
+        for branch in ("main", None, "", "   "):
+            execute = _FakeExecute(stdout="0")
+            probe = make_mode_c_commit_probe(
+                _FakePool(_row(branch=branch)),
+                base_branch="release/2026-07",
+                execute=execute,
+            )
+
+            _run(probe(_BUILD))
+
+            assert execute.calls[0]["command"][-1] == "release/2026-07..HEAD", branch
 
     def test_command_is_list_tokens_with_no_shell_metacharacters(self) -> None:
         # Defence against the shell-injection shape: a branch name with

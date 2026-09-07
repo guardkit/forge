@@ -324,6 +324,58 @@ class TestDualEnvelope:
         assert "Reject = nothing changes" in paused.rationale
 
     @pytest.mark.asyncio
+    async def test_the_card_offers_the_branch_the_build_made(
+        self, config, pool
+    ) -> None:
+        """Part M, rule 55: the payload's ``branch`` is the branch that will be merged.
+
+        A repair's commits land on the fix journey's own branch, recorded on
+        ``builds.merge_branch`` by the conductor; the offer must name THAT,
+        not the feature's ``autobuild/<feature id>`` (already on main), and
+        the card says the branch because it is not the feature's own.
+        """
+        _insert_build(pool)
+        pool.record_merge_branch(BUILD_ID, "fix/TASK-MX1FIX1-00000001")
+        recorder = _Recorder()
+        await _service(config, pool, recorder).maybe_offer(_event())
+
+        _subject, body = recorder.events[0][1]
+        details = MessageEnvelope.model_validate_json(body).payload["details"]
+        assert details["branch"] == "fix/TASK-MX1FIX1-00000001"
+        assert details["merge_branch"] == "fix/TASK-MX1FIX1-00000001"
+        paused = recorder.events[1][1]
+        assert paused.rationale.startswith(
+            f"{FEATURE_ID} (branch fix/TASK-MX1FIX1-00000001) built clean — "
+        )
+        assert "Approve = merge into main" in paused.rationale
+        # The durable latch says the same thing the card said.
+        latch = [
+            s for s in pool.read_stages(BUILD_ID)
+            if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ][0].details[MERGE_OFFER_DETAILS_KEY]
+        assert latch["branch"] == "fix/TASK-MX1FIX1-00000001"
+        assert latch["merge_branch"] == "fix/TASK-MX1FIX1-00000001"
+
+    @pytest.mark.asyncio
+    async def test_a_feature_build_with_an_empty_column_offers_its_own_branch(
+        self, config, pool
+    ) -> None:
+        """Rule 54: an empty ``merge_branch`` falls back to ``autobuild/<feature>``."""
+        _insert_build(pool)
+        assert pool.get_build_row(BUILD_ID).merge_branch is None
+        recorder = _Recorder()
+        await _service(config, pool, recorder).maybe_offer(_event())
+
+        _subject, body = recorder.events[0][1]
+        details = MessageEnvelope.model_validate_json(body).payload["details"]
+        assert details["branch"] == f"autobuild/{FEATURE_ID}"
+        assert details["merge_branch"] is None
+        paused = recorder.events[1][1]
+        # The card is byte for byte what it always was: no branch named.
+        assert paused.rationale.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed. ")
+        assert "(branch " not in paused.rationale
+
+    @pytest.mark.asyncio
     async def test_latch_details_carry_what_the_consumer_needs(
         self, config, pool
     ) -> None:

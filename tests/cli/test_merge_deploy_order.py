@@ -191,3 +191,115 @@ def test_the_attended_command_never_merges_a_branch_that_failed_its_check(
     assert "checked in the sandbox before merging: fail (4 of 5 checks passed)" in result.output
     # main did not move.
     assert _git(repo_root, "rev-parse", "main") != wired["merged"]
+
+
+# ---------------------------------------------------------------------------
+# The attended word merges the branch the build made (Part M, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+REPAIR_BUILD_ID = "build-FEAT-MD1-20260907120000"
+REPAIR_BRANCH = "fix/TASK-MD1FIX1-07120000"
+
+
+def _wire_recording_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    pool: SqliteLifecyclePersistence,
+    repo_root: Path,
+    *,
+    merged: str,
+) -> dict[str, Any]:
+    """The green wiring, but the merge fake keeps the argv it was given."""
+    argv: list[list[str]] = []
+    publisher = _Publisher()
+
+    async def _guardkit(**kwargs: Any) -> Any:
+        argv.append(list(kwargs["args"]))
+        return SimpleNamespace(
+            status="success",
+            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
+            stderr=None, exit_code=0, artefacts=[],
+        )
+
+    async def _deploy(**kwargs: Any) -> Any:
+        leg = kwargs.get("leg", "deploy")
+        if leg == "candidate_check":
+            return SimpleNamespace(
+                outcome="complete", verdict="pass", failed_step=None,
+                events=("DeployQueued",),
+                detail={"gate_summary": {"verdict": "pass", "checks_total": 5,
+                                         "checks_passed": 5, "failed_checks": []},
+                        "candidate": "standing"},
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
+        return SimpleNamespace(
+            outcome="complete", verdict="pass", deploy_record_ref="r",
+            detail={"candidate": "torn-down"},
+        )
+
+    async def _backends(_config: ForgeConfig):
+        async def _close() -> None:
+            return None
+
+        return publisher, _guardkit, _deploy, _close
+
+    async def _main_sha(_repo_root: Path) -> str | None:
+        return _git(repo_root, "rev-parse", "main")
+
+    monkeypatch.setattr(merge_deploy_module, "_open_pool", lambda _p: pool)
+    monkeypatch.setattr(merge_deploy_module, "_aopen_backends", _backends)
+    monkeypatch.setattr(merge_offer_module, "git_rev_parse_main", _main_sha)
+    return {"argv": argv, "publisher": publisher}
+
+
+def test_a_repair_named_by_build_id_merges_its_recorded_branch(
+    config, pool, repo_root, monkeypatch
+) -> None:
+    """Rule 54 on the attended path: the row's ``merge_branch`` is what is checked
+    and merged, ``--branch`` reaches the merge command, and the printed line
+    names the branch because it is not the feature's own (rule 55)."""
+    _git(repo_root, "checkout", "-q", "-b", REPAIR_BRANCH, "main")
+    (repo_root / "the-repair.txt").write_text("the repair\n", encoding="utf-8")
+    _git(repo_root, "add", "the-repair.txt")
+    _git(repo_root, "commit", "-q", "-m", "the repair")
+    _git(repo_root, "checkout", "-q", "main")
+    repair_tip = _git(repo_root, "rev-parse", REPAIR_BRANCH)
+    pool.connection.execute(
+        "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
+        "status, triggered_by, correlation_id, queued_at, mode, task_id) VALUES "
+        "(?, ?, ?, 'repair/TASK-MD1FIX1', 'f.yaml', 'COMPLETE', 'cli', ?, "
+        "'2026-09-07T12:00:00Z', 'mode-c', 'TASK-MD1FIX1')",
+        (REPAIR_BUILD_ID, FEATURE_ID, REPO, f"corr-{REPAIR_BUILD_ID}"),
+    )
+    pool.connection.commit()
+    pool.record_merge_branch(REPAIR_BUILD_ID, REPAIR_BRANCH)
+    wired = _wire_recording_argv(monkeypatch, pool, repo_root, merged=repair_tip)
+
+    result = CliRunner().invoke(
+        merge_deploy_cmd, [FEATURE_ID, "--build-id", REPAIR_BUILD_ID], obj=config
+    )
+
+    assert result.exit_code == 0, result.output
+    assert wired["argv"][0][-2:] == ["--branch", REPAIR_BRANCH]
+    assert f"merge-deploy {FEATURE_ID} (branch {REPAIR_BRANCH}) @ {REPO}: result=merged-and-running" in result.output
+    report = wired["publisher"].reports[0]
+    assert report.branch == REPAIR_BRANCH
+    assert report.gate_before_merge["candidate_sha"] == repair_tip
+    assert report.gate_before_merge["trees_match"] is True
+    assert not (repo_root / ".forge-candidates" / FEATURE_ID).exists()
+
+
+def test_a_feature_build_is_merged_without_a_branch_flag_and_named_as_before(
+    config, pool, repo_root, monkeypatch
+) -> None:
+    merged = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+    wired = _wire_recording_argv(monkeypatch, pool, repo_root, merged=merged)
+
+    result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+    assert result.exit_code == 0, result.output
+    assert "--branch" not in wired["argv"][0]
+    assert wired["argv"][0][-1] == "--json"
+    assert f"merge-deploy {FEATURE_ID} @ {REPO}: result=merged-and-running" in result.output
+    assert "(branch " not in result.output
+    assert wired["publisher"].reports[0].branch == f"autobuild/{FEATURE_ID}"

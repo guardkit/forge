@@ -247,6 +247,15 @@ class BuildRow(BaseModel):
     # (the runner never writes the ``error`` class — its absence is its value).
     # ``status`` is untouched by this column: a timeout is still ``FAILED``.
     terminal_class: str | None = None
+    # The branch the merge word merges (``schema_v11.sql``; rewrite-on-refusal
+    # spec Part M, rule 54). The conductor writes the fix journey's own branch
+    # (``fix/<task id>-<build8>``) here the moment it cuts it, so a repair's
+    # commits reach main. ``None`` for every feature build and every
+    # historical row: the readers (the merge offer, the candidate check, the
+    # landed-merge detection, the merge command) fall back to
+    # ``autobuild/<feature id>`` exactly as before. Distinct from ``branch``,
+    # which is the branch the build was queued ON.
+    merge_branch: str | None = None
 
 
 class BuildStatusView(BaseModel):
@@ -350,6 +359,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "budget_breach",
             "task_id",
             "terminal_class",
+            "merge_branch",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -387,6 +397,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         profile=data.get("profile"),
         task_id=data.get("task_id"),
         terminal_class=data.get("terminal_class"),
+        merge_branch=data.get("merge_branch"),
     )
 
 
@@ -1053,6 +1064,72 @@ class SqliteLifecyclePersistence:
                  WHERE build_id = ?
                 """,
                 (path, build_id),
+            )
+            self._cx.execute("COMMIT;")
+        except sqlite3.Error:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback failure is rare
+                pass
+            raise
+
+    # ------------------------------------------------------------------
+    # Write API — record_merge_branch (the branch the merge word merges,
+    # schema_v11; rewrite-on-refusal spec Part M, rule 54)
+    # ------------------------------------------------------------------
+
+    def record_merge_branch(self, build_id: str, branch: str) -> None:
+        """Persist the branch the merge word must merge onto the ``builds`` row.
+
+        The conductor's worktree writer
+        (:mod:`forge.cli._conductor_worktree`) calls this the moment it cuts
+        the fix journey's own branch (``fix/<task id>-<build8>``), beside
+        :meth:`record_worktree_path`. Before this column every reader of the
+        merge word derived ``autobuild/<feature id>``, which for a repair is
+        the ORIGINAL feature's branch — already on main — so the repair's
+        commits would never have reached main.
+
+        This is a **status-preserving** UPDATE of ``merge_branch`` alone, in
+        the pattern of :meth:`record_worktree_path`: ``apply_transition``
+        remains the sole writer of ``builds.status``. A missing ``build_id``
+        matches zero rows and is a quiet no-op; the caller proves the row
+        exists before it cuts anything.
+
+        Last write wins. The reuse arm re-records the same branch on a
+        redelivery, which is a no-op in value terms.
+
+        A feature build never calls this: its column stays NULL and every
+        reader falls back to ``autobuild/<feature id>``, so an empty value is
+        refused rather than written as a marker that reads like the fallback
+        without being it.
+
+        Args:
+            build_id: The build whose journey branch was cut.
+            branch: The branch the merge word merges. Non-blank.
+
+        Raises:
+            ValueError: If ``build_id`` or ``branch`` is blank.
+            sqlite3.Error: For any database error. The transaction is
+                rolled back so the row is not left partially updated.
+        """
+        if not build_id:
+            raise ValueError("record_merge_branch: build_id must be non-empty")
+        if not branch or not branch.strip():
+            raise ValueError(
+                "record_merge_branch: branch must be a non-blank branch name "
+                "— a blank merge_branch reads back like the NULL the readers "
+                "fall back from, without being it"
+            )
+
+        try:
+            self._cx.execute("BEGIN IMMEDIATE;")
+            self._cx.execute(
+                """
+                UPDATE builds
+                   SET merge_branch = ?
+                 WHERE build_id = ?
+                """,
+                (branch.strip(), build_id),
             )
             self._cx.execute("COMMIT;")
         except sqlite3.Error:

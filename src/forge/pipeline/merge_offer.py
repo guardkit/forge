@@ -58,6 +58,8 @@ __all__ = [
     "MERGE_OFFER_TARGET_IDENTIFIER",
     "MergeOfferService",
     "approval_subject_for",
+    "branch_to_merge",
+    "default_merge_branch",
     "git_rev_parse_main",
     "merge_request_id",
     "read_baseline_failing",
@@ -82,6 +84,26 @@ SOURCE_ID: str = "forge"
 def merge_request_id(build_id: str) -> str:
     """The offer's ``request_id`` — ``merge-{build_id}`` (spec-pinned)."""
     return f"merge-{build_id}"
+
+
+def default_merge_branch(feature_id: str) -> str:
+    """``autobuild/<feature id>`` — the branch every feature build is made on."""
+    return f"autobuild/{feature_id}"
+
+
+def branch_to_merge(feature_id: str, merge_branch: Any) -> str:
+    """The branch the merge word merges for this build.
+
+    Rewrite-on-refusal spec Part M, rule 54: the build row's ``merge_branch``
+    when the conductor recorded one (a repair's commits land on the fix
+    journey's own branch, ``fix/<task id>-<build8>``), else the feature's own
+    ``autobuild/<feature id>`` — so every feature build, whose column is
+    empty, behaves byte for byte as it always has. Every reader of the branch
+    (the offer, the candidate check, the landed-merge detection, the merge
+    command) goes through this one function so they can never disagree.
+    """
+    recorded = str(merge_branch or "").strip()
+    return recorded or default_merge_branch(feature_id)
 
 
 def approval_subject_for(feature_id: str) -> str:
@@ -286,12 +308,19 @@ class MergeOfferService:
 
         request_id = merge_request_id(event.build_id)
         subject = approval_subject_for(event.feature_id)
+        # The branch the press will merge (Part M, rule 55): the row's recorded
+        # journey branch for a repair, the feature's own branch otherwise. The
+        # raw column rides beside it so the executor can tell "recorded" from
+        # "derived" without a second lookup.
+        merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
+        branch = branch_to_merge(event.feature_id, merge_branch)
         details: dict[str, Any] = {
             "kind": "merge_deploy_offer",
             "build_id": event.build_id,
             "feature_id": event.feature_id,
             "repo": row.repo,
-            "branch": f"autobuild/{event.feature_id}",
+            "branch": branch,
+            "merge_branch": merge_branch,
             "expect_main_sha": expect_main_sha,
             "tasks_completed": event.tasks_completed,
             "tasks_total": event.tasks_total,
@@ -322,8 +351,15 @@ class MergeOfferService:
         )
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
+        # The card names the branch only when it is not the feature's own
+        # (Part M, rule 55): a feature build's card reads exactly as before.
+        named = (
+            f"{event.feature_id} (branch {branch})"
+            if merge_branch is not None
+            else event.feature_id
+        )
         rationale = (
-            f"{event.feature_id} built clean — {event.tasks_completed} of "
+            f"{named} built clean — {event.tasks_completed} of "
             f"{event.tasks_total} tasks passed. Approve = merge into main, "
             "deploy to the sandbox and run the checks; the branch is kept "
             "either way. Reject = nothing changes."
