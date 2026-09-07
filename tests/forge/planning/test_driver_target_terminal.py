@@ -4760,14 +4760,26 @@ class _Crash(BaseException):
     catches it — the durable rows are whatever was written before it."""
 
 
-def _sequenced_normalizer(sink: dict[str, Any], outcomes: list[Any]):
+def _sequenced_normalizer(
+    sink: dict[str, Any], outcomes: list[Any], *, legacy: bool = False
+):
     """A fake normalize_stamps that answers from ``outcomes`` in call order
     (the last one repeats). ``None`` = behave like a clean guardkit: write the
     fixture's one stamp and report ``written``. A ``_Crash`` instance is
-    RAISED — the simulated process death."""
+    RAISED — the simulated process death.
 
-    async def _normalize(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
+    Since rule 1a (2026-09-07) the production collaborator takes a keyword,
+    ``rules_only``; this fake takes it too and records, per call, what the
+    driver passed under ``sink["rules_only"]`` — ``True`` when the keyword
+    was passed, ``None`` when the call was positional. ``legacy=True`` builds
+    the collaborator in its older shape — positional ``(worktree,
+    feature_id)`` only — the one the driver must still work with."""
+
+    async def _answer(
+        worktree: Path, feature_id: str, rules_only: bool | None
+    ) -> StampNormalizerOutcome:
         sink.setdefault("order", []).append("normalize_stamps")
+        sink.setdefault("rules_only", []).append(rules_only)
         sink["calls"] = sink.get("calls", 0) + 1
         outcome = outcomes[min(sink["calls"] - 1, len(outcomes) - 1)]
         if isinstance(outcome, _Crash):
@@ -4785,6 +4797,18 @@ def _sequenced_normalizer(sink: dict[str, Any], outcomes: list[Any]):
             stamped={"ok": "hurl"},
             rules={"ok": "R9"},
         )
+
+    if legacy:
+
+        async def _legacy(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
+            return await _answer(worktree, feature_id, None)
+
+        return _legacy
+
+    async def _normalize(
+        worktree: Path, feature_id: str, *, rules_only: bool | None = None
+    ) -> StampNormalizerOutcome:
+        return await _answer(worktree, feature_id, rules_only)
 
     return _normalize
 
@@ -5391,3 +5415,301 @@ async def test_the_drivers_own_record_stops_saying_no_fallback_home_when_the_mod
         "The model fallback was asked and could not answer: HTTPStatusError: 502 "
         "Bad Gateway from localhost:4000." in card
     )
+
+
+# ---------------------------------------------------------------------------
+# THE REWRITE COMES BEFORE THE MODEL FALLBACK (rule 1a, 2026-09-07)
+#
+# The first live run of the rewrite round never fired: the model fallback
+# (reachable through LiteLLM since that morning) answered for the schema
+# examples and "proved" them with a check that never touches the schema, so
+# there was no refusal for the round to hear. Now the FIRST stamping of a run
+# goes by rule only — the collaborator is called with rules_only=True and the
+# argv carries --no-model — exactly when the round could fire: the switch is
+# on, the law is enforced for the repo, and this run has not had its one
+# rewrite. The second stamping, after the rewrite, asks the model about what
+# is still refused. Switch off, law not enforced, or rewrite already spent:
+# the model is asked on the first stamping as before.
+# ---------------------------------------------------------------------------
+
+_RULES_FIRST_LOG = "first stamping by rule only (the rewrite round is on)"
+
+_SWITCHED_OFF_MODEL_OUTCOME = {
+    "status": "switched_off",
+    "detail": (
+        "the model fallback was not asked about 2 title(s) no rule could decide: "
+        "switched off for this stamping by the caller (--no-model). The titles "
+        "stay refused and nothing was stamped."
+    ),
+}
+
+
+def _switched_off_outcome() -> StampNormalizerOutcome:
+    """What the guardkit half answers to ``--no-model`` when the rules refuse:
+    the same refusal, and the model outcome says the caller switched it off."""
+    return StampNormalizerOutcome(
+        status="refused",
+        detail=(
+            "2 scenario(s) undecidable by rule (R1–R10) — the model fallback was "
+            "not asked (switched off for this stamping); nothing was written"
+        ),
+        refused_titles=_UNDECIDABLE_TITLES,
+        model_outcome=dict(_SWITCHED_OFF_MODEL_OUTCOME),
+    )
+
+
+def _not_configured_outcome() -> StampNormalizerOutcome:
+    """A stamping that COULD ask the model and found no endpoint."""
+    return StampNormalizerOutcome(
+        status="refused",
+        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
+        refused_titles=_UNDECIDABLE_TITLES,
+        model_outcome={"status": "not_configured", "detail": "no model endpoint is configured"},
+    )
+
+
+def _driver_log_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "forge.planning.driver"]
+
+
+@pytest.mark.asyncio
+async def test_the_first_stamping_runs_by_rule_only_and_the_second_asks_the_model(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rule 1a end to end in an enforced repo: the first stamping is asked for
+    by rule only (the machine log names the mode), it refuses with the model
+    switched off, the rewrite fires, the second stamping is called the old
+    way (the model allowed) and stamps clean. The plan receipt says which
+    stamping ran by rule only; nothing on any surface says "no endpoint is
+    configured"; the durable spec row keeps rule 4's fields and no more."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), None]),
+    )
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert sink["rules_only"] == [True, None]
+    lines = _driver_log_lines(caplog)
+    assert any(_RULES_FIRST_LOG in m for m in lines)
+    assert any("this time with the model fallback allowed" in m for m in lines)
+    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert receipt["status"] == "written"
+    assert receipt["rules_only"] is False  # the second stamping, committed with the plan
+    assert "rules_only_note" not in receipt
+    assert receipt["rewrite"]["first_stamping"] == {
+        "status": "refused",
+        "rules_only": True,
+        "model_outcome": _SWITCHED_OFF_MODEL_OUTCOME,
+    }
+    assert _error_cards(h) == []
+    assert not any("no endpoint is configured" in m for _, m, _ in h.ctx["notifications"])
+    assert set(_approved_spec_rows(store)[-1]["rewritten_by_machine"]) == {
+        "round", "author", "note", "refused_titles", "changes",
+    }
+
+
+@pytest.mark.asyncio
+async def test_with_the_switch_off_the_first_stamping_asks_the_model_as_before(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``planning.rewrite_on_refusal: false``: the round cannot fire, so the
+    first stamping is called the old way — no keyword, no rule-only line."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None]),
+        rewrite_on_refusal=False,
+    )
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert sink["rules_only"] == [None]
+    assert not any(_RULES_FIRST_LOG in m for m in _driver_log_lines(caplog))
+
+
+@pytest.mark.asyncio
+async def test_an_unenforced_repo_stamps_as_before_even_with_the_switch_on(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The law is not enforced for the repo: the round never fires there, so
+    the stamping is called the old way, the log says why, and the receipt
+    says the stamping was not by rule only (with no note — nothing was
+    refused it)."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_partial_outcome()]),
+    )
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert sink["rules_only"] == [None]
+    lines = _driver_log_lines(caplog)
+    assert not any(_RULES_FIRST_LOG in m for m in lines)
+    assert any("the rewrite round does not fire in an unenforced repo" in m for m in lines)
+    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    assert receipt["rules_only"] is False
+    assert "rules_only_note" not in receipt
+    assert receipt["proceeded_unenforced"] is True
+
+
+@pytest.mark.asyncio
+async def test_after_the_one_rewrite_a_re_drive_stamps_with_the_model_allowed(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Rule 7 meets rule 1a: the re-drive reads the durable row, finds the
+    rewrite has happened, and its stamping — the only one this drive does —
+    is called the old way, because the round can no longer fire."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), _Crash()]),
+    )
+    with pytest.raises(_Crash):
+        await h.driver.drive(CID)
+    assert sink["rules_only"] == [True, None]
+    assert _approved_spec_rows(store)[-1]["rewritten_by_machine"]["round"] == 1
+
+    sink2: dict[str, Any] = {}
+    h2 = _make_driver(
+        store,
+        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2"),
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink2, [_not_configured_outcome()]),
+    )
+    assert await _drive_to_failure(h2, store) == PlanningState.FAILED.value
+    assert sink2["rules_only"] == [None]
+    assert h2.ctx["counters"]["spec"] == 0
+    card = _error_cards(h2)[0]
+    assert _STOP_STILL_UNPROVEN in card
+    assert "The model fallback was not asked: no endpoint is configured." in card
+
+
+@pytest.mark.asyncio
+async def test_an_older_collaborator_without_the_keyword_still_works_and_the_receipt_says_so(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A normalize_stamps collaborator in its pre-1a shape (positional only):
+    the driver calls it the old way instead of failing on the keyword, warns,
+    and the receipt says the first stamping was not by rule only and why. The
+    run itself goes exactly as the rewrite round always did."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None], legacy=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert sink["rules_only"] == [None, None]
+    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    first = receipt["rewrite"]["first_stamping"]
+    assert first["status"] == "refused" and first["rules_only"] is False
+    assert "does not take the rules_only keyword" in first["rules_only_note"]
+    assert any("does not take the rules_only keyword" in m for m in _driver_log_lines(caplog))
+    assert receipt["rules_only"] is False and "rules_only_note" not in receipt
+
+
+@pytest.mark.asyncio
+async def test_after_a_rewrite_the_card_reports_the_second_stampings_model_outcome(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The first stamping (model switched off) set off the rewrite; the second
+    could ask the model and found no endpoint. The card is about the second:
+    the "no endpoint is configured" sentence appears once, for that one, never
+    for the switched-off first."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(
+            sink, [_switched_off_outcome(), _not_configured_outcome()]
+        ),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert sink["rules_only"] == [True, None]
+    card = _error_cards(h)[0]
+    assert _STOP_STILL_UNPROVEN in card
+    assert card.count("The model fallback was not asked: no endpoint is configured.") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_switched_off_first_stamping_never_puts_no_endpoint_on_the_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The rewrite changed nothing, so the card is built from the FIRST
+    stamping — the one the machine ran by rule only. The card must not say
+    the model was not asked for want of an endpoint (it was not asked because
+    the machine switched it off), and says nothing about the model at all;
+    the machine record keeps the reason."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),  # the same reply both rounds
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome()]),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert sink["rules_only"] == [True]
+    card = _error_cards(h)[0]
+    assert _STOP_CHANGED_NOTHING in card
+    assert "no endpoint is configured" not in card
+    assert "model fallback" not in card
+    assert "there is no fallback home, so nothing was stamped and nothing was built" in card
+    error = store.get_run(CID)["error"] or ""
+    assert "switched off for this stamping" in error
+
+
+def test_the_card_says_nothing_about_the_model_when_the_machine_switched_it_off() -> None:
+    card = _Driver._stamp_normalizer_card(
+        CID, "FEAT-1234", _refusal_with_model(dict(_SWITCHED_OFF_MODEL_OUTCOME))
+    )
+    assert "no endpoint is configured" not in card
+    assert "model fallback" not in card
+    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
+    assert f"{titles}\nThis repo enforces the routing law" in card

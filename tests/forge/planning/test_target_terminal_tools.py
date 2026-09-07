@@ -2343,3 +2343,208 @@ def test_an_unknown_model_outcome_status_is_not_invented_into_one() -> None:
         "FEAT-TIME", status="failed", exit_code=2, stdout_tail=payload, stderr=""
     )
     assert out.model_outcome is None
+
+
+# -- the rewrite comes before the model fallback (rule 1a, 2026-09-07) ---------
+#
+# The production collaborator takes ``rules_only``: true adds ``--no-model``
+# to the argv, so the normalizer decides by rule alone on the driver's first
+# stamping. An older guardkit that has the subcommand but not the option is
+# run again the old way, once, and the receipt says so. The model outcome
+# gains ``switched_off`` — read from the JSON and from the one plain stderr
+# line, and never mistaken for "no endpoint is configured".
+
+from forge.planning.target_terminal_tools import (  # noqa: E402
+    NO_MODEL_OPTION_UNKNOWN_NOTE,
+    normalizer_accepts_rules_only,
+)
+
+_CLICK_NO_SUCH_OPTION = (
+    "Usage: python -m guardkit.cli.main qa normalize-stamps [OPTIONS]\n"
+    "Try 'python -m guardkit.cli.main qa normalize-stamps --help' for help.\n\n"
+    "Error: No such option: --no-model\n"
+)
+
+_SWITCHED_OFF_LINE = (
+    "INFO:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
+    "feature FEAT-TIME — the model fallback was not asked about 2 title(s) no "
+    "rule could decide: switched off for this stamping by the caller "
+    "(--no-model). The titles stay refused and nothing was stamped."
+)
+
+
+def _sequenced_run(answers: list[tuple[str, int, str, str]]):
+    """A fake seam that answers per call from ``(status, exit, stderr, tail)``
+    rows (the last repeats) and records every call's kwargs."""
+    calls: list[dict[str, Any]] = []
+
+    async def _run(**kwargs):
+        calls.append(dict(kwargs))
+        status, exit_code, stderr, tail = answers[min(len(calls) - 1, len(answers) - 1)]
+        return SimpleNamespace(status=status, exit_code=exit_code, stderr=stderr, stdout_tail=tail)
+
+    return _run, calls
+
+
+@pytest.mark.asyncio
+async def test_make_normalize_stamps_adds_no_model_exactly_when_asked_for_rules_only(
+    tmp_path: Path,
+) -> None:
+    run_fn, captured = _fake_run("failed", 2, tail=_fixture("refusal-stdout.txt"))
+    normalize = make_normalize_stamps(run_fn=run_fn)
+    assert normalizer_accepts_rules_only(normalize)
+
+    out = await normalize(tmp_path, "FEAT-TIME", rules_only=True)
+    assert captured["args"] == [
+        "normalize-stamps", "--feature", "FEAT-TIME", "--repo", str(tmp_path), "--no-model",
+    ]
+    assert out.status == "refused"
+    assert out.rules_only is True
+    assert out.receipt()["rules_only"] is True
+    assert "rules_only_note" not in out.receipt()
+
+    # Positional (every existing caller) and an explicit False: no flag, and
+    # the receipt says false — never absent.
+    out = await normalize(tmp_path, "FEAT-TIME")
+    assert "--no-model" not in captured["args"]
+    assert out.rules_only is False and out.receipt()["rules_only"] is False
+    out = await normalize(tmp_path, "FEAT-TIME", rules_only=False)
+    assert "--no-model" not in captured["args"]
+    assert out.rules_only is False and out.receipt()["rules_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_older_guardkit_without_the_option_is_run_again_the_old_way_and_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """click's "No such option: --no-model" (exit 2) on a rule-only call: the
+    seam is called once more WITHOUT the option, the outcome is whatever that
+    run said, ``rules_only`` is false and the note says why."""
+    run_fn, calls = _sequenced_run(
+        [
+            ("failed", 2, _CLICK_NO_SUCH_OPTION, ""),
+            ("failed", 2, "", _fixture("refusal-stdout.txt")),
+        ]
+    )
+    with caplog.at_level("WARNING", logger="forge.planning.target_terminal_tools"):
+        out = await make_normalize_stamps(run_fn=run_fn)(tmp_path, "FEAT-TIME", rules_only=True)
+    assert len(calls) == 2
+    assert calls[0]["args"][-1] == "--no-model"
+    assert "--no-model" not in calls[1]["args"]
+    assert out.status == "refused" and out.refused_titles[1] == "Another undecidable one"
+    assert out.rules_only is False
+    assert out.rules_only_note == NO_MODEL_OPTION_UNKNOWN_NOTE
+    assert out.receipt()["rules_only"] is False
+    assert out.receipt()["rules_only_note"] == NO_MODEL_OPTION_UNKNOWN_NOTE
+    assert any(NO_MODEL_OPTION_UNKNOWN_NOTE in r.getMessage() for r in caplog.records)
+
+    # The same stderr on a call that never asked for --no-model is just a
+    # failure — nothing is retried on a guess.
+    run_fn, calls = _sequenced_run([("failed", 2, _CLICK_NO_SUCH_OPTION, "")])
+    out = await make_normalize_stamps(run_fn=run_fn)(tmp_path, "FEAT-TIME")
+    assert len(calls) == 1 and out.status == "failed" and not out.rules_only_note
+
+
+def test_normalizer_accepts_rules_only_reads_the_signature() -> None:
+    async def positional_only(worktree: Path, feature_id: str) -> None: ...
+
+    async def keyword_only(worktree: Path, feature_id: str, *, rules_only: bool = False) -> None: ...
+
+    async def positional_or_keyword(worktree: Path, feature_id: str, rules_only: bool = False) -> None: ...
+
+    async def kwargs(worktree: Path, feature_id: str, **kw: Any) -> None: ...
+
+    assert not normalizer_accepts_rules_only(positional_only)
+    assert normalizer_accepts_rules_only(keyword_only)
+    assert normalizer_accepts_rules_only(positional_or_keyword)
+    assert normalizer_accepts_rules_only(kwargs)
+    assert not normalizer_accepts_rules_only(object())  # unreadable = not taken
+
+
+def test_classify_reads_switched_off_from_the_json_and_the_record_says_so() -> None:
+    payload = json.dumps(
+        {
+            "refused": [_MOON, "Another undecidable one"],
+            "written": False,
+            "model_outcome": {
+                "status": "switched_off",
+                "detail": "switched off for this stamping by the caller (--no-model)",
+            },
+        },
+        indent=2,
+    )
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=2, stdout_tail=payload, stderr=""
+    )
+    assert out.status == "refused"
+    assert out.model_outcome == {
+        "status": "switched_off",
+        "detail": "switched off for this stamping by the caller (--no-model)",
+    }
+    assert not out.model_was_asked
+    assert "no fallback home" not in out.detail
+    assert "the model fallback was not asked (switched off for this stamping)" in out.detail
+    assert out.receipt()["model_outcome"]["status"] == "switched_off"
+
+
+def test_the_switched_off_line_is_never_read_as_no_endpoint_configured() -> None:
+    """The guardkit half's INFO line says "was not asked" AND "switched off";
+    the reader must take the second, and strip the ``feature <id> —`` prefix."""
+    stderr = _with_model_line_where_guardkit_prints_it(_SWITCHED_OFF_LINE)
+    echoed = model_outcome_from_console_echo(stderr)
+    assert echoed is not None
+    assert echoed["status"] == "switched_off"
+    assert echoed["detail"].startswith("the model fallback was not asked about 2 title(s)")
+    assert "endpoint" not in echoed and "model" not in echoed
+    out = classify_normalizer_result(
+        "FEAT-TIME", status="failed", exit_code=3, stdout_tail="", stderr=stderr
+    )
+    assert out.status == "partial"
+    assert out.refused_titles == (_MOON, "Another undecidable one")
+    assert out.model_outcome is not None and out.model_outcome["status"] == "switched_off"
+    assert not out.model_was_asked
+    assert "no fallback home" not in out.detail
+
+
+@pytest.mark.asyncio
+async def test_live_guardkit_rules_only_is_honoured_or_fallen_back_from_and_receipted(
+    tmp_path: Path,
+) -> None:
+    """The REAL CLI through the real seam with ``rules_only=True``: a guardkit
+    that knows ``--no-model`` runs by rule only and the outcome says so; one
+    that predates it (the sibling checkout until the guardkit half merges) is
+    run again the old way and the receipt carries the note. Either way the
+    plan is stamped."""
+    checkout, python = live_guardkit_or_skip(Path(__file__))
+    fixture_src = checkout / "tests" / "fixtures" / "stamp_normalizer" / "api_test_5bc6fd1"
+    if not fixture_src.is_dir():
+        pytest.skip("guardkit's api_test_5bc6fd1 fixture not present")
+    wt = tmp_path / "wt"
+    shutil.copytree(fixture_src, wt)
+    yaml_path = wt / ".guardkit" / "features" / "FEAT-TIME.yaml"
+    import re as _re
+
+    yaml_path.write_text(
+        _re.sub(r"scenarios:\n(?:  .*\n)+", "", yaml_path.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    run_fn = live_run_fn(checkout, python)
+    helped = await run_fn(
+        subcommand="qa",
+        args=["normalize-stamps", "--help"],
+        repo_path=wt,
+        read_allowlist=[wt],
+        timeout_seconds=60,
+        with_nats_streaming=False,
+    )
+    knows_the_option = "--no-model" in str(getattr(helped, "stdout_tail", "") or "")
+
+    out = await make_normalize_stamps(run_fn=run_fn)(wt, "FEAT-TIME", rules_only=True)
+    assert out.status == "written", out
+    assert out.stamps_on_branch == 4
+    if knows_the_option:
+        assert out.rules_only is True and not out.rules_only_note
+    else:
+        assert out.rules_only is False
+        assert out.rules_only_note == NO_MODEL_OPTION_UNKNOWN_NOTE
+    assert out.receipt()["rules_only"] is knows_the_option

@@ -42,6 +42,7 @@ import asyncio
 import dataclasses
 import importlib
 import importlib.util
+import inspect
 import logging
 import json
 import posixpath
@@ -66,6 +67,7 @@ __all__ = [
     "NormalizeStampsFn",
     "NormalizerModuleUnresolved",
     "StampNormalizerOutcome",
+    "normalizer_accepts_rules_only",
     "FeatureFilesFill",
     "classify_normalizer_result",
     "declare_feature_files_if_absent",
@@ -576,7 +578,40 @@ ValidateFeaturePlanFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 #: <worktree>``) against the planning worktree, immediately BEFORE the
 #: plan-commit ``feature validate`` (Rich's condition 1, 2026-08-16: the
 #: ``verifier:`` stamps are WRITTEN on the planning branch before validate).
+#:
+#: Since 2026-09-07 (rule 1a of the rewrite-on-refusal lane) the production
+#: collaborator ALSO takes a keyword, ``rules_only: bool = False``: true adds
+#: ``--no-model`` to the argv, so the normalizer decides by rule alone and
+#: the model fallback is not asked on that call. The positional
+#: ``(worktree, feature_id)`` shape is unchanged for every existing caller; a
+#: collaborator that does not take the keyword is called without it (see
+#: :func:`normalizer_accepts_rules_only`) and the receipt says so.
 NormalizeStampsFn = Callable[[Path, str], Awaitable["StampNormalizerOutcome"]]
+
+
+def normalizer_accepts_rules_only(normalize: Callable[..., Any]) -> bool:
+    """Does this ``normalize_stamps`` collaborator take ``rules_only=``?
+
+    True when its signature names a ``rules_only`` parameter that can be
+    passed by keyword, or takes ``**kwargs``. A collaborator whose signature
+    cannot be read (a C callable, a mock without a spec) is read as NOT
+    taking it — the driver then calls it the old way and receipts that the
+    first stamping was not by rule only, rather than failing the run on a
+    ``TypeError`` it could have avoided.
+    """
+    try:
+        signature = inspect.signature(normalize)
+    except (TypeError, ValueError):
+        return False
+    for name, parameter in signature.parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if name == "rules_only" and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
 
 #: ``async (worktree_path, bar_rel_path) -> ToolOutcome`` — run
 #: ``guardkit qa validate pass-bar <bar_rel_path>`` against the worktree. The
@@ -1353,8 +1388,23 @@ class StampNormalizerOutcome:
     #: ``endpoint`` (host:port, never a key) and ``model``. Read from the
     #: result JSON's ``model_outcome`` key, or from the one plain
     #: ``STAMP NORMALIZER:`` line on stderr when only that survived; ``None``
-    #: when the normalizer said nothing about it (an older guardkit).
+    #: when the normalizer said nothing about it (an older guardkit). Since
+    #: 2026-09-07 the status may also be ``switched_off``: the caller ran
+    #: this stamping by rule only (``--no-model``), so the model was not
+    #: asked — rule 1a of the rewrite-on-refusal lane.
     model_outcome: Mapping[str, Any] | None = None
+    #: This stamping ran BY RULE ONLY (rule 1a, 2026-09-07): the collaborator
+    #: was called with ``rules_only=True`` and the argv carried ``--no-model``,
+    #: so a refusal here is the signal the machine's rewrite round needs
+    #: rather than the model fallback's answer. False for a stamping that
+    #: could ask the model (the second stamping after a rewrite, the switch
+    #: off, an unenforced repo, or an older collaborator — see
+    #: :attr:`rules_only_note`).
+    rules_only: bool = False
+    #: One plain sentence when the driver asked for rule-only stamping but
+    #: could not get it (the wired collaborator does not take the keyword),
+    #: so this stamping ran as before; empty otherwise.
+    rules_only_note: str = ""
 
     @property
     def is_failure(self) -> bool:
@@ -1447,6 +1497,12 @@ class StampNormalizerOutcome:
             rec["stops_the_run"] = self.stops_the_run
         if self.model_outcome is not None:
             rec["model_outcome"] = dict(self.model_outcome)
+        # Rule 1a (2026-09-07): every stamping says whether it ran by rule
+        # only — true / false, never absent — and why not when it was asked
+        # to and could not.
+        rec["rules_only"] = self.rules_only
+        if self.rules_only_note:
+            rec["rules_only_note"] = self.rules_only_note
         return rec
 
 
@@ -1468,6 +1524,18 @@ class FeatureFilesFill:
 _NORMALIZER_UNAVAILABLE_RE = re.compile(
     r"No such command ['\"](normalize-stamps|qa)['\"]"
 )
+#: click's usage error for the ``--no-model`` option on a guardkit that has
+#: the subcommand but predates rule 1a (2026-09-07): the stamping is run
+#: again WITHOUT the option, as before, and the receipt says it could not run
+#: by rule only. Matched on stderr only; click's casing has varied.
+_NORMALIZER_NO_MODEL_UNKNOWN_RE = re.compile(
+    r"No such option:?\s*['\"]?--no-model", re.IGNORECASE
+)
+#: The receipt's sentence for that case.
+NO_MODEL_OPTION_UNKNOWN_NOTE = (
+    "the guardkit on this image has no --no-model option (rebake pending), so "
+    "this stamping ran as before and the model fallback may have been asked"
+)
 _NORMALIZER_JSON_REFUSED_RE = re.compile(
     r'^  "refused": (\[\]|\[\n(?:    .*\n)*?  \])', re.MULTILINE
 )
@@ -1483,13 +1551,18 @@ _NORMALIZER_JSON_MODEL_OUTCOME_RE = re.compile(
     r'^  "model_outcome": (null|\{\}|\{\n(?:    .*\n)*?  \})', re.MULTILINE
 )
 
-#: The four things the model fallback can say about itself (guardkit
-#: ``decide_refused_titles``, rule 14 of the rewrite-on-refusal lane).
+#: The five things the model fallback can say about itself (guardkit
+#: ``decide_refused_titles``, rule 14 of the rewrite-on-refusal lane; the
+#: fifth, ``switched_off``, is rule 1a of 2026-09-07: the caller ran the
+#: normalizer with ``--no-model``, so the fallback was not asked on that call
+#: and the titles stay refused — the refusal is what the machine's rewrite
+#: round listens for).
 MODEL_OUTCOME_STATUSES: tuple[str, ...] = (
     "not_configured",
     "asked_and_failed",
     "answer_rejected",
     "decided",
+    "switched_off",
 )
 #: The three of them where the model WAS asked — "no fallback home" is then the
 #: wrong sentence, on the card and in the machine record alike.
@@ -1551,6 +1624,10 @@ def model_outcome_from_console_echo(stderr: str) -> dict[str, Any] | None:
     defensively — the guardkit half of this lane is built in a sibling
     worktree, so both its new sentences and the older ones are recognised:
 
+    * "switched off"                                       → ``switched_off``
+      (read BEFORE "not asked": the rule-only line says both — "the model
+      fallback was not asked … switched off for this stamping by the
+      caller" — and it must never be read as "no endpoint is configured")
     * "no model endpoint is configured" / "was not asked"  → ``not_configured``
     * "answer was rejected"                                → ``answer_rejected``
     * "could not be asked" / "could not answer"            → ``asked_and_failed``
@@ -1558,9 +1635,10 @@ def model_outcome_from_console_echo(stderr: str) -> dict[str, Any] | None:
 
     The status word itself (``asked_and_failed`` …) is honoured when the line
     carries it literally. ``detail`` is the line after the marker (and after a
-    ``feature <id>:`` prefix), one sentence; ``endpoint`` / ``model`` when the
-    line names them. The LAST line about the model wins (one run, one
-    outcome). Lines that mention no model at all are not an outcome.
+    ``feature <id>:`` / ``feature <id> —`` prefix), one sentence; ``endpoint``
+    / ``model`` when the line names them. The LAST line about the model wins
+    (one run, one outcome). Lines that mention no model at all are not an
+    outcome.
     """
     found: dict[str, Any] | None = None
     for raw_line in (stderr or "").splitlines():
@@ -1577,7 +1655,9 @@ def model_outcome_from_console_echo(stderr: str) -> dict[str, Any] | None:
         if status is None:
             if "model" not in lowered:
                 continue
-            if "no model endpoint is configured" in lowered or "not asked" in lowered:
+            if "switched off" in lowered:
+                status = "switched_off"
+            elif "no model endpoint is configured" in lowered or "not asked" in lowered:
                 status = "not_configured"
             elif "answer was rejected" in lowered or "answer rejected" in lowered:
                 status = "answer_rejected"
@@ -1587,7 +1667,7 @@ def model_outcome_from_console_echo(stderr: str) -> dict[str, Any] | None:
                 status = "decided"
             else:
                 continue
-        detail = re.sub(r"^feature \S+:\s*", "", line).strip()
+        detail = re.sub(r"^feature \S+\s*(?::|—|-)\s*", "", line).strip()
         outcome: dict[str, Any] = {"status": status, "detail": detail}
         m = _MODEL_OUTCOME_ENDPOINT_RE.search(line)
         if m:
@@ -1617,6 +1697,10 @@ def _fallback_words(model_outcome: Mapping[str, Any] | None) -> str:
             if isinstance(count, int)
             else "the model fallback decided some and could not decide these"
         )
+    if status == "switched_off":
+        # Rule 1a: the caller ran this stamping by rule only; the model was
+        # not asked, and the record says why rather than "no fallback home".
+        return "the model fallback was not asked (switched off for this stamping)"
     return "no fallback home"
 #: The exit code guardkit's CLI uses for PARTIAL (decided stamps written,
 #: ``refused`` names the rest) — distinct from 2 (cannot run) and 0 (all
@@ -2195,26 +2279,61 @@ def make_normalize_stamps(
     decides on (partial/refused/failed stop the run with a card ONLY where
     the routing law is enforced for the repo/feature, else the plan proceeds
     receipted; unavailable continues and is receipted).
+
+    ``rules_only=True`` (rule 1a, 2026-09-07) adds ``--no-model``: the
+    normalizer decides by rule alone and the model fallback is not asked on
+    that call — the driver's first stamping when the machine's rewrite round
+    is on. The outcome carries ``rules_only`` so the receipts say so.
     """
 
-    async def _normalize(worktree_path: Path, feature_id: str) -> StampNormalizerOutcome:
-        allowlist = list(read_allowlist or [worktree_path])
-        try:
-            result = await guardkit_run_shim(
-                run_fn,
-                subcommand="qa",
-                args=[
-                    "normalize-stamps",
-                    "--feature",
-                    feature_id,
-                    "--repo",
-                    str(worktree_path),
-                ],
-                repo_path=worktree_path,
-                read_allowlist=allowlist,
-                timeout_seconds=timeout_seconds,
-                with_nats_streaming=False,
+    async def _run_once(
+        worktree_path: Path, feature_id: str, *, no_model: bool
+    ) -> object:
+        args = [
+            "normalize-stamps",
+            "--feature",
+            feature_id,
+            "--repo",
+            str(worktree_path),
+        ]
+        if no_model:
+            args.append("--no-model")
+        return await guardkit_run_shim(
+            run_fn,
+            subcommand="qa",
+            args=args,
+            repo_path=worktree_path,
+            read_allowlist=list(read_allowlist or [worktree_path]),
+            timeout_seconds=timeout_seconds,
+            with_nats_streaming=False,
+        )
+
+    async def _normalize(
+        worktree_path: Path, feature_id: str, *, rules_only: bool = False
+    ) -> StampNormalizerOutcome:
+        by_rule_only = bool(rules_only)
+        rules_only_note = ""
+        if by_rule_only:
+            logger.info(
+                "normalize_stamps: %s runs by rule only (--no-model): the model "
+                "fallback is switched off for this stamping",
+                feature_id,
             )
+        try:
+            result = await _run_once(worktree_path, feature_id, no_model=by_rule_only)
+            if (
+                by_rule_only
+                and int(getattr(result, "exit_code", -1)) != 0
+                and _NORMALIZER_NO_MODEL_UNKNOWN_RE.search(
+                    str(getattr(result, "stderr", None) or "")
+                )
+            ):
+                # An older guardkit (has the subcommand, not the option):
+                # run again the old way, once, and say so in the receipt.
+                by_rule_only = False
+                rules_only_note = NO_MODEL_OPTION_UNKNOWN_NOTE
+                logger.warning("normalize_stamps: %s — %s", feature_id, rules_only_note)
+                result = await _run_once(worktree_path, feature_id, no_model=False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — oracle boundary
@@ -2222,6 +2341,8 @@ def make_normalize_stamps(
             return StampNormalizerOutcome(
                 status="failed",
                 detail=f"qa normalize-stamps raised {type(exc).__name__}: {exc}",
+                rules_only=by_rule_only,
+                rules_only_note=rules_only_note,
             )
         outcome = classify_normalizer_result(
             feature_id,
@@ -2230,6 +2351,10 @@ def make_normalize_stamps(
             stdout_tail=str(getattr(result, "stdout_tail", "") or ""),
             stderr=str(getattr(result, "stderr", None) or ""),
         )
+        if by_rule_only or rules_only_note:
+            outcome = dataclasses.replace(
+                outcome, rules_only=by_rule_only, rules_only_note=rules_only_note
+            )
         if outcome.status in ("written", "nothing-to-do", "partial"):
             # PARTIAL wrote its decided stamps too — read the plan of record
             # back off disk (the seam's clipped tail may have lost the map).
