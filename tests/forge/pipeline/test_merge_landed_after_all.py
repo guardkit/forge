@@ -149,12 +149,23 @@ print(json.dumps({
 sys.exit(2)
 """
 
-#: A clean merge that echoes what it was actually asked to do.
+#: A clean merge that merges for real, reports the commit it made, and echoes
+#: what it was actually asked to do. The commit must be real: since
+#: protect-main the executor compares the merged commit's tree with the tree
+#: it checked before the merge, and an invented commit would refuse the
+#: promote — rightly.
 MERGES_AND_ECHOES = """
-import json, os, sys
+import json, os, subprocess, sys
 argv = sys.argv[1:]
+feature = argv[2]
+git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+       "-c", "commit.gpgsign=false"]
+subprocess.run(git + ["merge", "--no-ff", "-m", "merge " + feature,
+                      "autobuild/" + feature], check=True)
+post = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                      text=True, check=True).stdout.strip()
 print(json.dumps({
-    "outcome": "merged", "post_sha": "e" * 40, "verify_ok": True,
+    "outcome": "merged", "post_sha": post, "verify_ok": True,
     "verify_status": "passed", "charged_failures": [],
     "checks_passed": 8, "checks_total": 8,
     "argv": argv, "cwd": os.getcwd(),
@@ -216,13 +227,38 @@ class _Publisher:
 
 
 class _Deploy:
+    """The deploy stage, every leg green: the candidate check passes, the
+    teardown completes, the promote completes."""
+
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        leg = kwargs.get("leg", "deploy")
+        if leg == "candidate_check":
+            return SimpleNamespace(
+                outcome="complete",
+                verdict="pass",
+                failed_step=None,
+                events=("DeployQueued",),
+                detail={
+                    "gate_summary": {
+                        "verdict": "pass",
+                        "checks_total": 8,
+                        "checks_passed": 8,
+                        "failed_checks": [],
+                    },
+                    "candidate": "standing",
+                },
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
         return SimpleNamespace(
-            outcome="complete", verdict="8/8", deploy_record_ref="docs/state/x.md"
+            outcome="complete",
+            verdict="8/8",
+            deploy_record_ref="docs/state/x.md",
+            detail={"candidate": "torn-down"},
         )
 
 
@@ -275,6 +311,12 @@ async def _press_merge(
         decided_by="rich",
     )
     return outcome, publisher, deploy
+
+
+def _promoted(deploy: _Deploy) -> bool:
+    """Did the promote leg run? (The candidate check runs before every merge,
+    so "no deploy calls at all" is no longer the sign that nothing shipped.)"""
+    return any(call.get("leg") == "promote" for call in deploy.calls)
 
 
 def _repair_rows(pool: SqliteLifecyclePersistence) -> list[str]:
@@ -332,7 +374,7 @@ async def test_a_merge_that_landed_before_the_command_died_is_not_called_refused
 
     # Nothing was deployed, one report went out, and no repair was filed:
     # what is broken is the check, and no amount of building mends that.
-    assert deploy.calls == []
+    assert not _promoted(deploy)
     assert len(publisher.reports) == 1
     assert publisher.reports[0].result == "merged-verify-failed"
     assert publisher.reports[0].verify_status == "unverified"
@@ -365,7 +407,7 @@ async def test_a_command_that_died_having_merged_nothing_is_still_a_refusal(
     assert outcome.failed_step == "merge"
     assert outcome.merged_sha is None
     assert KILLED_SENTENCE in outcome.detail
-    assert deploy.calls == []
+    assert not _promoted(deploy)
     assert _repair_rows(pool) == []
 
 
@@ -400,7 +442,7 @@ async def test_main_moving_on_its_own_is_not_taken_for_this_merge(
 
     assert outcome.result == "merge-refused"
     assert outcome.merged_sha is None
-    assert deploy.calls == []
+    assert not _promoted(deploy)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +477,7 @@ async def test_a_refusal_report_is_repeated_word_for_word(
     # No wrapper words, no slice of JSON.
     assert "status=" not in outcome.detail
     assert "{" not in outcome.detail
-    assert deploy.calls == []
+    assert not _promoted(deploy)
     assert publisher.reports[0].detail == outcome.detail
 
 
@@ -553,7 +595,7 @@ async def test_a_conflict_is_said_in_words_naming_the_file(
         "merged and the branch is kept"
     )
     assert "{" not in outcome.detail and "status=" not in outcome.detail
-    assert deploy.calls == []
+    assert not _promoted(deploy)
 
 
 @pytest.mark.asyncio

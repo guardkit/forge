@@ -656,6 +656,17 @@ class TestTheRedMergeHook:
             }
         )
 
+    @staticmethod
+    def _git(repo: Path, *args: str) -> str:
+        import subprocess
+
+        done = subprocess.run(
+            ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+             "-c", "commit.gpgsign=false", *args],
+            cwd=str(repo), capture_output=True, text=True, check=True,
+        )
+        return done.stdout.strip()
+
     def _seed_build(self, pool: SqliteLifecyclePersistence) -> None:
         pool.connection.execute(
             "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
@@ -681,8 +692,21 @@ class TestTheRedMergeHook:
             execute_merge_deploy,
         )
 
+        # A real repository, made once: the executor checks the branch's tree
+        # before the merge and compares tree ids after it (protect-main).
         repo_root = tmp_path / "api_test"
-        repo_root.mkdir(exist_ok=True)
+        if not (repo_root / ".git").exists():
+            repo_root.mkdir(exist_ok=True)
+            self._git(repo_root, "init", "-b", "main", "-q")
+            (repo_root / "README.md").write_text("first\n", encoding="utf-8")
+            self._git(repo_root, "add", "README.md")
+            self._git(repo_root, "commit", "-q", "-m", "first")
+            self._git(repo_root, "checkout", "-q", "-b", f"autobuild/{self.MERGE_FEATURE}")
+            (repo_root / "feature.txt").write_text("the feature\n", encoding="utf-8")
+            self._git(repo_root, "add", "feature.txt")
+            self._git(repo_root, "commit", "-q", "-m", "the feature")
+            self._git(repo_root, "checkout", "-q", "main")
+        merged = self._git(repo_root, "rev-parse", f"autobuild/{self.MERGE_FEATURE}")
         self._seed_build(pool)
 
         published: list[Any] = []
@@ -697,19 +721,35 @@ class TestTheRedMergeHook:
                 subcommand=kwargs.get("subcommand", "merge"),
                 duration_secs=0.1,
                 stdout_tail=json.dumps(
-                    {"outcome": "merged", "post_sha": "c" * 40, "verify_ok": True}
+                    {"outcome": "merged", "post_sha": merged, "verify_ok": True}
                 ),
                 stderr=None,
                 exit_code=0,
             )
 
-        async def deploy(**_: Any) -> Any:
+        async def deploy(**kwargs: Any) -> Any:
             from types import SimpleNamespace
 
+            leg = kwargs.get("leg", "deploy")
+            if leg == "candidate_check":
+                return SimpleNamespace(
+                    outcome="complete",
+                    verdict="pass",
+                    failed_step=None,
+                    events=("DeployQueued",),
+                    detail={
+                        "gate_summary": {"verdict": "pass", "checks_total": 2,
+                                         "checks_passed": 2, "failed_checks": []},
+                        "candidate": "standing",
+                    },
+                )
+            if leg == "candidate_down":
+                return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
             return SimpleNamespace(
                 outcome=deploy_outcome,
                 verdict="fail",
                 deploy_record_ref="docs/state/x.md",
+                detail={"candidate": "torn-down"},
             )
 
         deps = MergeExecutorDeps(
@@ -775,3 +815,77 @@ class TestTheRedMergeHook:
 
         assert outcome.result == "merge-refused"
         assert len(queue_rows(pool)) == first
+
+
+# ---------------------------------------------------------------------------
+# A branch that failed its sandbox check BEFORE the merge (protect-main)
+# ---------------------------------------------------------------------------
+
+from forge.pipeline.fix_row_producer import (  # noqa: E402
+    SOURCE_CANDIDATE_REFUSED,
+    candidate_refused_sentence,
+)
+
+
+class TestACandidateRefusedBeforeTheMerge:
+    def test_the_spec_s_sentence_word_for_word(self) -> None:
+        assert candidate_refused_sentence(
+            "FEAT-X",
+            checks_failed=2,
+            checks_total=8,
+            failing_checks=["users_count", "etag"],
+        ) == (
+            "FEAT-X was checked in the sandbox before merging and failed 2 of 8 "
+            "checks (users_count, etag); nothing was merged and the branch is kept."
+        )
+
+    def test_without_the_names_the_caller_s_plain_words_stand(self) -> None:
+        assert candidate_refused_sentence(
+            "FEAT-X",
+            detail="could not be started (the candidate deploy stopped at health_check)",
+        ) == (
+            "FEAT-X was checked in the sandbox before merging and could not be "
+            "started (the candidate deploy stopped at health_check); nothing was "
+            "merged and the branch is kept."
+        )
+        assert candidate_refused_sentence("FEAT-X") == (
+            "FEAT-X was checked in the sandbox before merging and failed its "
+            "checks; nothing was merged and the branch is kept."
+        )
+
+    def test_the_row_is_filed_with_no_pack_because_the_build_succeeded(
+        self, pool: SqliteLifecyclePersistence, receipts: Path
+    ) -> None:
+        build_id = queue_a_build(pool)  # no pack: the build was green
+
+        queue_id = maybe_mint_fix_row(
+            pool=pool,
+            build_id=build_id,
+            source=SOURCE_CANDIDATE_REFUSED,
+            checks_failed=2,
+            checks_total=8,
+            failing_checks=["users_count", "etag"],
+        )
+
+        assert queue_id is not None
+        row = queue_rows(pool)[0]
+        assert str(row["sentence"]) == (
+            "FEAT-44A8 was checked in the sandbox before merging and failed 2 of 8 "
+            "checks (users_count, etag); nothing was merged and the branch is kept."
+        )
+        assert row["kind"] == "fix"
+
+    def test_the_news_arriving_twice_keeps_one_row(
+        self, pool: SqliteLifecyclePersistence, receipts: Path
+    ) -> None:
+        build_id = queue_a_build(pool)
+        first = maybe_mint_fix_row(
+            pool=pool, build_id=build_id, source=SOURCE_CANDIDATE_REFUSED,
+            checks_failed=1, checks_total=3, failing_checks=["etag"],
+        )
+        second = maybe_mint_fix_row(
+            pool=pool, build_id=build_id, source=SOURCE_CANDIDATE_REFUSED,
+            checks_failed=1, checks_total=3, failing_checks=["etag"],
+        )
+        assert first == second
+        assert len(queue_rows(pool)) == 1

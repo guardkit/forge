@@ -2,8 +2,15 @@
 
 The consumer's authz matrix (wrong decided_by, unknown request_id, duplicate
 decision, correlation mismatch, reject, approve-exactly-once, single-flight)
-and the executor's sequencing (merge failure stops before deploy, receipts
-written, one outcome payload per result class, dry_run threads through).
+and the executor's sequencing (the candidate is checked before the merge, a
+merge failure stops before the promote, receipts written, one outcome payload
+per result class, dry_run threads through).
+
+The repository is a REAL git repository in a temporary directory — main with
+one commit and ``autobuild/FEAT-MX1`` one commit ahead — because the
+executor now reads the branch tip, lays its tree out, and compares tree ids
+with git itself (protect-main, rules 37 and 38). Guardkit and the deploy
+stage are the fakes, at the boundaries the executor already has.
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +39,7 @@ from forge.lifecycle.metrics import (
 from forge.pipeline.merge_executor import (
     MERGE_DECISION_TARGET_IDENTIFIER,
     MERGE_REPORT_TARGET_IDENTIFIER,
+    MERGE_STEP_CANDIDATE_TARGET_IDENTIFIER,
     MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
     MERGE_STEP_MERGE_TARGET_IDENTIFIER,
     MergeApprovalConsumer,
@@ -61,6 +70,39 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 
 
+def _git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=tests",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+def _tip(repo: Path, feature_id: str = FEATURE_ID) -> str:
+    """The feature branch's tip — what a clean merge lands (a fast-forward)."""
+    return _git(repo, "rev-parse", f"autobuild/{feature_id}")
+
+
+def _tree_of(repo: Path, sha: str) -> str:
+    return _git(repo, "rev-parse", f"{sha}^{{tree}}")
+
+
+def _candidate_dir(repo: Path, feature_id: str = FEATURE_ID) -> Path:
+    return repo / ".forge-candidates" / feature_id
+
+
 @pytest.fixture
 def pool(tmp_path: Path) -> SqliteLifecyclePersistence:
     cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "forge.db")
@@ -70,8 +112,19 @@ def pool(tmp_path: Path) -> SqliteLifecyclePersistence:
 
 @pytest.fixture
 def repo_root(tmp_path: Path) -> Path:
+    """A real repository: main with one commit, the feature branch one ahead."""
     root = tmp_path / "api_test"
     root.mkdir()
+    _git(root, "init", "-b", "main", "-q")
+    (root / "README.md").write_text("first\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "first")
+    for feature in (FEATURE_ID, "FEAT-MX2"):
+        _git(root, "checkout", "-q", "-b", f"autobuild/{feature}", "main")
+        (root / f"{feature}.txt").write_text("the feature\n", encoding="utf-8")
+        _git(root, "add", f"{feature}.txt")
+        _git(root, "commit", "-q", "-m", f"the feature {feature}")
+    _git(root, "checkout", "-q", "main")
     return root
 
 
@@ -150,7 +203,12 @@ class _FakePublisher:
 
 
 class _FakeGuardKit:
-    """Records calls; returns a canned merge report."""
+    """Records calls; returns a canned merge report.
+
+    With no ``report`` given the report says the merge landed on the feature
+    branch's tip — what a clean fast-forward merge lands — read from the
+    repository the merge was asked to run in, at call time.
+    """
 
     def __init__(
         self,
@@ -160,13 +218,16 @@ class _FakeGuardKit:
         stderr: str | None = None,
     ) -> None:
         self.status = status
-        self.report = (
-            report
-            if report is not None
-            else {"status": "merged", "merged_sha": "b" * 40}
-        )
+        self.report = report
         self.stderr = stderr
         self.calls: list[dict[str, Any]] = []
+
+    def _report_for(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if self.report is not None:
+            return self.report
+        repo = Path(kwargs["repo_path"])
+        feature = kwargs["args"][1]
+        return {"status": "merged", "merged_sha": _tip(repo, feature)}
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
@@ -174,33 +235,124 @@ class _FakeGuardKit:
             status=self.status,  # type: ignore[arg-type]
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
-            stdout_tail=json.dumps(self.report),
+            stdout_tail=json.dumps(self._report_for(kwargs)),
             stderr=self.stderr,
             exit_code=0 if self.status == "success" else 1,
         )
 
 
+#: What a green candidate check reports: every check passed, by name.
+GREEN_GATE: dict[str, Any] = {
+    "verdict": "pass",
+    "checks_total": 8,
+    "checks_passed": 8,
+    "failed_checks": [],
+    "gate_ids": ["health", "users_count", "etag", "a", "b", "c", "d", "e"],
+    "live_gate_runbook_id": "live-gate-cand-run",
+}
+
+#: What a red candidate check reports: two of eight failed, by name.
+RED_GATE: dict[str, Any] = {
+    "verdict": "fail",
+    "checks_total": 8,
+    "checks_passed": 6,
+    "failed_checks": ["users_count", "etag"],
+    "gate_ids": ["health", "users_count", "etag", "a", "b", "c", "d", "e"],
+    "live_gate_runbook_id": "live-gate-cand-run",
+}
+
+
 class _FakeDeploy:
+    """The deploy stage, one leg at a time.
+
+    ``candidate_outcome`` / ``candidate_verdict`` / ``gate`` shape the
+    candidate check; ``outcome`` / ``verdict`` / ``raises`` shape the
+    promote. ``outcome=None`` is the deploy stage switched off: every leg
+    answers None. The candidate teardown always completes. Every call is
+    recorded with its ``leg``; ``seen_tree`` records whether the candidate's
+    working directory existed, with the branch's file in it, when the
+    candidate leg was called.
+    """
+
     def __init__(
-        self, *, outcome: str | None = "complete", verdict: str | None = "pass",
+        self,
+        *,
+        outcome: str | None = "complete",
+        verdict: str | None = "pass",
         raises: BaseException | None = None,
+        candidate_outcome: str = "complete",
+        candidate_verdict: str | None = "pass",
+        candidate_raises: BaseException | None = None,
+        candidate_reason: str | None = None,
+        candidate_failed_step: str | None = None,
+        gate: dict[str, Any] | None = None,
+        promote_candidate_word: str = "torn-down",
     ) -> None:
         self.outcome = outcome
         self.verdict = verdict
         self.raises = raises
+        self.candidate_outcome = candidate_outcome
+        self.candidate_verdict = candidate_verdict
+        self.candidate_raises = candidate_raises
+        self.candidate_reason = candidate_reason
+        self.candidate_failed_step = candidate_failed_step
+        self.gate = gate
+        self.promote_candidate_word = promote_candidate_word
         self.calls: list[dict[str, Any]] = []
+        self.seen_tree: dict[str, Any] = {}
 
     async def __call__(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
-        if self.raises is not None:
-            raise self.raises
+        leg = kwargs.get("leg", "deploy")
         if self.outcome is None:
             return None
+        if leg == "candidate_check":
+            cwd = kwargs.get("candidate_cwd")
+            where = Path(cwd) if cwd else None
+            self.seen_tree = {
+                "cwd": cwd,
+                "existed": bool(where and where.is_dir()),
+                "branch_file": bool(
+                    where and (where / f"{kwargs['feature_id']}.txt").is_file()
+                ),
+                "git_dir": bool(where and (where / ".git").exists()),
+            }
+            if self.candidate_raises is not None:
+                raise self.candidate_raises
+            if self.candidate_outcome == "complete":
+                gate = self.gate if self.gate is not None else dict(GREEN_GATE)
+                return SimpleNamespace(
+                    outcome="complete",
+                    verdict=self.candidate_verdict,
+                    failed_step=None,
+                    events=("DeployQueued",),
+                    detail={"gate_summary": gate, "candidate": "standing"},
+                )
+            gate = self.gate if self.gate is not None else dict(RED_GATE)
+            reason = self.candidate_reason or "candidate_failed"
+            return SimpleNamespace(
+                outcome="failed",
+                verdict=self.candidate_verdict,
+                failed_step=self.candidate_failed_step or "candidate_gate",
+                events=("DeployQueued", "DeployFailed"),
+                detail={"reason": reason, "gate_summary": gate},
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(
+                outcome="complete", verdict=None, detail={"candidate": "torn-down"}
+            )
+        if self.raises is not None:
+            raise self.raises
         return SimpleNamespace(
             outcome=self.outcome,
             verdict=self.verdict,
             deploy_record_ref="docs/state/x.md",
+            detail={"candidate": self.promote_candidate_word},
         )
+
+
+def _legs(dp: _FakeDeploy) -> list[str]:
+    return [call.get("leg", "deploy") for call in dp.calls]
 
 
 def _deps(
@@ -365,7 +517,7 @@ class TestConsumerDecisions:
         await consumer.handle_envelope(_envelope(decision="reject"))
         await _drain(consumer)
         assert gk.calls == []
-        assert dp.calls == []
+        assert dp.calls == []  # a rejection dispatches nothing at all
         decision = [
             s
             for s in pool.read_stages(BUILD_ID)
@@ -390,7 +542,7 @@ class TestConsumerDecisions:
         await consumer.handle_envelope(_envelope())
         await _drain(consumer)
         assert len(gk.calls) == 1
-        assert len(dp.calls) == 1
+        assert _legs(dp) == ["candidate_check", "promote"]
         # The offer's pinned sha rode into the merge argv.
         args = gk.calls[0]["args"]
         assert args[:5] == ["merge", FEATURE_ID, "--target", "main", "--expect-main-sha"]
@@ -469,7 +621,8 @@ class TestExecutorSequencing:
         assert outcome.result == "merge-refused"
         assert outcome.status == "FAILED"
         assert outcome.failed_step == "merge"
-        assert dp.calls == []  # NOTHING half-done
+        # The candidate was checked first, then taken down; NOTHING promoted.
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
         assert len(publisher.reports) == 1
         assert publisher.reports[0].result == "merge-refused"
         receipts = _receipts_env / f"merge-{BUILD_ID}"
@@ -488,16 +641,17 @@ class TestExecutorSequencing:
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "merge-refused"
         assert "main moved" in outcome.detail
-        assert dp.calls == []
+        assert "promote" not in _legs(dp)
 
     @pytest.mark.asyncio
     async def test_happy_path_merged_and_running(
         self, config, pool, repo_root, _receipts_env: Path
     ) -> None:
+        merged = _tip(repo_root)
         gk = _FakeGuardKit(
             report={
                 "status": "merged",
-                "merged_sha": "c" * 40,
+                "merged_sha": merged,
                 "checks_passed": 7,
                 "checks_total": 7,
             }
@@ -506,19 +660,22 @@ class TestExecutorSequencing:
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "merged-and-running"
         assert outcome.status == "PASSED"
-        assert outcome.merged_sha == "c" * 40
+        assert outcome.merged_sha == merged
         assert outcome.checks_passed == 7 and outcome.checks_total == 7
         report = publisher.reports[0]
         assert report.stage_label == "merge-deploy"
         assert report.target_kind == "local_tool"
         assert report.target_identifier == "merge_deploy_executor"
         assert report.status == "PASSED"
-        assert report.merged_sha == "c" * 40
+        assert report.merged_sha == merged
         assert report.checks_passed == 7
         receipts = _receipts_env / f"merge-{BUILD_ID}"
         for name in (
+            "merge_deploy_candidate.json",
             "merge_deploy_merge.json",
+            "merge_deploy_tree_check.json",
             "merge_deploy_deploy.json",
+            "merge_deploy_cleanup.json",
             "merge_deploy_report.json",
         ):
             assert (receipts / name).is_file()
@@ -550,11 +707,15 @@ class TestExecutorSequencing:
     async def test_deploy_flag_off_reports_honestly(
         self, config, pool, repo_root
     ) -> None:
+        """With the deploy stage switched off the candidate cannot be
+        checked, and since protect-main an unchecked branch is not merged."""
         dp = _FakeDeploy(outcome=None)
         deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "merged-deploy-failed"
+        assert outcome.result == "candidate-refused"
         assert "deploy.enabled=false" in outcome.detail
+        assert "nothing was merged" in outcome.detail
+        assert gk.calls == []
 
     @pytest.mark.asyncio
     async def test_dry_run_merges_nothing_claims_nothing_publishes_nothing(
@@ -679,7 +840,7 @@ class TestExecutorSequencing:
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "merge-refused"
         assert len(gk.calls) == 1
-        assert len(dp.calls) == 1
+        assert _legs(dp) == ["candidate_check", "promote"]
 
     @pytest.mark.asyncio
     async def test_checks_derived_from_the_live_gate_verdict(
@@ -728,7 +889,7 @@ class TestExecutorSequencing:
         assert outcome.merged_sha == "c" * 40
         assert "pytest usage error" in outcome.detail
         assert "merged" in outcome.detail
-        assert dp.calls == []  # no deploy on red checks
+        assert "promote" not in _legs(dp)  # no deploy on red checks
         assert publisher.reports[0].result == "merged-verify-failed"
 
     def test_deploy_task_id_is_task_shaped(self) -> None:
@@ -769,7 +930,7 @@ class TestDigestConformanceAdvisory:
         # Advisory: the merge and deploy still went through untouched.
         assert outcome.result == "merged-and-running"
         assert outcome.status == "PASSED"
-        assert len(dp.calls) == 1
+        assert _legs(dp) == ["candidate_check", "promote"]
         # One plain warning line rides the outcome and the published report.
         assert "WARNING:" in outcome.detail
         assert "7" in outcome.detail
@@ -1019,7 +1180,7 @@ class TestChecksThatCouldNotRun:
         assert "could not run: test runner could not start" in outcome.detail
         assert "did not pass" not in outcome.detail
         assert "The deploy was not dispatched." in outcome.detail
-        assert dp.calls == []
+        assert "promote" not in _legs(dp)
         assert publisher.reports[0].verify_status == "unverified"
 
     @pytest.mark.asyncio
@@ -1169,6 +1330,8 @@ class TestTheSameMergeThroughTheSidecar:
         )
 
         baseline = ["tests/test_known_red.py::test_password"]
+        merged = _tip(repo_root)
+        report_of_record = {**self.REPORT, "post_sha": merged}
 
         # --- run one: the in-container guardkit, faked ---------------------
         in_container_receipts = tmp_path / "receipts-in-container"
@@ -1178,7 +1341,7 @@ class TestTheSameMergeThroughTheSidecar:
             config=config,
             pool=in_container_pool,
             pipeline_publisher=publisher_a,
-            guardkit_run=_FakeGuardKit(report=dict(self.REPORT)),
+            guardkit_run=_FakeGuardKit(report=dict(report_of_record)),
             deploy_dispatcher=_FakeDeploy(),
             receipts_root_fn=lambda: in_container_receipts,
         )
@@ -1188,7 +1351,7 @@ class TestTheSameMergeThroughTheSidecar:
 
         # --- run two: the same report, through a real sidecar --------------
         report_file = tmp_path / "merge-report.json"
-        report_file.write_text(json.dumps(self.REPORT), encoding="utf-8")
+        report_file.write_text(json.dumps(report_of_record), encoding="utf-8")
         fake_guardkit = tmp_path / "bin" / "guardkit"
         fake_guardkit.parent.mkdir(parents=True, exist_ok=True)
         fake_guardkit.write_text(
@@ -1238,7 +1401,7 @@ class TestTheSameMergeThroughTheSidecar:
         # The outcome a person reads is identical.
         assert outcome_a.result == outcome_b.result == "merged-and-running"
         assert outcome_a.detail == outcome_b.detail
-        assert outcome_a.merged_sha == outcome_b.merged_sha == "e" * 40
+        assert outcome_a.merged_sha == outcome_b.merged_sha == merged
         assert outcome_a.checks_passed == outcome_b.checks_passed == 17
         assert outcome_a.checks_total == outcome_b.checks_total == 17
         assert outcome_a.verify_status == outcome_b.verify_status
@@ -1247,6 +1410,7 @@ class TestTheSameMergeThroughTheSidecar:
         for name in (
             "merge_deploy_merge.json",
             "digest_conformance.json",
+            "merge_deploy_tree_check.json",
             "merge_deploy_deploy.json",
             "merge_deploy_report.json",
         ):
@@ -1374,7 +1538,7 @@ class TestARefusalSpeaksTheMergeCommandsOwnSentence:
         assert outcome.result == "merge-refused"
         assert outcome.detail == sentence
         assert "status=" not in outcome.detail
-        assert dp.calls == []
+        assert "promote" not in _legs(dp)
         assert publisher.reports[0].detail == sentence
 
     @pytest.mark.asyncio
@@ -1392,7 +1556,7 @@ class TestARefusalSpeaksTheMergeCommandsOwnSentence:
         assert outcome.result == "merge-refused"
         assert "the merge command did not succeed" in outcome.detail
         assert "does not exist" in outcome.detail
-        assert dp.calls == []
+        assert "promote" not in _legs(dp)
 
     @pytest.mark.asyncio
     async def test_a_report_with_no_reason_at_all_still_reads_plainly(
@@ -1407,7 +1571,7 @@ class TestARefusalSpeaksTheMergeCommandsOwnSentence:
 
         assert outcome.result == "merge-refused"
         assert outcome.detail == "the working tree is dirty"
-        assert dp.calls == []
+        assert "promote" not in _legs(dp)
 
 
 # ---------------------------------------------------------------------------
@@ -1524,7 +1688,7 @@ class TestWhereTheDeployRan:
         _write_deploy_profile(repo_root, SANDBOX_PROFILE)
         deps, publisher, gk, dp = _deps(config, pool, deploy=_FakeDeploy(outcome=None))
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "merged-deploy-failed"
+        assert outcome.result == "candidate-refused"
         assert outcome.deployed_in is None
 
     def test_the_question_answered_on_its_own(self, tmp_path) -> None:
@@ -1535,3 +1699,398 @@ class TestWhereTheDeployRan:
         _write_deploy_profile(tmp_path, PLAIN_PROFILE)
         assert deployed_in_for(tmp_path) is None
         assert deployed_in_for(tmp_path / "nowhere") is None
+
+
+# ---------------------------------------------------------------------------
+# Protect main: the candidate is checked BEFORE the merge (Part J, rule 42)
+#
+# The order inside the merge word: (1) the branch's exact tree is laid out and
+# checked in the sandbox; (2) only a green check merges; (3) the merged tree
+# must be the checked tree; (4) the checked image is promoted; (5) the
+# candidate comes down and its tree is removed — on every ending.
+# ---------------------------------------------------------------------------
+
+
+class _OrderedGuardKit(_FakeGuardKit):
+    """Writes into a shared order list so the interleaving can be asserted."""
+
+    def __init__(self, order: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._order = order
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self._order.append("merge")
+        return await super().__call__(**kwargs)
+
+
+class _OrderedDeploy(_FakeDeploy):
+    def __init__(self, order: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._order = order
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        self._order.append(kwargs.get("leg", "deploy"))
+        return await super().__call__(**kwargs)
+
+
+def _exclude_lines(repo_root: Path) -> list[str]:
+    exclude = repo_root / ".git" / "info" / "exclude"
+    if not exclude.is_file():
+        return []
+    return [
+        line for line in exclude.read_text(encoding="utf-8").splitlines()
+        if line.strip() == ".forge-candidates/"
+    ]
+
+
+class TestTheCandidateIsCheckedBeforeTheMerge:
+    @pytest.mark.asyncio
+    async def test_the_order_is_candidate_then_merge_then_promote(
+        self, config, pool, repo_root
+    ) -> None:
+        order: list[str] = []
+        gk = _OrderedGuardKit(order)
+        dp = _OrderedDeploy(order)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk, deploy=dp)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        assert order == ["candidate_check", "merge", "promote"]
+        # Both legs belong to ONE deploy run.
+        run_ids = {call["deploy_run_id"] for call in dp.calls}
+        task_ids = {call["task_id"] for call in dp.calls}
+        assert len(run_ids) == 1 and len(task_ids) == 1
+        # The promote carries the events the candidate leg already published.
+        promote = [c for c in dp.calls if c["leg"] == "promote"][0]
+        assert promote["prior_events"] == ("DeployQueued",)
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_is_built_from_the_branch_s_own_tree(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+        expected = _candidate_dir(repo_root)
+        assert dp.calls[0]["candidate_cwd"] == str(expected)
+        # While the candidate leg ran, the tree was there, it was the
+        # branch's (its file present), and it carried no git metadata.
+        assert dp.seen_tree == {
+            "cwd": str(expected),
+            "existed": True,
+            "branch_file": True,
+            "git_dir": False,
+        }
+        # The checkout itself is still main: the branch's file is not in it.
+        assert not (repo_root / f"{FEATURE_ID}.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_red_check_never_calls_the_merge(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        dp = _FakeDeploy(candidate_outcome="failed", candidate_verdict="fail")
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert outcome.status == "FAILED"
+        assert outcome.failed_step == "candidate"
+        assert gk.calls == []  # the merge command was never invoked
+        # The leg tore its own candidate down; no second teardown, no promote.
+        assert _legs(dp) == ["candidate_check"]
+        assert outcome.detail == (
+            f"{FEATURE_ID} was checked in the sandbox before merging and failed "
+            "2 of 8 checks (users_count, etag); nothing was merged and the "
+            "branch is kept."
+        )
+        assert outcome.merged_sha is None
+        # No merge claim on the record: the build may be pressed again once
+        # the branch is repaired. The check itself is on the record.
+        ids = _stage_ids(pool)
+        assert MERGE_STEP_MERGE_TARGET_IDENTIFIER not in ids
+        assert MERGE_STEP_DEPLOY_TARGET_IDENTIFIER not in ids
+        assert MERGE_STEP_CANDIDATE_TARGET_IDENTIFIER in ids
+        assert publisher.reports[0].result == "candidate-refused"
+        receipts = _receipts_env / f"merge-{BUILD_ID}"
+        assert (receipts / "merge_deploy_candidate.json").is_file()
+        assert not (receipts / "merge_deploy_merge.json").exists()
+        assert not (receipts / "merge_deploy_deploy.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_red_check_files_the_repair_row_with_the_failing_names(
+        self, config, pool, repo_root
+    ) -> None:
+        dp = _FakeDeploy(candidate_outcome="failed", candidate_verdict="fail")
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        await _run_executor(deps, repo_root)
+        rows = _repair_rows(pool)
+        assert rows == [
+            f"{FEATURE_ID} was checked in the sandbox before merging and failed "
+            "2 of 8 checks (users_count, etag); nothing was merged and the "
+            "branch is kept."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_that_never_came_up_says_so_and_files_a_repair(
+        self, config, pool, repo_root
+    ) -> None:
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict=None,
+            candidate_reason="candidate_deploy_failed",
+            candidate_failed_step="health_check",
+            gate={"verdict": None, "checks_total": None, "checks_passed": None,
+                  "failed_checks": None, "failed_step": "health_check"},
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "candidate-refused"
+        assert outcome.detail == (
+            f"{FEATURE_ID} was checked in the sandbox before merging and could "
+            "not be started (the candidate deploy stopped at health_check); "
+            "nothing was merged and the branch is kept."
+        )
+        assert gk.calls == []
+        assert _repair_rows(pool) == [outcome.detail]
+
+    @pytest.mark.asyncio
+    async def test_a_check_that_could_not_run_files_no_repair(
+        self, config, pool, repo_root, caplog
+    ) -> None:
+        dp = _FakeDeploy(
+            candidate_outcome="failed", candidate_reason="no_candidate_section"
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        with caplog.at_level("INFO"):
+            outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "candidate-refused"
+        assert "has no candidate section" in outcome.detail
+        assert "nothing was merged" in outcome.detail
+        assert gk.calls == []
+        assert _repair_rows(pool) == []
+        assert any(
+            "could not run, so no repair was filed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_missing_branch_is_refused_before_anything_runs(
+        self, config, pool, repo_root
+    ) -> None:
+        _git(repo_root, "branch", "-D", f"autobuild/{FEATURE_ID}")
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "candidate-refused"
+        assert f"the branch autobuild/{FEATURE_ID} was not found" in outcome.detail
+        assert gk.calls == [] and dp.calls == []
+        assert _repair_rows(pool) == []
+
+    @pytest.mark.asyncio
+    async def test_a_merge_refusal_after_a_green_check_takes_the_candidate_down(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            status="failed",
+            report={"outcome": "refused", "refusal_reason": "main has moved"},
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merge-refused"
+        assert outcome.detail == "main has moved"
+        # The candidate that passed was torn down; nothing was promoted.
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+        assert not _candidate_dir(repo_root).exists()
+        # The merge step was released, so the build can be pressed again.
+        rows = [
+            s for s in pool.read_stages(BUILD_ID)
+            if s.target_identifier == MERGE_STEP_MERGE_TARGET_IDENTIFIER
+        ]
+        assert rows[-1].status == "SKIPPED"
+
+    @pytest.mark.asyncio
+    async def test_a_tree_that_is_not_the_checked_tree_refuses_the_promote(
+        self, config, pool, repo_root, caplog
+    ) -> None:
+        """Main moved under the check in a way the pin did not catch: the
+        merge report names a commit whose tree is not the candidate's."""
+        # A commit on main that the candidate never saw.
+        _git(repo_root, "checkout", "-q", "main")
+        (repo_root / "moved.txt").write_text("main moved\n", encoding="utf-8")
+        _git(repo_root, "add", "moved.txt")
+        _git(repo_root, "commit", "-q", "-m", "main moved")
+        other = _git(repo_root, "rev-parse", "main")
+        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": other})
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        with caplog.at_level("INFO"):
+            outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.failed_step == "promote"
+        assert outcome.merged_sha == other
+        assert "is not the tree that was checked in the sandbox" in outcome.detail
+        assert "nothing live changed" in outcome.detail
+        assert "Send the sentence again" in outcome.detail
+        # No promote; the candidate came down.
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+        gate = outcome.gate_before_merge
+        assert gate["trees_match"] is False
+        assert gate["candidate_tree"] == _tree_of(repo_root, _tip(repo_root))
+        assert gate["merged_tree"] == _tree_of(repo_root, other)
+        assert gate["candidate_tree"] != gate["merged_tree"]
+        # There is nothing to repair; the remedy is a new run.
+        assert _repair_rows(pool) == []
+        assert any("main had moved under the check" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_merge_report_without_a_commit_refuses_the_promote(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(report={"status": "merged"})
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.failed_step == "promote"
+        assert "names no merged commit" in outcome.detail
+        assert "promote" not in _legs(dp)
+
+    @pytest.mark.asyncio
+    async def test_the_exclude_line_is_written_once(
+        self, config, pool, repo_root
+    ) -> None:
+        assert _exclude_lines(repo_root) == []
+        deps, publisher, gk, dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, dry_run=True)
+        assert _exclude_lines(repo_root) == [".forge-candidates/"]
+        await _run_executor(deps, repo_root)
+        assert _exclude_lines(repo_root) == [".forge-candidates/"]
+        # And with the tree laid out the checkout reads clean to git — the
+        # merge command's own dirty-tree check would not see it.
+        assert _git(repo_root, "status", "--porcelain") == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ending",
+        [
+            "green",
+            "dry-run",
+            "candidate-red",
+            "merge-refused",
+            "verify-failed",
+            "tree-mismatch",
+            "promote-raises",
+            "promote-reverted",
+            "deploy-off",
+        ],
+    )
+    async def test_the_tree_is_removed_on_every_ending(
+        self, config, pool, repo_root, ending: str
+    ) -> None:
+        gk: _FakeGuardKit | None = None
+        dp: _FakeDeploy | None = None
+        dry_run = False
+        if ending == "dry-run":
+            dry_run = True
+        elif ending == "candidate-red":
+            dp = _FakeDeploy(candidate_outcome="failed", candidate_verdict="fail")
+        elif ending == "merge-refused":
+            gk = _FakeGuardKit(status="failed", report={"outcome": "refused", "refusal_reason": "no"})
+        elif ending == "verify-failed":
+            gk = _FakeGuardKit(
+                status="failed",
+                report={"outcome": "merged", "post_sha": _tip(repo_root), "verify_ok": False,
+                        "verify_status": "failed", "verify_detail": "1 test failed"},
+            )
+        elif ending == "tree-mismatch":
+            _git(repo_root, "checkout", "-q", "main")
+            (repo_root / "moved.txt").write_text("m\n", encoding="utf-8")
+            _git(repo_root, "add", "moved.txt")
+            _git(repo_root, "commit", "-q", "-m", "moved")
+            gk = _FakeGuardKit(report={"status": "merged", "merged_sha": _git(repo_root, "rev-parse", "main")})
+        elif ending == "promote-raises":
+            dp = _FakeDeploy(raises=RuntimeError("the sidecar went away"))
+        elif ending == "promote-reverted":
+            dp = _FakeDeploy(outcome="reverted", verdict="fail")
+        elif ending == "deploy-off":
+            dp = _FakeDeploy(outcome=None)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk, deploy=dp)
+        await _run_executor(deps, repo_root, dry_run=dry_run)
+        assert not _candidate_dir(repo_root).exists()
+        assert not (repo_root / ".forge-candidates").exists() or not any(
+            (repo_root / ".forge-candidates").iterdir()
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_comes_down_when_the_promote_raises(
+        self, config, pool, repo_root
+    ) -> None:
+        dp = _FakeDeploy(raises=RuntimeError("the sidecar went away"))
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.failed_step == "deploy"
+        assert "the promote dispatch raised" in outcome.detail
+        assert _legs(dp) == ["candidate_check", "promote", "candidate_down"]
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_what_the_check_found(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-and-running"
+        tip = _tip(repo_root)
+        gate = outcome.gate_before_merge
+        assert gate["verdict"] == "pass"
+        assert gate["checks_passed"] == 8 and gate["checks_total"] == 8
+        assert gate["failed_checks"] == []
+        assert gate["candidate_sha"] == tip
+        assert gate["candidate_tree"] == _tree_of(repo_root, tip)
+        assert gate["merged_tree"] == gate["candidate_tree"]
+        assert gate["trees_match"] is True
+        # It rides the payload jarvis reads, and the row on the build's record.
+        raw = publisher.reports[0].model_dump(mode="json")
+        for key in ("verdict", "checks_passed", "checks_total", "candidate_sha",
+                    "candidate_tree", "merged_tree"):
+            assert key in raw["gate_before_merge"], key
+        assert raw["gate_before_merge"]["candidate_sha"] == tip
+        assert _report_rows(pool)[0].details["gate_before_merge"]["trees_match"] is True
+        assert "checked in the sandbox (8 of 8), merged and running" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_a_report_that_stopped_before_the_check_carries_no_gate(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        await _run_executor(deps, repo_root)
+        second = await _run_executor(deps, repo_root)  # refused at the probe
+        assert second.result == "merge-refused"
+        assert second.gate_before_merge is None
+        assert "gate_before_merge" not in publisher.reports[1].model_dump(mode="json")
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_checks_and_promotes_dry_and_merges_nothing(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root, dry_run=True)
+        assert gk.calls == []
+        assert _legs(dp) == ["candidate_check", "promote"]
+        assert all(call["dry_run"] is True for call in dp.calls)
+        assert _stage_ids(pool) == []  # not even the candidate row
+        assert outcome.merged_sha is None
+        assert outcome.gate_before_merge["trees_match"] is None
+        receipts = _receipts_env / f"merge-{BUILD_ID}"
+        assert json.loads((receipts / "merge_deploy_candidate.json").read_text())["dry_run"] is True
+        assert not (receipts / "merge_deploy_tree_check.json").exists()
+        cleanup = json.loads((receipts / "merge_deploy_cleanup.json").read_text())
+        assert cleanup["tree_removed"] is True
+
+    def test_the_result_words(self) -> None:
+        """The words a report may carry, and which of them file a repair."""
+        from forge.pipeline.merge_executor import RED_MERGE_ENDINGS
+
+        assert RED_MERGE_ENDINGS == {
+            "merged-verify-failed",
+            "merged-deploy-reverted",
+            "merged-deploy-failed",
+        }
+        assert "candidate-refused" not in RED_MERGE_ENDINGS  # filed on its own rule
+        assert "merge-refused" not in RED_MERGE_ENDINGS

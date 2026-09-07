@@ -4,12 +4,17 @@ Covers: config-required refusal, build-row resolution (newest COMPLETE
 routine build; --build-id mismatch refused; nothing-to-merge refused), and
 the happy path through the real executor with the NATS/guardkit/deploy seams
 faked — asserting the printed receipt lines and the exit-code mapping.
+
+The target repository is a real git repository (main plus the feature
+branch) because the executor lays the branch's tree out and compares tree
+ids with git before the promote (protect-main).
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -81,10 +86,33 @@ class _FakePublisher:
         self.reports.append(payload)
 
 
+def _git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    )
+    return done.stdout.strip()
+
+
 @pytest.fixture
-def config(tmp_path: Path) -> ForgeConfig:
-    repo_root = tmp_path / "api_test"
-    repo_root.mkdir()
+def repo_root(tmp_path: Path) -> Path:
+    root = tmp_path / "api_test"
+    root.mkdir()
+    _git(root, "init", "-b", "main", "-q")
+    (root / "README.md").write_text("first\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "first")
+    _git(root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    (root / "feature.txt").write_text("the feature\n", encoding="utf-8")
+    _git(root, "add", "feature.txt")
+    _git(root, "commit", "-q", "-m", "the feature")
+    _git(root, "checkout", "-q", "main")
+    return root
+
+
+@pytest.fixture
+def config(repo_root: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
@@ -94,30 +122,60 @@ def config(tmp_path: Path) -> ForgeConfig:
     )
 
 
+def _leg_aware_deploy(dp_calls: list[dict[str, Any]], *, promote: Any = None):
+    """A deploy fake that answers every leg green, unless ``promote`` is
+    given — then the promote leg calls it (to raise, for example)."""
+
+    async def _fake_deploy(**kwargs: Any) -> Any:
+        dp_calls.append(kwargs)
+        leg = kwargs.get("leg", "deploy")
+        if leg == "candidate_check":
+            return SimpleNamespace(
+                outcome="complete",
+                verdict="pass",
+                failed_step=None,
+                events=("DeployQueued",),
+                detail={
+                    "gate_summary": {
+                        "verdict": "pass", "checks_total": 3,
+                        "checks_passed": 3, "failed_checks": [],
+                    },
+                    "candidate": "standing",
+                },
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
+        if promote is not None:
+            return promote(**kwargs)
+        return SimpleNamespace(
+            outcome="complete", verdict="pass", deploy_record_ref="r",
+            detail={"candidate": "torn-down"},
+        )
+
+    return _fake_deploy
+
+
 @pytest.fixture
 def fakes(
-    pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    pool: SqliteLifecyclePersistence, repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, Any]:
     """Rebind the CLI's module seams to offline fakes."""
     publisher = _FakePublisher()
     gk_calls: list[dict[str, Any]] = []
     dp_calls: list[dict[str, Any]] = []
+    merged = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
 
     async def _fake_guardkit(**kwargs: Any) -> Any:
         gk_calls.append(kwargs)
         return SimpleNamespace(
             status="success",
-            stdout_tail=json.dumps({"status": "merged", "merged_sha": "d" * 40}),
+            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
             stderr=None,
             exit_code=0,
             artefacts=[],
         )
 
-    async def _fake_deploy(**kwargs: Any) -> Any:
-        dp_calls.append(kwargs)
-        return SimpleNamespace(
-            outcome="complete", verdict="pass", deploy_record_ref="r"
-        )
+    _fake_deploy = _leg_aware_deploy(dp_calls)
 
     async def _fake_backends(_config: ForgeConfig):
         async def _close() -> None:
@@ -133,7 +191,12 @@ def fakes(
     monkeypatch.setattr(
         merge_offer_module, "git_rev_parse_main", _fake_git_head
     )
-    return {"publisher": publisher, "gk_calls": gk_calls, "dp_calls": dp_calls}
+    return {
+        "publisher": publisher,
+        "gk_calls": gk_calls,
+        "dp_calls": dp_calls,
+        "merged": merged,
+    }
 
 
 class TestRefusals:
@@ -177,12 +240,14 @@ class TestHappyPath:
         assert result.exit_code == 0, result.output
         assert "result=merged-and-running" in result.output
         assert "status=PASSED" in result.output
-        assert f"merged_sha={'d' * 40}" in result.output
+        assert f"merged_sha={fakes['merged']}" in result.output
         assert "merged and running" in result.output
+        assert "checked in the sandbox before merging: pass (3 of 3 checks passed)" in result.output
         assert f"merge-{BUILD_ID}/" in result.output
-        # The executor really ran: one merge, one deploy, one report.
+        # The executor really ran: the candidate check, one merge, the
+        # promote, one report — in that order (protect-main).
         assert len(fakes["gk_calls"]) == 1
-        assert len(fakes["dp_calls"]) == 1
+        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "promote"]
         assert len(fakes["publisher"].reports) == 1
         # expect-main-sha was computed NOW (the fake pin).
         args = fakes["gk_calls"][0]["args"]
@@ -223,17 +288,24 @@ class TestHappyPath:
 
         publisher = fakes["publisher"]
 
+        def _no_promote(**kwargs: Any) -> Any:  # pragma: no cover
+            raise AssertionError("the promote must not run after a merge refusal")
+
         async def _fake_backends(_config: ForgeConfig):
             async def _close() -> None:
                 return None
 
-            async def _no_deploy(**kwargs: Any) -> Any:  # pragma: no cover
-                raise AssertionError("deploy must not run after a merge refusal")
-
-            return publisher, _refusing_guardkit, _no_deploy, _close
+            return (
+                publisher,
+                _refusing_guardkit,
+                _leg_aware_deploy(fakes["dp_calls"], promote=_no_promote),
+                _close,
+            )
 
         monkeypatch.setattr(merge_deploy_module, "_aopen_backends", _fake_backends)
         result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
         assert result.exit_code == 1
         assert "result=merge-refused" in result.output
         assert "failed_step=merge" in result.output
+        # The candidate was checked first and taken down after the refusal.
+        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "candidate_down"]

@@ -198,6 +198,9 @@ async def dispatch_deploy_stage(
     task_id: str | None = None,
     deploy_profile_ref: str | None = None,
     deployer: str | None = None,
+    leg: str = "deploy",
+    candidate_cwd: str | None = None,
+    prior_events: tuple[str, ...] = (),
 ) -> DeployStageResult | None:
     """Dispatch one DEPLOY (+ optional LIVE_GATE) stage through the runner.
 
@@ -205,8 +208,20 @@ async def dispatch_deploy_stage(
     the flag is OFF this returns ``None`` **before touching any seam** — zero
     DEPLOY dispatch, no publish, no F7 record (the byte-for-byte no-op the coach
     proves). When the flag is on it composes the runner (:func:`build_deploy_stage_runner`)
-    and drives :meth:`DeployStageRunner.run_deploy`, returning its
-    :class:`DeployStageResult`.
+    and drives the leg asked for, returning its :class:`DeployStageResult`.
+
+    ``leg`` (protect-main, rule 39) names which part of the stage runs:
+
+    * ``"deploy"`` (the default) — :meth:`DeployStageRunner.run_deploy`, both
+      legs in one call, exactly as before;
+    * ``"candidate_check"`` — :meth:`DeployStageRunner.candidate_check`, with
+      ``candidate_cwd`` as the candidate's working directory (the feature
+      branch's laid-out tree);
+    * ``"promote"`` — :meth:`DeployStageRunner.promote`, with ``prior_events``
+      the events the candidate leg already published for this run;
+    * ``"candidate_down"`` — :meth:`DeployStageRunner.candidate_down`.
+
+    Any other word is refused with a ``ValueError`` before a seam is touched.
 
     An unconfigured seam does not fail here — it fails loudly INSIDE the runbook
     when the offending step runs (the runner records an honest DeployFailed, a
@@ -232,13 +247,45 @@ async def dispatch_deploy_stage(
         # Flag OFF — no dispatch. Byte-for-byte no-op.
         return None
 
-    return await runner.run_deploy(
-        profile,
-        correlation_id=correlation_id,
-        deploy_run_id=deploy_run_id,
-        feature=feature,
-        feat_id=feat_id,
-        task_id=task_id,
-        deploy_profile_ref=deploy_profile_ref,
-        deployer=deployer,
+    if leg == "deploy":
+        return await runner.run_deploy(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            feature=feature,
+            feat_id=feat_id,
+            task_id=task_id,
+            deploy_profile_ref=deploy_profile_ref,
+            deployer=deployer,
+        )
+    if leg == "candidate_check":
+        return await runner.candidate_check(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            feature=feature,
+            feat_id=feat_id,
+            task_id=task_id,
+            deploy_profile_ref=deploy_profile_ref,
+            candidate_cwd=candidate_cwd,
+        )
+    if leg == "promote":
+        return await runner.promote(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            feature=feature,
+            feat_id=feat_id,
+            task_id=task_id,
+            deploy_profile_ref=deploy_profile_ref,
+            deployer=deployer,
+            prior_events=tuple(prior_events),
+        )
+    if leg == "candidate_down":
+        return await runner.candidate_down(
+            profile, correlation_id=correlation_id, deploy_run_id=deploy_run_id
+        )
+    raise ValueError(
+        f"unknown deploy leg {leg!r} — expected 'deploy', 'candidate_check', "
+        "'promote' or 'candidate_down'"
     )
