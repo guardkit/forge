@@ -472,6 +472,7 @@ class RepoDriverLiveGateInvoker:
                     verdict=str(verdict),
                     run_id=str(envelope.get("run_id") or run_id_fallback),
                     gate_ids=gate_ids_env or gate_ids,
+                    assertions=_per_check_results(envelope),
                     evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
                     dispositions_ref=envelope.get("dispositions_ref"),
                     attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
@@ -490,6 +491,66 @@ class RepoDriverLiveGateInvoker:
             dry_run=False,
             detail={**detail, "source": "exit_code_map"},
         )
+
+
+#: The three failure attributions the wire model accepts on an assertion.
+#: Anything else the envelope says is dropped rather than break the payload.
+_KNOWN_DISPOSITIONS: frozenset[str] = frozenset({"counts", "instrument", "environment"})
+
+
+def _per_check_results(envelope: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Every check's result from the envelope, in the wire's assertion shape.
+
+    Protect-main (2026-09-07): the deploy stage has to say which of the
+    sandbox checks failed, by name, before it refuses a merge — "failed 2 of 8
+    checks (users_count, etag)". The envelope carries that per gate
+    (``gates[].exit_code`` and ``gates[].assertions[].status``) and this
+    backend used to drop it, so the stage saw only the list of names.
+
+    Each gate's own assertions are carried through with the gate's id on
+    them; a gate that failed by exit code but reported no failing assertion
+    gets one assertion saying so, so a red gate is never counted green. Only
+    the fields the wire model knows are copied, and a disposition it would
+    refuse is left out — a malformed envelope must never stop a deploy.
+    """
+    results: list[dict[str, Any]] = []
+    for gate in envelope.get("gates") or []:
+        if not isinstance(gate, dict) or not gate.get("gate_id"):
+            continue
+        gate_id = str(gate["gate_id"])
+        any_failed = False
+        for raw in gate.get("assertions") or []:
+            if not isinstance(raw, dict):
+                continue
+            status = str(raw.get("status") or "").strip().lower() or "fail"
+            entry: dict[str, Any] = {
+                "id": str(raw.get("id") or f"{gate_id}::assertion"),
+                "gate_id": gate_id,
+                "status": status,
+            }
+            for key in ("evidence_ref", "observed", "expected"):
+                value = raw.get(key)
+                if value is not None:
+                    entry[key] = str(value)
+            disposition = raw.get("disposition")
+            if isinstance(disposition, str) and disposition in _KNOWN_DISPOSITIONS:
+                entry["disposition"] = disposition
+            if status != "pass":
+                any_failed = True
+            results.append(entry)
+        exit_code = gate.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            if exit_code != 0 and not any_failed:
+                results.append(
+                    {
+                        "id": f"{gate_id}::exit_code",
+                        "gate_id": gate_id,
+                        "status": "fail",
+                        "observed": str(exit_code),
+                        "expected": "0",
+                    }
+                )
+    return tuple(results)
 
 
 # ---------------------------------------------------------------------------

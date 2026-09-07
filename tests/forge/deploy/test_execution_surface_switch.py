@@ -300,3 +300,75 @@ def test_client_never_raises_when_sidecar_unreachable() -> None:
     exit_code, output = client(cwd="/x", script="deploy.sh", env_file=None, timeout=1)
     assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
     assert "unreachable" in output
+
+
+# ---------------------------------------------------------------------------
+# The client sends the working directory; the sidecar honours a candidate
+# tree and ignores anything else (protect-main, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+
+def test_client_sends_the_working_directory_and_a_candidate_tree_is_honoured(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    _write_profile(repo)
+    tree = repo / ".forge-candidates" / "FEAT-C1D0"
+    tree.mkdir(parents=True)
+    seen: list[dict[str, Any]] = []
+
+    class _RecordingCore:
+        def __call__(self, **kwargs: Any) -> tuple[int, str]:
+            seen.append(kwargs)
+            return (0, "ok")
+
+    server = build_server(
+        port=0,
+        config_loader=lambda: _config({"appmilla/api_test": str(repo)}),
+        script_runner=_RecordingCore(),
+    )
+    _serve(server)
+    try:
+        host, port = server.server_address[:2]
+        client = SidecarScriptRunner(
+            base_url=f"http://{host}:{port}", repo="appmilla/api_test"
+        )
+        exit_code, _ = client(
+            cwd=str(tree), script="deploy.sh", env_file=None, timeout=30,
+            extra_env={"CANDIDATE": "1"},
+        )
+        assert exit_code == 0
+        assert seen[-1]["cwd"] == str(tree.resolve())
+        exit_code, _ = client(
+            cwd="/somewhere/else", script="deploy.sh", env_file=None, timeout=30
+        )
+        assert exit_code == 0
+        assert seen[-1]["cwd"] == str(repo)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_client_relays_a_refused_candidate_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    _write_profile(repo)
+    server = build_server(
+        port=0, config_loader=lambda: _config({"appmilla/api_test": str(repo)})
+    )
+    _serve(server)
+    try:
+        host, port = server.server_address[:2]
+        client = SidecarScriptRunner(
+            base_url=f"http://{host}:{port}", repo="appmilla/api_test"
+        )
+        exit_code, output = client(
+            cwd=str(repo / ".forge-candidates" / "FEAT-GONE"),
+            script="deploy.sh", env_file=None, timeout=10,
+        )
+        assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
+        assert "is not a candidate tree" in output
+    finally:
+        server.shutdown()
+        server.server_close()
