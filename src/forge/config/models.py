@@ -815,6 +815,50 @@ class PlanningDigestReviewConfig(BaseModel):
     )
 
 
+class SandboxEntry(BaseModel):
+    """One repository's sandbox (sandbox first, 2026-09-07, rule 71).
+
+    ``name`` is the sandbox's own name (what ``sbx`` calls it); ``sidecar_url``
+    is where forge reaches the deploy sidecar running inside it (the planning
+    chain's git, the merge, the deploy); ``runner_url`` is where forge reaches
+    the build runner inside it. Both are loopback ports the sandbox
+    publishes on the host, so they are ordinary http addresses.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        description="The sandbox's name, as the sandbox tool knows it.",
+    )
+    sidecar_url: str = Field(
+        ...,
+        description=(
+            "The address of the deploy sidecar inside this sandbox, as forge "
+            "reaches it (http://127.0.0.1:<published port>)."
+        ),
+    )
+    runner_url: str = Field(
+        ...,
+        description=(
+            "The address of the build runner inside this sandbox, as forge "
+            "reaches it (http://127.0.0.1:<published port>)."
+        ),
+    )
+
+    @field_validator("sidecar_url", "runner_url")
+    @classmethod
+    def _validate_http_url(cls, v: str) -> str:
+        value = v.strip()
+        if not value.startswith(("http://", "https://")) or len(value) <= len("http://"):
+            raise ValueError(
+                f"must be an http:// or https:// address, got {v!r}"
+            )
+        return value
+
+
 class PlanningConfig(BaseModel):
     """Configuration for Mode P planning approval-routing (FEAT-SPL-002).
 
@@ -942,6 +986,33 @@ class PlanningConfig(BaseModel):
             "first refusal stops the run, exactly as before 2026-09-06."
         ),
     )
+    sandboxes: dict[str, SandboxEntry] = Field(
+        default_factory=dict,
+        description=(
+            "The repositories that have a sandbox, by the same 'org/name' key "
+            "as target_repo_paths, each with the sandbox's name and the two "
+            "addresses forge reaches inside it (the deploy sidecar and the "
+            "build runner). A repository listed here has its planning commits "
+            "made by the sidecar inside its sandbox, on the factory's own "
+            "clone, with the pre-commit checks run there; a repository not "
+            "listed is handled exactly as before, in the forge container. "
+            "Empty by default."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _sandboxes_name_known_repositories(self) -> "PlanningConfig":
+        """A sandbox entry must name a repository the map knows: the runner
+        routes by that repository's path, and the sidecar resolves the same
+        key, so an entry without a path could never be reached."""
+        unknown = sorted(set(self.sandboxes) - set(self.target_repo_paths))
+        if unknown:
+            raise ValueError(
+                "planning.sandboxes names repositories that are not in "
+                f"planning.target_repo_paths: {', '.join(unknown)} — add each "
+                "one to target_repo_paths first"
+            )
+        return self
 
     @field_validator("default_target_repo")
     @classmethod
