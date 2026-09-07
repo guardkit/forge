@@ -732,18 +732,38 @@ _MACHINE_REWRITE_LINE = (
 )
 
 #: The one sentence at the top of the plan-stop card when the rewrite did not
-#: get there (rule 6). ``{why}`` is one of the two outcomes the plan leg can
-#: see for itself: "changed nothing" (the rewrite's digest said the same
-#: thing) or "still could not be proven" (the second stamping refused titles).
-#: A rewrite the checker refused never reaches this card: the spec leg says
-#: that itself, in the note-refused sentence below (rule 23), with "the
-#: machine's note" as the author.
+#: get there (rule 6). ``{why}`` is the one outcome that still reaches this
+#: card: "still could not be proven" (the rewrite landed and the second
+#: stamping refused titles). A rewrite the checker refused, or one that
+#: changed nothing, no longer stops here: since rule 6b (2026-09-07, after
+#: run 696a3e38) the model fallback gets its turn on the second stamping
+#: first, and a stop after that is the note-refused sentence below with the
+#: model's own sentence after it.
 _MACHINE_REWRITE_STOP_SENTENCE = (
     "The machine already asked the spec writer once to rewrite these as what "
     "the endpoint does; the rewrite {why}."
 )
-_REWRITE_CHANGED_NOTHING = "changed nothing"
 _REWRITE_STILL_UNPROVEN = "still could not be proven"
+
+#: Why the spec writer could not rewrite the refused examples — the words in
+#: the parenthesis of the rule 6b line — the two outcomes the plan leg can
+#: see for itself.
+_REWRITE_REFUSED_BY_CHECKER_WHY = "the checker refused the rewrite twice"
+_REWRITE_CHANGED_NOTHING_WHY = "the rewrite changed nothing"
+
+#: Rule 6b (2026-09-07): the ONE un-mentioned line the owner reads when the
+#: spec writer could not rewrite the refused examples (the checker refused
+#: the rewrite twice, or it changed nothing) and the model fallback, given
+#: its turn on the second stamping, decided their verifiers. The spec's
+#: shape, verbatim for one example; ``{it}`` and ``{its_verifier}`` bend for
+#: more than one ("them", "their verifiers"). ``{decided}`` is
+#: "<title> → <word>" per example, joined with "; " — the real title and
+#: the real word from the second stamping's stamped map.
+_MACHINE_REWRITE_MODEL_LINE = (
+    "{n} of the worked examples could not be proven as written; the spec "
+    "writer could not rewrite {it} as what the endpoint does ({why}), so the "
+    "model fallback decided {its_verifier}: {decided}. The plan carries on."
+)
 
 #: What the owner reads when the spec writer's revision round is refused by
 #: the checker after a note (rule 23) — theirs or the machine's. It says what
@@ -768,6 +788,36 @@ _MACHINE_NOTE_REFUSED_MESSAGE = (
     "sentence as what the endpoint does: the method and path, the status code, "
     "and what is in the reply."
 )
+
+#: The same stop when the machine's rewrite CHANGED NOTHING and the model
+#: fallback, given its turn (rule 6b), still could not settle the titles.
+#: Rule 23's machine-variant sentence with the one clause that would be
+#: untrue swapped for what happened: the checker refused nothing, the
+#: rewrite came back saying the same thing.
+_MACHINE_REWRITE_CHANGED_NOTHING_MESSAGE = (
+    "Planning run {correlation_id} stopped at {stage}: {count} of the worked "
+    "examples could not be proven as written, and when the machine asked the "
+    "spec writer to rewrite them as what the endpoint does, the rewrite "
+    "changed nothing. Nothing was built. To try again, send the sentence as "
+    "what the endpoint does: the method and path, the status code, and what "
+    "is in the reply."
+)
+
+
+class _MachineNoteRefused(Exception):
+    """The checker refused the spec writer's revision round after the
+    MACHINE's note (rule 6b, 2026-09-07). Raised by :meth:`_draft_spec` when
+    the plan leg asked to hear about the refusal (``fail_on_refusal=False``)
+    instead of having the run failed there, so the model fallback can have
+    its turn on the second stamping before anyone is told to start again.
+    Carries the checker's reason as the dispatch reported it, and the
+    dispatch's own ``outcome: reason`` words for the machine record. Never
+    raised for an owner's note: that path is unchanged."""
+
+    def __init__(self, *, reason: Any, dispatch_reason: str) -> None:
+        super().__init__(dispatch_reason)
+        self.reason = reason
+        self.dispatch_reason = dispatch_reason
 
 
 @dataclass(frozen=True)
@@ -2123,6 +2173,7 @@ class PlanningRunDriver:
         plan_run_id: str,
         notes: list[str],
         note_from_machine: bool = False,
+        fail_on_refusal: bool = True,
     ) -> dict[str, Any] | None:
         """Dispatch the spec-writer, commit the spec, record the DRAFT row.
 
@@ -2139,6 +2190,15 @@ class PlanningRunDriver:
         differs is the words: the owner's message when the checker refuses the
         rewrite names "the machine's note", and the card is not annotated,
         because nobody is shown it again.
+
+        ``fail_on_refusal`` (rule 6b, 2026-09-07): ``False`` — honoured only
+        with ``note_from_machine`` — asks that a checker refusal of the
+        machine's round be RETURNED to the plan leg, as
+        :class:`_MachineNoteRefused`, rather than failing the run here, so
+        the model fallback can have its turn before anyone is told to start
+        again. An owner's note never passes it and keeps today's path exactly.
+        Every other failure of the round (the dispatch raising, the write, the
+        digest) still fails the run here, loudly, as before.
 
         Returns the draft record (the same dict the door and the approved row
         read), or ``None`` when the leg has already failed loudly.
@@ -2176,6 +2236,23 @@ class PlanningRunDriver:
             return None
         ok, reason = self._dispatch_ok(result)
         if not ok:
+            if notes and note_from_machine and not fail_on_refusal:
+                # Rule 6b (2026-09-07): the checker refused the MACHINE's
+                # rewrite and the plan leg asked to decide for itself what
+                # happens next (the model fallback's turn, then the words).
+                # Nothing is failed here; nobody is told yet.
+                logger.warning(
+                    "planning driver: run %s — the checker refused the spec "
+                    "writer's rewrite after the machine's note (%s); handed "
+                    "back to the plan leg, which gives the model fallback its "
+                    "turn before the run stops",
+                    correlation_id,
+                    reason,
+                )
+                raise _MachineNoteRefused(
+                    reason=getattr(result, "reason", None),
+                    dispatch_reason=f"007 dispatch {reason}",
+                )
             # After a note, a not-ok dispatch is the checker refusing the
             # rewrite (the must-pass "what the note asks must change, and
             # nothing else may move without reason"). The owner is told what
@@ -3343,13 +3420,20 @@ class PlanningRunDriver:
         same must-pass criterion), re-records the approved spec row with the
         owner's decision carried forward, and runs the attempt again from the
         top. A clean second stamping tells the owner in ONE un-mentioned line
-        and carries on; a rewrite that changed nothing, or a second refusal,
-        stops with the plan-stop card plus one sentence saying the machine
-        already tried; a rewrite the checker refused stops with the spec leg's
-        own sentence saying what to do. Never a third try; whether the one
-        rewrite has happened is read from the durable row, so a re-drive
-        after a crash does the right thing either side of it. Off by
-        ``planning.rewrite_on_refusal: false``, which is the 2026-09-05 path.
+        and carries on; a landed rewrite whose second stamping still refuses
+        titles stops with the plan-stop card plus one sentence saying the
+        machine already tried. When the spec writer could NOT rewrite them —
+        the checker refused the rewrite twice, or it changed nothing — the
+        run does not stop yet (rule 6b, 2026-09-07, after run 696a3e38): the
+        second stamping runs anyway, on the spec of record (nothing was
+        re-recorded), with the model fallback allowed; if everything stamps
+        the owner reads one line naming what the model decided and the plan
+        carries on; if titles are still refused the run stops with the
+        note-refused sentence and the model's own sentence after it. Never a
+        third try; whether the one rewrite has happened is read from the
+        durable row, so a re-drive after a crash does the right thing either
+        side of it. Off by ``planning.rewrite_on_refusal: false``, which is
+        the 2026-09-05 path.
         """
         deps = self._deps
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
@@ -3429,14 +3513,16 @@ class PlanningRunDriver:
                 stamps=stamps,
             )
             if rewrite is None:
-                return False  # the spec leg said why (rule 23) — already loud
-            if rewrite["repeat"]:
-                return await self._stop_at_stamps(
-                    correlation_id,
-                    feature_id,
-                    stamps,
-                    after_rewrite=_REWRITE_CHANGED_NOTHING,
-                )
+                return False  # the spec leg said why — already loud
+            rewrite_did_not_land = bool(
+                rewrite.get("refused_by_checker") or rewrite.get("changed_nothing")
+            )
+            # The second stamping runs either way, with the model fallback
+            # allowed: on the REWRITTEN spec when the rewrite landed (the
+            # attempt reads the latest approved row, which the rewrite
+            # re-recorded), or — rule 6b — on the spec of record when it did
+            # not land (nothing was re-recorded), so the model gets its turn
+            # before anyone is told to start again.
             second = await self._plan_attempt(
                 correlation_id,
                 target_repo=target_repo,
@@ -3444,7 +3530,12 @@ class PlanningRunDriver:
                 branch=branch,
                 plan_run_id=plan_run_id,
                 feature_id=feature_id,
-                round_label="second (after the machine's rewrite, round 1)",
+                round_label=(
+                    "second (the machine's rewrite, round 1, did not land: the "
+                    "model fallback's turn on the spec of record)"
+                    if rewrite_did_not_land
+                    else "second (after the machine's rewrite, round 1)"
+                ),
                 rules_only=False,
             )
             if second is None:
@@ -3454,16 +3545,31 @@ class PlanningRunDriver:
                 stamps2 = second.stamps
                 if stamps2 is None:  # pragma: no cover
                     return False
-                # Rule 6: never a third try. The refused titles get the
-                # sentence; a normalizer that could not RUN the second time
-                # is a different thing and keeps today's cannot-run card.
+                # Rule 6: never a third try. A normalizer that could not RUN
+                # the second time is a different thing and keeps today's
+                # cannot-run card, whichever way the rewrite went.
+                if not stamps2.refused_titles:
+                    return await self._stop_at_stamps(
+                        correlation_id,
+                        feature_id,
+                        stamps2,
+                        round_note=(
+                            self._rewrite_round_note(rewrite)
+                            if rewrite_did_not_land
+                            else None
+                        ),
+                    )
+                if rewrite_did_not_land:
+                    # Rule 6b: the model had its turn and titles are still
+                    # refused — the note-refused sentence, then the model's own.
+                    return await self._stop_after_refused_rewrite(
+                        correlation_id, feature_id, stamps2, rewrite
+                    )
                 return await self._stop_at_stamps(
                     correlation_id,
                     feature_id,
                     stamps2,
-                    after_rewrite=(
-                        _REWRITE_STILL_UNPROVEN if stamps2.refused_titles else None
-                    ),
+                    after_rewrite=_REWRITE_STILL_UNPROVEN,
                 )
         return await self._finish_feature_plan(
             correlation_id,
@@ -3731,16 +3837,20 @@ class PlanningRunDriver:
         stamps: "StampNormalizerOutcome",
     ) -> dict[str, Any] | None:
         """The machine's one rewrite: compose the note, run the spec writer's
-        revision round with it, and — unless the rewrite changed nothing —
-        re-record the approved row (rules 2, 3, 4).
+        revision round with it, and — when the rewrite landed — re-record the
+        approved row (rules 2, 3, 4).
 
         Returns the rewrite record (round, author, note, refused titles, the
-        what-changed sentence, and ``repeat``), or ``None`` when the spec leg
-        already failed the run loudly (a checker refusal speaks rule 23's
-        sentence with "the machine's note"; a write or digest failure speaks
-        its own). A ``repeat`` record is returned WITHOUT re-recording the
-        approved row: the caller stops the run, and the spec of record stays
-        the one the owner approved.
+        what-changed sentence, ``refused_by_checker`` and ``changed_nothing``
+        — with the checker's reason when it refused — and the first
+        stamping's receipt), or ``None`` when the spec leg already failed the
+        run loudly (a write or digest failure speaks its own sentence there).
+        A rewrite that did NOT land — the checker refused it (rule 6b: the
+        refusal comes back here as :class:`_MachineNoteRefused` instead of
+        failing the run) or it changed nothing — is returned WITHOUT
+        re-recording the approved row: the spec of record stays the one the
+        owner approved, and the caller gives the model fallback its turn on
+        it before deciding anything.
         """
         refused_titles = list(stamps.refused_titles)
         note = self._machine_rewrite_note(refused_titles)
@@ -3752,16 +3862,47 @@ class PlanningRunDriver:
             len(refused_titles),
             refused_titles,
         )
-        draft = await self._draft_spec(
-            row,
-            correlation_id,
-            target_repo=target_repo,
-            repo_path=repo_path,
-            branch=branch,
-            plan_run_id=plan_run_id,
-            notes=[*self._spec_review_notes(correlation_id), note],
-            note_from_machine=True,
-        )
+        record: dict[str, Any] = {
+            "round": 1,
+            "author": _MACHINE_NOTE_AUTHOR,
+            "note": note,
+            "refused_titles": refused_titles,
+            "changes": "",
+            "refused_by_checker": False,
+            "changed_nothing": False,
+            # Rule 1a: the receipt says whether the stamping that set off the
+            # rewrite ran by rule only, and what the model fallback said of
+            # itself on that call (switched off, when it was).
+            "first_stamping": self._first_stamping_block(stamps),
+        }
+        try:
+            draft = await self._draft_spec(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                notes=[*self._spec_review_notes(correlation_id), note],
+                note_from_machine=True,
+                fail_on_refusal=False,
+            )
+        except _MachineNoteRefused as refused:
+            # Rule 6b (2026-09-07): the checker refused the machine's rewrite.
+            # The run does not stop here: the spec of record stands, and the
+            # model fallback gets its turn on the second stamping.
+            record["refused_by_checker"] = True
+            record["checker_reason"] = str(refused.reason or "")
+            record["dispatch_reason"] = refused.dispatch_reason
+            logger.warning(
+                "planning driver: run %s — the checker refused the machine's "
+                "rewrite (round 1): %s; the spec of record stands, and the "
+                "model fallback gets its turn on the second stamping before "
+                "the run can stop",
+                correlation_id,
+                refused.dispatch_reason,
+            )
+            return record
         if draft is None:
             return None
         compared = draft.get("rewrite")
@@ -3777,23 +3918,16 @@ class PlanningRunDriver:
             )
             compared = {"repeat": False, "changes": "not recorded"}
         changes = str(compared.get("changes") or "")
-        repeat = bool(compared.get("repeat")) or not changes
-        record: dict[str, Any] = {
-            "round": 1,
-            "author": _MACHINE_NOTE_AUTHOR,
-            "note": note,
-            "refused_titles": refused_titles,
-            "changes": changes,
-            "repeat": repeat,
-            # Rule 1a: the receipt says whether the stamping that set off the
-            # rewrite ran by rule only, and what the model fallback said of
-            # itself on that call (switched off, when it was).
-            "first_stamping": self._first_stamping_block(stamps),
-        }
-        if repeat:
+        record["changes"] = changes
+        if bool(compared.get("repeat")) or not changes:
+            # Rule 6b: a rewrite that changed nothing is never re-recorded;
+            # the spec of record stands, and the model fallback gets its turn.
+            record["changed_nothing"] = True
             logger.warning(
                 "planning driver: run %s — the machine's rewrite (round 1) "
-                "changed nothing on the list; the run stops with the card",
+                "changed nothing on the list; the spec of record stands, and "
+                "the model fallback gets its turn on the second stamping "
+                "before the run can stop",
                 correlation_id,
             )
             return record
@@ -3841,17 +3975,22 @@ class PlanningRunDriver:
         stamps: "StampNormalizerOutcome",
         *,
         after_rewrite: str | None = None,
+        round_note: str | None = None,
     ) -> bool:
         """The normalizer stopped the run — the card names the refused titles
         VERBATIM (or the reason it could not run); the machine record keeps
         the internal reason and, after the machine's rewrite, names the round
-        and how it went (rule 6, rule 9)."""
+        and how it went (rule 6, rule 9). ``round_note`` goes on the machine
+        record only — the cannot-run card after a rewrite that did not land
+        (rule 6b) says nothing about the round, as it never has."""
         reason = self._stamps_reason(feature_id, stamps)
         if after_rewrite:
             reason = (
                 f"{reason}; after the machine's rewrite (round 1): the rewrite "
                 f"{after_rewrite}"
             )
+        if round_note:
+            reason = f"{reason}; {round_note}"
         return await self._fail_leg(
             correlation_id,
             _FEATURE_PLAN_STAGE,
@@ -3879,6 +4018,77 @@ class PlanningRunDriver:
                 if stamps.refused_titles
                 else ""
             )
+        )
+
+    @staticmethod
+    def _rewrite_round_note(rewrite: Mapping[str, Any]) -> str:
+        """The machine record's words for a rewrite that did not land (rule
+        6b): how it went — refused by the checker, with the dispatch's own
+        words, or changed nothing — and that the model fallback had its turn
+        on the second stamping, on the spec of record."""
+        if rewrite.get("refused_by_checker"):
+            how = (
+                "the rewrite was refused by the checker "
+                f"({rewrite.get('dispatch_reason') or 'no reason supplied'})"
+            )
+        else:
+            how = "the rewrite changed nothing"
+        return (
+            f"after the machine's rewrite (round 1): {how}; the model fallback "
+            "had its turn on the second stamping, on the spec of record"
+        )
+
+    async def _stop_after_refused_rewrite(
+        self,
+        correlation_id: str,
+        feature_id: str,
+        stamps: "StampNormalizerOutcome",
+        rewrite: Mapping[str, Any],
+    ) -> bool:
+        """Rule 6b's stop: the machine's rewrite did not land (the checker
+        refused it twice, or it changed nothing), the model fallback had its
+        turn on the second stamping, and titles are still refused. The owner
+        reads ONE message, not a card: the note-refused sentence (rule 23's
+        machine variant — or its changed-nothing twin, which says what
+        happened instead of blaming the checker), then the model fallback's
+        own sentence about itself (rule 16) when the normalizer said
+        anything, then the titles still refused, verbatim, one per line, so
+        "these" in the model's sentence names something. The machine record
+        keeps the round, how it went, and the second stamping's outcome."""
+        n = len(rewrite.get("refused_titles") or [])
+        if rewrite.get("refused_by_checker"):
+            first = self._note_refused_message(
+                correlation_id,
+                note=str(rewrite.get("note") or ""),
+                note_from_machine=True,
+                reason=rewrite.get("checker_reason"),
+            )
+        else:
+            first = _MACHINE_REWRITE_CHANGED_NOTHING_MESSAGE.format(
+                correlation_id=correlation_id,
+                stage=plain_stage_name(_FEATURE_PLAN_STAGE),
+                count=n,
+            )
+        model_sentence = self._model_fallback_sentence(stamps)
+        message = f"{first} {model_sentence}" if model_sentence else first
+        titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
+        message = f"{message}\n{titles}"
+        reason = (
+            f"{self._stamps_reason(feature_id, stamps)}; "
+            f"{self._rewrite_round_note(rewrite)}; titles still refused after "
+            "the model's turn, so the run stops (never a third try)"
+        )
+        logger.error(
+            "planning driver: run %s — the model fallback had its turn after "
+            "the machine's rewrite (round 1) did not land, and %d title(s) are "
+            "still refused; the run stops with the note-refused sentence and "
+            "the model's own (%s)",
+            correlation_id,
+            len(stamps.refused_titles),
+            str((stamps.model_outcome or {}).get("status") or "the normalizer said nothing about the model"),
+        )
+        return await self._fail_leg(
+            correlation_id, _FEATURE_PLAN_STAGE, reason, owner_message=message
         )
 
     async def _finish_feature_plan(
@@ -3950,16 +4160,43 @@ class PlanningRunDriver:
             ).get("rewritten_by_machine")
             rewrite = dict(recorded) if isinstance(recorded, Mapping) else None
         if rewrite is not None:
-            line = _MACHINE_REWRITE_LINE.format(
-                n=len(rewrite.get("refused_titles") or []),
-                changes=str(rewrite.get("changes") or "not recorded"),
+            refused_titles = list(rewrite.get("refused_titles") or [])
+            did_not_land = bool(
+                rewrite.get("refused_by_checker") or rewrite.get("changed_nothing")
             )
+            decided: list[tuple[str, str]] = []
+            if did_not_land:
+                # Rule 6b: the rewrite did not land and the model fallback,
+                # given its turn on the second stamping, decided the rest.
+                # The line names the real titles and the real words.
+                decided = (
+                    self._model_decided_pairs(stamps, refused_titles)
+                    if stamps is not None
+                    else [
+                        (t, "a verifier the normalizer did not name")
+                        for t in refused_titles
+                    ]
+                )
+                line = self._machine_rewrite_model_line(
+                    len(refused_titles),
+                    why=(
+                        _REWRITE_REFUSED_BY_CHECKER_WHY
+                        if rewrite.get("refused_by_checker")
+                        else _REWRITE_CHANGED_NOTHING_WHY
+                    ),
+                    decided=decided,
+                )
+            else:
+                line = _MACHINE_REWRITE_LINE.format(
+                    n=len(refused_titles),
+                    changes=str(rewrite.get("changes") or "not recorded"),
+                )
             sent = await self._notify(correlation_id, line, level="info", mention=False)
             receipt_block = {
                 "round": rewrite.get("round", 1),
                 "author": rewrite.get("author", _MACHINE_NOTE_AUTHOR),
                 "note": rewrite.get("note"),
-                "refused_titles": list(rewrite.get("refused_titles") or []),
+                "refused_titles": refused_titles,
                 "changes": rewrite.get("changes"),
                 "owner_line": line,
                 "owner_line_sent": (
@@ -3970,6 +4207,23 @@ class PlanningRunDriver:
                     else "line not sent (publish failed)"
                 ),
             }
+            if rewrite.get("refused_by_checker"):
+                receipt_block["refused_by_checker"] = True
+                receipt_block["checker_reason"] = str(rewrite.get("checker_reason") or "")
+            if rewrite.get("changed_nothing"):
+                receipt_block["changed_nothing"] = True
+            if did_not_land:
+                # Rule 6b's receipt: the second stamping — the one that ran
+                # with the model allowed, on the spec of record — and what
+                # the model decided, title by title.
+                second_stamping: dict[str, Any] = {
+                    "status": stamps.status if stamps is not None else "not run",
+                    "rules_only": bool(stamps.rules_only) if stamps is not None else False,
+                    "model_decided": dict(decided),
+                }
+                if stamps is not None and stamps.model_outcome is not None:
+                    second_stamping["model_outcome"] = dict(stamps.model_outcome)
+                receipt_block["second_stamping"] = second_stamping
             first_stamping = rewrite.get("first_stamping")
             if isinstance(first_stamping, Mapping):
                 # Rule 1a: the stamping that set off the rewrite, and whether
@@ -3982,9 +4236,15 @@ class PlanningRunDriver:
             stamp_receipt = dict(stamp_receipt or {})
             stamp_receipt["rewrite"] = receipt_block
             logger.info(
-                "planning driver: run %s — the machine's rewrite (round 1) "
-                "stamped clean; the owner's line %s",
+                "planning driver: run %s — %s; the owner's line %s",
                 correlation_id,
+                (
+                    "the model fallback settled, on the second stamping, what "
+                    "the machine's rewrite (round 1) could not: "
+                    + "; ".join(f"{t} -> {w}" for t, w in decided)
+                    if did_not_land
+                    else "the machine's rewrite (round 1) stamped clean"
+                ),
                 receipt_block["owner_line_sent"],
             )
         details: dict[str, Any] = {
@@ -4337,6 +4597,50 @@ class PlanningRunDriver:
         return None
 
     @staticmethod
+    def _model_decided_pairs(
+        stamps: "StampNormalizerOutcome", refused_titles: Sequence[str]
+    ) -> list[tuple[str, str]]:
+        """The (title, verifier word) pairs the MODEL decided on a stamping
+        (rule 6b): the titles the normalizer marks with rule ``model`` — its
+        own provenance mark for a model-decided stamp, never an R-number.
+        When it marked none (an older guardkit, or a stamped map the seam's
+        clipped tail lost), the titles the first stamping refused, each with
+        what this stamping wrote for it — or a plain "not named", never a
+        guessed word."""
+        stamped = {str(k): str(v) for k, v in stamps.stamped.items()}
+        rules = {str(k): str(v).strip().lower() for k, v in stamps.rules.items()}
+        pairs = [(t, w) for t, w in stamped.items() if rules.get(t) == "model"]
+        if pairs:
+            return pairs
+        out: list[tuple[str, str]] = []
+        for title in refused_titles:
+            word = stamped.get(title)
+            if word is None:
+                word = (
+                    "already stamped"
+                    if title in stamps.already_stamped
+                    else "a verifier the normalizer did not name"
+                )
+            out.append((title, word))
+        return out
+
+    @staticmethod
+    def _machine_rewrite_model_line(
+        n: int, *, why: str, decided: Sequence[tuple[str, str]]
+    ) -> str:
+        """Rule 6b's one line, in the spec's shape: the count, why the spec
+        writer could not rewrite the examples, and what the model decided —
+        the real title and the real word, one pair per example."""
+        one = n == 1
+        return _MACHINE_REWRITE_MODEL_LINE.format(
+            n=n,
+            it="it" if one else "them",
+            why=why,
+            its_verifier="its verifier" if one else "their verifiers",
+            decided="; ".join(f"{title} → {word}" for title, word in decided),
+        )
+
+    @staticmethod
     def _stamp_normalizer_card(
         correlation_id: str,
         feature_id: str,
@@ -4361,7 +4665,10 @@ class PlanningRunDriver:
 
         ``after_rewrite`` (rule 6, 2026-09-06): the machine already spent its
         one rewrite; the card opens with the sentence that says so and how the
-        rewrite went ("changed nothing" / "still could not be proven").
+        rewrite went ("still could not be proven" — the only outcome that
+        still reaches this card since rule 6b, 2026-09-07: a rewrite the
+        checker refused or that changed nothing gives the model its turn and
+        stops, if it must, with the note-refused sentence instead).
         """
         from forge.pipeline.routing_stamps import VERIFIER_HOMES
 
@@ -4393,13 +4700,11 @@ class PlanningRunDriver:
                 # off for this stamping so its rewrite round could go first.
                 # The card says THAT. It never says "there is no fallback
                 # home" — a model endpoint may well be configured; it was
-                # not asked on this stamping, and after a rewrite that
-                # changed nothing it was never asked at all.
+                # not asked on this stamping. (Since rule 6b a rewrite that
+                # changed nothing never reaches this card: the model gets its
+                # turn on a second stamping first.)
                 fallback_clause = (
-                    "the model fallback was not asked (the machine kept it for "
-                    "after its rewrite, which changed nothing)"
-                    if after_rewrite == _REWRITE_CHANGED_NOTHING
-                    else "the model fallback was not asked (it was switched off "
+                    "the model fallback was not asked (it was switched off "
                     "for this stamping)"
                 )
             else:
