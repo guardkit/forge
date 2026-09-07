@@ -1264,6 +1264,17 @@ def make_conductor_receipts_exporter(
     other repository copies in the container exactly as before. ``config``
     absent (a test that passes only a pool) means no sandboxes, hence
     today's path.
+
+    **The sandbox branch answers with something to await.** The copy is a
+    call over the wire, and this seam is called from the conductor's turn
+    loop, which runs on the daemon's own event loop alongside every other
+    build and journey. So for a sandbox repository the seam hands back a
+    coroutine that does the waiting on a worker thread; the driver already
+    awaits whatever this seam returns
+    (:func:`forge.pipeline.conductor_driver._maybe_await`), so the contract
+    is unchanged and the daemon keeps answering while the receipts copy.
+    The in-container branch returns the stage key directly, exactly as it
+    always has.
     """
     from forge.pipeline.fix_journey_receipts import export_stage_receipts
 
@@ -1282,6 +1293,8 @@ def make_conductor_receipts_exporter(
         worktree_path = getattr(row, "worktree_path", None)
         entry = sandboxes.get(str(getattr(row, "repo", "") or "")) if row else None
         if entry is not None:
+            # A coroutine, not a key: the driver awaits it, and the wire wait
+            # happens on a worker thread instead of on the daemon's loop.
             return _export_receipts_in_sandbox(
                 entry=entry,
                 build_id=build_id,
@@ -1308,7 +1321,7 @@ def make_conductor_receipts_exporter(
 RECEIPTS_EXPORT_TIMEOUT_S: float = 300.0
 
 
-def _export_receipts_in_sandbox(
+async def _export_receipts_in_sandbox(
     *,
     entry: Any,
     build_id: str,
@@ -1322,6 +1335,14 @@ def _export_receipts_in_sandbox(
     Returns the stage key it wrote, or ``None`` when it could not — the same
     contract the in-container export has, so a failure to copy never blocks a
     journey; it is logged and the turn carries on.
+
+    The POST waits on a worker thread (``asyncio.to_thread``), as this lane's
+    two sibling seams do — the tree cut in
+    :mod:`forge.cli._conductor_worktree` and the leg run in
+    :mod:`forge.adapters.guardkit.run_via_sidecar`. A journey turn runs on the
+    daemon's shared event loop, so waiting there would stop the bus
+    subscriptions, the queue and every other build for as long as the copy
+    took, and for the whole five minutes if the sandbox's sidecar were slow.
     """
     from forge.deploy_sidecar.service import RECEIPTS_EXPORT_ROUTE
     from forge.planning.sidecar_git_runner import _urllib_post
@@ -1344,7 +1365,11 @@ def _export_receipts_in_sandbox(
     if extra_files:
         body["extra_files"] = extra_files
     try:
-        status, decoded = sender(url, body, RECEIPTS_EXPORT_TIMEOUT_S)
+        status, decoded = await asyncio.to_thread(
+            sender, url, body, RECEIPTS_EXPORT_TIMEOUT_S
+        )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001 — never block a turn
         logger.warning(
             "conductor receipts: the sidecar in sandbox %s could not be "

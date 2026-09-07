@@ -16,9 +16,11 @@ behave exactly as it did before this lane, and each case says so.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sqlite3
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,6 +42,7 @@ from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import build_server
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.pipeline.conductor_driver import _maybe_await
 
 REPO_KEY = "guardkit/api_test"
 PLAIN_KEY = "guardkit/no_sandbox"
@@ -294,12 +297,14 @@ class TestTheReceiptsAreExportedInTheSandbox:
         (family / "review.json").write_text("{}", encoding="utf-8")
 
         export = make_conductor_receipts_exporter(pool=pool, config=sidecar.config)
-        key = export(
-            build_id=BUILD_ID,
-            report=SimpleNamespace(
-                chosen_stage=SimpleNamespace(value="task-review"),
-                rationale="the review leg ran",
-            ),
+        key = asyncio.run(
+            export(
+                build_id=BUILD_ID,
+                report=SimpleNamespace(
+                    chosen_stage=SimpleNamespace(value="task-review"),
+                    rationale="the review leg ran",
+                ),
+            )
         )
 
         assert key == "001-task-review"
@@ -366,14 +371,147 @@ class TestTheReceiptsAreExportedInTheSandbox:
         export = make_conductor_receipts_exporter(pool=pool, config=config)
 
         assert (
-            export(
-                build_id=BUILD_ID,
-                report=SimpleNamespace(
-                    chosen_stage=SimpleNamespace(value="task-work"), rationale=""
-                ),
+            asyncio.run(
+                export(
+                    build_id=BUILD_ID,
+                    report=SimpleNamespace(
+                        chosen_stage=SimpleNamespace(value="task-work"), rationale=""
+                    ),
+                )
             )
             is None
         )
+
+
+#: What the sidecar's ``/receipts/export`` route answers on a good copy.
+_SUCCESS = {"status": "success", "stage_key": "001-task-review", "dest": "x"}
+
+
+class TestTheExportNeverStopsTheDaemon:
+    """The copy is a wait on the wire, and a journey turn runs on the daemon's
+    own event loop beside every other build. So the sandbox branch must hand
+    back something to await, and the waiting must happen on a worker thread —
+    the same posture this lane's tree cut and leg run already take. A repository
+    without a sandbox answers with the key itself, exactly as before.
+    """
+
+    def test_the_sandbox_branch_hands_back_something_the_driver_awaits(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, receipts_root: Path
+    ) -> None:
+        _row(pool, REPO_KEY)
+        ready = asyncio.run(prepare_journey_worktree(pool, sidecar.config, BUILD_ID))
+        assert isinstance(ready, WorktreeReady)
+        (Path(ready.path) / ".guardkit" / "autobuild").mkdir(parents=True)
+
+        export = make_conductor_receipts_exporter(pool=pool, config=sidecar.config)
+        answer = export(
+            build_id=BUILD_ID,
+            report=SimpleNamespace(
+                chosen_stage=SimpleNamespace(value="task-review"), rationale=""
+            ),
+        )
+
+        assert inspect.isawaitable(answer)
+        # The driver's own helper, not a stand-in for it.
+        assert asyncio.run(_maybe_await(answer)) == "001-task-review"
+
+    def test_the_wire_wait_happens_off_the_event_loops_thread(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, clone: Path
+    ) -> None:
+        _row(pool, REPO_KEY)
+        pool.record_worktree_path(
+            BUILD_ID, str(clone / ".forge" / "worktrees" / BUILD_ID)
+        )
+        seen: dict[str, Any] = {}
+
+        def _record(url: str, body: Any, timeout: float) -> tuple[int, Any]:
+            seen["sender_thread"] = threading.current_thread().ident
+            return 200, _SUCCESS
+
+        export = make_conductor_receipts_exporter(
+            pool=pool, config=sidecar.config, post=_record
+        )
+
+        async def _drive() -> Any:
+            seen["loop_thread"] = threading.current_thread().ident
+            return await _maybe_await(
+                export(
+                    build_id=BUILD_ID,
+                    report=SimpleNamespace(
+                        chosen_stage=SimpleNamespace(value="task-review"), rationale=""
+                    ),
+                )
+            )
+
+        assert asyncio.run(_drive()) == "001-task-review"
+        assert seen["sender_thread"] != seen["loop_thread"]
+
+    def test_a_slow_sidecar_does_not_freeze_the_daemons_other_work(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, clone: Path
+    ) -> None:
+        """The defect this pins: a synchronous POST here stopped every other
+        build, every subscription and the queue for as long as the copy took."""
+        _row(pool, REPO_KEY)
+        pool.record_worktree_path(
+            BUILD_ID, str(clone / ".forge" / "worktrees" / BUILD_ID)
+        )
+
+        def _slow(url: str, body: Any, timeout: float) -> tuple[int, Any]:
+            time.sleep(0.3)
+            return 200, _SUCCESS
+
+        export = make_conductor_receipts_exporter(
+            pool=pool, config=sidecar.config, post=_slow
+        )
+        ticks = 0
+
+        async def _other_work() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def _drive() -> Any:
+            beside = asyncio.ensure_future(_other_work())
+            try:
+                return await _maybe_await(
+                    export(
+                        build_id=BUILD_ID,
+                        report=SimpleNamespace(
+                            chosen_stage=SimpleNamespace(value="task-review"),
+                            rationale="",
+                        ),
+                    )
+                )
+            finally:
+                beside.cancel()
+
+        assert asyncio.run(_drive()) == "001-task-review"
+        # A frozen loop would have ticked once or not at all.
+        assert ticks >= 5, f"the loop only ticked {ticks} times while the copy ran"
+
+    def test_a_repository_without_a_sandbox_answers_with_the_key_itself(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        plain_checkout: Path,
+        receipts_root: Path,
+    ) -> None:
+        _row(pool, PLAIN_KEY)
+        tree = plain_checkout / ".forge" / "worktrees" / BUILD_ID
+        (tree / ".guardkit" / "autobuild").mkdir(parents=True)
+        pool.record_worktree_path(BUILD_ID, str(tree))
+
+        export = make_conductor_receipts_exporter(pool=pool, config=sidecar.config)
+        answer = export(
+            build_id=BUILD_ID,
+            report=SimpleNamespace(
+                chosen_stage=SimpleNamespace(value="task-work"), rationale=""
+            ),
+        )
+
+        assert not inspect.isawaitable(answer)
+        assert answer == "001-task-work"
 
 
 # ---------------------------------------------------------------------------

@@ -2168,8 +2168,11 @@ def process_guardkit_leg_request(
     the forge configuration names; the working directory must be one of that
     repository's own journey worktrees and must exist; the subcommand must be
     ``task-review`` or ``task-work``; every argument and every path must be
-    text; the timeout must be a positive number no larger than the cap. A
-    refusal is a 4xx with one plain sentence. Never raises.
+    text; the timeout must be a positive number. A wall longer than this
+    route's ceiling is cut back to the ceiling and said so in the result's
+    warnings, never refused — a profile that asks for a longer stage wall
+    should run, not fail. A refusal is a 4xx with one plain sentence. Never
+    raises.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -2249,6 +2252,13 @@ def process_guardkit_leg_request(
 
     timeout_seconds = payload.get("timeout_seconds")
     timeout = LEG_TIMEOUT_DEFAULT
+    # A WALL WIDER THAN THIS ROUTE ALLOWS IS CUT BACK, NEVER REFUSED (ruled
+    # 2026-09-07 21:05Z). Refusing it with a 400 would fail a leg that could
+    # have run: the caller would get "internal error before dispatch" for a
+    # profile that merely asked for a longer stage wall than this route's
+    # ceiling. So the leg runs with the longest wall the route has, and the
+    # result says so in plain words alongside the context warnings.
+    timeout_warnings: list[dict[str, str]] = []
     if timeout_seconds is not None:
         if (
             isinstance(timeout_seconds, bool)
@@ -2256,14 +2266,20 @@ def process_guardkit_leg_request(
             or timeout_seconds <= 0
         ):
             return 400, {"error": "'timeout_seconds' must be a positive number"}
-        if float(timeout_seconds) > LEG_TIMEOUT_MAX:
-            return 400, {
-                "error": (
-                    f"'timeout_seconds' may not be longer than "
-                    f"{LEG_TIMEOUT_MAX:g} seconds; got {timeout_seconds}"
-                )
-            }
         timeout = float(timeout_seconds)
+        if timeout > LEG_TIMEOUT_MAX:
+            timeout_warnings.append(
+                {
+                    "code": "leg_timeout_clamped",
+                    "message": (
+                        f"this leg was asked for up to {timeout:g} seconds, "
+                        f"which is longer than the longest wall this route "
+                        f"allows, so it was given {LEG_TIMEOUT_MAX:g} seconds "
+                        f"instead"
+                    ),
+                }
+            )
+            timeout = LEG_TIMEOUT_MAX
 
     command = command_resolver()
     if not command:
@@ -2281,6 +2297,7 @@ def process_guardkit_leg_request(
         subcommand=str(subcommand),
         read_allowlist=read_allowlist,
     )
+    context_warnings = [*timeout_warnings, *context_warnings]
     for path in extra_context_paths:
         context_flags.extend(["--context", path])
     nats_flag = ["--nats"] if with_nats_streaming else []

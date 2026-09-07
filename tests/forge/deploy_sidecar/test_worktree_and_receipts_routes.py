@@ -524,6 +524,76 @@ class TestTheLegRoute:
         )
         assert status == 200 and body["exit_code"] == 2
 
+    def test_a_wall_longer_than_this_route_allows_is_cut_back_not_refused(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
+    ) -> None:
+        """Ruled 2026-09-07: a profile that widens a stage's wall past this
+        route's ceiling must still run its leg. Refusing it with a 400 fails a
+        leg that could have run, and reads to the caller as an internal error
+        before dispatch."""
+        from forge.deploy_sidecar.service import (
+            LEG_TIMEOUT_MAX,
+            process_guardkit_leg_request,
+        )
+
+        tree = _worktree_with_receipts(cfg, repo)
+        seen: dict[str, Any] = {}
+
+        def _record(
+            *, argv: list[str], cwd: str, timeout: float
+        ) -> tuple[int, str, str]:
+            seen["timeout"] = timeout
+            return 0, "leg ran", ""
+
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-work",
+                "timeout_seconds": 99999,
+            },
+            config=cfg,
+            leg_runner=_record,
+        )
+
+        assert status == 200 and body["exit_code"] == 0
+        assert seen["timeout"] == LEG_TIMEOUT_MAX
+        warning = body["context_warnings"][0]
+        assert warning["code"] == "leg_timeout_clamped"
+        assert "99999" in warning["message"] and "7200" in warning["message"]
+
+    def test_a_wall_within_the_ceiling_is_passed_through_with_no_warning(
+        self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
+    ) -> None:
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+
+        tree = _worktree_with_receipts(cfg, repo)
+        seen: dict[str, Any] = {}
+
+        def _record(
+            *, argv: list[str], cwd: str, timeout: float
+        ) -> tuple[int, str, str]:
+            seen["timeout"] = timeout
+            return 0, "leg ran", ""
+
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-work",
+                "timeout_seconds": 60,
+            },
+            config=cfg,
+            leg_runner=_record,
+        )
+
+        assert status == 200 and seen["timeout"] == 60.0
+        assert [
+            warning
+            for warning in body["context_warnings"]
+            if warning.get("code") == "leg_timeout_clamped"
+        ] == []
+
     @pytest.mark.parametrize(
         "over, wanted",
         [
@@ -532,7 +602,6 @@ class TestTheLegRoute:
             ({"args": "not-a-list"}, "'args' must be a list"),
             ({"args": [1]}, "must be written as text"),
             ({"timeout_seconds": 0}, "'timeout_seconds' must be a positive"),
-            ({"timeout_seconds": 99999}, "may not be longer than"),
         ],
     )
     def test_the_refusals_say_what_was_wrong(
