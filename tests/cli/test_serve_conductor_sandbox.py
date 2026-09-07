@@ -626,3 +626,222 @@ class TestALegRunsInTheSandbox:
 
         assert result.status == "failed"
         assert "does not know which repository" in (result.stderr or "")
+
+
+# ---------------------------------------------------------------------------
+# Rule 75, the other half: a leg is TOLD what it would have been told in the
+# container, and what it ANSWERS is read the same way. A review leg that ran
+# perfectly but whose findings block was lost on the way back is recorded by
+# the conductor's dispatcher as FAILED ("exited 0 but emitted NO readable
+# findings block"), so losing the answer would fail every review leg of a
+# sandbox repository on its first use.
+# ---------------------------------------------------------------------------
+
+
+_A_REVIEW_LEGS_OUTPUT = (
+    "reading the task\n"
+    "## Artefacts\n"
+    "- .guardkit/autobuild/review.json\n"
+    "\n"
+    "coach_score: 0.82\n"
+    "\n"
+    "## Coach Breakdown\n"
+    "| Criterion | Score |\n"
+    "| evidence | 0.9 |\n"
+    "\n"
+    "## Detection Findings\n"
+    "```json\n"
+    '[{"id": "F1", "severity": "high", "summary": "no migration"}]\n'
+    "```\n"
+)
+
+
+def _fake_guardkit_binary(bin_dir: Path, body: str) -> Path:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    binary = bin_dir / "guardkit"
+    binary.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
+
+@pytest.fixture
+def talking_leg_guardkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in ``guardkit`` that answers the way a real review leg does."""
+    binary = _fake_guardkit_binary(
+        tmp_path / "talkingbin",
+        "import sys\nsys.stdout.write(" + repr(_A_REVIEW_LEGS_OUTPUT) + ")\n",
+    )
+    monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(binary))
+    return binary
+
+
+def _commit_manifest(clone: Path) -> Path:
+    """Give the repository a context manifest, so its legs get --context."""
+    (clone / ".guardkit").mkdir(exist_ok=True)
+    (clone / ".guardkit" / "context-manifest.yaml").write_text(
+        "internal_docs:\n  always_include:\n    - docs/contract.md\n",
+        encoding="utf-8",
+    )
+    (clone / "docs").mkdir(exist_ok=True)
+    (clone / "docs" / "contract.md").write_text("the contract\n", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "the manifest")
+    return clone / "docs" / "contract.md"
+
+
+class TestTheLegsAnswerSurvivesTheWire:
+    def test_a_review_legs_findings_artefacts_and_score_all_come_back(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        talking_leg_guardkit: Path,
+    ) -> None:
+        _row(pool, REPO_KEY)
+        ready = asyncio.run(prepare_journey_worktree(pool, sidecar.config, BUILD_ID))
+        assert isinstance(ready, WorktreeReady), getattr(ready, "reason", "")
+        run = make_conductor_guardkit_run_chooser(
+            pool=pool, config=sidecar.config, in_container_run=object()
+        )(BUILD_ID)
+
+        result = asyncio.run(
+            run(
+                subcommand="task-review",
+                args=["--task-id", TASK_ID],
+                repo_path=Path(ready.path),
+                read_allowlist=[Path(ready.path)],
+                timeout_seconds=60,
+            )
+        )
+
+        assert result.status == "success"
+        assert result.detection_findings == [
+            {"id": "F1", "severity": "high", "summary": "no migration"}
+        ]
+        assert result.artefacts == [".guardkit/autobuild/review.json"]
+        assert result.coach_score == 0.82
+        assert result.criterion_breakdown == {"evidence": 0.9}
+
+    def test_a_leg_stopped_at_its_wall_is_a_timeout_not_a_failure(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        binary = _fake_guardkit_binary(
+            tmp_path / "slowbin", "import time\ntime.sleep(30)\n"
+        )
+        monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(binary))
+        _row(pool, REPO_KEY)
+        ready = asyncio.run(prepare_journey_worktree(pool, sidecar.config, BUILD_ID))
+        assert isinstance(ready, WorktreeReady), getattr(ready, "reason", "")
+        run = make_conductor_guardkit_run_chooser(
+            pool=pool, config=sidecar.config, in_container_run=object()
+        )(BUILD_ID)
+
+        result = asyncio.run(
+            run(
+                subcommand="task-work",
+                args=[],
+                repo_path=Path(ready.path),
+                timeout_seconds=1,
+            )
+        )
+
+        assert result.status == "timeout"
+        assert "was stopped after 1 seconds" in (result.stderr or "")
+
+    def test_the_manifests_own_words_ride_back_as_warnings(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        talking_leg_guardkit: Path,
+    ) -> None:
+        _row(pool, REPO_KEY)
+        ready = asyncio.run(prepare_journey_worktree(pool, sidecar.config, BUILD_ID))
+        assert isinstance(ready, WorktreeReady), getattr(ready, "reason", "")
+        run = make_conductor_guardkit_run_chooser(
+            pool=pool, config=sidecar.config, in_container_run=object()
+        )(BUILD_ID)
+
+        result = asyncio.run(
+            run(
+                subcommand="task-review",
+                args=[],
+                repo_path=Path(ready.path),
+                timeout_seconds=60,
+            )
+        )
+
+        # No manifest in this repository, so the leg ran with no --context
+        # flags and the reason says so — the same warning the in-container
+        # runner puts on its own result.
+        assert [w.code for w in result.warnings] == ["context_manifest_missing"]
+
+
+class TestTheSandboxArgvIsTheContainerArgv:
+    @pytest.mark.parametrize("subcommand", ["task-review", "task-work"])
+    def test_the_leg_is_given_the_same_arguments_either_side(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        leg_guardkit: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        subcommand: str,
+    ) -> None:
+        import json
+
+        import forge.adapters.guardkit.run as run_mod
+
+        doc = _commit_manifest(clone)
+        _row(pool, REPO_KEY)
+        ready = asyncio.run(prepare_journey_worktree(pool, sidecar.config, BUILD_ID))
+        assert isinstance(ready, WorktreeReady), getattr(ready, "reason", "")
+        tree = Path(ready.path)
+        call = {
+            "subcommand": subcommand,
+            "args": ["--build-id", BUILD_ID, "--task-id", TASK_ID],
+            "repo_path": tree,
+            "read_allowlist": [tree],
+            "timeout_seconds": 60,
+            "with_nats_streaming": True,
+            "extra_context_paths": [str(tree / "failure-pack.md")],
+        }
+
+        # The sandbox side: a real socket, a real process, in the tree.
+        run = make_conductor_guardkit_run_chooser(
+            pool=pool, config=sidecar.config, in_container_run=object()
+        )(BUILD_ID)
+        asyncio.run(run(**call))
+        in_sandbox = json.loads(leg_guardkit.read_text().splitlines()[0])
+
+        # The container side: the real runner, with only the spawn stubbed.
+        captured: dict[str, Any] = {}
+
+        async def _fake_spawn(*, command: list[str], cwd: str, timeout: int) -> Any:
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return ("", "", 0, 0.01, False, False)
+
+        monkeypatch.setattr(run_mod, "_execute_subprocess", _fake_spawn)
+        monkeypatch.setattr(run_mod, "_resolved_guardkit_binary", "/fake/guardkit")
+        asyncio.run(run_mod.run(**call))
+
+        assert in_sandbox["argv"] == captured["command"][1:]
+        assert Path(in_sandbox["cwd"]).resolve() == tree.resolve()
+        assert Path(captured["cwd"]).resolve() == tree.resolve()
+        # And the whole of it is what the manifest, the conductor and the
+        # progress switch asked for.
+        assert in_sandbox["argv"] == [
+            subcommand,
+            "--build-id",
+            BUILD_ID,
+            "--task-id",
+            TASK_ID,
+            "--context",
+            str((tree / doc.relative_to(clone)).resolve()),
+            "--context",
+            str(tree / "failure-pack.md"),
+            "--nats",
+        ]
