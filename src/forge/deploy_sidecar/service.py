@@ -28,6 +28,8 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
+    POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
+              -> {feature_yaml, envelope, code_commit_time, history_dir}
 
 The three git operations (sandbox first, 2026-09-07, rule 70) make the
 planning chain's commits where the repository lives: the caller declares the
@@ -386,7 +388,30 @@ def _looks_like_script_path(token: str) -> bool:
     return ("/" in token) or token.endswith((".py", ".sh"))
 
 
-def allowed_scripts(profile: DeployProfile) -> set[str]:
+#: The environment value the in-sandbox bootstrap (``deploy_templates/
+#: sandbox-runner.sh``) sets before it starts this service. It says one thing:
+#: *this copy of the sidecar is running inside a repository's sandbox*.
+SIDECAR_IN_SANDBOX_ENV: str = "FORGE_SIDECAR_IN_SANDBOX"
+
+#: What counts as "yes" in that value.
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
+    """Is this sidecar the one inside a repository's sandbox?
+
+    Read from the environment the bootstrap sets, and ``False`` whenever it is
+    absent or says anything else — so the sidecar on the HOST, which is the
+    one every repository without a sandbox still uses, never widens anything
+    on the strength of a value nobody set.
+    """
+    source = os.environ if env is None else env
+    return str(source.get(SIDECAR_IN_SANDBOX_ENV, "")).strip().lower() in _TRUTHY
+
+
+def allowed_scripts(
+    profile: DeployProfile, *, inside_sandbox: bool | None = None
+) -> set[str]:
     """The ONLY scripts this profile permits the sidecar to run (LAW 2).
 
     ``compose.script`` + every ``health_checks[].cmd`` + the ``live_gate.driver``
@@ -397,18 +422,30 @@ def allowed_scripts(profile: DeployProfile) -> set[str]:
     scripts: set[str] = set()
     if profile.compose.script:
         scripts.add(profile.compose.script)
-        # SANDBOX FIRST (rule 85). A profile that names a HOST sandbox wrapper
-        # (``deploy/sandbox-deploy.sh``) names its inner script too, by the
-        # shared template's fixed pairing: the wrapper's entire job is to put
-        # the sandbox in place and then run ``deploy/deploy.sh`` inside it.
-        # When the factory itself lives in that sandbox the wrapper cannot run
-        # — it would ask ``sbx`` for a sandbox from inside one — so the deploy
-        # stage runs the inner script directly and this allowlist has to name
-        # it. Nothing new becomes runnable: it is the same script of the
-        # repository's own, which the wrapper already runs.
-        inner = wrapper_inner_script(profile.compose.script)
-        if inner:
-            scripts.add(inner)
+        # SANDBOX FIRST (rule 85), AND ONLY INSIDE ONE (L3b's coach, 2026-09-08).
+        # A profile that names a HOST sandbox wrapper (``deploy/
+        # sandbox-deploy.sh``) names its inner script too, by the shared
+        # template's fixed pairing: the wrapper's whole job is to put the
+        # sandbox in place and then run ``deploy/deploy.sh`` inside it. The
+        # sidecar INSIDE that sandbox cannot run the wrapper — it would ask
+        # ``sbx`` for a sandbox from inside one — so the deploy stage sends it
+        # the inner script and this allowlist has to name it.
+        #
+        # The sidecar on the HOST must NOT name it. There the wrapper is the
+        # whole point: it is what puts the work inside a sandbox, and
+        # permitting the inner script would let something ask the host sidecar
+        # to run the repository's deploy straight against the host's Docker
+        # engine — the wall Rich's rule of 2026-09-07 puts up. So the widening
+        # is gated on the bootstrap's own flag, and a host sidecar's allowlist
+        # is byte for byte what it was before this lane.
+        if (
+            sidecar_is_inside_sandbox()
+            if inside_sandbox is None
+            else bool(inside_sandbox)
+        ):
+            inner = wrapper_inner_script(profile.compose.script)
+            if inner:
+                scripts.add(inner)
     for check in profile.health_checks:
         if check.cmd:
             scripts.add(check.cmd)
@@ -2416,6 +2453,145 @@ def process_receipts_export_request(
     }
 
 
+# ---------------------------------------------------------------------------
+# The routing law's own evidence, read where the repository lives (rule 88)
+# ---------------------------------------------------------------------------
+#
+# Found by L3b's coach, 2026-09-08. The merge-ready gates reader has five
+# steps, and the last one is the routing law's stamped-verifier check: it
+# reads the feature's per-scenario ``verifier:`` stamps from the canonical
+# repository and then asks, home by home, whether the promised verifier
+# really ran green for this branch — from the newest results envelope under
+# the journey worktree, and the branch's last code commit time, which says
+# whether that envelope is fresh enough to count.
+#
+# All three of those live inside the sandbox for a repository that has one.
+# Left reading the host, the check found no feature file, answered "this
+# feature carries no scenario stamps", had no effect, and a GREEN merge card
+# went out with the routing law silently not applied. That is the one
+# direction this reader is written never to fail in. So the three reads
+# happen here, and the DECISION still happens on the forge side, out of the
+# same pure function it always used: this route reads, it never judges.
+
+#: The route.
+STAMPS_EVIDENCE_ROUTE: str = "/routing-stamps/evidence"
+
+
+def process_stamps_evidence_request(
+    payload: Any, *, config: ForgeConfig, worktrees_root: Path | None = None
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id, worktree, branch}`` → the routing law's evidence.
+
+    The answer carries three things and no opinion about them:
+
+    * ``feature_yaml`` — the feature's plan of record, read from the CANONICAL
+      branch of the factory's clone (``main``, never the worktree the journey
+      has been editing, for the same reason the declared toolchain is), with
+      the path it has in here so every sentence a person reads names the real
+      file. ``present`` is false when the file is not on that branch, which
+      upstream reads exactly as an absent file on the host does.
+    * ``envelope`` — the newest results envelope under the journey worktree's
+      ``qa/gates/history/``, or ``null``.
+    * ``code_commit_time`` — the branch's last code commit, ISO-8601, or
+      ``null`` when git could not say.
+
+    The worktree must be one of this repository's own journey worktrees (LAW
+    10). Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    if not isinstance(feature_id, str) or not SAFE_NAME_PATTERN.match(feature_id):
+        return 400, {
+            "error": (
+                "'feature_id' is required and must be a plain feature id "
+                f"(letters, digits, dots, dashes and underscores); got "
+                f"{feature_id!r}"
+            )
+        }
+    error = _worktree_path_error(repo_path, payload.get("worktree"), what="worktree")
+    if error:
+        return 400, {"error": error}
+    worktree = os.path.normpath(os.path.abspath(str(payload["worktree"])))
+    branch = payload.get("branch")
+    if branch is not None:
+        error = _ref_error(branch, what="branch")
+        if error:
+            return 400, {"error": error}
+    from forge.cli._conductor_worktree import JOURNEY_BASE_REF
+
+    canonical = payload.get("canonical_branch") or JOURNEY_BASE_REF
+    error = _ref_error(canonical, what="canonical_branch")
+    if error:
+        return 400, {"error": error}
+
+    from forge.pipeline.routing_stamps import (
+        HISTORY_RELATIVE_PATH,
+        feature_yaml_relative_path,
+        read_last_code_commit_time,
+        read_newest_envelope,
+    )
+
+    runner = _git_runner(worktrees_root)
+    found_path = feature_yaml_relative_path(feature_id)
+    content: str | None = None
+    try:
+        for suffix in ("yaml", "yml"):
+            relative = feature_yaml_relative_path(feature_id, suffix=suffix)
+            answer = _run_coroutine(
+                runner.read_file_from_branch(
+                    repo_path=str(repo_path),
+                    branch=str(canonical),
+                    file_path=relative,
+                )
+            )
+            if isinstance(answer, str):
+                content, found_path = answer, relative
+                break
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    history_dir = os.path.join(worktree, str(HISTORY_RELATIVE_PATH))
+    try:
+        envelope = read_newest_envelope(history_dir)
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar receipts error: {type(exc).__name__}: {exc}"}
+    try:
+        commit_time = read_last_code_commit_time(
+            worktree, str(branch) if branch else None
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    return 200, {
+        "feature_yaml": {
+            "path": str(Path(repo_path) / found_path),
+            "branch": str(canonical),
+            "present": content is not None,
+            "text": content,
+        },
+        "envelope": None
+        if envelope is None
+        else {
+            "path": str(envelope.path),
+            "run_id": envelope.run_id,
+            "verdict": envelope.verdict,
+            "started": None
+            if envelope.started is None
+            else envelope.started.isoformat(),
+            "gates": dict(envelope.gates),
+            "feature_id": envelope.feature_id,
+        },
+        "code_commit_time": None
+        if commit_time is None
+        else commit_time.isoformat(),
+        "history_dir": history_dir,
+    }
+
+
 def _is_inside(candidate: str, root: str) -> bool:
     """Containment by path components, never by ``startswith``."""
     try:
@@ -2868,6 +3044,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
+                STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
@@ -2908,6 +3085,12 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             elif route == GIT_WORKTREE_ADD_ROUTE:
                 status, body = process_git_worktree_add_request(
                     payload, config=config
+                )
+            elif route == STAMPS_EVIDENCE_ROUTE:
+                status, body = process_stamps_evidence_request(
+                    payload,
+                    config=config,
+                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
                 )
             elif route == GIT_WORKTREE_REMOVE_ROUTE:
                 status, body = process_git_worktree_remove_request(
@@ -3031,6 +3214,8 @@ __all__ = [
     "resolve_guardkit_command",
     "run_merge_command",
     "allowed_scripts",
+    "sidecar_is_inside_sandbox",
+    "SIDECAR_IN_SANDBOX_ENV",
     "allowed_env_keys",
     "process_run_request",
     "process_guardkit_merge_request",
@@ -3053,6 +3238,8 @@ __all__ = [
     "GIT_WORKTREE_ADD_ROUTE",
     "GIT_WORKTREE_REMOVE_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
+    "STAMPS_EVIDENCE_ROUTE",
+    "process_stamps_evidence_request",
     "SAFE_NAME_PATTERN",
     "process_git_worktree_add_request",
     "process_git_worktree_remove_request",

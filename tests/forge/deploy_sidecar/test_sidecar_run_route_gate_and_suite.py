@@ -86,15 +86,92 @@ def config(repo: Path) -> ForgeConfig:
 
 
 class TestTheScriptAllowlistNamesTheWrappersInnerScript:
-    def test_a_sandbox_wrapper_permits_the_script_it_runs(self, repo: Path) -> None:
+    def test_the_sidecar_inside_a_sandbox_permits_the_script_it_runs(
+        self, repo: Path
+    ) -> None:
         profile = parse_deploy_profile(
             _profile_dict(repo, script="deploy/sandbox-deploy.sh")
         )
 
-        permitted = allowed_scripts(profile)
+        permitted = allowed_scripts(profile, inside_sandbox=True)
 
         assert "deploy/sandbox-deploy.sh" in permitted
         assert "deploy/deploy.sh" in permitted
+
+    def test_the_sidecar_on_the_host_permits_only_the_wrapper(
+        self, repo: Path
+    ) -> None:
+        """The wall Rich's rule of 2026-09-07 puts up (L3b's coach).
+
+        On the host the wrapper is the whole point: it is what puts the work
+        inside a sandbox. Permitting its inner script here would let something
+        ask the host sidecar to run the repository's deploy straight against
+        the host's Docker engine.
+        """
+        profile = parse_deploy_profile(
+            _profile_dict(repo, script="deploy/sandbox-deploy.sh")
+        )
+
+        permitted = allowed_scripts(profile, inside_sandbox=False)
+
+        assert "deploy/sandbox-deploy.sh" in permitted
+        assert "deploy/deploy.sh" not in permitted
+
+    def test_the_flag_comes_from_the_bootstraps_own_environment_value(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.deploy_sidecar.service import (
+            SIDECAR_IN_SANDBOX_ENV,
+            sidecar_is_inside_sandbox,
+        )
+
+        profile = parse_deploy_profile(
+            _profile_dict(repo, script="deploy/sandbox-deploy.sh")
+        )
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        assert sidecar_is_inside_sandbox() is False
+        assert "deploy/deploy.sh" not in allowed_scripts(profile)
+
+        monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
+        assert sidecar_is_inside_sandbox() is True
+        assert "deploy/deploy.sh" in allowed_scripts(profile)
+
+    def test_the_in_sandbox_bootstrap_sets_that_value(self) -> None:
+        """The one place the flag is turned on: the script that starts the
+        sidecar inside a repository's sandbox."""
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        bootstrap = (
+            Path(__file__).resolve().parents[3]
+            / "src"
+            / "forge"
+            / "cli"
+            / "deploy_templates"
+            / "sandbox-runner.sh"
+        )
+
+        assert f"export {SIDECAR_IN_SANDBOX_ENV}=1" in bootstrap.read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_host_sidecar_refuses_to_run_the_inner_script(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        ran: list[Any] = []
+
+        status, body = process_run_request(
+            {"repo": REPO, "script": "deploy/deploy.sh"},
+            config=config,
+            script_runner=lambda **kw: ran.append(kw),
+        )
+
+        assert status == 400
+        assert "deny by default" in body["error"]
+        assert ran == []
 
     def test_an_ordinary_script_permits_only_itself(self, repo: Path) -> None:
         profile = parse_deploy_profile(_profile_dict(repo, script="deploy/deploy.sh"))
@@ -287,3 +364,62 @@ class TestTheDeclaredTestCommandIsReadFromTheRepository:
 
         assert command is None
         assert "not importable" in error
+
+
+# ---------------------------------------------------------------------------
+# The routing law's evidence route (rule 88, repaired 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# It reads three things and judges none of them, and it fences the tree it
+# reads from exactly as the other worktree routes do.
+
+
+class TestTheStampsEvidenceRouteRefusesWhatItShould:
+    @staticmethod
+    def _body(repo_path: Path, **over: Any) -> dict[str, Any]:
+        body = {
+            "repo": REPO,
+            "feature_id": "FEAT-G88",
+            "worktree": str(repo_path / ".forge" / "worktrees" / "build-1"),
+        }
+        body.update(over)
+        return body
+
+    def test_a_worktree_of_another_place_is_refused(
+        self, repo: Path, config: ForgeConfig
+    ) -> None:
+        from forge.deploy_sidecar.service import process_stamps_evidence_request
+
+        status, body = process_stamps_evidence_request(
+            self._body(repo, worktree="/etc"), config=config
+        )
+
+        assert status == 400
+        assert "not a journey worktree" in body["error"]
+
+    def test_a_feature_id_that_is_not_a_plain_id_is_refused(
+        self, repo: Path, config: ForgeConfig
+    ) -> None:
+        from forge.deploy_sidecar.service import process_stamps_evidence_request
+
+        status, body = process_stamps_evidence_request(
+            self._body(repo, feature_id="../../etc/passwd"), config=config
+        )
+
+        assert status == 400
+        assert "'feature_id'" in body["error"]
+
+    def test_an_unknown_repository_is_refused(self, config: ForgeConfig) -> None:
+        from forge.deploy_sidecar.service import process_stamps_evidence_request
+
+        status, body = process_stamps_evidence_request(
+            {
+                "repo": "someone/else",
+                "feature_id": "FEAT-G88",
+                "worktree": "/tmp/x",
+            },
+            config=config,
+        )
+
+        assert status == 400
+        assert "someone/else" in body["error"]
