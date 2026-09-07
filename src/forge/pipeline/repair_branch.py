@@ -6,10 +6,11 @@ Why this exists
 Journey one refused in four seconds. guardkit's review leg is id-form only:
 it loads its subject from ``tasks/backlog/**/<TASK-id>*.md`` (or
 ``in_progress``, ``design_approved``, ``in_review``, ``blocked``) in the
-build's worktree, and that worktree is a detached ``git worktree add`` of the
-build's branch — so only COMMITTED files on the branch are visible to the
-legs. The repair admission used to write one uncommitted YAML into the shared
-checkout, which the worktree never saw.
+build's worktree, and that worktree is a branch the conductor cuts from the
+build's branch (:func:`forge.cli._conductor_worktree.prepare_journey_worktree`)
+— so only COMMITTED files on the branch are visible to the legs. The repair
+admission used to write one uncommitted YAML into the shared checkout, which
+the worktree never saw.
 
 So a repair now rides a branch of its own, ``repair/<task id>``, cut from the
 build's target branch and carrying the task file and the YAML as committed

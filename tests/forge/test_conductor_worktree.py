@@ -22,7 +22,12 @@ What is pinned:
 * materialise failure, an unregistered repo, a missing task id, a missing
   row, and a record-write that will not land — all refusals, never raises;
 * the router seam: a real materialise on the way to TAKEN_RUNNING, and a
-  refusing writer becoming a TakenTerminal with the row FAILED.
+  refusing writer becoming a TakenTerminal with the row FAILED;
+* a row queued on a ``repair/<task id>`` branch (Part L, 2026-09-07): the
+  tree is cut from THAT branch, so the repair's committed task file is in
+  it; the commit probe counts from the same base, so the repair's own
+  commit is never a leg's work; a repair branch nobody made refuses
+  plainly; any other row branch is cut from ``main`` exactly as before.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from forge.cli._conductor_worktree import (
     JOURNEY_BASE_REF,
     WorktreeReady,
     WorktreeRefused,
+    journey_base_ref,
     journey_branch_name,
     prepare_journey_worktree,
     short_build_id,
@@ -132,11 +138,12 @@ def _payload(
     repo: str = REPO_KEY,
     task_id: str | None = TASK_ID,
     queued_at: datetime | None = None,
+    branch: str = "main",
 ) -> SimpleNamespace:
     ns = SimpleNamespace(
         feature_id=feature_id,
         repo=repo,
-        branch="main",
+        branch=branch,
         feature_yaml_path="features/fix.yaml",
         max_turns=5,
         sdk_timeout_seconds=1800,
@@ -256,6 +263,7 @@ class TestMaterialise:
         assert _git(expected, "rev-parse", "HEAD").strip() == _git(
             checkout, "rev-parse", JOURNEY_BASE_REF
         ).strip()
+        assert outcome.base_ref == JOURNEY_BASE_REF
         # Invariant 1: RECORDED — the column three consumers refuse on.
         row = pool.get_build_row(build_id)
         assert row is not None and row.worktree_path == str(expected)
@@ -317,6 +325,158 @@ class TestMaterialise:
         after = await probe(build)
         assert after.failed is False, after
         assert after.count == 1
+
+
+# --------------------------------------------------------------------------- #
+# A row queued on a repair branch (Part L, rule 48's last clause, 2026-09-07).
+# --------------------------------------------------------------------------- #
+
+REPAIR_TASK_FILE = f"tasks/backlog/the-feature/{TASK_ID}-repair.md"
+
+
+def _cut_repair_branch(checkout: Path, task_id: str = TASK_ID) -> str:
+    """``repair/<task id>`` off main, with the repair's task file committed on it.
+
+    The shape the repair admission leaves behind
+    (:mod:`forge.pipeline.repair_branch`): one commit past main carrying the
+    task file guardkit's loader looks for. Made by hand here so this file
+    pins the WRITER alone.
+    """
+    branch = f"repair/{task_id}"
+    _git(checkout, "checkout", "-q", "-b", branch, "main")
+    task_file = checkout / REPAIR_TASK_FILE
+    task_file.parent.mkdir(parents=True)
+    task_file.write_text(
+        f"---\nid: {task_id}\ntask_type: fix\n---\n\n"
+        "## Acceptance Criteria\n\n- [ ] the failed checks pass\n",
+        encoding="utf-8",
+    )
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", f"repair task for {task_id}")
+    _git(checkout, "checkout", "-q", "main")
+    return branch
+
+
+class TestARowQueuedOnARepairBranch:
+    """'The build is queued on repair/<task id>, so the review leg's worktree
+    carries the file' (Part L, rule 48). The writer used to cut every journey
+    branch from ``main`` and never read the row's branch, so the repair's
+    committed task file was not in the tree and journey one refused in four
+    seconds. Now the row's repair branch is the base."""
+
+    def test_the_base_is_the_row_branch_only_when_it_is_a_repair_branch(self) -> None:
+        assert journey_base_ref("repair/TASK-FEAT39F6FIX1") == "repair/TASK-FEAT39F6FIX1"
+        assert journey_base_ref("main") == JOURNEY_BASE_REF
+        assert journey_base_ref("lane/fix-journey") == JOURNEY_BASE_REF
+        assert journey_base_ref(None) == JOURNEY_BASE_REF
+        assert journey_base_ref("") == JOURNEY_BASE_REF
+
+    @pytest.mark.asyncio
+    async def test_the_tree_is_cut_from_the_repair_branch_and_carries_the_task_file(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        branch = _cut_repair_branch(checkout)
+        build_id = _queue_mode_c(pool, "FEAT-WTWR", branch=branch)
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeReady), outcome
+        assert outcome.base_ref == branch
+        tree = Path(outcome.path)
+        # Still the journey's OWN named branch (a second journey for the
+        # same task must not collide) ...
+        assert (
+            _git(tree, "rev-parse", "--abbrev-ref", "HEAD").strip()
+            == journey_branch_name(TASK_ID, build_id)
+        )
+        # ... cut from the repair branch's tip, not main's.
+        assert _git(tree, "rev-parse", "HEAD").strip() == _git(
+            checkout, "rev-parse", branch
+        ).strip()
+        assert _git(tree, "rev-parse", "HEAD").strip() != _git(
+            checkout, "rev-parse", "main"
+        ).strip()
+        # The file the review leg loads by id is in the tree.
+        assert (tree / REPAIR_TASK_FILE).is_file()
+        assert list((tree / "tasks").rglob(f"{TASK_ID}*.md")) == [
+            tree / REPAIR_TASK_FILE
+        ]
+        row = pool.get_build_row(build_id)
+        assert row is not None and row.worktree_path == str(tree)
+        # A redelivery reuses the same tree and still says what it was cut from.
+        again = await prepare_journey_worktree(pool, _config(checkout), build_id)
+        assert isinstance(again, WorktreeReady), again
+        assert again.reused is True and again.base_ref == branch
+
+    @pytest.mark.asyncio
+    async def test_the_commit_probe_counts_from_the_repair_branch_not_main(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """The repair's own task-file commit is not a leg's work.
+
+        The probe is wired exactly as production wires it (base ``main`` at
+        wiring time); it reads the row's repair branch itself. Zero before
+        the leg commits, one after — ``main..HEAD`` would have said one
+        before anything happened, and a journey that changed nothing would
+        have been handed back as a fix.
+        """
+        from forge.lifecycle.persistence import Build
+
+        branch = _cut_repair_branch(checkout)
+        build_id = _queue_mode_c(pool, "FEAT-WTWS", branch=branch)
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+        assert isinstance(outcome, WorktreeReady), outcome
+        tree = Path(outcome.path)
+        assert _git(tree, "rev-list", "--count", "main..HEAD").strip() == "1"
+
+        probe = make_mode_c_commit_probe(pool)
+        build = Build(build_id=build_id, status=BuildState.RUNNING)
+
+        before = await probe(build)
+        assert before.failed is False and before.count == 0, before
+
+        (tree / "fix.txt").write_text("the leg's work\n", encoding="utf-8")
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "leg: a fix")
+
+        after = await probe(build)
+        assert after.failed is False and after.count == 1, after
+
+    @pytest.mark.asyncio
+    async def test_a_repair_branch_nobody_made_refuses_plainly(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        build_id = _queue_mode_c(pool, "FEAT-WTWT", branch=f"repair/{TASK_ID}")
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeRefused), outcome
+        assert f"repair/{TASK_ID}" in outcome.reason
+        assert "does not exist" in outcome.reason
+        assert not (checkout / ".forge" / "worktrees" / build_id).exists()
+        row = pool.get_build_row(build_id)
+        assert row is not None and row.worktree_path is None
+
+    @pytest.mark.asyncio
+    async def test_a_row_on_any_other_branch_is_still_cut_from_main(
+        self, pool: SqliteLifecyclePersistence, checkout: Path
+    ) -> None:
+        """Only a repair branch moves the base; every other row keeps today's path."""
+        _git(checkout, "branch", "lane/something", "main")
+        build_id = _queue_mode_c(pool, "FEAT-WTWU", branch="lane/something")
+
+        outcome = await prepare_journey_worktree(
+            pool, _config(checkout), build_id
+        )
+
+        assert isinstance(outcome, WorktreeReady), outcome
+        assert outcome.base_ref == JOURNEY_BASE_REF
 
 
 # --------------------------------------------------------------------------- #

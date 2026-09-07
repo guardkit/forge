@@ -21,8 +21,10 @@ What these pin:
   repository's own frontmatter shape, and the YAML beside it, on
   ``repair/<task id>`` cut from main; the build is queued on that branch;
   the shared checkout stays exactly as it was; a second admission adds no
-  commit; guardkit's own loader finds the file in a detached worktree of
-  the branch; a write that fails refuses cleanly.
+  commit; the worktree the review leg actually gets — the conductor's
+  writer run against the admitted build — is cut from the repair branch
+  and carries the file, and guardkit's own loader finds it there; a write
+  that fails refuses cleanly.
 
 No broker: the publisher is a list. No live database: SQLite under
 ``tmp_path``. The fixture repository is a real temporary git checkout.
@@ -44,6 +46,11 @@ import yaml
 from nats_core.events import BuildQueuedPayload
 
 from forge.adapters.sqlite import connect as sqlite_connect
+from forge.cli._conductor_worktree import (
+    WorktreeReady,
+    journey_branch_name,
+    prepare_journey_worktree,
+)
 from forge.config.models import FIX_JOURNEY_PROFILE_NAME, ForgeConfig
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.lifecycle.modes import BuildMode
@@ -1124,8 +1131,9 @@ class TestTheRepairTaskFile:
         ) in body
         assert "## Implementation Notes" in body
         assert (
-            f"- This task rides the branch {REPAIR_BRANCH}, cut from main; the "
-            "merge word takes that branch into main."
+            f"- This task and its YAML are committed on the branch {REPAIR_BRANCH}, "
+            "cut from main; the fix journey's own branch is cut from there, so "
+            "both files are in its worktree."
         ) in body
 
         # The YAML rides the branch too, in the drive-6 shape.
@@ -1324,17 +1332,31 @@ def _guardkit_loader_or_skip() -> tuple[Path, str]:
 
 
 class TestGuardkitsLoaderFindsTheFile:
-    def test_the_real_task_loader_reads_the_file_from_a_detached_worktree_of_the_branch(
+    """Rule 48's last clause and rule 52's loader proof, on the worktree the
+    review leg ACTUALLY gets.
+
+    A mode-C build's worktree is made by the conductor's writer
+    (``forge.cli._conductor_worktree.prepare_journey_worktree``, serve.py's
+    default ``worktree_writer``), which cuts ``fix/<task id>-<build8>`` for the
+    build. Before this lane it cut that branch from ``main`` and never read
+    the row's branch, so the repair's task file was not in the tree and
+    journey one refused in four seconds. Both tests here drive that writer
+    against the build the admission queued — never a hand-made worktree.
+    """
+
+    @pytest.fixture
+    def repo_root(self, tmp_path: Path) -> Path:
+        """The live estate's shape: the checkout's last two path parts ARE the
+        key the config registers (``.../appmilla_github/api_test``), because the
+        conductor's writer resolves the checkout from the build row's repo slug."""
+        return make_feature_repo(tmp_path / "appmilla_github" / "api_test")
+
+    def _admit_and_materialise(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         store: WorkQueueStore,
-        repo_root: Path,
-        tmp_path: Path,
-    ) -> None:
-        """Exactly what the review leg does: the runner makes a detached
-        worktree of the build's branch and guardkit loads the task by id there."""
-        checkout, python = _guardkit_loader_or_skip()
+    ) -> tuple[Any, WorktreeReady]:
         seed_failed_build(pool)
         queue_id = store.file_sentence(
             correlation_id=fix_correlation_id(SOURCE_BUILD),
@@ -1357,11 +1379,52 @@ class TestGuardkitsLoaderFindsTheFile:
                 profile=FIX_JOURNEY_PROFILE_NAME,
             )
         )
-        detached = tmp_path / "build-worktree"
-        git(repo_root, "worktree", "add", "--detach", str(detached), admission.branch)
+        assert admission.branch == REPAIR_BRANCH
+        outcome = asyncio.run(prepare_journey_worktree(pool, config, admission.build_id))
+        assert isinstance(outcome, WorktreeReady), outcome
+        return admission, outcome
+
+    def test_the_review_legs_worktree_is_cut_from_the_repair_branch_and_carries_the_file(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+    ) -> None:
+        status_before = porcelain_hash(repo_root)
+
+        admission, outcome = self._admit_and_materialise(config, pool, store)
+
+        tree = Path(outcome.path)
+        assert outcome.branch == journey_branch_name(admission.task_id, admission.build_id)
+        assert outcome.base_ref == REPAIR_BRANCH
+        # The tree is the repair branch's tip, not main's, ...
+        assert head(tree) == head(repo_root, REPAIR_BRANCH)
+        assert head(tree) != head(repo_root, "main")
+        # ... so the task file and the YAML are in it, where the legs look.
+        assert (tree / TASK_FILE).is_file()
+        assert (tree / YAML_FILE).is_file()
+        assert list((tree / "tasks").rglob(f"{admission.task_id}*.md")) == [tree / TASK_FILE]
+        row = pool.get_build_row(admission.build_id)
+        assert row is not None and row.worktree_path == str(tree)
+        # The shared checkout is still untouched: the tree lives under .forge/.
+        assert porcelain_hash(repo_root) == status_before
+
+    def test_the_real_task_loader_reads_the_file_from_that_worktree(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+    ) -> None:
+        """Exactly what the review leg does: guardkit loads the task by id in
+        the worktree the conductor's writer made for the build."""
+        checkout, python = _guardkit_loader_or_skip()
+        admission, outcome = self._admit_and_materialise(config, pool, store)
+        tree = Path(outcome.path)
 
         proc = subprocess.run(
-            [python, "-c", _LOADER_SCRIPT, admission.task_id, str(detached)],
+            [python, "-c", _LOADER_SCRIPT, admission.task_id, str(tree)],
             capture_output=True,
             text=True,
             env={**os.environ, "PYTHONPATH": str(checkout)},
@@ -1378,8 +1441,9 @@ class TestGuardkitsLoaderFindsTheFile:
         assert loaded["frontmatter"]["implementation_mode"] == "task-work"
         assert loaded["frontmatter"]["dependencies"] == []
         assert "The feature's existing tests stay green" in loaded["acceptance_criteria"]
-        assert loaded["file_path"] == str(detached / TASK_FILE)
-        # Before this lane the same loader had nothing to find on main.
+        assert loaded["file_path"] == str(tree / TASK_FILE)
+        # Before this lane the same loader had nothing to find on main — and
+        # a tree cut from main, as the writer used to make, had nothing either.
         proc_main = subprocess.run(
             [python, "-c", _LOADER_SCRIPT, admission.task_id, str(repo_root)],
             capture_output=True,
