@@ -5679,10 +5679,12 @@ async def test_a_switched_off_first_stamping_never_puts_no_endpoint_on_the_card(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
     """The rewrite changed nothing, so the card is built from the FIRST
-    stamping — the one the machine ran by rule only. The card must not say
-    the model was not asked for want of an endpoint (it was not asked because
-    the machine switched it off), and says nothing about the model at all;
-    the machine record keeps the reason."""
+    stamping — the one the machine ran by rule only. The model was never
+    asked at all on this run, and an endpoint may well be configured, so the
+    card must say neither "no endpoint is configured" nor "there is no
+    fallback home" (both untrue); it says the machine kept the model for
+    after its rewrite, which changed nothing, and adds no second sentence
+    about the model. The machine record keeps the reason."""
     repo, git = _enforced_repo(tmp_path)
     _queue(store)
     sink: dict[str, Any] = {}
@@ -5699,17 +5701,37 @@ async def test_a_switched_off_first_stamping_never_puts_no_endpoint_on_the_card(
     card = _error_cards(h)[0]
     assert _STOP_CHANGED_NOTHING in card
     assert "no endpoint is configured" not in card
-    assert "model fallback" not in card
-    assert "there is no fallback home, so nothing was stamped and nothing was built" in card
+    assert "no fallback home" not in card
+    assert (
+        "and the model fallback was not asked (the machine kept it for after its "
+        "rewrite, which changed nothing), so nothing was stamped and nothing was built"
+    ) in card
+    # The clause is the only thing the card says about the model: no second
+    # sentence between the titles and the routing-law line.
+    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
+    assert f"{titles}\nThis repo enforces the routing law" in card
+    assert card.count("model fallback") == 1
     error = store.get_run(CID)["error"] or ""
     assert "switched off for this stamping" in error
+    assert "no fallback home" not in error
 
 
-def test_the_card_says_nothing_about_the_model_when_the_machine_switched_it_off() -> None:
+def test_the_card_says_the_machine_switched_the_model_off_never_that_it_was_missing() -> None:
+    """The card built straight from a switched-off outcome (no rewrite named):
+    the clause says the model was switched off for this stamping — never
+    "no endpoint is configured" and never "there is no fallback home", both
+    of which would tell the owner the model was missing when the machine
+    chose not to ask it — and no second sentence about the model follows
+    the titles."""
     card = _Driver._stamp_normalizer_card(
         CID, "FEAT-1234", _refusal_with_model(dict(_SWITCHED_OFF_MODEL_OUTCOME))
     )
     assert "no endpoint is configured" not in card
-    assert "model fallback" not in card
+    assert "no fallback home" not in card
+    assert (
+        "and the model fallback was not asked (it was switched off for this "
+        "stamping), so nothing was stamped and nothing was built"
+    ) in card
+    assert card.count("model fallback") == 1
     titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
     assert f"{titles}\nThis repo enforces the routing law" in card
