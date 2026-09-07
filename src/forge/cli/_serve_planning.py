@@ -676,13 +676,11 @@ def compose_planning_git_runner(
     }
     for repo, entry in planning.sandboxes.items():
         logger.info(
-            "planning git for %s goes to the sidecar in sandbox %s at %s "
-            "(the plan stage's checks run there); other repositories stay "
-            "in the forge container. Only the plan leg's checks are declared "
-            "so far: the spec leg, the pass bars and the feature gate still "
-            "hand a Python function to the git runner, which a sidecar cannot "
-            "run, so give a repository a sandbox only once those legs are "
-            "moved too",
+            "planning git for %s goes to the sidecar in sandbox %s at %s — "
+            "every planning leg's checks run there (the spec's gherkin "
+            "normalizer and provability check, the plan's stamping and "
+            "feature validate, the pass bars, the feature gate). Other "
+            "repositories stay in the forge container",
             repo,
             entry.name,
             entry.sidecar_url,

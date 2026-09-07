@@ -102,6 +102,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
 from forge.deploy.candidate_tree import candidate_trees_root, is_candidate_tree_path
@@ -925,7 +926,7 @@ def process_guardkit_merge_request(
 #
 # LAW 9 (the git routes' own): the repository is the same key as everywhere
 # else; a branch, a ref and every file path are shape-checked before git sees
-# them; a check must be one of the three names below (nothing else runs, and
+# them; a check must be one of the six names below (nothing else runs, and
 # ``classify-scenarios`` may never be declared blocking); a check is one
 # fixed argument list through the same no-shell runner the merge uses.
 # ---------------------------------------------------------------------------
@@ -938,21 +939,39 @@ GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
-#: Each check's own time limit when the caller names none: the normalizer
-#: and the provability check are rules over a handful of files (seconds); a
-#: feature validate reads a whole plan tree (the oracle's usual ten minutes).
+#: Each check's own time limit when the caller names none: the stamp
+#: normalizer and the provability check are rules over a handful of files
+#: (seconds); a feature validate reads a whole plan tree, and the gherkin
+#: normalizer and the two schema checks are the planning oracles' usual ten
+#: minutes — the same budget the driver's own closures give them.
 GIT_CHECK_TIMEOUT_DEFAULTS: dict[str, float] = {
     "normalize-stamps": 120.0,
     "feature-validate": 600.0,
     "classify-scenarios": 120.0,
+    "normalize-feature": 600.0,
+    "validate-pass-bar": 600.0,
+    "validate-gate-registry": 600.0,
 }
 
-#: Whether a check blocks the commit when the caller does not say: the two
-#: the driver's own hook stops on, and never the provability check.
+#: Whether a check blocks the commit when the caller does not say: every
+#: check the driver's own hook stops on, and never the provability check.
 GIT_CHECK_BLOCKING_DEFAULTS: dict[str, bool] = {
     "normalize-stamps": True,
     "feature-validate": True,
     "classify-scenarios": False,
+    "normalize-feature": True,
+    "validate-pass-bar": True,
+    "validate-gate-registry": True,
+}
+
+#: The one argument each path-shaped check takes, by name. Every value is a
+#: repository-relative path, shape-checked before the worktree is joined to
+#: it, exactly as ``classify-scenarios``'s always was.
+GIT_CHECK_PATH_ARGS: dict[str, str] = {
+    "classify-scenarios": "feature_file",
+    "normalize-feature": "feature_file",
+    "validate-pass-bar": "bar_file",
+    "validate-gate-registry": "registry_file",
 }
 
 #: Ceiling on the whole pre-commit step (every check together) — the same
@@ -1115,13 +1134,14 @@ def _parse_checks(raw: Any) -> tuple[list[_DeclaredCheck] | None, str | None]:
                 clean["no_model"] = no_model
                 allowed.add("no_model")
         else:
+            key = GIT_CHECK_PATH_ARGS[name]
             error = _relative_path_error(
-                args.get("feature_file"), what=f"checks[{index}] args.feature_file"
+                args.get(key), what=f"checks[{index}] args.{key}"
             )
             if error:
                 return None, error
-            clean = {"feature_file": str(args["feature_file"])}
-            allowed = {"feature_file"}
+            clean = {key: str(args[key])}
+            allowed = {key}
         extra = sorted(set(args) - allowed)
         if extra:
             return None, (
@@ -1162,6 +1182,38 @@ def resolve_check_command(
     return None
 
 
+#: The check whose command is NOT guardkit's: the gherkin normalizer the spec
+#: leg runs is a guardkit MODULE (``python -m …``), resolved by its own dual
+#: candidate probe.
+NORMALIZER_CHECK_NAME: str = "normalize-feature"
+
+
+def resolve_normalizer_command_for_checks(
+    *, python_executable: str = sys.executable
+) -> tuple[str, ...] | None:
+    """The ``python -m <module>`` prefix the ``normalize-feature`` check runs,
+    or ``None`` when guardkit's normalizer module is not importable here.
+
+    The same resolution the spec leg's own oracle uses
+    (:func:`forge.planning.target_terminal_tools.resolve_normalizer_command`):
+    the wheel layout first, the source checkout second, probed in the
+    interpreter the sidecar runs under — which is the interpreter the
+    subprocess will use, so an importable spec here predicts the subprocess.
+    ``None`` becomes one plain sentence to the caller, before any worktree is
+    made; it is never a silent skip of the normalizer.
+    """
+    from forge.planning.target_terminal_tools import (
+        NormalizerModuleUnresolved,
+        resolve_normalizer_command,
+    )
+
+    try:
+        return resolve_normalizer_command(python_executable=python_executable)
+    except NormalizerModuleUnresolved as exc:
+        logger.error("forge-deploy-sidecar: %s", exc)
+        return None
+
+
 def _check_outcome(
     check: _DeclaredCheck,
     *,
@@ -1192,6 +1244,7 @@ def run_declared_check(
     worktree: Path,
     command: tuple[str, ...],
     check_runner: MergeRunner = run_merge_command,
+    normalizer_command: tuple[str, ...] | None = None,
 ) -> PreCommitCheckOutcome:
     """Run one declared check in ``worktree`` and judge it the way the
     driver's closure judged it.
@@ -1207,12 +1260,24 @@ def run_declared_check(
       then ``guardkit feature validate <id> --json``; passed means exit 0.
     * ``classify-scenarios`` — ``guardkit qa classify-scenarios``; its verdict
       is exit 0, and it never blocks.
+    * ``normalize-feature`` — the spec leg's gherkin normalizer over the
+      committed ``.feature``: the box-drawing divider repair first (the
+      closure's own, in place, its receipt riding ``note``), then
+      ``python -m <the normalizer module> <the file>``; passed means exit 0,
+      and the sentence a failure carries is the closure's word for word.
+    * ``validate-pass-bar`` / ``validate-gate-registry`` — ``guardkit qa
+      validate pass-bar <path>`` and ``guardkit qa validate gate-registry
+      <path>``; passed means exit 0, and the details are the two legs' own
+      sentences (a bar's names the bar first, as the pass-bar leg's loop
+      does).
 
     Never raises: a runner that blows up is a failed check with the reason.
     """
     from forge.planning.target_terminal_tools import (
         NO_MODEL_OPTION_UNKNOWN_NOTE,
         _NORMALIZER_NO_MODEL_UNKNOWN_RE,
+        _check_status_word,
+        _repair_box_drawing_dividers,
         classify_normalizer_check,
         classify_scenarios_check,
         repair_plan_task_frontmatter,
@@ -1289,6 +1354,97 @@ def run_declared_check(
                 detail=outcome.detail,
                 note=note,
             )
+        if check.name == "normalize-feature":
+            feature_rel = str(check.args["feature_file"])
+            target = (worktree / feature_rel).resolve()
+            # The closure's own pre-parse repair, in place, before the parse:
+            # a top-level box-drawing divider becomes a comment so the run
+            # gets a parseable spec instead of dying with no revision loop.
+            repair_note = _repair_box_drawing_dividers(target, feature_rel) or ""
+            if repair_note:
+                logger.warning(
+                    "forge-deploy-sidecar: normalize-feature — %s", repair_note
+                )
+            if not normalizer_command:
+                return _check_outcome(
+                    check,
+                    exit_code=1,
+                    stdout="",
+                    stderr="",
+                    passed=False,
+                    detail=(
+                        "the gherkin normalizer module could not be resolved "
+                        "in this sidecar's interpreter"
+                    ),
+                )
+            exit_code, stdout, stderr = _run([*normalizer_command, str(target)])
+            if exit_code == MERGE_TIMEOUT_EXIT_CODE:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=False,
+                    detail=(
+                        f"normalizer timed out after {check.timeout:g}s "
+                        f"({feature_rel})"
+                    ),
+                    note=repair_note,
+                )
+            if exit_code != 0:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=False,
+                    detail=(
+                        f"normalizer exit {exit_code} for {feature_rel}: "
+                        f"{(stderr or stdout).strip()[:500]}"
+                    ),
+                    note=repair_note,
+                )
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=True,
+                detail=repair_note,
+                note=repair_note,
+            )
+        if check.name in ("validate-pass-bar", "validate-gate-registry"):
+            verb = (
+                "pass-bar" if check.name == "validate-pass-bar" else "gate-registry"
+            )
+            rel = str(check.args[GIT_CHECK_PATH_ARGS[check.name]])
+            exit_code, stdout, stderr = _run([*command, "qa", "validate", verb, rel])
+            status = _check_status_word(exit_code, exit_code == MERGE_TIMEOUT_EXIT_CODE)
+            if status == "success" and exit_code == 0:
+                return _check_outcome(
+                    check,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    passed=True,
+                    detail="",
+                )
+            detail = (
+                f"guardkit qa validate {verb} {status} (exit {exit_code}) for "
+                f"{rel}: {(stderr or stdout).strip()[:500]}"
+            )
+            if check.name == "validate-pass-bar":
+                # The pass-bar leg's loop names the bar before the oracle's
+                # own sentence; the same words reach the leg from here.
+                detail = f"{rel}: {detail}"
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=False,
+                detail=detail,
+            )
         feature_file = worktree / str(check.args["feature_file"])
         exit_code, stdout, stderr = _run(
             [
@@ -1345,6 +1501,7 @@ def _declared_checks_hook(
     command: tuple[str, ...],
     check_runner: MergeRunner,
     outcomes: list[PreCommitCheckOutcome],
+    normalizer_command: tuple[str, ...] | None = None,
 ) -> Callable[[Path], Awaitable[PreCommitResult]]:
     """The pre-commit hook the in-container runner takes, built from the
     declaration: each check in order, in a worker thread (the runner is
@@ -1359,6 +1516,7 @@ def _declared_checks_hook(
                 worktree=worktree,
                 command=command,
                 check_runner=check_runner,
+                normalizer_command=normalizer_command,
             )
             outcomes.append(outcome)
             if check.blocking and not outcome.passed:
@@ -1401,6 +1559,9 @@ def process_git_write_tree_request(
     config: ForgeConfig,
     check_runner: MergeRunner = run_merge_command,
     command_resolver: Callable[[], tuple[str, ...] | None] = resolve_check_command,
+    normalizer_resolver: Callable[
+        [], tuple[str, ...] | None
+    ] = resolve_normalizer_command_for_checks,
     worktrees_root: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate and perform a ``/git/prepare-branch-and-write-tree`` payload.
@@ -1435,7 +1596,7 @@ def process_git_write_tree_request(
         return 400, {"error": error}
 
     command: tuple[str, ...] | None = None
-    if checks:
+    if any(check.name != NORMALIZER_CHECK_NAME for check in checks):
         command = command_resolver()
         if not command:
             return 500, {
@@ -1446,13 +1607,30 @@ def process_git_write_tree_request(
                     "guardkit beside the sidecar"
                 )
             }
+    normalizer_command: tuple[str, ...] | None = None
+    if any(check.name == NORMALIZER_CHECK_NAME for check in checks):
+        normalizer_command = normalizer_resolver()
+        if not normalizer_command:
+            return 500, {
+                "error": (
+                    "this sidecar cannot resolve guardkit's gherkin normalizer "
+                    "module, so the spec leg's check cannot be run here — "
+                    "install guardkit in the interpreter the sidecar runs "
+                    "under, or provide a checkout with an importable "
+                    "top-level installer package"
+                )
+            }
 
     outcomes: list[PreCommitCheckOutcome] = []
     hook = (
         _declared_checks_hook(
-            checks, command=command, check_runner=check_runner, outcomes=outcomes
+            checks,
+            command=command or (),
+            check_runner=check_runner,
+            outcomes=outcomes,
+            normalizer_command=normalizer_command,
         )
-        if checks and command
+        if checks
         else None
     )
     logger.info(
@@ -1554,6 +1732,606 @@ def process_git_rev_parse_request(
 
 
 # ---------------------------------------------------------------------------
+# The fix journey's tree and its receipts, made where the repository lives
+# (sandbox first, 2026-09-07, rules 76 and 77)
+# ---------------------------------------------------------------------------
+#
+# The conductor used to cut a fix journey's worktree with git inside
+# forge-prod, against the operator's bind-mounted checkout, and to copy that
+# tree's receipts out with the container's own filesystem. For a repository
+# that has a sandbox neither is possible any more, and neither should be:
+# nothing the factory runs on a repository runs on the host. These three
+# routes are the same work, done inside the sandbox, on the factory's clone.
+#
+# LAW 10 (the worktree routes' own): the routes act on the given repository's
+# path and on nothing else. A journey tree is
+# ``<repo>/.forge/worktrees/<build id>`` — one directory, directly under that
+# one parent — and a path that is not exactly that shape is refused before
+# git is started. The work itself is the conductor's own module, imported,
+# so the two sides cannot drift apart.
+
+#: The three routes.
+GIT_WORKTREE_ADD_ROUTE: str = "/git/worktree-add"
+GIT_WORKTREE_REMOVE_ROUTE: str = "/git/worktree-remove"
+RECEIPTS_EXPORT_ROUTE: str = "/receipts/export"
+
+#: The shape a build id, a stage name or a worktree leaf may have before it
+#: is joined to a path or put in a directory name: letters, digits and the
+#: three separators the estate's own ids use. No slash, no dot, so ``..`` and
+#: a second path component are both impossible by construction.
+SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _worktree_path_error(
+    repo_path: Path, value: Any, *, what: str = "path"
+) -> str | None:
+    """LAW 10 — a plain sentence unless ``value`` is this repository's own
+    journey-tree path (``<repo>/.forge/worktrees/<leaf>``)."""
+    if not isinstance(value, str) or not value.strip():
+        return (
+            f"'{what}' is required (the journey worktree's path, "
+            "<repo>/.forge/worktrees/<build id>)"
+        )
+    from forge.cli._conductor_worktree import WORKTREES_DIR
+
+    wanted = os.path.normpath(os.path.abspath(value))
+    parent = os.path.normpath(os.path.abspath(str(repo_path / WORKTREES_DIR)))
+    leaf = os.path.basename(wanted)
+    if os.path.dirname(wanted) != parent or not SAFE_NAME_PATTERN.match(leaf):
+        return (
+            f"'{what}' {value!r} is not a journey worktree of this repository — "
+            f"the sidecar acts on {parent}/<build id> and on no other path"
+        )
+    return None
+
+
+def process_git_worktree_add_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """Validate and perform a ``/git/worktree-add`` payload.
+
+    ``{repo, path, branch, base_ref}`` → on a permitted request a 200 carrying
+    ``{status, path, branch, base_ref, reused, detail}``: ``status`` is
+    ``success`` when the tree is there (``reused`` says whether it was
+    already), or ``failed`` with ``detail`` saying in one sentence why not — a
+    collision or a base branch nobody made is an answer, not a transport
+    error. A refusal of the request itself is a 400 with one plain sentence.
+    Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _worktree_path_error(repo_path, payload.get("path"))
+    if error:
+        return 400, {"error": error}
+    branch = payload.get("branch")
+    error = _ref_error(branch, what="branch")
+    if error:
+        return 400, {"error": error}
+    from forge.cli._conductor_worktree import (
+        JOURNEY_BASE_REF,
+        cut_worktree_in_checkout,
+    )
+
+    base_ref = payload.get("base_ref") or JOURNEY_BASE_REF
+    error = _ref_error(base_ref, what="base_ref")
+    if error:
+        return 400, {"error": error}
+
+    build_id = os.path.basename(os.path.normpath(str(payload["path"])))
+    logger.info(
+        "forge-deploy-sidecar: cutting %s in %s on %s off %s",
+        build_id,
+        repo_path,
+        branch,
+        base_ref,
+    )
+    try:
+        cut = _run_coroutine(
+            cut_worktree_in_checkout(
+                checkout=repo_path,
+                build_id=build_id,
+                branch=str(branch),
+                base_ref=str(base_ref),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar git error: {type(exc).__name__}: {exc}",
+            "status": "failed",
+            "path": None,
+            "reused": False,
+            "detail": "",
+        }
+    return 200, {
+        "status": "success" if cut.ok else "failed",
+        "path": cut.path or None,
+        "branch": cut.branch,
+        "base_ref": cut.base_ref,
+        "reused": bool(cut.reused),
+        "detail": cut.reason,
+    }
+
+
+def process_git_worktree_remove_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """Validate and perform a ``/git/worktree-remove`` payload.
+
+    ``{repo, path}`` → ``{status, path, detail}``. A path that is already
+    gone is a success: there is nothing left to remove, and a second call
+    must be safe. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _worktree_path_error(repo_path, payload.get("path"))
+    if error:
+        return 400, {"error": error}
+
+    from forge.cli._conductor_worktree import remove_journey_worktree
+
+    worktree = str(payload["path"])
+    logger.info("forge-deploy-sidecar: removing the worktree at %s", worktree)
+    try:
+        removed = _run_coroutine(remove_journey_worktree(worktree=worktree))
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar git error: {type(exc).__name__}: {exc}",
+            "status": "failed",
+            "path": worktree,
+            "detail": "",
+        }
+    return 200, {
+        "status": "success" if removed.ok else "failed",
+        "path": removed.path,
+        "detail": removed.reason,
+    }
+
+
+def process_receipts_export_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """Validate and perform a ``/receipts/export`` payload.
+
+    ``{build_id, stage, worktree, extra_files}`` → ``{status, stage_key, dest,
+    families, files}``: the fix journey's own receipts export, run here, so
+    the tree it copies from never leaves the sandbox and what it writes lands
+    under the receipts root forge resolves (``FORGE_RECEIPTS_DIR``), which is
+    mounted read-write and is the same directory forge-prod reads.
+
+    ``extra_files`` is the small text the conductor writes beside the copied
+    families (the turn's rationale); each name must be a plain file name.
+
+    The worktree must be inside one of the repositories this sidecar knows,
+    for the same reason the git routes fence their paths: the sidecar copies
+    from where the factory works and from nowhere else. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    build_id = payload.get("build_id")
+    if not isinstance(build_id, str) or not SAFE_NAME_PATTERN.match(build_id):
+        return 400, {
+            "error": (
+                "'build_id' is required and must be a plain build id (letters, "
+                f"digits, dots, dashes and underscores); got {build_id!r}"
+            )
+        }
+    stage = payload.get("stage")
+    if not isinstance(stage, str) or not SAFE_NAME_PATTERN.match(stage):
+        return 400, {
+            "error": (
+                "'stage' is required and must be a plain stage name; got "
+                f"{stage!r}"
+            )
+        }
+    worktree = payload.get("worktree")
+    if not isinstance(worktree, str) or not worktree.strip():
+        return 400, {"error": "'worktree' is required (the tree to export from)"}
+    wanted = os.path.normpath(os.path.abspath(worktree))
+    inside = any(
+        _is_inside(wanted, os.path.normpath(os.path.abspath(str(root))))
+        for root in config.planning.target_repo_paths.values()
+    )
+    if not inside:
+        known = ", ".join(sorted(config.planning.target_repo_paths)) or "(none)"
+        return 400, {
+            "error": (
+                f"'worktree' {worktree!r} is not inside any repository this "
+                f"sidecar knows ({known}), so there is nothing here to export "
+                "receipts from"
+            )
+        }
+    extra_files, error = _validate_extra_files(payload.get("extra_files"))
+    if error:
+        return 400, {"error": error}
+
+    from forge.pipeline.fix_journey_receipts import export_stage_receipts
+
+    logger.info(
+        "forge-deploy-sidecar: exporting %s receipts for %s from %s",
+        stage,
+        build_id,
+        wanted,
+    )
+    try:
+        result = export_stage_receipts(
+            build_id=build_id,
+            stage=stage,
+            worktree_path=wanted,
+            extra_files=extra_files or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar receipts error: {type(exc).__name__}: {exc}"}
+    dest = str(result.dest)
+    families = list(result.families)
+    return 200, {
+        "status": "success" if result.ok else "failed",
+        "stage_key": result.stage_key,
+        "dest": dest,
+        "families": families,
+        "files": [f"{dest}/{name}" for name in families]
+        + [f"{dest}/{name}" for name in sorted(extra_files or {})],
+    }
+
+
+def _is_inside(candidate: str, root: str) -> bool:
+    """Containment by path components, never by ``startswith``."""
+    try:
+        return os.path.commonpath([candidate, root]) == root
+    except ValueError:  # pragma: no cover — different drives (win32)
+        return False
+
+
+def _validate_extra_files(raw: Any) -> tuple[dict[str, str], str | None]:
+    """The small text files written beside the copied families."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, "'extra_files' must be a JSON object of file name → text"
+    out: dict[str, str] = {}
+    for name, text in raw.items():
+        if not isinstance(name, str) or not SAFE_NAME_PATTERN.match(name):
+            return {}, (
+                f"'extra_files' name {name!r} must be a plain file name "
+                "(letters, digits, dots, dashes and underscores)"
+            )
+        if not isinstance(text, str):
+            return {}, f"'extra_files' value for {name!r} must be text"
+        out[name] = text
+    return out, None
+
+
+# ---------------------------------------------------------------------------
+# The fix journey's legs, run where the repository lives (rule 75)
+# ---------------------------------------------------------------------------
+#
+# A journey's review and work legs (``guardkit task-review``, ``guardkit
+# task-work``) install and run the repository's own code, so for a repository
+# with a sandbox they run inside it. The sidecar already carried the merge
+# word's one command; this route carries those two, and nothing else.
+#
+# LAW 11 (the leg route's own): the subcommand is one of two words; the
+# working directory is a journey worktree of the repository named, and no
+# other directory; the arguments are passed as one fixed argument list with
+# no shell, exactly as the merge's are; the exit code is data, because "the
+# leg ran and failed" is an answer.
+#
+# A leg is given what it would have been given in the container: the
+# conductor's forward-context paths, the ``--context`` flags the
+# repository's own manifest asks for (read HERE, against the tree the leg
+# runs in), and ``--nats`` when the caller wants progress messages. The
+# answer carries the whole of stdout, whether the leg was stopped at its
+# wall, and anything the manifest reading had to say — so the caller can
+# read the leg's own findings out of it exactly as it reads a leg that ran
+# in the container.
+
+#: The route.
+GUARDKIT_LEG_ROUTE: str = "/guardkit-leg"
+
+#: The only two subcommands this route will carry.
+LEG_SUBCOMMANDS: tuple[str, ...] = ("task-review", "task-work")
+
+#: A leg's own time limits. The default matches the conductor's work-stage
+#: tripwire; the cap is longer than either tripwire so an operator who widens
+#: a leg's budget in a profile is not silently cut back here.
+LEG_TIMEOUT_DEFAULT: float = 1800.0
+LEG_TIMEOUT_MAX: float = 7200.0
+
+#: How many argument tokens a leg may carry, and how long one may be. The
+#: forward context rides as text pairs, so these are generous; they exist so
+#: a runaway caller cannot hand the sidecar an unbounded argument list.
+LEG_MAX_ARGS: int = 256
+LEG_MAX_ARG_CHARS: int = 65_536
+
+#: How many paths a leg's ``extra_context_paths`` or ``read_allowlist`` may
+#: carry. The same reason as ``LEG_MAX_ARGS``: generous, and bounded.
+LEG_MAX_PATHS: int = 256
+
+
+def _leg_path_list(value: Any, *, field: str) -> tuple[list[str], str | None]:
+    """Read one of the leg route's path lists; return ``(paths, error)``.
+
+    Absent reads as an empty list. Anything that is not a list of plain text
+    paths is a refusal in one sentence, checked before a process starts.
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"'{field}' must be a list of paths written as text"
+    if len(value) > LEG_MAX_PATHS:
+        return [], (
+            f"'{field}' may carry at most {LEG_MAX_PATHS} paths; got {len(value)}"
+        )
+    paths: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            return [], (
+                f"every entry in '{field}' must be a path written as text; got "
+                f"{type(entry).__name__}"
+            )
+        if len(entry) > LEG_MAX_ARG_CHARS:
+            return [], (
+                f"a path in '{field}' may be at most {LEG_MAX_ARG_CHARS} "
+                f"characters long; one is {len(entry)}"
+            )
+        paths.append(entry)
+    return paths, None
+
+
+def _leg_context_flags(
+    *,
+    cwd: str,
+    repo_path: str,
+    subcommand: str,
+    read_allowlist: list[str],
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Work out the leg's ``--context`` flags from the manifest, in here.
+
+    The in-container runner reads the repository's own
+    ``.guardkit/context-manifest.yaml`` and turns it into ``--context`` flags
+    before it spawns guardkit. A leg run in the sandbox must be told the same
+    thing, and the manifest it must be read from is the one in the sandbox's
+    own tree — so the reading happens here, against the journey worktree the
+    leg will run in, rather than in the forge container where that tree may
+    not exist at all.
+
+    Never raises: a manifest that cannot be read costs the leg its context
+    flags and says so, exactly as it does in the container.
+    """
+    allowlist = [Path(entry) for entry in read_allowlist] or [Path(repo_path)]
+    try:
+        resolved = resolve_context_flags(Path(cwd), subcommand, allowlist)
+    except KeyError:
+        return [], [
+            {
+                "code": "context_resolver_unknown_subcommand",
+                "message": (
+                    f"resolver has no category filter for subcommand "
+                    f"{subcommand!r}; proceeding with no --context flags"
+                ),
+            }
+        ]
+    except Exception as exc:  # noqa: BLE001 — a leg never dies of its context
+        logger.warning(
+            "forge-deploy-sidecar: reading the context manifest under %s "
+            "raised %s: %s — the leg runs with no --context flags",
+            cwd,
+            type(exc).__name__,
+            exc,
+        )
+        return [], [
+            {
+                "code": "context_manifest_unreadable",
+                "message": (
+                    f"could not read the context manifest under {cwd}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        ]
+    warnings = [
+        {"code": warning.code, "message": warning.message}
+        for warning in resolved.warnings
+    ]
+    return list(resolved.flags), warnings
+
+
+def process_guardkit_leg_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    leg_runner: MergeRunner = run_merge_command,
+    command_resolver: Callable[[], str | None] = resolve_guardkit_command,
+) -> tuple[int, dict[str, Any]]:
+    """Validate and run a ``/guardkit-leg`` payload; return ``(status, body)``.
+
+    ``{repo, cwd, subcommand, args, timeout_seconds, extra_context_paths,
+    read_allowlist, with_nats_streaming}`` → on a permitted request a 200
+    carrying ``{exit_code, stdout, stderr_tail, timed_out,
+    context_warnings}``. The exit code is data, because "the leg ran and
+    failed" is an answer; ``timed_out`` is separate from it, because a leg
+    stopped at its wall is not a leg that failed.
+
+    The last three fields of the request are how a leg is told what it would
+    have been told in the container: ``extra_context_paths`` are the
+    conductor's own forward-context paths, ``read_allowlist`` bounds which of
+    the manifest's documents may be read (absent: the repository itself), and
+    ``with_nats_streaming`` asks for ``--nats`` so the leg publishes its
+    progress. The manifest's own ``--context`` flags are worked out here,
+    against the tree the leg runs in.
+
+    Everything is checked before a process starts: the repository must be one
+    the forge configuration names; the working directory must be one of that
+    repository's own journey worktrees and must exist; the subcommand must be
+    ``task-review`` or ``task-work``; every argument and every path must be
+    text; the timeout must be a positive number. A wall longer than this
+    route's ceiling is cut back to the ceiling and said so in the result's
+    warnings, never refused — a profile that asks for a longer stage wall
+    should run, not fail. A refusal is a 4xx with one plain sentence. Never
+    raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _worktree_path_error(repo_path, payload.get("cwd"), what="cwd")
+    if error:
+        return 400, {"error": error}
+    cwd = os.path.normpath(os.path.abspath(str(payload["cwd"])))
+    if not os.path.isdir(cwd):
+        return 400, {
+            "error": (
+                f"the working directory {cwd} is not there, so there is no "
+                "worktree for this leg to run in"
+            )
+        }
+    subcommand = payload.get("subcommand")
+    if subcommand not in LEG_SUBCOMMANDS:
+        return 400, {
+            "error": (
+                "'subcommand' must be one of "
+                f"{', '.join(LEG_SUBCOMMANDS)}; got {subcommand!r}"
+            )
+        }
+    raw_args = payload.get("args") or []
+    if not isinstance(raw_args, list):
+        return 400, {"error": "'args' must be a list of text arguments"}
+    if len(raw_args) > LEG_MAX_ARGS:
+        return 400, {
+            "error": (
+                f"'args' may carry at most {LEG_MAX_ARGS} arguments; got "
+                f"{len(raw_args)}"
+            )
+        }
+    args: list[str] = []
+    for entry in raw_args:
+        if not isinstance(entry, str):
+            return 400, {
+                "error": (
+                    "every entry in 'args' must be written as text; got "
+                    f"{type(entry).__name__}"
+                )
+            }
+        if len(entry) > LEG_MAX_ARG_CHARS:
+            return 400, {
+                "error": (
+                    f"an argument may be at most {LEG_MAX_ARG_CHARS} characters "
+                    f"long; one is {len(entry)}"
+                )
+            }
+        args.append(entry)
+
+    # THE LEG IS TOLD WHAT IT WOULD HAVE BEEN TOLD IN THE CONTAINER. Rule 75
+    # moves where a leg runs, not what it is given: the conductor's forward
+    # context paths, the manifest's own context flags and the progress switch
+    # all travel with the request, and the flags are assembled below in the
+    # same order the in-container runner assembles them.
+    extra_context_paths, error = _leg_path_list(
+        payload.get("extra_context_paths"), field="extra_context_paths"
+    )
+    if error:
+        return 400, {"error": error}
+    read_allowlist, error = _leg_path_list(
+        payload.get("read_allowlist"), field="read_allowlist"
+    )
+    if error:
+        return 400, {"error": error}
+    with_nats_streaming = payload.get("with_nats_streaming", False)
+    if not isinstance(with_nats_streaming, bool):
+        return 400, {
+            "error": (
+                "'with_nats_streaming' must be true or false; got "
+                f"{type(with_nats_streaming).__name__}"
+            )
+        }
+
+    timeout_seconds = payload.get("timeout_seconds")
+    timeout = LEG_TIMEOUT_DEFAULT
+    # A WALL WIDER THAN THIS ROUTE ALLOWS IS CUT BACK, NEVER REFUSED (ruled
+    # 2026-09-07 21:05Z). Refusing it with a 400 would fail a leg that could
+    # have run: the caller would get "internal error before dispatch" for a
+    # profile that merely asked for a longer stage wall than this route's
+    # ceiling. So the leg runs with the longest wall the route has, and the
+    # result says so in plain words alongside the context warnings.
+    timeout_warnings: list[dict[str, str]] = []
+    if timeout_seconds is not None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            return 400, {"error": "'timeout_seconds' must be a positive number"}
+        timeout = float(timeout_seconds)
+        if timeout > LEG_TIMEOUT_MAX:
+            timeout_warnings.append(
+                {
+                    "code": "leg_timeout_clamped",
+                    "message": (
+                        f"this leg was asked for up to {timeout:g} seconds, "
+                        f"which is longer than the longest wall this route "
+                        f"allows, so it was given {LEG_TIMEOUT_MAX:g} seconds "
+                        f"instead"
+                    ),
+                }
+            )
+            timeout = LEG_TIMEOUT_MAX
+
+    command = command_resolver()
+    if not command:
+        return 500, {
+            "error": (
+                "this sidecar has no guardkit command to run a leg with — set "
+                f"{GUARDKIT_PATH_ENV} to its path, or put {GUARDKIT_BINARY_NAME} "
+                "on the service's PATH"
+            )
+        }
+
+    context_flags, context_warnings = _leg_context_flags(
+        cwd=cwd,
+        repo_path=repo_path,
+        subcommand=str(subcommand),
+        read_allowlist=read_allowlist,
+    )
+    context_warnings = [*timeout_warnings, *context_warnings]
+    for path in extra_context_paths:
+        context_flags.extend(["--context", path])
+    nats_flag = ["--nats"] if with_nats_streaming else []
+    argv = [command, str(subcommand), *args, *context_flags, *nats_flag]
+    logger.info(
+        "forge-deploy-sidecar: running guardkit %s in %s (up to %g seconds, "
+        "%d context paths, progress %s)",
+        subcommand,
+        cwd,
+        timeout,
+        len(context_flags) // 2,
+        "on" if with_nats_streaming else "off",
+    )
+    try:
+        exit_code, stdout, stderr = leg_runner(argv=argv, cwd=cwd, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        # A leg that was stopped at its wall is not a leg that failed, and the
+        # caller can only tell the two apart if this side says which happened.
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "context_warnings": context_warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Config resolution (re-read per request so path changes are picked up)
 # ---------------------------------------------------------------------------
 
@@ -1650,6 +2428,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WRITE_TREE_ROUTE,
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
+                GIT_WORKTREE_ADD_ROUTE,
+                GIT_WORKTREE_REMOVE_ROUTE,
+                RECEIPTS_EXPORT_ROUTE,
+                GUARDKIT_LEG_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
@@ -1686,6 +2468,22 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_REV_PARSE_ROUTE:
                 status, body = process_git_rev_parse_request(payload, config=config)
+            elif route == GIT_WORKTREE_ADD_ROUTE:
+                status, body = process_git_worktree_add_request(
+                    payload, config=config
+                )
+            elif route == GIT_WORKTREE_REMOVE_ROUTE:
+                status, body = process_git_worktree_remove_request(
+                    payload, config=config
+                )
+            elif route == RECEIPTS_EXPORT_ROUTE:
+                status, body = process_receipts_export_request(payload, config=config)
+            elif route == GUARDKIT_LEG_ROUTE:
+                status, body = process_guardkit_leg_request(
+                    payload,
+                    config=config,
+                    leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                )
             else:
                 status, body = process_run_request(
                     payload,
@@ -1802,8 +2600,11 @@ __all__ = [
     "GIT_READ_FILE_ROUTE",
     "GIT_REV_PARSE_ROUTE",
     "GIT_CHECK_NAMES",
+    "GIT_CHECK_PATH_ARGS",
     "GIT_CHECK_TIMEOUT_DEFAULTS",
     "GIT_CHECK_BLOCKING_DEFAULTS",
+    "NORMALIZER_CHECK_NAME",
+    "resolve_normalizer_command_for_checks",
     "GIT_HOOK_TIMEOUT_SECONDS",
     "REF_NAME_PATTERN",
     "resolve_check_command",
@@ -1811,6 +2612,19 @@ __all__ = [
     "process_git_write_tree_request",
     "process_git_read_file_request",
     "process_git_rev_parse_request",
+    "GIT_WORKTREE_ADD_ROUTE",
+    "GIT_WORKTREE_REMOVE_ROUTE",
+    "RECEIPTS_EXPORT_ROUTE",
+    "SAFE_NAME_PATTERN",
+    "process_git_worktree_add_request",
+    "process_git_worktree_remove_request",
+    "process_receipts_export_request",
+    "GUARDKIT_LEG_ROUTE",
+    "LEG_SUBCOMMANDS",
+    "LEG_TIMEOUT_DEFAULT",
+    "LEG_TIMEOUT_MAX",
+    "LEG_MAX_PATHS",
+    "process_guardkit_leg_request",
     "default_config_loader",
     "DeploySidecarHandler",
     "build_server",

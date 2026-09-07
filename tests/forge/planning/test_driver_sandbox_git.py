@@ -1,25 +1,25 @@
-"""The plan leg's checks run where the repository lives (sandbox first, 2026-09-07).
+"""Every planning leg's checks run where the repository lives (sandbox first,
+2026-09-07, rules 70 and 87).
 
 Rich's rule: nothing the factory runs on a repository runs on the host. When
-the repository has a sandbox of its own, the plan leg no longer runs the
-stamp normalizer and ``feature validate`` itself in a worktree beside the
-driver: it DECLARES the two checks by name, the deploy sidecar inside the
-sandbox runs them with the guardkit beside it, and their outcomes come back
-with the commit. What a refusal means, what the receipts say, which stamping
-ran by rule only and whether the machine's rewrite round fires must be
-exactly what they are when the checks run here.
+the repository has a sandbox of its own, no planning leg runs its oracle in a
+worktree beside the driver. Each one DECLARES its checks by name — the spec
+leg's gherkin normalizer and Part K's provability check, the plan leg's stamp
+normalizer and ``feature validate``, one ``qa validate pass-bar`` per minted
+bar, and ``qa validate gate-registry`` — the deploy sidecar inside the sandbox
+runs them with the guardkit beside it, and their outcomes come back with the
+commit. What a refusal means, what the receipts say, which stamping ran by
+rule only, what the card says and whether the machine's rewrite round fires
+must be exactly what they are when the checks run here.
 
 These tests drive the whole planning run against a REAL sidecar on an
 ephemeral loopback port, against a real git repository, with a stand-in
-``guardkit`` binary running the declared checks — so the argv, the exit
-codes, the JSON and the commit are the real ones.
+``guardkit`` binary and a stand-in normalizer module running the declared
+checks — so the argv, the exit codes, the JSON and the commit are the real
+ones.
 
-Phase 1's boundary, said out loud: only the PLAN leg's checks are declared.
-The spec leg, the pass-bar leg and the feature-gate leg still hand their
-oracle to the git runner as a Python closure, so those legs keep the git
-runner inside the forge container; a sandbox runner refuses a closure in one
-plain sentence rather than quietly running the repository's checks on the
-host. The last test here pins that refusal.
+The fence is still pinned at the bottom: a Python closure handed to a sandbox
+runner is refused in one plain sentence rather than quietly run on the host.
 """
 
 from __future__ import annotations
@@ -43,14 +43,20 @@ from forge.planning.sidecar_git_runner import CLOSURE_REFUSED_SENTENCE, SidecarG
 from forge.planning.states import PlanningState
 
 from tests.forge.deploy_sidecar._fake_guardkit import (
+    NORMALIZED_MARKER,
     REFUSED_TITLES,
+    classify_calls,
+    fake_normalizer,
     git_show,
     normalize_calls,
+    normalizer_calls,
+    qa_validate_calls,
     validate_calls,
     write_fake_guardkit,
 )
 from tests.forge.planning.test_driver_target_terminal import (
     CID,
+    _ROUND19_SEED_AUTHLESS,
     _approved_spec_rows,
     _commit_repo_routing_law,
     _drive_to_failure,
@@ -59,14 +65,20 @@ from tests.forge.planning.test_driver_target_terminal import (
     _leg_details,
     _make_driver,
     _plan_result_native,
+    _plan_result_native_versions,
     _plan_yaml_rel,
     _queue,
     _rewritten_spec_result,
+    _seed_gate_surface,
     _spec_by_round,
     _spec_result_native,
+    _spec_result_with_seed,
 )
 
 REPO_KEY = "guardkit/api_test"
+
+#: The committed spec's ``.feature`` path for the fixture the spec results use.
+FEATURE_REL = "features/stats-endpoint/stats-endpoint.feature"
 
 
 @pytest.fixture
@@ -92,9 +104,22 @@ def fake_guardkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv(GUARDKIT_PATH_ENV, str(write_fake_guardkit(tmp_path / "bin")))
     log = tmp_path / "guardkit-calls.jsonl"
     monkeypatch.setenv("FAKE_GUARDKIT_LOG", str(log))
-    for name in ("FAKE_GUARDKIT_NORMALIZE", "FAKE_GUARDKIT_VALIDATE", "FAKE_GUARDKIT_CLASSIFY"):
+    for name in (
+        "FAKE_GUARDKIT_NORMALIZE",
+        "FAKE_GUARDKIT_VALIDATE",
+        "FAKE_GUARDKIT_CLASSIFY",
+        "FAKE_GUARDKIT_QA_VALIDATE",
+    ):
         monkeypatch.delenv(name, raising=False)
     return log
+
+
+@pytest.fixture
+def fake_normalizer_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The stand-in gherkin normalizer, planted where BOTH the sidecar's own
+    ``find_spec`` probe and the subprocess it starts resolve it — the spec
+    leg's declared check runs a real module in a real subprocess."""
+    yield from fake_normalizer(tmp_path / "normalizer", monkeypatch)
 
 
 def _sandbox(repo: Path, tmp_path: Path):
@@ -116,7 +141,9 @@ def _sandbox(repo: Path, tmp_path: Path):
 
 
 @pytest.fixture
-def sandbox_repo(tmp_path: Path, request: pytest.FixtureRequest):
+def sandbox_repo(
+    tmp_path: Path, request: pytest.FixtureRequest, fake_normalizer_module: Path
+):
     """An enforced-law scratch repository, the in-container runner the legs
     that are not moved yet still use, and the sandbox's git runner."""
     law = getattr(request, "param", "enforced")
@@ -191,7 +218,7 @@ async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_c
     declared = [
         r.getMessage()
         for r in caplog.records
-        if "are declared to the sandbox git runner" in r.getMessage()
+        if "the plan leg's pre-commit checks" in r.getMessage()
     ]
     assert declared and "normalize-stamps(blocking, --no-model)" in declared[0]
     assert "feature-validate(blocking)" in declared[0]
@@ -340,20 +367,18 @@ async def test_a_red_feature_validate_in_the_sandbox_fails_the_leg_with_its_reas
 
 
 # ---------------------------------------------------------------------------
-# Phase 1's boundary, pinned
+# The fence, pinned
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_a_leg_that_still_hands_over_a_closure_is_refused_out_loud(
+async def test_a_caller_that_hands_over_a_closure_is_refused_out_loud(
     sandbox_repo, fake_guardkit: Path
 ) -> None:
-    """The legs phase 1 has not moved (the spec leg, the pass bars, the
-    feature gate) still hand their oracle over as a Python closure. A sandbox
-    runner refuses it in one plain sentence and sends nothing — it never
-    quietly runs the repository's checks on the host instead. Until those
-    legs declare their checks too, they keep the git runner in the forge
-    container, which is what the composition gives them.
+    """A Python closure handed to a sandbox runner is refused in one plain
+    sentence and nothing is sent — it is never quietly run on the host
+    instead. Every planning leg now declares its checks, so nothing in the
+    chain reaches this refusal; it stays as the fence that says so.
     """
     repo, _, sandbox_runner = sandbox_repo
 
@@ -444,3 +469,353 @@ async def test_a_law_that_cannot_be_read_at_all_says_so_and_does_not_block(
         "could not be read" in r.getMessage() and "routing law reads as off" in r.getMessage()
         for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# The other three legs' checks, declared too (rule 87, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+
+def _on_branch(repo: Path, branch: str, prefix: str) -> list[str]:
+    """The files under ``prefix`` that are on ``branch`` — empty when the
+    commit never landed (a blocking check refused it)."""
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", branch],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        return []
+    return [line for line in listed.stdout.splitlines() if line.startswith(prefix)]
+
+
+def _failure_text(store: SqlitePlanningRunStore, stage: str) -> str:
+    return json.dumps(
+        [
+            json.loads(e["details_json"] or "{}")
+            for e in store.list_events(CID)
+            if e["stage_label"] == stage
+        ]
+    )
+
+
+def _draft_provability(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
+    """The ``provability`` receipt on every spec-draft row, in order."""
+    out: list[dict[str, Any]] = []
+    for event in store.list_events(CID):
+        if event["stage_label"] != "feature-spec-draft":
+            continue
+        draft = (json.loads(event["details_json"] or "{}") or {}).get("spec_draft") or {}
+        if "provability" in draft:
+            out.append(draft["provability"])
+    return out
+
+
+@pytest.mark.asyncio
+async def test_the_spec_legs_normalizer_runs_in_the_sandbox_and_its_rewrite_rides_the_commit(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+    caplog,
+) -> None:
+    """The spec leg declares its gherkin normalizer instead of running it: the
+    sidecar runs the module in ITS worktree, what the normalizer rewrites
+    there rides the spec commit, and the collaborator inside the forge
+    container is never called."""
+    repo, _, _ = sandbox_repo
+    _queue(store)
+    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["normalize"] == 0  # never run in the container
+
+    calls = normalizer_calls(fake_guardkit)
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/" + FEATURE_REL)
+    assert not calls[0][0].startswith(str(repo))  # the sandbox's worktree, not the checkout
+
+    committed = git_show(repo, f"planning/{CID}", FEATURE_REL) or ""
+    assert committed.endswith(NORMALIZED_MARKER)
+
+    declared = [
+        r.getMessage()
+        for r in caplog.records
+        if "the spec leg's pre-commit checks" in r.getMessage()
+    ]
+    assert declared and "normalize-feature(blocking)" in declared[0]
+
+
+@pytest.mark.asyncio
+async def test_a_red_normalizer_in_the_sandbox_fails_the_spec_leg_with_the_same_words(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+    monkeypatch,
+) -> None:
+    """A spec the normalizer cannot parse fails the leg with the sentence the
+    closure gives it, and nothing reaches the branch."""
+    repo, _, _ = sandbox_repo
+    _queue(store)
+    monkeypatch.setenv("FAKE_NORMALIZER", "red")
+    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+
+    assert _on_branch(repo, f"planning/{CID}", "features/") == []
+    failure = _failure_text(store, "feature-spec")
+    assert "spec write / normalizer failed" in failure
+    assert f"normalizer exit 1 for {FEATURE_REL}" in failure
+    assert "could not be reached" not in failure
+
+
+@pytest.mark.asyncio
+async def test_the_pass_bar_leg_declares_one_check_per_bar_in_the_sandbox(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """guardkit's own ``qa validate pass-bar`` runs in the sandbox, once per
+    minted bar, and the bars land."""
+    repo, _, _ = sandbox_repo
+    _queue(store)
+    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["pass_bar_validate"] == 0
+    calls = qa_validate_calls(fake_guardkit, "pass-bar")
+    assert calls == [["qa", "validate", "pass-bar", "qa/pass-bar-TASK-STAT-001.yaml"]]
+    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") == [
+        "qa/pass-bar-TASK-STAT-001.yaml"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_bar_in_the_sandbox_fails_the_leg_and_no_bar_lands(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+    monkeypatch,
+) -> None:
+    repo, _, _ = sandbox_repo
+    _queue(store)
+    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
+    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+
+    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") == []
+    failure = _failure_text(store, "qa-pass-bars")
+    assert "pass-bar write / qa validate failed" in failure
+    assert "qa/pass-bar-TASK-STAT-001.yaml: guardkit qa validate pass-bar" in failure
+
+
+@pytest.mark.asyncio
+async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """The last writing leg: the appended registry is validated by guardkit
+    inside the sandbox before the gate lands."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    _commit_repo_routing_law(repo, "enforced")
+    in_container = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    runner, shutdown = _sandbox(repo, tmp_path)
+    try:
+        _queue(store)
+        h = _make_driver(
+            store,
+            git_runner=in_container,
+            git_runner_for_repo=lambda _repo: runner,
+            repo_path=str(repo),
+            spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+            plan_result_factory=_plan_result_native_versions,
+        )
+        await h.driver.drive(CID)
+    finally:
+        shutdown()
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert qa_validate_calls(fake_guardkit, "gate-registry") == [
+        ["qa", "validate", "gate-registry", "qa/gates/registry.yaml"]
+    ]
+    branch = f"planning/{CID}"
+    assert git_show(repo, branch, "qa/gates/version_endpoint_gate.py") is not None
+    registry = git_show(repo, branch, "qa/gates/registry.yaml") or ""
+    assert "version-endpoint" in registry
+
+
+# ---------------------------------------------------------------------------
+# Part K's provability check, answered by the sandbox with the spec commit
+# ---------------------------------------------------------------------------
+
+
+def _never_classify_here():
+    async def _classify(repo_path: Path, feature_text: str):
+        raise AssertionError(
+            "the provability check must run in the repository's sandbox, "
+            "never in the forge container"
+        )
+
+    return _classify
+
+
+@pytest.mark.asyncio
+async def test_the_provability_check_answers_from_the_sandbox_with_the_spec_commit(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """Rule 87's last item: for a sandboxed repository Part K's check rides
+    the spec commit as a declared, non-blocking check, so it runs on the
+    bytes that landed — and the check in the forge container is never run."""
+    _queue(store)
+    h = _driver(
+        store,
+        sandbox_repo,
+        plan_result_factory=_plan_result_native,
+        classify_fn=_never_classify_here(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(classify_calls(fake_guardkit)) == 1
+    receipts = _draft_provability(store)
+    assert len(receipts) == 1
+    assert receipts[0]["checked_by_rule"] is True
+    assert receipts[0]["refused_titles"] == []
+    assert receipts[0]["rewritten"] is False
+    assert _error_cards(h) == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_example_in_the_sandbox_fires_the_machines_round_before_the_card(
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+    monkeypatch,
+) -> None:
+    """The sandbox's own guardkit refuses two examples by rule, so the
+    machine's note round runs before the card exactly as it does when the
+    check runs in the container: two spec-writer calls, two checks, and the
+    card carries rule 45's words."""
+    _queue(store)
+    monkeypatch.setenv("FAKE_GUARDKIT_CLASSIFY", "refused")
+    h = _driver(
+        store,
+        sandbox_repo,
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        classify_fn=_never_classify_here(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["spec"] == 2
+    assert len(classify_calls(fake_guardkit)) == 2
+    receipt = _draft_provability(store)[-1]
+    assert receipt["round"] == 1
+    assert receipt["rewritten"] is True
+    assert receipt["refused_titles"] == list(REFUSED_TITLES)
+    for title in REFUSED_TITLES:
+        assert title in receipt["note"]
+    assert (
+        "The machine rewrote 2 of the worked examples so they can be proven"
+        in _digest_card_text(h)
+    )
+
+
+def _digest_card_text(h) -> str:
+    """The what-happened text on the one spec-digest card Rich reads."""
+    cards = [
+        env
+        for env in h.ctx["publisher"].envelopes
+        if env.payload["details"].get("checkpoint_type") == "product_docs_spec_digest"
+    ]
+    assert len(cards) == 1, cards
+    return str(cards[0].payload["details"]["summary"].get("what_happened") or "")
+
+
+# ---------------------------------------------------------------------------
+# The whole run, on the composition's own routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_whole_run_for_a_sandbox_repository_reaches_the_build_queue(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """The production shape end to end: the driver holds the ONE runner the
+    composition builds from ``planning.sandboxes``, so every read and every
+    write of the planning chain goes to the sidecar inside the sandbox. The
+    run reaches the build queue, no oracle ran in the forge container, and
+    every artefact the four legs write is on the branch.
+    """
+    from forge.planning.sidecar_git_runner import RepoRoutedGitRunner
+
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    _commit_repo_routing_law(repo, "enforced")
+    sandbox_runner, shutdown = _sandbox(repo, tmp_path)
+    routed = RepoRoutedGitRunner(
+        runners_by_repo={REPO_KEY: sandbox_runner},
+        repo_paths={REPO_KEY: str(repo)},
+        default=WorktreeGitRunner(worktrees_root=tmp_path / "must-not-be-used"),
+    )
+    try:
+        _queue(store)
+        h = _make_driver(
+            store,
+            git_runner=routed,
+            git_runner_for_repo=routed.runner_for,
+            repo_path=str(repo),
+            spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+            plan_result_factory=_plan_result_native_versions,
+        )
+        await h.driver.drive(CID)
+    finally:
+        shutdown()
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+    # Not one oracle ran in the forge container.
+    counters = h.ctx["counters"]
+    assert counters["normalize"] == 0
+    assert counters["validate"] == 0
+    assert counters["pass_bar_validate"] == 0
+    assert counters["gate_registry_validate"] == 0
+
+    # Every one of them ran in the sandbox instead.
+    assert len(normalizer_calls(fake_guardkit)) == 1
+    assert len(normalize_calls(fake_guardkit)) == 1
+    assert len(validate_calls(fake_guardkit)) == 1
+    assert qa_validate_calls(fake_guardkit, "pass-bar") == [
+        ["qa", "validate", "pass-bar", f"qa/pass-bar-TASK-VER-00{n}.yaml"]
+        for n in (1, 2, 3)
+    ]
+    assert len(qa_validate_calls(fake_guardkit, "gate-registry")) == 1
+
+    # And the four legs' artefacts are all on the planning branch.
+    branch = f"planning/{CID}"
+    feature_id = _leg_details(store, "feature-plan")["feature_id"]
+    assert git_show(repo, branch, "features/version-endpoint/version-endpoint.feature")
+    assert git_show(repo, branch, _plan_yaml_rel(feature_id))
+    assert git_show(repo, branch, "qa/pass-bar-TASK-VER-001.yaml")
+    assert git_show(repo, branch, "qa/gates/version_endpoint_gate.py")
+    assert _error_cards(h) == []

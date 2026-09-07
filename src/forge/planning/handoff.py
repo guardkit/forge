@@ -152,7 +152,11 @@ PreCommitHook = Callable[[Path], Awaitable[PreCommitResult]]
 # always used, so what a refusal means does not change.
 # ---------------------------------------------------------------------------
 
-#: The checks a sandbox git runner knows how to run, by name:
+#: The checks a sandbox git runner knows how to run, by name. Between them
+#: they are every check the planning chain's four writing legs run before a
+#: commit — the plan leg's two, the spec leg's two, the pass-bar leg's one
+#: (declared once per bar) and the feature-gate leg's one — so every leg can
+#: declare instead of handing over a Python function (rule 87, 2026-09-07):
 #:
 #: * ``normalize-stamps``    — ``guardkit qa normalize-stamps --feature <id>
 #:   --repo <worktree> [--no-model]``; args ``feature_id`` and ``no_model``.
@@ -162,10 +166,22 @@ PreCommitHook = Callable[[Path], Awaitable[PreCommitResult]]
 #:   args ``feature_id``. Blocks on a non-zero exit.
 #: * ``classify-scenarios``  — ``guardkit qa classify-scenarios --feature-file
 #:   <path> --repo <worktree> --json``; args ``feature_file``. Never blocks.
+#: * ``normalize-feature``   — the gherkin normalizer the spec leg runs over
+#:   the committed ``.feature`` (``python -m <the normalizer module>
+#:   <worktree>/<path>``, resolved the way
+#:   :func:`~forge.planning.target_terminal_tools.resolve_normalizer_command`
+#:   resolves it); args ``feature_file``. Blocks on a non-zero exit.
+#: * ``validate-pass-bar``   — ``guardkit qa validate pass-bar <path>``; args
+#:   ``bar_file``, declared once per minted bar. Blocks on a non-zero exit.
+#: * ``validate-gate-registry`` — ``guardkit qa validate gate-registry
+#:   <path>``; args ``registry_file``. Blocks on a non-zero exit.
 PRE_COMMIT_CHECK_NAMES: tuple[str, ...] = (
     "normalize-stamps",
     "feature-validate",
     "classify-scenarios",
+    "normalize-feature",
+    "validate-pass-bar",
+    "validate-gate-registry",
 )
 
 

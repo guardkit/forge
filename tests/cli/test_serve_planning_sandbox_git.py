@@ -94,6 +94,26 @@ def test_a_repository_with_a_sandbox_gets_that_sandboxs_sidecar() -> None:
     assert resolver(OTHER) is runner.default
 
 
+def test_the_boot_log_no_longer_says_some_legs_are_not_declared(caplog) -> None:
+    """Rule 87 landed: every planning leg declares its checks, so the boot no
+    longer warns that giving a repository a sandbox would stop its spec leg.
+    It says plainly where the checks run instead."""
+    import logging
+
+    planning = _config(sandboxes={REPO: SANDBOX}).planning
+    with caplog.at_level(logging.INFO, logger="forge.cli._serve_planning"):
+        compose_planning_git_runner(planning)
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "api-test" in said and "http://127.0.0.1:8225" in said
+    assert "every planning leg's checks run there" in said
+    for stale in (
+        "Only the plan leg's checks are declared",
+        "hand a Python function",
+        "only once those legs are moved",
+    ):
+        assert stale not in said
+
+
 def test_the_calls_of_a_repository_without_a_sandbox_never_leave_the_container() -> None:
     """Routing is by the repository's own path, so a leg that writes for the
     unsandboxed repository reaches the in-container runner untouched."""
