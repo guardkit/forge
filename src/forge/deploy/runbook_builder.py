@@ -115,6 +115,7 @@ def build_deploy_runbook(
     now: datetime,
     compose_extra_env: dict[str, str] | None = None,
     check_extra_env: dict[str, str] | None = None,
+    cwd_override: str | None = None,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -134,6 +135,15 @@ def build_deploy_runbook(
         check_extra_env: Same, for the ``health_check`` step — the candidate.env
             overlay so the candidate-leg checks hit the ``-cand`` port. ``None``
             (direct-live + promote leg's "no overlay" health check) ⇒ unchanged.
+        cwd_override: Protect-main (rule 38): the working directory every step
+            of THIS runbook runs in, instead of the profile's ``cwd``. The
+            candidate leg passes the feature branch's laid-out tree
+            (``<checkout>/.forge-candidates/<FEAT-id>``), so the repository's
+            own deploy script — found relative to that directory, and
+            anchoring itself to it — builds the candidate from the exact
+            commit the merge will land. The promote leg never passes it: it
+            runs from the checkout and re-tags the image the candidate built.
+            ``None`` ⇒ the profile's ``cwd``, exactly as before.
 
     When the profile carries a ``sandbox`` block, the sandbox's five settings
     (:func:`sandbox_env`) are added underneath both overlays, so the vetted
@@ -143,7 +153,7 @@ def build_deploy_runbook(
     Returns:
         A :class:`Runbook` of typed, ordered, ``pending`` steps.
     """
-    cwd = profile.cwd
+    cwd = cwd_override if cwd_override is not None else profile.cwd
     steps: list[Step] = []
     idx = 0
 

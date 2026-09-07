@@ -8,18 +8,36 @@ same ``(exit_code, output)`` return, same **never-raises** posture — so the
 handlers do not know or care which surface executed the script.
 
 The sidecar resolves the working directory itself (from ``repo`` +
-``planning.target_repo_paths``), so the ``cwd`` the handler passes is ignored
-here; the runner is bound to the target ``repo`` (org/name) at construction. A
+``planning.target_repo_paths``); the runner is bound to the target ``repo``
+(org/name) at construction. The ``cwd`` the handler passes rides along as
+``cwd`` in the request, and the sidecar honours it in exactly one case —
+protect-main (2026-09-07): a candidate tree, an existing directory directly
+under ``<checkout>/.forge-candidates/``, so the candidate leg builds the feature
+branch's own tree. Any other value is ignored there, as it always was. A
 transport or sidecar error is returned as a non-zero exit code with a
 descriptive body — never raised — mirroring the local core's contract.
+
+THE ANSWER MUST SAY WHERE IT RAN. A sidecar running the code from before the
+candidate leg ignores ``cwd`` and runs the profile's script from the checkout:
+the "candidate" would then be main, its checks would pass on main, an unchecked
+branch would merge, and the report would say the branch was checked. That is
+the exact silent defect protect-main exists to stop, so when the working
+directory sent names a candidate tree, the sidecar's answer must carry the
+working directory it actually used (``cwd``) and it must be that tree; an
+answer without it, or naming somewhere else, is returned as a non-zero exit
+with a plain sentence, and the candidate leg stops before anything merges.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +52,8 @@ class SidecarScriptRunner:
 
     Bound to one ``repo`` (org/name) and the sidecar ``base_url``. Each call maps
     the handler's ``(cwd, script, env_file, timeout, extra_env)`` to the sidecar
-    ``/run`` contract ``{repo, script, env, timeout_seconds}`` and unpacks the
-    ``{exit_code, output_tail}`` response.
+    ``/run`` contract ``{repo, script, env, timeout_seconds, cwd}`` and unpacks
+    the ``{exit_code, output_tail}`` response.
     """
 
     def __init__(self, *, base_url: str, repo: str, http_timeout_margin: float = 30.0):
@@ -48,7 +66,7 @@ class SidecarScriptRunner:
     def __call__(
         self,
         *,
-        cwd: str,  # noqa: ARG002 — the sidecar resolves cwd from repo itself
+        cwd: str,
         script: str,
         env_file: str | None,
         timeout: float = 600.0,
@@ -58,12 +76,16 @@ class SidecarScriptRunner:
         env: dict[str, str] = dict(extra_env or {})
         if env_file is not None:
             env["ENV_FILE"] = env_file
-        body = {
+        body: dict[str, object] = {
             "repo": self._repo,
             "script": script,
             "env": env,
             "timeout_seconds": timeout,
         }
+        if isinstance(cwd, str) and cwd.strip():
+            # The sidecar decides: a candidate tree is honoured, anything else
+            # is ignored in favour of the profile's own working directory.
+            body["cwd"] = cwd
         data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base_url}/run",
@@ -110,6 +132,10 @@ class SidecarScriptRunner:
                 SIDECAR_TRANSPORT_EXIT_CODE,
                 f"sidecar returned a non-integer exit_code: {exit_code!r}",
             )
+        not_honoured = candidate_tree_not_honoured(cwd, parsed)
+        if not_honoured is not None:
+            logger.error("sidecar script runner: %s", not_honoured)
+            return (SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
         return (exit_code, output if isinstance(output, str) else str(output))
 
     @staticmethod
@@ -123,4 +149,54 @@ class SidecarScriptRunner:
             return exc.reason if isinstance(exc.reason, str) else "unknown"
 
 
-__all__ = ["SidecarScriptRunner", "SIDECAR_TRANSPORT_EXIT_CODE"]
+def names_a_candidate_tree(cwd: object) -> bool:
+    """Does this working directory lie under a ``.forge-candidates`` directory?"""
+    if not isinstance(cwd, str) or not cwd.strip():
+        return False
+    return CANDIDATE_TREES_DIRNAME in Path(cwd).parts
+
+
+def _same_directory(sent: str, answered: str) -> bool:
+    """The same place, spelled either way: as sent, or fully resolved."""
+    if os.path.normpath(sent) == os.path.normpath(answered):
+        return True
+    try:
+        return Path(sent).resolve() == Path(answered).resolve()
+    except OSError:
+        return False
+
+
+def candidate_tree_not_honoured(sent_cwd: object, answer: dict[str, object]) -> str | None:
+    """The plain sentence when a candidate tree was sent and the answer did not run there.
+
+    ``None`` when the working directory sent is not a candidate tree (the
+    sidecar ignores it, as it always did) or when the answer names that tree.
+    Otherwise the sentence that becomes the step's failure: the deploy sidecar
+    on the host is running old code (no ``cwd`` in its answer) or a different
+    checkout path (a different ``cwd``), and the candidate was not checked.
+    """
+    if not names_a_candidate_tree(sent_cwd):
+        return None
+    sent = str(sent_cwd)
+    answered = answer.get("cwd")
+    if not isinstance(answered, str) or not answered.strip():
+        return (
+            f"the deploy sidecar did not run in the candidate tree {sent} — "
+            "it did not say where it ran, so it is running old code from before "
+            "the candidate check; the candidate was not checked"
+        )
+    if _same_directory(sent, answered):
+        return None
+    return (
+        f"the deploy sidecar did not run in the candidate tree {sent} — "
+        f"it ran in {answered}, so it is running a different checkout path; "
+        "the candidate was not checked"
+    )
+
+
+__all__ = [
+    "SidecarScriptRunner",
+    "SIDECAR_TRANSPORT_EXIT_CODE",
+    "candidate_tree_not_honoured",
+    "names_a_candidate_tree",
+]

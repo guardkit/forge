@@ -45,12 +45,53 @@ Irreversible-edge escalation reuses the EXISTING approval-gate machinery
 emits an ``awaiting_approval`` outcome, which the executor already routes to the
 same phone-approval loop (`gate_check`/`maybe_gate_build`). The runner surfaces
 that escalation as a non-failed, non-complete pause.
+
+PROTECT MAIN (the rewrite-on-refusal spec, Part J, 2026-09-07, rule 39): the
+stage is two callable legs so the merge word can put the merge BETWEEN them —
+
+* :meth:`DeployStageRunner.candidate_check` — the candidate up, healthy and
+  through the live gate. On a pass the candidate is LEFT STANDING (its image
+  is what the promote re-tags); on a fail it is torn down. It accepts a
+  working directory for the candidate (the feature branch's laid-out tree,
+  rule 38), so the candidate is built from the exact commit the merge will
+  land, never from the checkout's main.
+* :meth:`DeployStageRunner.promote` — ``PROMOTE=1`` (a re-tag, never a
+  rebuild), the live gate on the live name, the O-32 revert if that fails, and
+  the candidate torn down.
+* :meth:`DeployStageRunner.candidate_down` — the teardown on its own, for a
+  run that stops between the two legs (a refused merge after a green check).
+
+:meth:`DeployStageRunner.run_deploy` — today's one-call shape — is the two
+legs in a row and is kept for the attended ``forge deploy`` command and every
+existing caller; its events, runbooks and results are what they were.
+
+THE CANDIDATE'S GATE RUNS IN THE CANDIDATE'S TREE (coach finding on the lane,
+2026-09-07). The compose and health steps already run in the laid-out tree;
+the live gate did not — the driver ran in the checkout, at main, and checked
+the branch's build against main's gate registry and main's Hurl twins, when
+the per-feature gate is registered ON the branch and only reaches main with
+the merge. Now the candidate leg hands the same working directory to
+:meth:`DeployStageRunner._run_live_gate`, which moves the invoker into the
+tree (``with_repo_path``) before it overlays the candidate's addresses
+(``with_extra_env``). The promote leg and a plain deploy pass no directory,
+so their gate runs in the checkout exactly as before.
+
+Where the candidate gate's evidence goes: the driver writes it under the
+tree's ``qa/gates/evidence/`` and ``qa/gates/history/``, and it is removed
+with the tree when the run ends. It stays there on purpose — the merge that
+follows a green check refuses a dirty checkout, and the tree is the one
+place under the checkout that is excluded from that check. What a person or
+a repair needs leaves the tree before the teardown: the verdict, the number
+of checks, the number passed and the failing checks' names ride the gate
+step's own result in the runbook record, the candidate summary this leg
+returns, the executor's receipt and the merge report — all read from the
+candidate run, none from the tree.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -75,7 +116,11 @@ from forge.deploy.deploy_record import (
     DeployRecord,
     write_deploy_record,
 )
-from forge.deploy.live_gate import BrokerInspector, LiveGateInvoker
+from forge.deploy.live_gate import (
+    BrokerInspector,
+    LiveGateInvoker,
+    RefusingLiveGateInvoker,
+)
 from forge.deploy.profile import DeployProfile
 from forge.deploy.reservation import (
     ReservationError,
@@ -98,7 +143,7 @@ from forge.persistence.repositories.runbook_models import Runbook
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DeployStageRunner", "DeployStageResult"]
+__all__ = ["DeployStageRunner", "DeployStageResult", "gate_summary"]
 
 
 def _utcnow() -> datetime:
@@ -136,6 +181,78 @@ class DeployStageResult:
     live_gate_runbook_id: str | None = None
     dry_run: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveGateRun:
+    """What one run of the live gate said, as the stage reads it back.
+
+    ``verdict`` is None when the gate produced no verdict at all (an
+    instrument problem). ``gate_ids`` names every check that ran;
+    ``assertions`` carries each check's own results when the invoker reports
+    them, so the stage can say which checks failed by name.
+    ``evidence_index_ref`` is the evidence index the driver reported, as the
+    driver wrote it (relative to the directory the gate ran in); empty when
+    it reported none.
+    """
+
+    verdict: str | None
+    runbook_id: str
+    failing_verdict_ref: str | None
+    gate_ids: tuple[str, ...] = ()
+    assertions: tuple[dict[str, Any], ...] = ()
+    evidence_index_ref: str = ""
+
+
+def gate_summary(
+    *,
+    verdict: str | None,
+    gate_ids: tuple[str, ...] | list[str],
+    assertions: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    live_gate_runbook_id: str | None = None,
+) -> dict[str, Any]:
+    """The candidate check in numbers and names: how many checks, how many
+    passed, and which failed.
+
+    Counts are read from the per-check results when the invoker reported
+    them; a verdict of pass with no per-check results counts every check as
+    passed; a verdict that is not pass with no per-check results leaves the
+    count and the names unknown (None) rather than guessing — the sentence a
+    person reads then says the failing checks were not reported.
+    """
+    names = [str(g) for g in gate_ids if str(g).strip()]
+    per_gate: dict[str, bool] = {}
+    for entry in assertions:
+        if not isinstance(entry, dict):
+            continue
+        gate = str(entry.get("gate_id") or "").strip()
+        if not gate:
+            continue
+        status = str(entry.get("status") or "").strip().lower()
+        per_gate[gate] = per_gate.get(gate, True) and status == "pass"
+    if not names:
+        names = list(per_gate)
+    total: int | None = len(names) if names else None
+    failed: list[str] | None
+    passed: int | None
+    if per_gate:
+        failed = [n for n in names if per_gate.get(n) is False]
+        if verdict != "pass" and not failed:
+            failed, passed = None, None
+        else:
+            passed = (total - len(failed)) if total is not None else None
+    elif verdict == "pass" and total is not None:
+        failed, passed = [], total
+    else:
+        failed, passed = None, None
+    return {
+        "verdict": verdict,
+        "checks_total": total,
+        "checks_passed": passed,
+        "failed_checks": failed,
+        "gate_ids": names,
+        "live_gate_runbook_id": live_gate_runbook_id,
+    }
 
 
 class DeployStageRunner:
@@ -252,26 +369,96 @@ class DeployStageRunner:
         deploy_profile_ref: str | None = None,
         deployer: str | None = None,
     ) -> DeployStageResult:
-        """Run the DEPLOY (+ optional LIVE_GATE) stage for ``profile``.
+        """Run the DEPLOY (+ optional LIVE_GATE) stage for ``profile`` in one call.
 
-        Returns a :class:`DeployStageResult`. Never raises past its boundary —
-        a reservation or step failure is recorded and published as an honest
+        The two legs in a row: :meth:`candidate_check` when the profile has a
+        candidate section (a candidate that fails is torn down and the run
+        ends here — the live name is never touched), then :meth:`promote`.
+        Without a candidate section this is the direct-live flow. Returns a
+        :class:`DeployStageResult`. Never raises past its boundary — a
+        reservation or step failure is recorded and published as an honest
         DeployFailed, never a silent success.
+        """
+        prior_events: tuple[str, ...] = ()
+        if profile.candidate is not None:
+            checked = await self.candidate_check(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feature=feature,
+                feat_id=feat_id,
+                task_id=task_id,
+                deploy_profile_ref=deploy_profile_ref,
+            )
+            if checked.outcome != "complete":
+                return checked
+            prior_events = checked.events
+        return await self.promote(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            feature=feature,
+            feat_id=feat_id,
+            task_id=task_id,
+            deploy_profile_ref=deploy_profile_ref,
+            deployer=deployer,
+            prior_events=prior_events,
+        )
+
+    async def candidate_check(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feature: str | None = None,
+        feat_id: str | None = None,
+        task_id: str | None = None,
+        deploy_profile_ref: str | None = None,
+        candidate_cwd: str | None = None,
+    ) -> DeployStageResult:
+        """Leg one: the candidate up, healthy, and through the live gate.
+
+        ``candidate_cwd`` is the working directory the candidate's steps run
+        in — the feature branch's laid-out tree (protect-main, rule 38) — so
+        the repository's own deploy script, found relative to it, builds that
+        tree. ``None`` runs from the profile's ``cwd`` as before.
+
+        Returns ``outcome="complete"`` with ``verdict="pass"`` and the
+        candidate LEFT STANDING (the promote re-tags its image), and
+        ``detail["gate_summary"]`` saying how many checks ran and passed.
+        Returns ``outcome="failed"`` when the candidate could not start or
+        its gate did not pass — the candidate is then torn down and the live
+        name was never touched — or when the profile has no candidate
+        section at all (``detail["reason"] == "no_candidate_section"``).
         """
         events: list[str] = []
         profile_ref = deploy_profile_ref or profile.source_ref
-        deployer = deployer or deploy_run_id
-        reservation_resource = profile.reservation_resource
-        handle: ReservationHandle | None = None
+        if profile.candidate is None:
+            result = await self._fail_before_start(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feat_id=feat_id,
+                task_id=task_id,
+                profile_ref=profile_ref,
+                failed_step="candidate",
+                failure_reason=(
+                    "the deploy profile has no candidate section, so a "
+                    "candidate cannot be checked before the merge"
+                ),
+                events=events,
+            )
+            return replace(result, detail={"reason": "no_candidate_section"})
 
-        # --- reservation.acquire -------------------------------------------
+        handle: ReservationHandle | None = None
+        reservation_resource = profile.reservation_resource
         if reservation_resource is not None:
             try:
                 handle = self._reservation.acquire(
                     reservation_resource, holder=correlation_id
                 )
             except ReservationError as exc:
-                # Loud, honest failure — never proceed unprotected.
                 return await self._fail_before_start(
                     profile,
                     correlation_id=correlation_id,
@@ -283,54 +470,160 @@ class DeployStageRunner:
                     failure_reason=str(exc),
                     events=events,
                 )
-
         try:
-            # --- DeployQueued / DeployStarted ------------------------------
-            queued_at = self._clock()
-            await self._safe_publish(
-                self._deploy_publisher.publish_deploy_queued,
-                DeployQueuedPayload(
-                    correlation_id=correlation_id,
-                    env_id=profile.env_id,
-                    deploy_run_id=deploy_run_id,
-                    feat_id=feat_id,
-                    task_id=task_id,
-                    target_repo=None,
-                    deploy_profile_ref=profile_ref,
-                    hosts=profile.host_names or None,
-                    reservation_resource=reservation_resource,
-                    queued_at=queued_at,
-                ),
+            await self._publish_queued(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feat_id=feat_id,
+                task_id=task_id,
+                profile_ref=profile_ref,
+                events=events,
             )
-            events.append("DeployQueued")
+            terminal, summary = await self._run_candidate_leg(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                feature=feature or (feat_id or profile.env_id),
+                feat_id=feat_id,
+                task_id=task_id,
+                profile_ref=profile_ref,
+                events=events,
+                candidate_cwd=candidate_cwd,
+            )
+            if terminal is not None:
+                return replace(
+                    terminal,
+                    detail={**terminal.detail, "gate_summary": summary},
+                )
+            return DeployStageResult(
+                outcome="complete",
+                deploy_run_id=deploy_run_id,
+                verdict=summary.get("verdict"),
+                events=tuple(events),
+                deploy_runbook_id=f"deploy-cand-{deploy_run_id}",
+                live_gate_runbook_id=summary.get("live_gate_runbook_id"),
+                dry_run=self._dry_run,
+                detail={"gate_summary": summary, "candidate": "standing"},
+            )
+        finally:
+            if handle is not None:
+                self._reservation.release(handle)
 
-            # --- [candidate leg] optional candidate-then-promote gate ------
-            # When the profile carries a candidate section, stand the build up
-            # under a separate ``-cand`` project and gate it FIRST. A candidate
-            # that fails its gate is torn down and the run ends here — the LIVE
-            # name is never touched, no DeployStarted, no revert. Only a PASS
-            # falls through to the live (promote) leg below. Absent candidate
-            # section ⇒ this is skipped ⇒ byte-identical to the direct-live flow.
-            promote_extra_env: dict[str, str] | None = None
-            if profile.candidate is not None:
-                candidate_terminal = await self._run_candidate_leg(
+    async def candidate_down(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+    ) -> DeployStageResult:
+        """Tear the standing candidate down on its own — for a run that stops
+        between the two legs. Never raises; ``outcome="failed"`` with
+        ``failed_step="candidate_down"`` when the teardown did not complete."""
+        if profile.candidate is None:
+            return DeployStageResult(
+                outcome="complete",
+                deploy_run_id=deploy_run_id,
+                dry_run=self._dry_run,
+                detail={"reason": "no_candidate_section", "candidate": "absent"},
+            )
+        torn_down = await self._teardown_candidate(
+            profile, correlation_id=correlation_id, deploy_run_id=deploy_run_id
+        )
+        return DeployStageResult(
+            outcome="complete" if torn_down else "failed",
+            deploy_run_id=deploy_run_id,
+            failed_step=None if torn_down else "candidate_down",
+            dry_run=self._dry_run,
+            detail={"candidate": "torn-down" if torn_down else "standing"},
+        )
+
+    async def promote(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feature: str | None = None,
+        feat_id: str | None = None,
+        task_id: str | None = None,
+        deploy_profile_ref: str | None = None,
+        deployer: str | None = None,
+        prior_events: tuple[str, ...] = (),
+    ) -> DeployStageResult:
+        """Leg two: the live name comes up on the image the candidate built.
+
+        With a candidate section the deploy runs ``PROMOTE=1`` — the
+        repository's script re-tags the candidate image as the live image and
+        brings the live project up without rebuilding — then the candidate is
+        torn down (unless the profile asks to keep it), the live gate runs on
+        the live name, and a verdict that is not pass rolls back (O-32).
+        Without a candidate section this is the direct-live deploy.
+
+        ``prior_events`` are the events the candidate leg already published
+        for this run; DeployQueued is published here only when it is not
+        among them, so one run is queued once. The result's ``detail``
+        carries ``candidate``: ``"torn-down"``, ``"kept"``, ``"standing"``
+        (the promote stopped before the teardown) or ``"absent"``.
+        """
+        events: list[str] = list(prior_events)
+        profile_ref = deploy_profile_ref or profile.source_ref
+        deployer = deployer or deploy_run_id
+        reservation_resource = profile.reservation_resource
+        handle: ReservationHandle | None = None
+        candidate_word = "absent" if profile.candidate is None else "standing"
+
+        def _with_candidate(result: DeployStageResult) -> DeployStageResult:
+            return replace(result, detail={**result.detail, "candidate": candidate_word})
+
+        # --- reservation.acquire -------------------------------------------
+        if reservation_resource is not None:
+            try:
+                handle = self._reservation.acquire(
+                    reservation_resource, holder=correlation_id
+                )
+            except ReservationError as exc:
+                # Loud, honest failure — never proceed unprotected. A standing
+                # candidate is not left behind by a promote that never began.
+                if profile.candidate is not None:
+                    torn = await self._teardown_candidate(
+                        profile,
+                        correlation_id=correlation_id,
+                        deploy_run_id=deploy_run_id,
+                    )
+                    candidate_word = "torn-down" if torn else "standing"
+                failed = await self._fail_before_start(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
-                    feature=feature or (feat_id or profile.env_id),
+                    feat_id=feat_id,
+                    task_id=task_id,
+                    profile_ref=profile_ref,
+                    failed_step="reservation",
+                    failure_reason=str(exc),
+                    events=events,
+                )
+                return _with_candidate(failed)
+
+        try:
+            if "DeployQueued" not in events:
+                await self._publish_queued(
+                    profile,
+                    correlation_id=correlation_id,
+                    deploy_run_id=deploy_run_id,
                     feat_id=feat_id,
                     task_id=task_id,
                     profile_ref=profile_ref,
                     events=events,
                 )
-                if candidate_terminal is not None:
-                    return candidate_terminal
-                # Candidate PASSED — the live leg re-tags-and-promotes the
-                # candidate-built image (PROMOTE=1, no overlay: promote must NOT
-                # rebuild — it re-tags + brings the live project up --no-build,
-                # snapshotting the previous live image as the rollback tag).
-                promote_extra_env = {"PROMOTE": "1"}
 
+            # With a candidate section the live leg re-tags-and-promotes the
+            # candidate-built image (PROMOTE=1, no overlay: promote must NOT
+            # rebuild — it re-tags + brings the live project up --no-build,
+            # snapshotting the previous live image as the rollback tag).
+            promote_extra_env: dict[str, str] | None = (
+                {"PROMOTE": "1"} if profile.candidate is not None else None
+            )
             deploy_runbook = build_deploy_runbook(
                 profile,
                 runbook_id=f"deploy-{deploy_run_id}",
@@ -362,17 +655,19 @@ class DeployStageRunner:
             )
 
             if run_result.status != "complete":
-                return await self._on_deploy_not_complete(
-                    profile,
-                    run_result=run_result,
-                    executed=executed,
-                    correlation_id=correlation_id,
-                    deploy_run_id=deploy_run_id,
-                    feat_id=feat_id,
-                    task_id=task_id,
-                    profile_ref=profile_ref,
-                    deployer=deployer,
-                    events=events,
+                return _with_candidate(
+                    await self._on_deploy_not_complete(
+                        profile,
+                        run_result=run_result,
+                        executed=executed,
+                        correlation_id=correlation_id,
+                        deploy_run_id=deploy_run_id,
+                        feat_id=feat_id,
+                        task_id=task_id,
+                        profile_ref=profile_ref,
+                        deployer=deployer,
+                        events=events,
+                    )
                 )
 
             # --- F7 deploy record + DeployComplete -------------------------
@@ -411,23 +706,23 @@ class DeployStageRunner:
             # profile asked to keep it up for manual poking. Best-effort: a
             # leftover candidate is not a live-deploy failure, so a teardown
             # hiccup is logged, never fails the (already-live) deploy.
-            if profile.candidate is not None and not profile.candidate.keep:
-                await self._teardown_candidate(
-                    profile,
-                    correlation_id=correlation_id,
-                    deploy_run_id=deploy_run_id,
-                )
+            if profile.candidate is not None:
+                if profile.candidate.keep:
+                    candidate_word = "kept"
+                else:
+                    torn = await self._teardown_candidate(
+                        profile,
+                        correlation_id=correlation_id,
+                        deploy_run_id=deploy_run_id,
+                    )
+                    candidate_word = "torn-down" if torn else "standing"
 
             # --- LIVE_GATE (optional) --------------------------------------
             verdict: str | None = None
             live_gate_runbook_id: str | None = None
             failing_verdict_ref: str | None = None
             if self._config.run_live_gate:
-                (
-                    verdict,
-                    live_gate_runbook_id,
-                    failing_verdict_ref,
-                ) = await self._run_live_gate(
+                gate = await self._run_live_gate(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
@@ -436,6 +731,9 @@ class DeployStageRunner:
                     task_id=task_id,
                     events=events,
                 )
+                verdict = gate.verdict
+                live_gate_runbook_id = gate.runbook_id
+                failing_verdict_ref = gate.failing_verdict_ref
 
             # --- [O-32] revert-on-gate-fail --------------------------------
             # A live-gate verdict that is not "pass" means the current build is
@@ -461,19 +759,21 @@ class DeployStageRunner:
                     failing_verdict_ref=failing_verdict_ref,
                     deploy_run_id=deploy_run_id,
                 )
-                return await self._run_revert(
-                    profile,
-                    correlation_id=correlation_id,
-                    deploy_run_id=deploy_run_id,
-                    feat_id=feat_id,
-                    task_id=task_id,
-                    profile_ref=profile_ref,
-                    deployer=deployer,
-                    failing_verdict=verdict if verdict is not None else "instrument_fail",
-                    failing_verdict_ref=failing_verdict_ref,
-                    deploy_runbook_id=deploy_runbook.runbook_id,
-                    live_gate_runbook_id=live_gate_runbook_id,
-                    events=events,
+                return _with_candidate(
+                    await self._run_revert(
+                        profile,
+                        correlation_id=correlation_id,
+                        deploy_run_id=deploy_run_id,
+                        feat_id=feat_id,
+                        task_id=task_id,
+                        profile_ref=profile_ref,
+                        deployer=deployer,
+                        failing_verdict=verdict if verdict is not None else "instrument_fail",
+                        failing_verdict_ref=failing_verdict_ref,
+                        deploy_runbook_id=deploy_runbook.runbook_id,
+                        live_gate_runbook_id=live_gate_runbook_id,
+                        events=events,
+                    )
                 )
 
             return DeployStageResult(
@@ -485,6 +785,7 @@ class DeployStageRunner:
                 deploy_runbook_id=deploy_runbook.runbook_id,
                 live_gate_runbook_id=live_gate_runbook_id,
                 dry_run=self._dry_run,
+                detail={"candidate": candidate_word},
             )
         finally:
             if handle is not None:
@@ -493,6 +794,35 @@ class DeployStageRunner:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _publish_queued(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feat_id: str | None,
+        task_id: str | None,
+        profile_ref: str | None,
+        events: list[str],
+    ) -> None:
+        """DeployQueued — once per deploy run, whichever leg comes first."""
+        await self._safe_publish(
+            self._deploy_publisher.publish_deploy_queued,
+            DeployQueuedPayload(
+                correlation_id=correlation_id,
+                env_id=profile.env_id,
+                deploy_run_id=deploy_run_id,
+                feat_id=feat_id,
+                task_id=task_id,
+                target_repo=None,
+                deploy_profile_ref=profile_ref,
+                hosts=profile.host_names or None,
+                reservation_resource=profile.reservation_resource,
+                queued_at=self._clock(),
+            ),
+        )
+        events.append("DeployQueued")
 
     async def _run_runbook(
         self,
@@ -586,12 +916,14 @@ class DeployStageRunner:
         runbook_id: str | None = None,
         driver_env_overlay: dict[str, str] | None = None,
         publish_domain_events: bool = True,
-    ) -> tuple[str | None, str | None, str | None]:
+        driver_cwd_override: str | None = None,
+    ) -> _LiveGateRun:
         """Run the LIVE_GATE runbook and publish QAVerdict + LiveGateResult.
 
-        Returns ``(verdict, live_gate_runbook_id, failing_verdict_ref)`` — the
-        evidence ref (F5 index, falling back to the run id) lets the O-32 revert
-        receipt cite the failing gate.
+        Returns a :class:`_LiveGateRun` — the verdict, the runbook id, the
+        evidence ref (F5 index, falling back to the run id) that lets the O-32
+        revert receipt cite the failing gate, and the checks that ran with
+        their own results, so the candidate leg can say which failed by name.
 
         Candidate-then-promote sequencing (S2F): the candidate-leg call passes a
         ``-cand``-suffixed ``runbook_id``, a ``driver_env_overlay`` (candidate.env,
@@ -600,6 +932,18 @@ class DeployStageRunner:
         so it emits the FMDR runbook step/receipt events (an honest audit trail)
         but NOT the deploy-domain QAVerdict/LiveGateResult, which stay reserved
         for the ONE live deploy. The promote/direct-live leg keeps the defaults.
+
+        ``driver_cwd_override`` (protect-main, rule 38): the directory the
+        gate's driver runs in — the candidate leg passes the feature branch's
+        laid-out tree, so the driver reads that tree's gate registry and Hurl
+        twins and writes its evidence there. The invoker is moved into it
+        (``with_repo_path``) BEFORE the env overlay is applied, since the
+        overlay keeps whatever directory its invoker has. An invoker that
+        cannot be moved does not run the gate at all: the runbook step fails
+        with the reason on record, because a gate that ran in the checkout
+        instead would check main's registry against the branch's build — the
+        defect the candidate check exists to catch. ``None`` (the promote leg,
+        a plain deploy) leaves the invoker where it was composed: the checkout.
         """
         gate_runbook = build_live_gate_runbook(
             profile,
@@ -609,8 +953,30 @@ class DeployStageRunner:
             now=self._clock(),
         )
         invoker_override: LiveGateInvoker | None = None
-        if driver_env_overlay:
-            with_overlay = getattr(self._live_gate_invoker, "with_extra_env", None)
+        if driver_cwd_override is not None:
+            with_cwd = getattr(self._live_gate_invoker, "with_repo_path", None)
+            if callable(with_cwd):
+                invoker_override = with_cwd(driver_cwd_override)
+            else:
+                logger.error(
+                    "live-gate invoker %s cannot be moved into the candidate tree "
+                    "%s (no with_repo_path); the candidate gate is refused rather "
+                    "than run in the checkout",
+                    type(self._live_gate_invoker).__name__,
+                    driver_cwd_override,
+                )
+                invoker_override = RefusingLiveGateInvoker(
+                    f"the live-gate invoker "
+                    f"({type(self._live_gate_invoker).__name__}) cannot run in "
+                    f"the candidate tree {driver_cwd_override}, and a gate run "
+                    "in the checkout would check main's registry, not the "
+                    "branch's"
+                )
+        if driver_env_overlay and not isinstance(
+            invoker_override, RefusingLiveGateInvoker
+        ):
+            base = invoker_override or self._live_gate_invoker
+            with_overlay = getattr(base, "with_extra_env", None)
             if callable(with_overlay):
                 invoker_override = with_overlay(driver_env_overlay)
             else:
@@ -640,7 +1006,9 @@ class DeployStageRunner:
                 "live-gate step did not produce a verdict (run=%s)",
                 run_result.status,
             )
-            return None, gate_runbook.runbook_id, None
+            return _LiveGateRun(
+                verdict=None, runbook_id=gate_runbook.runbook_id, failing_verdict_ref=None
+            )
 
         verdict = str(payload.get("verdict", "environment_fail"))
         assertions = tuple(
@@ -685,7 +1053,16 @@ class DeployStageRunner:
             )
             events.append("LiveGateResult")
         failing_verdict_ref = common["evidence_index_ref"] or common["run_id"]
-        return verdict, gate_runbook.runbook_id, failing_verdict_ref
+        return _LiveGateRun(
+            verdict=verdict,
+            runbook_id=gate_runbook.runbook_id,
+            failing_verdict_ref=failing_verdict_ref,
+            gate_ids=tuple(str(g) for g in payload.get("gate_ids", []) or []),
+            assertions=tuple(
+                a for a in (payload.get("assertions", []) or []) if isinstance(a, dict)
+            ),
+            evidence_index_ref=str(common["evidence_index_ref"]),
+        )
 
     async def _run_candidate_leg(
         self,
@@ -698,20 +1075,36 @@ class DeployStageRunner:
         task_id: str | None,
         profile_ref: str | None,
         events: list[str],
-    ) -> DeployStageResult | None:
-        """Stand the candidate up under ``-cand``, gate it, promote-or-teardown.
+        candidate_cwd: str | None = None,
+    ) -> tuple[DeployStageResult | None, dict[str, Any]]:
+        """Stand the candidate up under ``-cand``, gate it, leave-standing-or-teardown.
 
-        Returns ``None`` when the candidate PASSED (the caller proceeds to the
-        promote leg). Returns a terminal ``DeployStageResult`` (outcome="failed",
-        detail reason ``candidate_failed`` / ``candidate_deploy_failed``) when the
-        candidate deploy or gate failed — in which case the candidate has been
-        torn down and the LIVE name was NEVER touched (no DeployStarted, no
-        revert). Emits the FMDR runbook step/receipt events for its runbooks; the
-        deploy-domain QAVerdict/LiveGateResult stay reserved for the live leg.
+        Returns ``(None, summary)`` when the candidate PASSED — it is left
+        standing for the promote to re-tag, and ``summary`` (see
+        :func:`gate_summary`) says how many checks ran and passed. Returns
+        ``(terminal, summary)`` with a terminal ``DeployStageResult``
+        (outcome="failed", detail reason ``candidate_failed`` /
+        ``candidate_deploy_failed``) when the candidate deploy or gate failed —
+        in which case the candidate has been torn down and the LIVE name was
+        NEVER touched (no DeployStarted, no revert). Emits the FMDR runbook
+        step/receipt events for its runbooks; the deploy-domain
+        QAVerdict/LiveGateResult stay reserved for the live leg.
+
+        ``candidate_cwd`` — protect-main (rule 38): the working directory of
+        every candidate step, the feature branch's laid-out tree; ``None`` is
+        the profile's ``cwd``. The live gate runs there too, so it checks the
+        tree's own registry and twins, and its evidence is written under the
+        tree (``summary["evidence_index_ref"]`` names the index as the driver
+        reported it, relative to that tree). The evidence goes when the tree
+        goes; the verdict, the counts and the failing names are in this
+        summary and in the gate step's runbook record before that.
         """
         assert profile.candidate is not None  # caller-guarded
         cand_env = dict(profile.candidate.env)
         compose_extra = {"CANDIDATE": "1", **cand_env}
+        summary: dict[str, Any] = gate_summary(verdict=None, gate_ids=(), assertions=())
+        summary["candidate_cwd"] = candidate_cwd
+        summary["evidence_index_ref"] = None
 
         # --- candidate deploy (separate -cand project) ---
         cand_runbook = build_deploy_runbook(
@@ -721,6 +1114,7 @@ class DeployStageRunner:
             now=self._clock(),
             compose_extra_env=compose_extra,
             check_extra_env=cand_env,
+            cwd_override=candidate_cwd,
         )
         run_result = await self._run_runbook(cand_runbook, correlation_id)
         executed = self._repo.load_runbook(
@@ -737,7 +1131,8 @@ class DeployStageRunner:
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
             )
-            return await self._candidate_failed_result(
+            summary["failed_step"] = failed_step
+            failed = await self._candidate_failed_result(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
@@ -749,10 +1144,11 @@ class DeployStageRunner:
                 failing_verdict=None,
                 events=events,
             )
+            return failed, summary
 
         # --- candidate live gate (candidate.env overlay, no domain events) ---
         if self._config.run_live_gate:
-            verdict, _, _ = await self._run_live_gate(
+            gate = await self._run_live_gate(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
@@ -763,14 +1159,26 @@ class DeployStageRunner:
                 runbook_id=f"live-gate-cand-{deploy_run_id}",
                 driver_env_overlay=cand_env,
                 publish_domain_events=False,
+                driver_cwd_override=candidate_cwd,
             )
+            verdict = gate.verdict
+            summary = {
+                **summary,
+                **gate_summary(
+                    verdict=verdict,
+                    gate_ids=gate.gate_ids,
+                    assertions=gate.assertions,
+                    live_gate_runbook_id=gate.runbook_id,
+                ),
+                "evidence_index_ref": gate.evidence_index_ref or None,
+            }
             if verdict != "pass":
                 await self._teardown_candidate(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
                 )
-                return await self._candidate_failed_result(
+                failed = await self._candidate_failed_result(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
@@ -782,8 +1190,13 @@ class DeployStageRunner:
                     failing_verdict=verdict if verdict is not None else "instrument_fail",
                     events=events,
                 )
+                return failed, summary
+        else:
+            # No live gate configured: the candidate came up and answered its
+            # health checks, and that is the whole check.
+            summary["verdict"] = "pass"
 
-        return None  # candidate passed → caller promotes
+        return None, summary  # candidate passed → left standing for the promote
 
     async def _teardown_candidate(
         self,
@@ -791,8 +1204,12 @@ class DeployStageRunner:
         *,
         correlation_id: str,
         deploy_run_id: str,
-    ) -> None:
-        """Tear the ``-cand`` compose project down (best-effort, never raises)."""
+    ) -> bool:
+        """Tear the ``-cand`` compose project down (best-effort, never raises).
+
+        True when the teardown runbook completed; False when it did not, or
+        could not be run at all — the ``-cand`` project may then still be up.
+        """
         assert profile.candidate is not None
         teardown_env = {"CANDIDATE_DOWN": "1", **dict(profile.candidate.env)}
         teardown_runbook = build_candidate_teardown_runbook(
@@ -811,8 +1228,11 @@ class DeployStageRunner:
                     profile.env_id,
                     run_result.status,
                 )
+                return False
+            return True
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort
             logger.warning("candidate teardown raised (continuing): %s", exc)
+            return False
 
     async def _candidate_failed_result(
         self,

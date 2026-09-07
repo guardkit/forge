@@ -7,8 +7,9 @@ Public surface
   behaviour: file one ``work_queue`` row of kind ``fix`` for the build that
   just ended badly, and return the row's id (``None`` when nothing was
   filed).
-- :data:`SOURCE_BUILD_FAILED` / :data:`SOURCE_MERGE_REPORT` — the two words
-  a caller names itself with, written down on the row's filing event.
+- :data:`SOURCE_BUILD_FAILED` / :data:`SOURCE_MERGE_REPORT` /
+  :data:`SOURCE_CANDIDATE_REFUSED` — the three words a caller names itself
+  with, written down on the row's filing event.
 - :func:`fix_correlation_id` and
   :func:`source_build_id_from_correlation_id` — the convention that links a
   repair back to the build it repairs, both directions.
@@ -25,6 +26,16 @@ that puts one there. A build that lands FAILED, and a merge whose live
 checks went red afterwards, are the two moments the factory learns something
 is broken; each of them now files a row that says so, in a sentence a person
 can read.
+
+A third moment (protect-main, 2026-09-07): the merge word now checks the
+feature branch in the Docker Sandbox BEFORE the merge, and a branch that
+fails that check is never merged. That refusal files a repair row too — the
+code is still wrong, only now main was never touched — with the sentence the
+spec fixes: "FEAT-X was checked in the sandbox before merging and failed k of
+M checks (the failing check names); nothing was merged and the branch is
+kept." When the check could not run at all (no candidate section, the deploy
+stage switched off) there is no code to fix and the merge executor files
+nothing.
 
 The three rules the producer keeps
 ----------------------------------
@@ -66,6 +77,7 @@ References
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -76,6 +88,10 @@ SOURCE_BUILD_FAILED: str = "build-failed"
 
 #: The merge executor's hook: the merge landed but the live checks went red.
 SOURCE_MERGE_REPORT: str = "merge-report"
+
+#: The merge executor's other hook: the branch failed its sandbox check
+#: BEFORE the merge, so nothing was merged and the branch is kept.
+SOURCE_CANDIDATE_REFUSED: str = "candidate-refused"
 
 #: The prefix every fix row's correlation id carries. The whole idempotence
 #: rule lives in this string plus the table's UNIQUE index.
@@ -174,6 +190,9 @@ def maybe_mint_fix_row(
     detail: str | None = None,
     receipts_root: Any = None,
     clock: Any = None,
+    checks_failed: int | None = None,
+    checks_total: int | None = None,
+    failing_checks: Sequence[str] | None = None,
 ) -> int | None:
     """File one repair row for the build that just ended badly.
 
@@ -192,6 +211,14 @@ def maybe_mint_fix_row(
         receipts_root: Injectable receipts root, for tests. ``None`` uses the
             routine path's own law.
         clock: Injectable clock handed to the queue store, for tests.
+        checks_failed: For :data:`SOURCE_CANDIDATE_REFUSED` — how many of the
+            sandbox checks failed, when that is known.
+        checks_total: For :data:`SOURCE_CANDIDATE_REFUSED` — how many
+            sandbox checks ran, when that is known.
+        failing_checks: For :data:`SOURCE_CANDIDATE_REFUSED` — the names of
+            the checks that failed, when they are known. With all three
+            known the sentence is the spec's own; otherwise ``detail`` says,
+            in plain words, what the check found.
 
     Returns:
         The queue row's id — the ``#12`` a person types — whether this call
@@ -250,6 +277,9 @@ def maybe_mint_fix_row(
                 feature_id=feature_id,
                 target_repo=target_repo,
                 detail=detail,
+                checks_failed=checks_failed,
+                checks_total=checks_total,
+                failing_checks=failing_checks,
             ),
             originating_user=str(getattr(row, "originating_user", None) or "forge"),
             target_repo=str(target_repo) if target_repo else None,
@@ -331,21 +361,63 @@ def _pack_path(build_id: str, *, receipts_root: Any) -> str | None:
     return str(pack.pack_dir) if pack is not None else None
 
 
+def candidate_refused_sentence(
+    feature_id: str,
+    *,
+    checks_failed: int | None = None,
+    checks_total: int | None = None,
+    failing_checks: Sequence[str] | None = None,
+    detail: str | None = None,
+) -> str:
+    """The repair row's line for a branch that failed its sandbox check.
+
+    With the counts and the names known it is the spec's sentence, word for
+    word: "FEAT-X was checked in the sandbox before merging and failed k of M
+    checks (a, b); nothing was merged and the branch is kept." When the check
+    did not get as far as naming what failed, the middle clause is whatever
+    plain words the caller has — "could not be started (the candidate deploy
+    stopped at health_check)" — and the two ends stay the same.
+    """
+    names = [str(n).strip() for n in (failing_checks or []) if str(n).strip()]
+    if checks_failed is not None and checks_total is not None and names:
+        middle = (
+            f"failed {checks_failed} of {checks_total} checks ({', '.join(names)})"
+        )
+    else:
+        middle = _one_line(detail) or "failed its checks"
+    return (
+        f"{feature_id} was checked in the sandbox before merging and {middle}; "
+        "nothing was merged and the branch is kept."
+    )
+
+
 def _sentence(
     *,
     source: str,
     feature_id: str,
     target_repo: Any,
     detail: str | None,
+    checks_failed: int | None = None,
+    checks_total: int | None = None,
+    failing_checks: Sequence[str] | None = None,
 ) -> str:
     """One plain line naming the feature and what went wrong."""
-    where = f" in {target_repo}" if target_repo else ""
-    if source == SOURCE_MERGE_REPORT:
-        opening = f"{feature_id} was merged{where} but the checks after it went red"
+    if source == SOURCE_CANDIDATE_REFUSED:
+        sentence = candidate_refused_sentence(
+            feature_id,
+            checks_failed=checks_failed,
+            checks_total=checks_total,
+            failing_checks=failing_checks,
+            detail=detail,
+        )
     else:
-        opening = f"The build of {feature_id}{where} failed"
-    trimmed = _one_line(detail)
-    sentence = f"{opening}: {trimmed}" if trimmed else f"{opening}."
+        where = f" in {target_repo}" if target_repo else ""
+        if source == SOURCE_MERGE_REPORT:
+            opening = f"{feature_id} was merged{where} but the checks after it went red"
+        else:
+            opening = f"The build of {feature_id}{where} failed"
+        trimmed = _one_line(detail)
+        sentence = f"{opening}: {trimmed}" if trimmed else f"{opening}."
     if len(sentence) > MAX_SENTENCE_CHARS:
         sentence = sentence[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
     return sentence
@@ -365,7 +437,9 @@ __all__ = [
     "MINTED_ACTION",
     "PRODUCER_ACTOR",
     "SOURCE_BUILD_FAILED",
+    "SOURCE_CANDIDATE_REFUSED",
     "SOURCE_MERGE_REPORT",
+    "candidate_refused_sentence",
     "fix_correlation_id",
     "make_failure_pack_source_reader",
     "maybe_mint_fix_row",

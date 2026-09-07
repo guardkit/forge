@@ -12,8 +12,13 @@ named by ``--build-id``), computes expect-main-sha NOW (main may have moved
 since the build — the merge verb refuses if it moves again after this), and
 prints receipt lines.
 
-Exit codes: 0 = merged and running (PASSED); 1 = any other outcome (the
-line printed says plainly which step failed and why).
+The order is the executor's, so it is the same as the card's (protect-main,
+rule 39): the feature branch is checked in the Docker Sandbox FIRST, and only
+if every check passes does the merge land and that exact build get promoted.
+A branch that fails the check is never merged.
+
+Exit codes: 0 = checked, merged and running (PASSED); 1 = any other outcome
+(the line printed says plainly which step failed and why).
 """
 
 from __future__ import annotations
@@ -185,6 +190,15 @@ async def _arun(
         f"merge-deploy {row.feature_id} @ {row.repo}: result={outcome.result} "
         f"status={outcome.status}"
     )
+    gate = outcome.gate_before_merge or {}
+    if gate.get("verdict") is not None:
+        passed, total = gate.get("checks_passed"), gate.get("checks_total")
+        counted = (
+            f" ({passed} of {total} checks passed)"
+            if isinstance(passed, int) and isinstance(total, int)
+            else ""
+        )
+        click.echo(f"  checked in the sandbox before merging: {gate['verdict']}{counted}")
     if outcome.merged_sha:
         click.echo(f"  merged_sha={outcome.merged_sha}")
     if outcome.failed_step:
@@ -222,11 +236,13 @@ def merge_deploy_cmd(
     build_id: str | None,
     dry_run: bool,
 ) -> None:
-    """Merge FEATURE_ID into main, deploy it, and verify it — attended.
+    """Check FEATURE_ID in the sandbox, merge it into main, promote it — attended.
 
     The invocation IS the human word: the same executor the merge card's
-    press runs, fired directly. Exit 0 = merged and running; 1 = anything
-    else (the printed line names the failed step).
+    press runs, fired directly, in the same order — the candidate is checked
+    first and only a passing one is merged and promoted. Exit 0 = checked,
+    merged and running; 1 = anything else (the printed line names the
+    failed step).
     """
     config = ctx.obj if isinstance(ctx.obj, ForgeConfig) else None
     if config is None:
