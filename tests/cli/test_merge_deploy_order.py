@@ -1,0 +1,193 @@
+"""The attended ``forge merge-deploy`` command follows the merge card's order.
+
+Protect-main (Part J, rule 39): the candidate is checked in the sandbox
+FIRST; only if every check passes does the merge land and that exact build
+get promoted. The command drives the same executor as the card press, so it
+cannot keep the old order — this proves it, with the NATS, guardkit and
+deploy seams faked and a real git repository for the branch.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from click.testing import CliRunner
+
+from forge.adapters.sqlite import connect as sqlite_connect
+from forge.cli import merge_deploy as merge_deploy_module
+from forge.cli.merge_deploy import merge_deploy_cmd
+from forge.config.models import ForgeConfig
+from forge.lifecycle import migrations
+from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.pipeline import merge_offer as merge_offer_module
+
+FEATURE_ID = "FEAT-ORD1"
+BUILD_ID = "build-FEAT-ORD1-20260907"
+REPO = "appmilla/api_test"
+
+
+def _git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    )
+    return done.stdout.strip()
+
+
+@pytest.fixture(autouse=True)
+def _receipts_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = tmp_path / "receipts"
+    monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(root))
+    return root
+
+
+@pytest.fixture
+def repo_root(tmp_path: Path) -> Path:
+    root = tmp_path / "api_test"
+    root.mkdir()
+    _git(root, "init", "-b", "main", "-q")
+    (root / "README.md").write_text("first\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "first")
+    _git(root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    (root / "feature.txt").write_text("the feature\n", encoding="utf-8")
+    _git(root, "add", "feature.txt")
+    _git(root, "commit", "-q", "-m", "the feature")
+    _git(root, "checkout", "-q", "main")
+    return root
+
+
+@pytest.fixture
+def pool(tmp_path: Path) -> SqliteLifecyclePersistence:
+    cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "forge.db")
+    migrations.apply_at_boot(cx)
+    pool = SqliteLifecyclePersistence(connection=cx)
+    cx.execute(
+        "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
+        "status, triggered_by, correlation_id, queued_at, mode) VALUES "
+        "(?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, '2026-09-07T00:00:00Z', 'mode-a')",
+        (BUILD_ID, FEATURE_ID, REPO, f"autobuild/{FEATURE_ID}", f"corr-{BUILD_ID}"),
+    )
+    cx.commit()
+    return pool
+
+
+@pytest.fixture
+def config(repo_root: Path) -> ForgeConfig:
+    return ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "approval": {"expected_approver": "rich"},
+        }
+    )
+
+
+class _Publisher:
+    def __init__(self) -> None:
+        self.reports: list[Any] = []
+
+    async def publish_stage_complete(self, payload: Any) -> None:
+        self.reports.append(payload)
+
+
+def _wire(
+    monkeypatch: pytest.MonkeyPatch,
+    pool: SqliteLifecyclePersistence,
+    repo_root: Path,
+    *,
+    candidate_verdict: str = "pass",
+) -> dict[str, Any]:
+    order: list[str] = []
+    publisher = _Publisher()
+    merged = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+
+    async def _guardkit(**kwargs: Any) -> Any:
+        order.append("merge")
+        return SimpleNamespace(
+            status="success",
+            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
+            stderr=None, exit_code=0, artefacts=[],
+        )
+
+    async def _deploy(**kwargs: Any) -> Any:
+        leg = kwargs.get("leg", "deploy")
+        order.append(leg)
+        if leg == "candidate_check":
+            if candidate_verdict == "pass":
+                return SimpleNamespace(
+                    outcome="complete", verdict="pass", failed_step=None,
+                    events=("DeployQueued",),
+                    detail={"gate_summary": {"verdict": "pass", "checks_total": 5,
+                                             "checks_passed": 5, "failed_checks": []},
+                            "candidate": "standing"},
+                )
+            return SimpleNamespace(
+                outcome="failed", verdict="fail", failed_step="candidate_gate",
+                events=("DeployQueued", "DeployFailed"),
+                detail={"reason": "candidate_failed",
+                        "gate_summary": {"verdict": "fail", "checks_total": 5,
+                                         "checks_passed": 4, "failed_checks": ["etag"]}},
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
+        return SimpleNamespace(
+            outcome="complete", verdict="pass", deploy_record_ref="r",
+            detail={"candidate": "torn-down"},
+        )
+
+    async def _backends(_config: ForgeConfig):
+        async def _close() -> None:
+            return None
+
+        return publisher, _guardkit, _deploy, _close
+
+    async def _main_sha(_repo_root: Path) -> str | None:
+        return _git(repo_root, "rev-parse", "main")
+
+    monkeypatch.setattr(merge_deploy_module, "_open_pool", lambda _p: pool)
+    monkeypatch.setattr(merge_deploy_module, "_aopen_backends", _backends)
+    monkeypatch.setattr(merge_offer_module, "git_rev_parse_main", _main_sha)
+    return {"order": order, "publisher": publisher, "merged": merged}
+
+
+def test_the_attended_command_checks_then_merges_then_promotes(
+    config, pool, repo_root, monkeypatch
+) -> None:
+    wired = _wire(monkeypatch, pool, repo_root)
+    result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+    assert result.exit_code == 0, result.output
+    assert wired["order"] == ["candidate_check", "merge", "promote"]
+    assert "result=merged-and-running" in result.output
+    assert "checked in the sandbox before merging: pass (5 of 5 checks passed)" in result.output
+    assert f"merged_sha={wired['merged']}" in result.output
+    report = wired["publisher"].reports[0]
+    assert report.gate_before_merge["verdict"] == "pass"
+    assert report.gate_before_merge["trees_match"] is True
+    # The tree it laid out is gone again.
+    assert not (repo_root / ".forge-candidates" / FEATURE_ID).exists()
+
+
+def test_the_attended_command_never_merges_a_branch_that_failed_its_check(
+    config, pool, repo_root, monkeypatch
+) -> None:
+    wired = _wire(monkeypatch, pool, repo_root, candidate_verdict="fail")
+    result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+    assert result.exit_code == 1
+    assert wired["order"] == ["candidate_check"]
+    assert "result=candidate-refused" in result.output
+    assert "failed_step=candidate" in result.output
+    assert (
+        f"{FEATURE_ID} was checked in the sandbox before merging and failed 1 of 5 "
+        "checks (etag); nothing was merged and the branch is kept."
+    ) in result.output
+    assert "checked in the sandbox before merging: fail (4 of 5 checks passed)" in result.output
+    # main did not move.
+    assert _git(repo_root, "rev-parse", "main") != wired["merged"]

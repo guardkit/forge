@@ -9,17 +9,32 @@ Make-merge-work build spec (2026-08-24). Two halves:
   approver VERBATIM, a matching correlation, and no decision yet on record
   (the durable decision row is written FIRST, so a restart can never
   double-run).
-* :func:`execute_merge_deploy` — the executor coroutine. STEP merge+verify
-  through the frozen guardkit subprocess boundary; STEP deploy mirroring the
-  attended ``forge deploy`` dispatch in-daemon (execution_surface forced to
-  ``sidecar`` — the daemon container has no docker); STEP report as one
-  additive ``pipeline.stage-complete.{feature_id}`` publish. Per-step durable
-  receipts land under ``receipts_root()/merge-<build_id>/`` and a stage row is
-  written BEFORE each irreversible act, probed on restart.
+* :func:`execute_merge_deploy` — the executor coroutine. STEP candidate: the
+  feature branch's tree is laid out inside the checkout and the deploy stage's
+  candidate leg builds it, brings it up in the Docker Sandbox and runs the
+  registered live checks against it; STEP merge+verify through the frozen
+  guardkit subprocess boundary, only if every check passed; STEP tree check:
+  the merged commit's tree must be the tree that was checked; STEP promote:
+  the deploy stage's promote leg re-tags the candidate image as live (never a
+  rebuild) and tears the candidate down; STEP report as one additive
+  ``pipeline.stage-complete.{feature_id}`` publish. Per-step durable receipts
+  land under ``receipts_root()/merge-<build_id>/`` and a stage row is written
+  BEFORE each irreversible act, probed on restart.
+
+PROTECT MAIN (the rewrite-on-refusal spec, Part J, 2026-09-07, on Rich's yes).
+FEAT-8388 and FEAT-39F6 both reached api_test main with a defect the sandbox
+gate found afterwards; the mission says main is the boundary. So the candidate
+check moved in front of the merge. The merge word stays one touch; what
+happens inside it changed order: (1) candidate built from the branch's exact
+tree and checked; (2) merge, pinned to main's commit exactly as before; (3) the
+merge's own post-merge test run; (4) promote the image that was checked;
+(5) candidate torn down. A red check means no merge, no promote: the branch is
+kept, a repair row is filed, and the report says so with the new result word
+``candidate-refused``.
 
 Any refusal, conflict, or verify failure stops the run with nothing
-half-done: the branch is always kept, and the report says plainly which step
-failed and why.
+half-done: the branch is always kept, the candidate is torn down and its tree
+removed on every ending, and the report says plainly which step failed and why.
 
 WHERE THE DEPLOY RAN (2026-09-06 decision): a repository whose deploy profile
 carries a ``sandbox`` block is deployed into its own Docker Sandbox. When it
@@ -44,7 +59,15 @@ from typing import Any, Awaitable, Callable
 from nats_core.events import ApprovalResponsePayload, StageCompletePayload
 from pydantic import ValidationError
 
+from forge.deploy.candidate_tree import (
+    CandidateTreeError,
+    ensure_candidate_trees_excluded,
+    git_rev_parse,
+    materialise_candidate_tree,
+    remove_candidate_tree,
+)
 from forge.lifecycle.persistence import StageLogEntry
+from forge.pipeline.fix_row_producer import candidate_refused_sentence
 from forge.pipeline.merge_offer import (
     MERGE_OFFER_DETAILS_KEY,
     MERGE_OFFER_STAGE_LABEL,
@@ -61,6 +84,7 @@ __all__ = [
     "MERGE_REPORT_STAGE_LABEL",
     "MERGE_REPORT_TARGET_IDENTIFIER",
     "MERGE_RESPONSE_SUBJECT_FILTER",
+    "MERGE_STEP_CANDIDATE_TARGET_IDENTIFIER",
     "MERGE_STEP_DEPLOY_TARGET_IDENTIFIER",
     "MERGE_STEP_MERGE_TARGET_IDENTIFIER",
     "MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS",
@@ -93,6 +117,10 @@ MERGE_DECISION_TARGET_IDENTIFIER: str = "merge_deploy_decision"
 #: Durable per-step claim rows, written BEFORE each irreversible act.
 MERGE_STEP_MERGE_TARGET_IDENTIFIER: str = "merge_deploy_merge"
 MERGE_STEP_DEPLOY_TARGET_IDENTIFIER: str = "merge_deploy_deploy"
+
+#: The candidate check's own row — written when it ran, for the record. It is
+#: not a claim: a check is torn down after itself and may safely run again.
+MERGE_STEP_CANDIDATE_TARGET_IDENTIFIER: str = "merge_deploy_candidate"
 
 #: The outcome report's identity on ``pipeline.stage-complete.{feature_id}``.
 MERGE_REPORT_STAGE_LABEL: str = "merge-deploy"
@@ -152,7 +180,7 @@ def _default_receipts_root() -> Path:
 class MergeDeployOutcome:
     """The executor's one-line truth, mirrored onto the report payload."""
 
-    result: str  # merged-and-running | merged-deploy-reverted | merged-deploy-failed | merge-refused | rejected
+    result: str  # merged-and-running | merged-deploy-reverted | merged-deploy-failed | merged-verify-failed | merge-refused | candidate-refused | rejected
     status: str  # PASSED | FAILED | SKIPPED
     detail: str
     merged_sha: str | None = None
@@ -169,6 +197,11 @@ class MergeDeployOutcome:
     #: they ran and something went red, "unverified" when they could not run at
     #: all. ``None`` for every ending that is not about the checks.
     verify_status: str | None = None
+    #: What the candidate check found BEFORE the merge (protect-main, rule
+    #: 40): ``verdict``, ``checks_passed``, ``checks_total``, ``failed_checks``
+    #: (names), ``candidate_sha``, ``candidate_tree``, ``merged_tree`` and
+    #: ``trees_match``. None when the run stopped before the check began.
+    gate_before_merge: dict[str, Any] | None = None
 
 
 @dataclass
@@ -185,7 +218,12 @@ class MergeExecutorDeps:
         guardkit_run: The frozen subprocess boundary
             (:func:`forge.adapters.guardkit.run.run`); tests fake it.
         deploy_dispatcher: ``async (**kw) -> DeployStageResult | None`` —
-            production binds :func:`build_in_daemon_deploy_dispatcher`.
+            production binds :func:`build_in_daemon_deploy_dispatcher`. The
+            executor calls it once per leg with ``leg`` set to
+            ``"candidate_check"`` (with ``candidate_cwd``, the branch's
+            laid-out tree), ``"promote"`` (with ``prior_events``) or
+            ``"candidate_down"``, plus the shared ``deploy_run_id`` and
+            ``task_id`` so both legs are one deploy run.
         clock: Wall-clock seam.
         receipts_root_fn: Receipts-root seam (env-steered in production).
     """
@@ -338,19 +376,26 @@ def _mint_repair_row(
     *,
     feature_id: str | None = None,
 ) -> None:
-    """File one repair row for a merge whose checks went red. Never raises.
+    """File one repair row for a press that found the code wrong. Never raises.
 
-    A repair is only worth filing when the checks RAN and something came back
-    red — there is code to fix then. When the checks could not run at all, the
-    thing that is broken is the check itself, and no amount of building will
-    mend it; the first real press of a merge card filed exactly such a repair
-    for a failure no code could fix. So that case files nothing and says so in
-    one line instead.
+    Three endings file one: the merge landed and the checks after it went
+    red (the three ``RED_MERGE_ENDINGS``), and — protect-main — the branch
+    failed its sandbox check BEFORE the merge (``candidate-refused``, with
+    the failing checks named). A repair is only worth filing when a check
+    RAN and something came back red — there is code to fix then. When the
+    checks could not run at all, the thing that is broken is the check
+    itself, and no amount of building will mend it; the first real press of
+    a merge card filed exactly such a repair for a failure no code could fix.
+    So that case files nothing and says so in one line instead. The same
+    goes for a promote refused because main had moved under the check (the
+    trees did not match): the remedy is to send the sentence again, not a
+    repair.
 
     The producer already swallows everything; this call site catches too,
     because the merge report is the only durable record of what the merge
     did and a queue row must never be able to cost it.
     """
+    gate = outcome.gate_before_merge or {}
     if outcome.result == "merged-verify-failed" and outcome.verify_status != "failed":
         logger.info(
             "merge-executor: the checks for %s could not run, so no repair was "
@@ -358,12 +403,50 @@ def _mint_repair_row(
             feature_id or build_id,
         )
         return
+    if outcome.result == "candidate-refused" and not gate.get("ran"):
+        logger.info(
+            "merge-executor: the sandbox check for %s could not run, so no "
+            "repair was filed — a person must look at the check itself",
+            feature_id or build_id,
+        )
+        return
+    if (
+        outcome.result == "merged-deploy-failed"
+        and outcome.failed_step == "promote"
+        and gate.get("trees_match") is False
+    ):
+        logger.info(
+            "merge-executor: the promote of %s was refused because main had "
+            "moved under the check, so no repair was filed — the sentence "
+            "must be sent again",
+            feature_id or build_id,
+        )
+        return
     try:
         from forge.pipeline.fix_row_producer import (
+            SOURCE_CANDIDATE_REFUSED,
             SOURCE_MERGE_REPORT,
             maybe_mint_fix_row,
         )
 
+        if outcome.result == "candidate-refused":
+            total = gate.get("checks_total")
+            passed = gate.get("checks_passed")
+            failed_count = (
+                total - passed
+                if isinstance(total, int) and isinstance(passed, int)
+                else None
+            )
+            maybe_mint_fix_row(
+                pool=pool,
+                build_id=build_id,
+                source=SOURCE_CANDIDATE_REFUSED,
+                detail=gate.get("refusal"),
+                checks_failed=failed_count,
+                checks_total=total if isinstance(total, int) else None,
+                failing_checks=gate.get("failed_checks") or None,
+            )
+            return
         maybe_mint_fix_row(
             pool=pool,
             build_id=build_id,
@@ -467,11 +550,26 @@ async def execute_merge_deploy(
     baseline_failing: list[str] | None = None,
     dry_run: bool = False,
 ) -> MergeDeployOutcome:
-    """Run merge -> deploy -> report for one approved (or attended) press.
+    """Run candidate check -> merge -> tree check -> promote -> report for one press.
 
-    Never raises past its boundary: every result class lands as an honest
-    :class:`MergeDeployOutcome`, one additive ``stage-complete`` publish, and
-    per-step JSON receipts under ``receipts_root()/merge-<build_id>/``.
+    The order inside the merge word (protect-main, rule 36):
+
+    1. the candidate is built from the feature branch's exact tree, brought up
+       in the sandbox, and the registered live checks run against it;
+    2. only if every check passed does the merge land — ``guardkit autobuild
+       merge`` pinned to main's commit, exactly as before;
+    3. the merge's own post-merge test run stays;
+    4. the merged commit's tree must be the tree that was checked (rule 37),
+       else the promote is refused and nothing live changes;
+    5. the promote re-tags the candidate image that was checked — never a
+       rebuild — and the candidate is torn down.
+
+    A red check at (1) means no merge and no promote: the candidate is torn
+    down, the branch is kept, the repair row is filed, and the report says so
+    (``candidate-refused``). The candidate's laid-out tree is removed on every
+    ending. Never raises past its boundary: every result class lands as an
+    honest :class:`MergeDeployOutcome`, one additive ``stage-complete``
+    publish, and per-step JSON receipts under ``receipts_root()/merge-<build_id>/``.
     """
     started = deps.clock()
     receipts_dir = deps.receipts_root_fn() / f"merge-{build_id}"
@@ -479,6 +577,28 @@ async def execute_merge_deploy(
     # read by the report step. It can add a warning line; it can never
     # block anything.
     digest_conformance: dict[str, Any] = {}
+    # What the candidate check found — on every report once the check began.
+    # ``ran`` says the deploy stage really drove the check (a repair row is
+    # only worth filing then); ``refusal`` is the middle clause of the
+    # refusal sentence, reused word for word on the repair row.
+    gate: dict[str, Any] = {
+        "verdict": None,
+        "checks_passed": None,
+        "checks_total": None,
+        "failed_checks": None,
+        "candidate_sha": None,
+        "candidate_tree": None,
+        "merged_tree": None,
+        "trees_match": None,
+        "ran": False,
+        "refusal": None,
+    }
+    gate_began = False
+    # One deploy run for both legs, so their runbooks and events belong together.
+    deploy_run_id = str(uuid.uuid4())
+    task_id = _deploy_task_id(feature_id)
+    tree_path: Path | None = None
+    candidate_standing = False
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -513,7 +633,9 @@ async def execute_merge_deploy(
             return False
         return str(rows[-1].status or "").upper() != "SKIPPED"
 
-    def _claim_step(target_identifier: str, details: dict[str, Any]) -> None:
+    def _record_step(
+        target_identifier: str, status: str, details: dict[str, Any]
+    ) -> None:
         now = deps.clock()
         deps.pool.record_stage(
             StageLogEntry(
@@ -521,7 +643,7 @@ async def execute_merge_deploy(
                 stage_label=MERGE_REPORT_STAGE_LABEL,
                 target_kind="local_tool",
                 target_identifier=target_identifier,
-                status="GATED",
+                status=status,
                 gate_mode="MANDATORY_HUMAN_APPROVAL",
                 started_at=now,
                 completed_at=now,
@@ -530,25 +652,18 @@ async def execute_merge_deploy(
             )
         )
 
+    def _claim_step(target_identifier: str, details: dict[str, Any]) -> None:
+        _record_step(target_identifier, "GATED", details)
+
     def _release_step(target_identifier: str, reason: str) -> None:
         """Give a claimed step back: nothing happened, so the build may be
         pressed again. Written as a SKIPPED row carrying the reason, after
         the claim, so the record says both that it was claimed and why it
         was let go."""
-        now = deps.clock()
-        deps.pool.record_stage(
-            StageLogEntry(
-                build_id=build_id,
-                stage_label=MERGE_REPORT_STAGE_LABEL,
-                target_kind="local_tool",
-                target_identifier=target_identifier,
-                status="SKIPPED",
-                gate_mode="MANDATORY_HUMAN_APPROVAL",
-                started_at=now,
-                completed_at=now,
-                duration_secs=0.0,
-                details={"merge_step": {"released": True, "reason": reason}},
-            )
+        _record_step(
+            target_identifier,
+            "SKIPPED",
+            {"merge_step": {"released": True, "reason": reason}},
         )
 
     def _record_report(payload: StageCompletePayload, completed: datetime) -> None:
@@ -589,11 +704,32 @@ async def execute_merge_deploy(
                 exc,
             )
 
+    def _gate_for_report() -> dict[str, Any]:
+        """The ``gate_before_merge`` block: the spec's six fields plus the
+        failing check names and whether the trees matched."""
+        return {
+            key: gate.get(key)
+            for key in (
+                "verdict",
+                "checks_passed",
+                "checks_total",
+                "failed_checks",
+                "candidate_sha",
+                "candidate_tree",
+                "merged_tree",
+                "trees_match",
+                "ran",
+                "refusal",
+            )
+        }
+
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         completed = deps.clock()
         conformance_warning = digest_conformance.get("warning")
         if conformance_warning:
             outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
+        if gate_began and outcome.gate_before_merge is None:
+            outcome.gate_before_merge = _gate_for_report()
         payload = StageCompletePayload(
             feature_id=feature_id,
             build_id=build_id,
@@ -621,6 +757,13 @@ async def execute_merge_deploy(
             # ran nowhere special sends no field at all, so every payload that
             # was written before Docker Sandboxes existed is unchanged.
             **({"deployed_in": outcome.deployed_in} if outcome.deployed_in else {}),
+            # Additive (protect-main, rule 40): what the sandbox check found
+            # before the merge, once the check began.
+            **(
+                {"gate_before_merge": outcome.gate_before_merge}
+                if outcome.gate_before_merge is not None
+                else {}
+            ),
         )
         if dry_run:
             logger.info(
@@ -641,27 +784,156 @@ async def execute_merge_deploy(
             )
         _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
         _record_report(payload, completed)
-        # A MERGE THAT DID NOT STAY GREEN BECOMES A REPAIR JOB (conductor
-        # rewire rule 1). The three red endings below are the ones where the
-        # merge itself landed and what came after it went red — the live
-        # checks, the deploy, or the revert. A refused merge is not one of
-        # them: nothing changed, so there is nothing to repair. The dry run
-        # is not one either: it changed nothing on purpose.
-        if not dry_run and outcome.result in RED_MERGE_ENDINGS:
+        # A PRESS THAT FOUND THE CODE WRONG BECOMES A REPAIR JOB (conductor
+        # rewire rule 1). The three red endings are the ones where the merge
+        # itself landed and what came after it went red — the live checks,
+        # the deploy, or the revert — and, since protect-main, the branch
+        # that failed its sandbox check before the merge. A refused merge is
+        # not one of them: nothing changed, so there is nothing to repair.
+        # The dry run is not one either: it changed nothing on purpose.
+        if not dry_run and (
+            outcome.result in RED_MERGE_ENDINGS or outcome.result == "candidate-refused"
+        ):
             _mint_repair_row(deps.pool, build_id, outcome, feature_id=feature_id)
         return outcome
 
-    # ------------------------------------------------------------------
-    # STEP merge + verify (through the frozen guardkit boundary)
-    # ------------------------------------------------------------------
-    if _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
-        logger.error(
-            "merge-executor: %s already has a merge step on record — refusing "
-            "to run the merge twice",
-            build_id,
+    async def _dispatch(leg: str, **extra: Any) -> Any:
+        return await deps.deploy_dispatcher(
+            repo=repo,
+            repo_root=repo_root,
+            feature_id=feature_id,
+            build_id=build_id,
+            correlation_id=correlation_id,
+            decided_by=decided_by,
+            dry_run=dry_run,
+            leg=leg,
+            deploy_run_id=deploy_run_id,
+            task_id=task_id,
+            **extra,
         )
-        return await _publish_report(
-            MergeDeployOutcome(
+
+    def _refused_before_merge(
+        sentence: str, *, failed_step: str = "candidate"
+    ) -> MergeDeployOutcome:
+        return MergeDeployOutcome(
+            result="candidate-refused",
+            status="FAILED",
+            failed_step=failed_step,
+            detail=sentence,
+            verdict=gate.get("verdict"),
+            checks_passed=gate.get("checks_passed"),
+            checks_total=gate.get("checks_total"),
+            # Where the check ran, when it ran: the sandbox, or nowhere named.
+            deployed_in=deployed_in_for(repo_root) if gate.get("ran") else None,
+            gate_before_merge=_gate_for_report(),
+        )
+
+    def _could_not_check(why: str) -> MergeDeployOutcome:
+        gate["refusal"] = f"could not be checked: {why}"
+        return _refused_before_merge(
+            f"{feature_id} could not be checked in the sandbox before merging: "
+            f"{why}; nothing was merged and the branch is kept."
+        )
+
+    async def _tear_down_candidate() -> None:
+        """Best-effort: the candidate that a stopped run left standing."""
+        nonlocal candidate_standing
+        try:
+            result = await _dispatch("candidate_down")
+        except Exception as exc:  # noqa: BLE001 — cleanup never costs a report
+            logger.warning(
+                "merge-executor: tearing the candidate for %s down raised "
+                "(%s: %s) — the -cand project may still be up",
+                feature_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        outcome_word = getattr(result, "outcome", None)
+        if result is not None and outcome_word != "complete":
+            logger.warning(
+                "merge-executor: the candidate for %s was not torn down "
+                "(%s) — the -cand project may still be up",
+                feature_id,
+                outcome_word,
+            )
+            return
+        candidate_standing = False
+
+    async def _cleanup() -> None:
+        """On every ending: the candidate down if still standing, the tree gone."""
+        nonlocal tree_path
+        if candidate_standing:
+            await _tear_down_candidate()
+        removed: bool | None = None
+        if tree_path is not None:
+            removed = await remove_candidate_tree(tree_path)
+            if removed:
+                logger.info(
+                    "merge-executor: removed the candidate tree for %s at %s",
+                    feature_id,
+                    tree_path,
+                )
+        _write_receipt(
+            "merge_deploy_cleanup.json",
+            {
+                "step": "cleanup",
+                "dry_run": dry_run,
+                "candidate_torn_down": not candidate_standing,
+                "tree_path": str(tree_path) if tree_path else None,
+                "tree_removed": removed,
+            },
+        )
+
+    def _candidate_refusal(
+        checked: Any, summary: dict[str, Any]
+    ) -> MergeDeployOutcome:
+        """The candidate came up and failed, or never came up: the sentence."""
+        reason = str((getattr(checked, "detail", None) or {}).get("reason") or "")
+        verdict = summary.get("verdict")
+        total = summary.get("checks_total")
+        passed = summary.get("checks_passed")
+        names = summary.get("failed_checks") or []
+        if reason == "candidate_deploy_failed" or (
+            verdict is None and reason != "candidate_failed"
+        ):
+            stopped_at = (
+                summary.get("failed_step")
+                or getattr(checked, "failed_step", None)
+                or "the candidate deploy"
+            )
+            gate["refusal"] = (
+                f"could not be started (the candidate deploy stopped at {stopped_at})"
+            )
+            sentence = candidate_refused_sentence(feature_id, detail=gate["refusal"])
+            return _refused_before_merge(sentence)
+        if names and isinstance(total, int) and isinstance(passed, int):
+            gate["refusal"] = None
+            sentence = candidate_refused_sentence(
+                feature_id,
+                checks_failed=total - passed,
+                checks_total=total,
+                failing_checks=list(names),
+            )
+            return _refused_before_merge(sentence)
+        gate["refusal"] = (
+            f"failed its checks (the check verdict was {verdict or 'missing'}; "
+            "which of the checks failed was not reported)"
+        )
+        return _refused_before_merge(
+            candidate_refused_sentence(feature_id, detail=gate["refusal"])
+        )
+
+    async def _press() -> MergeDeployOutcome:
+        nonlocal tree_path, candidate_standing, gate_began
+
+        if _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
+            logger.error(
+                "merge-executor: %s already has a merge step on record — refusing "
+                "to run the merge twice",
+                build_id,
+            )
+            return MergeDeployOutcome(
                 result="merge-refused",
                 status="FAILED",
                 failed_step="merge",
@@ -670,160 +942,269 @@ async def execute_merge_deploy(
                     "refusing to run it twice"
                 ),
             )
-        )
-    if dry_run:
-        # A dry run merges NOTHING and leaves NO durable step rows — a claimed
-        # step would make a later real press refuse "already on record". It
-        # proves the plumbing end to end and exercises the deploy stage's own
-        # dry mode below; the receipts on disk are its only record.
-        _write_receipt(
-            "merge_deploy_merge.json",
-            {
-                "step": "merge",
-                "dry_run": True,
-                "skipped": (
-                    "dry run — nothing merged; a real press would merge "
-                    f"autobuild/{feature_id} into main at {expect_main_sha}"
-                ),
-            },
-        )
-        merged_sha = None
-        checks_passed = None
-        checks_total = None
-    else:
-        _claim_step(
-            MERGE_STEP_MERGE_TARGET_IDENTIFIER,
-            {
-                "merge_step": {
-                    "expect_main_sha": expect_main_sha,
-                    "decided_by": decided_by,
+
+        # ------------------------------------------------------------------
+        # STEP candidate: the branch is checked in the sandbox BEFORE the merge
+        # ------------------------------------------------------------------
+        gate_began = True
+        candidate_sha = await git_rev_parse(repo_root, f"autobuild/{feature_id}")
+        if not candidate_sha:
+            return _could_not_check(
+                f"the branch autobuild/{feature_id} was not found in {repo_root}"
+            )
+        gate["candidate_sha"] = candidate_sha
+        gate["candidate_tree"] = await git_rev_parse(repo_root, f"{candidate_sha}^{{tree}}")
+        excluded_now: bool | None = None
+        try:
+            excluded_now = await ensure_candidate_trees_excluded(repo_root)
+            tree_path = await materialise_candidate_tree(
+                repo_root, feature_id, candidate_sha
+            )
+        except CandidateTreeError as exc:
+            _write_receipt(
+                "merge_deploy_candidate.json",
+                {
+                    "step": "candidate",
                     "dry_run": dry_run,
-                }
-            },
-        )
-
-        verify_timeout = _verify_timeout_from(deps.config)
-        merge_wall = merge_wall_seconds(verify_timeout)
-        args = [
-            "merge",
-            feature_id,
-            "--target",
-            "main",
-            "--expect-main-sha",
-            expect_main_sha,
-            # How long ONE run of the checks may take. The wall below holds
-            # the whole command: two such runs plus the merge between them.
-            "--verify-timeout",
-            str(verify_timeout),
-            "--json",
-        ]
-        baseline_path: Path | None = None
-        if baseline_failing is not None:
-            baseline_path = (
-                repo_root / ".guardkit" / "tmp" / f"merge-baseline-{build_id}.json"
+                    "candidate_sha": candidate_sha,
+                    "candidate_tree": gate["candidate_tree"],
+                    "tree_path": None,
+                    "error": str(exc),
+                },
             )
-            try:
-                baseline_path.parent.mkdir(parents=True, exist_ok=True)
-                baseline_path.write_text(
-                    json.dumps(
-                        {"failing_node_ids": baseline_failing},
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-                args += ["--baseline-json", str(baseline_path)]
-            except OSError as exc:
-                logger.warning(
-                    "merge-executor: could not write the baseline file for %s "
-                    "(%s) — the merge runs without a pre-merge baseline",
-                    build_id,
-                    exc,
-                )
-                baseline_path = None
-
-        result = await deps.guardkit_run(
-            subcommand="autobuild",
-            args=args,
-            repo_path=repo_root,
-            read_allowlist=[repo_root],
-            timeout_seconds=merge_wall,
-            with_nats_streaming=False,
-        )
-        report = _parse_merge_report(result)
-        # The merge verb exits non-zero for "merged but the checks after it
-        # did not pass" (exit 4) — the first real fire (FEAT-7CEA) proved that
-        # calling a LANDED merge "merge-refused" is a lie. Trust the report's
-        # own outcome over the exit code.
-        merged_in_report = bool(report and report.get("outcome") == "merged")
-        refusal: str | None = None
-        result_status = getattr(result, "status", "failed")
-        stderr = (getattr(result, "stderr", None) or "").strip()
-        tail = (getattr(result, "stdout_tail", "") or "").strip()
-        # Whatever the sidecar or guardkit itself said about the trouble, in
-        # its own words — the timeout sentence, the missing-command sentence.
-        own_sentence = (
-            _last_sentence(stderr)
-            or _last_sentence(tail)
-            or f"the merge command did not succeed (status={result_status})"
-        )
-        if not merged_in_report:
-            generic: str | None = None
-            if result_status != "success":
-                generic = (
-                    f"the merge command did not succeed (status={result_status})"
-                    + (
-                        f": {_last_sentence(stderr)}"
-                        if stderr
-                        else (f": {_last_sentence(tail)}" if tail else "")
-                    )
-                )
-            if report is not None:
-                # A REPORT THAT PARSED SPEAKS FOR ITSELF. Guardkit writes one
-                # plain sentence saying why it would not merge (a dirty tree,
-                # a target that moved, a missing branch); passing that through
-                # verbatim beats wrapping it in words of our own.
-                spoken = report.get("refusal_reason")
-                if isinstance(spoken, str) and spoken.strip():
-                    refusal = spoken.strip()
-                else:
-                    # A conflict report carries no refusal sentence of its
-                    # own, only the files; say those in words rather than
-                    # the last 400 characters of the JSON (seam coach,
-                    # 2026-09-06 — a slice cut mid-word on Rich's card).
-                    refusal = (
-                        _conflict_sentence(report)
-                        or _report_refusal(report)
-                        or generic
-                    )
-            else:
-                refusal = generic
-
-        # THE MERGE MAY HAVE LANDED ANYWAY. A command that was killed, or that
-        # died before it could print its report, leaves no answer at all — but
-        # git knows. Ask git before calling a landed merge refused.
-        landed_sha: str | None = None
-        if refusal and report is None and result_status != "success":
-            landed_sha = await merged_after_all_sha(
-                repo_root, feature_id, expect_main_sha
+            return _could_not_check(
+                f"its tree could not be laid out for the check ({exc})"
             )
 
+        try:
+            checked = await _dispatch("candidate_check", candidate_cwd=str(tree_path))
+        except Exception as exc:  # noqa: BLE001 — the sidecar-surface ValueError crack
+            _write_receipt(
+                "merge_deploy_candidate.json",
+                {
+                    "step": "candidate",
+                    "dry_run": dry_run,
+                    "candidate_sha": candidate_sha,
+                    "candidate_tree": gate["candidate_tree"],
+                    "tree_path": str(tree_path),
+                    "error": str(exc),
+                },
+            )
+            return _could_not_check(f"the candidate check raised ({exc})")
+
+        c_outcome = getattr(checked, "outcome", None)
+        c_detail = getattr(checked, "detail", None) or {}
+        summary = dict(c_detail.get("gate_summary") or {})
+        gate["verdict"] = summary.get("verdict")
+        gate["checks_passed"] = summary.get("checks_passed")
+        gate["checks_total"] = summary.get("checks_total")
+        gate["failed_checks"] = summary.get("failed_checks")
+        reason = str(c_detail.get("reason") or "")
+        gate["ran"] = checked is not None and reason != "no_candidate_section"
         _write_receipt(
-            "merge_deploy_merge.json",
+            "merge_deploy_candidate.json",
             {
-                "step": "merge",
-                "status": result_status,
-                "exit_code": getattr(result, "exit_code", None),
-                "refusal": refusal,
-                "report": report,
-                "landed_sha": landed_sha,
-                "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
-                "baseline_file": str(baseline_path) if baseline_path else None,
+                "step": "candidate",
+                "dry_run": dry_run,
+                "candidate_sha": candidate_sha,
+                "candidate_tree": gate["candidate_tree"],
+                "tree_path": str(tree_path),
+                "exclude_written_now": excluded_now,
+                "deploy_run_id": deploy_run_id,
+                "task_id": task_id,
+                "outcome": c_outcome,
+                "verdict": summary.get("verdict"),
+                "gate_summary": summary,
+                "failed_step": getattr(checked, "failed_step", None),
+                "reason": reason or None,
+                "events": list(getattr(checked, "events", ()) or ()),
             },
         )
-        if refusal and landed_sha:
-            return await _publish_report(
-                MergeDeployOutcome(
+        if not dry_run and checked is not None:
+            _record_step(
+                MERGE_STEP_CANDIDATE_TARGET_IDENTIFIER,
+                "PASSED" if c_outcome == "complete" else "FAILED",
+                {
+                    "candidate_step": {
+                        "candidate_sha": candidate_sha,
+                        "candidate_tree": gate["candidate_tree"],
+                        "verdict": summary.get("verdict"),
+                        "checks_passed": summary.get("checks_passed"),
+                        "checks_total": summary.get("checks_total"),
+                        "failed_checks": summary.get("failed_checks"),
+                        "deploy_run_id": deploy_run_id,
+                    }
+                },
+            )
+        if checked is None:
+            return _could_not_check(
+                "the deploy stage is disabled (deploy.enabled=false)"
+            )
+        if reason == "no_candidate_section":
+            return _could_not_check(
+                "the repository's deploy profile has no candidate section"
+            )
+        if c_outcome != "complete":
+            return _candidate_refusal(checked, summary)
+        candidate_standing = str(c_detail.get("candidate") or "standing") == "standing"
+        prior_events = tuple(getattr(checked, "events", ()) or ())
+
+        # ------------------------------------------------------------------
+        # STEP merge + verify (through the frozen guardkit boundary)
+        # ------------------------------------------------------------------
+        if dry_run:
+            # A dry run merges NOTHING and leaves NO durable step rows — a claimed
+            # step would make a later real press refuse "already on record". It
+            # proves the plumbing end to end and exercises the deploy stage's own
+            # dry mode; the receipts on disk are its only record.
+            _write_receipt(
+                "merge_deploy_merge.json",
+                {
+                    "step": "merge",
+                    "dry_run": True,
+                    "skipped": (
+                        "dry run — nothing merged; a real press would merge "
+                        f"autobuild/{feature_id} into main at {expect_main_sha}"
+                    ),
+                },
+            )
+            merged_sha = None
+            checks_passed = None
+            checks_total = None
+        else:
+            _claim_step(
+                MERGE_STEP_MERGE_TARGET_IDENTIFIER,
+                {
+                    "merge_step": {
+                        "expect_main_sha": expect_main_sha,
+                        "decided_by": decided_by,
+                        "dry_run": dry_run,
+                        "candidate_sha": candidate_sha,
+                    }
+                },
+            )
+
+            verify_timeout = _verify_timeout_from(deps.config)
+            merge_wall = merge_wall_seconds(verify_timeout)
+            args = [
+                "merge",
+                feature_id,
+                "--target",
+                "main",
+                "--expect-main-sha",
+                expect_main_sha,
+                # How long ONE run of the checks may take. The wall below holds
+                # the whole command: two such runs plus the merge between them.
+                "--verify-timeout",
+                str(verify_timeout),
+                "--json",
+            ]
+            baseline_path: Path | None = None
+            if baseline_failing is not None:
+                baseline_path = (
+                    repo_root / ".guardkit" / "tmp" / f"merge-baseline-{build_id}.json"
+                )
+                try:
+                    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+                    baseline_path.write_text(
+                        json.dumps(
+                            {"failing_node_ids": baseline_failing},
+                            indent=2,
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                    args += ["--baseline-json", str(baseline_path)]
+                except OSError as exc:
+                    logger.warning(
+                        "merge-executor: could not write the baseline file for %s "
+                        "(%s) — the merge runs without a pre-merge baseline",
+                        build_id,
+                        exc,
+                    )
+                    baseline_path = None
+
+            result = await deps.guardkit_run(
+                subcommand="autobuild",
+                args=args,
+                repo_path=repo_root,
+                read_allowlist=[repo_root],
+                timeout_seconds=merge_wall,
+                with_nats_streaming=False,
+            )
+            report = _parse_merge_report(result)
+            # The merge verb exits non-zero for "merged but the checks after it
+            # did not pass" (exit 4) — the first real fire (FEAT-7CEA) proved that
+            # calling a LANDED merge "merge-refused" is a lie. Trust the report's
+            # own outcome over the exit code.
+            merged_in_report = bool(report and report.get("outcome") == "merged")
+            refusal: str | None = None
+            result_status = getattr(result, "status", "failed")
+            stderr = (getattr(result, "stderr", None) or "").strip()
+            tail = (getattr(result, "stdout_tail", "") or "").strip()
+            # Whatever the sidecar or guardkit itself said about the trouble, in
+            # its own words — the timeout sentence, the missing-command sentence.
+            own_sentence = (
+                _last_sentence(stderr)
+                or _last_sentence(tail)
+                or f"the merge command did not succeed (status={result_status})"
+            )
+            if not merged_in_report:
+                generic: str | None = None
+                if result_status != "success":
+                    generic = (
+                        f"the merge command did not succeed (status={result_status})"
+                        + (
+                            f": {_last_sentence(stderr)}"
+                            if stderr
+                            else (f": {_last_sentence(tail)}" if tail else "")
+                        )
+                    )
+                if report is not None:
+                    # A REPORT THAT PARSED SPEAKS FOR ITSELF. Guardkit writes one
+                    # plain sentence saying why it would not merge (a dirty tree,
+                    # a target that moved, a missing branch); passing that through
+                    # verbatim beats wrapping it in words of our own.
+                    spoken = report.get("refusal_reason")
+                    if isinstance(spoken, str) and spoken.strip():
+                        refusal = spoken.strip()
+                    else:
+                        # A conflict report carries no refusal sentence of its
+                        # own, only the files; say those in words rather than
+                        # the last 400 characters of the JSON (seam coach,
+                        # 2026-09-06 — a slice cut mid-word on Rich's card).
+                        refusal = (
+                            _conflict_sentence(report)
+                            or _report_refusal(report)
+                            or generic
+                        )
+                else:
+                    refusal = generic
+
+            # THE MERGE MAY HAVE LANDED ANYWAY. A command that was killed, or that
+            # died before it could print its report, leaves no answer at all — but
+            # git knows. Ask git before calling a landed merge refused.
+            landed_sha: str | None = None
+            if refusal and report is None and result_status != "success":
+                landed_sha = await merged_after_all_sha(
+                    repo_root, feature_id, expect_main_sha
+                )
+
+            _write_receipt(
+                "merge_deploy_merge.json",
+                {
+                    "step": "merge",
+                    "status": result_status,
+                    "exit_code": getattr(result, "exit_code", None),
+                    "refusal": refusal,
+                    "report": report,
+                    "landed_sha": landed_sha,
+                    "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
+                    "baseline_file": str(baseline_path) if baseline_path else None,
+                },
+            )
+            if refusal and landed_sha:
+                return MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
                     merged_sha=landed_sha,
@@ -835,78 +1216,76 @@ async def execute_merge_deploy(
                     ),
                     verify_status="unverified",
                 )
-            )
-        if refusal:
-            # Nothing landed (main did not move), so the merge step goes
-            # back: the next press may run it again once the cause is gone.
-            _release_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER, refusal)
-            return await _publish_report(
-                MergeDeployOutcome(
+            if refusal:
+                # Nothing landed (main did not move), so the merge step goes
+                # back: the next press may run it again once the cause is gone.
+                # The candidate that passed its check is torn down on the way
+                # out; nothing is promoted.
+                _release_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER, refusal)
+                return MergeDeployOutcome(
                     result="merge-refused",
                     status="FAILED",
                     failed_step="merge",
                     detail=refusal,
                 )
-            )
 
-        merged_sha = _report_sha(report)
-        checks_passed = _report_int(report, "checks_passed")
-        checks_total = _report_int(report, "checks_total")
+            merged_sha = _report_sha(report)
+            checks_passed = _report_int(report, "checks_passed")
+            checks_total = _report_int(report, "checks_total")
 
-        # Advisory: does the merged tree keep the promises in the feature's
-        # spec digest? Deterministic and never blocking — the receipt lands
-        # beside the other merge receipts and any failure rides the merge
-        # report as one plain warning line. Built after FEAT-EF8D
-        # (2026-08-26), where every test was green but the built endpoint
-        # did not do what the approved digest promised.
-        try:
-            conformance = run_digest_conformance(
-                repo_root=repo_root, feature_id=feature_id
-            )
-        except Exception as exc:  # noqa: BLE001 — advisory must never stop a merge
-            conformance = {
-                "advisory": True,
-                "feature_id": feature_id,
-                "conformant": None,
-                "checks": [],
-                "warning": None,
-                "skipped": (
-                    "the digest conformance check itself failed "
-                    f"({exc}) — nothing was checked"
-                ),
-            }
-        digest_conformance.update(conformance)
-        _write_receipt("digest_conformance.json", conformance)
-
-        if merged_in_report and report.get("verify_ok") is False:
-            charged = report.get("charged_failures") or []
-            # Guardkit says "unverified" when the checks could not START at
-            # all — a missing interpreter, a command that is not there. That
-            # is not a failing test, and calling it one sent Rich looking for
-            # a red test that did not exist. Say which of the two happened.
-            could_not_run = (
-                str(report.get("verify_status") or "").strip().lower() == "unverified"
-            )
-            why = str(
-                report.get("verify_detail")
-                or report.get("verify_status")
-                or "verification failed"
-            )
-            if could_not_run:
-                detail = (
-                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
-                    f"post-merge checks could not run: {why}. "
-                    "The deploy was not dispatched."
+            # Advisory: does the merged tree keep the promises in the feature's
+            # spec digest? Deterministic and never blocking — the receipt lands
+            # beside the other merge receipts and any failure rides the merge
+            # report as one plain warning line. Built after FEAT-EF8D
+            # (2026-08-26), where every test was green but the built endpoint
+            # did not do what the approved digest promised.
+            try:
+                conformance = run_digest_conformance(
+                    repo_root=repo_root, feature_id=feature_id
                 )
-            else:
-                detail = (
-                    f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
-                    f"post-merge checks did not pass: {why}"
-                    + (f" — {len(charged)} charged failure(s)" if charged else "")
-                    + ". The deploy was not dispatched."
+            except Exception as exc:  # noqa: BLE001 — advisory must never stop a merge
+                conformance = {
+                    "advisory": True,
+                    "feature_id": feature_id,
+                    "conformant": None,
+                    "checks": [],
+                    "warning": None,
+                    "skipped": (
+                        "the digest conformance check itself failed "
+                        f"({exc}) — nothing was checked"
+                    ),
+                }
+            digest_conformance.update(conformance)
+            _write_receipt("digest_conformance.json", conformance)
+
+            if merged_in_report and report.get("verify_ok") is False:
+                charged = report.get("charged_failures") or []
+                # Guardkit says "unverified" when the checks could not START at
+                # all — a missing interpreter, a command that is not there. That
+                # is not a failing test, and calling it one sent Rich looking for
+                # a red test that did not exist. Say which of the two happened.
+                could_not_run = (
+                    str(report.get("verify_status") or "").strip().lower() == "unverified"
                 )
-            return await _publish_report(
-                MergeDeployOutcome(
+                why = str(
+                    report.get("verify_detail")
+                    or report.get("verify_status")
+                    or "verification failed"
+                )
+                if could_not_run:
+                    detail = (
+                        f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                        f"post-merge checks could not run: {why}. "
+                        "The deploy was not dispatched."
+                    )
+                else:
+                    detail = (
+                        f"{feature_id} merged ({(merged_sha or '')[:10]}), but the "
+                        f"post-merge checks did not pass: {why}"
+                        + (f" — {len(charged)} charged failure(s)" if charged else "")
+                        + ". The deploy was not dispatched."
+                    )
+                return MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
                     merged_sha=merged_sha,
@@ -916,52 +1295,100 @@ async def execute_merge_deploy(
                     checks_total=checks_total,
                     verify_status="unverified" if could_not_run else "failed",
                 )
-            )
 
-    # ------------------------------------------------------------------
-    # STEP deploy (mirrors the attended dispatch, in-daemon)
-    # ------------------------------------------------------------------
-    if not dry_run:
-        if _has_step(MERGE_STEP_DEPLOY_TARGET_IDENTIFIER):
-            logger.error(
-                "merge-executor: %s already has a deploy step on record — "
-                "refusing to dispatch the deploy twice",
-                build_id,
+            # --------------------------------------------------------------
+            # STEP tree check: what landed must be what was checked (rule 37)
+            # --------------------------------------------------------------
+            merged_tree = (
+                await git_rev_parse(repo_root, f"{merged_sha}^{{tree}}")
+                if merged_sha
+                else None
             )
-            return await _publish_report(
-                MergeDeployOutcome(
+            gate["merged_tree"] = merged_tree
+            gate["trees_match"] = bool(
+                merged_tree and gate["candidate_tree"] and merged_tree == gate["candidate_tree"]
+            )
+            _write_receipt(
+                "merge_deploy_tree_check.json",
+                {
+                    "step": "tree-check",
+                    "merged_sha": merged_sha,
+                    "merged_tree": merged_tree,
+                    "candidate_sha": candidate_sha,
+                    "candidate_tree": gate["candidate_tree"],
+                    "trees_match": gate["trees_match"],
+                },
+            )
+            if not gate["trees_match"]:
+                if not merged_sha:
+                    why = "the merge report names no merged commit, so its tree could not be compared with the tree that was checked"
+                elif merged_tree is None:
+                    why = (
+                        f"the merged commit's tree could not be read "
+                        f"(git rev-parse {merged_sha[:10]}^{{tree}} gave no answer)"
+                    )
+                else:
+                    why = (
+                        f"the merged commit's tree ({merged_tree[:10]}) is not the "
+                        f"tree that was checked in the sandbox "
+                        f"({str(gate['candidate_tree'] or '')[:10]}): main had "
+                        "moved since this was built in a way the pinned main "
+                        "commit did not catch"
+                    )
+                return MergeDeployOutcome(
+                    result="merged-deploy-failed",
+                    status="FAILED",
+                    merged_sha=merged_sha,
+                    failed_step="promote",
+                    detail=(
+                        f"{feature_id} merged ({(merged_sha or '')[:10]}), but {why}. "
+                        "The promote was refused and nothing live changed; the "
+                        "candidate was torn down. Send the sentence again."
+                    ),
+                    checks_passed=checks_passed,
+                    checks_total=checks_total,
+                    gate_before_merge=_gate_for_report(),
+                )
+
+        # ------------------------------------------------------------------
+        # STEP promote (the image that was checked, re-tagged — never rebuilt)
+        # ------------------------------------------------------------------
+        if not dry_run:
+            if _has_step(MERGE_STEP_DEPLOY_TARGET_IDENTIFIER):
+                logger.error(
+                    "merge-executor: %s already has a deploy step on record — "
+                    "refusing to dispatch the promote twice",
+                    build_id,
+                )
+                return MergeDeployOutcome(
                     result="merged-deploy-failed",
                     status="FAILED",
                     merged_sha=merged_sha,
                     failed_step="deploy",
                     detail=(
                         "the merge landed but a deploy step is already on "
-                        "record — refusing to dispatch it twice"
+                        "record — refusing to dispatch the promote twice"
                     ),
                 )
+            _claim_step(
+                MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
+                {
+                    "deploy_step": {
+                        "merged_sha": merged_sha,
+                        "dry_run": dry_run,
+                        "deploy_run_id": deploy_run_id,
+                    }
+                },
             )
-        _claim_step(
-            MERGE_STEP_DEPLOY_TARGET_IDENTIFIER,
-            {"deploy_step": {"merged_sha": merged_sha, "dry_run": dry_run}},
-        )
 
-    try:
-        deploy_result = await deps.deploy_dispatcher(
-            repo=repo,
-            repo_root=repo_root,
-            feature_id=feature_id,
-            build_id=build_id,
-            correlation_id=correlation_id,
-            decided_by=decided_by,
-            dry_run=dry_run,
-        )
-    except Exception as exc:  # noqa: BLE001 — the sidecar-surface ValueError crack
-        _write_receipt(
-            "merge_deploy_deploy.json",
-            {"step": "deploy", "error": str(exc), "dry_run": dry_run},
-        )
-        return await _publish_report(
-            MergeDeployOutcome(
+        try:
+            deploy_result = await _dispatch("promote", prior_events=prior_events)
+        except Exception as exc:  # noqa: BLE001 — the sidecar-surface ValueError crack
+            _write_receipt(
+                "merge_deploy_deploy.json",
+                {"step": "deploy", "error": str(exc), "dry_run": dry_run},
+            )
+            return MergeDeployOutcome(
                 result="merged-deploy-failed",
                 status="FAILED",
                 merged_sha=merged_sha,
@@ -972,81 +1399,90 @@ async def execute_merge_deploy(
                         if dry_run
                         else "the merge landed but "
                     )
-                    + f"the deploy dispatch raised: {exc}"
+                    + f"the promote dispatch raised: {exc}"
                 ),
                 checks_passed=checks_passed,
                 checks_total=checks_total,
             )
-        )
 
-    d_outcome = getattr(deploy_result, "outcome", None)
-    verdict = getattr(deploy_result, "verdict", None)
-    _write_receipt(
-        "merge_deploy_deploy.json",
-        {
-            "step": "deploy",
-            "outcome": d_outcome,
-            "verdict": verdict,
-            "record": getattr(deploy_result, "deploy_record_ref", None),
-            "dry_run": dry_run,
-        },
-    )
-    if checks_passed is None or checks_total is None:
-        m = re.search(r"(\d+)\s*/\s*(\d+)", str(verdict or ""))
-        if m:
-            checks_passed, checks_total = int(m.group(1)), int(m.group(2))
+        d_outcome = getattr(deploy_result, "outcome", None)
+        verdict = getattr(deploy_result, "verdict", None)
+        d_detail = getattr(deploy_result, "detail", None) or {}
+        # The promote leg tears the candidate down itself (unless the profile
+        # keeps it); only a promote that stopped short leaves it standing.
+        candidate_standing = str(d_detail.get("candidate") or "torn-down") == "standing"
+        _write_receipt(
+            "merge_deploy_deploy.json",
+            {
+                "step": "deploy",
+                "outcome": d_outcome,
+                "verdict": verdict,
+                "record": getattr(deploy_result, "deploy_record_ref", None),
+                "dry_run": dry_run,
+            },
+        )
+        if checks_passed is None or checks_total is None:
+            m = re.search(r"(\d+)\s*/\s*(\d+)", str(verdict or ""))
+            if m:
+                checks_passed, checks_total = int(m.group(1)), int(m.group(2))
 
-    if deploy_result is None:
-        outcome = MergeDeployOutcome(
-            result="merged-deploy-failed",
-            status="FAILED",
-            merged_sha=merged_sha,
-            failed_step="deploy",
-            detail=(
-                "the merge landed but the deploy stage is disabled "
-                "(deploy.enabled=false) — nothing was deployed"
-            ),
-            checks_passed=checks_passed,
-            checks_total=checks_total,
-        )
-    elif d_outcome == "complete":
-        deployed_in = deployed_in_for(repo_root)
-        checks = (
-            f" — checks {checks_passed}/{checks_total}"
-            if checks_passed is not None and checks_total is not None
-            else ""
-        )
-        outcome = MergeDeployOutcome(
-            result="merged-and-running",
-            status="PASSED",
-            merged_sha=merged_sha,
-            verdict=str(verdict) if verdict is not None else None,
-            detail=(
-                f"{feature_id} merged and running{checks}. Rollback is one "
-                "command; the branch is kept."
-            ),
-            checks_passed=checks_passed,
-            checks_total=checks_total,
-            deployed_in=deployed_in,
-        )
-    elif d_outcome == "reverted":
-        outcome = MergeDeployOutcome(
-            result="merged-deploy-reverted",
-            status="FAILED",
-            merged_sha=merged_sha,
-            failed_step="deploy",
-            verdict=str(verdict) if verdict is not None else None,
-            detail=(
-                f"{feature_id} merged, but the live checks failed and the "
-                "deploy was rolled back — live is untouched; the merge stands "
-                "and the branch is kept."
-            ),
-            checks_passed=checks_passed,
-            checks_total=checks_total,
-            deployed_in=deployed_in_for(repo_root),
-        )
-    else:
-        outcome = MergeDeployOutcome(
+        if deploy_result is None:
+            return MergeDeployOutcome(
+                result="merged-deploy-failed",
+                status="FAILED",
+                merged_sha=merged_sha,
+                failed_step="deploy",
+                detail=(
+                    "the merge landed but the deploy stage is disabled "
+                    "(deploy.enabled=false) — nothing was promoted"
+                ),
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+            )
+        if d_outcome == "complete":
+            deployed_in = deployed_in_for(repo_root)
+            checks = (
+                f" — checks {checks_passed}/{checks_total}"
+                if checks_passed is not None and checks_total is not None
+                else ""
+            )
+            sandbox_checks = (
+                f"checked in the sandbox ({gate['checks_passed']} of "
+                f"{gate['checks_total']}), "
+                if isinstance(gate.get("checks_passed"), int)
+                and isinstance(gate.get("checks_total"), int)
+                else "checked in the sandbox, "
+            )
+            return MergeDeployOutcome(
+                result="merged-and-running",
+                status="PASSED",
+                merged_sha=merged_sha,
+                verdict=str(verdict) if verdict is not None else None,
+                detail=(
+                    f"{feature_id} {sandbox_checks}merged and running{checks}. "
+                    "Rollback is one command; the branch is kept."
+                ),
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                deployed_in=deployed_in,
+            )
+        if d_outcome == "reverted":
+            return MergeDeployOutcome(
+                result="merged-deploy-reverted",
+                status="FAILED",
+                merged_sha=merged_sha,
+                failed_step="deploy",
+                verdict=str(verdict) if verdict is not None else None,
+                detail=(
+                    f"{feature_id} merged, but the live checks failed and the "
+                    "deploy was rolled back — live is untouched; the merge stands "
+                    "and the branch is kept."
+                ),
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                deployed_in=deployed_in_for(repo_root),
+            )
+        return MergeDeployOutcome(
             result="merged-deploy-failed",
             status="FAILED",
             merged_sha=merged_sha,
@@ -1054,9 +1490,9 @@ async def execute_merge_deploy(
             verdict=str(verdict) if verdict is not None else None,
             detail=(
                 (
-                    "dry run — nothing merged; the deploy ended "
+                    "dry run — nothing merged; the promote ended "
                     if dry_run
-                    else f"{feature_id} merged, but the deploy ended "
+                    else f"{feature_id} merged, but the promote ended "
                 )
                 + f"{d_outcome or 'without an outcome'} — nothing further was "
                 "touched"
@@ -1065,6 +1501,14 @@ async def execute_merge_deploy(
             checks_total=checks_total,
             deployed_in=deployed_in_for(repo_root),
         )
+
+    try:
+        outcome = await _press()
+    finally:
+        # Every ending, the normal ones and a crash alike: the candidate down
+        # if it is still standing, and its laid-out tree removed — BEFORE the
+        # report goes out, so the report never says "torn down" ahead of time.
+        await _cleanup()
     return await _publish_report(outcome)
 
 
@@ -1076,14 +1520,19 @@ async def execute_merge_deploy(
 def build_in_daemon_deploy_dispatcher(
     *, config: Any, nats_client: Any, db_path: Any
 ) -> Callable[..., Awaitable[Any]]:
-    """Bind the production deploy dispatch for the executor's deploy step.
+    """Bind the production deploy dispatch for the executor's deploy legs.
 
     Mirrors ``forge.cli._deploy_run`` but in-daemon: profile + live-gate
     invoker from the target repo, runbook DDL ensured idempotently (the C4
     ``no such table: runbooks`` lesson), and ``execution_surface`` forced to
     ``sidecar`` on a config COPY — the daemon container has no docker, and
-    ``_resolve_script_runner`` reads only the passed config. ONE dispatch runs
-    candidate -> gates -> promote -> live-gate -> auto-revert internally. The
+    ``_resolve_script_runner`` reads only the passed config. The executor
+    dispatches one LEG at a time (protect-main, rule 39): ``candidate_check``
+    with the branch's laid-out tree as the candidate's working directory,
+    then — after the merge — ``promote``, or ``candidate_down`` when the run
+    stopped between them; ``deploy`` (the default) is the whole stage in one
+    call, as before. ``deploy_run_id`` and ``task_id`` are shared by the legs
+    of one press so their runbooks and events belong to one deploy run. The
     boot-time stash ``_serve_daemon.deploy_stage_runner`` is NEVER touched
     (its seams raise).
     """
@@ -1097,6 +1546,11 @@ def build_in_daemon_deploy_dispatcher(
         correlation_id: str,
         decided_by: str,
         dry_run: bool,
+        leg: str = "deploy",
+        candidate_cwd: str | None = None,
+        prior_events: tuple[str, ...] = (),
+        deploy_run_id: str | None = None,
+        task_id: str | None = None,
     ) -> Any:
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
@@ -1137,7 +1591,7 @@ def build_in_daemon_deploy_dispatcher(
             deploy_cfg,
             profile,
             correlation_id=correlation_id,
-            deploy_run_id=str(uuid.uuid4()),
+            deploy_run_id=deploy_run_id or str(uuid.uuid4()),
             repository=repository,
             runbook_publisher=runbook_publisher,
             deploy_publisher=deploy_publisher,
@@ -1152,8 +1606,11 @@ def build_in_daemon_deploy_dispatcher(
             # ^TASK-[A-Z0-9]{3,12}$ (the first dry fire caught this live);
             # the time suffix also keeps the date-granular F7 record filename
             # distinct across same-day runs.
-            task_id=_deploy_task_id(feature_id),
+            task_id=task_id or _deploy_task_id(feature_id),
             deployer=f"merge-word:{decided_by}",
+            leg=leg,
+            candidate_cwd=candidate_cwd,
+            prior_events=tuple(prior_events),
         )
 
     return _dispatch
