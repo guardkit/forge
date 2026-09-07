@@ -214,3 +214,285 @@ class TestARepositoryWithASandboxIsDispatchedIntoIt:
 
         assert routed is default
         assert "no runner address" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Where the dispatched build is WATCHED (rule 78, repaired 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# Dispatching a build into the sandbox is only half of rule 78. Everything
+# that then watches it — the event stream forge-prod joins, the run id it
+# resolves, the final state it reads back when the stream closes empty — has
+# to speak to the same runner. Watching the host runner for a build that ran
+# in a sandbox would mean no lifecycle event ever arrives: the build sits in
+# its stage for ever and the queue counts it as in flight, which is the shape
+# of the 2026-09-05 stuck-count defect.
+
+
+def _pool(tmp_path: Any) -> Any:
+    """A real ledger on disk, with the real schema and the real facade."""
+    import sqlite3 as _sqlite3
+
+    from forge.cli._serve_deps_state_channel import ASYNC_TASKS_SCHEMA_DDL
+    from forge.lifecycle.migrations import apply_at_boot
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+    db_path = str(tmp_path / "forge.db")
+    connection = _sqlite3.connect(db_path)
+    apply_at_boot(connection)
+    connection.execute(ASYNC_TASKS_SCHEMA_DDL)
+    connection.commit()
+    return SqliteLifecyclePersistence(connection=connection, db_path=db_path)
+
+
+def _record_build(pool: Any, *, feature_id: str, repo: str) -> None:
+    pool.connection.execute(
+        "INSERT INTO builds (build_id, feature_id, repo, branch, "
+        "feature_yaml_path, status, triggered_by, correlation_id, queued_at) "
+        "VALUES (?, ?, ?, ?, ?, 'QUEUED', 'cli', ?, '2026-09-08T00:00:00Z')",
+        (
+            f"build-{feature_id}-20260908000000",
+            feature_id,
+            repo,
+            f"feat/{feature_id}",
+            f"features/{feature_id}.yaml",
+            f"corr-{feature_id}",
+        ),
+    )
+    pool.connection.commit()
+
+
+class TestWhichRunnerIsWatchedForADispatchedBuild:
+    def test_with_no_sandbox_there_is_no_routing_at_all(self, tmp_path: Any) -> None:
+        from forge.cli._serve_production import build_feature_runner_url_resolver
+
+        resolver = build_feature_runner_url_resolver(
+            sqlite_pool=_pool(tmp_path),
+            forge_config=_config(with_sandbox=False),
+            default_url=GLOBAL_RUNNER,
+        )
+
+        # None means "do not wrap anything": the stream source, the identity
+        # provider and the state fetcher stay the objects they always were.
+        assert resolver is None
+
+    def test_a_features_own_build_row_says_which_runner_holds_it(
+        self, tmp_path: Any
+    ) -> None:
+        from forge.cli._serve_production import build_feature_runner_url_resolver
+
+        pool = _pool(tmp_path)
+        _record_build(pool, feature_id="FEAT-AAAA", repo=REPO_WITH)
+        _record_build(pool, feature_id="FEAT-BBBB", repo=REPO_WITHOUT)
+        resolver = build_feature_runner_url_resolver(
+            sqlite_pool=pool,
+            forge_config=_config(with_sandbox=True),
+            default_url=GLOBAL_RUNNER,
+        )
+        assert resolver is not None
+
+        assert resolver("FEAT-AAAA") == SANDBOX_RUNNER
+        assert resolver("FEAT-BBBB") == GLOBAL_RUNNER
+        # A feature nothing has queued yet, and a blank one: the honest
+        # answer is the global runner, never a guess.
+        assert resolver("FEAT-NONE") == GLOBAL_RUNNER
+        assert resolver("") == GLOBAL_RUNNER
+
+    def test_the_answer_is_remembered_so_watching_is_not_a_query_per_event(
+        self, tmp_path: Any
+    ) -> None:
+        from forge.cli._serve_production import build_feature_runner_url_resolver
+
+        pool = _pool(tmp_path)
+        _record_build(pool, feature_id="FEAT-AAAA", repo=REPO_WITH)
+        resolver = build_feature_runner_url_resolver(
+            sqlite_pool=pool,
+            forge_config=_config(with_sandbox=True),
+            default_url=GLOBAL_RUNNER,
+        )
+        assert resolver is not None
+        assert resolver("FEAT-AAAA") == SANDBOX_RUNNER
+
+        # The row is gone; the answer already given does not change.
+        pool.connection.execute("DELETE FROM builds")
+        pool.connection.commit()
+        assert resolver("FEAT-AAAA") == SANDBOX_RUNNER
+
+    def test_a_ledger_that_cannot_be_read_watches_the_global_runner(
+        self, tmp_path: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from forge.cli._serve_production import build_feature_runner_url_resolver
+
+        pool = _pool(tmp_path)
+        pool.connection.execute("DROP TABLE builds")
+        pool.connection.commit()
+        resolver = build_feature_runner_url_resolver(
+            sqlite_pool=pool,
+            forge_config=_config(with_sandbox=True),
+            default_url=GLOBAL_RUNNER,
+        )
+        assert resolver is not None
+
+        with caplog.at_level("WARNING"):
+            assert resolver("FEAT-AAAA") == GLOBAL_RUNNER
+
+        assert "could not read which repository" in caplog.text
+
+
+class TestTheWatchingSeamsTakeTheRoutedAddress:
+    """The three seams that speak to a runner, driven for both repositories.
+
+    Each factory is replaced by a recorder so no LangGraph client is ever
+    constructed; what is under test is which address each seam is built
+    against, which is the whole of the defect.
+    """
+
+    @staticmethod
+    def _recorders(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+        from forge.cli import _serve_production as production
+
+        joined: list[str] = []
+        fetched: list[str] = []
+
+        def _stream(*, runner_url: str) -> Any:
+            def _source(*, feature_id: str, thread_id: Any, run_id: Any) -> Any:
+                joined.append(runner_url)
+                return iter(())
+
+            return _source
+
+        def _fetcher(*, runner_url: str) -> Any:
+            async def _fetch(*, feature_id: str, thread_id: Any, run_id: Any) -> Any:
+                fetched.append(runner_url)
+                return None
+
+            return _fetch
+
+        monkeypatch.setattr(production, "langgraph_stream_source", _stream)
+        monkeypatch.setattr(production, "langgraph_run_state_fetcher", _fetcher)
+        return {"joined": joined, "fetched": fetched}
+
+    def test_the_stream_and_the_state_are_read_where_the_build_ran(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.cli._serve_production import _build_lifecycle_bridge_wireup_parts
+
+        seen = self._recorders(monkeypatch)
+        pool = _pool(tmp_path)
+        _record_build(pool, feature_id="FEAT-AAAA", repo=REPO_WITH)
+        _record_build(pool, feature_id="FEAT-BBBB", repo=REPO_WITHOUT)
+
+        parts = _build_lifecycle_bridge_wireup_parts(
+            sqlite_pool=pool,
+            autobuild_runner_url=GLOBAL_RUNNER,
+            forge_config=_config(with_sandbox=True),
+        )
+
+        parts.stream_source(feature_id="FEAT-AAAA", thread_id="t", run_id="r")
+        parts.stream_source(feature_id="FEAT-BBBB", thread_id="t", run_id="r")
+        asyncio.run(
+            parts.run_state_fetcher(feature_id="FEAT-AAAA", thread_id="t", run_id="r")
+        )
+        asyncio.run(
+            parts.run_state_fetcher(feature_id="FEAT-BBBB", thread_id="t", run_id="r")
+        )
+
+        assert seen["joined"] == [SANDBOX_RUNNER, GLOBAL_RUNNER]
+        assert seen["fetched"] == [SANDBOX_RUNNER, GLOBAL_RUNNER]
+
+    def test_with_no_sandbox_the_seams_are_the_very_objects_as_before(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.cli import _serve_production as production
+
+        made: dict[str, Any] = {}
+
+        def _stream(*, runner_url: str) -> Any:
+            made["stream"] = object()
+            made["stream_url"] = runner_url
+            return made["stream"]
+
+        def _fetcher(*, runner_url: str) -> Any:
+            made["fetch"] = object()
+            return made["fetch"]
+
+        monkeypatch.setattr(production, "langgraph_stream_source", _stream)
+        monkeypatch.setattr(production, "langgraph_run_state_fetcher", _fetcher)
+
+        parts = production._build_lifecycle_bridge_wireup_parts(
+            sqlite_pool=_pool(tmp_path),
+            autobuild_runner_url=GLOBAL_RUNNER,
+            forge_config=_config(with_sandbox=False),
+        )
+
+        # Not merely equivalent — the same objects the factories returned,
+        # with no wrapper of this lane's in between.
+        assert parts.stream_source is made["stream"]
+        assert parts.run_state_fetcher is made["fetch"]
+        assert made["stream_url"] == GLOBAL_RUNNER
+
+    def test_the_run_id_is_asked_for_at_the_same_runner(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The identity provider is the third seam that speaks to a runner:
+        it asks which run belongs to a thread. A thread made inside a sandbox
+        is unknown to the host runner, so it must be asked there too."""
+        import sys
+        from types import ModuleType
+
+        from forge.cli._serve_production import (
+            _build_async_tasks_identity_provider,
+            build_feature_runner_url_resolver,
+        )
+
+        asked: list[str] = []
+
+        class _Runs:
+            def __init__(self, url: str) -> None:
+                self._url = url
+
+            async def list(self, thread_id: str, limit: int = 1) -> Any:
+                asked.append(self._url)
+                return [{"run_id": f"run-in-{self._url}"}]
+
+        fake_sdk = ModuleType("langgraph_sdk")
+        fake_sdk.get_client = lambda *, url: SimpleNamespace(runs=_Runs(url))  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "langgraph_sdk", fake_sdk)
+
+        pool = _pool(tmp_path)
+        _record_build(pool, feature_id="FEAT-AAAA", repo=REPO_WITH)
+        _record_build(pool, feature_id="FEAT-BBBB", repo=REPO_WITHOUT)
+        for feature_id in ("FEAT-AAAA", "FEAT-BBBB"):
+            pool.connection.execute(
+                "INSERT INTO async_tasks (task_id, build_id, feature_id, "
+                "correlation_id, lifecycle, wave_index, task_index, "
+                "started_at, last_activity_at) VALUES (?, ?, ?, ?, 'run', 0, 0, "
+                "'2026-09-08T00:00:00Z', '2026-09-08T00:00:00Z')",
+                (
+                    f"thread-{feature_id}",
+                    f"build-{feature_id}-20260908000000",
+                    feature_id,
+                    f"corr-{feature_id}",
+                ),
+            )
+        pool.connection.commit()
+
+        provider = _build_async_tasks_identity_provider(
+            sqlite_pool=pool,
+            autobuild_runner_url=GLOBAL_RUNNER,
+            runner_url_for_feature=build_feature_runner_url_resolver(
+                sqlite_pool=pool,
+                forge_config=_config(with_sandbox=True),
+                default_url=GLOBAL_RUNNER,
+            ),
+        )
+
+        assert asyncio.run(provider("FEAT-AAAA", "corr-FEAT-AAAA")) == (
+            "thread-FEAT-AAAA",
+            f"run-in-{SANDBOX_RUNNER}",
+        )
+        assert asyncio.run(provider("FEAT-BBBB", "corr-FEAT-BBBB")) == (
+            "thread-FEAT-BBBB",
+            f"run-in-{GLOBAL_RUNNER}",
+        )
+        assert asked == [SANDBOX_RUNNER, GLOBAL_RUNNER]
