@@ -4791,6 +4791,13 @@ def _sequenced_normalizer(
     ) -> StampNormalizerOutcome:
         sink.setdefault("order", []).append("normalize_stamps")
         sink.setdefault("rules_only", []).append(rules_only)
+        # The spec .feature this stamping saw in the worktree — the bytes the
+        # real normalizer would classify — so a test can prove WHICH spec a
+        # stamping ran on (the approved one, or a rewrite's).
+        feature_path = worktree / _SPEC_FEATURE_REL
+        sink.setdefault("feature_seen", []).append(
+            feature_path.read_text(encoding="utf-8") if feature_path.is_file() else None
+        )
         sink["calls"] = sink.get("calls", 0) + 1
         outcome = outcomes[min(sink["calls"] - 1, len(outcomes) - 1)]
         if isinstance(outcome, _Crash):
@@ -5164,20 +5171,46 @@ _REFUSED_TWICE_SENTENCE = (
     "in the reply."
 )
 
-#: Its changed-nothing twin: the same sentence with what happened in place
-#: of a checker refusal that never was.
-_CHANGED_NOTHING_SENTENCE = (
-    f"Planning run {CID} stopped at writing the task plan: 2 of the worked "
-    "examples could not be proven as written, and when the machine asked the "
-    "spec writer to rewrite them as what the endpoint does, the rewrite "
-    "changed nothing. Nothing was built. To try again, send the sentence as "
-    "what the endpoint does: the method and path, the status code, and what "
-    "is in the reply."
+#: Rule 6's sentence at the top of the plan-stop card when the rewrite
+#: changed nothing — the spec's own words for that outcome, which is also
+#: how a changed-nothing rewrite stops after the model's turn (rule 6b):
+#: the note-refused sentence would blame the checker for a refusal that
+#: never was, and the spec quotes no other sentence for it.
+_STOP_CHANGED_NOTHING = (
+    "The machine already asked the spec writer once to rewrite these as what "
+    "the endpoint does; the rewrite changed nothing."
 )
 
-#: The titles still refused after the model's turn, verbatim, as the stop
-#: message lists them after its two sentences.
-_STILL_REFUSED_TITLES = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
+#: The same worked example with its steps said as what the endpoint does and
+#: the title untouched: a rewrite that moves the .feature but not one digest
+#: sentence, so the cards say the same thing while the bytes differ.
+_FIXTURE_FEATURE_ENDPOINT_STEPS = (
+    "Feature: stats\n  Scenario: ok\n    When the caller sends GET /stats\n"
+    "    Then the reply is 200\n"
+)
+_SPEC_FEATURE_REL = "features/stats-endpoint/stats-endpoint.feature"
+
+
+def _steps_moved_spec_result(slug: str = "stats-endpoint") -> Any:
+    """Round two of the spec: the .feature's steps rewritten into the
+    endpoint shape, every digest sentence byte-identical to round one."""
+    result = _spec_result_native(slug)
+    result.role_output[f"{slug}.feature"] = _FIXTURE_FEATURE_ENDPOINT_STEPS
+    return result
+
+
+def _branch_subjects(repo: Path, branch: str) -> list[str]:
+    """The commit subjects on ``branch``, newest first."""
+    res = subprocess.run(
+        ["git", "log", "--format=%s", branch], cwd=repo, capture_output=True, text=True
+    )
+    return [ln for ln in res.stdout.splitlines() if ln]
+
+
+def _rev_parse(repo: Path, rev: str) -> str:
+    res = subprocess.run(["git", "rev-parse", rev], cwd=repo, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip()
 
 
 @pytest.mark.asyncio
@@ -5223,14 +5256,22 @@ async def test_a_rewrite_that_changed_nothing_gives_the_model_its_turn_and_carri
     assert _error_cards(h) == []
     assert not any("The machine already asked" in m for _, m, _ in h.ctx["notifications"])
     # The owner's approved row stands alone: a changed-nothing rewrite is
-    # never re-recorded, and the spec of record is what was stamped.
+    # never re-recorded, and the spec of record is what was stamped — on the
+    # branch too: a byte-identical rewrite is the runner's idempotent
+    # no-commit path, so the branch never moved and nothing was put back.
     rows = _approved_spec_rows(store)
     assert len(rows) == 1 and "rewritten_by_machine" not in rows[0]
+    assert sink["feature_seen"] == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
+    assert not any("put back" in s for s in _branch_subjects(repo, f"planning/{CID}"))
     receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
     assert receipt["status"] == "written"
     assert receipt["rules_only"] is False
     rewrite = receipt["rewrite"]
     assert rewrite["changed_nothing"] is True
+    assert rewrite["spec_of_record"] == {
+        "sha": rows[0]["sha"],
+        "branch_moved_by_rewrite": False,
+    }
     assert "refused_by_checker" not in rewrite
     assert rewrite["note"] == _MACHINE_NOTE_FOR_TITLES
     assert rewrite["author"] == _MACHINE_NOTE_AUTHOR
@@ -5254,14 +5295,17 @@ async def test_a_rewrite_that_changed_nothing_gives_the_model_its_turn_and_carri
 
 
 @pytest.mark.asyncio
-async def test_a_rewrite_that_changed_nothing_stops_with_both_sentences_when_the_model_cannot_settle_it(
+async def test_a_rewrite_that_changed_nothing_stops_with_the_card_and_its_changed_nothing_sentence_when_the_model_cannot_settle_it(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
     """Rule 6b, the changed-nothing half, the other way: the model had its
     turn and its answer was rejected, so the titles are still refused. The
-    run stops with ONE message, not a card: the changed-nothing sentence,
-    then the model fallback's own sentence, then the titles still refused.
-    Never a third try."""
+    run stops with rule 6's card — the spec's own words for a rewrite that
+    changed nothing — opening with the "changed nothing" sentence, the card
+    about the SECOND stamping (the model was asked and could not settle
+    them), the titles verbatim, and the model fallback's own sentence (rule
+    16). Never the note-refused sentence: the checker refused nothing. Never
+    a third try."""
     repo, git = _enforced_repo(tmp_path)
     _queue(store)
     sink: dict[str, Any] = {}
@@ -5289,18 +5333,227 @@ async def test_a_rewrite_that_changed_nothing_stops_with_both_sentences_when_the
     assert h.ctx["counters"]["plan"] == 2
     assert sink["order"] == ["normalize_stamps", "normalize_stamps"]
     assert sink["rules_only"] == [True, None]
-    assert _error_cards(h) == [
-        f"{_CHANGED_NOTHING_SENTENCE} The model fallback's answer was rejected: "
-        f"'maybe' is not one of the allowed words.\n{_STILL_REFUSED_TITLES}"
-    ]
-    assert not any("This repo enforces the routing law" in m for _, m, _ in h.ctx["notifications"])
+    cards = _error_cards(h)
+    assert len(cards) == 1
+    card = cards[0]
+    feature_id = h.ctx["counters"]["last_feature_id"]
+    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
+    assert card.startswith(
+        f"Planning run {CID} stopped at writing the task plan. {_STOP_CHANGED_NOTHING} "
+        f"The verifier stamps could not all be minted by rule for feature {feature_id}. "
+        "2 scenario(s) had no rule to decide which verifier proves them, and the model "
+        "fallback could not settle them, so nothing was stamped and nothing was built:\n"
+        f"{titles}\n"
+        "The model fallback's answer was rejected: 'maybe' is not one of the allowed "
+        "words.\n"
+        "This repo enforces the routing law"
+    )
+    assert "refused the rewrite twice" not in card
+    assert "switched off" not in card
     assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
     assert len(_approved_spec_rows(store)) == 1
     error = store.get_run(CID)["error"] or ""
     assert error.startswith("stamp normalizer refused for FEAT-")
     assert "after the machine's rewrite (round 1): the rewrite changed nothing" in error
+    assert "the branch never moved, so the spec of record stands" in error
     assert "the model fallback had its turn on the second stamping, on the spec of record" in error
     assert "titles still refused after the model's turn" in error
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_moved_the_steps_but_not_the_list_is_stamped_on_the_spec_of_record(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rule 6b says the model's turn after a changed-nothing rewrite is "on
+    the spec of record" — and that has to be true of the BRANCH, not only of
+    the row (coach finding, 2026-09-07). The spec writer rewrites the refused
+    example's steps into the endpoint shape but keeps every digest sentence
+    word for word: the cards say the same thing, yet the spec leg has already
+    committed the rewrite, so the branch tip is the rewrite. The driver sees
+    the sha moved, reads the approved files off the approved commit and puts
+    them back on the branch as one commit; the second stamping and the plan
+    sit on the approved bytes; the owner's line is true (the model decided
+    the titles on the spec of record); the receipt names the commit set
+    aside and the one that put the spec back; one approved row."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    branch = f"planning/{CID}"
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _steps_moved_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(
+            sink,
+            [
+                _switched_off_outcome(),
+                _model_decided_outcome(
+                    {_MOON_TITLE: "probe:process", "Another undecidable one": "hurl"}
+                ),
+            ],
+        ),
+    )
+    _share_order(sink, h)
+
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["spec"] == 2
+    assert h.ctx["counters"]["plan"] == 2
+    assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
+    assert sink["rules_only"] == [True, None]
+    # BOTH stampings saw the approved .feature — never the rewrite's steps.
+    assert sink["feature_seen"] == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
+    # The branch carries the approved bytes under the plan commit ...
+    assert _show(repo, branch, _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE
+    rows = _approved_spec_rows(store)
+    assert len(rows) == 1 and "rewritten_by_machine" not in rows[0]
+    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
+    rewrite = receipt["rewrite"]
+    assert rewrite["changed_nothing"] is True
+    spec_of_record = rewrite["spec_of_record"]
+    assert spec_of_record["sha"] == rows[0]["sha"]
+    assert spec_of_record["branch_moved_by_rewrite"] is True
+    assert spec_of_record["rewrite_sha"] != rows[0]["sha"]
+    assert "files_left_by_rewrite" not in spec_of_record
+    # ... the put-back commit sits right under the plan commit, on top of the
+    # rewrite's commit (set aside, still in the history, its steps readable
+    # there and nowhere else), which sits on the approved commit.
+    plan_sha = _leg_details(store, "feature-plan")["sha"]
+    assert _rev_parse(repo, f"{plan_sha}^") == spec_of_record["restored_sha"]
+    assert _rev_parse(repo, f"{spec_of_record['restored_sha']}^") == spec_of_record["rewrite_sha"]
+    assert _rev_parse(repo, f"{spec_of_record['rewrite_sha']}^") == rows[0]["sha"]
+    assert (
+        _show(repo, spec_of_record["rewrite_sha"], _SPEC_FEATURE_REL).stdout
+        == _FIXTURE_FEATURE_ENDPOINT_STEPS
+    )
+    assert _show(repo, spec_of_record["restored_sha"], _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE
+    assert (
+        f"planning: the approved spec put back for {CID} (the machine's rewrite "
+        f"changed nothing the owner reads; its commit {spec_of_record['rewrite_sha']} "
+        "is set aside)"
+    ) in _branch_subjects(repo, branch)
+    # The owner's line is TRUE: the model decided both titles on the approved
+    # spec; no card, no error.
+    assert (_MODEL_LINE_AFTER_CHANGED_NOTHING, False) in h.ctx["mentions"]
+    assert rewrite["owner_line"] == _MODEL_LINE_AFTER_CHANGED_NOTHING
+    assert rewrite["second_stamping"]["model_decided"] == {
+        _MOON_TITLE: "probe:process",
+        "Another undecidable one": "hurl",
+    }
+    assert _error_cards(h) == []
+    assert h.ctx["counters"].get("build_trigger") == 1
+    # The machine log says what was put back, and where.
+    log = "\n".join(_driver_log_lines(caplog))
+    assert (
+        f"had moved the planning branch to {spec_of_record['rewrite_sha']} without "
+        "changing anything the owner reads; the approved spec "
+        f"({rows[0]['sha']}) is put back as {spec_of_record['restored_sha']}, 4 file(s)"
+    ) in log
+    assert "the rewrite's commit" in log and "put back on the branch as" in log
+
+
+class _ForgetfulGitRunner(WorktreeGitRunner):
+    """A real runner that cannot read a file at a COMMIT id (only at a branch
+    name) — the one thing the put-back needs from it."""
+
+    async def read_file_from_branch(
+        self, *, repo_path: str, branch: str, file_path: str
+    ) -> str | None:
+        if re.fullmatch(r"[0-9a-f]{40}", branch):
+            return None
+        return await super().read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=file_path
+        )
+
+
+@pytest.mark.asyncio
+async def test_when_the_approved_spec_cannot_be_put_back_nothing_is_stamped_on_the_rewrites_bytes(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The put-back's failing path: the branch moved (the rewrite's steps
+    differ) but the approved files cannot be read at the approved commit.
+    The run stops loudly at the plan stage, in plain words, BEFORE the second
+    stamping: nothing is ever stamped or planned on bytes no approved row
+    records. One approved row, no line about the model."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _commit_repo_routing_law(repo, "enforced")
+    git = _ForgetfulGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _steps_moved_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(
+            sink,
+            [_switched_off_outcome(), _model_decided_outcome({_MOON_TITLE: "probe:process"})],
+        ),
+    )
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["spec"] == 2
+    assert h.ctx["counters"]["plan"] == 1  # no second attempt
+    assert sink["calls"] == 1
+    cards = _error_cards(h)
+    assert len(cards) == 1
+    assert cards[0].startswith(
+        f"Planning run {CID} stopped at writing the task plan: the machine's rewrite "
+        f"changed nothing on the list, but {_SPEC_FEATURE_REL} could not be read at "
+        "the approved spec's commit "
+    )
+    assert cards[0].endswith(
+        "so the approved spec could not be put back on the branch before stamping "
+        "again; nothing was built"
+    )
+    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
+    assert len(_approved_spec_rows(store)) == 1
+    # The branch tip is still the rewrite's commit: nothing was planned on it.
+    assert _show(repo, f"planning/{CID}", _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE_ENDPOINT_STEPS
+    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(h.ctx["counters"]["last_feature_id"])).returncode != 0
+
+
+@pytest.mark.asyncio
+async def test_when_the_second_stamping_settles_the_titles_without_the_model_no_line_claims_it_did(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The rule 6b line says what the MODEL decided. If the second stamping's
+    own rules settle every refused title (an R-number on each — which the
+    same bytes should never produce, but the line must be true if they do),
+    the plan carries on and NO line about the model is sent; the receipt and
+    the log say why."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    by_rule = StampNormalizerOutcome(
+        status="written",
+        detail="3 scenario(s) stamped by rule, 0 already stamped (untouched)",
+        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "hurl"},
+        rules={"ok": "R9", _MOON_TITLE: "R9", "Another undecidable one": "R9"},
+    )
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),  # the same reply both rounds
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), by_rule]),
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert sink["rules_only"] == [True, None]
+    assert not any("model fallback" in m for _, m, _ in h.ctx["notifications"])
+    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
+    rewrite = _leg_details(store, "feature-plan")["stamp_normalizer"]["rewrite"]
+    assert rewrite["changed_nothing"] is True
+    assert rewrite["owner_line"].startswith("no owner line: the model fallback decided none")
+    assert rewrite["owner_line_sent"] == "no line to send"
+    assert rewrite["second_stamping"]["model_decided"] == {}
 
 
 @pytest.mark.asyncio
@@ -5388,8 +5641,9 @@ async def test_a_refused_rewrite_stops_with_both_sentences_when_the_model_cannot
     ONE message: rule 23's machine-variant sentence — how many examples,
     that the machine tried once, the checker's reason, that nothing was
     built, the sentence shape that works — then the model fallback's own
-    sentence (rule 16), then the titles still refused. No card; the machine's
-    note (a list of titles) is not quoted back; one approved row."""
+    sentence (rule 16), and nothing else (every sentence quoted in the
+    spec). No card; the machine's note (a list of titles) is not quoted
+    back; one approved row."""
     repo, git = _enforced_repo(tmp_path)
     _queue(store)
     sink: dict[str, Any] = {}
@@ -5417,8 +5671,7 @@ async def test_a_refused_rewrite_stops_with_both_sentences_when_the_model_cannot
     assert sink["rules_only"] == [True, None]
     assert _error_cards(h) == [
         f"{_REFUSED_TWICE_SENTENCE} The model fallback was asked and could not "
-        "answer: HTTPStatusError: 502 Bad Gateway from localhost:4000.\n"
-        f"{_STILL_REFUSED_TITLES}"
+        "answer: HTTPStatusError: 502 Bad Gateway from localhost:4000."
     ]
     assert not any("This repo enforces the routing law" in m for _, m, _ in h.ctx["notifications"])
     assert not any("Your note" in m for _, m, _ in h.ctx["notifications"])
@@ -6125,11 +6378,11 @@ async def test_after_a_changed_nothing_rewrite_the_stop_reports_the_models_turn_
 ) -> None:
     """Rule 6b meets rule 1a: the first stamping ran by rule only (the machine
     switched the model off), the rewrite changed nothing, so the model got
-    its turn on a SECOND stamping — which found no endpoint. The stop message
-    is about that second stamping: "no endpoint is configured" once, true
-    this time, and never a word about the model being switched off (that was
-    the first stamping, the machine's own doing, and not what stopped the
-    run). No card."""
+    its turn on a SECOND stamping — which found no endpoint. The card (rule
+    6's, with its "changed nothing" sentence) is about that second stamping:
+    "no endpoint is configured" once, true this time, and never a word about
+    the model being switched off (that was the first stamping, the machine's
+    own doing, and not what stopped the run)."""
     repo, git = _enforced_repo(tmp_path)
     _queue(store)
     sink: dict[str, Any] = {}
@@ -6146,12 +6399,14 @@ async def test_after_a_changed_nothing_rewrite_the_stop_reports_the_models_turn_
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
     assert sink["rules_only"] == [True, None]
     message = _error_cards(h)[0]
-    assert message == (
-        f"{_CHANGED_NOTHING_SENTENCE} The model fallback was not asked: no endpoint "
-        f"is configured.\n{_STILL_REFUSED_TITLES}"
+    assert message.startswith(
+        f"Planning run {CID} stopped at writing the task plan. {_STOP_CHANGED_NOTHING} "
+        "The verifier stamps could not all be minted by rule for feature "
     )
+    assert message.count("The model fallback was not asked: no endpoint is configured.") == 1
     assert "switched off" not in message
-    assert "This repo enforces the routing law" not in message
+    assert "refused the rewrite twice" not in message
+    assert "This repo enforces the routing law" in message
     error = store.get_run(CID)["error"] or ""
     assert "the rewrite changed nothing" in error
     assert "switched off for this stamping" not in error
@@ -6182,7 +6437,9 @@ def test_the_model_decided_pairs_are_the_titles_marked_model_and_nothing_is_gues
     """Rule 6b's line names what the MODEL decided: the titles the normalizer
     marks with rule ``model``. When it marked none (an older guardkit, or a
     stamped map the seam's clipped tail lost), the refused titles with what
-    was written for them — or "not named", never a guessed word."""
+    was written for them — or "not named", never a guessed word. A title an
+    R-number decided, or one found already stamped, is never put in the
+    model's mouth: it is left out, whatever else the map says."""
     marked = _model_decided_outcome({_MOON_TITLE: "probe:process"})
     assert _Driver._model_decided_pairs(marked, [_MOON_TITLE]) == [
         (_MOON_TITLE, "probe:process")
@@ -6194,8 +6451,24 @@ def test_the_model_decided_pairs_are_the_titles_marked_model_and_nothing_is_gues
     lost = StampNormalizerOutcome(status="written", already_stamped=("Another undecidable one",))
     assert _Driver._model_decided_pairs(lost, [_MOON_TITLE, "Another undecidable one"]) == [
         (_MOON_TITLE, "a verifier the normalizer did not name"),
-        ("Another undecidable one", "already stamped"),
     ]
+    # A rule decided it on THIS stamping (an R-number in the rules map): not
+    # the model's, so not on the model's line — even beside a title the map
+    # does not mark at all.
+    by_rule = StampNormalizerOutcome(
+        status="written",
+        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "exam"},
+        rules={"ok": "R9", _MOON_TITLE: "R9"},
+    )
+    assert _Driver._model_decided_pairs(by_rule, [_MOON_TITLE, "Another undecidable one"]) == [
+        ("Another undecidable one", "exam"),
+    ]
+    all_by_rule = StampNormalizerOutcome(
+        status="written",
+        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "hurl"},
+        rules={"ok": "R9", _MOON_TITLE: "R9", "Another undecidable one": "R3"},
+    )
+    assert _Driver._model_decided_pairs(all_by_rule, list(_UNDECIDABLE_TITLES)) == []
 
 
 def test_the_rule_6b_line_keeps_the_specs_shape_for_one_example_and_bends_for_more() -> None:
