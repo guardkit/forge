@@ -3378,6 +3378,13 @@ class PlanningRunDriver:
         # redoes the plan work on the same id and the same branch.
         feature_id = self._mint_feature_id(correlation_id)
 
+        # Rule 1a (2026-09-07): when the rewrite round could still fire — the
+        # switch is on and this run has not had its one rewrite — the FIRST
+        # stamping runs by rule only (no model fallback), because a refusal
+        # is the signal the round listens for. Whether the law is enforced
+        # for the repo is the stamping step's own reading (an unenforced
+        # repo stamps as before). The second stamping, after a rewrite, asks
+        # the model about what is still refused.
         first = await self._plan_attempt(
             correlation_id,
             target_repo=target_repo,
@@ -3386,6 +3393,7 @@ class PlanningRunDriver:
             plan_run_id=plan_run_id,
             feature_id=feature_id,
             round_label="first",
+            rules_only=self._rewrite_round_could_fire(correlation_id),
         )
         if first is None:
             return False  # already loud and terminal
@@ -3437,6 +3445,7 @@ class PlanningRunDriver:
                 plan_run_id=plan_run_id,
                 feature_id=feature_id,
                 round_label="second (after the machine's rewrite, round 1)",
+                rules_only=False,
             )
             if second is None:
                 return False
@@ -3475,6 +3484,7 @@ class PlanningRunDriver:
         plan_run_id: str,
         feature_id: str,
         round_label: str,
+        rules_only: bool = False,
     ) -> "_PlanAttempt | None":
         """One pass of the plan leg's work, from the top: read the approved spec
         back off the branch, dispatch the plan-writer, write the tree with the
@@ -3483,6 +3493,11 @@ class PlanningRunDriver:
         Runs once today; twice when the machine's one rewrite is in play
         (2026-09-06) — the second pass reads the REWRITTEN spec, because it
         reads the latest approved spec row, which the rewrite re-recorded.
+
+        ``rules_only`` (rule 1a, 2026-09-07): ask the stamping step to run by
+        rule only — no model fallback — which it does where the routing law
+        is enforced for the repo/feature. True on the first attempt exactly
+        when the rewrite round could fire; False on the second.
 
         Returns the attempt record, or ``None`` after failing the run loudly
         for any reason other than the normalizer's stop (which the caller
@@ -3614,7 +3629,7 @@ class PlanningRunDriver:
             # failed normalizer never kills the plan — the decided stamps it
             # wrote ride the commit, and everything is receipted below.
             stamps = await self._stamp_normalizer_step(
-                worktree, feature_id, spec_feature_paths
+                worktree, feature_id, spec_feature_paths, rules_only=rules_only
             )
             stamp_state["outcome"] = stamps
             if stamps.stops_the_run:
@@ -3677,12 +3692,26 @@ class PlanningRunDriver:
         latest approved spec row does not already carry ``rewritten_by_machine``
         — the fence is read from the durable row, never from memory (rule 7).
         """
-        cfg = self._deps.planning_config
-        if not bool(getattr(cfg, "rewrite_on_refusal", True)):
+        if not self._rewrite_round_could_fire(correlation_id):
             return False
         if stamps.status not in ("refused", "partial") or not stamps.refused_titles:
             return False
         if not stamps.enforced:
+            return False
+        return True
+
+    def _rewrite_round_could_fire(self, correlation_id: str) -> bool:
+        """The outcome-free half of rule 1: the switch is on
+        (``planning.rewrite_on_refusal``) and the latest approved spec row does
+        not already carry ``rewritten_by_machine`` (rule 7, read from the
+        durable row). This is what decides, BEFORE the first stamping, whether
+        it runs by rule only (rule 1a, 2026-09-07): with the round still
+        possible, a refusal is the signal it needs and the model is not asked
+        until the second stamping; with the switch off, or the one rewrite
+        already spent, the stamping asks the model as before.
+        """
+        cfg = self._deps.planning_config
+        if not bool(getattr(cfg, "rewrite_on_refusal", True)):
             return False
         if self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE).get(
             "rewritten_by_machine"
@@ -3756,6 +3785,10 @@ class PlanningRunDriver:
             "refused_titles": refused_titles,
             "changes": changes,
             "repeat": repeat,
+            # Rule 1a: the receipt says whether the stamping that set off the
+            # rewrite ran by rule only, and what the model fallback said of
+            # itself on that call (switched off, when it was).
+            "first_stamping": self._first_stamping_block(stamps),
         }
         if repeat:
             logger.warning(
@@ -3774,11 +3807,32 @@ class PlanningRunDriver:
         )
         logger.info(
             "planning driver: run %s — the machine's rewrite (round 1) landed "
-            "(%s); stamping again from the top of the plan leg",
+            "(%s); stamping again from the top of the plan leg%s",
             correlation_id,
             changes,
+            (
+                ", this time with the model fallback allowed"
+                if stamps.rules_only
+                else ""
+            ),
         )
         return record
+
+    @staticmethod
+    def _first_stamping_block(stamps: "StampNormalizerOutcome") -> dict[str, Any]:
+        """The receipt of the stamping that set off the machine's rewrite
+        (rule 1a, 2026-09-07): its status, whether it ran by rule only, the
+        note when rule-only was asked for and could not be had, and what the
+        model fallback said about itself when it said anything."""
+        block: dict[str, Any] = {
+            "status": stamps.status,
+            "rules_only": stamps.rules_only,
+        }
+        if stamps.rules_only_note:
+            block["rules_only_note"] = stamps.rules_only_note
+        if stamps.model_outcome is not None:
+            block["model_outcome"] = dict(stamps.model_outcome)
+        return block
 
     async def _stop_at_stamps(
         self,
@@ -3916,6 +3970,15 @@ class PlanningRunDriver:
                     else "line not sent (publish failed)"
                 ),
             }
+            first_stamping = rewrite.get("first_stamping")
+            if isinstance(first_stamping, Mapping):
+                # Rule 1a: the stamping that set off the rewrite, and whether
+                # it ran by rule only; the block's own ``rules_only`` is the
+                # SECOND stamping's (the one committed with the plan). Known
+                # only to the drive that did the stamping — a re-drive after
+                # the row was written reads the rewrite from the durable row,
+                # which keeps rule 4's fields and no more.
+                receipt_block["first_stamping"] = dict(first_stamping)
             stamp_receipt = dict(stamp_receipt or {})
             stamp_receipt["rewrite"] = receipt_block
             logger.info(
@@ -3961,6 +4024,8 @@ class PlanningRunDriver:
         worktree: Path,
         feature_id: str,
         spec_feature_paths: list[str],
+        *,
+        rules_only: bool = False,
     ) -> "StampNormalizerOutcome":
         """Run THE STAMP NORMALIZER against the planning worktree (pre-validate).
 
@@ -3985,11 +4050,22 @@ class PlanningRunDriver:
            refused) or ERROR (failed) is logged here, and the caller
            receipts every title and tells the owner in one plain line.
 
-        The enforcement is resolved AFTER the normalizer ran, from the
-        worktree: the feature YAML's own ``routing_law:`` wins, then the
-        repo's ``.guardkit/config.yaml``, else off — the same two places and
-        the same precedence guardkit's plan-load half reads. Forge only READS
+        The enforcement is resolved from the worktree BEFORE the normalizer
+        runs (since 2026-09-07; it was read afterwards before, from the same
+        files, and nothing the normalizer writes touches the flag): the
+        feature YAML's own ``routing_law:`` wins, then the repo's
+        ``.guardkit/config.yaml``, else off — the same two places and the
+        same precedence guardkit's plan-load half reads. Forge only READS
         the flag; it never writes ``routing_law`` (pinned by test).
+
+        ``rules_only`` (rule 1a of the rewrite-on-refusal lane, 2026-09-07):
+        the caller asks for this stamping to run by rule only — the model
+        fallback not asked — because the machine's rewrite round is still
+        possible and a refusal is what it listens for. Honoured ONLY where
+        the law is enforced for this repo/feature (an unenforced repo stamps
+        exactly as before: the round never fires there) and only by a
+        collaborator that takes the keyword; an older one is called the old
+        way and the receipt says so (``rules_only_note``).
 
         Never raises.
         """
@@ -3997,6 +4073,7 @@ class PlanningRunDriver:
         from forge.planning.target_terminal_tools import (
             StampNormalizerOutcome,
             declare_feature_files_if_absent,
+            normalizer_accepts_rules_only,
         )
 
         normalize = self._deps.normalize_stamps
@@ -4013,28 +4090,10 @@ class PlanningRunDriver:
                     "NOT minted by forge for this plan"
                 ),
             )
-        fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
-        if fill.inconsistent:
-            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
-            # a plan whose feature_files: contradicts forge's own spec commit.
-            logger.error("stamp normalizer hook: %s", fill.reason)
-            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
-        else:
-            try:
-                outcome = await normalize(worktree, feature_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — collaborator boundary
-                logger.exception("stamp normalizer hook raised for %s", feature_id)
-                outcome = StampNormalizerOutcome(
-                    status="failed",
-                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
-                )
-        if fill.fired:
-            outcome = dataclasses.replace(
-                outcome, feature_files_filled=tuple(fill.feature_files)
-            )
-        # Coordinator condition 5: the STOP is gated on enforcement.
+        # Coordinator condition 5: the STOP is gated on enforcement — and
+        # since rule 1a the MODE of the stamping is too, so the law is read
+        # first. A resolver defect is "off", said aloud (the law is opt-in).
+        enforcement: dict[str, str]
         try:
             law = resolve_routing_law(worktree, feature_id)
         except Exception as exc:  # noqa: BLE001 — a resolver defect is "off", said aloud
@@ -4045,19 +4104,78 @@ class PlanningRunDriver:
                 exc,
                 feature_id,
             )
-            outcome = dataclasses.replace(
-                outcome,
-                enforcement="off",
-                enforcement_source="default",
-                enforcement_detail=f"resolver raised {type(exc).__name__}: {exc}",
-            )
+            enforcement = {
+                "enforcement": "off",
+                "enforcement_source": "default",
+                "enforcement_detail": f"resolver raised {type(exc).__name__}: {exc}",
+            }
         else:
-            outcome = dataclasses.replace(
-                outcome,
-                enforcement=law.enforcement,
-                enforcement_source=law.source,
-                enforcement_detail=law.detail,
+            enforcement = {
+                "enforcement": law.enforcement,
+                "enforcement_source": law.source,
+                "enforcement_detail": law.detail,
+            }
+        by_rule_only = bool(rules_only) and enforcement["enforcement"] == "enforced"
+        rules_only_note = ""
+        if by_rule_only and not normalizer_accepts_rules_only(normalize):
+            by_rule_only = False
+            rules_only_note = (
+                "the first stamping was asked to run by rule only (the rewrite "
+                "round is on) but the wired normalize_stamps collaborator does "
+                "not take the rules_only keyword, so it was called as before "
+                "and the model fallback may have been asked"
             )
+            logger.warning("stamp normalizer hook: %s for %s", rules_only_note, feature_id)
+        elif rules_only and not by_rule_only:
+            logger.info(
+                "stamp normalizer hook: rule-only stamping was asked for %s but the "
+                "routing law is not enforced here (%s) — stamping as before, the "
+                "rewrite round does not fire in an unenforced repo",
+                feature_id,
+                enforcement["enforcement_detail"],
+            )
+        fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
+        if fill.inconsistent:
+            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
+            # a plan whose feature_files: contradicts forge's own spec commit.
+            logger.error("stamp normalizer hook: %s", fill.reason)
+            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
+        else:
+            try:
+                if by_rule_only:
+                    logger.info(
+                        "stamp normalizer hook: %s — first stamping by rule only "
+                        "(the rewrite round is on); the model fallback is not "
+                        "asked on this call",
+                        feature_id,
+                    )
+                    outcome = await normalize(worktree, feature_id, rules_only=True)
+                else:
+                    outcome = await normalize(worktree, feature_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — collaborator boundary
+                logger.exception("stamp normalizer hook raised for %s", feature_id)
+                outcome = StampNormalizerOutcome(
+                    status="failed",
+                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
+                )
+        if rules_only_note:
+            # The driver's own reason: the collaborator does not take the keyword.
+            outcome = dataclasses.replace(
+                outcome, rules_only=False, rules_only_note=rules_only_note
+            )
+        elif by_rule_only and not outcome.rules_only_note:
+            # The keyword was passed and the collaborator did not say it could
+            # not honour it (the production one says so — and keeps
+            # ``rules_only`` false — when the installed guardkit has no
+            # ``--no-model`` option); the driver's word is the receipt's.
+            outcome = dataclasses.replace(outcome, rules_only=True)
+        if fill.fired:
+            outcome = dataclasses.replace(
+                outcome, feature_files_filled=tuple(fill.feature_files)
+            )
+        outcome = dataclasses.replace(outcome, **enforcement)
         if outcome.status == "unavailable":
             logger.warning(
                 "stamp normalizer hook: normalizer unavailable for %s — %s",
@@ -4200,6 +4318,14 @@ class PlanningRunDriver:
             return f"The model fallback's answer was rejected: {detail or 'no reason was given'}."
         if status == "not_configured":
             return "The model fallback was not asked: no endpoint is configured."
+        if status == "switched_off":
+            # Rule 1a (2026-09-07): the machine itself ran this stamping by
+            # rule only so its rewrite round could fire. That is the machine's
+            # own doing, not something the owner can act on, and it is NEVER
+            # "no endpoint is configured" — the card says nothing about the
+            # model for it (the receipts carry the outcome). After a rewrite
+            # the card reports the SECOND stamping, which could ask the model.
+            return None
         if status == "decided":
             count: Any = outcome.get("count")
             if not isinstance(count, int) or isinstance(count, bool):
