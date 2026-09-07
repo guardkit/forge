@@ -16,17 +16,26 @@ What these pin:
   the conductor's composed reader reads back — so the journey reviews the
   right failure instead of reviewing blind.
 - **Write, then publish.** A publish that fails leaves the row alone.
+- **The task file rides a repair branch** (rewrite-on-refusal spec Part L,
+  rules 48, 50 and 52). The admission commits a task file in the
+  repository's own frontmatter shape, and the YAML beside it, on
+  ``repair/<task id>`` cut from main; the build is queued on that branch;
+  the shared checkout stays exactly as it was; a second admission adds no
+  commit; guardkit's own loader finds the file in a detached worktree of
+  the branch; a write that fails refuses cleanly.
 
 No broker: the publisher is a list. No live database: SQLite under
-``tmp_path``. No ``.guardkit`` outside the fixture repository.
+``tmp_path``. The fixture repository is a real temporary git checkout.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
-from datetime import UTC, datetime
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -55,7 +64,24 @@ from forge.pipeline.fix_row_producer import (
     fix_correlation_id,
     make_failure_pack_source_reader,
 )
+from forge.pipeline.repair_branch import (
+    branch_exists,
+    find_task_file_on_branch,
+    repair_worktree_path,
+)
 from forge.planning.work_queue_store import WorkQueueStore
+
+from ._repair_repo import (
+    branches,
+    commit_count,
+    git,
+    head,
+    isolate_git,
+    make_feature_repo,
+    porcelain_hash,
+    show,
+    worktrees,
+)
 
 FEATURE_ID = "FEAT-44A8"
 REPO_KEY = "appmilla_github/api_test"
@@ -67,11 +93,15 @@ SOURCE_BUILD = "build-FEAT-44A8-20260904131328"
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _git_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    isolate_git(monkeypatch)
+
+
 @pytest.fixture
 def repo_root(tmp_path: Path) -> Path:
-    root = tmp_path / "api_test"
-    (root / ".guardkit" / "features").mkdir(parents=True)
-    return root
+    """A real checkout on ``main`` with FEAT-44A8 merged and its task folder."""
+    return make_feature_repo(tmp_path / "api_test")
 
 
 @pytest.fixture
@@ -596,12 +626,22 @@ class TestAdmittingAQueueRow:
 
         assert admission.task_id == "TASK-FEAT44A8FIX1"
         assert admission.source_build_id == SOURCE_BUILD
-        written = features_dir(repo_root) / "TASK-FEAT44A8FIX1.yaml"
-        assert yaml.safe_load(written.read_text(encoding="utf-8")) == {
+        assert admission.branch == "repair/TASK-FEAT44A8FIX1"
+        # The YAML lives on the repair branch beside the task file, never in
+        # the shared checkout's working tree (Part L, rules 48 and 50).
+        written = show(
+            repo_root, admission.branch, ".guardkit/features/TASK-FEAT44A8FIX1.yaml"
+        )
+        assert yaml.safe_load(written) == {
             "id": "TASK-FEAT44A8FIX1",
             "name": "The build of FEAT-44A8 in api_test failed: gates red",
             "parent_feature": FEATURE_ID,
         }
+        assert not (features_dir(repo_root) / "TASK-FEAT44A8FIX1.yaml").exists()
+        assert admission.fix_task_path == str(
+            features_dir(repo_root) / "TASK-FEAT44A8FIX1.yaml"
+        )
+        assert publisher.payloads[0]["branch"] == "repair/TASK-FEAT44A8FIX1"
         assert len(publisher.published) == 1
         assert make_failure_pack_source_reader(pool)(admission.build_id) == (
             SOURCE_BUILD
@@ -643,6 +683,10 @@ class TestAdmittingAQueueRow:
                 "feature_id": FEATURE_ID,
                 "source_build_id": SOURCE_BUILD,
                 "fix_task_path": admission.fix_task_path,
+                "branch": "repair/TASK-FEAT44A8FIX1",
+                "task_file_path": (
+                    "tasks/backlog/add-the-thing/TASK-FEAT44A8FIX1-repair.md"
+                ),
             }
         ]
 
@@ -883,3 +927,465 @@ class TestSayingTheQueuedEventAgain:
                     row, publish=Publisher(fail_with=RuntimeError("broker unreachable"))
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# The task file on the repair branch (Part L, rules 48, 50 and 52)
+# ---------------------------------------------------------------------------
+
+REPAIR_BRANCH = "repair/TASK-FEAT44A8FIX1"
+TASK_FILE = "tasks/backlog/add-the-thing/TASK-FEAT44A8FIX1-repair.md"
+YAML_FILE = ".guardkit/features/TASK-FEAT44A8FIX1.yaml"
+MERGE_SENTENCE = (
+    "FEAT-44A8 was merged in appmilla_github/api_test but the checks after it "
+    "went red: merged-deploy-failed — FEAT-44A8 merged, but the deploy ended "
+    "failed"
+)
+
+EVIDENCE_TEXT = """format_version: '1.0'
+entries:
+- artifact: qa/gates/evidence/health_latest.json
+  checkpoint_or_assertion_id: health::status
+  description: 'health/health::status [pass]: expected ''200'', observed ''200'''
+  inspected_by: null
+  verdict: null
+- artifact: qa/gates/evidence/stats_latest.json
+  checkpoint_or_assertion_id: stats::status
+  description: 'stats/stats::status [pass]: expected ''200'', observed ''200'''
+  inspected_by: null
+  verdict: null
+- artifact: qa/gates/evidence/hurl-twins_latest.json
+  checkpoint_or_assertion_id: hurl-twins::delete-existing-user::40
+  description: 'hurl-twins/hurl-twins::delete-existing-user::40 [fail]: expected ''HTTP
+    204'', observed ''actual value is <503>'''
+  inspected_by: null
+  verdict: null
+- artifact: qa/gates/evidence/hurl-twins_latest.json
+  checkpoint_or_assertion_id: hurl-twins::double-delete-honest-404::35
+  description: 'hurl-twins/hurl-twins::double-delete-honest-404::35 [fail]: expected
+    ''HTTP 204'', observed ''actual value is <503>'''
+  inspected_by: null
+  verdict: null
+"""
+
+
+def _frontmatter_and_body(text: str) -> tuple[dict[str, Any], str]:
+    assert text.startswith("---\n"), text[:40]
+    end = text.index("\n---", 4)
+    return yaml.safe_load(text[4:end]), text[end + 4 :]
+
+
+def _write_merge_report(receipts_root: Path, *, source: str = SOURCE_BUILD) -> Path:
+    where = receipts_root / f"merge-{source}"
+    where.mkdir(parents=True)
+    path = where / "merge_deploy_report.json"
+    path.write_text(
+        json.dumps(
+            {
+                "build_id": source,
+                "feature_id": FEATURE_ID,
+                "result": "merged-deploy-failed",
+                "detail": (
+                    "FEAT-44A8 merged, but the deploy ended failed — nothing "
+                    "further was touched"
+                ),
+                "failed_step": "deploy",
+                "merged_sha": "9131bc6b495a489921ab22aeabb71fa477a16cbd",
+                "checks_passed": None,
+                "checks_total": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_gate_evidence(repo_root: Path) -> Path:
+    run = repo_root / "qa" / "gates" / "evidence" / f"{FEATURE_ID}-local-20260907T083219Z"
+    run.mkdir(parents=True)
+    path = run / "EVIDENCE.yaml"
+    path.write_text(EVIDENCE_TEXT, encoding="utf-8")
+    return path
+
+
+class TestTheRepairTaskFile:
+    def _file_merge_row(self, store: WorkQueueStore, *, pack: str | None = None) -> int:
+        return store.file_sentence(
+            correlation_id=fix_correlation_id(SOURCE_BUILD),
+            sentence=MERGE_SENTENCE,
+            originating_user="rich",
+            target_repo=REPO_KEY,
+            kind="fix",
+            action="minted",
+            extra_details={
+                "source": "merge-report",
+                "source_build_id": SOURCE_BUILD,
+                "failure_pack_path": pack,
+            },
+        ).queue_id
+
+    def _admit(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        queue_id: int,
+        *,
+        receipts_root: Path | None = None,
+        publisher: Publisher | None = None,
+    ) -> Any:
+        return asyncio.run(
+            admit_fix_row(
+                config=config,
+                persistence=pool,
+                store=store,
+                queue_id=queue_id,
+                correlation_id=fix_correlation_id(SOURCE_BUILD),
+                sentence=MERGE_SENTENCE,
+                target_repo=REPO_KEY,
+                publish=publisher or Publisher(),
+                originating_user="rich",
+                profile=FIX_JOURNEY_PROFILE_NAME,
+                receipts_root=receipts_root,
+            )
+        )
+
+    def test_the_file_is_committed_on_the_repair_branch_in_the_repository_s_shape(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        receipts = tmp_path / "receipts"
+        report = _write_merge_report(receipts)
+        _write_gate_evidence(repo_root)
+        queue_id = self._file_merge_row(store, pack=None)
+        publisher = Publisher()
+
+        admission = self._admit(
+            config, pool, store, queue_id, receipts_root=receipts, publisher=publisher
+        )
+
+        assert admission.branch == REPAIR_BRANCH
+        assert admission.task_file_path == TASK_FILE
+        assert branch_exists(repo_root, REPAIR_BRANCH)
+        assert admission.repair_commit == head(repo_root, REPAIR_BRANCH)
+        assert commit_count(repo_root, REPAIR_BRANCH) == commit_count(repo_root, "main") + 1
+        assert find_task_file_on_branch(repo_root, REPAIR_BRANCH, admission.task_id) == TASK_FILE
+        assert git(repo_root, "log", "-1", "--format=%s", REPAIR_BRANCH).stdout.strip() == (
+            f"repair task for {SOURCE_BUILD}: {MERGE_SENTENCE}"
+        )
+
+        front, body = _frontmatter_and_body(show(repo_root, REPAIR_BRANCH, TASK_FILE))
+        assert front == {
+            "id": "TASK-FEAT44A8FIX1",
+            "title": f"Repair of {SOURCE_BUILD}",
+            "task_type": "fix",
+            "parent_review": "TASK-REV-44A8",
+            "feature_id": FEATURE_ID,
+            "wave": 1,
+            "implementation_mode": "task-work",
+            "complexity": 3,
+            "dependencies": [],
+        }
+        assert f"# Repair of {SOURCE_BUILD}\n\n{MERGE_SENTENCE}\n" in body
+        assert "## What was observed" in body
+        assert (
+            "- Result: merged-deploy-failed — FEAT-44A8 merged, but the deploy "
+            "ended failed — nothing further was touched"
+        ) in body
+        assert (
+            f"- Source build: {SOURCE_BUILD} (feature FEAT-44A8, merged commit "
+            "9131bc6b495a)"
+        ) in body
+        assert "- Checks: 2 of 4 passed" in body
+        assert (
+            "- These checks failed:\n"
+            "  - hurl-twins::delete-existing-user::40: expected HTTP 204, "
+            "observed actual value is <503>\n"
+            "  - hurl-twins::double-delete-honest-404::35: expected HTTP 204, "
+            "observed actual value is <503>\n"
+        ) in body
+        assert "## Where the evidence is" in body
+        assert f"- Merge report: {report}" in body
+        assert (
+            "- Gate evidence: qa/gates/evidence/FEAT-44A8-local-20260907T083219Z/"
+            "EVIDENCE.yaml"
+        ) in body
+        assert "- Failure pack: none was recorded for this build" in body
+        assert "## Acceptance Criteria" in body
+        assert (
+            "- [ ] The failed checks pass: hurl-twins::delete-existing-user::40, "
+            "hurl-twins::double-delete-honest-404::35\n"
+            "- [ ] The feature's existing tests stay green\n"
+        ) in body
+        assert "## Implementation Notes" in body
+        assert (
+            f"- This task rides the branch {REPAIR_BRANCH}, cut from main; the "
+            "merge word takes that branch into main."
+        ) in body
+
+        # The YAML rides the branch too, in the drive-6 shape.
+        assert yaml.safe_load(show(repo_root, REPAIR_BRANCH, YAML_FILE)) == {
+            "id": "TASK-FEAT44A8FIX1",
+            "name": MERGE_SENTENCE,
+            "parent_feature": FEATURE_ID,
+        }
+        # And the build was queued on the branch.
+        assert publisher.payloads[0]["branch"] == REPAIR_BRANCH
+        assert build_rows(pool)[-1]["branch"] == REPAIR_BRANCH
+
+    def test_the_shared_checkout_is_untouched_throughout(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        (repo_root / "scratch.txt").write_text("an operator's own untracked file\n")
+        queue_id = self._file_merge_row(store)
+        status_before = porcelain_hash(repo_root)
+        head_before = head(repo_root)
+        trees_before = worktrees(repo_root)
+
+        self._admit(config, pool, store, queue_id)
+
+        assert porcelain_hash(repo_root) == status_before
+        assert head(repo_root) == head_before
+        assert git(repo_root, "diff", "--cached", "--quiet").returncode == 0
+        assert worktrees(repo_root) == trees_before
+        assert not repair_worktree_path(repo_root, "TASK-FEAT44A8FIX1").exists()
+        assert not (features_dir(repo_root) / "TASK-FEAT44A8FIX1.yaml").exists()
+
+    def test_a_second_admission_of_the_same_repair_reuses_the_branch_and_adds_no_commit(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+    ) -> None:
+        """The branch is made before the row; a refusal at the row leaves it
+        for the next tick, which must find the same task id and the same file."""
+        seed_failed_build(pool)
+        queue_id = self._file_merge_row(store)
+        # Queued a minute ago: a build id is the feature plus the queued
+        # second, so a build queued in the same second as the repair's own
+        # would collide on the id and read as a duplicate for the wrong reason.
+        earlier = datetime.now(UTC) - timedelta(minutes=1)
+        pool.record_pending_build(
+            BuildQueuedPayload(
+                feature_id=FEATURE_ID,
+                repo=REPO_KEY,
+                feature_yaml_path="f.yaml",
+                triggered_by="cli",
+                correlation_id="already-running",
+                requested_at=earlier,
+                queued_at=earlier,
+            )
+        )
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._admit(config, pool, store, queue_id)
+        assert caught.value.reason == "duplicate"
+        tip = head(repo_root, REPAIR_BRANCH)
+        pool.connection.execute(
+            "UPDATE builds SET status = 'FAILED' WHERE correlation_id = 'already-running'"
+        )
+        pool.connection.commit()
+
+        admission = self._admit(config, pool, store, queue_id)
+
+        assert admission.task_id == "TASK-FEAT44A8FIX1"
+        assert admission.branch == REPAIR_BRANCH
+        assert head(repo_root, REPAIR_BRANCH) == tip
+        assert commit_count(repo_root, REPAIR_BRANCH) == commit_count(repo_root, "main") + 1
+        assert branches(repo_root) == ["main", REPAIR_BRANCH]
+        recorded = [
+            json.loads(str(row["details_json"]))["task_id"]
+            for row in store.list_events(queue_id)
+            if row["action"] == "repair_branch"
+        ]
+        assert recorded == ["TASK-FEAT44A8FIX1", "TASK-FEAT44A8FIX1"]
+
+    def test_a_feature_without_a_task_folder_gets_its_id_lower_cased(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        tmp_path: Path,
+    ) -> None:
+        bare = make_feature_repo(tmp_path / "bare", folder=None)
+        config = make_config(
+            bare,
+            profiles={"attended": {}, FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+        )
+        seed_failed_build(pool)
+        queue_id = self._file_merge_row(store)
+
+        admission = self._admit(config, pool, store, queue_id)
+
+        assert admission.task_file_path == (
+            "tasks/backlog/feat-44a8/TASK-FEAT44A8FIX1-repair.md"
+        )
+        front, body = _frontmatter_and_body(
+            show(bare, REPAIR_BRANCH, admission.task_file_path)
+        )
+        assert "parent_review" not in front
+        assert front["feature_id"] == FEATURE_ID
+        assert "- Merge report: none was found under the receipts root" in body
+        assert "- Gate evidence: not recorded" in body
+        assert (
+            "- Why the repair was filed: the merge landed and the checks after "
+            "it went red"
+        ) in body
+        assert "- [ ] The checks that failed pass" in body
+
+    def test_a_write_that_fails_refuses_cleanly_and_leaves_nothing(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+    ) -> None:
+        """``tasks`` is a file on main, so the task folder cannot be made."""
+        (repo_root / "tasks").rename(repo_root / "tasks-was-here")
+        (repo_root / "tasks").write_text("not a directory\n")
+        git(repo_root, "add", "-A")
+        git(repo_root, "commit", "-q", "-m", "tasks is a file now")
+        seed_failed_build(pool)
+        queue_id = self._file_merge_row(store)
+        status_before = porcelain_hash(repo_root)
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._admit(config, pool, store, queue_id)
+
+        assert caught.value.reason == "repair-task"
+        assert caught.value.permanent is True
+        assert caught.value.message.startswith(
+            "Nothing was queued: the repair's task file could not be put on a "
+            "repair branch ("
+        )
+        assert caught.value.message.endswith(
+            "), and the review leg cannot find a repair task without its file."
+        )
+        assert branches(repo_root) == ["main"]
+        assert not repair_worktree_path(repo_root, "TASK-FEAT44A8FIX1").exists()
+        assert worktrees(repo_root) == [str(repo_root.resolve())]
+        assert porcelain_hash(repo_root) == status_before
+        assert [row for row in build_rows(pool) if row["build_id"] != SOURCE_BUILD] == []
+
+
+# ---------------------------------------------------------------------------
+# guardkit's own loader, against a detached worktree of the branch (rule 52)
+# ---------------------------------------------------------------------------
+
+_LOADER_SCRIPT = """
+import json, sys
+from pathlib import Path
+from guardkit.tasks.task_loader import TaskLoader
+task = TaskLoader.load_task(sys.argv[1], repo_root=Path(sys.argv[2]))
+print("LOADED " + json.dumps({
+    "frontmatter": task["frontmatter"],
+    "acceptance_criteria": task["acceptance_criteria"],
+    "file_path": str(task["file_path"]),
+}, default=str))
+"""
+
+
+def _guardkit_loader_or_skip() -> tuple[Path, str]:
+    """``(checkout, python)`` that can import guardkit's real TaskLoader, or skip."""
+    from tests.forge.planning._live_guardkit import (
+        find_sibling_checkout,
+        live_guardkit_python,
+    )
+
+    start = Path(__file__)
+    env = os.environ.get("FORGE_GUARDKIT_NORMALIZER_CHECKOUT")
+    candidates = [Path(env)] if env else []
+    candidates.append(find_sibling_checkout("guardkit", start))
+    checkout = next(
+        (c for c in candidates if (c / "guardkit" / "tasks" / "task_loader.py").is_file()),
+        None,
+    )
+    if checkout is None:
+        pytest.skip("no guardkit checkout with tasks/task_loader.py reachable")
+    python = live_guardkit_python(checkout, start)
+    probe = subprocess.run(
+        [python, "-c", "import guardkit.tasks.task_loader"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(checkout)},
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"no interpreter can import guardkit's loader: {probe.stderr[-300:]!r}")
+    return checkout, python
+
+
+class TestGuardkitsLoaderFindsTheFile:
+    def test_the_real_task_loader_reads_the_file_from_a_detached_worktree_of_the_branch(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Exactly what the review leg does: the runner makes a detached
+        worktree of the build's branch and guardkit loads the task by id there."""
+        checkout, python = _guardkit_loader_or_skip()
+        seed_failed_build(pool)
+        queue_id = store.file_sentence(
+            correlation_id=fix_correlation_id(SOURCE_BUILD),
+            sentence=MERGE_SENTENCE,
+            originating_user="rich",
+            target_repo=REPO_KEY,
+            kind="fix",
+            action="minted",
+        ).queue_id
+        admission = asyncio.run(
+            admit_fix_row(
+                config=config,
+                persistence=pool,
+                store=store,
+                queue_id=queue_id,
+                correlation_id=fix_correlation_id(SOURCE_BUILD),
+                sentence=MERGE_SENTENCE,
+                target_repo=REPO_KEY,
+                publish=Publisher(),
+                profile=FIX_JOURNEY_PROFILE_NAME,
+            )
+        )
+        detached = tmp_path / "build-worktree"
+        git(repo_root, "worktree", "add", "--detach", str(detached), admission.branch)
+
+        proc = subprocess.run(
+            [python, "-c", _LOADER_SCRIPT, admission.task_id, str(detached)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(checkout)},
+            timeout=120,
+        )
+
+        assert proc.returncode == 0, proc.stderr[-1200:]
+        line = next(line for line in proc.stdout.splitlines() if line.startswith("LOADED "))
+        loaded = json.loads(line[len("LOADED "):])
+        assert loaded["frontmatter"]["id"] == "TASK-FEAT44A8FIX1"
+        assert loaded["frontmatter"]["task_type"] == "fix"
+        assert loaded["frontmatter"]["feature_id"] == FEATURE_ID
+        assert loaded["frontmatter"]["parent_review"] == "TASK-REV-44A8"
+        assert loaded["frontmatter"]["implementation_mode"] == "task-work"
+        assert loaded["frontmatter"]["dependencies"] == []
+        assert "The feature's existing tests stay green" in loaded["acceptance_criteria"]
+        assert loaded["file_path"] == str(detached / TASK_FILE)
+        # Before this lane the same loader had nothing to find on main.
+        proc_main = subprocess.run(
+            [python, "-c", _LOADER_SCRIPT, admission.task_id, str(repo_root)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(checkout)},
+            timeout=120,
+        )
+        assert proc_main.returncode != 0
+        assert "not found" in (proc_main.stderr + proc_main.stdout)

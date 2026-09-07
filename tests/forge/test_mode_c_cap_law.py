@@ -330,9 +330,27 @@ def cli_published(
 
 
 @pytest.fixture
-def repo_dir(tmp_path: Path) -> Path:
+def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real checkout on ``main``: since Part L (2026-09-07) a fix journey
+    rides a ``repair/<task id>`` branch cut from ``--branch``, carrying the
+    task file the review leg loads, so the queue needs a branch to cut from."""
+    import os
+    import subprocess
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     repo = tmp_path / "checkout"
     repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "tests@example.com")
+    git("config", "user.name", "the tests")
+    (repo / "README.md").write_text("the feature, merged\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "the feature, merged")
     return repo
 
 
