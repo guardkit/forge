@@ -45,24 +45,42 @@ and cut to eight characters, then ``FIX``, then the next free number — and
 trims the feature half further if the whole would overflow twelve.
 
 The fix-task YAML it writes is the drive-6 shape and nothing more: ``id``,
-``name``, ``parent_feature``. It lands in the target repository's own
-features directory (``.guardkit/features/``), which is where every other
-leg of the journey looks for the file it was given.
+``name``, ``parent_feature``. On the queue's path it lives at
+``.guardkit/features/<task id>.yaml`` ON THE REPAIR BRANCH, beside the task
+file; the CLI's path takes it wherever the operator put it (``--feature-yaml``)
+and commits a copy at the same place on the branch.
+
+The task file on the repair branch (Part L, 2026-09-07)
+------------------------------------------------------
+
+Journey one refused in four seconds: guardkit's review leg loads its subject
+by id from ``tasks/backlog/**/<TASK-id>*.md`` in the build's worktree, which
+is a detached worktree of the build's branch, so only committed files are
+visible to the legs — and the admission used to write one uncommitted YAML
+into the shared checkout. Now :func:`materialise_repair_task` gathers what
+was observed (the merge report, the gate evidence, the failure pack), renders
+a task file in the repository's own frontmatter shape, and commits it with
+the YAML on ``repair/<task id>``, cut from the build's target branch, through
+:mod:`forge.pipeline.repair_branch`. The build is queued on that branch. Both
+doors take the same path: :func:`admit_fix_row` always; ``forge queue --mode
+c`` when the branch it was given carries no task file for the id.
 
 References
 ----------
 - ``docs/conductor-rewire-spec-2026-09-05.md`` rule 2.
+- ``docs/rewrite-on-refusal-spec-2026-09-06.md`` Part L, rules 48 to 52.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +121,42 @@ DUPLICATE_REASON: str = "duplicate"
 #: next tick, so the queue closes the row instead of asking again for ever.
 TRANSIENT_REFUSAL_REASONS: frozenset[str] = frozenset({DUPLICATE_REASON})
 
+#: The refusal reason when the repair's task file could not be written or
+#: committed on its branch (Part L, rule 50).
+REPAIR_TASK_REASON: str = "repair-task"
+
+#: The events-row action written on the queue row once its repair branch
+#: carries the task file — read back so a second admission of the same row
+#: reuses the same task id and branch.
+REPAIR_BRANCH_ACTION: str = "repair_branch"
+
+#: Where a merge's receipts live under the receipts root, and the report's name.
+MERGE_RECEIPTS_PREFIX: str = "merge-"
+MERGE_REPORT_NAME: str = "merge_deploy_report.json"
+
+#: Where a repository's live gate writes its evidence, and the file's name.
+GATE_EVIDENCE_DIR_PARTS: tuple[str, ...] = ("qa", "gates", "evidence")
+GATE_EVIDENCE_NAME: str = "EVIDENCE.yaml"
+
+#: The complexity a repair task declares. guardkit's legs read neither this
+#: nor ``task_type``; the value keeps the frontmatter in the repository's own
+#: shape, and a repair scoped to named checks is small.
+REPAIR_TASK_COMPLEXITY: int = 3
+
+#: Plain words for why the queue filed a repair, by the producer's source word.
+_FILED_BECAUSE: dict[str, str] = {
+    "merge-report": "the merge landed and the checks after it went red",
+    "candidate-refused": (
+        "the branch failed its sandbox check before the merge, so nothing was merged"
+    ),
+    "build-failed": "the build failed",
+}
+
+#: ``expected '…', observed '…'`` at the end of a gate evidence description.
+_EXPECTED_OBSERVED: re.Pattern[str] = re.compile(
+    r"""expected (['"])(.*?)\1, observed (['"])(.*)\3\s*$""", re.DOTALL
+)
+
 
 # ---------------------------------------------------------------------------
 # Outcomes
@@ -121,6 +175,22 @@ class FixAdmission:
     fix_task_path: str
     source_build_id: str | None = None
     published: bool = True
+    #: The branch the build was queued on — ``repair/<task id>`` when the
+    #: admission put the task file on one, else the branch it was given.
+    branch: str = "main"
+    #: The task file's path on that branch, relative to the checkout.
+    task_file_path: str | None = None
+    #: The tip of the repair branch when one was prepared.
+    repair_commit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBranch:
+    """What a ``prepare_branch`` hook hands back: the branch to queue on."""
+
+    branch: str
+    task_file_path: str | None = None
+    commit: str | None = None
 
 
 class FixAdmissionRefused(Exception):
@@ -131,7 +201,7 @@ class FixAdmissionRefused(Exception):
         reason: A short machine word for the caller to map onto its own
             exit code — one of ``cap``, ``task-id``, ``fix-task-yaml``,
             ``parent-feature``, ``repo-not-allowed``, ``repo-unknown``,
-            ``no-source-build`` or ``duplicate``.
+            ``no-source-build``, ``repair-task`` or ``duplicate``.
         permanent: Whether trying again changes anything. A repository the
             configuration does not know, a budget profile with no cap, a row
             that names no build, a fix-task file that will not parse: every
@@ -218,10 +288,18 @@ def existing_fix_task_ids(repo_path: Path | str) -> set[str]:
     """Every task id that already has a file in the repository's features."""
     directory = features_dir(repo_path)
     try:
-        names = [path.stem.upper() for path in directory.glob("TASK-*.y*ml")]
+        names = {path.stem.upper() for path in directory.glob("TASK-*.y*ml")}
     except OSError:  # pragma: no cover - unreadable directory
-        return set()
-    return set(names)
+        names = set()
+    # A repair that already rides a ``repair/<task id>`` branch has its id
+    # spoken for, whether or not a YAML sits in the checkout.
+    try:
+        from forge.pipeline.repair_branch import repair_task_ids_on_branches
+
+        names |= repair_task_ids_on_branches(repo_path)
+    except Exception:  # noqa: BLE001 — a checkout git cannot read counts no ids
+        pass
+    return names
 
 
 def write_fix_task_yaml(
@@ -237,20 +315,30 @@ def write_fix_task_yaml(
     Written beside the repository's features, because that is where the legs
     of the journey are pointed.
     """
-    import yaml
-
     directory = features_dir(repo_path)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{task_id}.yaml"
     path.write_text(
-        yaml.safe_dump(
-            {"id": task_id, "name": name, "parent_feature": parent_feature},
-            sort_keys=False,
-            default_flow_style=False,
-        ),
+        fix_task_yaml_text(task_id=task_id, parent_feature=parent_feature, name=name),
         encoding="utf-8",
     )
     return path
+
+
+def fix_task_yaml_text(*, task_id: str, parent_feature: str, name: str) -> str:
+    """The three-field fix-task YAML as text — one spelling for both doors."""
+    import yaml
+
+    return yaml.safe_dump(
+        {"id": task_id, "name": name, "parent_feature": parent_feature},
+        sort_keys=False,
+        default_flow_style=False,
+    )
+
+
+def fix_task_yaml_relpath(task_id: str) -> str:
+    """``.guardkit/features/<task id>.yaml`` — where the YAML sits on the branch."""
+    return "/".join((*FEATURES_DIR_PARTS, f"{task_id}.yaml"))
 
 
 def read_parent_feature(yaml_path: Path | str) -> str:
@@ -299,6 +387,461 @@ def read_parent_feature(yaml_path: Path | str) -> str:
     return parent
 
 
+def read_fix_task_name(yaml_path: Path | str) -> str | None:
+    """The ``name`` a fix-task YAML declares, or None when it declares none."""
+    import yaml
+
+    try:
+        data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    name = data.get("name") if isinstance(data, dict) else None
+    return _one_line(name) if isinstance(name, str) and name.strip() else None
+
+
+# ---------------------------------------------------------------------------
+# The task file on the repair branch (Part L)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FailedCheck:
+    """One check that went red, with what it expected and saw when recorded."""
+
+    name: str
+    expected: str | None = None
+    observed: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RepairTaskFacts:
+    """Everything the task file says, gathered from the records that exist."""
+
+    task_id: str
+    feature_id: str
+    name: str
+    base_branch: str = "main"
+    source_build_id: str | None = None
+    filed_because: str | None = None
+    result: str | None = None
+    detail: str | None = None
+    merged_sha: str | None = None
+    checks_passed: int | None = None
+    checks_total: int | None = None
+    failed_checks: tuple[FailedCheck, ...] = ()
+    merge_report_path: str | None = None
+    gate_evidence_path: str | None = None
+    failure_pack_path: str | None = None
+    parent_review: str | None = None
+
+
+def repair_task_relpath(folder: str, task_id: str) -> str:
+    """``tasks/backlog/<folder>/<task id>-repair.md``."""
+    return f"tasks/backlog/{folder}/{task_id}-repair.md"
+
+
+def repair_task_folder(feature_id: str, files_on_base: Iterable[str]) -> str:
+    """The parent feature's task folder under ``tasks/backlog/``, else the id lower-cased.
+
+    The repository's own task files are named ``TASK-<feature code>-NNN-…``
+    (``TASK-39F6-003-update-user-crud.md`` for FEAT-39F6), so the folder is
+    the one under ``tasks/backlog/`` holding files of that name — matched on
+    the feature's code after ``FEAT-`` and, for safety, on its eight-character
+    stem too. A loose file directly under ``tasks/backlog/`` names no folder.
+    """
+    short = feature_id.split("-", 1)[1] if "-" in feature_id else feature_id
+    stems = {f"TASK-{short.upper()}-", f"TASK-{_feature_stem(feature_id)}-"}
+    counts: dict[str, int] = {}
+    for path in files_on_base:
+        parts = Path(path).parts
+        if len(parts) != 4 or parts[0] != "tasks" or parts[1] != "backlog":
+            continue
+        name = parts[3].upper()
+        if name.endswith(".MD") and any(name.startswith(stem) for stem in stems):
+            counts[parts[2]] = counts.get(parts[2], 0) + 1
+    if counts:
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    return feature_id.lower()
+
+
+def render_repair_task_file(facts: RepairTaskFacts) -> str:
+    """The task file's text: the repository's own frontmatter, then rule 48's body."""
+    import yaml
+
+    from forge.pipeline.repair_branch import repair_branch_name
+
+    title = (
+        f"Repair of {facts.source_build_id}"
+        if facts.source_build_id
+        else f"Repair of {facts.feature_id}"
+    )
+    front: dict[str, Any] = {"id": facts.task_id, "title": title, "task_type": "fix"}
+    if facts.parent_review:
+        front["parent_review"] = facts.parent_review
+    front["feature_id"] = facts.feature_id
+    front["wave"] = 1
+    front["implementation_mode"] = "task-work"
+    front["complexity"] = REPAIR_TASK_COMPLEXITY
+    front["dependencies"] = []
+    header = yaml.safe_dump(front, sort_keys=False, allow_unicode=True)
+
+    observed: list[str] = []
+    if facts.result:
+        line = f"- Result: {facts.result}"
+        if facts.detail:
+            line += f" — {facts.detail}"
+        observed.append(line)
+    elif facts.filed_because:
+        observed.append(f"- Why the repair was filed: {facts.filed_because}")
+    if facts.source_build_id:
+        line = f"- Source build: {facts.source_build_id} (feature {facts.feature_id}"
+        if facts.merged_sha:
+            line += f", merged commit {facts.merged_sha[:12]}"
+        observed.append(line + ")")
+    if facts.checks_passed is not None and facts.checks_total is not None:
+        observed.append(
+            f"- Checks: {facts.checks_passed} of {facts.checks_total} passed"
+        )
+    if facts.failed_checks:
+        observed.append("- These checks failed:")
+        for check in facts.failed_checks:
+            line = f"  - {check.name}"
+            if check.expected or check.observed:
+                line += (
+                    f": expected {check.expected or 'not recorded'}, "
+                    f"observed {check.observed or 'not recorded'}"
+                )
+            observed.append(line)
+    else:
+        observed.append(
+            "- No failing check was named on the report or the gate evidence; "
+            "the evidence below is the record."
+        )
+
+    if facts.merge_report_path:
+        report_line = f"- Merge report: {facts.merge_report_path}"
+    elif facts.source_build_id:
+        report_line = "- Merge report: none was found under the receipts root"
+    else:
+        report_line = "- Merge report: not recorded (this repair names no source build)"
+    evidence = [
+        report_line,
+        f"- Gate evidence: {facts.gate_evidence_path or 'not recorded'}",
+        f"- Failure pack: {facts.failure_pack_path or 'none was recorded for this build'}",
+    ]
+
+    if facts.failed_checks:
+        names = ", ".join(check.name for check in facts.failed_checks)
+        first = f"- [ ] The failed checks pass: {names}"
+    else:
+        first = "- [ ] The checks that failed pass"
+    criteria = [first, "- [ ] The feature's existing tests stay green"]
+
+    notes = [
+        "- Read the evidence named above before changing code.",
+        f"- This task rides the branch {repair_branch_name(facts.task_id)}, cut "
+        f"from {facts.base_branch}; the merge word takes that branch into main.",
+    ]
+
+    body = "\n".join(
+        [
+            f"# {title}",
+            "",
+            facts.name,
+            "",
+            "## What was observed",
+            "",
+            *observed,
+            "",
+            "## Where the evidence is",
+            "",
+            *evidence,
+            "",
+            "## Acceptance Criteria",
+            "",
+            *criteria,
+            "",
+            "## Implementation Notes",
+            "",
+            *notes,
+            "",
+        ]
+    )
+    return f"---\n{header}---\n\n{body}"
+
+
+def _frontmatter(text: str) -> dict[str, Any]:
+    """The YAML between the leading ``---`` lines, or ``{}``."""
+    import yaml
+
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    try:
+        data = yaml.safe_load(text[3:end])
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _text(value: Any) -> str | None:
+    return _one_line(value) if isinstance(value, str) and value.strip() else None
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _default_receipts_root() -> Path:
+    try:
+        from forge.receipts import receipts_root
+
+        return receipts_root()
+    except Exception:  # noqa: BLE001 — the report is then simply not found
+        return Path("~/forge-state/receipts").expanduser()
+
+
+def _read_merge_report(
+    source_build_id: str, receipts_root: Path | str | None
+) -> tuple[str | None, dict[str, Any] | None]:
+    """``(path, report)`` — the path when the file exists, the report when it parses."""
+    root = Path(receipts_root).expanduser() if receipts_root else _default_receipts_root()
+    path = root / f"{MERGE_RECEIPTS_PREFIX}{source_build_id}" / MERGE_REPORT_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return (str(path) if path.is_file() else None), None
+    return str(path), (data if isinstance(data, dict) else None)
+
+
+def _newest_gate_evidence(repo: Path, feature_id: str) -> tuple[str | None, str | None]:
+    """``(relative path, text)`` of the newest ``qa/gates/evidence/<FEAT>-*/EVIDENCE.yaml``."""
+    root = repo.joinpath(*GATE_EVIDENCE_DIR_PARTS)
+    try:
+        runs = sorted(
+            entry
+            for entry in root.iterdir()
+            if entry.is_dir()
+            and entry.name.startswith(f"{feature_id}-")
+            and (entry / GATE_EVIDENCE_NAME).is_file()
+        )
+    except OSError:
+        return None, None
+    if not runs:
+        return None, None
+    path = runs[-1] / GATE_EVIDENCE_NAME
+    try:
+        return str(path.relative_to(repo)), path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None, None
+
+
+def _parse_gate_evidence(text: str) -> tuple[int, list[FailedCheck]]:
+    """``(passed, failed)`` from an EVIDENCE.yaml; the checks say ``[pass]``/``[fail]``."""
+    import yaml
+
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return 0, []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return 0, []
+    passed = 0
+    failed: list[FailedCheck] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        description = str(entry.get("description") or "")
+        verdict = str(entry.get("verdict") or "").lower()
+        if verdict in {"fail", "failed"} or "[fail]" in description:
+            name = str(entry.get("checkpoint_or_assertion_id") or entry.get("id") or description)
+            match = _EXPECTED_OBSERVED.search(description)
+            failed.append(
+                FailedCheck(
+                    name=_one_line(name),
+                    expected=_one_line(match.group(2)) if match else None,
+                    observed=_one_line(match.group(4)) if match else None,
+                )
+            )
+        elif verdict in {"pass", "passed"} or "[pass]" in description:
+            passed += 1
+    return passed, failed
+
+
+def _parent_review_on_branch(
+    repo: Path, base_branch: str, feature_id: str, folder: str, files_on_base: Iterable[str]
+) -> str | None:
+    """The ``parent_review`` the feature's own task files carry, when they do."""
+    from forge.pipeline.repair_branch import read_branch_file
+
+    head = f"tasks/backlog/{folder}/"
+    for path in sorted(files_on_base):
+        name = Path(path).name.upper()
+        if not (path.startswith(head) and name.startswith("TASK-") and name.endswith(".MD")):
+            continue
+        front = _frontmatter(read_branch_file(repo, base_branch, path) or "")
+        declared = front.get("feature_id")
+        if declared not in (None, feature_id):
+            continue
+        review = front.get("parent_review")
+        if isinstance(review, str) and review.strip():
+            return review.strip()
+    return None
+
+
+def gather_repair_facts(
+    *,
+    repo_path: Path | str,
+    task_id: str,
+    feature_id: str,
+    name: str,
+    base_branch: str = "main",
+    source_build_id: str | None = None,
+    minted: Mapping[str, Any] | None = None,
+    receipts_root: Path | str | None = None,
+    files_on_base: Iterable[str] | None = None,
+) -> RepairTaskFacts:
+    """Read what the records say about the failure; never raise for a missing one.
+
+    The merge report under ``<receipts root>/merge-<source build>/`` gives the
+    result word, the detail, the merged commit and the counts; the newest
+    gate evidence for the feature in the checkout's ``qa/gates/evidence/``
+    names the checks that failed with what they expected and saw; the queue
+    row's filing note (``minted``) gives the failure pack and why the row was
+    filed; the feature's own task files on the base branch give the review id.
+    """
+    from forge.pipeline.repair_branch import list_branch_files
+
+    repo = Path(repo_path)
+    note = dict(minted or {})
+    files = list(files_on_base) if files_on_base is not None else list_branch_files(
+        repo, base_branch, "tasks"
+    )
+    folder = repair_task_folder(feature_id, files)
+
+    result = detail = merged_sha = None
+    checks_passed = checks_total = None
+    failed: list[FailedCheck] = []
+    report_path: str | None = None
+    if source_build_id:
+        report_path, report = _read_merge_report(source_build_id, receipts_root)
+        if report:
+            result = _text(report.get("result"))
+            detail = _text(report.get("detail"))
+            merged_sha = _text(report.get("merged_sha"))
+            checks_passed = _int(report.get("checks_passed"))
+            checks_total = _int(report.get("checks_total"))
+            gate = report.get("gate_before_merge")
+            if isinstance(gate, dict):
+                for check in gate.get("failed_checks") or []:
+                    if _text(check):
+                        failed.append(FailedCheck(name=_one_line(check)))
+                if checks_total is None:
+                    checks_total = _int(gate.get("checks_total"))
+                    checks_passed = _int(gate.get("checks_passed"))
+
+    evidence_path, evidence_text = _newest_gate_evidence(repo, feature_id)
+    if evidence_text:
+        passed_count, from_evidence = _parse_gate_evidence(evidence_text)
+        if from_evidence:
+            by_name = {check.name: check for check in from_evidence}
+            merged = [by_name.pop(check.name, check) for check in failed]
+            merged.extend(by_name.values())
+            failed = merged
+        if checks_total is None:
+            checks_total = passed_count + len(from_evidence)
+            checks_passed = passed_count
+
+    return RepairTaskFacts(
+        task_id=task_id,
+        feature_id=feature_id,
+        name=name,
+        base_branch=base_branch,
+        source_build_id=source_build_id,
+        filed_because=_FILED_BECAUSE.get(str(note.get("source") or "")),
+        result=result,
+        detail=detail,
+        merged_sha=merged_sha,
+        checks_passed=checks_passed,
+        checks_total=checks_total,
+        failed_checks=tuple(failed),
+        merge_report_path=report_path,
+        gate_evidence_path=evidence_path,
+        failure_pack_path=_text(note.get("failure_pack_path")),
+        parent_review=_parent_review_on_branch(
+            repo, base_branch, feature_id, folder, files
+        ),
+    )
+
+
+def materialise_repair_task(
+    *,
+    repo_path: Path | str,
+    task_id: str,
+    feature_id: str,
+    name: str,
+    base_branch: str = "main",
+    source_build_id: str | None = None,
+    minted: Mapping[str, Any] | None = None,
+    receipts_root: Path | str | None = None,
+) -> PreparedBranch:
+    """Put the task file and the YAML on ``repair/<task id>``, cut from ``base_branch``.
+
+    The one materialisation both doors use. Raises
+    :class:`forge.pipeline.repair_branch.RepairBranchError` with a plain
+    sentence when the branch cannot be cut, written or committed; then
+    nothing this call made is left behind.
+    """
+    from forge.pipeline.repair_branch import (
+        list_branch_files,
+        materialise_repair_branch,
+    )
+
+    repo = Path(repo_path)
+    files_on_base = list_branch_files(repo, base_branch, "tasks")
+    folder = repair_task_folder(feature_id, files_on_base)
+    facts = gather_repair_facts(
+        repo_path=repo,
+        task_id=task_id,
+        feature_id=feature_id,
+        name=name,
+        base_branch=base_branch,
+        source_build_id=source_build_id,
+        minted=minted,
+        receipts_root=receipts_root,
+        files_on_base=files_on_base,
+    )
+    task_relpath = repair_task_relpath(folder, task_id)
+    files = {
+        task_relpath: render_repair_task_file(facts),
+        fix_task_yaml_relpath(task_id): fix_task_yaml_text(
+            task_id=task_id, parent_feature=feature_id, name=name
+        ),
+    }
+    subject = source_build_id or task_id
+    result = materialise_repair_branch(
+        repo,
+        task_id=task_id,
+        base_branch=base_branch,
+        files=files,
+        message=f"repair task for {subject}: {name}",
+    )
+    logger.info(
+        "fix admission: %s carries %s and %s at %s (%s)",
+        result.branch,
+        task_relpath,
+        fix_task_yaml_relpath(task_id),
+        result.commit[:12],
+        "committed" if result.committed else "already there, nothing committed",
+    )
+    return PreparedBranch(
+        branch=result.branch, task_file_path=task_relpath, commit=result.commit
+    )
+
+
 # ---------------------------------------------------------------------------
 # The admission itself
 # ---------------------------------------------------------------------------
@@ -323,6 +866,8 @@ async def admit_fix_build(
     originating_adapter: str | None = None,
     parent_request_id: str | None = None,
     source_build_id: str | None = None,
+    parent_feature: str | None = None,
+    prepare_branch: Callable[[], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FixAdmission:
     """Open one fix journey: check it, write its row, tell the pipeline.
@@ -349,6 +894,16 @@ async def admit_fix_build(
         source_build_id: The FAILED build this journey repairs, recorded for
             the caller's own audit trail. The journey itself finds the pack
             through the correlation id (``fix-<source build id>``).
+        parent_feature: The parent feature when the caller already knows it
+            (the queue's path reads it off the source build's row and writes
+            the YAML from it, on the branch); the YAML is then not read.
+        prepare_branch: Called after every check and before the row is
+            written; returns a :class:`PreparedBranch` (or an awaitable of
+            one) naming the branch the build rides — the repair branch
+            carrying the task file. A
+            :class:`forge.pipeline.repair_branch.RepairBranchError` from it
+            refuses the admission with reason ``repair-task``. Left unset,
+            the build rides ``branch`` as given.
 
     Returns:
         The :class:`FixAdmission` describing what was opened.
@@ -383,8 +938,11 @@ async def admit_fix_build(
             permanent=True,
         )
 
-    # 3. The parent feature, from the fix-task YAML.
-    raw_parent = read_parent_feature(fix_task_yaml)
+    # 3. The parent feature, from the fix-task YAML unless the caller knows it.
+    raw_parent = (
+        parent_feature if parent_feature and parent_feature.strip()
+        else read_parent_feature(fix_task_yaml)
+    )
     try:
         feature_id = validate_feature_id(raw_parent)
     except InvalidIdentifierError as exc:
@@ -404,6 +962,34 @@ async def admit_fix_build(
             reason="repo-not-allowed",
             permanent=True,
         )
+
+    # 4b. The branch the build rides. The repair's own, with the task file
+    #     the review leg will look for committed on it (Part L, rule 48) —
+    #     before the row, so a repair whose task file cannot be written never
+    #     gets a build row.
+    prepared: PreparedBranch | None = None
+    if prepare_branch is not None:
+        from forge.pipeline.repair_branch import RepairBranchError
+
+        try:
+            outcome = prepare_branch()
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+        except RepairBranchError as exc:
+            raise FixAdmissionRefused(
+                "Nothing was queued: the repair's task file could not be put on "
+                f"a repair branch ({exc}), and the review leg cannot find a "
+                "repair task without its file.",
+                reason=REPAIR_TASK_REASON,
+                permanent=True,
+            ) from exc
+        if not isinstance(outcome, PreparedBranch):
+            raise TypeError(
+                "prepare_branch must return a PreparedBranch, "
+                f"got {type(outcome).__name__}"
+            )
+        prepared = outcome
+        branch = prepared.branch
 
     # 5. The payload, the row, then the publish.
     from nats_core.envelope import EventType, MessageEnvelope
@@ -464,6 +1050,9 @@ async def admit_fix_build(
         repo=payload.repo,
         fix_task_path=str(Path(fix_task_yaml)),
         source_build_id=source_build_id,
+        branch=branch,
+        task_file_path=prepared.task_file_path if prepared else None,
+        repair_commit=prepared.commit if prepared else None,
     )
 
     envelope = MessageEnvelope(
@@ -485,12 +1074,13 @@ async def admit_fix_build(
         ) from exc
 
     logger.info(
-        "fix admission: opened %s for %s (task %s, repo %s, correlation id "
-        "%s, profile %s)",
+        "fix admission: opened %s for %s (task %s, repo %s, branch %s, "
+        "correlation id %s, profile %s)",
         admission.build_id,
         feature_id,
         task_id,
         admission.repo,
+        branch,
         correlation_id,
         profile,
     )
@@ -512,14 +1102,24 @@ async def admit_fix_row(
     branch: str = "main",
     profile: str | None = None,
     actor_identity: str = "forge-work-queue",
+    receipts_root: Path | str | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> FixAdmission:
     """Turn one ``kind='fix'`` queue row into an open fix journey.
 
-    Mints the task id, writes the fix-task YAML beside the target
-    repository's features, and hands the rest to :func:`admit_fix_build`.
-    Records what it opened against the queue row so the row and its build can
-    be read back as one thing.
+    Mints the task id (or reuses the one this row already has), puts the
+    task file and the fix-task YAML on ``repair/<task id>`` cut from
+    ``branch`` (Part L, rule 48), and hands the rest to
+    :func:`admit_fix_build`, which queues the build on that branch. Records
+    what it opened against the queue row so the row and its build can be
+    read back as one thing. The shared checkout's working tree and index are
+    not touched.
+
+    Args:
+        branch: The build's target branch — what the repair branch is cut
+            from and what the repair will merge into.
+        receipts_root: Where the merge report is read from (tests point it
+            at a temporary directory); the estate's own root when unset.
 
     Raises:
         FixAdmissionRefused: when the source build, the repository or the
@@ -569,15 +1169,35 @@ async def admit_fix_row(
         )
     repo_path = Path(str(paths[resolution.name])).expanduser()
 
-    task_id = mint_fix_task_id(
+    task_id = _task_id_already_on_row(store, queue_id) or mint_fix_task_id(
         parent_feature, existing=existing_fix_task_ids(repo_path)
     )
-    fix_task_path = write_fix_task_yaml(
-        repo_path=repo_path,
-        task_id=task_id,
-        parent_feature=parent_feature,
-        name=_one_line(sentence),
-    )
+    name = _one_line(sentence)
+    fix_task_path = features_dir(repo_path) / f"{task_id}.yaml"
+    minted = _minted_details(store, queue_id)
+
+    async def _prepare() -> PreparedBranch:
+        import asyncio
+
+        prepared = await asyncio.to_thread(
+            materialise_repair_task,
+            repo_path=repo_path,
+            task_id=task_id,
+            feature_id=parent_feature,
+            name=name,
+            base_branch=branch,
+            source_build_id=source,
+            minted=minted,
+            receipts_root=receipts_root,
+        )
+        _record_repair_branch(
+            store,
+            queue_id=queue_id,
+            task_id=task_id,
+            prepared=prepared,
+            actor_identity=actor_identity,
+        )
+        return prepared
 
     admission = await admit_fix_build(
         config=config,
@@ -589,6 +1209,8 @@ async def admit_fix_row(
         publish=publish,
         branch=branch,
         profile=profile,
+        parent_feature=parent_feature,
+        prepare_branch=_prepare,
         max_turns=getattr(config.queue, "default_max_turns", None),
         sdk_timeout_seconds=getattr(config.queue, "default_sdk_timeout_seconds", None),
         originating_user=originating_user,
@@ -715,6 +1337,8 @@ def _record_admitted_build(
                 "feature_id": admission.feature_id,
                 "source_build_id": admission.source_build_id,
                 "fix_task_path": admission.fix_task_path,
+                "branch": admission.branch,
+                "task_file_path": admission.task_file_path,
             },
         )
     except Exception as exc:  # noqa: BLE001 — a note never costs a journey
@@ -724,6 +1348,76 @@ def _record_admitted_build(
             type(exc).__name__,
             exc,
         )
+
+
+def _record_repair_branch(
+    store: Any,
+    *,
+    queue_id: int,
+    task_id: str,
+    prepared: PreparedBranch,
+    actor_identity: str,
+) -> None:
+    """Write down which branch this row's repair rides; never stop the journey for it."""
+    try:
+        store.record_event(
+            queue_id=queue_id,
+            action=REPAIR_BRANCH_ACTION,
+            actor_identity=actor_identity,
+            details={
+                "task_id": task_id,
+                "branch": prepared.branch,
+                "task_file_path": prepared.task_file_path,
+                "commit": prepared.commit,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — a note never costs a journey
+        logger.warning(
+            "fix admission: could not record the repair branch against #%d (%s: %s)",
+            queue_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _row_events(store: Any, queue_id: int) -> list[tuple[str, dict[str, Any]]]:
+    """``(action, details)`` for every event on the row, oldest first; empty on any trouble."""
+    try:
+        rows = list(store.list_events(queue_id))
+    except Exception:  # noqa: BLE001 — a store that cannot be read has no notes
+        return []
+    events: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        action = str(_row_value(row, "action", "") or "")
+        raw = _row_value(row, "details_json") or _row_value(row, "details")
+        details: Any = raw
+        if isinstance(raw, (str, bytes)):
+            try:
+                details = json.loads(raw)
+            except ValueError:
+                details = {}
+        events.append((action, details if isinstance(details, dict) else {}))
+    return events
+
+
+def _task_id_already_on_row(store: Any, queue_id: int) -> str | None:
+    """The task id this row's repair already has — from an earlier admission
+    or an earlier materialised branch — so a second admission reuses it."""
+    found: str | None = None
+    for action, details in _row_events(store, queue_id):
+        if action in (ADMITTED_BUILD_ACTION, REPAIR_BRANCH_ACTION):
+            candidate = details.get("task_id")
+            if isinstance(candidate, str) and TASK_ID_REGEX.match(candidate):
+                found = candidate
+    return found
+
+
+def _minted_details(store: Any, queue_id: int) -> dict[str, Any]:
+    """The producer's filing note on the row (source, failure pack), if any."""
+    for action, details in _row_events(store, queue_id):
+        if action == "minted":
+            return details
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -793,23 +1487,41 @@ def _one_line(text: str) -> str:
 __all__ = [
     "ADMITTED_BUILD_ACTION",
     "DUPLICATE_REASON",
+    "GATE_EVIDENCE_DIR_PARTS",
+    "GATE_EVIDENCE_NAME",
+    "MERGE_RECEIPTS_PREFIX",
+    "MERGE_REPORT_NAME",
+    "REPAIR_BRANCH_ACTION",
+    "REPAIR_TASK_COMPLEXITY",
+    "REPAIR_TASK_REASON",
     "REPUBLISHED_ACTION",
     "TRANSIENT_REFUSAL_REASONS",
     "BUILD_QUEUED_SUBJECT_PREFIX",
     "FEATURES_DIR_PARTS",
     "FixAdmission",
+    "FailedCheck",
     "FixAdmissionRefused",
     "FixPublishFailed",
     "MAX_TASK_SUFFIX_CHARS",
+    "PreparedBranch",
+    "RepairTaskFacts",
     "SOURCE_ID",
     "TASK_ID_REGEX",
     "admit_fix_build",
     "admit_fix_row",
     "existing_fix_task_ids",
     "features_dir",
+    "fix_task_yaml_relpath",
+    "fix_task_yaml_text",
+    "gather_repair_facts",
+    "materialise_repair_task",
     "mint_fix_task_id",
     "path_in_allowlist",
+    "read_fix_task_name",
     "read_parent_feature",
+    "render_repair_task_file",
+    "repair_task_folder",
+    "repair_task_relpath",
     "repo_slug",
     "republish_build_queued",
     "write_fix_task_yaml",

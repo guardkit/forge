@@ -72,7 +72,7 @@ import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import click
 
@@ -444,7 +444,74 @@ _FIX_REFUSAL_EXIT_CODES: dict[str, int] = {
     "parent-feature": EXIT_INVALID_IDENTIFIER,
     "repo-not-allowed": EXIT_PATH_REFUSED,
     "duplicate": EXIT_DUPLICATE,
+    "repair-task": EXIT_PUBLISH_FAILED,
 }
+
+
+def _repair_task_preparer(
+    *,
+    task_id: str,
+    repo_path: Path,
+    branch: str,
+    feature_yaml: Path,
+    correlation_id: str,
+) -> Callable[[], Any] | None:
+    """The materialisation ``forge queue --mode c`` runs when the branch has no task file.
+
+    Rewrite-on-refusal spec Part L, rule 49: guardkit's review leg loads its
+    subject from ``tasks/**/<task id>*.md`` in the build's worktree, a
+    detached worktree of the branch, so a repair queued on a branch without
+    that file refuses in seconds. When ``--branch`` carries no such file the
+    same materialisation the work queue uses writes one from the YAML's own
+    fields on ``repair/<task id>``, cut from ``--branch``, and the build is
+    queued there.
+
+    Returns ``None`` when nothing needs doing — the branch already carries
+    the file, or the subject is not a task id at all (the admission refuses
+    that in its own words). Exits with one sentence, queueing nothing, when
+    the checkout cannot even be asked (no git, no such branch): a repair whose
+    task file the review leg cannot find is not worth a build row.
+    """
+    from forge.pipeline.fix_admission import (
+        TASK_ID_REGEX,
+        materialise_repair_task,
+        read_fix_task_name,
+        read_parent_feature,
+    )
+    from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
+    from forge.pipeline.repair_branch import (
+        branch_exists,
+        find_task_file_on_branch,
+        is_git_checkout,
+    )
+
+    if not TASK_ID_REGEX.match(task_id):
+        return None
+    if not is_git_checkout(repo_path) or not branch_exists(repo_path, branch):
+        click.echo(
+            f"Nothing was queued: {repo_path} has no git branch {branch!r} to "
+            f"look for {task_id}'s task file on or to cut a repair branch "
+            "from, and the review leg cannot find a repair task without its "
+            "file.",
+            err=True,
+        )
+        sys.exit(EXIT_PUBLISH_FAILED)
+    if find_task_file_on_branch(repo_path, branch, task_id) is not None:
+        return None
+
+    def _prepare() -> Any:
+        parent = read_parent_feature(feature_yaml)
+        name = read_fix_task_name(feature_yaml) or f"repair of {parent}"
+        return materialise_repair_task(
+            repo_path=repo_path,
+            task_id=task_id,
+            feature_id=parent,
+            name=name,
+            base_branch=branch,
+            source_build_id=source_build_id_from_correlation_id(correlation_id),
+        )
+
+    return _prepare
 
 
 def _admit_fix_journey(
@@ -482,6 +549,15 @@ def _admit_fix_journey(
 
     persistence = make_persistence(config)
 
+    # Part L, rule 49: a repair rides a branch that carries its task file.
+    preparer = _repair_task_preparer(
+        task_id=positional_id,
+        repo_path=repo_path,
+        branch=branch,
+        feature_yaml=feature_yaml,
+        correlation_id=correlation_id,
+    )
+
     async def _publish(subject: str, body: bytes) -> None:
         await asyncio.to_thread(publish, subject, body)
 
@@ -496,6 +572,7 @@ def _admit_fix_journey(
                 correlation_id=correlation_id,
                 publish=_publish,
                 branch=branch,
+                prepare_branch=preparer,
                 profile=profile_name,
                 uncapped_acknowledged=uncapped_acknowledged,
                 max_turns=max_turns,
@@ -521,6 +598,12 @@ def _admit_fix_journey(
         click.echo(exc.message, err=True)
         sys.exit(EXIT_PUBLISH_FAILED)
 
+    if admission.branch != branch:
+        click.echo(
+            f"{admission.task_id} had no task file on {branch!r}, so the "
+            f"machine wrote one on the branch {admission.branch!r} "
+            f"({admission.task_file_path}) and queued the build there."
+        )
     click.echo(
         f"Queued {admission.feature_id} (build pending) "
         f"mode={BuildMode.MODE_C.value} "
