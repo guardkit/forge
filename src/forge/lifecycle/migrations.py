@@ -46,13 +46,17 @@ from typing import Final
 # ordinary broken build — all four of which ``status`` still spells FAILED.
 # bumped to 10 in the work-queue lane (Lane B stage one) to add the two new
 # ``work_queue`` / ``work_queue_events`` tables — the list of sentences the
-# factory has been asked for but has not started yet.
+# factory has been asked for but has not started yet; bumped to 11 in Part M of
+# the rewrite-on-refusal lane to add the additive ``builds.merge_branch``
+# column — the branch the merge word merges, written by the conductor for a
+# fix journey and empty (meaning ``autobuild/<feature id>``) for every feature
+# build.
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 10
+_SCHEMA_VERSION: Final[int] = 11
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -78,6 +82,13 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # index is touched, so a forge that never reads the queue behaves exactly
     # as it does today.
     (10, "schema_v10.sql"),
+    # v11 (the merge word merges the branch the build made, Part M) — the
+    # additive ``builds.merge_branch`` column. A repair's commits land on the
+    # fix journey's own branch, and nothing recorded its name, so the merge
+    # word would have merged the original feature's branch instead. NULL-able:
+    # a feature build never writes it and every reader falls back to
+    # ``autobuild/<feature id>``.
+    (11, "schema_v11.sql"),
 )
 
 

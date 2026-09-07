@@ -57,14 +57,16 @@ operator whose fix journeys branch off something else passes it here once,
 at wiring time.
 
 One exception, per build (Part L of the 2026-09-06 spec, added
-2026-09-07): a build queued on a ``repair/<task id>`` branch has its journey
-tree cut from that branch, not from ``main``
-(:func:`forge.cli._conductor_worktree.journey_base_ref`), because the branch
-carries the repair's task file as a committed file. The probe reads the
-row's ``branch`` and counts from it in that case, so the repair's own
-task-file commit is never counted as a leg's work — a journey that changed
-nothing must still end quietly, not be handed back as a fix. Every other row
-branch leaves the wiring-time base in force.
+2026-09-07, widened by Part M rule 56 the same day): a build queued on a
+branch of its own — ``repair/<task id>``, or whatever ``forge queue --mode c
+--branch`` named — has its journey tree cut from that branch, not from
+``main`` (:func:`forge.cli._conductor_worktree.journey_base_ref`), because
+the branch carries the repair's task file as a committed file. The probe
+reads the row's ``branch`` through the same function and counts from it, so
+the branch's own commits are never counted as a leg's work — a journey that
+changed nothing must still end quietly, not be handed back as a fix. A row
+whose branch is ``main`` (or names none) leaves the wiring-time base in
+force.
 
 References:
     - design pass §a.3 (`supervisor-revival-design-pass-2026-07-31`).
@@ -82,7 +84,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from forge.adapters.git.operations import ExecuteCallable, _default_execute
 from forge.lifecycle.persistence import Build
-from forge.pipeline.repair_branch import is_repair_branch
 from forge.pipeline.terminal_handlers.mode_c import CommitProbe, CommitProbeResult
 
 logger = logging.getLogger(__name__)
@@ -202,12 +203,16 @@ def make_mode_c_commit_probe(
                     f"build_id={build_id!r}",
                 )
 
-        # The wiring-time base — unless the build was queued on a repair
-        # branch, whose journey tree is cut from that branch (module
-        # docstring, "The base ref"): counting from main there would count
-        # the repair's own task-file commit as a leg's work.
+        # The wiring-time base — unless the build was queued on a branch of
+        # its own, whose journey tree is cut from that branch (module
+        # docstring, "The base ref"; one rule with the conductor's writer,
+        # Part M rule 56): counting from main there would count the branch's
+        # own commits as a leg's work.
+        from forge.cli._conductor_worktree import JOURNEY_BASE_REF, journey_base_ref
+
         row_branch = getattr(row, "branch", None)
-        range_base = str(row_branch).strip() if is_repair_branch(row_branch) else base
+        journey_base = journey_base_ref(row_branch)
+        range_base = base if journey_base == JOURNEY_BASE_REF else journey_base
         command = ["git", "rev-list", "--count", f"{range_base}..HEAD"]
         try:
             result = await execute(

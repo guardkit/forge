@@ -2199,3 +2199,257 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         }
         assert "candidate-refused" not in RED_MERGE_ENDINGS  # filed on its own rule
         assert "merge-refused" not in RED_MERGE_ENDINGS
+
+
+# ---------------------------------------------------------------------------
+# The merge word merges the branch the build actually made (Part M, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+REPAIR_BUILD_ID = "build-FEAT-MX1-20260907120000"
+REPAIR_TASK_ID = "TASK-MX1FIX1"
+#: What the conductor names a journey branch: ``fix/<task id>-<build8>``.
+REPAIR_BRANCH = f"fix/{REPAIR_TASK_ID}-07120000"
+
+
+def _cut_repair_journey_branch(repo_root: Path, branch: str = REPAIR_BRANCH) -> str:
+    """The repair's own branch: one commit past main that the feature branch lacks."""
+    _git(repo_root, "checkout", "-q", "-b", branch, "main")
+    (repo_root / "the-repair.txt").write_text("the repair\n", encoding="utf-8")
+    _git(repo_root, "add", "the-repair.txt")
+    _git(repo_root, "commit", "-q", "-m", "the repair")
+    _git(repo_root, "checkout", "-q", "main")
+    return _git(repo_root, "rev-parse", branch)
+
+
+def _write_repair_row_and_offer(
+    pool: SqliteLifecyclePersistence, *, merge_branch: str | None = REPAIR_BRANCH
+) -> None:
+    """A mode-c build of the same feature whose conductor recorded its branch."""
+    pool.connection.execute(
+        "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
+        "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
+        "mode, task_id) VALUES (?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, "
+        "'2026-09-07T12:00:00Z', 'mode-c', ?)",
+        (
+            REPAIR_BUILD_ID,
+            FEATURE_ID,
+            REPO,
+            f"repair/{REPAIR_TASK_ID}",
+            f"corr-{REPAIR_BUILD_ID}",
+            REPAIR_TASK_ID,
+        ),
+    )
+    pool.connection.commit()
+    if merge_branch:
+        pool.record_merge_branch(REPAIR_BUILD_ID, merge_branch)
+    _write_offer(
+        pool,
+        build_id=REPAIR_BUILD_ID,
+        correlation_id=f"corr-{REPAIR_BUILD_ID}",
+        request_id=f"merge-{REPAIR_BUILD_ID}",
+    )
+
+
+class TestTheBranchTheBuildMade:
+    """Rule 54: the candidate lay-out, the landed detection and the merge
+    argv read the branch from the build row; rule 55: the report names it;
+    and a feature build with an empty column is byte for byte as before."""
+
+    @pytest.mark.asyncio
+    async def test_a_repair_press_checks_lays_out_and_merges_the_journey_branch(
+        self, config, pool, repo_root
+    ) -> None:
+        repair_tip = _cut_repair_journey_branch(repo_root)
+        _write_repair_row_and_offer(pool)
+        # A clean merge of the journey branch lands ITS tip, so the executor's
+        # tree comparison sees the tree it checked.
+        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": repair_tip})
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(
+            _envelope(
+                request_id=f"merge-{REPAIR_BUILD_ID}",
+                correlation_id=f"corr-{REPAIR_BUILD_ID}",
+            )
+        )
+        await _drain(consumer)
+
+        # The merge command was told the branch, and only that changed.
+        assert len(gk.calls) == 1
+        args = gk.calls[0]["args"]
+        assert args[:5] == ["merge", FEATURE_ID, "--target", "main", "--expect-main-sha"]
+        assert args[-2:] == ["--branch", REPAIR_BRANCH]
+        assert args[-3] == "--json"
+        # The candidate that was checked is the journey branch's tip, and the
+        # laid-out tree carries the repair's file rather than the feature's.
+        assert _legs(dp) == ["candidate_check", "promote"]
+        assert dp.seen_tree["existed"] is True
+        assert dp.seen_tree["branch_file"] is False  # not autobuild/FEAT-MX1's tree
+        report = publisher.reports[0]
+        assert report.result == "merged-and-running"
+        assert report.branch == REPAIR_BRANCH
+        assert report.gate_before_merge["candidate_sha"] == repair_tip
+        assert report.gate_before_merge["candidate_tree"] == _tree_of(repo_root, repair_tip)
+        assert report.gate_before_merge["trees_match"] is True
+        # The thread line names the branch because it is not the feature's own.
+        assert report.detail.startswith(f"{FEATURE_ID} (branch {REPAIR_BRANCH}) checked in the sandbox")
+        # The receipts say the same branch, step by step.
+        receipts = deps.receipts_root_fn() / f"merge-{REPAIR_BUILD_ID}"
+        candidate = json.loads((receipts / "merge_deploy_candidate.json").read_text())
+        assert candidate["branch"] == REPAIR_BRANCH
+        assert candidate["candidate_sha"] == repair_tip
+        merge = json.loads((receipts / "merge_deploy_merge.json").read_text())
+        assert merge["branch"] == REPAIR_BRANCH
+
+    @pytest.mark.asyncio
+    async def test_the_laid_out_candidate_tree_is_the_journey_branch_tree(
+        self, config, pool, repo_root
+    ) -> None:
+        """Part J's lay-out uses the same branch: the repair's file is in the tree."""
+        repair_tip = _cut_repair_journey_branch(repo_root)
+        _write_repair_row_and_offer(pool)
+        seen: dict[str, Any] = {}
+
+        class _LookingDeploy(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") == "candidate_check":
+                    cwd = Path(kwargs["candidate_cwd"])
+                    seen["repair_file"] = (cwd / "the-repair.txt").is_file()
+                    seen["feature_file"] = (cwd / f"{FEATURE_ID}.txt").is_file()
+                return await super().__call__(**kwargs)
+
+        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": repair_tip})
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk, deploy=_LookingDeploy())
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(
+            _envelope(
+                request_id=f"merge-{REPAIR_BUILD_ID}",
+                correlation_id=f"corr-{REPAIR_BUILD_ID}",
+            )
+        )
+        await _drain(consumer)
+        assert seen == {"repair_file": True, "feature_file": False}
+
+    @pytest.mark.asyncio
+    async def test_a_feature_press_is_byte_for_byte_as_before(
+        self, config, pool
+    ) -> None:
+        """Rule 54's fence: an empty column changes nothing about a feature build."""
+        _write_offer(pool)
+        assert pool.get_build_row(BUILD_ID).merge_branch is None
+        deps, publisher, gk, dp = _deps(config, pool)
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(_envelope())
+        await _drain(consumer)
+
+        args = gk.calls[0]["args"]
+        assert args == [
+            "merge",
+            FEATURE_ID,
+            "--target",
+            "main",
+            "--expect-main-sha",
+            MAIN_SHA,
+            "--verify-timeout",
+            args[7],
+            "--json",
+        ]
+        assert "--branch" not in args
+        report = publisher.reports[0]
+        assert report.result == "merged-and-running"
+        assert report.branch == f"autobuild/{FEATURE_ID}"
+        assert report.detail.startswith(f"{FEATURE_ID} checked in the sandbox")
+        assert "(branch " not in report.detail
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_branch_nobody_made_is_refused_by_name(
+        self, config, pool, repo_root
+    ) -> None:
+        _write_repair_row_and_offer(pool, merge_branch="fix/TASK-MX1FIX1-deadbeef")
+        deps, publisher, gk, dp = _deps(config, pool)
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(
+            _envelope(
+                request_id=f"merge-{REPAIR_BUILD_ID}",
+                correlation_id=f"corr-{REPAIR_BUILD_ID}",
+            )
+        )
+        await _drain(consumer)
+        assert gk.calls == []
+        report = publisher.reports[0]
+        assert report.result == "candidate-refused"
+        assert "the branch fix/TASK-MX1FIX1-deadbeef was not found" in report.detail
+        assert report.branch == "fix/TASK-MX1FIX1-deadbeef"
+
+    @pytest.mark.asyncio
+    async def test_the_offer_copy_is_the_fallback_when_the_row_cannot_be_read(
+        self, config, pool, repo_root
+    ) -> None:
+        """The row is the record; the card's own copy stands in when it is unreadable."""
+        repair_tip = _cut_repair_journey_branch(repo_root)
+        _write_repair_row_and_offer(pool)
+        # The offer as the service writes it carries the branch it promised.
+        offer_row = [
+            s for s in pool.read_stages(REPAIR_BUILD_ID)
+            if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ][0]
+        offer_row.details[MERGE_OFFER_DETAILS_KEY]["merge_branch"] = REPAIR_BRANCH
+
+        class _RowlessPool:
+            """Everything the executor needs except a readable builds row."""
+
+            def __init__(self, real: Any) -> None:
+                self._real = real
+
+            def get_build_row(self, build_id: str) -> Any:
+                raise sqlite3.OperationalError("database is locked")
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+        from forge.pipeline.merge_executor import _merge_branch_of_record
+
+        assert (
+            _merge_branch_of_record(
+                _RowlessPool(pool),
+                REPAIR_BUILD_ID,
+                offer_row.details[MERGE_OFFER_DETAILS_KEY],
+            )
+            == REPAIR_BRANCH
+        )
+        assert _merge_branch_of_record(pool, REPAIR_BUILD_ID, {}) == REPAIR_BRANCH
+        assert _merge_branch_of_record(pool, BUILD_ID, {"merge_branch": ""}) is None
+        assert repair_tip  # the branch exists; only the row read was refused
+
+
+class TestTheLandedDetectionFollowsTheBranch:
+    """``merged_after_all_sha`` asks git about the branch the press was merging."""
+
+    @pytest.mark.asyncio
+    async def test_a_landed_repair_is_seen_on_its_own_branch(
+        self, repo_root
+    ) -> None:
+        from forge.pipeline.merge_executor import merged_after_all_sha
+
+        _cut_repair_journey_branch(repo_root)
+        pinned = _git(repo_root, "rev-parse", "main")
+        _git(repo_root, "merge", "--no-ff", "-q", "-m", "merge the repair", REPAIR_BRANCH)
+        new_main = _git(repo_root, "rev-parse", "main")
+
+        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch=REPAIR_BRANCH) == new_main
+        # Asked about the feature's own branch, git says it is not on main: None.
+        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned) is None
+
+    @pytest.mark.asyncio
+    async def test_the_default_is_the_feature_branch_exactly_as_before(
+        self, repo_root
+    ) -> None:
+        from forge.pipeline.merge_executor import merged_after_all_sha
+
+        pinned = _git(repo_root, "rev-parse", "main")
+        _git(repo_root, "merge", "--no-ff", "-q", "-m", "merge the feature", f"autobuild/{FEATURE_ID}")
+        new_main = _git(repo_root, "rev-parse", "main")
+
+        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned) == new_main
+        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch=None) == new_main
+        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch="  ") == new_main

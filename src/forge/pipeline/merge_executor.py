@@ -84,6 +84,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_DETAILS_KEY,
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
+    branch_to_merge,
     git_rev_parse_main,
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
@@ -214,6 +215,10 @@ class MergeDeployOutcome:
     #: (names), ``candidate_sha``, ``candidate_tree``, ``merged_tree`` and
     #: ``trees_match``. None when the run stopped before the check began.
     gate_before_merge: dict[str, Any] | None = None
+    #: The branch this press merged, or would have (Part M, rule 55): the
+    #: build row's recorded journey branch for a repair, else the feature's
+    #: own ``autobuild/<feature id>``. Set on every ending by the executor.
+    branch: str | None = None
 
 
 @dataclass
@@ -502,7 +507,10 @@ async def _git_exit_code(repo_root: Path, *args: str) -> int | None:
 
 
 async def merged_after_all_sha(
-    repo_root: Path, feature_id: str, expect_main_sha: str
+    repo_root: Path,
+    feature_id: str,
+    expect_main_sha: str,
+    branch: str | None = None,
 ) -> str | None:
     """Did the merge land even though the command gave no answer?
 
@@ -514,16 +522,17 @@ async def merged_after_all_sha(
     So ask git itself, the same way the merge card pins its target commit
     (:func:`forge.pipeline.merge_offer.git_rev_parse_main`). If main has moved
     off the commit the merge was pinned to, AND main now contains the tip of
-    ``autobuild/<feature>``, the merge landed: return main's new commit.
-    Anything else — main unmoved, main moved for some other reason, git not
-    answering — returns ``None`` and the merge is reported as refused, which
-    is then the truth.
+    the branch the press was merging (``branch`` when given — a repair's own
+    journey branch, Part M rule 54 — else ``autobuild/<feature>``), the merge
+    landed: return main's new commit. Anything else — main unmoved, main moved
+    for some other reason, git not answering — returns ``None`` and the merge
+    is reported as refused, which is then the truth.
     """
     new_main = await git_rev_parse_main(repo_root)
     pinned = (expect_main_sha or "").strip().lower()
     if not new_main or new_main.strip().lower() == pinned:
         return None
-    branch = f"autobuild/{feature_id}"
+    branch = branch_to_merge(feature_id, branch)
     contains = await _git_exit_code(
         repo_root, "merge-base", "--is-ancestor", branch, new_main
     )
@@ -572,6 +581,34 @@ def moved_main_refusal_sentence(feature_id: str, expect_main_sha: str) -> str:
     )
 
 
+def _merge_branch_of_record(
+    pool: Any, build_id: str, offer: dict[str, Any] | None = None
+) -> str | None:
+    """The build row's recorded ``merge_branch``, or ``None`` (Part M, rule 54).
+
+    The row is the record; the durable offer's ``merge_branch`` (what the
+    card promised) is the fallback when the row cannot be read. ``None``
+    means "the feature's own branch" and every reader derives
+    ``autobuild/<feature id>`` from it, exactly as before the column existed.
+    """
+    try:
+        row = pool.get_build_row(build_id)
+    except Exception as exc:  # noqa: BLE001 — the offer's copy is the fallback
+        logger.warning(
+            "merge-executor: could not read the builds row for %s to learn its "
+            "merge branch (%s: %s) — using the offer's copy",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        row = None
+    if row is not None:
+        recorded = str(getattr(row, "merge_branch", None) or "").strip()
+        return recorded or None
+    recorded = str((offer or {}).get("merge_branch") or "").strip()
+    return recorded or None
+
+
 def _report_sha(report: dict[str, Any] | None) -> str | None:
     if not report:
         return None
@@ -601,6 +638,7 @@ async def execute_merge_deploy(
     decided_by: str,
     baseline_failing: list[str] | None = None,
     dry_run: bool = False,
+    merge_branch: str | None = None,
 ) -> MergeDeployOutcome:
     """Run candidate check -> merge -> tree check -> promote -> report for one press.
 
@@ -622,9 +660,22 @@ async def execute_merge_deploy(
     ending. Never raises past its boundary: every result class lands as an
     honest :class:`MergeDeployOutcome`, one additive ``stage-complete``
     publish, and per-step JSON receipts under ``receipts_root()/merge-<build_id>/``.
+
+    ``merge_branch`` is the build row's recorded journey branch (Part M, rule
+    54) — a repair's ``fix/<task id>-<build8>`` — and ``None`` for a feature
+    build. The branch checked, laid out, merged and reported is that branch
+    when it is set, else ``autobuild/<feature id>``; the merge command is
+    given ``--branch`` only when it is set, so a feature build's argv is byte
+    for byte what it always was.
     """
     started = deps.clock()
     receipts_dir = deps.receipts_root_fn() / f"merge-{build_id}"
+    # The branch of record for this press (Part M, rules 54 and 55).
+    merge_branch = str(merge_branch or "").strip() or None
+    branch = branch_to_merge(feature_id, merge_branch)
+    # The subject as the thread line names it: the branch is said only when it
+    # is not the feature's own, so a feature build's words are unchanged.
+    named = f"{feature_id} (branch {branch})" if merge_branch is not None else feature_id
     # Advisory digest-conformance state — filled in after a landed merge,
     # read by the report step. It can add a warning line; it can never
     # block anything.
@@ -782,6 +833,7 @@ async def execute_merge_deploy(
             outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
         if gate_began and outcome.gate_before_merge is None:
             outcome.gate_before_merge = _gate_for_report()
+        outcome.branch = branch
         payload = StageCompletePayload(
             feature_id=feature_id,
             build_id=build_id,
@@ -805,6 +857,9 @@ async def execute_merge_deploy(
             detail=outcome.detail,
             digest_conformance_warning=conformance_warning,
             dry_run=dry_run,
+            # Additive (Part M, rule 55): the branch this press merged, or
+            # would have — truthful for a repair, the feature's own otherwise.
+            branch=branch,
             # Additive, and only when there is something to say: a deploy that
             # ran nowhere special sends no field at all, so every payload that
             # was written before Docker Sandboxes existed is unchanged.
@@ -999,10 +1054,10 @@ async def execute_merge_deploy(
         # STEP candidate: the branch is checked in the sandbox BEFORE the merge
         # ------------------------------------------------------------------
         gate_began = True
-        candidate_sha = await git_rev_parse(repo_root, f"autobuild/{feature_id}")
+        candidate_sha = await git_rev_parse(repo_root, branch)
         if not candidate_sha:
             return _could_not_check(
-                f"the branch autobuild/{feature_id} was not found in {repo_root}"
+                f"the branch {branch} was not found in {repo_root}"
             )
         gate["candidate_sha"] = candidate_sha
         gate["candidate_tree"] = await git_rev_parse(repo_root, f"{candidate_sha}^{{tree}}")
@@ -1018,6 +1073,7 @@ async def execute_merge_deploy(
                 {
                     "step": "candidate",
                     "dry_run": dry_run,
+                    "branch": branch,
                     "candidate_sha": candidate_sha,
                     "candidate_tree": gate["candidate_tree"],
                     "tree_path": None,
@@ -1058,6 +1114,7 @@ async def execute_merge_deploy(
             {
                 "step": "candidate",
                 "dry_run": dry_run,
+                "branch": branch,
                 "candidate_sha": candidate_sha,
                 "candidate_tree": gate["candidate_tree"],
                 "tree_path": str(tree_path),
@@ -1151,9 +1208,10 @@ async def execute_merge_deploy(
                 {
                     "step": "merge",
                     "dry_run": True,
+                    "branch": branch,
                     "skipped": (
                         "dry run — nothing merged; a real press would merge "
-                        f"autobuild/{feature_id} into main at {expect_main_sha}"
+                        f"{branch} into main at {expect_main_sha}"
                     ),
                 },
             )
@@ -1169,6 +1227,7 @@ async def execute_merge_deploy(
                         "decided_by": decided_by,
                         "dry_run": dry_run,
                         "candidate_sha": candidate_sha,
+                        "branch": branch,
                     }
                 },
             )
@@ -1188,6 +1247,12 @@ async def execute_merge_deploy(
                 str(verify_timeout),
                 "--json",
             ]
+            # Part M, rule 54: the merge command is told the branch ONLY when
+            # the build row recorded one (a repair's own journey branch).
+            # Without the flag guardkit derives autobuild/<feature id> exactly
+            # as it always has, so a feature build's argv is byte-identical.
+            if merge_branch is not None:
+                args += ["--branch", merge_branch]
             baseline_path: Path | None = None
             if baseline_failing is not None:
                 baseline_path = (
@@ -1276,7 +1341,7 @@ async def execute_merge_deploy(
             landed_sha: str | None = None
             if refusal and report is None and result_status != "success":
                 landed_sha = await merged_after_all_sha(
-                    repo_root, feature_id, expect_main_sha
+                    repo_root, feature_id, expect_main_sha, branch=branch
                 )
 
             _write_receipt(
@@ -1285,6 +1350,7 @@ async def execute_merge_deploy(
                     "step": "merge",
                     "status": result_status,
                     "exit_code": getattr(result, "exit_code", None),
+                    "branch": branch,
                     "refusal": refusal,
                     "report": report,
                     "landed_sha": landed_sha,
@@ -1548,7 +1614,7 @@ async def execute_merge_deploy(
                 merged_sha=merged_sha,
                 verdict=str(verdict) if verdict is not None else None,
                 detail=(
-                    f"{feature_id} {sandbox_checks}merged and running{checks}. "
+                    f"{named} {sandbox_checks}merged and running{checks}. "
                     "Rollback is one command; the branch is kept."
                 ),
                 checks_passed=checks_passed,
@@ -1920,6 +1986,7 @@ class MergeApprovalConsumer:
         baseline_failing = (
             [str(x) for x in baseline] if isinstance(baseline, list) else None
         )
+        merge_branch = _merge_branch_of_record(self._deps.pool, build_id, offer)
         task = asyncio.create_task(
             self._run_approved(
                 build_id=build_id,
@@ -1930,6 +1997,7 @@ class MergeApprovalConsumer:
                 correlation_id=correlation_id,
                 decided_by=payload.decided_by,
                 baseline_failing=baseline_failing,
+                merge_branch=merge_branch,
             )
         )
         self._tasks.add(task)
@@ -1946,6 +2014,7 @@ class MergeApprovalConsumer:
         correlation_id: str,
         decided_by: str,
         baseline_failing: list[str] | None,
+        merge_branch: str | None = None,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
@@ -1961,6 +2030,7 @@ class MergeApprovalConsumer:
                     correlation_id=correlation_id,
                     decided_by=decided_by,
                     baseline_failing=baseline_failing,
+                    merge_branch=merge_branch,
                 )
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
                 logger.error(

@@ -255,8 +255,10 @@ class TestBootLogEmitsAppliedCount:
         # WHICH of the five deaths a FAILED build died; schema_v10.sql added by
         # the work-queue lane for the work_queue / work_queue_events tables —
         # the list of sentences the factory has been asked for and has not
-        # started yet) → applied=10.
-        assert "applied 10" in applied_lines[0], applied_lines[0]
+        # started yet; schema_v11.sql added by Part M of the rewrite-on-refusal
+        # lane for the builds.merge_branch column — the branch the merge word
+        # merges, recorded by the conductor for a fix journey) → applied=11.
+        assert "applied 11" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------
