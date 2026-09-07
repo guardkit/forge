@@ -1484,11 +1484,12 @@ class TestARunRichRejected:
         assert row["closed_reason"] == "the planning run was cancelled"
 
     @pytest.mark.asyncio
-    async def test_a_failed_run_never_reads_the_events(
+    async def test_a_timed_out_run_never_reads_the_events(
         self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
     ) -> None:
-        """Only a cancelled run can be his reject; the events are read for
-        that and for nothing else."""
+        """Only a cancelled run can be his reject, and only a failed run
+        carries the driver's sentence (2026-09-07); the events are read for
+        those two things and for nothing else."""
         reads: list[str] = []
 
         def reader(cid: str) -> list[dict[str, Any]]:
@@ -1498,13 +1499,16 @@ class TestARunRichRejected:
         queue_id, loop = await self._admitted(
             store, clock, notifier, runs, events=None, reader=reader
         )
-        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+        runs["plan-1"] = {
+            "state": PlanningState.TIMED_OUT.value,
+            "error": "it ran too long",
+        }
 
         loop.close_finished()
 
         assert reads == []
         row = store.get(queue_id)
-        assert row is not None and row["closed_reason"] == "it fell over"
+        assert row is not None and row["closed_reason"] == "it ran too long"
 
     @pytest.mark.asyncio
     async def test_against_the_real_planning_run_store(
@@ -1585,6 +1589,452 @@ class TestARunRichRejected:
         source = inspect.getsource(PlanningRunDriver._cancel_run_at_digest_door)
         assert _NO_REJECT_REASON == NO_REJECT_REASON
         assert f'"{_NO_REJECT_REASON}"' in source
+
+
+# ---------------------------------------------------------------------------
+# A run the driver failed closes with the sentence Rich read (2026-09-07)
+# ---------------------------------------------------------------------------
+
+#: What the live run 696a3e38 wrote as its machine reason — the words the
+#: queue closed the row with before Part I, and must never again.
+MACHINE_REASON = (
+    "007 dispatch error: Command 'feature_spec' failed: Registered mode "
+    "'feature_spec' refused the revision"
+)
+
+#: The sentence the driver sent Rich for the same run.
+OWNER_SENTENCE = (
+    "Planning run 696a3e38 stopped at writing the task plan: 1 of the worked "
+    "examples could not be proven as written, and when the machine asked the "
+    "spec writer to rewrite them as what the endpoint does, the checker "
+    "refused the rewrite twice (the rewritten example still described the "
+    "database). Nothing was built. To try again, send the sentence as what "
+    "the endpoint does: the method and path, the status code, and what is in "
+    "the reply."
+)
+
+
+def _failure_details(sentence: Any, reason: str = MACHINE_REASON) -> str:
+    """The details ``fail_run`` writes on the FAILED event."""
+    return json.dumps(
+        {
+            "failure": {
+                "owner_message": sentence,
+                "reason": reason,
+                "stage_label": "feature-plan",
+            }
+        }
+    )
+
+
+def _failed_event(details_json: str | None) -> dict[str, Any]:
+    """The terminal event the driver writes when a leg cannot continue."""
+    return {
+        "status": PlanningState.FAILED.value,
+        "stage_label": "feature-plan",
+        "actor_identity": "planning-driver",
+        "details_json": details_json,
+    }
+
+
+class TestARunTheDriverFailed:
+    """Part I, rule 35: the row closes with the sentence the driver sent Rich
+    when the FAILED event carries it, and with today's words when it does
+    not — an older run, a transition written without the sentence, nothing
+    wired to read events, a reader that fails. "Rejected by you" keeps
+    precedence, and a repair's row is not touched."""
+
+    async def _admitted(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        *,
+        events: dict[str, list[dict[str, Any]]] | None,
+        reader: Any | None = None,
+    ) -> tuple[int, WorkQueueLoop]:
+        queue_id = file_row(store, "plan-1")
+        run_events = reader
+        if run_events is None and events is not None:
+            run_events = lambda cid: events.get(cid, [])  # noqa: E731
+        loop, _ = build_loop(
+            store, clock=clock, notifier=notifier, runs=runs, run_events=run_events
+        )
+        await loop.take_next()
+        return queue_id, loop
+
+    @pytest.mark.asyncio
+    async def test_the_row_closes_with_the_sentence_rich_read_not_the_machine_reason(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": MACHINE_REASON}
+        events["plan-1"] = [
+            {"status": PlanningState.RUNNING.value, "details_json": None},
+            _failed_event(_failure_details(OWNER_SENTENCE)),
+        ]
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == OWNER_SENTENCE
+        assert "007 dispatch error" not in row["closed_reason"]
+
+    @pytest.mark.asyncio
+    async def test_the_listing_still_says_blocked_for_such_a_row(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """The sentence is the reason; the status word is unchanged."""
+        from forge.planning.work_queue_commands import closed_word
+
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": MACHINE_REASON}
+        events["plan-1"] = [_failed_event(_failure_details(OWNER_SENTENCE))]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert closed_word(row) == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_without_the_sentence_on_the_event_the_error_stands_as_today(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """A FAILED transition written before this lane, or by anything
+        other than ``fail_run``, has no details; the row closes on the run's
+        error exactly as it did."""
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+        events["plan-1"] = [_failed_event(None)]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    async def test_details_without_a_failure_block_keep_the_error(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+        events["plan-1"] = [
+            _failed_event(json.dumps({"something_else": {"note": "unrelated"}}))
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sentence", ["", "   ", None, 7], ids=repr)
+    async def test_an_empty_or_missing_sentence_keeps_the_error(
+        self,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+        runs: dict,
+        sentence: Any,
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+        events["plan-1"] = [_failed_event(_failure_details(sentence))]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    async def test_details_that_do_not_parse_keep_the_error(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+        events["plan-1"] = [_failed_event("{not json")]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    async def test_no_error_and_no_sentence_keeps_the_plain_words(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": None}
+        events["plan-1"] = [_failed_event(None)]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == "the planning run failed"
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_wired_to_read_events_the_error_stands(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=None
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": MACHINE_REASON}
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == MACHINE_REASON
+
+    @pytest.mark.asyncio
+    async def test_a_reader_that_fails_does_not_stop_the_close(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        def broken(_cid: str) -> list[dict[str, Any]]:
+            raise sqlite3.OperationalError("database is locked")
+
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=None, reader=broken
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": "it fell over"}
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "it fell over"
+
+    @pytest.mark.asyncio
+    async def test_the_last_failed_event_is_the_one_read(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """Newest first, like the reject reader: an earlier event in the same
+        state is not the terminal one."""
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": MACHINE_REASON}
+        events["plan-1"] = [
+            _failed_event(_failure_details("an earlier sentence")),
+            _failed_event(_failure_details(OWNER_SENTENCE)),
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None and row["closed_reason"] == OWNER_SENTENCE
+
+    @pytest.mark.asyncio
+    async def test_rejected_by_you_keeps_precedence(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """A cancelled run whose terminal event somehow carries both blocks
+        is still his reject; the sentence is read only on a FAILED run."""
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {
+            "state": PlanningState.CANCELLED.value,
+            "error": "wrong endpoint",
+        }
+        events["plan-1"] = [
+            {
+                "status": PlanningState.CANCELLED.value,
+                "stage_label": "feature-spec-digest-review",
+                "actor_identity": "U-RICH",
+                "details_json": json.dumps(
+                    {
+                        "digest_review": {
+                            "outcome": "cancelled",
+                            "reason": "wrong endpoint",
+                            "decided_by": "U-RICH",
+                        },
+                        "failure": {
+                            "owner_message": OWNER_SENTENCE,
+                            "reason": MACHINE_REASON,
+                            "stage_label": "feature-plan",
+                        },
+                    }
+                ),
+            }
+        ]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["closed_reason"] == "rejected by you: wrong endpoint"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_is_never_read_as_his_reject(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        events: dict[str, list[dict[str, Any]]] = {}
+        queue_id, loop = await self._admitted(
+            store, clock, notifier, runs, events=events
+        )
+        runs["plan-1"] = {"state": PlanningState.FAILED.value, "error": MACHINE_REASON}
+        events["plan-1"] = [_failed_event(_failure_details(OWNER_SENTENCE))]
+
+        loop.close_finished()
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert not row["closed_reason"].startswith("rejected by you")
+        assert row["closed_reason"] == OWNER_SENTENCE
+
+    @pytest.mark.asyncio
+    async def test_a_repairs_row_is_untouched(
+        self, store: WorkQueueStore, clock: FakeClock, notifier: Notifier, runs: dict
+    ) -> None:
+        """A fix journey is a build, not a planning run: its events are never
+        read and its row closes in the fix words as before."""
+        reads: list[str] = []
+
+        def reader(cid: str) -> list[dict[str, Any]]:
+            reads.append(cid)
+            return [_failed_event(_failure_details(OWNER_SENTENCE))]
+
+        builds: dict[str, dict[str, Any]] = {}
+        queue_id = file_row(store, "fix-build-1", kind="fix")
+        loop, _ = build_loop(
+            store,
+            clock=clock,
+            notifier=notifier,
+            runs=runs,
+            admit_fix_rows=True,
+            fix_maker=RunMaker(),
+            builds=builds,
+            run_events=reader,
+        )
+        await loop.take_next()
+
+        builds["fix-build-1"] = {"status": "FAILED", "error": "the coach refused the fix"}
+        loop.close_finished()
+
+        assert reads == []
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == "the coach refused the fix"
+
+        builds["fix-build-2"] = {"status": "FAILED", "error": None}
+        second = file_row(store, "fix-build-2", kind="fix")
+        await loop.take_next()
+        loop.close_finished()
+        assert reads == []
+        assert store.get(second)["closed_reason"] == "the fix journey failed"
+
+    @pytest.mark.asyncio
+    async def test_against_the_real_planning_run_store_and_fail_run(
+        self,
+        connection: sqlite3.Connection,
+        store: WorkQueueStore,
+        clock: FakeClock,
+        notifier: Notifier,
+    ) -> None:
+        """The live shape end to end: the driver fails the run through
+        ``fail_run`` with the machine reason and the plain sentence; the loop
+        reads it back through the planning run store's own ``get_run`` and
+        ``list_events`` and closes the row with the sentence, never the
+        machine reason."""
+        from forge.planning.failure import fail_run
+        from forge.planning.run_store import SqlitePlanningRunStore
+
+        run_store = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
+        queue_id = file_row(store, "696a3e38")
+        loop = WorkQueueLoop(
+            store,
+            count_in_flight=lambda: 0,
+            planning_run=run_store.get_run,
+            paused_repositories=set,
+            start_run=RunMaker(),
+            notify=notifier,
+            clock=clock.now,
+            run_events=run_store.list_events,
+        )
+        store.admit(queue_id, actor_identity=LOOP_ACTOR)
+        assert (
+            run_store.record_queued(
+                correlation_id="696a3e38",
+                originating_user=USER,
+                expected_approver=USER,
+                request_text="add pagination to GET /users",
+                triggered_by="jarvis",
+            )
+            is None
+        )
+        for state in (PlanningState.RUNNING, PlanningState.FEATURE_SPEC):
+            assert run_store.transition("696a3e38", state, "planning-driver") is None
+
+        sent: list[str] = []
+
+        async def tell(_cid: str, message: str) -> None:
+            sent.append(message)
+
+        assert (
+            await fail_run(
+                run_store,
+                "696a3e38",
+                stage_label="feature-plan",
+                reason=MACHINE_REASON,
+                owner_message=OWNER_SENTENCE,
+                notify=tell,
+            )
+            is False
+        )
+        run = run_store.get_run("696a3e38")
+        assert run is not None and run["error"] == MACHINE_REASON
+
+        assert loop.close_finished() == 1
+
+        row = store.get(queue_id)
+        assert row is not None
+        assert row["status"] == "BLOCKED"
+        assert row["closed_reason"] == OWNER_SENTENCE
+        assert sent == [OWNER_SENTENCE]
+
+    def test_the_keys_are_the_writers_own(self) -> None:
+        """The loop reads the event under the keys ``fail_run`` writes; they
+        are imported, not mirrored, so the two cannot drift apart."""
+        from forge.planning import failure, work_queue_loop
+
+        assert work_queue_loop.FAILURE_DETAILS_KEY is failure.FAILURE_DETAILS_KEY
+        assert work_queue_loop.OWNER_MESSAGE_KEY is failure.OWNER_MESSAGE_KEY
+        assert failure.FAILURE_DETAILS_KEY == "failure"
+        assert failure.OWNER_MESSAGE_KEY == "owner_message"
 
 
 # ---------------------------------------------------------------------------

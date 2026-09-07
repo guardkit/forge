@@ -96,6 +96,7 @@ from forge.pipeline.fix_admission import (
 )
 from forge.pipeline.merge_executor import MERGE_DECISION_TARGET_IDENTIFIER
 from forge.pipeline.merge_offer import MERGE_OFFER_TARGET_IDENTIFIER
+from forge.planning.failure import FAILURE_DETAILS_KEY, OWNER_MESSAGE_KEY
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     REJECTED_BY_OWNER,
@@ -516,11 +517,13 @@ class WorkQueueLoop:
         run_events:
             Reads one planning run's events by correlation id, oldest first
             (the planning run store's ``list_events``). The run's own row
-            says it was cancelled but not by whom; the terminal event's
-            details do. The loop reads them for one thing only: to close a
-            run Rich rejected at the spec card as "rejected by you" rather
-            than "blocked". ``None`` means nothing here can read events, and
-            every cancelled run is closed with today's words.
+            says it ended but not in the words Rich read; the terminal
+            event's details do. The loop reads them for two things only: to
+            close a run Rich rejected at the spec card as "rejected by you"
+            rather than "blocked", and to close a run the driver failed with
+            the plain sentence it sent him rather than the machine reason
+            behind it. ``None`` means nothing here can read events, and
+            every such run is closed with today's words.
         paused_repositories:
             The repositories with a card waiting on Rich; the shadow order
             puts their rows second.
@@ -680,12 +683,22 @@ class WorkQueueLoop:
                     logger.info("work queue: #%d is done", queue_id)
             elif state in failure:
                 rejected = None
+                spoken = None
                 if not is_fix and state == PlanningState.CANCELLED.value:
                     rejected = self._rejected_by_owner_reason(
                         run, str(row["correlation_id"])
                     )
-                reason = rejected or self._failure_reason(
-                    run, state, is_fix=is_fix
+                elif not is_fix and state == PlanningState.FAILED.value:
+                    # The driver already told Rich why, in one plain
+                    # sentence; the row closes with that sentence, never
+                    # with the machine reason behind it.
+                    spoken = self._owner_failure_sentence(
+                        str(row["correlation_id"])
+                    )
+                reason = (
+                    rejected
+                    or spoken
+                    or self._failure_reason(run, state, is_fix=is_fix)
                 )
                 if self._store.close(
                     queue_id,
@@ -718,6 +731,63 @@ class WorkQueueLoop:
         without details or with details that do not parse — every one of
         those is "not his reject", and the row closes with today's words.
         """
+        details = self._terminal_event_details(
+            correlation_id, PlanningState.CANCELLED.value
+        )
+        if details is None:
+            return None
+        review = details.get(_DIGEST_REVIEW_KEY)
+        if not isinstance(review, Mapping):
+            return None
+        if str(review.get("outcome") or "") != _DIGEST_REVIEW_REJECTED:
+            return None
+        # His reason is on the event first (the row the rule names) and on
+        # the run's ``error`` too; read the event, fall back to the run.
+        reason = review.get("reason") or _build_field(run, "error")
+        words = " ".join(str(reason or "").split())
+        if not words or words == _NO_REJECT_REASON:
+            return REJECTED_BY_OWNER
+        return f"{REJECTED_BY_OWNER}: {words}"
+
+    def _owner_failure_sentence(self, correlation_id: str) -> str | None:
+        """The plain sentence the driver sent Rich when it failed the run;
+        None when the terminal event does not carry one.
+
+        ``fail_run`` (``forge.planning.failure``) tells Rich why a run
+        stopped in one sentence and, since 2026-09-07, writes that sentence
+        on the FAILED event's details beside the machine reason. The row
+        closes with the sentence he already read, never with the machine
+        reason ("007 dispatch error: Command 'feature_spec' failed: …").
+        An older run, or a FAILED transition written by anything other
+        than ``fail_run``, has no sentence there, and the row closes with
+        the run's ``error`` as before. Nothing that goes wrong in the read
+        reaches the caller.
+        """
+        details = self._terminal_event_details(
+            correlation_id, PlanningState.FAILED.value
+        )
+        if details is None:
+            return None
+        block = details.get(FAILURE_DETAILS_KEY)
+        if not isinstance(block, Mapping):
+            return None
+        sentence = block.get(OWNER_MESSAGE_KEY)
+        if not isinstance(sentence, str):
+            return None
+        words = sentence.strip()
+        return words or None
+
+    def _terminal_event_details(
+        self, correlation_id: str, state: str
+    ) -> Mapping[str, Any] | None:
+        """The parsed details of the last event that put the run in ``state``.
+
+        None whenever there is nothing to answer from: no reader wired, a
+        reader that throws, no event in that state, an event without
+        details, or details that do not parse to a mapping. Nothing that
+        goes wrong in here reaches the caller — every one of those is
+        "read nothing", and the row closes with today's words.
+        """
         if self._run_events is None:
             return None
         try:
@@ -735,8 +805,7 @@ class WorkQueueLoop:
             (
                 event
                 for event in reversed(events)
-                if str(_build_field(event, "status") or "")
-                == PlanningState.CANCELLED.value
+                if str(_build_field(event, "status") or "") == state
             ),
             None,
         )
@@ -751,18 +820,7 @@ class WorkQueueLoop:
             return None
         if not isinstance(details, Mapping):
             return None
-        review = details.get(_DIGEST_REVIEW_KEY)
-        if not isinstance(review, Mapping):
-            return None
-        if str(review.get("outcome") or "") != _DIGEST_REVIEW_REJECTED:
-            return None
-        # His reason is on the event first (the row the rule names) and on
-        # the run's ``error`` too; read the event, fall back to the run.
-        reason = review.get("reason") or _build_field(run, "error")
-        words = " ".join(str(reason or "").split())
-        if not words or words == _NO_REJECT_REASON:
-            return REJECTED_BY_OWNER
-        return f"{REJECTED_BY_OWNER}: {words}"
+        return details
 
     @staticmethod
     def _failure_reason(run: Any, state: str, *, is_fix: bool = False) -> str:
