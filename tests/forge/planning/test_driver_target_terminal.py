@@ -4735,9 +4735,11 @@ _MACHINE_NOTE_FOR_TITLES = (
     f"- {_MOON_TITLE}\n"
     "- Another undecidable one\n"
     "\n"
-    "Rewrite each of them as a request to the endpoint and the reply it gets: "
-    "the method and path, the status code, and what is in the body. Keep every "
-    "other worked example exactly as it is."
+    "Rewrite each of them as what can be proven, keeping the behaviour itself "
+    "unchanged: a request to the endpoint and the reply it gets (the method and "
+    "path, the status code, and what is in the body), or, for behaviour one "
+    "request cannot show — two requests at once, timing — the repository test "
+    "that proves it, named. Keep every other worked example exactly as it is."
 )
 
 #: Rule 5: the ONE un-mentioned line when the rewrite stamped clean.
@@ -5596,9 +5598,11 @@ async def test_a_refused_rewrite_gives_the_model_its_turn_and_carries_on(
         "the database or the code rather than what a caller sees:\n"
         f"- {_MOON_TITLE}\n"
         "\n"
-        "Rewrite each of them as a request to the endpoint and the reply it gets: "
-        "the method and path, the status code, and what is in the body. Keep every "
-        "other worked example exactly as it is."
+        "Rewrite each of them as what can be proven, keeping the behaviour itself "
+        "unchanged: a request to the endpoint and the reply it gets (the method and "
+        "path, the status code, and what is in the body), or, for behaviour one "
+        "request cannot show — two requests at once, timing — the repository test "
+        "that proves it, named. Keep every other worked example exactly as it is."
     )
     assert h.ctx["counters"]["plan"] == 2
     assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]

@@ -715,9 +715,11 @@ _MACHINE_REWRITE_NOTE = (
     "the database or the code rather than what a caller sees:\n"
     "{titles}\n"
     "\n"
-    "Rewrite each of them as a request to the endpoint and the reply it gets: "
-    "the method and path, the status code, and what is in the body. Keep every "
-    "other worked example exactly as it is."
+    "Rewrite each of them as what can be proven, keeping the behaviour itself "
+    "unchanged: a request to the endpoint and the reply it gets (the method and "
+    "path, the status code, and what is in the body), or, for behaviour one "
+    "request cannot show — two requests at once, timing — the repository test "
+    "that proves it, named. Keep every other worked example exactly as it is."
 )
 
 #: The note's author on every receipt: the machine, never a person.
