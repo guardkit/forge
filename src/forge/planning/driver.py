@@ -4322,9 +4322,11 @@ class PlanningRunDriver:
             # Rule 1a (2026-09-07): the machine itself ran this stamping by
             # rule only so its rewrite round could fire. That is the machine's
             # own doing, not something the owner can act on, and it is NEVER
-            # "no endpoint is configured" — the card says nothing about the
-            # model for it (the receipts carry the outcome). After a rewrite
-            # the card reports the SECOND stamping, which could ask the model.
+            # "no endpoint is configured". The card's fallback clause (in
+            # :meth:`_stamp_normalizer_card`) already says the model was not
+            # asked and why, so no second sentence repeats it. After a
+            # rewrite the card reports the SECOND stamping, which could ask
+            # the model.
             return None
         if status == "decided":
             count: Any = outcome.get("count")
@@ -4349,8 +4351,10 @@ class PlanningRunDriver:
         Names every refused title VERBATIM (the rule could not decide which
         verifier proves it; partial and refused alike — no rule ids on the
         face), says what the model fallback said about itself when it said
-        anything (rule 16, 2026-09-06 — and "no fallback home" is only said
-        when the model was NOT asked), says nothing was stamped on the branch
+        anything (rule 16, 2026-09-06 — "no fallback home" is said only when
+        the model was NOT asked, and never when the machine itself switched
+        it off for this stamping, rule 1a of 2026-09-07: that clause says the
+        model was not asked and why), says nothing was stamped on the branch
         and nothing was built, says the repo enforces the law, and says what a
         person does next — in plain words, the vocabulary named once. A
         cannot-run failure names the reason instead.
@@ -4381,11 +4385,25 @@ class PlanningRunDriver:
                 if stamps.titles_recovered_from_console_echo
                 else ""
             )
-            fallback_clause = (
-                "the model fallback could not settle them"
-                if stamps.model_was_asked
-                else "there is no fallback home"
-            )
+            model_status = str((stamps.model_outcome or {}).get("status") or "")
+            if stamps.model_was_asked:
+                fallback_clause = "the model fallback could not settle them"
+            elif model_status == "switched_off":
+                # Rule 1a (2026-09-07): the machine itself switched the model
+                # off for this stamping so its rewrite round could go first.
+                # The card says THAT. It never says "there is no fallback
+                # home" — a model endpoint may well be configured; it was
+                # not asked on this stamping, and after a rewrite that
+                # changed nothing it was never asked at all.
+                fallback_clause = (
+                    "the model fallback was not asked (the machine kept it for "
+                    "after its rewrite, which changed nothing)"
+                    if after_rewrite == _REWRITE_CHANGED_NOTHING
+                    else "the model fallback was not asked (it was switched off "
+                    "for this stamping)"
+                )
+            else:
+                fallback_clause = "there is no fallback home"
             model_sentence = PlanningRunDriver._model_fallback_sentence(stamps)
             return (
                 f"{lead} verifier stamps could not all be minted by rule for "
