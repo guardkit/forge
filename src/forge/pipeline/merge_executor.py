@@ -32,6 +32,18 @@ merge's own post-merge test run; (4) promote the image that was checked;
 kept, a repair row is filed, and the report says so with the new result word
 ``candidate-refused``.
 
+A MAIN THAT MOVED DURING THE BUILD is refused before the merge, not after it.
+The pinned main commit is read when the offer is made — after the build — so a
+main that moved WHILE the feature was building still matches the pin, the
+merge command would land a merge commit carrying main's new work, its tree
+could never equal the tree that was checked, and the promote would be refused
+with the merge already on main (the coach's finding, 2026-09-07). So after a
+green check and before the merge step is claimed the executor asks git one
+question: is the pinned main commit in the branch? A "no" is ``merge-refused``
+at the merge step with nothing claimed, nothing merged, the candidate torn
+down and the branch kept. The tree comparison after the merge (rule 37) stays
+as the belt for anything else.
+
 Any refusal, conflict, or verify failure stops the run with nothing
 half-done: the branch is always kept, the candidate is torn down and its tree
 removed on every ending, and the report says plainly which step failed and why.
@@ -518,6 +530,46 @@ async def merged_after_all_sha(
     if contains != 0:
         return None
     return new_main
+
+
+async def pinned_main_in_branch(
+    repo_root: Path, expect_main_sha: str, candidate_sha: str
+) -> bool | None:
+    """Is the pinned main commit an ancestor of the branch tip?
+
+    ``git merge-base --is-ancestor <pin> <tip>`` answers exit 0 (yes), exit 1
+    (no), or something else (git could not say: a pin it does not know, or git
+    not running at all). Only a plain "no" is returned as ``False`` — that is
+    the case where the merge command would land a merge commit carrying work
+    the candidate never saw. ``None`` leaves the decision to the merge
+    command's own pin check, which refuses a main that is not at the pin.
+    """
+    pin = (expect_main_sha or "").strip()
+    tip = (candidate_sha or "").strip()
+    if not pin or not tip:
+        return None
+    code = await _git_exit_code(repo_root, "merge-base", "--is-ancestor", pin, tip)
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    logger.warning(
+        "merge-executor: git could not say whether main's pinned commit %s is in "
+        "the branch at %s (exit %s) — the merge command's own pin check decides",
+        pin[:10],
+        tip[:10],
+        code,
+    )
+    return None
+
+
+def moved_main_refusal_sentence(feature_id: str, expect_main_sha: str) -> str:
+    """The plain sentence when main moved during the build (before the merge)."""
+    return (
+        f"{feature_id} passed its sandbox check, but main had moved since this "
+        f"was built ({expect_main_sha[:10]} is not in the branch); nothing was "
+        "merged and the branch is kept. Send the sentence again."
+    )
 
 
 def _report_sha(report: dict[str, Any] | None) -> str | None:
@@ -1048,6 +1100,43 @@ async def execute_merge_deploy(
             return _candidate_refusal(checked, summary)
         candidate_standing = str(c_detail.get("candidate") or "standing") == "standing"
         prior_events = tuple(getattr(checked, "events", ()) or ())
+
+        # ------------------------------------------------------------------
+        # Has main moved since this was built? Asked BEFORE the merge step is
+        # claimed, in a dry run too (it reads, it writes nothing), because the
+        # pin is read after the build and cannot see a main that moved during
+        # it. A "no" merges nothing: the candidate comes down on the way out.
+        # ------------------------------------------------------------------
+        main_in_branch = await pinned_main_in_branch(
+            repo_root, expect_main_sha, candidate_sha
+        )
+        if main_in_branch is False:
+            sentence = moved_main_refusal_sentence(feature_id, expect_main_sha)
+            _write_receipt(
+                "merge_deploy_merge.json",
+                {
+                    "step": "merge",
+                    "dry_run": dry_run,
+                    "refusal": sentence,
+                    "expect_main_sha": expect_main_sha,
+                    "candidate_sha": candidate_sha,
+                    "pinned_main_in_branch": False,
+                    "skipped": "main moved during the build — the merge was not run",
+                },
+            )
+            logger.warning(
+                "merge-executor: %s passed its sandbox check but main had moved "
+                "since it was built (%s is not in the branch) — nothing was "
+                "merged; the candidate comes down and the sentence must be sent again",
+                feature_id,
+                expect_main_sha[:10],
+            )
+            return MergeDeployOutcome(
+                result="merge-refused",
+                status="FAILED",
+                failed_step="merge",
+                detail=sentence,
+            )
 
         # ------------------------------------------------------------------
         # STEP merge + verify (through the frozen guardkit boundary)

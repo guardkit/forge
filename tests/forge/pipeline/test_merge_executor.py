@@ -594,6 +594,7 @@ async def _run_executor(
     *,
     baseline_failing: list[str] | None = None,
     dry_run: bool = False,
+    expect_main_sha: str = MAIN_SHA,
 ) -> Any:
     _ensure_build(deps.pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
     return await execute_merge_deploy(
@@ -602,7 +603,7 @@ async def _run_executor(
         feature_id=FEATURE_ID,
         repo=REPO,
         repo_root=repo_root,
-        expect_main_sha=MAIN_SHA,
+        expect_main_sha=expect_main_sha,
         correlation_id=CORRELATION,
         decided_by="rich",
         baseline_failing=baseline_failing,
@@ -1905,6 +1906,106 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         ]
         assert rows[-1].status == "SKIPPED"
 
+    def _main_moves(self, repo_root: Path) -> str:
+        """Another feature (or a hand commit) lands on main while this one
+        was building. Returns main's new commit — what the offer would pin,
+        because the pin is read after the build."""
+        _git(repo_root, "checkout", "-q", "main")
+        (repo_root / "moved.txt").write_text("another feature landed\n", encoding="utf-8")
+        _git(repo_root, "add", "moved.txt")
+        _git(repo_root, "commit", "-q", "-m", "main moved during the build")
+        return _git(repo_root, "rev-parse", "main")
+
+    @pytest.mark.asyncio
+    async def test_a_main_that_moved_during_the_build_is_refused_before_the_merge(
+        self, config, pool, repo_root, _receipts_env: Path, caplog
+    ) -> None:
+        """The pin is read when the offer is made, after the build, so a main
+        that moved DURING the build matches it; the merge command would land a
+        merge commit whose tree is not the one that was checked, and the
+        promote would be refused with the merge already on main. So git is
+        asked first, and a "no" merges nothing."""
+        pin = self._main_moves(repo_root)
+        deps, publisher, gk, dp = _deps(config, pool)
+        with caplog.at_level("WARNING"):
+            outcome = await _run_executor(deps, repo_root, expect_main_sha=pin)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.failed_step == "merge"
+        assert outcome.detail == (
+            f"{FEATURE_ID} passed its sandbox check, but main had moved since this "
+            f"was built ({pin[:10]} is not in the branch); nothing was merged and "
+            "the branch is kept. Send the sentence again."
+        )
+        # The merge command was never called; the candidate came down; the
+        # tree is gone.
+        assert gk.calls == []
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+        assert not _candidate_dir(repo_root).exists()
+        # Nothing was claimed, so nothing had to be released: no merge step
+        # row at all, and the build can be pressed again.
+        assert MERGE_STEP_MERGE_TARGET_IDENTIFIER not in _stage_ids(pool)
+        # The branch is kept and main is exactly where it was.
+        assert _git(repo_root, "rev-parse", "main") == pin
+        assert _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}") == _tip(repo_root)
+        # There is nothing to repair; the remedy is a new run.
+        assert _repair_rows(pool) == []
+        # The check that passed still rides the report, so the words can say so.
+        assert outcome.gate_before_merge["verdict"] == "pass"
+        assert publisher.reports[0].model_dump(mode="json")["result"] == "merge-refused"
+        receipt = json.loads(
+            (_receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_merge.json").read_text()
+        )
+        assert receipt["pinned_main_in_branch"] is False
+        assert any(
+            "main had moved since it was built" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_branch_on_top_of_the_pinned_main_merges(
+        self, config, pool, repo_root
+    ) -> None:
+        """The ordinary case with a REAL pin: the branch contains main's commit."""
+        pin = _git(repo_root, "rev-parse", "main")
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root, expect_main_sha=pin)
+        assert outcome.result == "merged-and-running"
+        assert len(gk.calls) == 1
+        assert _legs(dp) == ["candidate_check", "promote"]
+
+    @pytest.mark.asyncio
+    async def test_a_pin_git_cannot_place_leaves_the_decision_to_the_merge_command(
+        self, config, pool, repo_root, caplog
+    ) -> None:
+        """A pin git does not know is not a "no": the merge command's own pin
+        check refuses a main that is not at the pin, and the tree comparison
+        after the merge is the belt. (The fakes here let the merge land.)"""
+        deps, publisher, gk, dp = _deps(config, pool)
+        with caplog.at_level("WARNING"):
+            outcome = await _run_executor(deps, repo_root, expect_main_sha="b" * 40)
+        assert outcome.result == "merged-and-running"
+        assert len(gk.calls) == 1
+        assert any(
+            "the merge command's own pin check decides" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_also_refuses_a_moved_main(
+        self, config, pool, repo_root
+    ) -> None:
+        """The question reads and writes nothing, so a dry run asks it too
+        and says the same thing a real press would."""
+        pin = self._main_moves(repo_root)
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root, expect_main_sha=pin, dry_run=True)
+        assert outcome.result == "merge-refused"
+        assert "main had moved since this was built" in outcome.detail
+        assert gk.calls == []
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+        assert _stage_ids(pool) == []
+        assert not _candidate_dir(repo_root).exists()
+
     @pytest.mark.asyncio
     async def test_a_tree_that_is_not_the_checked_tree_refuses_the_promote(
         self, config, pool, repo_root, caplog
@@ -1973,6 +2074,7 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
             "dry-run",
             "candidate-red",
             "merge-refused",
+            "moved-main",
             "verify-failed",
             "tree-mismatch",
             "promote-raises",
@@ -1986,8 +2088,11 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         gk: _FakeGuardKit | None = None
         dp: _FakeDeploy | None = None
         dry_run = False
+        pin = MAIN_SHA
         if ending == "dry-run":
             dry_run = True
+        elif ending == "moved-main":
+            pin = self._main_moves(repo_root)
         elif ending == "candidate-red":
             dp = _FakeDeploy(candidate_outcome="failed", candidate_verdict="fail")
         elif ending == "merge-refused":
@@ -2011,7 +2116,7 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         elif ending == "deploy-off":
             dp = _FakeDeploy(outcome=None)
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk, deploy=dp)
-        await _run_executor(deps, repo_root, dry_run=dry_run)
+        await _run_executor(deps, repo_root, dry_run=dry_run, expect_main_sha=pin)
         assert not _candidate_dir(repo_root).exists()
         assert not (repo_root / ".forge-candidates").exists() or not any(
             (repo_root / ".forge-candidates").iterdir()
