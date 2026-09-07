@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from forge.adapters.sqlite.connect import connect_writer
 from forge.cli._serve_async_task_starter import build_async_task_starter
@@ -690,6 +690,114 @@ def _interrupt_and_reset_to_preparing(
         sqlite_pool.apply_transition(hop)
 
 
+class _RepoRoutedAsyncTaskStarter:
+    """Dispatch each build to the runner that lives with its repository.
+
+    SANDBOX FIRST (2026-09-07, rule 78). A build installs and runs a
+    repository's own code, so for a repository that has a sandbox it is
+    dispatched to the build runner INSIDE that sandbox, whose worktrees, venvs
+    and test runs exist only there. Every other repository is dispatched to
+    the one global runner exactly as before.
+
+    The choice is per dispatch, not per boot, because one daemon serves every
+    repository and only some of them have a sandbox. The repository rides on
+    the dispatch itself (``context["repo"]``, which
+    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`
+    puts there); a dispatch that names no repository, or names one with no
+    sandbox, goes to the global runner.
+
+    This class is only ever built when ``planning.sandboxes`` names at least
+    one repository — with the mapping empty the composition hands the
+    dispatcher the same single starter it always did, so nothing routes at all.
+    """
+
+    __slots__ = ("_default", "_by_repo")
+
+    def __init__(
+        self, *, default: AsyncTaskStarter, by_repo: dict[str, AsyncTaskStarter]
+    ) -> None:
+        self._default = default
+        self._by_repo = dict(by_repo)
+
+    def _starter_for(self, context: "Mapping[str, Any]") -> AsyncTaskStarter:
+        try:
+            repo = str(context.get("repo") or "").strip()
+        except AttributeError:  # pragma: no cover — a mapping is what is sent
+            return self._default
+        starter = self._by_repo.get(repo)
+        if starter is None:
+            return self._default
+        logger.info(
+            "autobuild dispatch: %s has a sandbox, so this build runs on the "
+            "build runner inside it — the repository's own code is never "
+            "installed or run on the host",
+            repo,
+        )
+        return starter
+
+    def start_async_task(
+        self, subagent_name: str, context: "Mapping[str, Any]"
+    ) -> str:
+        return self._starter_for(context).start_async_task(subagent_name, context)
+
+    async def astart_async_task(
+        self, subagent_name: str, context: "Mapping[str, Any]"
+    ) -> str:
+        starter = self._starter_for(context)
+        return await starter.astart_async_task(subagent_name, context)
+
+
+def build_repo_routed_async_task_starter(
+    *,
+    serve_module: Any,
+    forge_config: Any,
+    default_starter: AsyncTaskStarter,
+) -> AsyncTaskStarter:
+    """Return the starter the dispatch chain uses — routed only if it must be.
+
+    With ``planning.sandboxes`` empty (the default, and the estate's state
+    until an operator fills it in) this returns ``default_starter`` itself, so
+    the composition is byte for byte what it was before this lane. Otherwise
+    it builds one more middleware per sandboxed repository, each registered
+    against that sandbox's own runner address, and wraps them all in
+    :class:`_RepoRoutedAsyncTaskStarter`.
+    """
+    from forge.config.sandboxes import sandboxes_of
+
+    sandboxes = sandboxes_of(forge_config)
+    if not sandboxes:
+        return default_starter
+    by_repo: dict[str, AsyncTaskStarter] = {}
+    for repo, entry in sandboxes.items():
+        runner_url = str(getattr(entry, "runner_url", "") or "").strip()
+        if not runner_url:
+            logger.warning(
+                "autobuild dispatch: %s has a sandbox (%s) but no runner "
+                "address, so its builds go to the global build runner — the "
+                "repository's code would run on the host. Set runner_url in "
+                "planning.sandboxes",
+                repo,
+                getattr(entry, "name", "?"),
+            )
+            continue
+        middleware = serve_module._build_async_subagent_middleware(
+            autobuild_runner_url=runner_url,
+        )
+        by_repo[str(repo)] = _resolve_async_task_starter(middleware)
+        logger.info(
+            "autobuild dispatch: %s has a sandbox (%s), so its builds are "
+            "dispatched to the build runner inside it at %s",
+            repo,
+            getattr(entry, "name", "?"),
+            runner_url,
+        )
+    if not by_repo:
+        return default_starter
+    return _RepoRoutedAsyncTaskStarter(
+        default=default_starter, by_repo=by_repo
+    )
+
+
 def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
     """Return an :class:`AsyncTaskStarter` adapter over ``middleware.tools``.
 
@@ -885,6 +993,16 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # Step 6 — derive the AsyncTaskStarter from the middleware tool
     # surface (per TASK-FW10-008 contract).
     async_task_starter = _resolve_async_task_starter(middleware)
+
+    # Step 6.1 (sandbox first, rule 78) — a repository that has a sandbox has
+    # its builds dispatched to the build runner inside it, so its own code is
+    # installed and run there and never on the host. With planning.sandboxes
+    # empty this is the same object Step 6 just made.
+    async_task_starter = build_repo_routed_async_task_starter(
+        serve_module=serve_module,
+        forge_config=forge_config,
+        default_starter=async_task_starter,
+    )
 
     # Step 6.5 (TASK-FORGE-FRR-PEBR-WIREUP) — construct the
     # SQLite-bound dependencies for the lifecycle-bridge wireup. The
