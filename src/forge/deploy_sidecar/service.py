@@ -13,6 +13,11 @@ The narrow contract:
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
+    POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
+              -> {exit_code, stdout, stderr_tail, timed_out, cwd, warnings}
+    POST /run  {repo, declared_test, cwd, timeout_seconds}
+              -> {exit_code, stdout, stderr_tail, timed_out, cwd, command,
+                  warnings}
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
                            timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
@@ -77,6 +82,16 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    caller can tell a sidecar that honoured the candidate tree from one that
    is running old code or a different checkout path and silently ran the
    script from the checkout — main, checked and reported as the branch.
+11. The two shapes of ``/run`` whose work is not a vetted script (sandbox
+   first, rules 85 and 88) keep the same posture by a different route: the
+   program comes from the repository, never from the message. ``driver`` must
+   be exactly the argument list ``deploy/profile.yaml`` declares as the
+   live-gate driver, and ``declared_test`` must be exactly the command
+   ``.guardkit/config.yaml`` declares as the toolchain's test; anything else
+   is refused in one plain sentence before a process starts. The declared
+   test command's working directory must be one of this repository's own
+   journey worktrees (LAW 10), and the live-gate driver's may be a candidate
+   tree exactly as LAW 8 allows.
 
 Each request-processing core (:func:`process_run_request` and
 :func:`process_guardkit_merge_request`) is a pure function
@@ -99,8 +114,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
@@ -110,6 +126,7 @@ from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
     load_deploy_profile,
+    wrapper_inner_script,
 )
 from forge.executor.shell_steps import _run_script_step
 from forge.memory.redaction import scrub_process_output
@@ -173,6 +190,42 @@ OUTPUT_TAIL_CHARS: int = 65_536
 
 #: Truncation marker prepended when the tail drops leading output.
 _TAIL_MARKER = "... [OUTPUT HEAD TRUNCATED] ...\n"
+
+
+# --- the two answers /run gives when the work is not a vetted script --------
+#
+# SANDBOX FIRST (2026-09-07, rules 85 and 88). Two pieces of work that used to
+# happen in the forge container have to happen where the repository lives: the
+# live-gate driver (rule 85 — the candidate's port is on the sandbox's own
+# loopback, not the host's) and the merge-ready gates reader's declared test
+# command (rule 88 — for a sandbox repository neither the toolchain nor the
+# journey worktree exists on the host, so the reader could only ever answer
+# UNKNOWN, and a fix journey could never publish a merge card).
+#
+# Both ride ``POST /run``, and both keep LAW 2's posture exactly: THE PROGRAM
+# COMES FROM THE REPOSITORY, NEVER FROM THE MESSAGE. The caller sends what it
+# wants run, and this service checks it against the repository's own
+# checked-in declaration — the driver against ``deploy/profile.yaml``'s
+# ``live_gate.driver``, the test command against ``.guardkit/config.yaml``'s
+# ``toolchain.test`` — and refuses anything else in one plain sentence. So a
+# message can choose between the repository's own two declared commands and
+# can name no other program at all.
+
+#: How many extra argument tokens the live-gate driver may carry, and how long
+#: one may be. The driver's own flags are few; these exist so a runaway caller
+#: cannot hand the service an unbounded argument list.
+DRIVER_MAX_ARGS: int = 32
+DRIVER_MAX_ARG_CHARS: int = 4_096
+
+#: Where a repository's toolchain declaration lives, and the two shapes the
+#: estate installs guardkit in. The same candidates
+#: :func:`forge.cli._serve_conductor.load_declared_toolchain` uses — resolved
+#: here rather than imported so the sidecar never pulls the daemon's CLI in.
+#: Both delegate to guardkit's OWN loader; neither parses the YAML itself.
+TOOLCHAIN_MODULE_CANDIDATES: tuple[str, ...] = (
+    "guardkit.orchestrator.toolchain_declaration",
+    "orchestrator.toolchain_declaration",
+)
 
 
 # --- the merge operation's own constants -----------------------------------
@@ -256,6 +309,12 @@ class MergeRunner(Protocol):
 
     Injected so tests can record exactly what the sidecar would have run
     without starting a process. Returns ``(exit_code, stdout, stderr)``.
+
+    ``what`` names the command in a "could not be started" sentence, and
+    ``extra_env`` is a non-secret overlay for the command's own environment.
+    Both are optional: every caller that predates the live gate and the gates
+    reader leaves them out, so a runner that does not accept them is still a
+    runner.
     """
 
     def __call__(
@@ -264,6 +323,8 @@ class MergeRunner(Protocol):
         argv: list[str],
         cwd: str,
         timeout: float = ...,
+        what: str = ...,
+        extra_env: dict[str, str] | None = ...,
     ) -> tuple[int, str, str]: ...
 
 
@@ -336,6 +397,18 @@ def allowed_scripts(profile: DeployProfile) -> set[str]:
     scripts: set[str] = set()
     if profile.compose.script:
         scripts.add(profile.compose.script)
+        # SANDBOX FIRST (rule 85). A profile that names a HOST sandbox wrapper
+        # (``deploy/sandbox-deploy.sh``) names its inner script too, by the
+        # shared template's fixed pairing: the wrapper's entire job is to put
+        # the sandbox in place and then run ``deploy/deploy.sh`` inside it.
+        # When the factory itself lives in that sandbox the wrapper cannot run
+        # — it would ask ``sbx`` for a sandbox from inside one — so the deploy
+        # stage runs the inner script directly and this allowlist has to name
+        # it. Nothing new becomes runnable: it is the same script of the
+        # repository's own, which the wrapper already runs.
+        inner = wrapper_inner_script(profile.compose.script)
+        if inner:
+            scripts.add(inner)
     for check in profile.health_checks:
         if check.cmd:
             scripts.add(check.cmd)
@@ -421,11 +494,343 @@ def _tail(output: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _allowlisted_env(
+    raw_env: Any, profile: DeployProfile
+) -> tuple[dict[str, str], str | None]:
+    """LAW 3 — the caller's env, or one plain sentence saying why not.
+
+    One implementation for every shape ``/run`` carries: the vetted script,
+    the live-gate driver. Absent reads as no overlay at all.
+    """
+    if raw_env is None:
+        raw_env = {}
+    if not isinstance(raw_env, dict):
+        return {}, "'env' must be a JSON object of allowlisted string values"
+    permitted_keys = allowed_env_keys(profile)
+    env: dict[str, str] = {}
+    for key, value in raw_env.items():
+        if key not in permitted_keys:
+            names = ", ".join(sorted(permitted_keys))
+            return {}, (
+                f"env key {key!r} is not allowlisted — deny by default. "
+                f"Allowed: {names}"
+            )
+        if not isinstance(value, str):
+            return {}, (
+                f"env value for {key!r} must be a string, got "
+                f"{type(value).__name__}"
+            )
+        env[key] = value
+    return env, None
+
+
+def _text_list(
+    value: Any, *, field: str, max_items: int, max_chars: int
+) -> tuple[list[str], str | None]:
+    """Read a list of plain-text tokens; return ``(tokens, error)``.
+
+    Absent reads as an empty list. Anything that is not a bounded list of
+    text is a refusal in one sentence, checked before a process starts.
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"'{field}' must be a list of text values"
+    if len(value) > max_items:
+        return [], (
+            f"'{field}' may carry at most {max_items} values; got {len(value)}"
+        )
+    tokens: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            return [], (
+                f"every entry in '{field}' must be written as text; got "
+                f"{type(entry).__name__}"
+            )
+        if len(entry) > max_chars:
+            return [], (
+                f"a value in '{field}' may be at most {max_chars} characters "
+                f"long; one is {len(entry)}"
+            )
+        tokens.append(entry)
+    return tokens, None
+
+
+def declared_test_command(
+    repo_path: "Path | str",
+    *,
+    module_candidates: Sequence[str] = TOOLCHAIN_MODULE_CANDIDATES,
+) -> tuple[str | None, int | None, str | None]:
+    """The repository's own declared test command, read where it lives.
+
+    Returns ``(command, timeout_seconds, error)``. Delegates to guardkit's OWN
+    ``toolchain_declaration.load_toolchain_declaration`` — the loader that
+    owns the schema — so this service never forms a second opinion about what
+    a repository declared. ``error`` is one plain sentence when guardkit is
+    not importable here, when the repository declares no toolchain, or when it
+    declares one with no ``test:`` command; the caller turns that into a
+    refusal and the gates reader turns the refusal into UNKNOWN, which is red.
+    Never raises.
+    """
+    for candidate in module_candidates:
+        try:
+            module = import_module(candidate)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        try:
+            declaration = module.load_toolchain_declaration(Path(repo_path))
+        except Exception as exc:  # noqa: BLE001 — a loader defect is not a pass
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml could not be read: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if declaration is None:
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml declares no toolchain, so "
+                "there is no declared test command to run"
+            )
+        command = getattr(declaration, "test", None)
+        if not command:
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml declares a toolchain but "
+                "no `test:` command, so there is no verdict-bearing gate to run"
+            )
+        timeout = getattr(declaration, "test_timeout", None)
+        return (
+            str(command),
+            int(timeout) if isinstance(timeout, int) and timeout > 0 else None,
+            None,
+        )
+    return None, None, (
+        "guardkit's toolchain declaration loader is not importable in this "
+        f"service (tried {', '.join(module_candidates)}), so "
+        f"{repo_path}'s declared test command cannot be read"
+    )
+
+
+def _bounded_timeout(value: Any, *, default: float, ceiling: float) -> tuple[
+    float, list[dict[str, str]], str | None
+]:
+    """The wall this run gets: the caller's, clamped, never refused for length.
+
+    Ruled 2026-09-07 21:05Z on the leg route and applied here for the same
+    reason: a stage wall wider than a route's ceiling should run at the
+    ceiling with a warning on the result, not fail a run that could have
+    happened. A wall that is not a positive number is still a refusal, because
+    that is a mistake in the caller rather than an ambitious budget.
+    """
+    if value is None:
+        return default, [], None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return default, [], "'timeout_seconds' must be a positive number"
+    timeout = float(value)
+    if timeout <= ceiling:
+        return timeout, [], None
+    return ceiling, [
+        {
+            "code": "timeout_clamped",
+            "message": (
+                f"this run was asked for up to {timeout:g} seconds, which is "
+                f"longer than the longest wall this route allows, so it was "
+                f"given {ceiling:g} seconds instead"
+            ),
+        }
+    ], None
+
+
+def process_live_gate_run(
+    payload: dict[str, Any],
+    *,
+    repo_path: Path,
+    profile: DeployProfile,
+    extra_env: dict[str, str],
+    command_runner: MergeRunner,
+) -> tuple[int, dict[str, Any]]:
+    """``/run`` carrying the repository's own live-gate driver (rule 85).
+
+    The candidate stands up inside the sandbox and its port is on the
+    sandbox's own loopback, so the driver that checks it has to run in there
+    too. The driver is the profile's ``live_gate.driver`` and nothing else:
+    the request must send that exact argument list, and any other program is
+    refused. The flags the caller adds (``--feature``, ``--target``,
+    ``--gates``) ride in ``args``.
+
+    The answer carries ``stdout`` whole (up to the merge route's cap) rather
+    than a combined tail, because the driver prints its results envelope
+    there and the caller reads the verdict out of it.
+    """
+    spec = profile.live_gate
+    if spec is None:
+        return 400, {
+            "error": (
+                "this repository's deploy/profile.yaml declares no live_gate "
+                "driver, so there is no gate for the sidecar to run"
+            )
+        }
+    driver, error = _text_list(
+        payload.get("driver"),
+        field="driver",
+        max_items=DRIVER_MAX_ARGS,
+        max_chars=DRIVER_MAX_ARG_CHARS,
+    )
+    if error:
+        return 400, {"error": error}
+    declared = [token for token in spec.driver]
+    if driver != declared:
+        return 400, {
+            "error": (
+                "the live-gate driver must be the one this repository's "
+                f"deploy/profile.yaml declares ({' '.join(declared)}); it was "
+                f"asked to run {' '.join(driver) if driver else '(nothing)'}"
+            )
+        }
+    args, error = _text_list(
+        payload.get("args"),
+        field="args",
+        max_items=DRIVER_MAX_ARGS,
+        max_chars=DRIVER_MAX_ARG_CHARS,
+    )
+    if error:
+        return 400, {"error": error}
+    timeout, warnings, error = _bounded_timeout(
+        payload.get("timeout_seconds"),
+        default=float(spec.timeout_seconds),
+        ceiling=MERGE_TIMEOUT_MAX,
+    )
+    if error:
+        return 400, {"error": error}
+
+    cwd = _resolve_cwd(repo_path, profile)
+    candidate_cwd, cwd_error = _resolve_requested_cwd(repo_path, payload.get("cwd"))
+    if cwd_error is not None:
+        return 400, {"error": cwd_error}
+    if candidate_cwd is not None:
+        cwd = candidate_cwd
+
+    argv = [*driver, *args]
+    logger.info(
+        "forge-deploy-sidecar: running the live-gate driver %s in %s (up to "
+        "%g seconds)",
+        " ".join(argv),
+        cwd,
+        timeout,
+    )
+    try:
+        exit_code, stdout, stderr = command_runner(
+            argv=argv,
+            cwd=str(cwd),
+            timeout=timeout,
+            what="the live-gate driver",
+            extra_env=extra_env or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "cwd": str(cwd),
+        "warnings": warnings,
+    }
+
+
+def process_declared_test_run(
+    payload: dict[str, Any],
+    *,
+    repo_path: Path,
+    command_runner: MergeRunner,
+) -> tuple[int, dict[str, Any]]:
+    """``/run`` carrying the repository's own declared test command (rule 88).
+
+    The merge-ready gates reader runs the command the repository declares in
+    ``.guardkit/config.yaml`` in the fix journey's worktree, and for a
+    repository with a sandbox neither that file nor that worktree exists on
+    the host. So it runs here. The command is read from the repository's own
+    declaration by guardkit's own loader and the request must send that exact
+    command; anything else is refused. The working directory must be one of
+    this repository's own journey worktrees.
+
+    A declaration is a *command line* (``uv run --frozen pytest -q``), which
+    is what the repository owner wrote and what guardkit's own executor runs,
+    so it is handed to ``/bin/sh -c`` — the same shape the in-container reader
+    uses. What may reach that shell is the repository's own checked-in text
+    and nothing a caller composed.
+    """
+    error = _worktree_path_error(repo_path, payload.get("cwd"), what="cwd")
+    if error:
+        return 400, {"error": error}
+    cwd = os.path.normpath(os.path.abspath(str(payload["cwd"])))
+    if not os.path.isdir(cwd):
+        return 400, {
+            "error": (
+                f"the working directory {cwd} is not there, so there is "
+                "nowhere to run the declared test command"
+            )
+        }
+    declared, declared_timeout, error = declared_test_command(repo_path)
+    if error or declared is None:
+        return 400, {"error": error}
+    asked = payload.get("declared_test")
+    if not isinstance(asked, str) or asked != declared:
+        return 400, {
+            "error": (
+                "the test command must be the one this repository declares in "
+                f".guardkit/config.yaml ({declared!r}); it was asked to run "
+                f"{asked!r}"
+            )
+        }
+    timeout, warnings, error = _bounded_timeout(
+        payload.get("timeout_seconds"),
+        default=float(declared_timeout or 300),
+        ceiling=MERGE_TIMEOUT_MAX,
+    )
+    if error:
+        return 400, {"error": error}
+
+    logger.info(
+        "forge-deploy-sidecar: running the declared test command %r in %s "
+        "(up to %g seconds)",
+        declared,
+        cwd,
+        timeout,
+    )
+    try:
+        exit_code, stdout, stderr = command_runner(
+            argv=["/bin/sh", "-c", declared],
+            cwd=cwd,
+            timeout=timeout,
+            what="the declared test command",
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "cwd": cwd,
+        "command": declared,
+        "warnings": warnings,
+    }
+
+
 def process_run_request(
     payload: Any,
     *,
     config: ForgeConfig,
     script_runner: ScriptRunner = _run_script_step,
+    command_runner: "MergeRunner | None" = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + execute a ``/run`` payload; return ``(http_status, body)``.
 
@@ -434,6 +839,14 @@ def process_run_request(
     error, and a 200 with ``{exit_code, output_tail, cwd}`` on a permitted run (the
     script's non-zero exit is a 200 with a non-zero ``exit_code``, not an HTTP
     error — the script's verdict is data, not a transport failure). Never raises.
+
+    Two other kinds of work reach this route (sandbox first, rules 85 and 88),
+    each named by its own field and each running the repository's own declared
+    command rather than one the caller composed: ``driver`` runs the profile's
+    live-gate driver (:func:`process_live_gate_run`), and ``declared_test``
+    runs the repository's declared test command in a journey worktree
+    (:func:`process_declared_test_run`). A request carrying neither is the
+    vetted-script request this route has always served, unchanged.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -462,12 +875,41 @@ def process_run_request(
         }
     repo_path = Path(paths[repo])
 
+    # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
+    # command. It is answered BEFORE the deploy profile is read, because a
+    # repository can have a fix journey without being deployable at all: what
+    # it needs is a toolchain declaration and a journey worktree, not a deploy
+    # profile. Its own function checks both.
+    if payload.get("declared_test") is not None:
+        return process_declared_test_run(
+            payload,
+            repo_path=repo_path,
+            command_runner=command_runner or run_merge_command,
+        )
+
     # LAW 2 (part a) — re-read the target's profile ourselves.
     profile_path = repo_path / "deploy" / "profile.yaml"
     try:
         profile = load_deploy_profile(profile_path)
     except DeployProfileError as exc:
         return 400, {"error": f"target repo {repo!r} is not deployable: {exc}"}
+
+    # SANDBOX FIRST (rule 85) — the live-gate driver, whose program comes from
+    # the repository's profile rather than from ``script``. Answered whole by
+    # its own function, before a single line of the vetted-script path below
+    # is reached, so that path is exactly what it always was for every request
+    # that does not name a driver.
+    if payload.get("driver") is not None:
+        env_only, error = _allowlisted_env(payload.get("env"), profile)
+        if error:
+            return 400, {"error": error}
+        return process_live_gate_run(
+            payload,
+            repo_path=repo_path,
+            profile=profile,
+            extra_env=env_only,
+            command_runner=command_runner or run_merge_command,
+        )
 
     # LAW 2 (part b) — refuse any script the profile does not name.
     if not isinstance(script, str) or not script.strip():
@@ -491,31 +933,9 @@ def process_run_request(
         }
 
     # LAW 3 — env keys allowlisted, values must be strings.
-    if raw_env is None:
-        raw_env = {}
-    if not isinstance(raw_env, dict):
-        return 400, {
-            "error": "'env' must be a JSON object of allowlisted string values"
-        }
-    permitted_keys = allowed_env_keys(profile)
-    extra_env: dict[str, str] = {}
-    for key, value in raw_env.items():
-        if key not in permitted_keys:
-            names = ", ".join(sorted(permitted_keys))
-            return 400, {
-                "error": (
-                    f"env key {key!r} is not allowlisted — deny by default. "
-                    f"Allowed: {names}"
-                )
-            }
-        if not isinstance(value, str):
-            return 400, {
-                "error": (
-                    f"env value for {key!r} must be a string, got "
-                    f"{type(value).__name__}"
-                )
-            }
-        extra_env[key] = value
+    extra_env, env_error = _allowlisted_env(raw_env, profile)
+    if env_error is not None:
+        return 400, {"error": env_error}
 
     # LAW 4 — timeout cap.
     timeout = TIMEOUT_DEFAULT
@@ -632,6 +1052,8 @@ def run_merge_command(
     argv: list[str],
     cwd: str,
     timeout: float = MERGE_TIMEOUT_DEFAULT,
+    what: str = "the merge command",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run one fixed argument list with no shell; return exit code and output.
 
@@ -642,11 +1064,26 @@ def run_merge_command(
 
     Never raises: a command that cannot be started comes back as a non-zero
     exit code with a plain sentence saying so.
+
+    ``what`` names the command in those sentences. It is the merge command by
+    default, because that is what this runner was written for and what every
+    existing caller runs; the live gate and the gates reader (sandbox first,
+    rules 85 and 88) pass their own name so a person reading a failure is told
+    which command would not start.
+
+    ``extra_env`` is laid over this service's own environment for the command
+    only. The live-gate driver needs it: the candidate leg's gate must address
+    the candidate's port rather than the live one, and that address is one of
+    the allowlisted, non-secret values the profile itself declares. ``None``
+    (every caller before the live gate) inherits the environment exactly as
+    before.
     """
+    env = (os.environ | extra_env) if extra_env else None
     try:
         process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             argv,
             cwd=cwd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -655,18 +1092,18 @@ def run_merge_command(
         return (
             MERGE_NOT_STARTED_EXIT_CODE,
             "",
-            f"the merge command could not be started: {exc}",
+            f"{what} could not be started: {exc}",
         )
     except NotADirectoryError as exc:
         return (
             MERGE_NOT_STARTED_EXIT_CODE,
             "",
-            f"the merge command could not be started: {exc}",
+            f"{what} could not be started: {exc}",
         )
     except PermissionError as exc:
-        return (126, "", f"the merge command could not be run: {exc}")
+        return (126, "", f"{what} could not be run: {exc}")
     except OSError as exc:
-        return (1, "", f"the merge command could not be started: {exc}")
+        return (1, "", f"{what} could not be started: {exc}")
 
     timed_out = False
     try:
@@ -687,7 +1124,7 @@ def run_merge_command(
     stderr = scrub_process_output((raw_err or b"").decode("utf-8", errors="replace"))
     if timed_out:
         stderr += (
-            f"\nthe merge command was stopped after {timeout:g} seconds and "
+            f"\n{what} was stopped after {timeout:g} seconds and "
             "everything it had started was stopped with it"
         )
     return exit_code, stdout, stderr
@@ -2489,6 +2926,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     payload,
                     config=config,
                     script_runner=self.server.script_runner,  # type: ignore[attr-defined]
+                    command_runner=self.server.merge_runner,  # type: ignore[attr-defined]
                 )
             self._write_json(status, body)
         except Exception as exc:  # noqa: BLE001 — never crash the server

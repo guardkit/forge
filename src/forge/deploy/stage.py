@@ -121,7 +121,7 @@ from forge.deploy.live_gate import (
     LiveGateInvoker,
     RefusingLiveGateInvoker,
 )
-from forge.deploy.profile import DeployProfile
+from forge.deploy.profile import DeployProfile, wrapper_inner_script
 from forge.deploy.reservation import (
     ReservationError,
     ReservationHandle,
@@ -142,6 +142,8 @@ from forge.persistence.repositories.runbook import RunbookRepository
 from forge.persistence.repositories.runbook_models import Runbook
 
 logger = logging.getLogger(__name__)
+
+
 
 __all__ = ["DeployStageRunner", "DeployStageResult", "gate_summary"]
 
@@ -292,6 +294,7 @@ class DeployStageRunner:
         presence_resolver: SecretPresenceResolver | None = None,
         target_repo: str | None = None,
         target_repo_root: str | None = None,
+        sandbox: Any | None = None,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -305,6 +308,15 @@ class DeployStageRunner:
         self._clock = clock
         self._presence_resolver = presence_resolver
         self._target_repo = target_repo
+        # SANDBOX FIRST (2026-09-07, rule 85). The repository's sandbox entry
+        # from ``planning.sandboxes``, or None for a repository that has none —
+        # which is every repository until an operator fills that mapping in,
+        # and which keeps this stage byte for byte what it was. When it is set,
+        # two things change and nothing else: the scripts go to the sidecar
+        # INSIDE that sandbox rather than the host one, and the script they run
+        # is the repository's own deploy script rather than the host wrapper
+        # that would put it in a sandbox (see :meth:`_profile_for_run`).
+        self._sandbox = sandbox
         # [MG-5] The target repo's filesystem root — the demotion-event emission
         # writes under ``<root>/qa/`` (beside the live-gate gates), where the
         # DF-021 trust ledger reads it. None (older callers/tests) → the emission
@@ -332,8 +344,50 @@ class DeployStageRunner:
                 "planning.target_repo_paths); none was threaded into the "
                 "DeployStageRunner"
             )
-        return SidecarScriptRunner(
-            base_url=self._config.sidecar_url, repo=self._target_repo
+        base_url = self._config.sidecar_url
+        if self._sandbox is not None:
+            # The sidecar that runs this repository's scripts is the one inside
+            # its own sandbox, where the clone, the toolchain and the Docker
+            # engine are (rule 85). The global address stays for every
+            # repository that has no sandbox.
+            base_url = str(getattr(self._sandbox, "sidecar_url", "") or base_url)
+        return SidecarScriptRunner(base_url=base_url, repo=self._target_repo)
+
+    def _profile_for_run(self, profile: DeployProfile) -> DeployProfile:
+        """The profile this stage actually runs — the inner script in a sandbox.
+
+        A repository that deploys into a Docker Sandbox names a HOST wrapper as
+        its ``compose.script`` (``deploy/sandbox-deploy.sh``): the wrapper puts
+        the sandbox in place with ``sbx`` and then runs the repository's own
+        ``deploy/deploy.sh`` inside it. When the factory itself lives in that
+        sandbox (rule 85) the deploy stage's scripts already run in there, so
+        the wrapper would be asking ``sbx`` to make a sandbox from inside one —
+        which cannot work and must never be tried. So for a repository with a
+        sandbox this stage runs the wrapper's own inner script instead, and the
+        wrapper goes back to being what rule 86 says it is: an attended,
+        host-side command an operator runs to create the sandbox.
+
+        The inner script is the wrapper's name without its ``sandbox-`` prefix,
+        in the same directory — the shared template's own pairing
+        (``deploy/sandbox-deploy.sh`` runs ``deploy/deploy.sh``). A profile
+        whose script is not a wrapper by that name is left exactly as it is,
+        and so is every repository without a sandbox.
+        """
+        if self._sandbox is None:
+            return profile
+        script = profile.compose.script or ""
+        inner_path = wrapper_inner_script(script)
+        if not inner_path:
+            return profile
+        logger.info(
+            "deploy stage: %s runs inside its own sandbox, so the deploy step "
+            "runs %s directly instead of the host wrapper %s",
+            self._target_repo or profile.env_id,
+            inner_path,
+            script,
+        )
+        return replace(
+            profile, compose=replace(profile.compose, script=inner_path)
         )
 
     def _build_registry(
@@ -379,6 +433,7 @@ class DeployStageRunner:
         reservation or step failure is recorded and published as an honest
         DeployFailed, never a silent success.
         """
+        profile = self._profile_for_run(profile)
         prior_events: tuple[str, ...] = ()
         if profile.candidate is not None:
             checked = await self.candidate_check(
@@ -433,6 +488,7 @@ class DeployStageRunner:
         section at all (``detail["reason"] == "no_candidate_section"``).
         """
         events: list[str] = []
+        profile = self._profile_for_run(profile)
         profile_ref = deploy_profile_ref or profile.source_ref
         if profile.candidate is None:
             result = await self._fail_before_start(
@@ -520,6 +576,7 @@ class DeployStageRunner:
         """Tear the standing candidate down on its own — for a run that stops
         between the two legs. Never raises; ``outcome="failed"`` with
         ``failed_step="candidate_down"`` when the teardown did not complete."""
+        profile = self._profile_for_run(profile)
         if profile.candidate is None:
             return DeployStageResult(
                 outcome="complete",
@@ -566,6 +623,7 @@ class DeployStageRunner:
         carries ``candidate``: ``"torn-down"``, ``"kept"``, ``"standing"``
         (the promote stopped before the teardown) or ``"absent"``.
         """
+        profile = self._profile_for_run(profile)
         events: list[str] = list(prior_events)
         profile_ref = deploy_profile_ref or profile.source_ref
         deployer = deployer or deploy_run_id

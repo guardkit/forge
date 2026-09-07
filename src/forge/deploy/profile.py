@@ -67,7 +67,34 @@ __all__ = [
     "DeploySandbox",
     "DeployProfileError",
     "load_deploy_profile",
+    "SANDBOX_WRAPPER_PREFIX",
+    "wrapper_inner_script",
 ]
+
+
+#: The prefix a repository's HOST sandbox wrapper carries in front of its own
+#: inner deploy script: ``deploy/sandbox-deploy.sh`` puts the sandbox in place
+#: with ``sbx`` and then runs ``deploy/deploy.sh`` inside it (the shared
+#: template's fixed pairing). Sandbox first, 2026-09-07, rule 85.
+SANDBOX_WRAPPER_PREFIX: str = "sandbox-"
+
+
+def wrapper_inner_script(script: str | None) -> str | None:
+    """The script a sandbox wrapper runs, or ``None`` if this is not one.
+
+    ``deploy/sandbox-deploy.sh`` -> ``deploy/deploy.sh``. One derivation, in
+    one place, because two things read it and they must not drift: the deploy
+    stage, which runs the inner script instead of the wrapper for a repository
+    whose factory lives inside its sandbox, and the deploy sidecar's script
+    allowlist, which has to permit what the stage will send.
+    """
+    directory, _, name = str(script or "").rpartition("/")
+    if not name.startswith(SANDBOX_WRAPPER_PREFIX):
+        return None
+    inner = name[len(SANDBOX_WRAPPER_PREFIX) :]
+    if not inner:
+        return None
+    return f"{directory}/{inner}" if directory else inner
 
 
 class DeployProfileError(ValueError):

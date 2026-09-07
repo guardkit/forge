@@ -1710,8 +1710,12 @@ def build_in_daemon_deploy_dispatcher(
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
         from forge.adapters.sqlite.connect import connect_writer
+        from forge.config.sandboxes import sandbox_for
         from forge.deploy.composition import dispatch_deploy_stage
-        from forge.deploy.live_gate import RepoDriverLiveGateInvoker
+        from forge.deploy.live_gate import (
+            RepoDriverLiveGateInvoker,
+            SidecarLiveGateInvoker,
+        )
         from forge.deploy.profile import load_deploy_profile
         from forge.persistence.migrations import runbook as runbook_migration
         from forge.persistence.repositories.runbook import RunbookRepository
@@ -1723,9 +1727,26 @@ def build_in_daemon_deploy_dispatcher(
             )
         repo_root = Path(repo_root)
         profile = load_deploy_profile(repo_root / "deploy" / "profile.yaml")
+        # SANDBOX FIRST (2026-09-07, rule 85). A repository that has a sandbox
+        # is deployed and gated INSIDE it: the stage's scripts go to the deploy
+        # sidecar in there, and the live gate's driver goes with them, because
+        # the candidate's port is on that sandbox's own loopback and a driver
+        # run in the forge container could reach nothing. A repository with no
+        # sandbox — every repository until an operator fills the map in — takes
+        # exactly the path it took before this lane.
+        sandbox = sandbox_for(config, repo)
         spec = profile.live_gate
         invoker = None
-        if spec is not None:
+        if spec is not None and sandbox is not None:
+            invoker = SidecarLiveGateInvoker(
+                base_url=str(sandbox.sidecar_url),
+                repo=repo,
+                repo_path=repo_root,
+                driver_argv=list(spec.driver),
+                timeout_seconds=spec.timeout_seconds,
+                extra_env=dict(spec.env),
+            )
+        elif spec is not None:
             invoker = RepoDriverLiveGateInvoker(
                 repo_path=repo_root,
                 driver_argv=list(spec.driver),
@@ -1755,6 +1776,7 @@ def build_in_daemon_deploy_dispatcher(
             dry_run=dry_run,
             target_repo=repo,
             target_repo_root=str(repo_root),
+            sandbox=sandbox,
             feature=feature_id,
             feat_id=feature_id,
             # Distinct per run AND TASK-shaped — DeployQueuedPayload validates
