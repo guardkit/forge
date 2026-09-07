@@ -725,6 +725,7 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.frontier import FrontierSecondOpinion
         from forge.planning.target_terminal_tools import (
             make_normalize_feature_spec,
+            make_classify_scenarios,
             make_normalize_stamps,
             make_validate_feature_plan,
             make_validate_gate_registry,
@@ -1053,6 +1054,10 @@ async def compose_planning_consumer_and_dispatch(
         # frozen guardkit seam; an older guardkit without the subcommand
         # continues (receipted) until the rebake.
         normalize_stamps = make_normalize_stamps()
+        # The worked examples are checked for provability before the spec card
+        # (2026-09-07): a refused one is rewritten once by the machine before Rich
+        # is asked anything. Unwired, the card is exactly as before.
+        classify_scenarios = make_classify_scenarios()
         # B4 round-19: the per-task pass bars forge mints from the 007 seed are
         # validated by guardkit's OWN ``qa validate pass-bar`` before they land.
         validate_pass_bar = make_validate_pass_bar()
@@ -1172,6 +1177,7 @@ async def compose_planning_consumer_and_dispatch(
                 normalize_feature_spec=normalize_feature_spec,
                 validate_feature_plan=validate_feature_plan,
                 normalize_stamps=normalize_stamps,
+                classify_scenarios=classify_scenarios,
                 validate_pass_bar=validate_pass_bar,
                 # Lane B / Phase E1 (F2) — the per-feature live-gate registration
                 # leg (sibling of the pass-bar leg; no-op unless the endpoint is
