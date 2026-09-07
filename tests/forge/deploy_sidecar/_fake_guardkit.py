@@ -18,15 +18,26 @@ guardkit's three verbs as far as the sidecar and the driver read them:
 * ``qa classify-scenarios --feature-file <path> --repo <root> --json`` prints
   the classify JSON (exit 0), with refused titles when asked, or the
   cannot-run object (exit 2).
+* ``qa validate pass-bar <path>`` and ``qa validate gate-registry <path>``
+  answer valid (exit 0) or, when asked through the environment, refuse (exit
+  1) with guardkit's own shape of message on stderr.
 
 Every call appends one JSON line (argv, cwd) to ``FAKE_GUARDKIT_LOG`` so a
 test can prove what ran, in what order, with which flags.
+
+Beside it lives a stand-in for the OTHER command the sidecar's checks run:
+guardkit's gherkin normalizer, which is a MODULE (``python -m
+installer.core.commands.lib.feature_spec_normalize <file>``), not a guardkit
+subcommand. :func:`install_fake_normalizer` plants that module where both the
+sidecar's own interpreter and the subprocess it starts will find it, so the
+resolution the production code does is the resolution the test exercises.
 """
 
 from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 #: The two titles the fake refuses — the driver test's own fixture titles.
@@ -161,6 +172,22 @@ def classify(argv):
     return 0
 
 
+def qa_validate(kind, argv):
+    """``qa validate pass-bar|gate-registry <path>`` — guardkit's own schema
+    checkers, as far as the sidecar and the driver read them."""
+    rel = argv[0] if argv else ""
+    path = Path(rel)
+    if not path.is_file():
+        sys.stderr.write(f"Error: {rel} does not exist\n")
+        return 1
+    want = "red-pass-bar" if kind == "pass-bar" else "red-gate-registry"
+    if os.environ.get("FAKE_GUARDKIT_QA_VALIDATE") == want:
+        sys.stderr.write(f"{rel}: 'criteria' is a required property\n")
+        return 1
+    print(f"{rel}: valid")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     log(argv)
@@ -170,6 +197,10 @@ def main():
         return validate(argv[2:])
     if argv[:2] == ["qa", "classify-scenarios"]:
         return classify(argv[2:])
+    if argv[:3] == ["qa", "validate", "pass-bar"]:
+        return qa_validate("pass-bar", argv[3:])
+    if argv[:3] == ["qa", "validate", "gate-registry"]:
+        return qa_validate("gate-registry", argv[3:])
     sys.stderr.write(f"Error: No such command {argv!r}\n")
     return 2
 
@@ -177,6 +208,119 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''
+
+
+#: The marker the stand-in normalizer writes into a ``.feature`` it accepted —
+#: proof that what the sidecar's checks rewrite in ITS worktree rides the
+#: commit, the way the real normalizer's step collapse does.
+NORMALIZED_MARKER = "# normalized by the stand-in\n"
+
+#: The module path the normalizer is resolved at in a source checkout — the
+#: second of the two candidates the production resolver probes.
+NORMALIZER_MODULE = "installer.core.commands.lib.feature_spec_normalize"
+
+FAKE_NORMALIZER_SOURCE = r'''"""The stand-in gherkin normalizer (see _fake_guardkit.py).
+
+Behaves like guardkit's own module as far as the sidecar reads it: it is run
+as ``python -m <this module> <path to the .feature>``, it may REWRITE the file
+in place, and its exit code is the verdict.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+MARKER = "# normalized by the stand-in\n"
+
+
+def main():
+    argv = sys.argv[1:]
+    path = Path(argv[0]) if argv else None
+    log = os.environ.get("FAKE_GUARDKIT_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"argv": ["<normalize-feature>", *argv],
+                                 "cwd": os.getcwd()}) + "\n")
+    mode = os.environ.get("FAKE_NORMALIZER", "")
+    if mode == "red":
+        sys.stderr.write("gherkin parse error: line 3: expected a step keyword\n")
+        return 1
+    if path is None or not path.is_file():
+        sys.stderr.write(f"no such feature file: {argv!r}\n")
+        return 1
+    text = path.read_text(encoding="utf-8")
+    if MARKER not in text:
+        path.write_text(text + MARKER, encoding="utf-8")
+    print(f"{path}: parseable")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def write_fake_normalizer(directory: Path) -> Path:
+    """Write the stand-in normalizer as a real importable package tree under
+    ``directory`` and return ``directory`` (the path to put on the import
+    path). The tree is the source-checkout layout the production resolver's
+    second candidate names."""
+    package = directory / "installer" / "core" / "commands" / "lib"
+    package.mkdir(parents=True, exist_ok=True)
+    for level in (
+        directory / "installer",
+        directory / "installer" / "core",
+        directory / "installer" / "core" / "commands",
+        package,
+    ):
+        (level / "__init__.py").write_text("", encoding="utf-8")
+    (package / "feature_spec_normalize.py").write_text(
+        FAKE_NORMALIZER_SOURCE, encoding="utf-8"
+    )
+    return directory
+
+
+def fake_normalizer(directory: Path, monkeypatch) -> "Iterator[Path]":
+    """Plant the stand-in normalizer and make it the one BOTH the sidecar's
+    own interpreter (which probes with ``find_spec``) and the subprocess it
+    starts (which reads ``PYTHONPATH``) resolve. Use it from a fixture::
+
+        @pytest.fixture
+        def fake_normalizer_module(tmp_path, monkeypatch):
+            yield from fake_normalizer(tmp_path / "normalizer", monkeypatch)
+
+    Any ``installer`` package a previous test imported — the sibling guardkit
+    checkout the planning conftest appends for its own test-root discovery —
+    is dropped from the module cache on the way in and on the way out, so the
+    plant is invisible to every other test and so is its removal.
+    """
+    import importlib
+    import sys
+
+    def forget_installer() -> None:
+        for name in [
+            n for n in sys.modules if n == "installer" or n.startswith("installer.")
+        ]:
+            del sys.modules[name]
+
+    forget_installer()
+    root = write_fake_normalizer(directory)
+    # APPENDED, never prepended: the planning conftest appends the sibling
+    # guardkit checkout for its own test-root discovery, and prepending would
+    # take that name away from it. All the sidecar's probe needs is that the
+    # module resolves at all; which one the SUBPROCESS runs is decided by
+    # PYTHONPATH below, where the stand-in is first.
+    monkeypatch.setattr(sys, "path", [*sys.path, str(root)])
+    importlib.invalidate_caches()
+    existing = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{root}{os.pathsep}{existing}" if existing else str(root)
+    )
+    monkeypatch.delenv("FAKE_NORMALIZER", raising=False)
+    try:
+        yield root
+    finally:
+        forget_installer()
 
 
 def write_fake_guardkit(directory: Path) -> Path:
@@ -217,6 +361,25 @@ def classify_calls(path: Path) -> list[list[str]]:
         entry["argv"]
         for entry in read_log(path)
         if entry["argv"][:2] == ["qa", "classify-scenarios"]
+    ]
+
+
+def normalizer_calls(path: Path) -> list[list[str]]:
+    """The argv of every stand-in NORMALIZER call, in order (the module run
+    as ``python -m …``, logged under its check's name)."""
+    return [
+        entry["argv"][1:]
+        for entry in read_log(path)
+        if entry["argv"][:1] == ["<normalize-feature>"]
+    ]
+
+
+def qa_validate_calls(path: Path, kind: str) -> list[list[str]]:
+    """The argv of every ``qa validate <kind> …`` call, in order."""
+    return [
+        entry["argv"]
+        for entry in read_log(path)
+        if entry["argv"][:3] == ["qa", "validate", kind]
     ]
 
 

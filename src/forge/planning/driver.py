@@ -2516,13 +2516,35 @@ class PlanningRunDriver:
             outcome = await normalize(worktree, feature_rel)
             return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
 
+        # Sandbox first (2026-09-07, rule 87): a git runner that lives in the
+        # repository's sandbox cannot run the closure above. For such a runner
+        # the SAME normalizer is DECLARED by name against the same file, and
+        # Part K's provability check rides the same commit — it is the check
+        # the routing law would run, on the very bytes that land on the
+        # branch, so what a red normalizer means and what the card says are
+        # unchanged. The in-container runner keeps the closure.
+        git_runner = self._git_runner_for(target_repo)
+        pre_commit: Any = _pre_commit
+        declared_spec_checks = False
+        if self._runner_takes_declared_checks(git_runner):
+            if feature_rel is None:
+                await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_SPEC_STAGE,
+                    "spec write / normalizer failed: spec contract has no "
+                    ".feature file to normalize",
+                )
+                return None
+            pre_commit = self._declare_spec_checks(correlation_id, feature_rel)
+            declared_spec_checks = True
+
         try:
-            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+            gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
                 files=files,
                 message=f"planning: feature spec for {correlation_id} (Lane B 007)",
-                pre_commit=_pre_commit,
+                pre_commit=pre_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -2538,6 +2560,10 @@ class PlanningRunDriver:
                 f"spec write / normalizer failed: {gitres.stderr}",
             )
             return None
+        if declared_spec_checks and not record:
+            # Only the pre-card path asks for Part K's answer (``record`` is
+            # false exactly there), so only that path keeps it.
+            self._keep_declared_provability(gitres)
 
         # THE DIGEST IS RE-PROVEN AGAINST THE COMMITTED SPEC. The spec-writer
         # checked its digest against its own text; the normalizer then rewrote
@@ -2959,6 +2985,21 @@ class PlanningRunDriver:
         missing file, or a raise comes back as an outcome that says so.
         """
         from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome
+
+        kept = self._provability_from_the_sandbox.pop(
+            str(draft.get("sha") or ""), None
+        )
+        if kept is not None:
+            # The repository has a sandbox, so the check already ran there,
+            # beside the normalizer, on the committed bytes (rule 87).
+            logger.info(
+                "planning driver: run %s — the worked examples were checked "
+                "for provability in the repository's sandbox with the spec "
+                "commit: %s",
+                correlation_id,
+                kept.detail,
+            )
+            return kept
 
         classify = self._deps.classify_scenarios
         if classify is None:
@@ -4410,6 +4451,100 @@ class PlanningRunDriver:
             return bool(probe())
         except Exception:  # noqa: BLE001 — a runner that cannot answer takes closures
             return False
+
+    @property
+    def _provability_from_the_sandbox(self) -> dict[str, Any]:
+        """Part K's answers that came back with a spec commit made in a
+        repository's sandbox, by the commit's sha (rule 87, 2026-09-07).
+
+        When the spec leg declares its checks, the provability check runs
+        beside the normalizer in the sandbox's own worktree, on the bytes
+        that land on the branch — so its answer is already in hand by the
+        time the card's round asks for it, and asking again would run the
+        repository's guardkit a second time (and, for a sandboxed
+        repository, in the wrong place: the forge container). The answer is
+        kept here until that round reads it.
+        """
+        kept = getattr(self, "_provability_kept", None)
+        if kept is None:
+            kept = {}
+            self._provability_kept = kept
+        return kept
+
+    def _declare_spec_checks(
+        self, correlation_id: str, feature_rel: str
+    ) -> PreCommitChecks:
+        """The spec leg's pre-commit, declared: the gherkin normalizer over
+        the committed ``.feature`` (blocking, as the closure is), then Part
+        K's provability check over the same file (never blocking — it decides
+        nothing about the commit, only what the card says).
+
+        The provability check is declared exactly when it is wired at all
+        (``classify_scenarios``), so a composition that does not wire it
+        reads "no provability check is wired" here as it does anywhere else.
+        """
+        checks = [
+            PreCommitCheck(
+                name="normalize-feature",
+                args={"feature_file": feature_rel},
+                blocking=True,
+            )
+        ]
+        if self._deps.classify_scenarios is not None:
+            checks.append(
+                PreCommitCheck(
+                    name="classify-scenarios",
+                    args={"feature_file": feature_rel},
+                    blocking=False,
+                )
+            )
+        logger.info(
+            "planning driver: run %s — the spec leg's pre-commit checks on %s "
+            "are declared to the sandbox git runner rather than run here: %s",
+            correlation_id,
+            feature_rel,
+            ", ".join(
+                f"{c.name}({'blocking' if c.blocking else 'not blocking'})"
+                for c in checks
+            ),
+        )
+        return PreCommitChecks(tuple(checks))
+
+    def _keep_declared_provability(self, gitres: Any) -> None:
+        """Read Part K's answer off a declared spec write and keep it against
+        the commit's sha for :meth:`_check_provability_by_rule`. A check that
+        never ran (an older guardkit in the sandbox, or no answer at all)
+        keeps nothing, and the card's round then reports it as not checked in
+        the words it always used.
+
+        Only the spec leg's pre-card write calls this, and the round that
+        follows it always reads what it kept — so nothing accumulates in the
+        ordinary course. The cap below is for a leg that failed in between.
+        """
+        from forge.planning.target_terminal_tools import classify_scenarios_check
+
+        sha = str(getattr(gitres, "sha", "") or "")
+        check = next(
+            (
+                c
+                for c in (getattr(gitres, "checks", None) or [])
+                if c.name == "classify-scenarios"
+            ),
+            None,
+        )
+        if not sha or check is None or not check.ran:
+            return
+        kept = self._provability_from_the_sandbox
+        if len(kept) > 32:
+            # A leg that failed after its write leaves its answer behind;
+            # the newest thirty-two are all any run can still ask for.
+            kept.clear()
+        kept[sha] = classify_scenarios_check(
+            exit_code=check.exit_code,
+            stdout=check.stdout,
+            stderr=check.stderr_tail,
+            timed_out=check.timed_out,
+        )
 
     async def _declare_plan_checks(
         self,
@@ -6175,8 +6310,30 @@ class PlanningRunDriver:
                     )
             return PreCommitResult(ok=True)
 
+        # Sandbox first (rule 87): for a runner that lives in the repository's
+        # sandbox the same check is DECLARED once per minted bar, in the same
+        # order the loop above runs them; the first refusal stops the list and
+        # refuses the commit, exactly as the loop's early return does.
+        git_runner = self._git_runner_for(_target_repo)
+        pre_commit: Any = _pre_commit
+        if self._runner_takes_declared_checks(git_runner):
+            pre_commit = PreCommitChecks(
+                tuple(
+                    PreCommitCheck(
+                        name="validate-pass-bar", args={"bar_file": rel}, blocking=True
+                    )
+                    for rel in sorted(bars)
+                )
+            )
+            logger.info(
+                "planning driver: run %s — the pass-bar leg's %d check(s) are "
+                "declared to the sandbox git runner rather than run here",
+                correlation_id,
+                len(bars),
+            )
+
         try:
-            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+            gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
                 files=bars,
@@ -6184,7 +6341,7 @@ class PlanningRunDriver:
                     f"planning: register {len(bars)} per-task QA pass bar(s) for "
                     f"{correlation_id} ({feature_id}, Lane B seed fan-out)"
                 ),
-                pre_commit=_pre_commit,
+                pre_commit=pre_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
@@ -7143,9 +7300,29 @@ class PlanningRunDriver:
             outcome = await validate(worktree, _GATE_REGISTRY_REL)
             return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
 
+        # Sandbox first (rule 87): declared by name for a runner in the
+        # repository's sandbox, the same check against the same file.
+        git_runner = self._git_runner_for(_target_repo)
+        pre_commit: Any = _pre_commit
+        if self._runner_takes_declared_checks(git_runner):
+            pre_commit = PreCommitChecks(
+                (
+                    PreCommitCheck(
+                        name="validate-gate-registry",
+                        args={"registry_file": _GATE_REGISTRY_REL},
+                        blocking=True,
+                    ),
+                )
+            )
+            logger.info(
+                "planning driver: run %s — the feature-gate leg's check is "
+                "declared to the sandbox git runner rather than run here",
+                correlation_id,
+            )
+
         files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
         try:
-            gitres = await deps.git_runner.prepare_branch_and_write_tree(
+            gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
                 files=files,
@@ -7154,7 +7331,7 @@ class PlanningRunDriver:
                     f"{correlation_id} ({feature_id}, GET {endpoint['path']} — "
                     "F2 seed derivation)"
                 ),
-                pre_commit=_pre_commit,
+                pre_commit=pre_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(

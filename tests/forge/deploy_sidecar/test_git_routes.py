@@ -36,21 +36,27 @@ from forge.deploy_sidecar.service import (
     GUARDKIT_PATH_ENV,
     MERGE_TIMEOUT_EXIT_CODE,
     TIMEOUT_MAX,
+    GIT_CHECK_PATH_ARGS,
     build_server,
     process_git_read_file_request,
     process_git_rev_parse_request,
     process_git_write_tree_request,
     resolve_check_command,
+    resolve_normalizer_command_for_checks,
 )
 from forge.planning.handoff import PRE_COMMIT_CHECK_NAMES
 from forge.planning.target_terminal_tools import NO_MODEL_OPTION_UNKNOWN_NOTE
 
 from tests.forge.deploy_sidecar._fake_guardkit import (
+    NORMALIZED_MARKER,
     REFUSED_TITLES,
     classify_calls,
+    fake_normalizer,
     git_rev_parse,
     git_show,
     normalize_calls,
+    normalizer_calls,
+    qa_validate_calls,
     scratch_repo,
     validate_calls,
     validate_saw,
@@ -114,6 +120,37 @@ def fake_guardkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return log
 
 
+@pytest.fixture
+def fake_normalizer_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The stand-in gherkin normalizer, planted where BOTH the sidecar's own
+    ``find_spec`` probe and the subprocess it starts resolve it."""
+    yield from fake_normalizer(tmp_path / "normalizer", monkeypatch)
+
+
+FEATURE_REL = "features/stats/stats.feature"
+FEATURE_TEXT = "Feature: stats\n  Scenario: ok\n    Given a thing\n"
+BAR_REL = "qa/pass-bar-TASK-STAT-001.yaml"
+REGISTRY_REL = "qa/gates/registry.yaml"
+SPEC_FILES = {
+    FEATURE_REL: FEATURE_TEXT,
+    "features/stats/stats_summary.md": "# summary\n",
+}
+BAR_FILES = {BAR_REL: "task_id: TASK-STAT-001\ncriteria: []\n"}
+GATE_FILES = {REGISTRY_REL: "gates:\n  - id: stats\n"}
+
+
+def _normalize_feature_check(rel: str = FEATURE_REL) -> dict[str, Any]:
+    return {"name": "normalize-feature", "args": {"feature_file": rel}}
+
+
+def _pass_bar_check(rel: str = BAR_REL) -> dict[str, Any]:
+    return {"name": "validate-pass-bar", "args": {"bar_file": rel}}
+
+
+def _gate_registry_check(rel: str = REGISTRY_REL) -> dict[str, Any]:
+    return {"name": "validate-gate-registry", "args": {"registry_file": rel}}
+
+
 def _write(
     cfg: ForgeConfig,
     tmp_path: Path,
@@ -162,17 +199,31 @@ def _no_commit_landed(repo: Path, branch: str = BRANCH) -> bool:
 
 
 def test_the_checks_the_sidecar_runs_are_the_ones_the_protocol_names() -> None:
+    """Every check the planning chain's four writing legs run before a commit
+    is on the list, so no leg has to hand over a Python function (rule 87)."""
     assert GIT_CHECK_NAMES == PRE_COMMIT_CHECK_NAMES == (
         "normalize-stamps",
         "feature-validate",
         "classify-scenarios",
+        "normalize-feature",
+        "validate-pass-bar",
+        "validate-gate-registry",
     )
     assert GIT_CHECK_BLOCKING_DEFAULTS == {
         "normalize-stamps": True,
         "feature-validate": True,
         "classify-scenarios": False,
+        "normalize-feature": True,
+        "validate-pass-bar": True,
+        "validate-gate-registry": True,
     }
     assert set(GIT_CHECK_TIMEOUT_DEFAULTS) == set(GIT_CHECK_NAMES)
+    assert GIT_CHECK_PATH_ARGS == {
+        "classify-scenarios": "feature_file",
+        "normalize-feature": "feature_file",
+        "validate-pass-bar": "bar_file",
+        "validate-gate-registry": "registry_file",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +772,297 @@ def test_an_escaping_file_path_never_reaches_the_worktree(
 
 
 # ---------------------------------------------------------------------------
+# The three checks the other planning legs declare (rule 87, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+
+def test_the_gherkin_normalizer_runs_over_the_committed_feature_file(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """The spec leg's check: the normalizer module is run against the file in
+    the sidecar's OWN worktree, what it rewrites there rides the commit, and
+    it needs no guardkit command at all."""
+    status, body = _write(
+        cfg, tmp_path, checks=[_normalize_feature_check()], files=SPEC_FILES
+    )
+    assert status == 200, body
+    assert body["status"] == "success"
+    check = _by_name(body)["normalize-feature"]
+    assert check["ran"] and check["passed"] and check["blocking"]
+    committed = git_show(repo, BRANCH, FEATURE_REL) or ""
+    assert committed == FEATURE_TEXT + NORMALIZED_MARKER
+
+
+def test_a_red_normalizer_refuses_the_commit_with_the_legs_own_sentence(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_normalizer_module: Path,
+) -> None:
+    """A spec the normalizer cannot parse never reaches the branch, and the
+    sentence the leg reads is word for word the closure's."""
+    monkeypatch.setenv("FAKE_NORMALIZER", "red")
+    status, body = _write(
+        cfg, tmp_path, checks=[_normalize_feature_check()], files=SPEC_FILES
+    )
+    assert status == 200 and body["status"] == "failed" and body["sha"] is None
+    check = _by_name(body)["normalize-feature"]
+    assert not check["passed"] and check["exit_code"] == 1
+    assert check["detail"].startswith(f"normalizer exit 1 for {FEATURE_REL}: ")
+    assert "expected a step keyword" in check["detail"]
+    assert body["detail"].endswith(check["detail"])
+    assert _no_commit_landed(repo)
+
+
+def test_the_normalizer_runs_where_the_files_are_and_says_which_file(
+    cfg: ForgeConfig, tmp_path: Path, fake_guardkit: Path, fake_normalizer_module: Path
+) -> None:
+    """One fixed argument list: the module, then the absolute path of the
+    file inside the sidecar's worktree — never the operator's checkout."""
+    _write(cfg, tmp_path, checks=[_normalize_feature_check()], files=SPEC_FILES)
+    calls = normalizer_calls(fake_guardkit)
+    assert len(calls) == 1
+    assert calls[0][0].startswith(str(tmp_path / "wt"))
+    assert calls[0][0].endswith("/" + FEATURE_REL)
+
+
+def test_without_the_normalizer_module_the_request_is_a_plain_500(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path
+) -> None:
+    """A sidecar whose interpreter cannot import guardkit's normalizer says
+    so in one sentence, before any worktree is made — it never skips the
+    check quietly."""
+    status, body = process_git_write_tree_request(
+        {
+            "repo": REPO_KEY,
+            "branch": BRANCH,
+            "files": SPEC_FILES,
+            "message": MESSAGE,
+            "checks": [_normalize_feature_check()],
+        },
+        config=cfg,
+        normalizer_resolver=lambda: None,
+        worktrees_root=tmp_path / "wt",
+    )
+    assert status == 500
+    assert "gherkin normalizer module" in body["error"]
+    assert _no_commit_landed(repo)
+
+
+def test_the_normalizer_check_needs_no_guardkit_command(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_normalizer_module: Path,
+) -> None:
+    """It is a module, not a guardkit verb: a sidecar with no guardkit on it
+    still runs the spec leg's check."""
+    monkeypatch.delenv(GUARDKIT_PATH_ENV, raising=False)
+    status, body = process_git_write_tree_request(
+        {
+            "repo": REPO_KEY,
+            "branch": BRANCH,
+            "files": SPEC_FILES,
+            "message": MESSAGE,
+            "checks": [_normalize_feature_check()],
+        },
+        config=cfg,
+        command_resolver=lambda: None,
+        worktrees_root=tmp_path / "wt",
+    )
+    assert status == 200 and body["status"] == "success"
+
+
+def test_the_normalizer_command_is_resolved_the_way_the_spec_leg_resolves_it(
+    fake_normalizer_module: Path,
+) -> None:
+    command = resolve_normalizer_command_for_checks()
+    assert command is not None
+    assert command[1] == "-m"
+    assert command[2].endswith("feature_spec_normalize")
+
+
+def test_a_pass_bar_is_validated_by_guardkits_own_checker_before_it_lands(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path, fake_guardkit: Path
+) -> None:
+    status, body = _write(cfg, tmp_path, checks=[_pass_bar_check()], files=BAR_FILES)
+    assert status == 200 and body["status"] == "success"
+    check = _by_name(body)["validate-pass-bar"]
+    assert check["ran"] and check["passed"] and check["blocking"]
+    assert qa_validate_calls(fake_guardkit, "pass-bar") == [
+        ["qa", "validate", "pass-bar", BAR_REL]
+    ]
+    assert git_show(repo, BRANCH, BAR_REL) is not None
+
+
+def test_a_malformed_pass_bar_refuses_the_commit_and_names_the_bar_first(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_guardkit: Path,
+) -> None:
+    """The pass-bar leg's loop names the bar before the oracle's sentence;
+    the declared form says exactly the same thing."""
+    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
+    status, body = _write(cfg, tmp_path, checks=[_pass_bar_check()], files=BAR_FILES)
+    assert status == 200 and body["status"] == "failed" and body["sha"] is None
+    detail = _by_name(body)["validate-pass-bar"]["detail"]
+    assert detail.startswith(
+        f"{BAR_REL}: guardkit qa validate pass-bar failed (exit 1) for {BAR_REL}: "
+    )
+    assert "'criteria' is a required property" in detail
+    assert _no_commit_landed(repo)
+
+
+def test_one_bar_per_check_and_the_first_refusal_stops_the_list(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_guardkit: Path,
+) -> None:
+    """A bar is declared once per bar. When one refuses, the checks after it
+    are reported as not run and nothing is committed — the loop's own early
+    return, said over the wire."""
+    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
+    second = "qa/pass-bar-TASK-STAT-002.yaml"
+    status, body = _write(
+        cfg,
+        tmp_path,
+        checks=[_pass_bar_check(), _pass_bar_check(second)],
+        files={**BAR_FILES, second: "task_id: TASK-STAT-002\n"},
+    )
+    assert body["status"] == "failed"
+    outcomes = body["checks"]
+    assert [c["ran"] for c in outcomes] == [True, False]
+    assert outcomes[1]["detail"] == "not run: an earlier check refused the commit"
+    assert len(qa_validate_calls(fake_guardkit, "pass-bar")) == 1
+    assert _no_commit_landed(repo)
+
+
+def test_the_gate_registry_is_validated_before_the_gate_lands(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path, fake_guardkit: Path
+) -> None:
+    status, body = _write(
+        cfg, tmp_path, checks=[_gate_registry_check()], files=GATE_FILES
+    )
+    assert status == 200 and body["status"] == "success"
+    check = _by_name(body)["validate-gate-registry"]
+    assert check["ran"] and check["passed"] and check["blocking"]
+    assert qa_validate_calls(fake_guardkit, "gate-registry") == [
+        ["qa", "validate", "gate-registry", REGISTRY_REL]
+    ]
+    assert git_show(repo, BRANCH, REGISTRY_REL) is not None
+
+
+def test_a_malformed_gate_registry_refuses_the_commit(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_guardkit: Path,
+) -> None:
+    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-gate-registry")
+    status, body = _write(
+        cfg, tmp_path, checks=[_gate_registry_check()], files=GATE_FILES
+    )
+    assert status == 200 and body["status"] == "failed" and body["sha"] is None
+    detail = _by_name(body)["validate-gate-registry"]["detail"]
+    assert detail == (
+        f"guardkit qa validate gate-registry failed (exit 1) for {REGISTRY_REL}: "
+        f"{REGISTRY_REL}: 'criteria' is a required property"
+    )
+    assert _no_commit_landed(repo)
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("normalize-feature", "feature_file"),
+        ("validate-pass-bar", "bar_file"),
+        ("validate-gate-registry", "registry_file"),
+    ],
+)
+def test_each_new_check_takes_one_relative_path_and_nothing_else(
+    cfg: ForgeConfig, tmp_path: Path, name: str, key: str
+) -> None:
+    status, body = _write(
+        cfg, tmp_path, checks=[{"name": name, "args": {key: "/etc/passwd"}}]
+    )
+    assert status == 400 and f"args.{key}" in body["error"]
+    status, body = _write(
+        cfg, tmp_path, checks=[{"name": name, "args": {key: "a.yaml", "extra": 1}}]
+    )
+    assert status == 400 and "arguments the check does not take: extra" in body["error"]
+    status, body = _write(cfg, tmp_path, checks=[{"name": name, "args": {}}])
+    assert status == 400 and f"args.{key}" in body["error"]
+
+
+def test_a_new_check_may_be_declared_not_blocking_when_the_caller_says_so(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_guardkit: Path,
+) -> None:
+    """Blocking is the caller's to declare, as it is for the stamp normalizer:
+    a check declared not blocking reports its refusal and the commit lands."""
+    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-gate-registry")
+    status, body = _write(
+        cfg,
+        tmp_path,
+        checks=[{**_gate_registry_check(), "blocking": False}],
+        files=GATE_FILES,
+    )
+    assert status == 200 and body["status"] == "success"
+    check = _by_name(body)["validate-gate-registry"]
+    assert check["ran"] and not check["passed"] and not check["blocking"]
+    assert git_show(repo, BRANCH, REGISTRY_REL) is not None
+
+
+def test_every_leg_can_declare_its_checks_on_one_commit(
+    cfg: ForgeConfig,
+    tmp_path: Path,
+    repo: Path,
+    fake_guardkit: Path,
+    fake_normalizer_module: Path,
+) -> None:
+    """The six names together, in order, on one write: nothing in the closed
+    list needs a Python function on the host."""
+    files = {**PLAN_FILES, **SPEC_FILES, **BAR_FILES, **GATE_FILES}
+    status, body = _write(
+        cfg,
+        tmp_path,
+        files=files,
+        checks=[
+            _normalize_feature_check(),
+            {"name": "classify-scenarios", "args": {"feature_file": FEATURE_REL}},
+            _normalize_check(no_model=True),
+            _validate_check(),
+            _pass_bar_check(),
+            _gate_registry_check(),
+        ],
+    )
+    assert status == 200, body
+    assert body["status"] == "success"
+    assert [c["name"] for c in body["checks"]] == [
+        "normalize-feature",
+        "classify-scenarios",
+        "normalize-stamps",
+        "feature-validate",
+        "validate-pass-bar",
+        "validate-gate-registry",
+    ]
+    assert all(c["ran"] and c["passed"] for c in body["checks"]), body["checks"]
+
+
+# ---------------------------------------------------------------------------
 # read-file-from-branch and rev-parse
 # ---------------------------------------------------------------------------
 
@@ -994,3 +1336,69 @@ def test_live_guardkit_classify_and_normalize_through_the_route(
         assert written["model_outcome"]["status"] == "switched_off"
     assert body["status"] == "success"
     assert "Reading the current server time" in (git_show(repo, BRANCH, PLAN_YAML) or "")
+
+
+def test_live_gherkin_normalizer_and_the_two_schema_checks_through_the_route(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """guardkit's REAL gherkin normalizer module and its real ``qa validate``
+    verbs, run by the sidecar in its worktree: the spec leg's check collapses
+    a wrapped step in place and the collapsed file rides the commit, and a
+    malformed pass bar is refused by guardkit's own schema."""
+    import importlib
+    import sys
+
+    checkout = live_guardkit_checkout(Path(__file__))
+    if checkout is None:
+        pytest.skip("no live guardkit checkout is reachable")
+    module_rel = Path("installer/core/commands/lib/feature_spec_normalize.py")
+    if not (checkout / module_rel).is_file():
+        pytest.skip("the live guardkit checkout carries no gherkin normalizer")
+    wrapper = _live_guardkit_wrapper(tmp_path)
+    if wrapper is None:
+        pytest.skip("no live guardkit CLI is reachable")
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(wrapper))
+    for name in [n for n in sys.modules if n == "installer" or n.startswith("installer.")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "path", [*sys.path, str(checkout)])
+    monkeypatch.setenv("PYTHONPATH", str(checkout))
+    importlib.invalidate_caches()
+
+    feature_rel = "features/stats/stats.feature"
+    wrapped = (
+        "Feature: stats\n"
+        "  Scenario: Reading the current server time\n"
+        "    When the client sends GET /time\n"
+        "      and waits for the reply\n"
+        "    Then the response status is 200\n"
+    )
+    status, body = _write(
+        cfg,
+        tmp_path,
+        files={feature_rel: wrapped},
+        checks=[_normalize_feature_check(feature_rel)],
+    )
+    assert status == 200, body
+    check = _by_name(body)["normalize-feature"]
+    assert check["passed"], check
+    assert body["status"] == "success"
+    committed = git_show(repo, BRANCH, feature_rel) or ""
+    # The real normalizer collapsed the wrapped step in the sidecar's own
+    # worktree, and the collapsed file is what landed on the branch.
+    assert "and waits for the reply" in committed
+    assert "\n      and waits" not in committed
+
+    # And guardkit's own pass-bar schema refuses a malformed bar, on the same
+    # route, before it can land.
+    status, body = _write(
+        cfg,
+        tmp_path,
+        branch="planning/run-0002",
+        files={"qa/pass-bar-x.yaml": "not: a bar\n"},
+        checks=[_pass_bar_check("qa/pass-bar-x.yaml")],
+    )
+    assert status == 200 and body["status"] == "failed"
+    bar = _by_name(body)["validate-pass-bar"]
+    assert not bar["passed"]
+    assert bar["detail"].startswith("qa/pass-bar-x.yaml: guardkit qa validate pass-bar ")
+    assert _no_commit_landed(repo, "planning/run-0002")
