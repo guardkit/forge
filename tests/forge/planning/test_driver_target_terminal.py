@@ -436,6 +436,7 @@ def _make_driver(
     wire_build_trigger: bool = True,
     rewrite_on_refusal: bool | None = None,
     classify_fn: Any | None = None,
+    git_runner_for_repo: Any | None = None,
 ) -> _Harness:
     from datetime import UTC, datetime
 
@@ -631,6 +632,9 @@ def _make_driver(
         dispatch_product_owner=dispatch_po,
         second_opinion_provider=FakeSecondOpinion(),
         git_runner=git_runner or RecordingGitRunner(),
+        # Sandbox first (2026-09-07): the plan leg's git BY TARGET REPO. None
+        # (the default) = every leg uses the single runner above, as before.
+        git_runner_for_repo=git_runner_for_repo,
         planning_config=cfg,
         clock=clock,
         publish_notification=publish_notification,
