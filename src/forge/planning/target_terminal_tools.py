@@ -47,6 +47,7 @@ import logging
 import json
 import posixpath
 import re
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -73,6 +74,11 @@ __all__ = [
     "declare_feature_files_if_absent",
     "make_normalize_stamps",
     "parse_normalizer_payload",
+    "ClassifyScenariosFn",
+    "ScenarioProvabilityOutcome",
+    "classify_scenarios_result",
+    "make_classify_scenarios",
+    "parse_classify_payload",
     "TargetTestRootsUnresolved",
     "ToolOutcome",
     "ValidateFeaturePlanFn",
@@ -2385,6 +2391,338 @@ def make_normalize_stamps(
         return outcome
 
     return _normalize
+
+
+# ---------------------------------------------------------------------------
+# THE PROVABILITY CHECK BEFORE THE CARD (Part K of the rewrite-on-refusal
+# lane, 2026-09-07, on Rich's decision).
+#
+# Until now the routing law first saw a spec's worked examples at the plan
+# stage, after the owner's yes; a refusal there cost him a wait and, at worst,
+# a stop. ``guardkit qa classify-scenarios`` is the law's dry run for a spec
+# that has no plan yet: for every scenario in one .feature file it prints, BY
+# RULE ALONE, the home the rules would mint (R1–R10 and the verifier word) or
+# that the scenario is refused, using the repository's own HTTP-surface
+# detection. It never asks the model, never reads or writes a feature YAML,
+# and exits 0 whether or not anything is refused (the JSON says which); exit
+# 2 only when it cannot run (the file missing or unreadable).
+#
+# The contract, fixed so both halves could be built at once:
+#
+#   guardkit qa classify-scenarios --feature-file <path> --repo <root> --json
+#   → exactly one JSON object on stdout:
+#     {"feature_file": "<path as given>", "repo_has_http_surface": true|false,
+#      "http_surface_evidence": "<text>",
+#      "scenarios": [{"title": "<verbatim>", "home": "<word>|null",
+#                     "rule": "R1..R10|null", "refused": true|false}, ...],
+#      "refused_titles": ["<title>", ...]}
+#
+# forge's spec leg runs it on the COMMITTED draft, before the digest card
+# opens, and sends a refused example back to the spec writer as the machine's
+# own note (the same round the plan stage runs) so the card the owner reads
+# lists examples the law can prove. What the leg does with the outcome is the
+# driver's decision; this seam only runs the verb and reads its answer.
+# ---------------------------------------------------------------------------
+
+#: ``async (repo_path, feature_text) -> ScenarioProvabilityOutcome`` — run the
+#: rules-only check over the committed ``.feature`` CONTENT (the bytes the
+#: spec leg reads back off the planning branch) against the target repo's
+#: checkout (whose manifests decide whether the wire rule is armed).
+ClassifyScenariosFn = Callable[[Path, str], Awaitable["ScenarioProvabilityOutcome"]]
+
+#: click's usage error on a guardkit that predates the verb (or the ``qa``
+#: group). The check is then skipped, receipted, and the card is unchanged.
+_CLASSIFY_UNAVAILABLE_RE = re.compile(
+    r"No such command ['\"](classify-scenarios|qa)['\"]"
+)
+
+#: The check's exit code when it could not run (the file missing or
+#: unreadable, the Gherkin unparseable): ``{"error": "..."}`` on stdout.
+CLASSIFY_EXIT_CANNOT_RUN = 2
+
+
+@dataclass(frozen=True)
+class ScenarioProvabilityOutcome:
+    """What the rules-only provability check said about one committed spec.
+
+    ``status``:
+
+    * ``"checked"``     — the verb ran; ``refused_titles`` names every
+      scenario no rule can prove (verbatim; empty when all have a home),
+      ``homes`` / ``rules`` the verifier word and the rule for each homed one
+    * ``"unavailable"`` — the guardkit on this image has no such verb; the
+      check is skipped and receipted, the card unchanged
+    * ``"failed"``      — the verb could not run, timed out, raised, or its
+      answer could not be read; likewise skipped and receipted
+    * ``"not-wired"``   — no collaborator injected (hermetic composition)
+
+    A refusal here never stops anything: it is the signal the machine's
+    pre-card note round listens for, and the plan stage's own stamping stays
+    the check of record.
+    """
+
+    status: str
+    detail: str = ""
+    refused_titles: tuple[str, ...] = ()
+    homes: Mapping[str, str] = field(default_factory=dict)  # title -> verifier word
+    rules: Mapping[str, str] = field(default_factory=dict)  # title -> rule id
+    scenario_count: int | None = None
+    repo_has_http_surface: bool | None = None
+    http_surface_evidence: str = ""
+    #: The whole JSON was clipped by the seam's 4 KB stdout tail and only the
+    #: ``refused_titles`` array at its end could be read back.
+    titles_recovered_from_tail: bool = False
+
+    @property
+    def checked(self) -> bool:
+        """The verb ran and answered: ``refused_titles`` is meaningful."""
+        return self.status == "checked"
+
+    def receipt(self) -> dict[str, Any]:
+        """Durable-row projection (JSON-safe)."""
+        rec: dict[str, Any] = {"status": self.status, "detail": self.detail}
+        if self.status == "checked":
+            rec["refused_titles"] = list(self.refused_titles)
+            rec["homes"] = dict(self.homes)
+            rec["rules"] = dict(self.rules)
+            if self.scenario_count is not None:
+                rec["scenario_count"] = self.scenario_count
+            if self.repo_has_http_surface is not None:
+                rec["repo_has_http_surface"] = self.repo_has_http_surface
+            if self.http_surface_evidence:
+                rec["http_surface_evidence"] = self.http_surface_evidence
+            if self.titles_recovered_from_tail:
+                rec["titles_recovered_from_tail"] = True
+        return rec
+
+
+def parse_classify_payload(stdout_tail: str) -> dict[str, Any] | None:
+    """Recover the ``classify-scenarios`` JSON from the seam's stdout TAIL.
+
+    1. the whole object when the tail still starts at its ``{`` (the common
+       case — a spec of a dozen scenarios is well under 4 KB);
+    2. else the ``"refused_titles": [...]`` array, which the verb prints LAST
+       in the object, so it survives a clipped head (``partial: True``);
+    3. else ``None`` — the caller reads that as an answer it could not read,
+       never as "nothing refused".
+    """
+    text = stdout_tail or ""
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        start = text.find("{")
+        end = -1
+        for m in re.finditer(r"^\}\s*$", text[start:], re.MULTILINE):
+            end = start + m.end()
+        if end > start:
+            try:
+                data = json.loads(text[start:end])
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+    key = text.rfind('"refused_titles":')
+    if key < 0:
+        return None
+    open_at = text.find("[", key)
+    close_at = text.rfind("]")
+    if open_at < 0 or close_at <= open_at:
+        return None
+    try:
+        titles = json.loads(text[open_at : close_at + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(titles, list):
+        return None
+    return {"refused_titles": [str(t) for t in titles], "partial": True}
+
+
+def classify_scenarios_result(
+    *, status: str, exit_code: int, stdout_tail: str, stderr: str
+) -> ScenarioProvabilityOutcome:
+    """Map one ``guardkit qa classify-scenarios`` seam result onto an outcome.
+
+    Pure; the decision table:
+
+    * ``timeout``                            → ``failed``
+    * non-zero + click ``No such command``   → ``unavailable``
+    * exit 0 + readable JSON                 → ``checked``
+    * exit 0 + unreadable answer             → ``failed`` (never "all proven")
+    * exit 2                                 → ``failed`` (the verb's own
+      ``error`` sentence when it printed one, else stderr's last line)
+    * anything else non-zero                 → ``failed`` (the streams)
+    """
+    stderr = stderr or ""
+    tail = stdout_tail or ""
+    if status == "timeout":
+        return ScenarioProvabilityOutcome(
+            status="failed", detail="guardkit qa classify-scenarios timed out"
+        )
+    if exit_code != 0 and _CLASSIFY_UNAVAILABLE_RE.search(stderr):
+        line = next(
+            (ln.strip() for ln in stderr.splitlines() if "No such command" in ln),
+            stderr.strip(),
+        )
+        return ScenarioProvabilityOutcome(
+            status="unavailable",
+            detail=(
+                "the guardkit on this image has no `qa classify-scenarios` "
+                f"verb ({line}); the worked examples were not checked for "
+                "provability before the card (the plan stage's stamping still "
+                "checks them)"
+            ),
+        )
+    payload = parse_classify_payload(tail)
+    if exit_code == 0 and status == "success":
+        if payload is None:
+            return ScenarioProvabilityOutcome(
+                status="failed",
+                detail=(
+                    "guardkit qa classify-scenarios exited 0 but its answer "
+                    "could not be read from the output"
+                ),
+            )
+        refused = tuple(str(t) for t in (payload.get("refused_titles") or []))
+        rows = payload.get("scenarios")
+        homes: dict[str, str] = {}
+        rules: dict[str, str] = {}
+        count: int | None = None
+        if isinstance(rows, list):
+            count = len(rows)
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                title = str(row.get("title") or "")
+                if not title or row.get("refused") or row.get("home") is None:
+                    continue
+                homes[title] = str(row.get("home"))
+                if row.get("rule") is not None:
+                    rules[title] = str(row.get("rule"))
+        surface = payload.get("repo_has_http_surface")
+        partial = bool(payload.get("partial"))
+        detail = (
+            f"{len(refused)} of {count} scenario(s) cannot be proven by rule"
+            if count is not None and refused
+            else f"every one of the {count} scenario(s) can be proven by rule"
+            if count is not None
+            else (
+                f"{len(refused)} scenario(s) cannot be proven by rule "
+                "(the rest of the answer was clipped)"
+                if refused
+                else "no scenario is refused (the rest of the answer was clipped)"
+            )
+        )
+        return ScenarioProvabilityOutcome(
+            status="checked",
+            detail=detail,
+            refused_titles=refused,
+            homes=homes,
+            rules=rules,
+            scenario_count=count,
+            repo_has_http_surface=bool(surface) if isinstance(surface, bool) else None,
+            http_surface_evidence=str(payload.get("http_surface_evidence") or ""),
+            titles_recovered_from_tail=partial,
+        )
+    error = (payload or {}).get("error") if isinstance(payload, Mapping) else None
+    if not error:
+        m = re.search(r'"error":\s*"((?:[^"\\]|\\.)*)"', tail)
+        if m:
+            try:
+                error = json.loads(f'"{m.group(1)}"')
+            except json.JSONDecodeError:
+                error = m.group(1)
+    if error:
+        return ScenarioProvabilityOutcome(
+            status="failed",
+            detail=f"guardkit qa classify-scenarios could not run: {error}",
+        )
+    last = next(
+        (ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), ""
+    )
+    return ScenarioProvabilityOutcome(
+        status="failed",
+        detail=(
+            f"guardkit qa classify-scenarios exited {exit_code}"
+            + (f": {last}" if last else "")
+        ),
+    )
+
+
+def make_classify_scenarios(
+    *,
+    read_allowlist: Sequence[Path] | None = None,
+    timeout_seconds: int = _DEFAULT_NORMALIZER_TIMEOUT_SECONDS,
+    run_fn: Callable[..., Awaitable[object]] = guardkit_run,
+) -> ClassifyScenariosFn:
+    """Build the production PROVABILITY CHECK hook (spec leg, before the card).
+
+    Rides the SAME frozen :func:`forge.adapters.guardkit.run.run` seam the
+    stamp normalizer rides: ``guardkit qa classify-scenarios --feature-file
+    <tmp> --repo <repo checkout> --json`` with cwd = the target repository's
+    checkout. The committed ``.feature`` content the driver read back off the
+    planning branch is written to a temporary file for the verb to read —
+    the driver never learns the planning worktree's path (only the
+    pre-commit hook sees it, transiently), and the checkout must stay clean
+    for the other legs, so nothing is written under it. The ``--repo`` root
+    is used by the verb ONLY to detect the HTTP surface from the repository's
+    own manifests, which are the same on any branch of the checkout.
+
+    Never raises: every outcome — checked / unavailable / failed — comes back
+    as a :class:`ScenarioProvabilityOutcome` the driver decides on. Rules
+    only: the verb never asks the model, so the budget is the normalizer's
+    seconds, not minutes.
+    """
+
+    async def _classify(repo_path: Path, feature_text: str) -> ScenarioProvabilityOutcome:
+        try:
+            with tempfile.TemporaryDirectory(prefix="forge-provability-") as td:
+                feature_file = Path(td) / "draft.feature"
+                feature_file.write_text(feature_text, encoding="utf-8")
+                result = await guardkit_run_shim(
+                    run_fn,
+                    subcommand="qa",
+                    args=[
+                        "classify-scenarios",
+                        "--feature-file",
+                        str(feature_file),
+                        "--repo",
+                        str(repo_path),
+                        "--json",
+                    ],
+                    repo_path=repo_path,
+                    read_allowlist=list(read_allowlist or [repo_path]),
+                    timeout_seconds=timeout_seconds,
+                    with_nats_streaming=False,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — oracle boundary
+            logger.exception("classify_scenarios invocation raised")
+            return ScenarioProvabilityOutcome(
+                status="failed",
+                detail=f"qa classify-scenarios raised {type(exc).__name__}: {exc}",
+            )
+        outcome = classify_scenarios_result(
+            status=str(getattr(result, "status", "failed")),
+            exit_code=int(getattr(result, "exit_code", -1)),
+            stdout_tail=str(getattr(result, "stdout_tail", "") or ""),
+            stderr=str(getattr(result, "stderr", None) or ""),
+        )
+        if outcome.status == "checked":
+            if outcome.refused_titles:
+                logger.info(
+                    "classify_scenarios: %s; refused: %s",
+                    outcome.detail,
+                    list(outcome.refused_titles),
+                )
+            else:
+                logger.info("classify_scenarios: %s", outcome.detail)
+        elif outcome.status == "unavailable":
+            logger.warning("classify_scenarios: %s", outcome.detail)
+        else:
+            logger.error("classify_scenarios: %s: %s", outcome.status, outcome.detail)
+        return outcome
+
+    return _classify
 
 
 async def guardkit_run_shim(run_fn: Callable[..., Awaitable[object]], **kwargs: object):

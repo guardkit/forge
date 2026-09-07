@@ -435,6 +435,7 @@ def _make_driver(
     build_trigger_fn: Any | None = None,
     wire_build_trigger: bool = True,
     rewrite_on_refusal: bool | None = None,
+    classify_fn: Any | None = None,
 ) -> _Harness:
     from datetime import UTC, datetime
 
@@ -640,6 +641,8 @@ def _make_driver(
         # THE STAMP NORMALIZER hook: unwired by default (the not-wired path,
         # receipted); the stamp tests inject their own.
         normalize_stamps=normalize_stamps_fn,
+        # THE PROVABILITY CHECK BEFORE THE CARD (Part K): unwired by default.
+        classify_scenarios=classify_fn,
         validate_pass_bar=_validate_pass_bar if wire_legs else None,
         validate_gate_registry=_validate_gate_registry if wire_legs else None,
         dispatch_build_trigger=(
@@ -6490,3 +6493,177 @@ def test_the_rule_6b_line_keeps_the_specs_shape_for_one_example_and_bends_for_mo
     )
     assert two == _MODEL_LINE_AFTER_CHANGED_NOTHING
     assert not re.search(r"\bR\d+\b", one) and not re.search(r"\bR\d+\b", two)
+
+
+# ---------------------------------------------------------------------------
+# THE PROVABILITY CHECK BEFORE THE CARD MEETS THE PLAN STAGE (Part K, rule 47:
+# "the plan stage's rule 1a path runs as today"). The machine's one note was
+# sent before the card, so the plan stage never sends it again: its first
+# stamping runs with the model fallback allowed — as the card told the owner
+# it would — and a title still refused stops with the plan-stop card and rule
+# 6's sentence for how the one rewrite went. Never a third try.
+# ---------------------------------------------------------------------------
+
+from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome  # noqa: E402
+
+
+def _classify_by_call(*refusals: list[str]):
+    """A fake ``classify_scenarios`` seam answering, per call, which of the
+    fixture's titles the rules refuse (the last answer repeats)."""
+    calls: list[str] = []
+
+    async def _classify(repo_path: Path, feature_text: str) -> ScenarioProvabilityOutcome:
+        calls.append(feature_text)
+        refused = refusals[min(len(calls) - 1, len(refusals) - 1)]
+        return ScenarioProvabilityOutcome(
+            status="checked",
+            detail=f"{len(refused)} of 1 scenario(s) cannot be proven by rule",
+            refused_titles=tuple(refused),
+            homes={} if refused else {"ok": "hurl"},
+            rules={} if refused else {"ok": "R9"},
+            scenario_count=1,
+            repo_has_http_surface=True,
+        )
+
+    _classify.calls = calls  # type: ignore[attr-defined]
+    return _classify
+
+
+def _refusal_of_ok() -> StampNormalizerOutcome:
+    """The plan stage's normalizer refusing the fixture's one example after
+    the model had its turn (the model could not settle it either)."""
+    return StampNormalizerOutcome(
+        status="refused",
+        detail="1 scenario(s) undecidable by rule (R1–R10) — the model fallback was asked and could not settle them; nothing was written",
+        refused_titles=("ok",),
+        model_outcome={"status": "answer_rejected", "detail": "the answer named no verifier"},
+    )
+
+
+_STOP_REFUSED_BY_CHECKER = (
+    "The machine already asked the spec writer once to rewrite these as what "
+    "the endpoint does; the rewrite was refused by the checker: could not carry "
+    "out what this round required, after 2 attempts. 'feedback_resolved' must "
+    "be met."
+)
+
+
+@pytest.mark.asyncio
+async def test_after_a_pre_card_round_the_plan_stage_asks_the_model_and_never_sends_the_note_again(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The pre-card round rewrote the example and the check still refused it;
+    the card said so and the owner approved. At the plan stage the FIRST
+    stamping runs with the model allowed (never by rule only: the round is
+    spent), and when it refuses the title the run stops with the plan-stop
+    card and rule 6's "still could not be proven" sentence — the spec writer
+    ran exactly twice in the whole run."""
+    repo, git = _enforced_repo(tmp_path)
+    _queue(store)
+    sink: dict[str, Any] = {}
+    classify = _classify_by_call(["ok"], ["ok"])
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_of_ok()]),
+        classify_fn=classify,
+    )
+    _share_order(sink, h)
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h.ctx["counters"]["spec"] == 2  # the pre-card round, never a third try
+    assert len(h.ctx["counters"]["spec_revisions"]) == 1
+    assert classify.calls == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
+    # The one card a person read carried rule 45's cannot-be-proven line.
+    card = h.ctx["publisher"].envelopes[0].payload["details"]["summary"]
+    assert card["what_happened"].endswith(
+        "1 of the worked examples cannot be proven as written: “ok”. If you "
+        "approve, the plan stage will ask the model fallback to place them; or "
+        "send a note."
+    )
+    assert "The machine rewrote 1 of the worked examples" in card["what_happened"]
+    # The plan stage stamped ONCE, called the old way (the model allowed —
+    # never by rule only: the round is spent), and stopped.
+    assert sink["rules_only"] == [None]
+    assert sink["order"] == ["normalize_stamps"]
+    assert h.ctx["counters"]["plan"] == 1
+    cards = _error_cards(h)
+    assert len(cards) == 1
+    assert _STOP_STILL_UNPROVEN in cards[0]
+    assert "ok" in cards[0]
+    assert "The model fallback's answer was rejected" in cards[0]
+    # The approved spec row carries the pre-card round; no plan-stage rewrite.
+    approved = _approved_spec_rows(store)
+    assert len(approved) == 1
+    assert approved[0]["provability"]["round"] == 1
+    assert approved[0]["provability"]["rewritten"] is True
+    assert "rewritten_by_machine" not in approved[0]
+
+
+@pytest.mark.asyncio
+async def test_after_a_checker_refused_pre_card_round_the_plan_stage_asks_the_model(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The checker refused the machine's rewrite before the card; the card
+    opened on the original draft and the owner approved. The plan stage's
+    first stamping asks the model; when it settles the title the plan carries
+    on to the build with no second note — and when it cannot, the stop card
+    says the rewrite was refused by the checker, with the reason."""
+    reason = (
+        "could not carry out what this round required, after 2 attempts. "
+        "'feedback_resolved' must be met"
+    )
+
+    # Carried on: the model settles it.
+    repo, git = _enforced_repo(tmp_path / "a")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _error_result(reason=reason)),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink, [None]),
+        classify_fn=_classify_by_call(["ok"]),
+    )
+    _share_order(sink, h)
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["spec"] == 2
+    assert sink["rules_only"] == [None]  # called the old way: the model allowed
+    assert sink["order"] == ["normalize_stamps", "validate"]
+    assert _error_cards(h) == []
+    approved = _approved_spec_rows(store)
+    assert approved[0]["provability"]["refused_by_checker"] is True
+    assert approved[0]["provability"]["rewritten"] is False
+
+    # Stopped: the model could not settle it either.
+    cx = sqlite_connect.connect_writer(tmp_path / "b.db")
+    migrations.apply_at_boot(cx)
+    store_b = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+    repo_b, git_b = _enforced_repo(tmp_path / "b")
+    _queue(store_b)
+    sink_b: dict[str, Any] = {}
+    h_b = _make_driver(
+        store_b,
+        git_runner=git_b,
+        repo_path=str(repo_b),
+        spec_result_factory=_spec_by_round(_spec_result_native(), _error_result(reason=reason)),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_sequenced_normalizer(sink_b, [_refusal_of_ok()]),
+        classify_fn=_classify_by_call(["ok"]),
+    )
+    _share_order(sink_b, h_b)
+    await h_b.driver.drive(CID)
+    assert store_b.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert h_b.ctx["counters"]["spec"] == 2
+    assert sink_b["rules_only"] == [None]  # the model allowed
+    cards = _error_cards(h_b)
+    assert len(cards) == 1
+    assert _STOP_REFUSED_BY_CHECKER in cards[0]
