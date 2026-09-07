@@ -217,6 +217,9 @@ class TestYamlRoundTrip:
                 "max_in_flight": 1,
                 "order": "shadow",
                 "stale_after_days": 7,
+                # The merge word's hold on a queued row while its merge offer
+                # is open (2026-09-06); the unfiltered dump always includes it.
+                "merge_offer_hold_seconds": 86400,
             },
             # ``budget`` was added by FEAT-UBS-002 — like ``queue`` above, the
             # round-trip dump now always includes it, so the canonical input
@@ -267,6 +270,12 @@ class TestYamlRoundTrip:
                 # ``planning.digest_review`` — the machine chain's one pause.
                 # Default always_ask=True; the unfiltered dump always includes it.
                 "digest_review": {"always_ask": True, "skip_max_scenarios": 3},
+                # ``planning.rewrite_on_refusal`` (2026-09-06, the machine rewrites a
+                # refused example once before asking) and ``planning.sandboxes``
+                # (2026-09-07, the repositories whose factory services run inside
+                # their own sandbox); the unfiltered dump always includes both.
+                "rewrite_on_refusal": True,
+                "sandboxes": {},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages) — like
             # ``planning`` above, the unfiltered round-trip dump always includes
@@ -330,7 +339,12 @@ class TestYamlRoundTrip:
             # card is offered and no approval response is consumed. A
             # first-class config section, so the unfiltered round-trip dump
             # always includes it and this exhaustive fixture must declare it.
-            "merge_executor": {"enabled": False, "response_wait_seconds": 86400},
+            "merge_executor": {
+                "enabled": False,
+                "response_wait_seconds": 86400,
+                # The verify run's wall clock inside the merge word (2026-09-06).
+                "verify_timeout_seconds": 600,
+            },
             # ``autobuild_gate`` — the build gate's human-approval wait
             # (2026-08-26). Default 0 = wait indefinitely for the answer; the
             # unfiltered round-trip dump always includes it, so this
