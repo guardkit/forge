@@ -2548,3 +2548,228 @@ async def test_live_guardkit_rules_only_is_honoured_or_fallen_back_from_and_rece
         assert out.rules_only is False
         assert out.rules_only_note == NO_MODEL_OPTION_UNKNOWN_NOTE
     assert out.receipt()["rules_only"] is knows_the_option
+
+
+# ---------------------------------------------------------------------------
+# THE PROVABILITY CHECK BEFORE THE CARD (Part K, 2026-09-07) — the seam.
+#
+# ``guardkit qa classify-scenarios --feature-file <tmp> --repo <checkout>
+# --json`` is the routing law's rules-only dry run on a spec that has no plan
+# yet. The seam writes the committed .feature CONTENT to a temporary file,
+# runs the verb in the target checkout, and reads back exactly one JSON
+# object; it never writes under the checkout, and an older guardkit without
+# the verb is "unavailable", never a failure of the run.
+# ---------------------------------------------------------------------------
+
+from forge.planning.target_terminal_tools import (  # noqa: E402
+    ScenarioProvabilityOutcome,
+    classify_scenarios_result,
+    make_classify_scenarios,
+    parse_classify_payload,
+)
+
+_CLASSIFY_FEATURE = (
+    "Feature: users\n"
+    "  Scenario: Creating a user answers 201\n"
+    "    When the caller sends POST /users\n"
+    "    Then the reply is 201\n"
+    "  Scenario: A new user can be created on a freshly created database\n"
+    "    Given a fresh database\n"
+    "    When a user is created\n"
+    "    Then the row exists\n"
+)
+
+_CLASSIFY_JSON = (
+    "{\n"
+    '  "feature_file": "/tmp/forge-provability-x/draft.feature",\n'
+    '  "repo_has_http_surface": true,\n'
+    '  "http_surface_evidence": "fastapi is an exact dependency in pyproject.toml",\n'
+    '  "scenarios": [\n'
+    "    {\n"
+    '      "title": "Creating a user answers 201",\n'
+    '      "home": "hurl",\n'
+    '      "rule": "R9",\n'
+    '      "refused": false\n'
+    "    },\n"
+    "    {\n"
+    '      "title": "A new user can be created on a freshly created database",\n'
+    '      "home": null,\n'
+    '      "rule": null,\n'
+    '      "refused": true\n'
+    "    }\n"
+    "  ],\n"
+    '  "refused_titles": [\n'
+    '    "A new user can be created on a freshly created database"\n'
+    "  ]\n"
+    "}\n"
+)
+
+_CLICK_NO_SUCH_CLASSIFY = (
+    "Usage: guardkit qa [OPTIONS] COMMAND [ARGS]...\n"
+    "Try 'guardkit qa --help' for help.\n\n"
+    "Error: No such command 'classify-scenarios'.\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_make_classify_scenarios_rides_the_seam_with_the_committed_text_in_a_temp_file(
+    tmp_path: Path,
+) -> None:
+    """The contract's argv, verbatim: the verb, the temp file carrying the
+    committed .feature CONTENT byte for byte, the checkout as --repo and as
+    cwd, --json; no NATS; the normalizer's seconds budget; and nothing
+    written under the checkout."""
+    seen: dict[str, Any] = {}
+
+    async def _run(**kwargs):
+        seen.update(kwargs)
+        args = kwargs["args"]
+        feature_file = Path(args[args.index("--feature-file") + 1])
+        seen["file_existed"] = feature_file.is_file()
+        seen["file_text"] = feature_file.read_text(encoding="utf-8")
+        seen["file_path"] = feature_file
+        return SimpleNamespace(status="success", exit_code=0, stderr="", stdout_tail=_CLASSIFY_JSON)
+
+    before = sorted(p.name for p in tmp_path.iterdir())
+    out = await make_classify_scenarios(run_fn=_run)(tmp_path, _CLASSIFY_FEATURE)
+
+    assert out.status == "checked"
+    assert out.refused_titles == ("A new user can be created on a freshly created database",)
+    assert out.homes == {"Creating a user answers 201": "hurl"}
+    assert out.rules == {"Creating a user answers 201": "R9"}
+    assert out.scenario_count == 2
+    assert out.repo_has_http_surface is True
+    assert "fastapi" in out.http_surface_evidence
+    assert seen["subcommand"] == "qa"
+    assert seen["args"][0] == "classify-scenarios"
+    assert seen["args"][1] == "--feature-file"
+    assert seen["args"][3:] == ["--repo", str(tmp_path), "--json"]
+    assert seen["repo_path"] == tmp_path
+    assert seen["read_allowlist"] == [tmp_path]
+    assert seen["with_nats_streaming"] is False
+    assert seen["timeout_seconds"] == 120  # rules, not a model: seconds
+    # The temp file carried the committed text verbatim, lived outside the
+    # checkout, and is gone once the verb has answered.
+    assert seen["file_existed"] and seen["file_text"] == _CLASSIFY_FEATURE
+    assert tmp_path not in seen["file_path"].parents
+    assert not seen["file_path"].exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    # The receipt is JSON-safe and names what was decided.
+    rec = out.receipt()
+    assert rec["status"] == "checked"
+    assert rec["refused_titles"] == ["A new user can be created on a freshly created database"]
+    assert rec["scenario_count"] == 2 and rec["repo_has_http_surface"] is True
+
+
+@pytest.mark.asyncio
+async def test_make_classify_scenarios_unavailable_failed_timeout_and_raise(tmp_path: Path) -> None:
+    """An older guardkit (click's usage error) is ``unavailable``; the verb's
+    own cannot-run exit 2 (one ``{"error": …}`` object) is ``failed`` with
+    its sentence; a timeout and a raise are ``failed`` — none of them ever
+    reads as "nothing refused"."""
+    run_fn, _ = _fake_run("failed", 2, stderr=_CLICK_NO_SUCH_CLASSIFY)
+    out = await make_classify_scenarios(run_fn=run_fn)(tmp_path, _CLASSIFY_FEATURE)
+    assert out.status == "unavailable" and not out.checked
+    assert "no `qa classify-scenarios` verb" in out.detail
+    assert out.refused_titles == ()
+
+    run_fn, _ = _fake_run(
+        "failed",
+        2,
+        tail='{\n  "error": "feature file could not be parsed: draft.feature (bad Gherkin)"\n}\n',
+        stderr="classify-scenarios: feature file could not be parsed: draft.feature (bad Gherkin)\n",
+    )
+    out = await make_classify_scenarios(run_fn=run_fn)(tmp_path, "not gherkin")
+    assert out.status == "failed"
+    assert out.detail == (
+        "guardkit qa classify-scenarios could not run: feature file could not "
+        "be parsed: draft.feature (bad Gherkin)"
+    )
+
+    run_fn, _ = _fake_run("timeout", -1)
+    out = await make_classify_scenarios(run_fn=run_fn)(tmp_path, _CLASSIFY_FEATURE)
+    assert out.status == "failed" and "timed out" in out.detail
+
+    async def _boom(**kwargs):
+        raise RuntimeError("guardkit blew up")
+
+    out = await make_classify_scenarios(run_fn=_boom)(tmp_path, _CLASSIFY_FEATURE)
+    assert out.status == "failed" and "RuntimeError" in out.detail
+    # A receipt for a check that did not run carries no titles at all.
+    assert set(out.receipt()) == {"status", "detail"}
+
+
+def test_classify_scenarios_result_reads_the_refused_titles_off_a_clipped_tail() -> None:
+    """The seam keeps a 4 KB stdout TAIL. The verb prints ``refused_titles``
+    LAST, so a long answer whose head was clipped still yields the titles —
+    marked as recovered from the tail — and never a guessed "all proven"."""
+    clipped = _CLASSIFY_JSON[_CLASSIFY_JSON.index('"refused": true'):]
+    assert not clipped.lstrip().startswith("{")
+    out = classify_scenarios_result(status="success", exit_code=0, stdout_tail=clipped, stderr="")
+    assert out.status == "checked"
+    assert out.refused_titles == ("A new user can be created on a freshly created database",)
+    assert out.titles_recovered_from_tail is True
+    assert out.scenario_count is None and out.homes == {}
+    assert out.receipt()["titles_recovered_from_tail"] is True
+
+    # A title containing ']' does not confuse the array recovery.
+    tail = '  "refused_titles": [\n    "Rows [soft-deleted] are hidden"\n  ]\n}\n'
+    assert parse_classify_payload(tail) == {
+        "refused_titles": ["Rows [soft-deleted] are hidden"],
+        "partial": True,
+    }
+    # Exit 0 with nothing readable is a FAILED check, never a clean one.
+    out = classify_scenarios_result(status="success", exit_code=0, stdout_tail="", stderr="")
+    assert out.status == "failed" and "could not be read" in out.detail
+    assert parse_classify_payload("no json here") is None
+
+
+def test_classify_scenarios_result_says_all_proven_only_when_the_verb_did() -> None:
+    payload = _CLASSIFY_JSON.replace(
+        '      "home": null,\n      "rule": null,\n      "refused": true\n',
+        '      "home": "probe:process",\n      "rule": "R4",\n      "refused": false\n',
+    ).replace(
+        '  "refused_titles": [\n    "A new user can be created on a freshly created database"\n  ]\n',
+        '  "refused_titles": []\n',
+    )
+    out = classify_scenarios_result(status="success", exit_code=0, stdout_tail=payload, stderr="")
+    assert out.status == "checked" and out.checked
+    assert out.refused_titles == ()
+    assert out.homes["A new user can be created on a freshly created database"] == "probe:process"
+    assert out.rules["A new user can be created on a freshly created database"] == "R4"
+    assert out.detail == "every one of the 2 scenario(s) can be proven by rule"
+    assert ScenarioProvabilityOutcome(status="not-wired", detail="x").checked is False
+
+
+@pytest.mark.asyncio
+async def test_live_classify_scenarios_answers_the_contract_or_is_unavailable(tmp_path: Path) -> None:
+    """The REAL verb, when a guardkit checkout is reachable: the contract's
+    JSON on stdout, rules only, the wire rule armed by --http-surface, exit 0
+    with a refused title, and NOTHING written under the checkout. A checkout
+    that predates the verb answers ``unavailable`` — the seam's honest word
+    for it — never a failure.
+
+    ``FORGE_GUARDKIT_NORMALIZER_CHECKOUT`` points the test at a checkout
+    carrying the verb (the lane's guardkit worktree); the sibling ``guardkit``
+    main is used otherwise.
+    """
+    checkout, python = live_guardkit_or_skip(Path(__file__))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("scratch\n", encoding="utf-8")
+    before = sorted(str(p.relative_to(repo)) for p in repo.rglob("*"))
+    run_fn = live_run_fn(checkout, python)
+
+    out = await make_classify_scenarios(run_fn=run_fn)(repo, _CLASSIFY_FEATURE)
+
+    assert sorted(str(p.relative_to(repo)) for p in repo.rglob("*")) == before
+    if out.status == "unavailable":
+        assert "no `qa classify-scenarios` verb" in out.detail
+        pytest.skip(f"this guardkit predates the verb: {out.detail}")
+    assert out.status == "checked", out
+    assert out.scenario_count == 2
+    assert out.repo_has_http_surface is False  # a bare scratch repo has no HTTP surface
+    # Without the wire rule armed, the endpoint example has no rule home
+    # either; both titles come back refused, verbatim.
+    assert "A new user can be created on a freshly created database" in out.refused_titles
+    assert "Creating a user answers 201" in out.refused_titles

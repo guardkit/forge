@@ -106,8 +106,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.preflight import ResourcePreflightResult
     from forge.planning.checkpoint import SecondOpinionProvider
     from forge.planning.target_terminal_tools import (
+        ClassifyScenariosFn,
         NormalizeFeatureSpecFn,
         NormalizeStampsFn,
+        ScenarioProvabilityOutcome,
         StampNormalizerOutcome,
         ValidateFeaturePlanFn,
         ValidateGateRegistryFn,
@@ -697,6 +699,55 @@ _SAME_LIST_NOTIFICATION = (
 _CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
 
 # ---------------------------------------------------------------------------
+# The worked examples are checked for provability BEFORE the spec card
+# (Part K of the rewrite-on-refusal lane, 2026-09-07, on Rich's decision).
+#
+# Until now the routing law first saw the examples at the plan stage, after
+# the owner's yes; a refusal there cost him a wait and, at worst, a stop.
+# Now, after the draft is committed and before the door opens, the spec leg
+# runs guardkit's rules-only check on the committed .feature; a refused
+# example goes back to the spec writer as the machine's own note — the same
+# round the plan stage runs, at most once — and the card the owner reads
+# says what happened. The plan stage's own stamping stays the consistency
+# check, and the model fallback's turn stays where rules 1a and 6b put it.
+# ---------------------------------------------------------------------------
+
+#: The card's line when the machine rewrote refused examples before the card
+#: (rule 45, the spec's own words). ``{changes}`` is the what-changed
+#: sentence from :func:`_plain_card_changes`.
+_PROVABILITY_REWRITTEN_CARD_LINE = (
+    "The machine rewrote {n} of the worked examples so they can be proven "
+    "(they described the database or the code rather than what a caller "
+    "sees). What changed: {changes}."
+)
+
+#: The card's line when examples are still unprovable after the round — or
+#: when the checker refused the machine's rewrite, so the card opens on the
+#: draft as first written (rule 45, the spec's own words). The titles are
+#: verbatim, quoted, separated by semicolons.
+_PROVABILITY_UNPROVABLE_CARD_LINE = (
+    "{n} of the worked examples cannot be proven as written: {titles}. If you "
+    "approve, the plan stage will ask the model fallback to place them; or "
+    "send a note."
+)
+
+#: What fills the rewritten line's ``{changes}`` slot when the rewrite moved
+#: the examples' steps into a provable shape while every sentence on the
+#: list stayed word for word (the comparison sentence is then empty, and
+#: "What changed: ." would be a defect on a surface Rich reads).
+_PROVABILITY_CHANGES_WHEN_LIST_UNCHANGED = (
+    "nothing on this list (the examples' wording changed underneath it)"
+)
+
+#: The receipt's words when no check collaborator is wired (hermetic
+#: composition, or a serve that predates the seam).
+_PROVABILITY_NOT_WIRED_DETAIL = (
+    "no provability check is wired (classify_scenarios), so the worked "
+    "examples were not checked by rule before the card; the plan stage's "
+    "stamping still checks them"
+)
+
+# ---------------------------------------------------------------------------
 # The machine rewrites on a refusal before it asks (2026-09-06).
 #
 # Two of Rich's sentences that weekend stopped at the plan stage because the
@@ -1089,6 +1140,14 @@ class PlanningDriverDeps:
     # naming the titles verbatim; an older guardkit without the subcommand
     # continues (backward compatible until the rebake) and is receipted.
     normalize_stamps: "NormalizeStampsFn | None" = None
+    # THE PROVABILITY CHECK BEFORE THE CARD (Part K, 2026-09-07) — ``guardkit
+    # qa classify-scenarios`` run, rules only, on the committed spec .feature
+    # BEFORE the digest card opens, so a worked example no rule can prove goes
+    # back to the spec writer as the machine's note before the owner is asked
+    # anything. Optional / default None: unwired = the card opens exactly as
+    # before and the draft row's receipt says the check did not run (never
+    # silent). A guardkit without the verb is likewise skipped and receipted.
+    classify_scenarios: "ClassifyScenariosFn | None" = None
     # Lane B / Phase E1 (B4 round-19, Rich-ratified) — the guardkit ``qa validate
     # pass-bar`` oracle. Optional / default None: with the flag OFF it is never
     # consulted. With the flag ON the per-task QA pass-bar registration leg
@@ -2043,10 +2102,28 @@ class PlanningRunDriver:
                     branch=branch,
                     plan_run_id=plan_run_id,
                     notes=notes,
+                    record=False,
                 )
                 if drafted is None:
                     return False  # the failure is already loud and terminal
-                draft = drafted
+                # THE EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD
+                # (Part K, 2026-09-07): the committed .feature is run through
+                # the routing law's rules-only check, a refused example goes
+                # back to the spec writer once as the machine's note, and
+                # the draft row is written HERE, with the receipt, so the
+                # card a restart replays is the card that was shown.
+                draft = await self._prove_the_examples_before_the_card(
+                    row,
+                    correlation_id,
+                    drafted,
+                    target_repo=target_repo,
+                    repo_path=repo_path,
+                    branch=branch,
+                    plan_run_id=plan_run_id,
+                    notes=notes,
+                )
+                if draft is None:
+                    return False  # already loud (a write or digest failure)
 
             # THE ONE PAUSE. A run configured to skip the card on a thin
             # feature skips it here — mechanically decidable, no judgement.
@@ -2188,6 +2265,8 @@ class PlanningRunDriver:
         notes: list[str],
         note_from_machine: bool = False,
         fail_on_refusal: bool = True,
+        record: bool = True,
+        previous_card: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Dispatch the spec-writer, commit the spec, record the DRAFT row.
 
@@ -2213,6 +2292,16 @@ class PlanningRunDriver:
         again. An owner's note never passes it and keeps today's path exactly.
         Every other failure of the round (the dispatch raising, the write, the
         digest) still fails the run here, loudly, as before.
+
+        ``record`` (Part K, 2026-09-07): ``False`` returns the draft WITHOUT
+        writing its ``drafted`` row, so the spec leg can check the committed
+        examples for provability — and run the machine's note round — before
+        the row that opens the card is written (:meth:`_record_spec_draft`
+        writes it). ``previous_card`` names the card the what-changed
+        comparison is made against when the caller knows it (the machine's
+        pre-card round compares with a draft that has no row yet); ``None``
+        reads it off the durable draft rows as before. Every existing caller
+        passes neither and is byte-identical.
 
         Returns the draft record (the same dict the door and the approved row
         read), or ``None`` when the leg has already failed loudly.
@@ -2460,31 +2549,18 @@ class PlanningRunDriver:
         # restart replays the same words.
         rewrite: dict[str, Any] | None = None
         if notes:
-            previous = self._previous_digest_card(correlation_id)
+            previous = (
+                previous_card
+                if previous_card is not None
+                else self._previous_digest_card(correlation_id)
+            )
             if previous is not None:
-                note = str(notes[-1])
-                if _cards_say_the_same_thing(previous, card):
-                    rewrite = {"repeat": True, "note": note, "changes": ""}
-                else:
-                    changes = _plain_card_changes(previous, card)
-                    rewrite = {"repeat": False, "note": note, "changes": changes}
-                if note_from_machine:
-                    # The machine's own round (2026-09-06): the comparison is
-                    # what the plan leg reads to decide between carrying on
-                    # and stopping, and the receipt names the author. The
-                    # card itself is NOT annotated — nobody is shown it
-                    # again, and "Your note was" would be a lie on a row a
-                    # person may read later.
-                    rewrite["author"] = _MACHINE_NOTE_AUTHOR
-                elif rewrite["repeat"]:
-                    card = dict(card)
-                    card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
-                else:
-                    card = dict(card)
-                    card["what_happened"] = (
-                        f"{card.get('what_happened', '')} "
-                        + _CHANGED_LIST_CARD_LINE.format(changes=rewrite["changes"])
-                    ).strip()
+                card, rewrite = self._compare_with_previous_card(
+                    previous,
+                    card,
+                    note=str(notes[-1]),
+                    note_from_machine=note_from_machine,
+                )
 
         draft: dict[str, Any] = {
             "slug": slug,
@@ -2506,30 +2582,418 @@ class PlanningRunDriver:
             # re-reads it rather than re-deriving it from a branch that has
             # moved on. A renderer never sees it.
             draft["rewrite"] = rewrite
-        # Status ``drafted``, deliberately NOT ``approved``: this row is the
-        # door's restart sentinel, never the leg's.
-        deps.store._record_event(
+        if record:
+            self._record_spec_draft(
+                correlation_id, draft, note_from_machine=note_from_machine
+            )
+        return draft
+
+    @staticmethod
+    def _compare_with_previous_card(
+        previous: Mapping[str, Any],
+        card: Mapping[str, Any],
+        *,
+        note: str,
+        note_from_machine: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """What a note's rewrite changed on the list, and the card's words for
+        it. Returns ``(card, rewrite)``: the rewrite record (``repeat``, the
+        note, the what-changed sentence, and the author when the note was the
+        machine's) and the card — annotated for an OWNER's note (the same-list
+        text, or the changed-list line appended), untouched for the machine's
+        (nobody is shown that card again, and "Your note was" would be a lie
+        on a row a person may read later)."""
+        rewrite: dict[str, Any]
+        if _cards_say_the_same_thing(previous, card):
+            rewrite = {"repeat": True, "note": note, "changes": ""}
+        else:
+            changes = _plain_card_changes(previous, card)
+            rewrite = {"repeat": False, "note": note, "changes": changes}
+        if note_from_machine:
+            # The machine's own round (2026-09-06): the comparison is what
+            # the caller reads to decide between carrying on and stopping,
+            # and the receipt names the author.
+            rewrite["author"] = _MACHINE_NOTE_AUTHOR
+            return dict(card), rewrite
+        card = dict(card)
+        if rewrite["repeat"]:
+            card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
+        else:
+            card["what_happened"] = (
+                f"{card.get('what_happened', '')} "
+                + _CHANGED_LIST_CARD_LINE.format(changes=rewrite["changes"])
+            ).strip()
+        return card, rewrite
+
+    def _record_spec_draft(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        *,
+        note_from_machine: bool,
+    ) -> None:
+        """Write the durable ``drafted`` row for a committed draft.
+
+        Status ``drafted``, deliberately NOT ``approved``: this row is the
+        door's restart sentinel, never the leg's.
+        """
+        self._deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_SPEC_DRAFT_STAGE,
             status="drafted",
             actor_identity="planning-driver",
-            details_json=json.dumps({"spec_draft": draft}),
+            details_json=json.dumps({"spec_draft": dict(draft)}),
         )
         logger.info(
             "planning driver: run %s feature-spec drafted (slug=%s, %d files, "
             "%d worked example(s), pass-bar seed %s) — %s",
             correlation_id,
-            slug,
-            len(files),
-            draft["scenario_count"],
-            "captured" if pass_bar_seed is not None else "ABSENT",
+            draft.get("slug"),
+            len(draft.get("spec_files") or []),
+            int(draft.get("scenario_count") or 0),
+            "captured" if draft.get("pass_bar_seed") is not None else "ABSENT",
             (
                 "the machine's rewrite round (round 1); the digest is not shown again"
                 if note_from_machine
                 else "showing the digest"
             ),
         )
-        return draft
+
+    # ------------------------------------------------------------------ #
+    # The worked examples are checked for provability before the card
+    # (Part K, 2026-09-07)
+    # ------------------------------------------------------------------ #
+
+    async def _prove_the_examples_before_the_card(
+        self,
+        row: Any,
+        correlation_id: str,
+        draft: dict[str, Any],
+        *,
+        target_repo: str,
+        repo_path: str,
+        branch: str,
+        plan_run_id: str,
+        notes: list[str],
+    ) -> dict[str, Any] | None:
+        """Check the committed draft's examples by rule; rewrite once if any
+        is refused; write the draft row that opens the card (rules 44–46).
+
+        ``draft`` is a committed draft WITHOUT a row yet (``record=False``).
+        The check is guardkit's rules-only dry run of the routing law on the
+        committed ``.feature``. When it refuses examples, the machine's note
+        round runs exactly as at the plan stage — the same note
+        (:meth:`_machine_rewrite_note`), the same revision path, the same
+        note-honoured criterion, at most one round — and the new draft is
+        checked again. The card then says which it was (rule 45): a rewrite
+        that landed, examples still unprovable after the round, or nothing
+        (the card byte-identical to today's). A checker-refused rewrite never
+        stops the run: the card opens on the draft as first written, with the
+        cannot-be-proven line. A check that could not run (unwired, an older
+        guardkit, a failure) is skipped and receipted; the card is unchanged.
+
+        Returns the draft the card opens on — its row written, its
+        ``provability`` receipt set — or ``None`` when the rewrite round's
+        write or digest failed the run loudly.
+        """
+        deps = self._deps
+        check = await self._check_provability_by_rule(
+            correlation_id, draft, repo_path=repo_path, branch=branch
+        )
+        provability: dict[str, Any] = {
+            "checked_by_rule": check.checked,
+            "refused_titles": list(check.refused_titles),
+            "rewritten": False,
+            "changes": None,
+            "check": check.receipt(),
+        }
+        if not check.checked:
+            provability["not_checked"] = check.detail
+            logger.warning(
+                "planning driver: run %s — the worked examples were not checked "
+                "for provability before the card (%s); the card opens as "
+                "written, and the plan stage's stamping is the check",
+                correlation_id,
+                check.detail,
+            )
+            return self._open_the_card_with(correlation_id, draft, provability)
+        if not check.refused_titles:
+            logger.info(
+                "planning driver: run %s — %s before the card; the card opens "
+                "as written",
+                correlation_id,
+                check.detail,
+            )
+            return self._open_the_card_with(correlation_id, draft, provability)
+
+        # THE MACHINE'S NOTE ROUND, BEFORE THE CARD (rule 44).
+        refused = list(check.refused_titles)
+        note = self._machine_rewrite_note(refused)
+        provability.update(
+            {
+                "round": 1,
+                "author": _MACHINE_NOTE_AUTHOR,
+                "note": note,
+                "refused_by_checker": False,
+                "still_refused": list(refused),
+            }
+        )
+        logger.info(
+            "planning driver: run %s — %d of the worked example(s) cannot be "
+            "proven by rule; the machine sends them back to the spec writer "
+            "once (round 1) before the card: %s",
+            correlation_id,
+            len(refused),
+            refused,
+        )
+        # The draft's own row, SUPERSEDED by the machine's note — the row an
+        # owner's note writes, so the revision channel finds the files to
+        # read back off the branch, a restart mid-round redoes the round, and
+        # the record says why this draft was never shown. No card on it: the
+        # spec text belongs on the row a card is opened from, and nowhere else.
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_SPEC_DRAFT_STAGE,
+            status="superseded",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "spec_draft": {
+                        "slug": draft.get("slug"),
+                        "spec_files": list(draft.get("spec_files") or []),
+                        "sha": draft.get("sha"),
+                        "scenario_count": draft.get("scenario_count"),
+                        "superseded_by_note": note,
+                        "author": _MACHINE_NOTE_AUTHOR,
+                        "refused_titles": refused,
+                    }
+                }
+            ),
+        )
+        try:
+            rewritten = await self._draft_spec(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                notes=[*notes, note],
+                note_from_machine=True,
+                fail_on_refusal=False,
+                record=False,
+                previous_card=draft.get("card") or {},
+            )
+        except _MachineNoteRefused as refused_round:
+            # Rule 44: a checker-refused pre-card rewrite never stops the
+            # run. The card opens on the draft as first written and says
+            # which examples cannot be proven; the plan stage's stamping,
+            # with the model fallback allowed, decides them after the yes.
+            provability["refused_by_checker"] = True
+            provability["checker_reason"] = str(refused_round.reason or "")
+            provability["dispatch_reason"] = refused_round.dispatch_reason
+            logger.warning(
+                "planning driver: run %s — the checker refused the machine's "
+                "rewrite before the card (round 1: %s); the card opens on the "
+                "draft as first written and names the %d example(s) that "
+                "cannot be proven",
+                correlation_id,
+                refused_round.dispatch_reason,
+                len(refused),
+            )
+            return self._open_the_card_with(
+                correlation_id,
+                draft,
+                provability,
+                lines=[self._unprovable_card_line(refused)],
+            )
+        if rewritten is None:
+            return None  # the spec leg already failed the run loudly
+        compared = rewritten.get("rewrite") or {}
+        changes = str(compared.get("changes") or "")
+        provability["rewritten"] = True
+        provability["changes"] = changes or None
+        second = await self._check_provability_by_rule(
+            correlation_id, rewritten, repo_path=repo_path, branch=branch
+        )
+        provability["second_check"] = second.receipt()
+        still = list(second.refused_titles) if second.checked else []
+        provability["still_refused"] = still
+        if not second.checked:
+            logger.warning(
+                "planning driver: run %s — the rewritten examples could not be "
+                "checked again before the card (%s); the card reports the "
+                "rewrite, and the plan stage's stamping is the check",
+                correlation_id,
+                second.detail,
+            )
+        # The draft the card opens on is the REWRITE. Its comparison with the
+        # draft it replaced is the machine's (kept in the receipt); what the
+        # OWNER is told about his own note, when this round followed one, is
+        # measured against the card he actually read, not the draft he never
+        # saw. The machine's round is not one of the owner's rounds.
+        final = dict(rewritten)
+        final.pop("rewrite", None)
+        final["cycle"] = draft.get("cycle")
+        card = dict(final.get("card") or {})
+        if notes:
+            owner_read = self._previous_digest_card(correlation_id)
+            if owner_read is not None:
+                card, owner_rewrite = self._compare_with_previous_card(
+                    owner_read, card, note=str(notes[-1]), note_from_machine=False
+                )
+                final["rewrite"] = owner_rewrite
+        final["card"] = card
+        lines: list[str] = []
+        if changes or not still:
+            lines.append(
+                _PROVABILITY_REWRITTEN_CARD_LINE.format(
+                    n=len(refused),
+                    changes=changes or _PROVABILITY_CHANGES_WHEN_LIST_UNCHANGED,
+                )
+            )
+        if still:
+            lines.append(self._unprovable_card_line(still))
+        logger.info(
+            "planning driver: run %s — the machine's rewrite before the card "
+            "(round 1) landed (%s); %s",
+            correlation_id,
+            changes or "nothing on the list changed",
+            (
+                f"{len(still)} example(s) still cannot be proven by rule: {still}"
+                if still
+                else "every example can now be proven by rule"
+                if second.checked
+                else "the second check did not run"
+            ),
+        )
+        return self._open_the_card_with(correlation_id, final, provability, lines=lines)
+
+    @staticmethod
+    def _unprovable_card_line(titles: Sequence[str]) -> str:
+        """Rule 45's cannot-be-proven line: the count and every title verbatim."""
+        return _PROVABILITY_UNPROVABLE_CARD_LINE.format(
+            n=len(titles),
+            titles="; ".join(f"“{title}”" for title in titles),
+        )
+
+    def _open_the_card_with(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        provability: dict[str, Any],
+        *,
+        lines: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Append rule 45's line(s) to the card's what-happened text, set the
+        ``provability`` receipt (rule 46) on the draft, write its ``drafted``
+        row, and return the draft the door opens on. No lines = the card
+        byte-identical to today's."""
+        final = dict(draft)
+        if lines:
+            card = dict(final.get("card") or {})
+            added = " ".join(lines)
+            card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
+            final["card"] = card
+            provability["card_line"] = added
+        final["provability"] = provability
+        self._record_spec_draft(correlation_id, final, note_from_machine=False)
+        return final
+
+    async def _check_provability_by_rule(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        *,
+        repo_path: str,
+        branch: str,
+    ) -> "ScenarioProvabilityOutcome":
+        """Run guardkit's rules-only check on the draft's COMMITTED ``.feature``.
+
+        The bytes are read back off the planning branch — the same call the
+        plan leg uses to read the spec of record — because the committed
+        file is what the plan stage will stamp, and the driver never learns
+        the worktree's path. Never raises: an unwired collaborator, a
+        missing file, or a raise comes back as an outcome that says so.
+        """
+        from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome
+
+        classify = self._deps.classify_scenarios
+        if classify is None:
+            return ScenarioProvabilityOutcome(
+                status="not-wired", detail=_PROVABILITY_NOT_WIRED_DETAIL
+            )
+        feature_rel = next(
+            (
+                str(rel)
+                for rel in (draft.get("spec_files") or [])
+                if str(rel).endswith(".feature")
+            ),
+            None,
+        )
+        if feature_rel is None:
+            return ScenarioProvabilityOutcome(
+                status="failed",
+                detail="the committed spec has no .feature file to check",
+            )
+        text = await self._deps.git_runner.read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=feature_rel
+        )
+        if text is None:
+            return ScenarioProvabilityOutcome(
+                status="failed",
+                detail=(
+                    f"{feature_rel} could not be read back off the planning "
+                    "branch to be checked"
+                ),
+            )
+        try:
+            return await classify(Path(repo_path), text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — collaborator boundary
+            logger.exception(
+                "planning driver: run %s — the provability check raised",
+                correlation_id,
+            )
+            return ScenarioProvabilityOutcome(
+                status="failed",
+                detail=f"the provability check raised {type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _how_the_spent_rewrite_went(spec_row: Mapping[str, Any]) -> str | None:
+        """The plan-stop card's word for how the run's one rewrite went when
+        it was spent before this stamping — at the plan stage on an earlier
+        drive (``rewritten_by_machine``: it landed, so titles refused now
+        "still could not be proven"), or before the card (Part K: landed →
+        the same; refused by the checker → rule 6's "was refused by the
+        checker: <reason>" variant). ``None`` when no rewrite was spent."""
+        if spec_row.get("rewritten_by_machine"):
+            return _REWRITE_STILL_UNPROVEN
+        pre_card = PlanningRunDriver._pre_card_round(spec_row)
+        if pre_card is None:
+            return None
+        if pre_card.get("rewritten"):
+            return _REWRITE_STILL_UNPROVEN
+        if pre_card.get("refused_by_checker"):
+            reason = " ".join(str(pre_card.get("checker_reason") or "").split()).rstrip(".")
+            return (
+                "was refused by the checker: "
+                + (reason or "the checker gave no reason")
+            )
+        return _REWRITE_STILL_UNPROVEN
+
+    @staticmethod
+    def _pre_card_round(spec_row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The approved spec row's record of a machine note round that ran
+        BEFORE the card (Part K), or ``None`` when none did. Present, it is
+        the run's one rewrite (rule 6: never a third try), so the plan
+        stage's stamping asks the model instead of sending the note again."""
+        block = spec_row.get("provability")
+        if isinstance(block, Mapping) and block.get("round"):
+            return block
+        return None
 
     async def _prove_digest_against_branch(
         self,
@@ -2666,6 +3130,11 @@ class PlanningRunDriver:
             # and the gate leg falls back to the prose regex exactly as before.
             "digest": draft.get("digest"),
         }
+        if isinstance(draft.get("provability"), Mapping):
+            # Part K (2026-09-07): the pre-card provability receipt rides the
+            # approved row so the plan stage can read, from the durable row,
+            # whether the machine's one note round already ran.
+            record["provability"] = dict(draft["provability"])
         if answer is not None:
             # The one tap answered the sign-in question too, when the card
             # carried it — the pass-bars leg reads this instead of opening a
@@ -3483,6 +3952,26 @@ class PlanningRunDriver:
         # for the repo is the stamping step's own reading (an unenforced
         # repo stamps as before). The second stamping, after a rewrite, asks
         # the model about what is still refused.
+        pre_card = self._pre_card_round(
+            self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
+        )
+        if pre_card is not None:
+            # Part K (2026-09-07): the machine's one note round already ran
+            # before the card, so this stamping asks the model about anything
+            # still refused rather than sending the note again.
+            logger.info(
+                "planning driver: run %s — the machine's note round (round 1) "
+                "ran before the spec card (%s); the plan stage's stamping runs "
+                "with the model fallback allowed and never sends the note again",
+                correlation_id,
+                (
+                    "the checker refused the rewrite"
+                    if pre_card.get("refused_by_checker")
+                    else "the rewrite landed"
+                    if pre_card.get("rewritten")
+                    else "the rewrite did not land"
+                ),
+            )
         first = await self._plan_attempt(
             correlation_id,
             target_repo=target_repo,
@@ -3503,17 +3992,16 @@ class PlanningRunDriver:
                 return False
             if not self._machine_rewrite_allowed(correlation_id, stamps):
                 # Today's stop — or, on a re-drive after the one rewrite was
-                # already recorded (rule 7), the stop that says so.
-                already = self._leg_event_details(
-                    correlation_id, _FEATURE_SPEC_STAGE
-                ).get("rewritten_by_machine")
+                # already recorded (rule 7), or when the machine spent its one
+                # note BEFORE the card (Part K), the stop that says so.
+                spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
                 return await self._stop_at_stamps(
                     correlation_id,
                     feature_id,
                     stamps,
                     after_rewrite=(
-                        _REWRITE_STILL_UNPROVEN
-                        if already and stamps.refused_titles
+                        self._how_the_spent_rewrite_went(spec_row)
+                        if stamps.refused_titles
                         else None
                     ),
                 )
@@ -3847,9 +4335,13 @@ class PlanningRunDriver:
         cfg = self._deps.planning_config
         if not bool(getattr(cfg, "rewrite_on_refusal", True)):
             return False
-        if self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE).get(
-            "rewritten_by_machine"
-        ):
+        spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
+        if spec_row.get("rewritten_by_machine"):
+            return False
+        if self._pre_card_round(spec_row) is not None:
+            # Part K (2026-09-07): the machine's one note was sent BEFORE the
+            # card; the plan stage never sends it again — its stamping asks
+            # the model, as the card told the owner it would.
             return False
         return True
 

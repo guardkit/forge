@@ -329,6 +329,7 @@ def _make_driver(
     normalize: Any | None = None,
     git: Any | None = None,
     target_terminal_enabled: bool = True,
+    classify: Any | None = None,
 ) -> _Harness:
     from datetime import UTC, datetime
 
@@ -419,6 +420,9 @@ def _make_driver(
         validate_pass_bar=_validate_pass_bar,
         validate_gate_registry=_validate_gate_registry,
         dispatch_build_trigger=dispatch_build_trigger,
+        # THE PROVABILITY CHECK BEFORE THE CARD (Part K): unwired by default —
+        # the not-wired path, receipted; the provability tests inject a fake.
+        classify_scenarios=classify,
     )
     return _Harness(
         PlanningRunDriver(deps),
@@ -2420,3 +2424,497 @@ async def test_a_refusal_with_no_reason_still_says_what_to_do(
         "(the checker gave no reason). Nothing was built. To try again, send "
         "the sentence again with the note folded into it."
     ]
+
+
+# ---------------------------------------------------------------------------
+# THE WORKED EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD (Part K of
+# the rewrite-on-refusal lane, 2026-09-07, on Rich's decision).
+#
+# Until now the routing law first saw the examples at the plan stage, after
+# Rich's yes; a refusal there cost him a wait and, at worst, a stop. Now the
+# committed draft is run through guardkit's rules-only check before the door
+# opens; a refused example goes back to the spec writer once as the machine's
+# own note — the same round the plan stage runs — and the card says what
+# happened, in the spec's words. No new buttons, no new touch.
+# ---------------------------------------------------------------------------
+
+from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome  # noqa: E402
+
+_REFUSED_TITLE = "Version endpoint rejects an unknown format"
+_HOMED_TITLE = "Version endpoint returns the running build"
+
+#: Rule 2's note, the spec's own words, with the fixture's refused title.
+_PRE_CARD_NOTE = (
+    "These worked examples cannot be proven as written, because they describe "
+    "the database or the code rather than what a caller sees:\n"
+    f"- {_REFUSED_TITLE}\n"
+    "\n"
+    "Rewrite each of them as what can be proven, keeping the behaviour itself "
+    "unchanged: a request to the endpoint and the reply it gets (the method and "
+    "path, the status code, and what is in the body), or, for behaviour one "
+    "request cannot show — two requests at once, timing — the repository test "
+    "that proves it, named. Keep every other worked example exactly as it is."
+)
+_PRE_CARD_AUTHOR = "planning-driver (stamp normalizer refusal)"
+
+#: Rule 45's two lines, the spec's own words, with the fixture's numbers.
+_REWROTE_LINE = (
+    "The machine rewrote 1 of the worked examples so they can be proven (they "
+    "described the database or the code rather than what a caller sees). What "
+    "changed: 1 example changed."
+)
+_UNPROVABLE_LINE = (
+    f"1 of the worked examples cannot be proven as written: “{_REFUSED_TITLE}”. "
+    "If you approve, the plan stage will ask the model fallback to place them; "
+    "or send a note."
+)
+
+#: The rewrite: the refused example said as what the endpoint does.
+_REWRITTEN_FEATURE = FEATURE_TEXT.replace(
+    "    When an unpublished format is asked for\n    Then the request is refused\n",
+    "    When GET /version?format=xml is sent\n    Then the reply is 406\n",
+)
+_REWRITTEN_DIGEST = DIGEST_YAML.replace(
+    "  sentence: Asking for the version in a format the service does not publish is\n"
+    "    refused rather than guessed at.\n",
+    "  sentence: GET /version with a format the service does not publish answers\n"
+    "    406.\n",
+)
+
+
+def _checked(refused: list[str]) -> ScenarioProvabilityOutcome:
+    """A rules-only answer over the fixture's two examples."""
+    homes = {t: "hurl" for t in (_HOMED_TITLE, _REFUSED_TITLE) if t not in refused}
+    return ScenarioProvabilityOutcome(
+        status="checked",
+        detail=(
+            f"{len(refused)} of 2 scenario(s) cannot be proven by rule"
+            if refused
+            else "every one of the 2 scenario(s) can be proven by rule"
+        ),
+        refused_titles=tuple(refused),
+        homes=homes,
+        rules={t: "R9" for t in homes},
+        scenario_count=2,
+        repo_has_http_surface=True,
+        http_surface_evidence="fastapi is an exact dependency in pyproject.toml",
+    )
+
+
+class _RecordingClassify:
+    """A fake ``classify_scenarios`` seam: answers in call order (the last
+    repeats) and records what it was asked to check."""
+
+    def __init__(self, outcomes: list[ScenarioProvabilityOutcome]) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._outcomes = outcomes
+
+    async def __call__(self, repo_path: Path, feature_text: str) -> ScenarioProvabilityOutcome:
+        self.calls.append({"repo_path": repo_path, "feature_text": feature_text})
+        return self._outcomes[min(len(self.calls) - 1, len(self._outcomes) - 1)]
+
+
+def _not_ok_reply(reason: str) -> Any:
+    """The checker refusing a revision round (the must-pass note-honoured
+    criterion failed twice): a not-ok dispatch with the checker's reason."""
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="failed"), role_output={}, reason=reason
+    )
+
+
+def _draft_rows(store: SqlitePlanningRunStore) -> list[tuple[str, dict]]:
+    return [(status, d.get("spec_draft") or {}) for status, d in _events(store, _DRAFT_STAGE)]
+
+
+def _card_summary(h: _Harness, index: int = 0) -> dict[str, Any]:
+    return _digest_cards(h)[index].payload["details"]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_spec_leaves_the_card_and_the_dispatch_count_unchanged(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Rule 46's cost: a clean spec costs exactly one spec-writer call, the
+    card is byte-identical to today's, and the draft row says the check ran
+    and refused nothing. The check saw the COMMITTED .feature, in the target
+    repository's checkout."""
+    _queue(store)
+    classify = _RecordingClassify([_checked([])])
+    h = _make_driver(
+        store, subscriber_factory=SharedScriptFactory([_answer("approve")]), classify=classify
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 1
+    assert len(classify.calls) == 1
+    assert classify.calls[0] == {
+        "repo_path": Path("/srv/repos/api_test"),
+        "feature_text": FEATURE_TEXT,
+    }
+    assert len(_digest_cards(h)) == 1
+    assert _card_summary(h)["what_happened"] == _ROUND_ONE_TEXT
+    rows = _draft_rows(store)
+    assert [status for status, _ in rows] == ["drafted"]
+    receipt = rows[0][1]["provability"]
+    assert receipt["checked_by_rule"] is True
+    assert receipt["refused_titles"] == []
+    assert receipt["rewritten"] is False
+    assert receipt["changes"] is None
+    assert "round" not in receipt
+    assert receipt["check"]["status"] == "checked"
+    assert receipt["check"]["homes"] == {_HOMED_TITLE: "hurl", _REFUSED_TITLE: "hurl"}
+    # The approved row carries the receipt forward (the plan stage reads it).
+    approved = [d for status, d in _events(store, _SPEC_STAGE) if status == "approved"]
+    assert approved[-1]["provability"] == receipt
+
+
+@pytest.mark.asyncio
+async def test_one_refused_example_runs_the_machines_note_round_before_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Rules 44–46: one example refused by rule → the spec writer is
+    dispatched with the machine's note VERBATIM as ``validate_feedback`` and
+    the prior spec as ``revision_of`` → the rewrite is checked again, clean →
+    ONE card, opening on the rewrite, with rule 45's rewrite line → the draft
+    row carries the receipt, the machine log names the round, and the
+    owner's touches are unchanged."""
+    _queue(store)
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([])])
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _spec_reply(),
+            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
+        ],
+        classify=classify,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    first, second = h.ctx["dispatches"]
+    assert first == {"revision_of": None, "validate_feedback": None}
+    assert second["validate_feedback"] == _PRE_CARD_NOTE
+    assert set(second["revision_of"]) == {
+        f"{SLUG}.feature",
+        f"{SLUG}_assumptions.yaml",
+        f"{SLUG}_summary.md",
+        f"{SLUG}_digest.yaml",
+    }
+    assert second["revision_of"][f"{SLUG}.feature"] == FEATURE_TEXT
+    # The check ran twice: on the draft as first written, then on the rewrite.
+    assert [c["feature_text"] for c in classify.calls] == [FEATURE_TEXT, _REWRITTEN_FEATURE]
+    # ONE card, on the rewrite, saying what the machine did in the spec's words.
+    assert len(_digest_cards(h)) == 1
+    card = _card_summary(h)
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+    assert [row["sentence"] for row in card["what_it_will_do"]][1] == (
+        "GET /version with a format the service does not publish answers 406."
+    )
+    assert card["worked_examples"] == _REWRITTEN_FEATURE
+    assert "Your note" not in json.dumps(card)
+    # The rows: the first draft superseded by the machine's note (no card on
+    # it — the spec text belongs on the row a card opens from), then the
+    # rewrite's drafted row with the receipt.
+    rows = _draft_rows(store)
+    assert [status for status, _ in rows] == ["superseded", "drafted"]
+    superseded = rows[0][1]
+    assert superseded["superseded_by_note"] == _PRE_CARD_NOTE
+    assert superseded["author"] == _PRE_CARD_AUTHOR
+    assert superseded["refused_titles"] == [_REFUSED_TITLE]
+    assert "card" not in superseded
+    receipt = rows[1][1]["provability"]
+    assert receipt["checked_by_rule"] is True
+    assert receipt["refused_titles"] == [_REFUSED_TITLE]
+    assert receipt["rewritten"] is True
+    assert receipt["changes"] == "1 example changed"
+    assert receipt["round"] == 1
+    assert receipt["author"] == _PRE_CARD_AUTHOR
+    assert receipt["note"] == _PRE_CARD_NOTE
+    assert receipt["refused_by_checker"] is False
+    assert receipt["still_refused"] == []
+    assert receipt["second_check"]["status"] == "checked"
+    assert receipt["card_line"] == _REWROTE_LINE
+    # The machine's round is not one of the owner's: no revise row, the
+    # owner's budget untouched, and the row the door replays carries no
+    # "your note" record.
+    assert [status for status, _ in _events(store, _DIGEST_STAGE)] == ["GATED", "approved"]
+    assert "rewrite" not in rows[1][1]
+    assert rows[1][1]["cycle"] == 1
+    # The approved row carries the round, so the plan stage never sends the
+    # note again.
+    approved = [d for status, d in _events(store, _SPEC_STAGE) if status == "approved"]
+    assert approved[-1]["provability"]["round"] == 1
+    # Nothing was said to a person beyond the card and its opening ping.
+    assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+
+
+@pytest.mark.asyncio
+async def test_still_refused_after_the_round_says_so_on_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Rule 45's second line: the rewrite landed and changed the list, but
+    the example still cannot be proven by rule — the card carries the rewrite
+    line AND the cannot-be-proven line naming the title verbatim; the receipt
+    says which is still refused; the run goes on to the owner's yes."""
+    _queue(store)
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([_REFUSED_TITLE])])
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _spec_reply(),
+            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
+        ],
+        classify=classify,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    assert len(_digest_cards(h)) == 1
+    assert _card_summary(h)["what_happened"] == (
+        f"{_ROUND_ONE_TEXT} {_REWROTE_LINE} {_UNPROVABLE_LINE}"
+    )
+    receipt = _draft_rows(store)[-1][1]["provability"]
+    assert receipt["rewritten"] is True
+    assert receipt["changes"] == "1 example changed"
+    assert receipt["still_refused"] == [_REFUSED_TITLE]
+    assert receipt["card_line"] == f"{_REWROTE_LINE} {_UNPROVABLE_LINE}"
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_changed_nothing_on_the_list_and_is_still_refused_gets_only_the_cannot_be_proven_line(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The rewrite came back with the same list and the check still refuses
+    the example: saying "the machine rewrote it" would be a lie, so the card
+    carries only the cannot-be-proven line. The receipt keeps the truth: a
+    rewrite landed, nothing on the list changed."""
+    _queue(store)
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(), _spec_reply()],
+        classify=classify,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    assert _card_summary(h)["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
+    receipt = _draft_rows(store)[-1][1]["provability"]
+    assert receipt["rewritten"] is True
+    assert receipt["changes"] is None
+    assert receipt["still_refused"] == [_REFUSED_TITLE]
+
+
+@pytest.mark.asyncio
+async def test_a_checker_refused_pre_card_rewrite_opens_the_card_on_the_original_draft(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Rule 44's last sentence: the checker refused the machine's rewrite
+    (the note-honoured criterion failed twice). The run does NOT stop — the
+    card opens on the draft as first written, with the cannot-be-proven line,
+    and the owner's yes carries on to the plan stage as today."""
+    _queue(store)
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
+    reason = (
+        "could not carry out what this round required, after 2 attempts. "
+        "'feedback_resolved' must be met"
+    )
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(), _not_ok_reply(reason)],
+        classify=classify,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    assert h.ctx["dispatches"][1]["validate_feedback"] == _PRE_CARD_NOTE
+    # Only the first draft was checked: there was no rewrite to check again.
+    assert [c["feature_text"] for c in classify.calls] == [FEATURE_TEXT]
+    assert len(_digest_cards(h)) == 1
+    card = _card_summary(h)
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
+    assert card["worked_examples"] == FEATURE_TEXT
+    assert [row["sentence"] for row in card["what_it_will_do"]][1] == (
+        "Asking for the version in a format the service does not publish is "
+        "refused rather than guessed at."
+    )
+    rows = _draft_rows(store)
+    assert [status for status, _ in rows] == ["superseded", "drafted"]
+    assert rows[1][1]["sha"] == rows[0][1]["sha"]  # the draft of record
+    receipt = rows[1][1]["provability"]
+    assert receipt["round"] == 1
+    assert receipt["rewritten"] is False
+    assert receipt["changes"] is None
+    assert receipt["refused_by_checker"] is True
+    assert receipt["checker_reason"] == reason
+    assert receipt["still_refused"] == [_REFUSED_TITLE]
+    # Nobody was told the run stopped, because it did not.
+    assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert not any("stopped" in m for _, m, _ in h.ctx["notifications"])
+
+
+@pytest.mark.asyncio
+async def test_an_owners_note_after_the_card_keeps_todays_path_byte_for_byte(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Rule 47's last case: with the check wired and clean, an owner's note
+    round is byte-identical to the same run without the check — the same
+    dispatches, the same cards word for word, the same rows in the same
+    order. The check runs on the rewrite too (the machine checks every list
+    before a person reads it) and leaves everything as it was."""
+    script = [
+        _answer("reject", notes="the second example should be a 404, not a 400"),
+        _answer("approve", attempt=1),
+    ]
+
+    _queue(store)
+    today = _make_driver(store, subscriber_factory=SharedScriptFactory(list(script)))
+    await today.driver.drive(CID)
+
+    cx = sqlite_connect.connect_writer(tmp_path / "with-check.db")
+    migrations.apply_at_boot(cx)
+    checked_store = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+    _queue(checked_store)
+    classify = _RecordingClassify([_checked([])])
+    checked = _make_driver(
+        checked_store, subscriber_factory=SharedScriptFactory(list(script)), classify=classify
+    )
+    await checked.driver.drive(CID)
+
+    for h, st in ((today, store), (checked, checked_store)):
+        assert st.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert checked.ctx["dispatches"] == today.ctx["dispatches"]
+    assert len(classify.calls) == 2
+    assert [c.payload["details"]["summary"] for c in _digest_cards(checked)] == [
+        c.payload["details"]["summary"] for c in _digest_cards(today)
+    ]
+    assert [m for _, m, _ in checked.ctx["notifications"]] == [
+        m for _, m, _ in today.ctx["notifications"]
+    ]
+    assert [s for s, _ in _events(checked_store, _DIGEST_STAGE)] == [
+        s for s, _ in _events(store, _DIGEST_STAGE)
+    ]
+    assert [s for s, _ in _draft_rows(checked_store)] == [s for s, _ in _draft_rows(store)]
+    # The only difference on the record is the receipt itself.
+    for (_, with_check), (_, without) in zip(_draft_rows(checked_store), _draft_rows(store)):
+        with_check = dict(with_check)
+        receipt = with_check.pop("provability", None)
+        without = dict(without)
+        without.pop("provability", None)
+        assert with_check == without
+        if receipt is not None:
+            assert receipt["checked_by_rule"] is True and receipt["refused_titles"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unwired_or_older_check_leaves_the_card_unchanged_and_says_so(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """No collaborator wired, or a guardkit that predates the verb: the card
+    is byte-identical to today's, one spec-writer call, and the draft row says
+    the check did not run and why — never silent, never a stop."""
+    _queue(store)
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 1
+    assert _card_summary(h)["what_happened"] == _ROUND_ONE_TEXT
+    receipt = _draft_rows(store)[-1][1]["provability"]
+    assert receipt["checked_by_rule"] is False
+    assert receipt["check"]["status"] == "not-wired"
+    assert "no provability check is wired" in receipt["not_checked"]
+
+    cx = sqlite_connect.connect_writer(tmp_path / "older.db")
+    migrations.apply_at_boot(cx)
+    older_store = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+    _queue(older_store)
+    older = _RecordingClassify(
+        [
+            ScenarioProvabilityOutcome(
+                status="unavailable",
+                detail="the guardkit on this image has no `qa classify-scenarios` verb",
+            )
+        ]
+    )
+    h2 = _make_driver(
+        older_store, subscriber_factory=SharedScriptFactory([_answer("approve")]), classify=older
+    )
+    await h2.driver.drive(CID)
+    assert older_store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h2.ctx["dispatches"]) == 1
+    assert _card_summary(h2)["what_happened"] == _ROUND_ONE_TEXT
+    receipt = _draft_rows(older_store)[-1][1]["provability"]
+    assert receipt["checked_by_rule"] is False
+    assert receipt["check"]["status"] == "unavailable"
+    assert "no `qa classify-scenarios` verb" in receipt["not_checked"]
+    assert not [m for _, m, lvl in h2.ctx["notifications"] if lvl == "error"]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_re_opens_the_card_with_the_provability_line_word_for_word(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The line is on the row the door replays from: a daemon killed with the
+    card live re-opens the SAME card, rewrite line and all, and neither the
+    spec writer nor the check runs again."""
+    _queue(store)
+    publisher = FakePublisher()
+    git = RecordingGitRunner()
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([])])
+    boot1 = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        publisher=publisher,
+        git=git,
+        spec_replies=[
+            _spec_reply(),
+            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
+        ],
+        classify=classify,
+    )
+    task = asyncio.create_task(boot1.driver.drive(CID))
+    for _ in range(600):
+        await asyncio.sleep(0.01)
+        if _digest_cards(boot1):
+            break
+    assert _digest_cards(boot1), "the door never put a card on the wire"
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert _card_summary(boot1)["what_happened"] == f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+    assert [s for s, _ in _draft_rows(store)] == ["superseded", "drafted"]
+
+    classify2 = _RecordingClassify([_checked([])])
+    boot2 = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        publisher=publisher,
+        git=git,
+        classify=classify2,
+    )
+    await boot2.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(boot2.ctx["dispatches"]) == 0
+    assert classify2.calls == []
+    cards = _digest_cards(boot2)
+    assert len(cards) == 2
+    assert cards[0].payload["details"]["summary"] == cards[1].payload["details"]["summary"]
+    assert cards[1].payload["details"]["summary"]["what_happened"] == (
+        f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+    )
