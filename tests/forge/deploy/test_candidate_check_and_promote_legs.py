@@ -114,7 +114,12 @@ ALL_GREEN = tuple(_assertion(g, "pass") for g in EIGHT_GATES)
 
 class _Invoker:
     """A live-gate invoker: ``candidate`` shapes the candidate leg (reached
-    through ``with_extra_env``), ``live`` the promote leg's bare invoke."""
+    through ``with_extra_env``), ``live`` the promote leg's bare invoke.
+
+    It records every ``with_repo_path`` and ``with_extra_env`` call and, for
+    every invoke, the working directory and overlay the invoking copy
+    carried — so a test can say where each leg's gate ran.
+    """
 
     def __init__(
         self,
@@ -125,6 +130,8 @@ class _Invoker:
         self._candidate = candidate
         self._live = live
         self.with_extra_env_calls: list[dict[str, str]] = []
+        self.with_repo_path_calls: list[str] = []
+        self.invocations: list[dict[str, Any]] = []
 
     @staticmethod
     def _invocation(shape, feature: str) -> LiveGateInvocation:
@@ -139,18 +146,55 @@ class _Invoker:
         )
 
     def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
+        self.invocations.append({"feature": feature, "cwd": None, "overlay": {}})
         return self._invocation(self._live, feature)
 
-    def with_extra_env(self, overlay: dict[str, str]) -> "_Invoker._Child":
-        self.with_extra_env_calls.append(dict(overlay))
-        return _Invoker._Child(self._invocation(self._candidate, "cand"))
+    def with_repo_path(self, repo_path) -> "_Invoker._Copy":
+        self.with_repo_path_calls.append(str(repo_path))
+        return _Invoker._Copy(self, cwd=str(repo_path), overlay={})
 
-    class _Child:
-        def __init__(self, invocation: LiveGateInvocation) -> None:
-            self._invocation = invocation
+    def with_extra_env(self, overlay: dict[str, str]) -> "_Invoker._Copy":
+        self.with_extra_env_calls.append(dict(overlay))
+        return _Invoker._Copy(self, cwd=None, overlay=dict(overlay))
+
+    class _Copy:
+        """A moved and/or overlaid copy: any invoke on it is the candidate leg."""
+
+        def __init__(self, parent: "_Invoker", *, cwd: str | None, overlay: dict[str, str]) -> None:
+            self._parent = parent
+            self._cwd = cwd
+            self._overlay = overlay
+
+        def with_repo_path(self, repo_path) -> "_Invoker._Copy":
+            self._parent.with_repo_path_calls.append(str(repo_path))
+            return _Invoker._Copy(self._parent, cwd=str(repo_path), overlay=self._overlay)
+
+        def with_extra_env(self, overlay: dict[str, str]) -> "_Invoker._Copy":
+            self._parent.with_extra_env_calls.append(dict(overlay))
+            return _Invoker._Copy(
+                self._parent, cwd=self._cwd, overlay={**self._overlay, **overlay}
+            )
 
         def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
-            return self._invocation
+            self._parent.invocations.append(
+                {"feature": feature, "cwd": self._cwd, "overlay": dict(self._overlay)}
+            )
+            return self._parent._invocation(self._parent._candidate, "cand")
+
+
+class _UnmovableInvoker:
+    """An invoker with an env overlay seam but no working-directory seam —
+    the shape every fake had before the candidate gate moved into the tree."""
+
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
+        self.invocations += 1
+        return _Invoker._invocation(("pass", ALL_GREEN), feature)
+
+    def with_extra_env(self, overlay: dict[str, str]) -> "_UnmovableInvoker":
+        return self
 
 
 def _runner(
@@ -257,6 +301,10 @@ class TestTheCandidateRunsFromItsOwnTree:
         assert _step_params(cand, "health_check")["cwd"] == CANDIDATE_TREE
         assert _step_params(cand, "deploy_compose")["extra_env"]["CANDIDATE"] == "1"
         assert checked.detail["gate_summary"]["candidate_cwd"] == CANDIDATE_TREE
+        # The candidate's live gate ran in the tree as well — not in the checkout.
+        invoker = runner._live_gate_invoker
+        assert invoker.with_repo_path_calls == [CANDIDATE_TREE]
+        assert invoker.invocations[-1]["cwd"] == CANDIDATE_TREE
 
         promoted = await runner.promote(
             profile,
@@ -272,6 +320,154 @@ class TestTheCandidateRunsFromItsOwnTree:
         assert _step_params(live, "deploy_compose")["extra_env"] == {"PROMOTE": "1"}
         teardown = _load(repository, "teardown-cand-run-1", "c1")
         assert _step_params(teardown, "deploy_compose")["cwd"] == "/home/x/api_test"
+        # The promote's gate ran where the invoker was composed: the checkout.
+        assert invoker.with_repo_path_calls == [CANDIDATE_TREE]  # no second move
+        assert invoker.invocations[-1]["cwd"] is None
+
+
+# ---------------------------------------------------------------------------
+# The candidate's live gate runs in the candidate's tree (coach finding,
+# 2026-09-07): the driver reads the tree's registry and twins, not main's.
+# ---------------------------------------------------------------------------
+
+
+class TestTheCandidateGateRunsInTheTree:
+    @pytest.mark.asyncio
+    async def test_the_gate_is_moved_into_the_tree_then_given_the_candidate_addresses(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        deploy_pub = RecordingDeployPublisher()
+        invoker = _Invoker()
+        runner = _runner(
+            repository, runbook_publisher, deploy_pub, tmp_path, live_gate_invoker=invoker
+        )
+        result = await runner.candidate_check(
+            _profile(),
+            correlation_id="ct",
+            deploy_run_id="run-t",
+            feature="FEAT-T1",
+            candidate_cwd=CANDIDATE_TREE,
+        )
+        assert result.outcome == "complete"
+        # Moved first, overlaid second: the one gate invocation carries both.
+        assert invoker.with_repo_path_calls == [CANDIDATE_TREE]
+        assert invoker.with_extra_env_calls == [
+            {"CANDIDATE_PORT": "8902", "API_TEST_BASE_URL": "http://localhost:8902"}
+        ]
+        assert invoker.invocations == [
+            {
+                "feature": "FEAT-T1",
+                "cwd": CANDIDATE_TREE,
+                "overlay": {
+                    "CANDIDATE_PORT": "8902",
+                    "API_TEST_BASE_URL": "http://localhost:8902",
+                },
+            }
+        ]
+        # The evidence ref leaves the tree with the summary, as the driver said it.
+        summary = result.detail["gate_summary"]
+        assert summary["evidence_index_ref"] == "ev/idx.json"
+        assert summary["candidate_cwd"] == CANDIDATE_TREE
+        assert (summary["checks_total"], summary["checks_passed"]) == (8, 8)
+
+    @pytest.mark.asyncio
+    async def test_a_plain_deploy_and_a_promote_never_move_the_gate(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        deploy_pub = RecordingDeployPublisher()
+        invoker = _Invoker()
+        runner = _runner(
+            repository, runbook_publisher, deploy_pub, tmp_path, live_gate_invoker=invoker
+        )
+        result = await runner.run_deploy(
+            _profile(), correlation_id="pd", deploy_run_id="run-pd", feature="FEAT-T2"
+        )
+        assert result.outcome == "complete"
+        assert invoker.with_repo_path_calls == []
+        # Two gates ran — the candidate's (overlaid) and the live one — both
+        # in the checkout, since no tree was given.
+        assert [i["cwd"] for i in invoker.invocations] == [None, None]
+        assert invoker.invocations[0]["overlay"]["CANDIDATE_PORT"] == "8902"
+        assert invoker.invocations[1]["overlay"] == {}
+
+        direct = await runner.run_deploy(
+            _profile(candidate=False), correlation_id="pd2", deploy_run_id="run-pd2", feature="FEAT-T3"
+        )
+        assert direct.outcome == "complete"
+        assert invoker.with_repo_path_calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_dispatcher_hands_the_tree_to_the_gate(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        invoker = _Invoker()
+        result = await dispatch_deploy_stage(
+            DeployStageConfig(enabled=True),
+            _profile(),
+            correlation_id="dt",
+            deploy_run_id="run-dt",
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            deploy_publisher=RecordingDeployPublisher(),
+            live_gate_invoker=invoker,
+            deploy_record_root=str(tmp_path / "state"),
+            dry_run=True,
+            clock=lambda: FIXED,
+            feature="FEAT-T4",
+            leg="candidate_check",
+            candidate_cwd=CANDIDATE_TREE,
+        )
+        assert result is not None and result.outcome == "complete"
+        assert invoker.with_repo_path_calls == [CANDIDATE_TREE]
+        assert invoker.invocations[-1]["cwd"] == CANDIDATE_TREE
+
+    @pytest.mark.asyncio
+    async def test_a_gate_that_cannot_move_into_the_tree_is_refused_not_run_in_the_checkout(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        deploy_pub = RecordingDeployPublisher()
+        invoker = _UnmovableInvoker()
+        runner = _runner(
+            repository, runbook_publisher, deploy_pub, tmp_path, live_gate_invoker=invoker
+        )
+        result = await runner.candidate_check(
+            _profile(),
+            correlation_id="um",
+            deploy_run_id="run-um",
+            feature="FEAT-T5",
+            candidate_cwd=CANDIDATE_TREE,
+        )
+        # Not run at all: a gate in the checkout would check main's registry.
+        assert invoker.invocations == 0
+        assert result.outcome == "failed"
+        assert result.failed_step == "candidate_gate"
+        assert result.verdict == "instrument_fail"
+        assert result.detail["gate_summary"]["verdict"] is None
+        # The reason is on the gate step's own record, and the candidate is down.
+        gate_rb = _load(repository, "live-gate-cand-run-um", "um")
+        step_result = gate_rb.steps[0].result.payload
+        assert "cannot run in the candidate tree" in step_result["error"]
+        assert CANDIDATE_TREE in step_result["error"]
+        assert _load(repository, "teardown-cand-run-um", "um") is not None
+        assert _load(repository, "deploy-run-um", "um") is None
+        assert [n for n, _ in deploy_pub.events] == ["DeployQueued", "DeployFailed"]
+
+    @pytest.mark.asyncio
+    async def test_the_same_invoker_still_serves_a_run_with_no_tree(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        """What every existing caller had: no tree given, the gate runs where
+        the invoker was composed, the env overlay alone is best-effort."""
+        deploy_pub = RecordingDeployPublisher()
+        invoker = _UnmovableInvoker()
+        runner = _runner(
+            repository, runbook_publisher, deploy_pub, tmp_path, live_gate_invoker=invoker
+        )
+        result = await runner.candidate_check(
+            _profile(), correlation_id="nt", deploy_run_id="run-nt", feature="FEAT-T6"
+        )
+        assert result.outcome == "complete"
+        assert invoker.invocations == 1
 
 
 # ---------------------------------------------------------------------------

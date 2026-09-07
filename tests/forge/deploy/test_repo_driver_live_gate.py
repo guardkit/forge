@@ -275,3 +275,112 @@ def test_a_disposition_the_wire_does_not_know_is_left_out(tmp_path: Path) -> Non
 def test_no_gates_means_no_results(tmp_path: Path) -> None:
     inv = _drive(tmp_path, {"run_id": "r", "verdict": "pass", "gates": []})
     assert inv.assertions == ()
+
+
+# ---------------------------------------------------------------------------
+# with_repo_path: the driver runs in the tree it is given (protect-main,
+# 2026-09-07) — the registry, the twins and the evidence are the tree's.
+# ---------------------------------------------------------------------------
+
+_REPORTS_CWD_AND_ENV = (
+    "import json, os, sys\n"
+    "print(json.dumps({'run_id': 'r', 'verdict': 'pass', 'gates': [],"
+    " 'evidence_index_ref': os.getcwd() + '|' + os.environ.get('DEPLOY_BASE_URL', 'unset')}))\n"
+    "sys.exit(0)\n"
+)
+
+
+def _checkout_and_tree(tmp_path: Path) -> tuple[Path, Path, list[str]]:
+    """A checkout and a laid-out tree, each carrying the same driver script
+    (found relative to the working directory, as the profile names it)."""
+    checkout = tmp_path / "checkout"
+    tree = checkout / ".forge-candidates" / "FEAT-1"
+    checkout.mkdir()
+    tree.mkdir(parents=True)
+    argv = _write_driver(checkout, _REPORTS_CWD_AND_ENV)
+    _write_driver(tree, _REPORTS_CWD_AND_ENV)
+    return checkout, tree, argv
+
+
+def _cwd_and_env(inv: LiveGateInvocation) -> tuple[Path, str]:
+    cwd, env = inv.evidence_index_ref.split("|", 1)
+    return Path(cwd).resolve(), env
+
+
+def test_with_repo_path_moves_the_driver_and_keeps_the_env(tmp_path: Path) -> None:
+    checkout, tree, argv = _checkout_and_tree(tmp_path)
+    base = RepoDriverLiveGateInvoker(
+        repo_path=checkout, driver_argv=argv, extra_env={"DEPLOY_BASE_URL": "http://live"}
+    )
+    moved = base.with_repo_path(tree)
+
+    assert _cwd_and_env(moved.invoke(feature="F", target="t")) == (tree.resolve(), "http://live")
+    assert moved.repo_path == tree
+    assert moved.invoke(feature="F", target="t").detail["cwd"] == str(tree)
+    # The base is a different object, still in the checkout (a copy, not a move).
+    assert base.repo_path == checkout
+    assert _cwd_and_env(base.invoke(feature="F", target="t")) == (checkout.resolve(), "http://live")
+
+
+def test_moved_then_overlaid_is_in_the_tree_with_the_candidate_address(tmp_path: Path) -> None:
+    """The stage's order: with_repo_path first, with_extra_env second — and
+    with_extra_env keeps whatever working directory its invoker has."""
+    checkout, tree, argv = _checkout_and_tree(tmp_path)
+    base = RepoDriverLiveGateInvoker(
+        repo_path=checkout, driver_argv=argv, extra_env={"DEPLOY_BASE_URL": "http://live"}
+    )
+    candidate = base.with_repo_path(tree).with_extra_env({"DEPLOY_BASE_URL": "http://cand"})
+    assert _cwd_and_env(candidate.invoke(feature="F", target="t")) == (tree.resolve(), "http://cand")
+    assert candidate.repo_path == tree
+
+
+def test_with_extra_env_alone_stays_in_the_checkout(tmp_path: Path) -> None:
+    """Every existing caller's behaviour, kept: an overlay never moves the driver."""
+    checkout, _tree, argv = _checkout_and_tree(tmp_path)
+    base = RepoDriverLiveGateInvoker(repo_path=checkout, driver_argv=argv)
+    overlaid = base.with_extra_env({"DEPLOY_BASE_URL": "http://cand"})
+    assert _cwd_and_env(overlaid.invoke(feature="F", target="t")) == (checkout.resolve(), "http://cand")
+    assert overlaid.repo_path == checkout
+
+
+def test_the_driver_record_names_where_it_ran(tmp_path: Path) -> None:
+    body = "import sys\nsys.stdout.write('garbage')\nsys.exit(1)\n"
+    argv = _write_driver(tmp_path, body)
+    inv = RepoDriverLiveGateInvoker(repo_path=tmp_path, driver_argv=argv).invoke(
+        feature="F", target="t"
+    )
+    assert inv.detail["cwd"] == str(tmp_path)
+    spawn_failed = RepoDriverLiveGateInvoker(
+        repo_path=tmp_path, driver_argv=["this-interpreter-does-not-exist-xyz", "x.py"]
+    ).invoke(feature="F", target="t")
+    assert spawn_failed.detail["cwd"] == str(tmp_path)
+
+
+def test_the_other_backends_can_be_moved_too(tmp_path: Path) -> None:
+    from forge.deploy.live_gate import (
+        DryRunLiveGateInvoker,
+        GuardkitSeamLiveGateInvoker,
+        LiveGateSeamError,
+        RefusingLiveGateInvoker,
+    )
+
+    dry = DryRunLiveGateInvoker()
+    assert dry.repo_path is None
+    assert dry.invoke(feature="F", target="t").detail["cwd"] is None
+    moved = dry.with_repo_path(tmp_path / "tree")
+    assert moved.repo_path == tmp_path / "tree"
+    assert moved.invoke(feature="F", target="t").detail["cwd"] == str(tmp_path / "tree")
+    assert moved.invoke(feature="F", target="t").dry_run is True
+    assert dry.repo_path is None  # a copy
+
+    seam = GuardkitSeamLiveGateInvoker(
+        repo_path=tmp_path / "checkout", read_allowlist=(tmp_path,), timeout_seconds=7
+    )
+    seam_moved = seam.with_repo_path(tmp_path / "tree")
+    assert seam_moved.repo_path == tmp_path / "tree"
+    assert seam.repo_path == tmp_path / "checkout"
+
+    import pytest
+
+    with pytest.raises(LiveGateSeamError, match="cannot run here"):
+        RefusingLiveGateInvoker("cannot run here").invoke(feature="F", target="t")

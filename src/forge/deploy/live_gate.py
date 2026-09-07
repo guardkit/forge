@@ -22,6 +22,17 @@ The guardkit seam is ``async``; the executor invokes step handlers
 synchronously. :class:`GuardkitSeamLiveGateInvoker` bridges by running the
 frozen coroutine to completion on a dedicated worker thread with its own event
 loop, so the seam stays untouched and the sync handler contract is preserved.
+
+WHERE THE GATE RUNS (protect-main, Part J, 2026-09-07). A backend that runs a
+driver has a working directory, fixed when the deploy stage is composed: the
+repository checkout. The candidate leg checks the feature branch's laid-out
+tree, and its gate must read THAT tree's registry and Hurl twins, not the
+checkout's (which is main — the per-feature gate is registered on the branch
+and only reaches main with the merge). So every backend with a working
+directory offers ``with_repo_path``: a copy moved into the tree, exactly as
+``with_extra_env`` is a copy carrying the candidate's addresses. The stage
+applies the move first and the env overlay second, for the candidate leg
+only; the promote leg and a plain deploy keep the checkout.
 """
 
 from __future__ import annotations
@@ -45,6 +56,7 @@ __all__ = [
     "DryRunLiveGateInvoker",
     "GuardkitSeamLiveGateInvoker",
     "RepoDriverLiveGateInvoker",
+    "RefusingLiveGateInvoker",
     "BrokerDiff",
     "BrokerInspector",
     "UnconfiguredBrokerInspector",
@@ -140,6 +152,29 @@ class UnconfiguredLiveGateInvoker:
         )
 
 
+class RefusingLiveGateInvoker:
+    """Raises ``reason`` whenever it is invoked.
+
+    For a gate that must NOT run as it stands — the stage puts this in the
+    runbook when the candidate leg was given a tree to run in but the
+    configured invoker cannot be moved into one. The step then fails with the
+    reason on record, instead of the gate quietly running in the checkout and
+    checking main's registry against the branch's build (the very defect the
+    candidate check exists to catch).
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def invoke(
+        self, *, feature: str, target: str, gates: tuple[str, ...] = ()
+    ) -> LiveGateInvocation:
+        raise LiveGateSeamError(
+            f"run_live_gate refused for feature={feature!r} target={target!r}: "
+            f"{self._reason}"
+        )
+
+
 class DryRunLiveGateInvoker:
     """Records the intended ``guardkit qa live-gate`` command without running it.
 
@@ -147,7 +182,23 @@ class DryRunLiveGateInvoker:
     is labelled as a dry run — NOT a claim that the gate passed. The stage marks
     the whole run dry-run in the F7 record and never publishes a live QA verdict
     consumers would mistake for a real one.
+
+    ``repo_path`` is the working directory the gate WOULD run in (None when
+    unsaid); :meth:`with_repo_path` returns a copy that records a different
+    one, so a dry run of the candidate leg says it would run in the tree.
     """
+
+    def __init__(self, *, repo_path: Path | None = None) -> None:
+        self._repo_path = Path(repo_path) if repo_path is not None else None
+
+    @property
+    def repo_path(self) -> Path | None:
+        """The working directory this dry run would use, or None."""
+        return self._repo_path
+
+    def with_repo_path(self, repo_path: Path | str) -> "DryRunLiveGateInvoker":
+        """A copy that would run in ``repo_path`` (this one is unchanged)."""
+        return DryRunLiveGateInvoker(repo_path=Path(repo_path))
 
     def invoke(
         self, *, feature: str, target: str, gates: tuple[str, ...] = ()
@@ -171,7 +222,10 @@ class DryRunLiveGateInvoker:
             gate_ids=tuple(gate_args),
             evidence_index_ref="",
             dry_run=True,
-            detail={"planned_command": planned},
+            detail={
+                "planned_command": planned,
+                "cwd": str(self._repo_path) if self._repo_path is not None else None,
+            },
         )
 
 
@@ -200,6 +254,20 @@ class GuardkitSeamLiveGateInvoker:
         self._repo_path = repo_path
         self._read_allowlist = list(read_allowlist)
         self._timeout_seconds = timeout_seconds
+
+    @property
+    def repo_path(self) -> Path:
+        """The repository the seam is pointed at (the gate's working directory)."""
+        return self._repo_path
+
+    def with_repo_path(self, repo_path: Path | str) -> "GuardkitSeamLiveGateInvoker":
+        """A copy pointed at ``repo_path`` — the candidate tree — with the same
+        read allowlist and timeout. This invoker is unchanged."""
+        return GuardkitSeamLiveGateInvoker(
+            repo_path=Path(repo_path),
+            read_allowlist=tuple(self._read_allowlist),
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def invoke(
         self, *, feature: str, target: str, gates: tuple[str, ...] = ()
@@ -329,6 +397,17 @@ class RepoDriverLiveGateInvoker:
     unparseable stdout falls back to the driver's own exit-code map. None of
     those indict the system under test (DF-017).
 
+    WHICH TREE THE DRIVER CHECKS is decided by its working directory alone:
+    the drivers' ``--repo`` defaults to ``.``, and guardkit's ``LiveGateRunner``
+    resolves the gate registry (``qa/gates/registry.yaml``), the gates' Hurl
+    twins and the evidence directory (``qa/gates/evidence/``) relative to it.
+    So the candidate leg gets a copy moved into the branch's laid-out tree
+    (:meth:`with_repo_path`) and the driver named in the profile is found,
+    run and read from that tree — its registry, its twins, its evidence. No
+    ``--repo`` is added to the argv: the working directory is the one lever
+    every driver already honours, and a second one would be an argument every
+    driver would have to accept.
+
     Args:
         repo_path: Absolute path to the target repo (the subprocess ``cwd``).
         driver_argv: The per-target driver command, e.g.
@@ -351,6 +430,29 @@ class RepoDriverLiveGateInvoker:
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
 
+    @property
+    def repo_path(self) -> Path:
+        """The working directory the driver runs in — the tree it checks."""
+        return self._repo_path
+
+    def with_repo_path(self, repo_path: Path | str) -> "RepoDriverLiveGateInvoker":
+        """Return a copy whose driver runs in ``repo_path``, env and argv kept.
+
+        Protect-main (rule 38): the candidate leg's gate runs IN the feature
+        branch's laid-out tree, so the driver found relative to that tree reads
+        that tree's registry and twins and writes its evidence there. The stage
+        applies this BEFORE :meth:`with_extra_env` (which keeps whatever
+        working directory its invoker has), for the candidate leg only. A copy
+        (not a mutation): the shared injected invoker still points at the
+        checkout for the promote leg and for a plain deploy.
+        """
+        return RepoDriverLiveGateInvoker(
+            repo_path=Path(repo_path),
+            driver_argv=self._driver_argv,
+            timeout_seconds=self._timeout_seconds,
+            extra_env=self._extra_env,
+        )
+
     def with_extra_env(self, overlay: dict[str, str]) -> "RepoDriverLiveGateInvoker":
         """Return a copy whose driver env is this invoker's env plus ``overlay``.
 
@@ -359,7 +461,9 @@ class RepoDriverLiveGateInvoker:
         ``API_TEST_BASE_URL=http://localhost:8902``) is merged ON TOP of the
         profile's live_gate.env (overlay wins on a key clash) for that leg ONLY —
         the promote-leg live gate keeps the base env untouched. A copy (not a
-        mutation) so the shared injected invoker is never altered.
+        mutation) so the shared injected invoker is never altered. The working
+        directory is kept as it is on THIS invoker — the candidate leg moves it
+        with :meth:`with_repo_path` first.
         """
         merged = {**self._extra_env, **overlay}
         return RepoDriverLiveGateInvoker(
@@ -404,6 +508,7 @@ class RepoDriverLiveGateInvoker:
                 dry_run=False,
                 detail={
                     "argv": argv,
+                    "cwd": str(self._repo_path),
                     "exit_code": None,
                     "error": f"driver timed out after {self._timeout_seconds}s",
                     "stdout_tail": _bounded_tail(
@@ -424,6 +529,7 @@ class RepoDriverLiveGateInvoker:
                 dry_run=False,
                 detail={
                     "argv": argv,
+                    "cwd": str(self._repo_path),
                     "exit_code": None,
                     "error": f"could not spawn driver: {exc}",
                     "stdout_tail": "",
@@ -438,6 +544,7 @@ class RepoDriverLiveGateInvoker:
                 dry_run=False,
                 detail={
                     "argv": argv,
+                    "cwd": str(self._repo_path),
                     "exit_code": None,
                     "error": f"driver invocation error: {exc}",
                 },
@@ -447,6 +554,7 @@ class RepoDriverLiveGateInvoker:
         stderr = proc.stderr or ""
         detail: dict[str, Any] = {
             "argv": argv,
+            "cwd": str(self._repo_path),
             "exit_code": proc.returncode,
             "stdout_tail": _bounded_tail(stdout),
             "stderr_tail": _bounded_tail(stderr),
