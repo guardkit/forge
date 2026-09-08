@@ -382,6 +382,14 @@ def build_stage_log_recorder(sqlite_pool: _StageLogWriter) -> StageLogRecorder:
 #: the work.
 FIX_JOURNEY_TARGET_KIND: str = "local_tool"
 
+#: ``stage_log.target_identifier`` for the merge-ready checkpoint's own row.
+#: Deliberately NOT the merge card's identifier
+#: (``_serve_gate_activation._MERGE_CARD_TARGET_IDENTIFIER``): the one-card
+#: latch answers "already carded" for any row bearing that name, and a
+#: checkpoint row wearing it would silence every later checkpoint in the
+#: journey — including the green one that should publish the card.
+CHECKPOINT_TARGET_IDENTIFIER: str = "merge-ready-checks"
+
 #: ``stage_log.status`` values, mapped from the dispatcher's own discriminator.
 #: The schema's CHECK allows only PASSED / FAILED / GATED / SKIPPED; the
 #: projection maps PASSED → ``approved`` and FAILED → ``failed``, which is
@@ -635,6 +643,98 @@ class _FixJourneyStageLogWriter:
             details=details,
         )
         self._persistence.record_stage(entry)
+
+    def record_checkpoint(
+        self,
+        *,
+        build_id: str,
+        feature_id: str | None,
+        green: bool,
+        rationale: str,
+        failing_tests: "tuple[str, ...]" = (),
+        failed_gates: "tuple[str, ...]" = (),
+        declared_test_command: str = "",
+        declared_test_exit_code: "int | None" = None,
+        evidence: str = "",
+    ) -> None:
+        """Write the MERGE-READY CHECKPOINT'S OWN ROW into the journey.
+
+        The checkpoint used to record nothing durable. Its verdict lived on
+        a turn report, the turn rows all said the same three words
+        (``chosen_stage=pull-request-review``, ``outcome=waiting``,
+        ``rationale=mode-c-commits-present``), and the history the planner
+        reads had no idea the checks had ever run. So on attempt fifteen a
+        red suite was re-run four times on an unchanged tree until the
+        nothing-changed rule stopped the build (2026-09-08).
+
+        This row is what a later turn reads. It says which way the checks
+        went, and on a red one it carries what a person needs to act: the
+        tests the tool named, the command that was run and the code it
+        exited with, and the run's own output as the checkpoint kept it.
+
+        The status column takes the schema's own words — ``PASSED`` for
+        green, ``FAILED`` for red — which the projection reads back as
+        ``approved`` and ``failed``.
+
+        ``target_identifier`` is deliberately NOT the merge card's: the
+        one-card latch matches on that name and would read this row as "a
+        card has already gone out", which would silence the checkpoint for
+        the rest of the journey.
+        """
+        from forge.pipeline.mode_c_history_reader import (
+            CHECKPOINT_COMMAND_DETAILS_KEY,
+            CHECKPOINT_EVIDENCE_DETAILS_KEY,
+            CHECKPOINT_EXIT_CODE_DETAILS_KEY,
+            CHECKPOINT_FAILING_TESTS_DETAILS_KEY,
+        )
+
+        details: dict[str, Any] = {
+            # The row's own account of itself, which the projection carries
+            # forward as the failure reason on a red row — the sentence that
+            # ends up naming what stopped the journey.
+            "rationale": rationale,
+            CHECKPOINT_FAILING_TESTS_DETAILS_KEY: list(failing_tests or ()),
+            "failed_gates": list(failed_gates or ()),
+        }
+        if feature_id:
+            details["feature_id"] = feature_id
+        if declared_test_command:
+            details[CHECKPOINT_COMMAND_DETAILS_KEY] = declared_test_command
+        if declared_test_exit_code is not None:
+            details[CHECKPOINT_EXIT_CODE_DETAILS_KEY] = int(declared_test_exit_code)
+        if evidence:
+            details[CHECKPOINT_EVIDENCE_DETAILS_KEY] = evidence
+
+        now: datetime = self._clock()
+        self._persistence.record_stage(
+            StageLogEntry(
+                build_id=build_id,
+                stage_label=StageClass.PULL_REQUEST_REVIEW.value,
+                target_kind=FIX_JOURNEY_TARGET_KIND,
+                target_identifier=CHECKPOINT_TARGET_IDENTIFIER,
+                status=_STAGE_LOG_PASSED if green else "FAILED",
+                gate_mode=None,
+                coach_score=None,
+                threshold_applied=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details=details,
+            )
+        )
+        logger.log(
+            logging.INFO if green else logging.WARNING,
+            "fix_journey_stage_log: the merge-ready checkpoint's row for "
+            "build_id=%s records the checks as %s%s",
+            build_id,
+            "GREEN" if green else "RED",
+            (
+                ""
+                if green
+                else " — failing tests: "
+                + (", ".join(failing_tests) or "none named by the test tool")
+            ),
+        )
 
 
 def build_fix_journey_stage_log_writer(

@@ -41,6 +41,7 @@ answers ``{}`` and ``build_conductor_router`` answers ``None`` first.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import subprocess
@@ -51,7 +52,11 @@ from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli._conductor_worktree import JOURNEY_BASE_REF
-from forge.pipeline.conductor_driver import ConductorDriverDeps, WaitWindow
+from forge.pipeline.conductor_driver import (
+    CHECKPOINT_VERDICT_RECORDED_KEY,
+    ConductorDriverDeps,
+    WaitWindow,
+)
 from forge.pipeline.stage_taxonomy import StageClass
 
 logger = logging.getLogger(__name__)
@@ -132,7 +137,13 @@ __all__ = [
     "CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS",
     "CONDUCTOR_STAGE_TIMEOUT_SECONDS",
     "CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS",
+    "DECLARED_TEST_EVIDENCE_LIMIT_BYTES",
+    "DECLARED_TEST_EVIDENCE_TAIL_LINES",
+    "DeclaredTestDetail",
     "TOOLCHAIN_MODULE_CANDIDATES",
+    "failing_cases_in_output",
+    "failure_lines_in_output",
+    "summarise_declared_test_output",
     "build_conductor_driver_deps_factory",
     "build_conductor_supervisor_factory",
     "load_declared_toolchain",
@@ -417,6 +428,409 @@ def load_declared_toolchain(
     return None
 
 
+# ---------------------------------------------------------------------------
+# WHAT THE TESTS THEMSELVES SAID (ruled 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# Attempt fifteen's merge-ready checkpoint ran the repository's declared
+# suite inside its sandbox and it came back "2 failed, 817 passed, 2
+# deselected". That last line was the ONLY thing kept: it went on the log
+# line and on the decision, and the checkpoint's receipts held a rationale
+# and nothing of the run. Which two tests failed, and why, had to be found
+# by running the whole suite again by hand.
+#
+# So both forms of the declared-test runner — the one that runs here and the
+# one that runs through a sandbox's sidecar — now keep a bounded piece of the
+# command's own output. Two rules hold:
+#
+#   * THE EXIT CODE IS STILL THE VERDICT. Nothing below decides anything.
+#     Reading the output is for the person who has to fix the tests.
+#   * NO PYTEST-ONLY PARSER. Test tools write a short summary naming the
+#     cases that failed; when such lines are there they are kept first,
+#     because they are the answer to "which tests?". When they are not,
+#     the last lines of the output are kept instead, which is all any tool
+#     can be relied on to give.
+#   * ONLY A RUN THAT FAILED IS DESCRIBED AS FAILING (the coach, 2026-09-08).
+#     The exit code decides whether the sentence says anything about failing
+#     tests at all, so a run that PASSED is never written down — in the log
+#     line, on the decision or in the receipts — as a run with failures,
+#     however many lines its captured logs begin with the word ERROR.
+#   * ONLY SOMETHING THAT LOOKS LIKE A TEST IS NAMED AS ONE (the same coach).
+#     A marker line contributes a NAME only when what follows the marker
+#     reads like a case identifier: it holds ``::``, a path separator or a
+#     dot, the way every test tool writes one. "ERROR shutting down worker
+#     pool" is kept in the output and counted, never named, because a stop
+#     reason that says a test called "shutting" failed is a false sentence.
+
+#: How much of a declared test's own output is kept as evidence: sixteen
+#: kibibytes. Big enough for a short summary and the failure sections under
+#: it, small enough to sit on a decision, in a log and in one receipts file
+#: without becoming a second copy of the run.
+DECLARED_TEST_EVIDENCE_LIMIT_BYTES: int = 16 * 1024
+
+#: How many last lines of the output are kept when the tool wrote no summary
+#: lines of its own (and, alongside the summary, as the run's tail).
+DECLARED_TEST_EVIDENCE_TAIL_LINES: int = 60
+
+#: How many failing case names the one-sentence detail may list before it
+#: says how many more there are. The whole list is in the evidence.
+DECLARED_TEST_NAMES_IN_DETAIL: int = 6
+
+#: The first word of a line that names a failing case, across the tools the
+#: estate actually declares: pytest writes ``FAILED …`` and ``ERROR …`` in
+#: its short summary, other runners write ``FAIL …``, and a TAP producer
+#: writes ``not ok …``. Matching is on the line's first word only, so a
+#: sentence that merely contains the word is not mistaken for a summary line.
+_FAILING_CASE_MARKERS: tuple[str, ...] = ("FAILED", "FAIL", "not ok", "ERROR")
+
+#: ``ERROR`` is the weak one: a test tool writes it in its summary for a case
+#: that could not even run, and a captured log writes it for a message that
+#: has nothing to do with a case. So when the output has any of the other
+#: three, they are what the sentence names, and ``ERROR`` lines are named only
+#: when nothing else did. Both kinds are kept in the evidence either way.
+_WEAK_FAILING_CASE_MARKERS: tuple[str, ...] = ("ERROR",)
+
+#: Said in place of the lines that did not fit, so nobody reads a cut-off
+#: piece of output as the whole of it. There are two of these because a part
+#: is cut in two different directions: the tail of the output keeps its END
+#: (its earlier lines are the ones that go), while the tool's own list of
+#: failing cases keeps its START (its later names are the ones that go).
+#: Printing the wrong one sends a reader hunting for a test name at the wrong
+#: end of the list, so each direction says exactly what happened to it. The
+#: size named is the size actually kept, not the budget it was cut to.
+_EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_END: str = (
+    "[… earlier output dropped: only the last {kept} bytes of this part are "
+    "kept, of {whole} the command printed …]"
+)
+_EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_START: str = (
+    "[… later output dropped: only the first {kept} bytes of this part are "
+    "kept, of {whole} the command printed …]"
+)
+
+
+class DeclaredTestDetail(str):
+    """The one sentence about a declared test run, with the run kept on it.
+
+    It IS the sentence: an ordinary string, equal to the string the runners
+    have always returned, so every caller that unpacks ``(exit_code, detail)``
+    and prints or matches it sees exactly what it saw before. What it adds is
+    two attributes for the caller that keeps evidence — the gate-set reader:
+
+    * ``evidence`` — the bounded text of what the command printed.
+    * ``failing_cases`` — the case names the tool's own summary lines named,
+      in the order it wrote them, empty when it wrote none and empty on any
+      run that exited zero: a run that passed has no failing cases, whatever
+      its output looks like.
+    * ``command`` — the declared command that was run, verbatim, and
+      ``exit_code`` — what it answered. Added 2026-09-08 for the document a
+      red checkpoint hands the review seat: "these tests failed" is not
+      actionable without "this is what was run, and this is what it said".
+      ``None`` for a run that never started.
+
+    Carrying them on the sentence rather than widening the runners' return
+    means the two runner seams keep the shape every existing caller and every
+    injected test double already speaks; a runner that returns a plain string
+    simply has no evidence, and the reader says so by keeping none.
+    """
+
+    __slots__ = ("evidence", "failing_cases", "command", "exit_code")
+
+    # Named for the type checker as well as for the reader: the four things
+    # a slot holds, said once, so nothing has to be silenced below.
+    evidence: str
+    failing_cases: "tuple[str, ...]"
+    command: str
+    exit_code: "int | None"
+
+    def __new__(
+        cls,
+        sentence: str,
+        *,
+        evidence: str = "",
+        failing_cases: "tuple[str, ...]" = (),
+        command: str = "",
+        exit_code: "int | None" = None,
+    ) -> "DeclaredTestDetail":
+        detail = super().__new__(cls, sentence)
+        detail.evidence = evidence
+        detail.failing_cases = tuple(failing_cases)
+        detail.command = command
+        detail.exit_code = exit_code
+        return detail
+
+
+def _both_streams(stdout: Any, stderr: Any) -> str:
+    """The command's whole output, standard output first, then errors.
+
+    A test tool writes its summary on one stream and a crash on the other,
+    and which is which differs by tool, so the evidence reads both. Only the
+    one-line sentence beside it keeps the single stream it always kept.
+    """
+    parts = [str(stream or "") for stream in (stdout, stderr)]
+    return "\n".join(part for part in parts if part.strip())
+
+
+def _names_a_failing_case(line: str) -> bool:
+    """Is this one of the tool's own lines naming a case that failed?"""
+    stripped = line.strip()
+    for marker in _FAILING_CASE_MARKERS:
+        if stripped == marker or stripped.startswith(marker + " "):
+            return True
+    return False
+
+
+def _failing_case_name(line: str) -> str:
+    """The case name out of one summary line, or ``""``.
+
+    ``FAILED tests/users/test_router.py::TestX::test_y - assert 404 == 200``
+    is the shape pytest writes and ``FAIL  suite/case (0.2s)`` the shape
+    others do: the name is the first thing after the marker word, up to the
+    tool's own separator. Nothing here is required to succeed — a line whose
+    shape is not understood keeps its whole self in the evidence and simply
+    contributes no name to the sentence.
+    """
+    stripped = line.strip()
+    for marker in _FAILING_CASE_MARKERS:
+        if stripped.startswith(marker + " "):
+            rest = stripped[len(marker) :].strip()
+            rest = rest.split(" - ")[0].split(" — ")[0].strip()
+            name = rest.split()[0].strip(",;:") if rest.split() else ""
+            return name
+    return ""
+
+
+def _looks_like_a_case_identifier(name: str) -> bool:
+    """Does this word, taken from a marker line, read like a test's name?
+
+    Test tools name a case with a path, a module or a dotted name:
+    ``tests/users/test_router.py::TestX::test_y``, ``suite/login/can-sign-in``,
+    ``app.tests.CartTest``. Ordinary prose does not. So a name counts only
+    when it carries one of those joins — ``::``, a path separator or a dot —
+    and starts the way an identifier or a path starts.
+
+    The rule is deliberately blunt, and it errs towards saying no: a line
+    whose name is refused is still kept, whole, in the evidence, and still
+    counted in the sentence. What it prevents is the opposite mistake, which
+    a person actually reads: a log line such as "ERROR shutting down worker
+    pool" turning into a failing test called "shutting" in the reason a
+    journey stopped.
+    """
+    if not name:
+        return False
+    first = name[0]
+    if not (first.isalnum() or first == "_"):
+        return False
+    return "::" in name or "/" in name or "." in name
+
+
+def _keep_within(text: str, budget_bytes: int, *, keep_end: bool) -> str:
+    """Trim ``text`` to ``budget_bytes``, saying plainly that it was trimmed.
+
+    ``keep_end`` says which end survives, and the sentence left behind says
+    the same thing in words: keeping the end means the earlier output went,
+    keeping the start means the later output went. The sentence also names
+    the size that really is kept, which is a little under the budget because
+    the sentence itself has to fit inside it.
+    """
+    whole = len(text.encode("utf-8", errors="replace"))
+    if whole <= budget_bytes:
+        return text
+    template = (
+        _EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_END
+        if keep_end
+        else _EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_START
+    )
+    # Room is measured against the longest the sentence could be — the kept
+    # size is never larger than the budget, so no later wording of it can be
+    # longer than this one and overrun what was reserved for it.
+    longest = template.format(kept=max(budget_bytes, 0), whole=whole)
+    room = max(budget_bytes - len(longest.encode("utf-8")) - 1, 0)
+    encoded = text.encode("utf-8", errors="replace")
+    piece = (encoded[-room:] if keep_end else encoded[:room]).decode(
+        "utf-8", errors="replace"
+    )
+    # A cut through the middle of a multi-byte character becomes a
+    # replacement character, which can be wider than the bytes it stands
+    # for; drop from the cut end until the piece really does fit.
+    while piece and len(piece.encode("utf-8", errors="replace")) > room:
+        piece = piece[1:] if keep_end else piece[:-1]
+    kept = len(piece.encode("utf-8", errors="replace"))
+    marker = template.format(kept=kept, whole=whole)
+    return f"{marker}\n{piece}" if keep_end else f"{piece}\n{marker}"
+
+
+def summarise_declared_test_output(
+    output: str,
+    *,
+    limit_bytes: int = DECLARED_TEST_EVIDENCE_LIMIT_BYTES,
+    tail_lines: int = DECLARED_TEST_EVIDENCE_TAIL_LINES,
+) -> str:
+    """The bounded evidence kept from one declared test run.
+
+    Two parts, in the order a person wants them: the tool's own lines naming
+    what failed, when it wrote any, and then the last lines of the output,
+    which is where every test tool puts its own summing up. A green run has
+    no failing-case lines, so its evidence is simply its last lines — small.
+
+    The whole is bounded by ``limit_bytes``. The naming lines are kept first
+    and the tail is trimmed from its front, because the tail's own end is the
+    part worth keeping; a naming list long enough to overrun its own half of
+    the budget is trimmed the other way, keeping the first names. Either way
+    the piece that was dropped is said in plain words, in the direction it
+    really went, where it went. Never raises: evidence that could not be summarised is not
+    a reason to lose a verdict.
+    """
+    text = (output or "").replace("\r\n", "\n").strip("\n")
+    if not text.strip():
+        return ""
+    lines = text.split("\n")
+    named = [line.strip() for line in lines if _names_a_failing_case(line)]
+    tail = lines[-max(tail_lines, 1) :]
+
+    parts: list[str] = []
+    if named:
+        # Said flatly, because this text is kept for a GREEN run as well:
+        # these are the lines that begin with one of the marker words, which
+        # on a failing run are the tool's own list of what failed and on a
+        # passing run may be nothing more than its captured logs.
+        summary = (
+            "the lines the test command wrote that begin with FAILED, FAIL, "
+            "ERROR or not ok:\n" + "\n".join(named)
+        )
+        parts.append(_keep_within(summary, max(limit_bytes // 2, 0), keep_end=False))
+    spent = sum(len(part.encode("utf-8", errors="replace")) + 2 for part in parts)
+    tail_block = f"the last {len(tail)} lines of the output:\n" + "\n".join(tail)
+    parts.append(
+        _keep_within(tail_block, max(limit_bytes - spent, 0), keep_end=True)
+    )
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def failing_cases_in_output(output: str) -> "tuple[str, ...]":
+    """The case names the tool's own summary lines named, in its own order.
+
+    The strong markers first; the weak one (``ERROR``) only when they named
+    nothing, so a run whose captured logs are full of error messages does not
+    turn them into a list of failing tests.
+
+    A marker line contributes a name only when that name reads like a case
+    identifier (:func:`_looks_like_a_case_identifier`). Every other marker
+    line keeps its whole self in the evidence and is counted by
+    :func:`failure_lines_in_output`; what it must never do is put a word out
+    of an ordinary sentence into a list of failing tests.
+    """
+    strong: list[str] = []
+    weak: list[str] = []
+    for line in (output or "").replace("\r\n", "\n").split("\n"):
+        if not _names_a_failing_case(line):
+            continue
+        name = _failing_case_name(line)
+        if not _looks_like_a_case_identifier(name):
+            continue
+        stripped = line.strip()
+        is_weak = any(
+            stripped == marker or stripped.startswith(marker + " ")
+            for marker in _WEAK_FAILING_CASE_MARKERS
+        )
+        into = weak if is_weak else strong
+        if name not in into:
+            into.append(name)
+    return tuple(strong or weak)
+
+
+def failure_lines_in_output(output: str) -> int:
+    """How many lines the tool wrote that begin with one of the markers.
+
+    What the sentence falls back to when a failing run's marker lines name
+    nothing that looks like a test: how many such lines there are, so a
+    person knows the kept output has something to read, and the names are
+    left to that output rather than invented here.
+    """
+    return sum(
+        1
+        for line in (output or "").replace("\r\n", "\n").split("\n")
+        if _names_a_failing_case(line)
+    )
+
+
+def _names_the_failing_cases(names: "tuple[str, ...]") -> str:
+    """``"2 failed: a, b"`` — the half-sentence a person reads first.
+
+    At most :data:`DECLARED_TEST_NAMES_IN_DETAIL` names, then how many more
+    there are; the whole list is always in the evidence.
+    """
+    listed = ", ".join(names[:DECLARED_TEST_NAMES_IN_DETAIL])
+    more = len(names) - DECLARED_TEST_NAMES_IN_DETAIL
+    return f"{len(names)} failed: {listed}" + (
+        f", and {more} more" if more > 0 else ""
+    )
+
+
+def _counts_the_failure_lines(count: int) -> str:
+    """``"the command wrote 3 lines about failures …"`` — the honest fallback.
+
+    Used when a run that failed wrote marker lines but none of them named
+    anything shaped like a test. Saying how many there are is true and
+    useful; naming the words out of them would not be.
+    """
+    lines = "line" if count == 1 else "lines"
+    return (
+        f"the command wrote {count} {lines} about failures without naming a "
+        "test in them; the lines are in the kept output"
+    )
+
+
+def _detail_with_the_run_kept(
+    sentence: str, output: str, *, exit_code: "int | None", command: str = ""
+) -> DeclaredTestDetail:
+    """One sentence about the run, with the run's own evidence on it.
+
+    **The exit code decides whether this sentence mentions failures at all.**
+    A run that exited zero passed, whatever its output looks like, so nothing
+    about failing tests is added to its sentence and it carries no failing
+    case names — the sentence a green run gets is the sentence it has always
+    got, byte for byte. Only a run whose exit code says it failed is
+    described as having failed.
+
+    When such a run's tool named the cases that failed, the sentence says how
+    many and which — that is the word a person reads on the RED log line, on
+    the decision and, through the failing-gate name, in the reason the journey
+    stops with. It lists at most
+    :data:`DECLARED_TEST_NAMES_IN_DETAIL` of them and says how many more
+    there are; all of them are in the evidence. When the tool wrote lines
+    about failures but named nothing that looks like a test, the sentence
+    says how many such lines it wrote and leaves them to the kept output.
+    """
+    failed = exit_code is not None and exit_code != 0
+    try:
+        evidence = summarise_declared_test_output(output)
+        names = failing_cases_in_output(output) if failed else ()
+    except Exception as exc:  # noqa: BLE001 — evidence never costs a verdict
+        logger.warning(
+            "conductor gates: the declared test command's output could not be "
+            "summarised (%s: %s), so this run keeps no evidence; the exit "
+            "code is still the verdict",
+            type(exc).__name__,
+            exc,
+        )
+        return DeclaredTestDetail(
+            sentence, command=command, exit_code=exit_code
+        )
+    if names:
+        sentence = f"{sentence} — {_names_the_failing_cases(names)}"
+    elif failed:
+        wrote = failure_lines_in_output(output)
+        if wrote:
+            sentence = f"{sentence} — {_counts_the_failure_lines(wrote)}"
+    return DeclaredTestDetail(
+        sentence,
+        evidence=evidence,
+        failing_cases=names,
+        command=command,
+        exit_code=exit_code,
+    )
+
+
 def _run_declared_command(
     *, command: str, cwd: "Path | str", timeout_seconds: int
 ) -> "tuple[int | None, str]":
@@ -455,9 +869,12 @@ def _run_declared_command(
             f"{cwd}: {type(exc).__name__}: {exc}"
         )
     tail = (completed.stderr or completed.stdout or "").strip().splitlines()
-    return completed.returncode, (
+    return completed.returncode, _detail_with_the_run_kept(
         f"`{command}` exited {completed.returncode} in {cwd}"
-        + (f" — last line: {tail[-1]}" if tail else "")
+        + (f" — last line: {tail[-1]}" if tail else ""),
+        _both_streams(completed.stdout, completed.stderr),
+        exit_code=completed.returncode,
+        command=command,
     )
 
 
@@ -630,10 +1047,17 @@ def run_declared_command_in_sandbox(
         .strip()
         .splitlines()
     )
-    return exit_code, (
+    return exit_code, _detail_with_the_run_kept(
         f"`{command}` exited {exit_code} in {cwd} inside sandbox "
         f"{getattr(sandbox, 'name', '?')}"
-        + (f" — last line: {tail[-1]}" if tail else "")
+        + (f" — last line: {tail[-1]}" if tail else ""),
+        # The sidecar answers with both streams; a test tool's summary is
+        # usually on stdout and a crash usually on stderr, so the evidence
+        # reads both, stdout first. The sentence above keeps the source and
+        # the order it always had.
+        _both_streams(answer.get("stdout"), answer.get("stderr_tail")),
+        exit_code=exit_code,
+        command=command,
     )
 
 
@@ -1014,6 +1438,7 @@ def make_gates_green_reader(
         worktree: Any,
         branch: Any,
         suite_detail: str,
+        suite_evidence: str = "",
         stamps: Callable[..., Any] | None = None,
         candidate_check_before_merge: bool = False,
     ) -> Any:
@@ -1023,6 +1448,11 @@ def make_gates_green_reader(
         repository whose clone and worktrees are inside its sandbox — the one
         that reads the same three pieces of evidence in there. Both answer the
         same verdict type and both fail towards no card.
+
+        ``suite_evidence`` is what the declared suite itself printed, kept
+        (bounded) by the runner and carried onto the report so a green run
+        leaves its last lines behind too — the receipts of a card are worth
+        as much as the receipts of a stop.
 
         ``candidate_check_before_merge`` is asked of the leg ONLY when it is
         true, so that a repository whose merge does not check a candidate first
@@ -1062,7 +1492,11 @@ def make_gates_green_reader(
                 suite_detail,
                 stamps_detail or "routing law: not enforced",
             )
-            return GatesReport(status=GateStatus.GREEN, detail=suite_detail)
+            return GatesReport(
+                status=GateStatus.GREEN,
+                detail=str(suite_detail),
+                evidence=suite_evidence,
+            )
         if getattr(verdict, "blocks_card", False):
             missing = tuple(
                 f"routing law: {home} (scenario {title!r})"
@@ -1084,6 +1518,7 @@ def make_gates_green_reader(
                     f"{stamps_detail} The declared suite itself is green "
                     f"({suite_detail})."
                 ),
+                evidence=suite_evidence,
             )
         attended = tuple(getattr(verdict, "attended", ()) or ())
         if attended:
@@ -1113,6 +1548,7 @@ def make_gates_green_reader(
             status=GateStatus.GREEN,
             detail=f"{suite_detail} {stamps_detail}".strip(),
             deferred_detail=deferred_detail,
+            evidence=suite_evidence,
         )
 
     def read_gates(*, build_id: str, branch: Any = None) -> Any:
@@ -1245,6 +1681,13 @@ def make_gates_green_reader(
                 build_id,
             )
 
+        # WHAT THE RUN ITSELF SAID. The runner keeps it on the sentence it
+        # returns (:class:`DeclaredTestDetail`); a runner that returns a plain
+        # string — every injected test double, and any older seam — simply has
+        # none, and the report is what it always was.
+        evidence = str(getattr(detail, "evidence", "") or "")
+        failing_cases = tuple(getattr(detail, "failing_cases", ()) or ())
+
         if exit_code is None:
             return _unknown(detail, build_id)
         if exit_code == 0:
@@ -1271,6 +1714,7 @@ def make_gates_green_reader(
                 worktree=worktree,
                 branch=branch or getattr(row, "branch", None),
                 suite_detail=detail,
+                suite_evidence=evidence,
                 stamps=stamps_here,
                 candidate_check_before_merge=defers,
             )
@@ -1280,10 +1724,33 @@ def make_gates_green_reader(
             build_id,
             detail,
         )
+        if evidence:
+            logger.warning(
+                "conductor gates: build_id=%s — what the declared test "
+                "command printed, kept so nobody has to run the suite again "
+                "to find out:\n%s",
+                build_id,
+                evidence,
+            )
+        # THE FAILING GATE'S NAME CARRIES THE FAILING TESTS. The reason a
+        # journey stops with (``conductor_driver._red_gate_reason``) names the
+        # failed gates when there are any, so the tests that failed have to be
+        # in the name for a person to read them there. With no names to add —
+        # a tool that wrote no summary, or an injected runner — the name is
+        # the one word it has always been.
+        gate_name = "declared toolchain test"
+        if failing_cases:
+            gate_name = f"{gate_name} — {_names_the_failing_cases(failing_cases)}"
+        # ``detail`` is passed as the runner returned it, not re-flattened
+        # with ``str()``: it IS the sentence (``DeclaredTestDetail`` is a
+        # string), and keeping the object lets the checkpoint's own row carry
+        # the command that ran and the code it exited with. Every reader that
+        # only wants the sentence sees exactly the sentence it saw before.
         return GatesReport(
             status=GateStatus.RED,
-            failed_gates=("declared toolchain test",),
+            failed_gates=(gate_name,),
             detail=detail,
+            evidence=evidence,
         )
 
     return read_gates
@@ -1343,6 +1810,46 @@ def make_conductor_merge_card_published_probe(
     return already_carded
 
 
+def _checkpoint_class_that_writes_its_verdict() -> Any:
+    """The merge-ready checkpoint, with its verdict written into the journey.
+
+    Attempt fifteen, 2026-09-08: the checkpoint ran the repository's declared
+    suite on the journey worktree, two tests failed, and nothing durable said
+    so. The planner reads the journey's ``stage_log`` rows, and the only rows
+    the checkpoint left were conductor-turn rows all saying the same three
+    words — so the planner re-read the same clean follow-up review and chose
+    the checkpoint again. Four identical turns later the nothing-changed rule
+    stopped the build.
+
+    The cure is one line of behaviour added AFTER the checkpoint has decided:
+    the same publisher, subclassed, recording what it just decided. It is a
+    subclass rather than a wrapper on purpose — the design pass's rule is
+    "one publisher behind all four call sites", and everything that reads the
+    gate (the one-card latch, the seams, an ``isinstance`` check) must still
+    be looking at that publisher.
+
+    A decision that never read the gate set (no commits, already carded)
+    writes no row: there is no verdict to record. A recorder that raises
+    leaves the decision exactly as the checkpoint made it, and the loop is
+    bounded by the nothing-changed rule as it was before this lane.
+
+    Built lazily so this module keeps its import edge to the checkpoint
+    inside the factory, where it has always been.
+    """
+    from forge.pipeline.merge_ready_checkpoint import MergeReadyCheckpointPublisher
+
+    class _CheckpointThatWritesItsVerdict(MergeReadyCheckpointPublisher):
+        def __init__(self, *, record: Callable[[Any], Any], **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._record = record
+
+        async def submit_decision(self, **kwargs: Any) -> Any:
+            decision = await super().submit_decision(**kwargs)
+            return self._record(decision)
+
+    return _CheckpointThatWritesItsVerdict
+
+
 def make_merge_ready_checkpoint(
     *,
     pool: Any,
@@ -1351,6 +1858,8 @@ def make_merge_ready_checkpoint(
     has_commits_probe: Callable[[str], Any] | None = None,
     receipts_root: "Path | str | None" = None,
     published_probe: Callable[[str], Any] | None = None,
+    stage_log_writer: Any = None,
+    review_cycle_cap: int | None = None,
 ) -> Any:
     """Compose the ONE ``pr_review_gate`` implementation for production.
 
@@ -1374,9 +1883,29 @@ def make_merge_ready_checkpoint(
     in-memory latch is empty after a daemon restart; without the durable
     probe a restart mid-journey could put a second card in front of the
     owner for one merge word.
+
+    ``stage_log_writer`` is the fix journey's own writer. When it is given,
+    the checkpoint's verdict is written into the journey's history and a RED
+    verdict goes back into the fix cycle instead of being asked for again
+    (2026-09-08, attempt fifteen). Left ``None`` — every caller that predates
+    this lane — the checkpoint is byte for byte what it was.
+
+    ``review_cycle_cap`` is how many review cycles this build's profile
+    allows, read from the same resolved profile the supervisor is judged
+    against. It answers one question: on a red gate, is there a cycle left to
+    loop back into? With one, the gate loops back and the next plan sends the
+    failing tests to the review seat; with none, the journey ends FAILED and
+    the driver's close-out names the tests that kept it red. ``None`` means
+    the profile caps nothing, so a red gate always loops back — today's
+    behaviour, and the attended profile's.
     """
     from forge.pipeline.fix_journey_receipts import write_fix_journey_failure_pack
-    from forge.pipeline.merge_ready_checkpoint import MergeReadyCheckpointPublisher
+    from forge.pipeline.merge_ready_checkpoint import (
+        MergeReadyCheckpointPublisher,
+        RedGateAction,
+    )
+    from forge.pipeline.mode_c_history_reader import project_mode_c_history
+    from forge.pipeline.mode_c_planner import a_review_cycle_remains
 
     def _branch_reader(build_id: str) -> str | None:
         row = pool.get_build_row(build_id)
@@ -1397,18 +1926,141 @@ def make_merge_ready_checkpoint(
             receipts_root=receipts_root,
         )
 
-    return MergeReadyCheckpointPublisher(
-        publish_card=publish_card,
-        gates_green_reader=gates_green_reader,
-        has_commits_probe=has_commits_probe,
-        branch_reader=_branch_reader,
-        failure_pack_writer=_failure_pack_writer,
-        published_probe=(
+    def _red_gate_action(build_id: str, gates: Any) -> Any:
+        """Loop back into the fix cycle, or end the journey — §c.3's choice.
+
+        The design's words for a red gate are "it loops back into the fix
+        cycle, or terminates FAILED when there is no cycle left to loop
+        into". That question is answered here, off the journey's own rows and
+        the profile's own cap, using the SAME arithmetic the planner and the
+        budget guard use, so no two of the three can disagree about where the
+        last cycle ends.
+
+        A ledger that cannot be read answers "loop back": the planner reads
+        the same rows a moment later and will end the journey itself if there
+        is really nothing left, and refusing to loop on an unreadable read
+        would stop a journey that still had a cycle to spend.
+        """
+        try:
+            history = project_mode_c_history(pool.read_stages(build_id))
+        except Exception as exc:  # noqa: BLE001 — a read defect is not a verdict
+            logger.warning(
+                "the merge-ready checkpoint: reading build_id=%s's history to "
+                "decide whether a review cycle is left raised %s: %s — "
+                "looping back into the fix cycle, where the planner reads the "
+                "same rows and decides",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return RedGateAction.LOOP_BACK
+        if a_review_cycle_remains(history, review_cycle_cap):
+            return RedGateAction.LOOP_BACK
+        logger.error(
+            "the merge-ready checkpoint: the checks are red for build_id=%s "
+            "and this build's profile has no review cycle left (cap=%s) — the "
+            "journey ends FAILED, naming what stayed red: %s",
+            build_id,
+            review_cycle_cap,
+            ", ".join(getattr(gates, "failed_gates", ()) or ()) or "no gate named",
+        )
+        return RedGateAction.TERMINATE_FAILED
+
+    seams: dict[str, Any] = {
+        "publish_card": publish_card,
+        "gates_green_reader": gates_green_reader,
+        "has_commits_probe": has_commits_probe,
+        "branch_reader": _branch_reader,
+        "failure_pack_writer": _failure_pack_writer,
+        "published_probe": (
             published_probe
             if published_probe is not None
             else make_conductor_merge_card_published_probe(pool=pool)
         ),
+    }
+    if stage_log_writer is None:
+        # Every caller that predates this lane: the publisher itself, with
+        # the seams it has always had and no red-gate action of its own.
+        return MergeReadyCheckpointPublisher(**seams)
+    return _checkpoint_class_that_writes_its_verdict()(
+        red_gate_action=_red_gate_action,
+        record=lambda decision: record_checkpoint_verdict(
+            decision, pool=pool, stage_log_writer=stage_log_writer
+        ),
+        **seams,
     )
+
+
+def record_checkpoint_verdict(
+    decision: Any, *, pool: Any, stage_log_writer: Any
+) -> Any:
+    """Write one checkpoint verdict into the journey's history; return it.
+
+    The decision comes back with :data:`CHECKPOINT_VERDICT_RECORDED_KEY` on
+    its details when the row was really written, which is what tells the
+    conductor's loop that a red gate's loop-back moved the journey rather
+    than standing still.
+
+    Never raises. A row that could not be written is said plainly and the
+    decision is returned exactly as the checkpoint made it — the journey is
+    then bounded by the nothing-changed rule, as it was before this lane.
+    """
+    gates = getattr(decision, "gates", None)
+    if gates is None:
+        # No gate set was read (no commits to check, or the one card is
+        # already spent). There is no verdict to record.
+        return decision
+
+    detail = getattr(gates, "detail", "")
+    failing = tuple(getattr(detail, "failing_cases", ()) or ())
+    green = bool(getattr(gates, "is_green", False))
+    build_id = str(getattr(decision, "build_id", "") or "")
+    status = getattr(getattr(gates, "status", None), "value", None) or "red"
+    # The row's own account of itself, which the projection carries forward as
+    # the failure reason on a red row — so the sentence that names what
+    # stopped a journey is written once, here.
+    reason = f"the merge-ready checks are {status}: {detail or 'no detail'}"
+    try:
+        stage_log_writer.record_checkpoint(
+            build_id=build_id,
+            feature_id=getattr(decision, "feature_id", "") or None,
+            green=green,
+            rationale=reason,
+            failing_tests=failing,
+            failed_gates=tuple(getattr(gates, "failed_gates", ()) or ()),
+            declared_test_command=str(getattr(detail, "command", "") or ""),
+            declared_test_exit_code=getattr(detail, "exit_code", None),
+            evidence=str(getattr(gates, "evidence", "") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 — a row is not worth a journey
+        logger.error(
+            "the merge-ready checkpoint: writing its verdict into build_id=%s's "
+            "history raised %s: %s — the decision stands, but the planner "
+            "cannot read what the checks said and the journey is bounded by "
+            "the nothing-changed rule instead",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return decision
+
+    try:
+        return dataclasses.replace(
+            decision,
+            details={
+                **dict(getattr(decision, "details", None) or {}),
+                CHECKPOINT_VERDICT_RECORDED_KEY: True,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — the row is written either way
+        logger.warning(
+            "the merge-ready checkpoint: the verdict for build_id=%s is "
+            "recorded but could not be marked on the decision (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return decision
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +2158,63 @@ def make_conductor_guardkit_run_chooser(
         return runners[repo]
 
     return choose
+
+
+def with_the_gate_evidence(
+    inner: Callable[..., Any] | None, *, pool: Any
+) -> Callable[..., Any] | None:
+    """Wrap the fix-task context builder so a gate-driven review is told why.
+
+    The supervisor asks its ``fix_task_context_builder`` for BOTH Mode C
+    stages. For a ``/task-review`` that follows a RED merge-ready checkpoint
+    this adds one more ``--context`` entry: the declared command that failed,
+    the tests it named, what it printed, and the instruction that the
+    repository's existing tests are the specification.
+
+    Everything else is left exactly as it was found — any other stage, and a
+    review the checks have not sent back, gets the very mapping the inner
+    builder made, so a routine build and an ordinary review cycle are
+    byte-identical to before. ``None`` in, ``None`` out: a composition with
+    no context builder wired stays without one.
+
+    Never raises: a document that cannot be built is a review dispatched the
+    way it always was, said once in the log.
+    """
+    if inner is None:
+        return None
+
+    from forge.pipeline.fix_task_context_builder import build_gate_evidence_context
+
+    def build(stage: Any, build_id: str, fix_task: Any) -> Any:
+        context = inner(stage, build_id, fix_task)
+        if stage is not StageClass.TASK_REVIEW:
+            return context
+        try:
+            row = pool.get_build_row(build_id)
+            entry = build_gate_evidence_context(
+                rows=pool.read_stages(build_id),
+                worktree_path=getattr(row, "worktree_path", None) if row else None,
+                task_id=str(getattr(row, "task_id", "") or "") if row else "",
+            )
+        except Exception as exc:  # noqa: BLE001 — a read defect is not a journey
+            logger.warning(
+                "gate evidence: reading build_id=%s to build the review's "
+                "document raised %s: %s — the review is dispatched exactly as "
+                "before",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return context
+        if entry is None:
+            return context
+        updated = dict(context or {})
+        entries = list(updated.get("context_entries") or ())
+        entries.append(entry)
+        updated["context_entries"] = entries
+        return updated
+
+    return build
 
 
 def build_conductor_supervisor_factory(
@@ -1683,12 +2392,34 @@ def build_conductor_supervisor_factory(
             leg_model=resolved_leg_model,
             leg_budgets=leg_budgets,
         )
+        # HOW MANY REVIEW CYCLES THIS BUILD MAY SPEND — read off the SAME
+        # resolved profile the supervisor is judged against (above), never
+        # resolved a second time. The checkpoint asks it once, on a red gate:
+        # with a cycle left the failures go back to the review seat, with
+        # none the journey ends and says which tests kept it red.
+        guards = budget_kwargs.get("budget_guards")
+        review_cycle_cap = (
+            guards.max_review_cycles
+            if guards is not None and getattr(guards, "caps_enabled", False)
+            else None
+        )
         checkpoint = make_merge_ready_checkpoint(
             pool=pool,
             publish_card=publish_card,
             gates_green_reader=gates_green_reader,
             has_commits_probe=None,
             receipts_root=receipts_root,
+            stage_log_writer=stage_log_writer,
+            review_cycle_cap=review_cycle_cap,
+        )
+        # THE REVIEW LEG'S CONTEXT, WITH THE GATE'S EVIDENCE ON IT. A review
+        # the checks sent the journey back to is handed what they ran, what
+        # failed and what the run printed — the same carriage K2's
+        # verification document uses, added here because this is the layer
+        # that holds both the ledger and the build row.
+        mode_kwargs = dict(mode_kwargs)
+        mode_kwargs["fix_task_context_builder"] = with_the_gate_evidence(
+            mode_kwargs.get("fix_task_context_builder"), pool=pool
         )
         return _build(
             forward_context_builder=forward_context_builder,
@@ -1781,6 +2512,28 @@ def make_conductor_wait_window_reader(
     return read_window
 
 
+def _declared_test_evidence_of(report: Any) -> str:
+    """What the declared test printed on this turn, or ``""``.
+
+    The merge-ready checkpoint hands its decision back on the turn report
+    (``dispatch_result``), and the gate set it read carries the declared test
+    command's own output. Every other turn's dispatch result has no gate set
+    and no evidence, so it writes no file — this reader asks, it does not
+    assume, and it never raises: a receipt that could not be written must
+    never cost a journey.
+    """
+    from forge.pipeline.merge_ready_checkpoint import DECLARED_TEST_EVIDENCE_KEY
+
+    decision = getattr(report, "dispatch_result", None)
+    gates = getattr(decision, "gates", None)
+    evidence = getattr(gates, "evidence", "")
+    if not isinstance(evidence, str) or not evidence.strip():
+        details = getattr(decision, "details", None)
+        if isinstance(details, Mapping):
+            evidence = details.get(DECLARED_TEST_EVIDENCE_KEY, "")
+    return evidence if isinstance(evidence, str) and evidence.strip() else ""
+
+
 def make_conductor_receipts_exporter(
     *,
     pool: Any,
@@ -1823,6 +2576,7 @@ def make_conductor_receipts_exporter(
     always has.
     """
     from forge.pipeline.fix_journey_receipts import export_stage_receipts
+    from forge.pipeline.merge_ready_checkpoint import DECLARED_TEST_OUTPUT_FILENAME
 
     sandboxes = dict(
         getattr(getattr(config, "planning", None), "sandboxes", None) or {}
@@ -1835,7 +2589,12 @@ def make_conductor_receipts_exporter(
             return None
         row = pool.get_build_row(build_id)
         rationale = getattr(report, "rationale", "") or ""
-        extra_files = {"turn-rationale.txt": rationale} if rationale else None
+        extra_files: dict[str, str] = {}
+        if rationale:
+            extra_files["turn-rationale.txt"] = rationale
+        evidence = _declared_test_evidence_of(report)
+        if evidence:
+            extra_files[DECLARED_TEST_OUTPUT_FILENAME] = evidence
         worktree_path = getattr(row, "worktree_path", None)
         entry = sandboxes.get(str(getattr(row, "repo", "") or "")) if row else None
         if entry is not None:
@@ -1846,7 +2605,7 @@ def make_conductor_receipts_exporter(
                 build_id=build_id,
                 stage=stage_name,
                 worktree_path=worktree_path,
-                extra_files=extra_files,
+                extra_files=extra_files or None,
                 post=post,
             )
         result = export_stage_receipts(
@@ -1854,7 +2613,7 @@ def make_conductor_receipts_exporter(
             stage=stage_name,
             worktree_path=worktree_path,
             receipts_root=receipts_root,
-            extra_files=extra_files,
+            extra_files=extra_files or None,
         )
         return getattr(result, "stage_key", None)
 
