@@ -42,6 +42,11 @@ Acceptance criteria mapping
 * AC-6: :meth:`LifecycleBridgeWireup.shutdown` cancels every observer
   task and returns within ``shutdown_timeout_seconds`` (default 5.0s).
 
+One later addition, outside that list (2026-09-08, seam seven):
+:meth:`take_ack_handle` hands a fix journey's queued-message handle to
+the conductor, which is the only thing that knows when such a journey has
+ended. See the method for why the bridge cannot ack it itself.
+
 Stream source contract
 ----------------------
 
@@ -586,6 +591,14 @@ class LifecycleBridgeWireup:
         # Per-feature handle book-keeping so the observer can ack on
         # terminal arrival even when the consumer's own reference has
         # been released.
+        #
+        # THE HANDLE IS ALSO THE CONDUCTOR'S (2026-09-08, seam seven). For
+        # a fix journey the observer stands down without acking — the
+        # conductor owns both the terminal and the ack — so on that one
+        # path the entry is KEPT here after the observer exits, and the
+        # conductor takes it at its close-out through
+        # :meth:`take_ack_handle`. A routine build is unchanged: its entry
+        # is dropped when its observer finishes, exactly as before.
         self._handles: dict[str, BuildAckHandle] = {}
         # Tracks shutdown so a late ``register_ack_handle`` call after
         # ``shutdown()`` has begun raises rather than silently leaking
@@ -754,6 +767,11 @@ class LifecycleBridgeWireup:
         """
         feature_id = context.feature_id
         correlation_id = context.correlation_id
+        # Set on the one path where the observer walks away from a build
+        # that is still running: the mode-c stand-down below. It tells the
+        # ``finally`` to LEAVE this build's ack handle where the conductor
+        # can take it at its terminal close-out (2026-09-08, seam seven).
+        conductor_owns_the_ack = False
         # FEAT-UBS-002 stage 2 — open a fresh per-observer budget-detection
         # session when a detector is wired. In-memory only: a bridge restart
         # starts a fresh session (the review-cycle count resets by design).
@@ -807,11 +825,14 @@ class LifecycleBridgeWireup:
                         "(no identity deadline armed, no synthetic "
                         "build-failed, nothing acked; the bridge's registry "
                         "row is detached because nothing observes it any "
-                        "more — the conductor owns the ack and the terminal)",
+                        "more — the conductor owns the ack and the terminal, "
+                        "and the queued message's handle is kept here for it "
+                        "to take)",
                         feature_id,
                         build_id,
                         MODE_C_WATCHDOG_STAND_DOWN,
                     )
+                    conductor_owns_the_ack = True
                     self._detach_on_stand_down(context)
                     return
                 identity = await self._await_identity_until_deadline(context)
@@ -917,7 +938,13 @@ class LifecycleBridgeWireup:
             # Drop ourselves from the live observer set so a future
             # registration for the same feature_id can succeed.
             self._observers.pop(feature_id, None)
-            self._handles.pop(feature_id, None)
+            # The ack handle goes with us — EXCEPT after a mode-c
+            # stand-down, where the build is still running and the
+            # conductor will take the handle at its close-out. Dropping it
+            # there is what left the pipeline consumer's slot held for a
+            # full hour on 2026-09-08.
+            if not conductor_owns_the_ack:
+                self._handles.pop(feature_id, None)
             # Drop the per-observer budget session (in-memory state does not
             # outlive the observer — FEAT-UBS-002 stage 2).
             self._budget_sessions.pop(feature_id, None)
@@ -2202,6 +2229,27 @@ class LifecycleBridgeWireup:
         ``record`` / ``update_lifecycle`` calls).
         """
         return sum(1 for task in self._observers.values() if not task.done())
+
+    def take_ack_handle(self, feature_id: str) -> BuildAckHandle | None:
+        """Hand out this build's queued-message handle, and forget it here.
+
+        The conductor's terminal close-out calls this so a finished fix
+        journey releases the pipeline consumer's ``build-queued`` message
+        and the next build can start. Before it existed nothing on the
+        conductor's side could reach the handle: the bridge stands down
+        for a fix journey without acking (the conductor owns the ack), and
+        the handle went out of scope with the observer — so on
+        2026-09-08 two closed journeys each held the consumer's one
+        outstanding acknowledgement until the hour-long redelivery, and
+        the cure was pulling the message off the stream by hand.
+
+        Handing it out and forgetting it in one act is deliberate: the
+        second close-out for the same build finds nothing, says so in one
+        line, and does nothing else. ``None`` is the ordinary answer for a
+        build this bridge never registered (a journey started before the
+        bridge attached, or any test).
+        """
+        return self._handles.pop(feature_id, None)
 
     def get_observer_task(self, feature_id: str) -> asyncio.Task[None] | None:
         """Return the observer task for ``feature_id`` (or ``None``).

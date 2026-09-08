@@ -138,6 +138,7 @@ __all__ = [
     "load_declared_toolchain",
     "make_conductor_close_out",
     "make_conductor_failure_pack_writer",
+    "make_conductor_queue_release",
     "make_conductor_guardkit_run_chooser",
     "make_conductor_receipts_exporter",
     "RECEIPTS_EXPORT_TIMEOUT_S",
@@ -2056,6 +2057,94 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
     return close_out
 
 
+def make_conductor_queue_release(
+    *,
+    pool: Any,
+    take_ack_handle: Callable[[str], Any] | None = None,
+) -> Callable[[str], Any]:
+    """Build the seam that lets the next build start when a journey ends.
+
+    The pipeline consumer takes ONE build message at a time: it holds that
+    message unacknowledged for the whole build and every later build waits
+    behind it. For a routine build the lifecycle bridge watches the run and
+    releases the message when the run ends. For a fix journey the bridge
+    deliberately stands down — nothing it can see says when the journey is
+    over — so the release has to come from the conductor, and until now
+    nothing did it. On 2026-09-08 two journeys closed (one FAILED, one
+    cancelled) with their messages still held, forge-prod's health line
+    said the slot was held, a restart would not cure it (the boot check
+    read the held message as a live build, correctly), and the message had
+    to be pulled off the stream by hand.
+
+    The returned ``async (build_id) -> None``:
+
+    1. reads the build's feature id off its row (that is the name the
+       bridge files the handle under);
+    2. takes the handle — taking it, not borrowing it, so a second
+       close-out for the same build cannot acknowledge twice;
+    3. acknowledges the message once.
+
+    Anything missing — no bridge this boot, no row, a journey that began
+    before the bridge attached, a second close-out — is one plain log line
+    and nothing else. It is never an error: a journey ending with no
+    message to release is an ordinary thing.
+    """
+
+    async def release_queue_message(build_id: str) -> None:
+        if take_ack_handle is None:
+            logger.info(
+                "conductor close-out: build_id=%s — no lifecycle bridge is "
+                "wired this boot, so there is no queued message to release",
+                build_id,
+            )
+            return
+
+        feature_id: str | None = None
+        try:
+            row = pool.get_build_row(build_id)
+            feature_id = getattr(row, "feature_id", None) if row else None
+        except Exception as exc:  # noqa: BLE001 — a read must not end a terminal
+            logger.warning(
+                "conductor close-out: could not read the build row for "
+                "build_id=%s (%s: %s) — the queued message is not released "
+                "here; the queue frees it at the redelivery",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+
+        if not feature_id:
+            logger.info(
+                "conductor close-out: build_id=%s has no feature id on its "
+                "row, so there is no queued message to release",
+                build_id,
+            )
+            return
+
+        handle = take_ack_handle(feature_id)
+        if handle is None:
+            logger.info(
+                "conductor close-out: build_id=%s (%s) — no queued message is "
+                "held for this build, so there is nothing to release (it was "
+                "released already, or the journey started before the bridge "
+                "attached)",
+                build_id,
+                feature_id,
+            )
+            return
+
+        await handle.ack()
+        logger.info(
+            "conductor close-out: build_id=%s (%s) — released the queued "
+            "message; the next build can start",
+            build_id,
+            feature_id,
+        )
+
+    return release_queue_message
+
+
 #: ``builds.error`` is a one-line column and ``forge status`` renders it in
 #: a table cell. The terminal rationale can carry a multi-line leg banner.
 _ERROR_COLUMN_LIMIT: int = 500
@@ -2158,6 +2247,7 @@ def build_conductor_driver_deps_factory(
     republish_pending: Callable[[str], Any] | None = None,
     receipts_root: "Path | str | None" = None,
     source_build_id_reader: Callable[[str], str | None] | None = None,
+    take_ack_handle: Callable[[str], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> Callable[[str, Any], ConductorDriverDeps]:
     """Return the ``(build_id, supervisor) -> ConductorDriverDeps`` factory.
@@ -2178,6 +2268,11 @@ def build_conductor_driver_deps_factory(
       read off the build row for the report's rationale.
     * ``export_stage_receipts`` / ``write_failure_pack`` / ``close_out`` —
       the receipts fold, both directions (design pass §b.2).
+    * ``release_queue_message`` — :func:`make_conductor_queue_release`,
+      composed over the lifecycle bridge's ``take_ack_handle``. It is what
+      lets the next build start when a fix journey ends; ``take_ack_handle``
+      ``None`` (no bridge this boot, and every test here) leaves it saying
+      so in one line and doing nothing.
 
     The bus seam is the ONLY one that touches NATS, and it arrives
     injected, so every test here runs network-free.
@@ -2194,6 +2289,9 @@ def build_conductor_driver_deps_factory(
         source_build_id_reader=source_build_id_reader,
     )
     close_out = make_conductor_close_out(pool=pool)
+    release_queue_message = make_conductor_queue_release(
+        pool=pool, take_ack_handle=take_ack_handle
+    )
     expected_approver = getattr(config.approval, "expected_approver", None)
 
     subscribe_resume = (
@@ -2222,6 +2320,7 @@ def build_conductor_driver_deps_factory(
             export_stage_receipts=export,
             write_failure_pack=write_pack,
             close_out=close_out,
+            release_queue_message=release_queue_message,
         )
 
     return deps_factory

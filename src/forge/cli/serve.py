@@ -561,6 +561,11 @@ def bind_production_dispatch_chain(
 
         register_ack_handle: Any = None
         terminal_publish_ledger: Any = None
+        # The other half of the same bridge: how a finished fix journey
+        # gives the pipeline consumer's message back (2026-09-08, seam
+        # seven). ``None`` on a boot with no bridge, and the conductor's
+        # close-out then says so in one line and does nothing.
+        take_ack_handle: Any = None
         if bridge_wireup_parts is not None:
             from forge.adapters.nats.approval_publisher import (
                 AGENT_ID as _approval_agent_id,
@@ -637,6 +642,7 @@ def bind_production_dispatch_chain(
                 merge_offer_hook=merge_offer_hook,
             )
             register_ack_handle = wireup.register_ack_handle
+            take_ack_handle = wireup.take_ack_handle
             terminal_publish_ledger = bridge_wireup_parts.terminal_publish_ledger
 
         # TASK-JNB-101 — construct the approval-gate collaborators
@@ -758,6 +764,7 @@ def bind_production_dispatch_chain(
                     gate_state_machine=gate_state_machine,
                     clock=_gate_wall_clock,
                     nats_client=client,
+                    take_ack_handle=take_ack_handle,
                 )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             conductor_router = None
@@ -1639,6 +1646,7 @@ def _compose_conductor_router(
     gate_state_machine: Any,
     clock: "Callable[[], datetime]",
     nats_client: Any = None,
+    take_ack_handle: "Callable[[str], Any] | None" = None,
 ) -> "Callable[..., Any] | None":
     """Compose the ACTIVATED conductor router (Stage 2, shakeout item 3).
 
@@ -1806,6 +1814,13 @@ def _compose_conductor_router(
         config=forge_config,
         subscriber_factory=subscriber_factory,
         source_build_id_reader=failure_pack_source_reader,
+        # THE QUEUE SLOT (2026-09-08, seam seven). The lifecycle bridge
+        # stands down for a fix journey without acking, so if the
+        # conductor does not hand the queued message back at its terminal
+        # close-out nothing does, and every later build waits an hour for
+        # the redelivery. ``None`` (no bridge this boot) makes the seam
+        # say so in one line and do nothing.
+        take_ack_handle=take_ack_handle,
     )
     return build_conductor_router(
         pool=sqlite_pool,
