@@ -35,6 +35,18 @@ registered repositories does; it is written down here so nobody meets it as a
 puzzle.
 
 Nothing here runs docker, ``sbx``, or the deploy script.
+
+THE VENUE SEAM (sandbox first, 2026-09-07, rule 89). The five git operations
+the merge press needs — reading a commit, asking whether one commit is in
+another, keeping the laid-out trees out of the checkout's eyes, laying one
+out, removing it — are gathered into one small surface,
+:class:`CandidateGit`, so the press can be told WHERE they happen instead of
+assuming they happen here. :class:`InContainerCandidateGit` is this file's own
+functions, called in the order the press has always called them, for every
+repository that has no sandbox; :class:`~forge.deploy.sidecar_git.
+SidecarCandidateGit` is the same five over the sidecar inside a repository's
+sandbox, where a sandboxed repository's branches actually are. Neither knows
+about the other.
 """
 
 from __future__ import annotations
@@ -44,17 +56,23 @@ import logging
 import shutil
 import subprocess
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "CANDIDATE_TREES_DIRNAME",
     "CANDIDATE_TREES_EXCLUDE_LINE",
+    "CandidateGit",
     "CandidateTreeError",
+    "CandidateTreeLayout",
+    "InContainerCandidateGit",
     "candidate_tree_path",
     "candidate_trees_root",
     "ensure_candidate_trees_excluded",
+    "git_is_ancestor",
     "git_rev_parse",
     "is_candidate_tree_path",
     "materialise_candidate_tree",
@@ -257,3 +275,150 @@ async def ensure_candidate_trees_excluded(repo_root: Path | str) -> bool:
     reason nobody could see.
     """
     return await asyncio.to_thread(_ensure_excluded_sync, Path(repo_root))
+
+
+async def git_is_ancestor(
+    repo_root: Path | str, ancestor: str, descendant: str
+) -> bool | None:
+    """Is ``ancestor`` a commit that ``descendant`` already contains?
+
+    ``git merge-base --is-ancestor`` answers exit 0 (yes) or exit 1 (no), and
+    anything else means git could not say — a commit it does not know, or git
+    not running at all. Only a plain yes or no is returned as a bool; "could
+    not say" is an honest ``None`` and the caller decides what to do with a
+    question it could not have answered.
+    """
+    root = Path(repo_root)
+    args = ("merge-base", "--is-ancestor", str(ancestor), str(descendant))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=str(root),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
+        logger.warning(
+            "candidate tree: git %s could not be run in %s (%s)",
+            " ".join(args),
+            root,
+            exc,
+        )
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    logger.warning(
+        "candidate tree: git %s exited %s in %s — git could not say",
+        " ".join(args),
+        proc.returncode,
+        root,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The venue seam — the same five operations, in the place the repository lives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CandidateTreeLayout:
+    """What laying a candidate's tree out produced.
+
+    ``path`` is the directory the tree is in — the same path whichever venue
+    laid it out, because a repository's sandbox holds its clone at the path
+    the checkout has on this side, which is what lets the deploy stage and the
+    live gate run against it with no translation.
+
+    ``tree`` is the commit's tree id when the venue answered one while it was
+    laying the tree out (the sandbox route does; the functions here do not,
+    and the press reads it with :meth:`CandidateGit.rev_parse` as it always
+    has). ``exclude_written`` says whether THIS call wrote the exclude line.
+    """
+
+    path: str
+    tree: str | None = None
+    exclude_written: bool | None = None
+
+
+@runtime_checkable
+class CandidateGit(Protocol):
+    """The merge press's five git operations, wherever they happen.
+
+    One repository, one surface. Every implementation is written never to
+    raise except where the press already expects a raise
+    (:meth:`materialise_candidate_tree`, which raises
+    :class:`CandidateTreeError`); everything else answers ``None`` or
+    ``False`` when it could not do the thing, and says why in the log.
+    """
+
+    async def rev_parse(self, ref: str) -> str | None:
+        """The commit (or tree) ``ref`` names, or ``None``."""
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        """Is ``ancestor`` in ``descendant``? ``None`` = git could not say."""
+
+    async def ensure_candidate_trees_excluded(self) -> bool | None:
+        """Keep the laid-out trees out of the checkout's eyes, once.
+
+        ``True`` when this call wrote the line, ``False`` when it was already
+        there, ``None`` when this venue does it as part of laying the tree out
+        and there is nothing to do on its own.
+        """
+
+    async def materialise_candidate_tree(
+        self, feature_id: str, sha: str
+    ) -> CandidateTreeLayout:
+        """Lay ``sha``'s tree out for ``feature_id``; raise on failure."""
+
+    async def remove_candidate_tree(
+        self, feature_id: str, path: str | None = None
+    ) -> bool:
+        """Remove the laid-out tree. Never raises; ``False`` when it could not."""
+
+
+class InContainerCandidateGit:
+    """The five operations run here, against ``repo_root``, exactly as before.
+
+    Every method is one of this module's own functions, called with the
+    arguments the merge press has always called it with. This is the venue for
+    every repository that has no sandbox — which is every repository until an
+    operator gives one a sandbox — so nothing about such a press changes.
+    """
+
+    def __init__(self, repo_root: Path | str) -> None:
+        self._repo_root = Path(repo_root)
+
+    @property
+    def repo_root(self) -> Path:
+        return self._repo_root
+
+    @property
+    def venue(self) -> str:
+        """Where the work happened, for a sentence a person reads."""
+        return f"in {self._repo_root}"
+
+    async def rev_parse(self, ref: str) -> str | None:
+        return await git_rev_parse(self._repo_root, ref)
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        return await git_is_ancestor(self._repo_root, ancestor, descendant)
+
+    async def ensure_candidate_trees_excluded(self) -> bool | None:
+        return await ensure_candidate_trees_excluded(self._repo_root)
+
+    async def materialise_candidate_tree(
+        self, feature_id: str, sha: str
+    ) -> CandidateTreeLayout:
+        path = await materialise_candidate_tree(self._repo_root, feature_id, sha)
+        return CandidateTreeLayout(path=str(path))
+
+    async def remove_candidate_tree(
+        self, feature_id: str, path: str | None = None
+    ) -> bool:
+        where = path or str(candidate_tree_path(self._repo_root, feature_id))
+        return await remove_candidate_tree(where)

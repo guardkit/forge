@@ -17,6 +17,12 @@ rule 39): the feature branch is checked in the Docker Sandbox FIRST, and only
 if every check passes does the merge land and that exact build get promoted.
 A branch that fails the check is never merged.
 
+For a repository whose factory lives in its own sandbox (sandbox first, rule
+89) every git operation of the press — main's commit for the pin, the branch,
+the candidate's tree, the ancestry checks and the tree comparison — happens
+inside that sandbox, on the factory's clone, exactly as it does for the card's
+press. A repository with no sandbox is pressed here, as before.
+
 The branch merged is the branch the build made (Part M of the rewrite-on-refusal
 spec): the row's recorded ``merge_branch`` when the conductor cut one (a
 repair's ``fix/<task id>-<build8>``, reachable here with ``--build-id``), else
@@ -157,11 +163,25 @@ async def _arun(
         )
     repo_root = Path(paths[row.repo])
 
-    expect_main_sha = await git_rev_parse_main(repo_root)
+    # WHERE this repository's git happens (sandbox first, rule 89): inside its
+    # sandbox when it has one, in this process when it has not. The pin is the
+    # first git the press needs, so it is read in the same place as the rest.
+    from forge.cli.serve import compose_merge_git_surface
+
+    git_surface = compose_merge_git_surface(config)
+    surface = git_surface(row.repo, repo_root) if git_surface is not None else None
+    if surface is None:
+        expect_main_sha = await git_rev_parse_main(repo_root)
+    else:
+        expect_main_sha = await surface.rev_parse("main")
     if expect_main_sha is None:
+        where = (
+            f"in {repo_root}"
+            if surface is None
+            else f"in the sandbox that holds {row.repo}"
+        )
         raise click.ClickException(
-            f"could not read main's sha in {repo_root} — refusing an "
-            "unpinned merge"
+            f"could not read main's sha {where} — refusing an unpinned merge"
         )
     baseline_failing = read_baseline_failing(row.build_id)
     # The branch the build made, when the conductor recorded one (a repair).
@@ -174,6 +194,7 @@ async def _arun(
             pool=pool,
             pipeline_publisher=publisher,
             guardkit_run=guardkit_run,
+            git_surface=git_surface,
             deploy_dispatcher=dispatcher,
         )
         decided_by = config.approval.expected_approver or os.environ.get(

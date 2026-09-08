@@ -356,6 +356,84 @@ def compose_merge_guardkit_run(forge_config: Any) -> Any:
     return run_merge_where_the_repository_lives
 
 
+def compose_merge_git_surface(forge_config: Any) -> Any | None:
+    """Choose WHERE each repository's merge git happens (sandbox first, rule 89).
+
+    Returns ``(repo, repo_root) -> CandidateGit | None`` — the sandbox's git
+    surface for a repository named in ``planning.sandboxes``, ``None`` for a
+    repository that has none (its press keeps running the git functions it
+    always ran, in the forge container).
+
+    With the map empty — the default, and the estate's state until an operator
+    fills it in — this returns ``None`` itself, so nothing is composed and no
+    press asks a routing question at all.
+    """
+    from forge.config.sandboxes import has_sandboxes, sandbox_for
+
+    if not has_sandboxes(forge_config):
+        return None
+
+    from forge.deploy.sidecar_git import SidecarCandidateGit
+
+    per_repo: dict[str, Any] = {}
+
+    def surface_for(repo: str, repo_root: Path) -> Any | None:
+        entry = sandbox_for(forge_config, repo)
+        if entry is None:
+            return None
+        if repo not in per_repo:
+            per_repo[repo] = SidecarCandidateGit(
+                str(entry.sidecar_url), repo=str(repo)
+            )
+            logger.info(
+                "forge-serve: %s has a sandbox (%s), so the merge word's own "
+                "git — the branch, the ancestry checks, the candidate's tree "
+                "and the tree comparison — runs inside it, through the "
+                "sidecar at %s",
+                repo,
+                getattr(entry, "name", "?"),
+                entry.sidecar_url,
+            )
+        return per_repo[repo]
+
+    logger.info(
+        "forge-serve: the merge word's own git chooses its venue per "
+        "repository — a repository with a sandbox is read and written inside "
+        "it, every other one in the forge container as before"
+    )
+    return surface_for
+
+
+def compose_merge_offer_git_head(forge_config: Any) -> Any | None:
+    """Read main's commit where the repository lives, for the merge card's pin.
+
+    The card pins the commit the merge will be held to, and for a repository
+    whose factory lives in its sandbox main is the clone's main, in there. A
+    pin read on this side would be a commit the merge inside the sandbox has
+    never heard of, and every press would refuse. Returns ``None`` when no
+    repository has a sandbox, so the offer keeps its own default
+    (:func:`forge.pipeline.merge_offer.git_rev_parse_main`) byte for byte.
+    """
+    surface_for = compose_merge_git_surface(forge_config)
+    if surface_for is None:
+        return None
+
+    from forge.pipeline.merge_offer import git_rev_parse_main
+
+    paths = dict(forge_config.planning.target_repo_paths)
+
+    async def read_main(repo_root: Path) -> str | None:
+        from forge.adapters.guardkit.run_via_sidecar import _resolve_repo_key
+
+        repo_key = _resolve_repo_key(Path(repo_root), paths)
+        surface = surface_for(repo_key, Path(repo_root)) if repo_key else None
+        if surface is None:
+            return await git_rev_parse_main(Path(repo_root))
+        return await surface.rev_parse("main")
+
+    return read_main
+
+
 def bind_production_dispatch_chain(
     *,
     forge_config: Any,
@@ -461,11 +539,16 @@ def bind_production_dispatch_chain(
             if _merge_cfg is not None and _merge_cfg.enabled:
                 from forge.pipeline.merge_offer import MergeOfferService
 
+                _offer_git_head = compose_merge_offer_git_head(forge_config)
+                _offer_kwargs: dict[str, Any] = (
+                    {} if _offer_git_head is None else {"git_head": _offer_git_head}
+                )
                 _merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,
                     pipeline_publisher=publisher,
                     raw_publish=client.publish,
+                    **_offer_kwargs,
                 )
                 merge_offer_hook = _merge_offer_service.maybe_offer
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
@@ -811,6 +894,7 @@ def bind_production_dispatch_chain(
                         pool=sqlite_pool,
                         pipeline_publisher=publisher,
                         guardkit_run=compose_merge_guardkit_run(forge_config),
+                        git_surface=compose_merge_git_surface(forge_config),
                         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
                             config=forge_config,
                             nats_client=client,

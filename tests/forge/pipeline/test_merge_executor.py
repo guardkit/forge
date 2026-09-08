@@ -29,6 +29,7 @@ from nats_core.events import ApprovalResponsePayload
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.adapters.sqlite import connect as sqlite_connect
+from forge.deploy.candidate_tree import InContainerCandidateGit
 from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence, StageLogEntry
@@ -2455,15 +2456,55 @@ class TestTheLandedDetectionFollowsTheBranch:
         assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch="  ") == new_main
 
 
-class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
-    """Sandbox first, rules 62 and 85 — the wall L3b could not move.
+class _RecordingGit:
+    """A venue that records every operation and does the work in ``where``.
 
-    A repository named in ``planning.sandboxes`` has its build worktrees and
-    its branches inside that sandbox. Every git command in the press runs
-    against the copy on this side, which does not have the branch the build
-    made, so the press cannot start. It says so in one plain sentence and
-    changes nothing, rather than stopping a step later on "the branch was not
-    found" (L3b's coach, 2026-09-08).
+    It stands for the sandbox's surface without a wire: the press must reach
+    git ONLY through it, so a test can both watch what was asked and put the
+    work somewhere the container's own git functions were never pointed at.
+    """
+
+    def __init__(self, where: Path) -> None:
+        self._real = InContainerCandidateGit(where)
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    venue = "in the sandbox that holds appmilla/api_test"
+
+    async def rev_parse(self, ref: str) -> str | None:
+        self.calls.append(("rev_parse", (ref,)))
+        return await self._real.rev_parse(ref)
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        self.calls.append(("is_ancestor", (ancestor, descendant)))
+        return await self._real.is_ancestor(ancestor, descendant)
+
+    async def ensure_candidate_trees_excluded(self) -> bool | None:
+        self.calls.append(("ensure_candidate_trees_excluded", ()))
+        return await self._real.ensure_candidate_trees_excluded()
+
+    async def materialise_candidate_tree(self, feature_id: str, sha: str) -> Any:
+        self.calls.append(("materialise_candidate_tree", (feature_id, sha)))
+        return await self._real.materialise_candidate_tree(feature_id, sha)
+
+    async def remove_candidate_tree(
+        self, feature_id: str, path: str | None = None
+    ) -> bool:
+        self.calls.append(("remove_candidate_tree", (feature_id, path)))
+        return await self._real.remove_candidate_tree(feature_id, path)
+
+    def names(self) -> list[str]:
+        return [name for name, _args in self.calls]
+
+
+class TestARepositoryWithASandboxIsPressedWhereItLives:
+    """Sandbox first, rule 89 — the wall L3b put up is gone.
+
+    L3b refused the press outright for a repository named in
+    ``planning.sandboxes``, because everything after the refusal ran git
+    against the copy of the repository on this side. Rich's ruling of
+    2026-09-07 23:31Z: no merge-by-hand shape — the merge word's git moves
+    into the sandbox. So the press now asks one surface for its five git
+    operations and is told which venue it has.
     """
 
     @staticmethod
@@ -2487,37 +2528,73 @@ class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
         )
 
     @pytest.mark.asyncio
-    async def test_the_press_refuses_before_it_touches_git_or_the_deploy_stage(
+    async def test_every_git_operation_of_the_press_goes_to_the_venue(
         self, pool, repo_root, _receipts_env: Path
     ) -> None:
-        deps, publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
+        """The whole Part J order runs, and not one git call is made here.
 
-        outcome = await _run_executor(deps, repo_root)
+        ``repo_root`` is a directory that is NOT a git repository — it stands
+        for what forge-prod sees of a sandboxed repository — while the branch,
+        its tree and main are in ``elsewhere``, which is what the venue is
+        pointed at. A press that reached for git on this side could not have
+        found the branch at all.
+        """
+        elsewhere = repo_root
+        on_this_side = repo_root.parent / "no-checkout-here"
+        on_this_side.mkdir()
+        venue = _RecordingGit(elsewhere)
+        # The merge command runs in the sandbox too (L3b): its report names
+        # the commit that landed in there, which for a clean fast-forward is
+        # the branch's own tip.
+        merge = _FakeGuardKit(
+            report={"status": "merged", "merged_sha": _tip(elsewhere)}
+        )
+        deps, publisher, gk, dp = _deps(
+            self._sandbox_config(elsewhere), pool, guardkit=merge
+        )
+        deps.git_surface = lambda repo, root: venue
 
-        assert outcome.result == "merge-refused"
-        assert outcome.status == "FAILED"
-        assert outcome.failed_step == "merge"
-        assert "api-test-factory" in outcome.detail
-        assert "merged by hand" in outcome.detail
-        # Nothing was checked, merged, deployed or promoted.
-        assert dp.calls == []
-        assert gk.calls == []
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=on_this_side,
+            expect_main_sha=_git(elsewhere, "rev-parse", "main"),
+            correlation_id=CORRELATION,
+            decided_by="rich",
+        )
+
+        assert outcome.result == "merged-and-running", outcome.detail
+        # Part J's order, unchanged in meaning: candidate, then merge, then
+        # promote — with the tree comparison between the merge and the promote.
+        assert _legs(dp) == ["candidate_check", "promote"]
+        assert gk.calls, "the merge command was never run"
+        assert venue.names() == [
+            "rev_parse",  # the branch's tip
+            "rev_parse",  # its tree
+            "ensure_candidate_trees_excluded",
+            "materialise_candidate_tree",
+            "is_ancestor",  # is the pinned main in the branch?
+            "rev_parse",  # the merged commit's tree
+            "remove_candidate_tree",
+        ]
+        # The candidate was laid out where the venue is, never on this side.
+        assert not (on_this_side / ".forge-candidates").exists()
+        assert outcome.gate_before_merge["trees_match"] is True
 
     @pytest.mark.asyncio
     async def test_a_build_that_already_merged_still_answers_the_double_merge(
         self, config, pool, repo_root, _receipts_env: Path
     ) -> None:
-        """The question "did this already happen?" is answered first.
-
-        A press replayed on a build that has a merge on record must answer
-        the double-merge refusal, whatever else is true of the repository —
-        so the answer never changes because of anything this lane added
-        (L3b's coach, 2026-09-08).
-        """
+        """The question "did this already happen?" is answered first."""
         first, _publisher, _gk, _dp = _deps(config, pool)
         assert (await _run_executor(first, repo_root)).result == "merged-and-running"
 
+        venue = _RecordingGit(repo_root)
         deps, _publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
+        deps.git_surface = lambda repo, root: venue
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "merge-refused"
@@ -2525,7 +2602,23 @@ class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
             "a merge step is already on record for this build — "
             "refusing to run it twice"
         )
-        assert "api-test-factory" not in outcome.detail
+        assert venue.calls == [] and gk.calls == [] and dp.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_venue_that_cannot_find_the_branch_says_where_it_looked(
+        self, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        empty = repo_root.parent / "empty-clone"
+        empty.mkdir()
+        venue = _RecordingGit(empty)
+        deps, _publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
+        deps.git_surface = lambda repo, root: venue
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert f"the branch autobuild/{FEATURE_ID} was not found" in outcome.detail
+        assert "the sandbox that holds appmilla/api_test" in outcome.detail
         assert gk.calls == [] and dp.calls == []
 
     @pytest.mark.asyncio
@@ -2533,6 +2626,7 @@ class TestARepositoryWhoseFactoryLivesInItsSandboxIsRefusedOutLoud:
         self, config, pool, repo_root, _receipts_env: Path
     ) -> None:
         deps, publisher, gk, dp = _deps(config, pool)
+        assert deps.git_surface is None
 
         outcome = await _run_executor(deps, repo_root)
 
