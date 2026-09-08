@@ -1383,3 +1383,100 @@ class TestRoutineDetachPathUnchangedByStandDown:
         handle.ack.assert_awaited_once()
         assert registry.get("FEAT-NMD", correlation_id="corr-nmd") is None
         await wireup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Seam seven (2026-09-08) — the stand-down keeps the queued message's handle
+# where the conductor can take it. The bridge stands down for a fix journey
+# without acking, which is right: the journey is alive and the conductor owns
+# its terminal. But the handle went out of scope with the observer, so when
+# the conductor closed the journey nothing could give the message back, and
+# the pipeline consumer held it for the full hour before redelivery.
+# ---------------------------------------------------------------------------
+
+
+class TestTheConductorCanTakeTheAckHandle:
+    """A fix journey's handle survives the stand-down; a routine one does not."""
+
+    @pytest.mark.asyncio
+    async def test_the_stand_down_leaves_the_handle_for_the_conductor(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-take-handle": BuildMode.MODE_C}),
+            resolved_build_id="build-take-handle",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-TKH", "corr-tkh", handle)
+        await _drain_observer(wireup, "FEAT-TKH", timeout=2.0)
+
+        # Nothing was acked by the bridge — the journey is still running.
+        handle.ack.assert_not_awaited()
+        # And the conductor can reach the handle at its close-out.
+        assert wireup.take_ack_handle("FEAT-TKH") is handle
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_taking_it_twice_answers_nothing_the_second_time(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # Handed over, not lent: a second close-out for the same build can
+        # never acknowledge the message a second time.
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-take-twice": BuildMode.MODE_C}),
+            resolved_build_id="build-take-twice",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-TKT", "corr-tkt", handle)
+        await _drain_observer(wireup, "FEAT-TKT", timeout=2.0)
+
+        assert wireup.take_ack_handle("FEAT-TKT") is handle
+        assert wireup.take_ack_handle("FEAT-TKT") is None
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_a_routine_build_leaves_nothing_behind(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # The no-change proof: a routine build's observer acks at its own
+        # terminal and drops the handle exactly as it always did, so nothing
+        # accumulates in the daemon for builds nobody will ever close out.
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-routine-handle": BuildMode.MODE_A}),
+            resolved_build_id="build-routine-handle",
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-RTH", "corr-rth", handle)
+        await _drain_observer(wireup, "FEAT-RTH", timeout=2.0)
+
+        handle.ack.assert_awaited_once()
+        assert wireup.take_ack_handle("FEAT-RTH") is None
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_a_build_this_bridge_never_saw_answers_nothing(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({}),
+        )
+
+        assert wireup.take_ack_handle("FEAT-NEVER-QUEUED") is None

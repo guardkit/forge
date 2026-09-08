@@ -1180,7 +1180,9 @@ class _AlwaysReviewPlanner:
     planner's stage selection.
     """
 
-    def plan_next_stage(self, build, history, *, has_commits):  # noqa: ANN001
+    def plan_next_stage(  # noqa: ANN001
+        self, build, history, *, has_commits, review_cycle_cap=None
+    ):
         return ModeCPlan(
             permitted_stages=frozenset(MODE_C_CHAIN),
             next_stage=StageClass.TASK_REVIEW,

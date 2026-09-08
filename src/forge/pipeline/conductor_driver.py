@@ -21,9 +21,12 @@ and branch on the outcome:
   settled**. See the turn-serial law below.
 * ``WAITING`` (and its siblings) → a **structured wait** on the
   approval / resume signal. Never a spin-poll.
-* ``PAUSED_BUDGET`` → stop. The build is paused with a risk-high
-  escalation card out; the journey resumes when a human resolves it, not
-  when a timer fires.
+* ``PAUSED_BUDGET`` → stop. When a pause collaborator is wired the
+  build is paused with a risk-high escalation card out, and the journey
+  resumes when a human resolves it, not when a timer fires. When none is
+  wired there is nobody to resolve anything, so the loop closes the build
+  out FAILED with the reason instead of leaving it RUNNING for ever with
+  the queue's slot held (journey one, 2026-09-08).
 * ``TERMINAL`` → close out and export receipts.
 
 The turn-serial law (risk h.1)
@@ -87,7 +90,7 @@ import asyncio
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
@@ -189,9 +192,15 @@ class ConductorRunOutcome(StrEnum):
         EXPIRED: The card was published and no answer arrived inside the
             approval window. Not a delivery, not a refusal — a silence,
             and the report says so.
-        PAUSED_BUDGET: A budget cap was breached. The build is paused
-            with a risk-high escalation out; the loop stopped and the
-            queue moves on (design pass §d Stage 3).
+        PAUSED_BUDGET: A budget cap was breached and the loop stopped;
+            the queue moves on (design pass §d Stage 3). Two shapes end
+            here. With a pause collaborator wired the build is paused
+            with a risk-high escalation out and waits for the human who
+            can answer it. With none wired nobody can be asked, so the
+            journey is closed out FAILED with the reason on the build
+            row — the report still says PAUSED_BUDGET because a cap is
+            what stopped it, and its rationale says nobody could be
+            asked.
         WAIT_EXPIRED: The structured wait's durable window ran out with
             no response. A loud stop with a pack.
         RED_GATE_STOP: The merge-ready checkpoint found a RED gate, looped
@@ -285,6 +294,38 @@ class ConductorRunReport:
     failure_pack: Any | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _BudgetStopWord:
+    """The one word the close-out seam reads: this journey failed.
+
+    The close-out looks at the turn's dispatch result for the journey's
+    terminal word and writes the build row FAILED on ``"failed"``. A
+    budget stop has no dispatch result of its own (nothing was
+    dispatched — that is the point), so the branch that closes an
+    unescalatable breach hands it this instead. The word is true: the
+    journey ended, and it ended without delivering.
+    """
+
+    outcome: str = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _BudgetStopCloseOut:
+    """What the close-out seam is told about an unescalatable budget stop.
+
+    Report-shaped, because that is the seam's argument: the build it
+    happened to, the plain reason for the build row's error line, the
+    turn outcome for the audit row, and the terminal word above. Used in
+    exactly one place — the ``PAUSED_BUDGET`` branch with no pause
+    collaborator wired.
+    """
+
+    build_id: str
+    rationale: str
+    outcome: TurnOutcome = TurnOutcome.PAUSED_BUDGET
+    dispatch_result: _BudgetStopWord = field(default_factory=_BudgetStopWord)
+
+
 @dataclass
 class ConductorDriverDeps:
     """Injected collaborators of the turn loop.
@@ -323,6 +364,16 @@ class ConductorDriverDeps:
             Any`` — the journey's own failure pack on a loud stop.
         close_out: ``(build_id, report) -> Any`` — terminal close-out
             (the caller's own bookkeeping: ack, status, emit).
+        release_queue_message: ``(build_id) -> Any`` — releases the
+            pipeline consumer's ``build-queued`` message for this build
+            so the next build can start. Called on EVERY terminal
+            close-out, right after ``close_out`` and whatever it did,
+            because a journey that ends without releasing it holds the
+            consumer's one outstanding acknowledgement for the whole
+            hour-long redelivery window (2026-09-08: two closed journeys
+            did exactly that, and the cure was pulling the message off
+            the stream by hand). ``None`` — every test, and any boot with
+            no lifecycle bridge — does nothing at all.
         clock: Monotonic source, injected for deterministic tests.
         sleep: ``(seconds) -> Awaitable[None]`` — injected so tests do
             not spend real wall-clock on the anti-spin back-off.
@@ -339,6 +390,7 @@ class ConductorDriverDeps:
     export_stage_receipts: Callable[..., Any] | None = None
     write_failure_pack: Callable[..., Any] | None = None
     close_out: Callable[..., Any] | None = None
+    release_queue_message: Callable[[str], Any] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     max_turns: int = DEFAULT_MAX_TURNS
@@ -488,6 +540,49 @@ class ConductorTurnLoop:
                 )
 
             if outcome is TurnOutcome.PAUSED_BUDGET:
+                # A cap was breached. Whether stopping here leaves anyone
+                # to ask is the question this branch now puts, because on
+                # 2026-09-08 the answer in production was nobody: the
+                # supervisor had no pause collaborator wired, so no card
+                # went out, and the journey sat RUNNING for ever with the
+                # pipeline consumer's slot held (journey one, seam nine).
+                can_be_asked = (
+                    getattr(deps.supervisor, "budget_pause", None) is not None
+                )
+                breach = getattr(report, "rationale", "") or "budget cap breached"
+                if not can_be_asked:
+                    reason = (
+                        f"stopped at the cap ({breach}); no one could be "
+                        "asked, so the build is closed out failed"
+                    )
+                    logger.error(
+                        "conductor: build_id=%s breached a budget cap after %d "
+                        "turn(s) and there is no one to escalate to (no "
+                        "budget_pause collaborator is wired) — closing the "
+                        "build out FAILED with the reason rather than leaving "
+                        "it RUNNING",
+                        build_id,
+                        turns,
+                    )
+                    pack = await self._write_pack(
+                        build_id,
+                        reason=reason,
+                        outcome=ConductorRunOutcome.PAUSED_BUDGET,
+                    )
+                    await self._close_out(
+                        build_id,
+                        _BudgetStopCloseOut(build_id=build_id, rationale=reason),
+                    )
+                    return ConductorRunReport(
+                        outcome=ConductorRunOutcome.PAUSED_BUDGET,
+                        build_id=build_id,
+                        turns=turns,
+                        last_report=report,
+                        stage_receipts=tuple(self._stage_receipts),
+                        rationale=reason,
+                        failure_pack=pack,
+                    )
+
                 resolved = await self._escalation_resolved(build_id)
                 logger.warning(
                     "conductor: build_id=%s breached a budget cap after %d "
@@ -499,7 +594,7 @@ class ConductorTurnLoop:
                 )
                 pack = await self._write_pack(
                     build_id,
-                    reason=getattr(report, "rationale", "") or "budget cap breached",
+                    reason=breach,
                     outcome=ConductorRunOutcome.PAUSED_BUDGET,
                 )
                 return ConductorRunReport(
@@ -508,9 +603,7 @@ class ConductorTurnLoop:
                     turns=turns,
                     last_report=report,
                     stage_receipts=tuple(self._stage_receipts),
-                    rationale=(
-                        getattr(report, "rationale", "") or "budget cap breached"
-                    ),
+                    rationale=breach,
                     failure_pack=pack,
                 )
 
@@ -881,15 +974,40 @@ class ConductorTurnLoop:
             self._stage_receipts.append(str(key))
 
     async def _close_out(self, build_id: str, report: Any) -> None:
+        """End the journey: write it down, then let the next build start.
+
+        Every terminal close-out comes through here — the TERMINAL turn,
+        the merge card's publication, and a budget breach nobody could be
+        asked about — so this is the one place that releases the pipeline
+        consumer's queued message for the build. The release is LAST and
+        it is unconditional: the journey's own bookkeeping is durable
+        before the next build is allowed to start, and a close-out that
+        blew up still must not leave the queue holding a message for a
+        journey that is over (2026-09-08, seam seven).
+        """
         deps = self._deps
-        if deps.close_out is None:
+        if deps.close_out is not None:
+            try:
+                await _maybe_await(deps.close_out(build_id=build_id, report=report))
+            except Exception as exc:  # noqa: BLE001 — close-out is best-effort
+                logger.warning(
+                    "conductor: close_out raised %s: %s for build_id=%s — the "
+                    "terminal stands",
+                    type(exc).__name__,
+                    exc,
+                    build_id,
+                )
+
+        if deps.release_queue_message is None:
             return
         try:
-            await _maybe_await(deps.close_out(build_id=build_id, report=report))
-        except Exception as exc:  # noqa: BLE001 — close-out is best-effort
+            await _maybe_await(deps.release_queue_message(build_id))
+        except Exception as exc:  # noqa: BLE001 — never crash on a terminal
             logger.warning(
-                "conductor: close_out raised %s: %s for build_id=%s — the "
-                "terminal stands",
+                "conductor: releasing the queued message raised %s: %s for "
+                "build_id=%s — the terminal stands, but the queue is still "
+                "holding this build's message and the next build waits for "
+                "the redelivery",
                 type(exc).__name__,
                 exc,
                 build_id,

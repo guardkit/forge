@@ -114,7 +114,11 @@ with uv once, installs from the copies, and then starts and supervises the two
 services: the deploy sidecar on port 8125 and the build runner (`langgraph
 dev`) on port 8124, both inside the sandbox. The sandbox publishes them to the
 host's loopback on the ports the repository's `deploy/profile.yaml` names
-(`sidecar_publish`, `runner_publish` — for api_test, 8925 and 8924).
+(`sidecar_publish`, `runner_publish` — for api_test, 8925 and 8924). The
+script sets uv's "never download an interpreter" switch on the one command
+that makes the factory's venv and does not export it, so the two services —
+and the repository's own build venv beneath them, which guardkit pins to the
+floor of that repository's `requires-python` — start without it.
 
 It is modelled on the keeper beside it: `ExecStart=/usr/bin/sbx exec %i
 deploy/sandbox-runner.sh`, `Restart=always`, `KillMode=process`. The
