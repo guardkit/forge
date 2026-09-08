@@ -90,7 +90,7 @@ logger = logging.getLogger(__name__)
 # parser discards even a perfect marker block, so the leg dies silently.
 
 #: Outer tripwire for a ``task-review`` leg. Its inner budget is 480s.
-CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS: int = 600
+CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS: int = 960  # 2026-09-08: the review leg's model budget is profile-driven (leg_sdk_timeout_seconds, up to 900s on the workhorse); the outer wall must exceed it
 
 #: Outer tripwire for a ``task-work`` leg. The leg's own inner budget is
 #: 1620s (the builder venue's ``--leg-budget`` default) — the same
