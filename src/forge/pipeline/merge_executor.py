@@ -54,6 +54,33 @@ does, the report carries ``deployed_in: "docker-sandbox"``, which is how the
 line Rich reads after a successful press comes to say the feature is running in
 its Docker Sandbox. No sandbox block ⇒ no such field ⇒ the report is exactly
 what it was.
+
+A REPOSITORY WHOSE FACTORY LIVES IN ITS SANDBOX is pressed there, whole
+(sandbox first, rules 62, 85 and 89). Its build's branch is made in the
+sandbox's own clone, so every git operation of the press — the branch
+look-up, main's commit, the ancestry guards, the candidate tree's lay-out and
+removal, the tree-equality read — happens in there, through that sandbox's
+deploy sidecar, beside the merge command, the deploy leg and the live gate
+that already run in it. The press asks for those five operations through one
+small surface (:class:`~forge.deploy.candidate_tree.CandidateGit`) and is
+TOLD which venue it has: ``deps.git_surface`` builds the sandbox one for a
+repository named in ``planning.sandboxes``, and for every other repository —
+which is every repository until an operator gives one a sandbox — the venue
+is :class:`~forge.deploy.candidate_tree.InContainerCandidateGit`, this file's
+own git functions called in the order they have always been called. Part J's
+order does not change; only where its git runs does.
+
+AND BECAUSE IT LANDED IN THERE, the words after a green press say so and give
+the one command that brings the merge to the operator's checkout (sandbox
+first, rule 79): "This merge landed in the factory's own copy of the
+repository, inside the sandbox <name> — not in your checkout at <path>. To
+bring it to your checkout, run: git -C <path> fetch sandbox-<name> main && git
+-C <path> merge --ff-only sandbox-<name>/main". The same words ride the report
+as ``sandbox_merge`` (the sandbox, the remote, the checkout, the command and
+the sentence), so a thread can print them verbatim rather than compose words of
+its own, and the merge's own receipt records them beside the merge. A
+repository without a sandbox says and records nothing extra: its sentence, its
+report and its receipts are byte for byte what they were.
 """
 
 from __future__ import annotations
@@ -72,11 +99,9 @@ from nats_core.events import ApprovalResponsePayload, StageCompletePayload
 from pydantic import ValidationError
 
 from forge.deploy.candidate_tree import (
+    CandidateGit,
     CandidateTreeError,
-    ensure_candidate_trees_excluded,
-    git_rev_parse,
-    materialise_candidate_tree,
-    remove_candidate_tree,
+    InContainerCandidateGit,
 )
 from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.fix_row_producer import candidate_refused_sentence
@@ -111,6 +136,7 @@ __all__ = [
     "execute_merge_deploy",
     "deployed_in_for",
     "merge_wall_seconds",
+    "sandbox_merge_words",
     "merged_after_all_sha",
 ]
 
@@ -219,6 +245,13 @@ class MergeDeployOutcome:
     #: build row's recorded journey branch for a repair, else the feature's
     #: own ``autobuild/<feature id>``. Set on every ending by the executor.
     branch: str | None = None
+    #: What to do after a merge that landed in a sandbox's own clone
+    #: (sandbox first, rule 79): ``sandbox`` (its name), ``remote``,
+    #: ``checkout``, ``fetch_command`` and the plain ``sentence`` that says
+    #: both. Set only on a green press of a repository that has a sandbox;
+    #: ``None`` for every repository that has none, whose report carries no
+    #: such field at all.
+    sandbox_merge: dict[str, Any] | None = None
 
 
 @dataclass
@@ -243,6 +276,12 @@ class MergeExecutorDeps:
             ``task_id`` so both legs are one deploy run.
         clock: Wall-clock seam.
         receipts_root_fn: Receipts-root seam (env-steered in production).
+        git_surface: WHERE this repository's git happens (sandbox first,
+            rule 89) — ``(repo, repo_root) -> CandidateGit | None``. The
+            composition sets it only when some repository has a sandbox, and
+            it answers ``None`` for a repository that has none. Left unset —
+            the default, and every estate with an empty ``planning.sandboxes``
+            — the press runs the very git functions it always ran, here.
     """
 
     config: Any
@@ -252,6 +291,7 @@ class MergeExecutorDeps:
     deploy_dispatcher: Callable[..., Awaitable[Any]]
     clock: Callable[[], datetime] = field(default=_utcnow)
     receipts_root_fn: Callable[[], Path] = field(default=_default_receipts_root)
+    git_surface: Callable[[str, Path], "CandidateGit | None"] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +426,61 @@ def deployed_in_for(repo_root: Path) -> str | None:
     return "docker-sandbox" if profile.sandbox is not None else None
 
 
+def sandbox_merge_words(
+    config: Any, repo: str, repo_root: Path | str
+) -> dict[str, Any] | None:
+    """What to say after a merge that landed in a sandbox's own clone (rule 79).
+
+    A repository whose factory lives in its sandbox is merged in there, on the
+    factory's own copy of the repository — so the operator's checkout does not
+    have the merge until he fetches it. This composes, once, the plain sentence
+    that says that and the exact command that brings it over, from the two
+    facts the settings already carry: the sandbox's name
+    (``planning.sandboxes[repo].name``, which is also the name of the git
+    remote ``sbx`` leaves on the host) and the checkout's path
+    (``planning.target_repo_paths[repo]``, which is the ``repo_root`` every
+    caller of the executor passes).
+
+    Returns ``None`` for a repository with no sandbox — which is every
+    repository until an operator gives one a sandbox — so nothing about that
+    repository's words or receipts changes by a byte. Never raises: this only
+    decides what a report says, and a settings object of an unexpected shape
+    must not be the thing that fails a merge.
+    """
+    try:
+        from forge.config.sandboxes import sandbox_for
+
+        entry = sandbox_for(config, repo)
+    except Exception:  # noqa: BLE001 — words on a report, never a failure
+        return None
+    if entry is None:
+        return None
+    name = getattr(entry, "name", None)
+    if name is None and isinstance(entry, dict):
+        name = entry.get("name")
+    name = str(name or "").strip()
+    if not name:
+        return None
+    checkout = str(repo_root)
+    remote = f"sandbox-{name}"
+    command = (
+        f"git -C {checkout} fetch {remote} main && "
+        f"git -C {checkout} merge --ff-only {remote}/main"
+    )
+    sentence = (
+        "This merge landed in the factory's own copy of the repository, inside "
+        f"the sandbox {name} — not in your checkout at {checkout}. To bring it "
+        f"to your checkout, run: {command}"
+    )
+    return {
+        "sandbox": name,
+        "remote": remote,
+        "checkout": checkout,
+        "fetch_command": command,
+        "sentence": sentence,
+    }
+
+
 def _mint_repair_row(
     pool: Any,
     build_id: str,
@@ -480,30 +575,44 @@ def _mint_repair_row(
         )
 
 
-async def _git_exit_code(repo_root: Path, *args: str) -> int | None:
-    """Run one git command in ``repo_root`` and return its exit code.
+def git_venue(git: Any, repo_root: Path | str) -> str:
+    """Where this press's git happened, as a phrase a sentence can carry.
 
-    ``None`` when git could not be run at all. The same guardkit-free path the
-    offer uses to read main's sha: plain git, no shell, nothing written.
+    ``in /home/rich/Projects/.../api_test`` when it happened in this
+    container, ``in the sandbox that holds appmilla/api_test`` when it
+    happened where the repository lives.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            *args,
-            cwd=str(repo_root),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.communicate()
-    except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
-        logger.warning(
-            "merge-executor: git %s could not be run in %s (%s)",
-            " ".join(args),
-            repo_root,
-            exc,
-        )
-        return None
-    return proc.returncode
+    return str(getattr(git, "venue", "") or f"in {repo_root}")
+
+
+def git_surface_for(
+    deps: Any, repo: str, repo_root: Path | str
+) -> CandidateGit:
+    """The venue this repository's git happens in (sandbox first, rule 89).
+
+    ``deps.git_surface`` is a factory the composition sets when SOME
+    repository has a sandbox; it answers the sandbox's surface for a
+    repository that has one and ``None`` for a repository that has not. With
+    no factory at all — the default, and every estate whose
+    ``planning.sandboxes`` is empty — the venue is this container, running
+    the very functions the press has always run.
+    """
+    factory = getattr(deps, "git_surface", None)
+    if factory is not None:
+        try:
+            surface = factory(repo, Path(repo_root))
+        except Exception as exc:  # noqa: BLE001 — never let composition stop a press
+            logger.error(
+                "merge-executor: choosing where %s's git runs raised (%s: %s) — "
+                "falling back to this container",
+                repo,
+                type(exc).__name__,
+                exc,
+            )
+            surface = None
+        if surface is not None:
+            return surface
+    return InContainerCandidateGit(repo_root)
 
 
 async def merged_after_all_sha(
@@ -511,6 +620,8 @@ async def merged_after_all_sha(
     feature_id: str,
     expect_main_sha: str,
     branch: str | None = None,
+    *,
+    git: CandidateGit | None = None,
 ) -> str | None:
     """Did the merge land even though the command gave no answer?
 
@@ -527,49 +638,55 @@ async def merged_after_all_sha(
     landed: return main's new commit. Anything else — main unmoved, main moved
     for some other reason, git not answering — returns ``None`` and the merge
     is reported as refused, which is then the truth.
+
+    ``git`` is the venue (rule 89). Without one the questions are asked here,
+    against ``repo_root``, exactly as before; with one they are asked wherever
+    that repository's git lives.
     """
-    new_main = await git_rev_parse_main(repo_root)
+    if git is None:
+        new_main = await git_rev_parse_main(repo_root)
+    else:
+        new_main = await git.rev_parse("main")
     pinned = (expect_main_sha or "").strip().lower()
     if not new_main or new_main.strip().lower() == pinned:
         return None
     branch = branch_to_merge(feature_id, branch)
-    contains = await _git_exit_code(
-        repo_root, "merge-base", "--is-ancestor", branch, new_main
-    )
-    if contains != 0:
+    venue = git if git is not None else InContainerCandidateGit(repo_root)
+    contains = await venue.is_ancestor(branch, new_main)
+    if contains is not True:
         return None
     return new_main
 
 
 async def pinned_main_in_branch(
-    repo_root: Path, expect_main_sha: str, candidate_sha: str
+    repo_root: Path,
+    expect_main_sha: str,
+    candidate_sha: str,
+    *,
+    git: CandidateGit | None = None,
 ) -> bool | None:
     """Is the pinned main commit an ancestor of the branch tip?
 
-    ``git merge-base --is-ancestor <pin> <tip>`` answers exit 0 (yes), exit 1
-    (no), or something else (git could not say: a pin it does not know, or git
-    not running at all). Only a plain "no" is returned as ``False`` — that is
-    the case where the merge command would land a merge commit carrying work
-    the candidate never saw. ``None`` leaves the decision to the merge
+    The venue answers yes, no, or "could not say" (a pin it does not know, or
+    git not running at all). Only a plain "no" is returned as ``False`` — that
+    is the case where the merge command would land a merge commit carrying
+    work the candidate never saw. ``None`` leaves the decision to the merge
     command's own pin check, which refuses a main that is not at the pin.
     """
     pin = (expect_main_sha or "").strip()
     tip = (candidate_sha or "").strip()
     if not pin or not tip:
         return None
-    code = await _git_exit_code(repo_root, "merge-base", "--is-ancestor", pin, tip)
-    if code == 0:
-        return True
-    if code == 1:
-        return False
-    logger.warning(
-        "merge-executor: git could not say whether main's pinned commit %s is in "
-        "the branch at %s (exit %s) — the merge command's own pin check decides",
-        pin[:10],
-        tip[:10],
-        code,
-    )
-    return None
+    venue = git if git is not None else InContainerCandidateGit(repo_root)
+    answer = await venue.is_ancestor(pin, tip)
+    if answer is None:
+        logger.warning(
+            "merge-executor: git could not say whether main's pinned commit %s "
+            "is in the branch at %s — the merge command's own pin check decides",
+            pin[:10],
+            tip[:10],
+        )
+    return answer
 
 
 def moved_main_refusal_sentence(feature_id: str, expect_main_sha: str) -> str:
@@ -702,6 +819,15 @@ async def execute_merge_deploy(
     task_id = _deploy_task_id(feature_id)
     tree_path: Path | None = None
     candidate_standing = False
+    # WHERE this repository's git happens (sandbox first, rule 89): inside its
+    # sandbox when it has one, in this container when it has not. Chosen once,
+    # used by every git operation the press makes, so they cannot disagree.
+    git = git_surface_for(deps, repo, repo_root)
+    # WHAT TO SAY AFTERWARDS when the merge lands in a sandbox's own clone
+    # (sandbox first, rule 79): the sentence and the exact fetch command, made
+    # once from the settings, said on a green press and written on the merge's
+    # own receipt. ``None`` for a repository without a sandbox.
+    sandbox_words = sandbox_merge_words(deps.config, repo, repo_root)
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -871,6 +997,15 @@ async def execute_merge_deploy(
                 if outcome.gate_before_merge is not None
                 else {}
             ),
+            # Additive (sandbox first, rule 79): where this merge landed and
+            # the exact command that brings it to the operator's checkout —
+            # only for a repository that has a sandbox, so every other
+            # report is byte for byte what it was.
+            **(
+                {"sandbox_merge": outcome.sandbox_merge}
+                if outcome.sandbox_merge
+                else {}
+            ),
         )
         if dry_run:
             logger.info(
@@ -974,7 +1109,7 @@ async def execute_merge_deploy(
             await _tear_down_candidate()
         removed: bool | None = None
         if tree_path is not None:
-            removed = await remove_candidate_tree(tree_path)
+            removed = await git.remove_candidate_tree(feature_id, str(tree_path))
             if removed:
                 logger.info(
                     "merge-executor: removed the candidate tree for %s at %s",
@@ -1050,23 +1185,36 @@ async def execute_merge_deploy(
                 ),
             )
 
+        # A press replayed on a build that already merged answers the
+        # double-merge refusal above and nothing else — that guard comes
+        # FIRST so the answer to "did this already happen?" never changes
+        # because of anything this lane added (L3b's coach, 2026-09-08).
+
         # ------------------------------------------------------------------
         # STEP candidate: the branch is checked in the sandbox BEFORE the merge
         # ------------------------------------------------------------------
         gate_began = True
-        candidate_sha = await git_rev_parse(repo_root, branch)
+        candidate_sha = await git.rev_parse(branch)
         if not candidate_sha:
             return _could_not_check(
-                f"the branch {branch} was not found in {repo_root}"
+                f"the branch {branch} was not found {git_venue(git, repo_root)}"
             )
         gate["candidate_sha"] = candidate_sha
-        gate["candidate_tree"] = await git_rev_parse(repo_root, f"{candidate_sha}^{{tree}}")
+        gate["candidate_tree"] = await git.rev_parse(f"{candidate_sha}^{{tree}}")
         excluded_now: bool | None = None
         try:
-            excluded_now = await ensure_candidate_trees_excluded(repo_root)
-            tree_path = await materialise_candidate_tree(
-                repo_root, feature_id, candidate_sha
+            excluded_now = await git.ensure_candidate_trees_excluded()
+            laid_out = await git.materialise_candidate_tree(
+                feature_id, candidate_sha
             )
+            tree_path = Path(laid_out.path)
+            # A venue that keeps the trees excluded as part of laying one out
+            # says so in its answer rather than in a call of its own, and one
+            # that reads the tree id while it is there saves the second ask.
+            if excluded_now is None:
+                excluded_now = laid_out.exclude_written
+            if not gate["candidate_tree"]:
+                gate["candidate_tree"] = laid_out.tree
         except CandidateTreeError as exc:
             _write_receipt(
                 "merge_deploy_candidate.json",
@@ -1165,7 +1313,7 @@ async def execute_merge_deploy(
         # it. A "no" merges nothing: the candidate comes down on the way out.
         # ------------------------------------------------------------------
         main_in_branch = await pinned_main_in_branch(
-            repo_root, expect_main_sha, candidate_sha
+            repo_root, expect_main_sha, candidate_sha, git=git
         )
         if main_in_branch is False:
             sentence = moved_main_refusal_sentence(feature_id, expect_main_sha)
@@ -1341,23 +1489,28 @@ async def execute_merge_deploy(
             landed_sha: str | None = None
             if refusal and report is None and result_status != "success":
                 landed_sha = await merged_after_all_sha(
-                    repo_root, feature_id, expect_main_sha, branch=branch
+                    repo_root, feature_id, expect_main_sha, branch=branch, git=git
                 )
 
-            _write_receipt(
-                "merge_deploy_merge.json",
-                {
-                    "step": "merge",
-                    "status": result_status,
-                    "exit_code": getattr(result, "exit_code", None),
-                    "branch": branch,
-                    "refusal": refusal,
-                    "report": report,
-                    "landed_sha": landed_sha,
-                    "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
-                    "baseline_file": str(baseline_path) if baseline_path else None,
-                },
-            )
+            merge_receipt: dict[str, Any] = {
+                "step": "merge",
+                "status": result_status,
+                "exit_code": getattr(result, "exit_code", None),
+                "branch": branch,
+                "refusal": refusal,
+                "report": report,
+                "landed_sha": landed_sha,
+                "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
+                "baseline_file": str(baseline_path) if baseline_path else None,
+            }
+            # SANDBOX FIRST, rule 79: a merge that landed in a sandbox landed
+            # in the factory's own clone, and the receipt says so — with the
+            # command that brings it to the operator's checkout — beside the
+            # merge it is the receipt for. Nothing is added for a repository
+            # without a sandbox, or for a merge that did not land.
+            if sandbox_words is not None and (refusal is None or landed_sha):
+                merge_receipt["landed_in_the_sandbox"] = sandbox_words
+            _write_receipt("merge_deploy_merge.json", merge_receipt)
             if refusal and landed_sha:
                 return MergeDeployOutcome(
                     result="merged-verify-failed",
@@ -1455,9 +1608,7 @@ async def execute_merge_deploy(
             # STEP tree check: what landed must be what was checked (rule 37)
             # --------------------------------------------------------------
             merged_tree = (
-                await git_rev_parse(repo_root, f"{merged_sha}^{{tree}}")
-                if merged_sha
-                else None
+                await git.rev_parse(f"{merged_sha}^{{tree}}") if merged_sha else None
             )
             gate["merged_tree"] = merged_tree
             gate["trees_match"] = bool(
@@ -1608,18 +1759,27 @@ async def execute_merge_deploy(
                 and isinstance(gate.get("checks_total"), int)
                 else "checked in the sandbox, "
             )
+            detail = (
+                f"{named} {sandbox_checks}merged and running{checks}. "
+                "Rollback is one command; the branch is kept."
+            )
+            # SANDBOX FIRST, rule 79: this repository's merge landed in the
+            # factory's own clone inside its sandbox, so the words say that
+            # and give the one command that brings it to the checkout. A
+            # repository without a sandbox adds nothing: same sentence, and no
+            # such field on the report.
+            if sandbox_words is not None:
+                detail = f"{detail} {sandbox_words['sentence']}"
             return MergeDeployOutcome(
                 result="merged-and-running",
                 status="PASSED",
                 merged_sha=merged_sha,
                 verdict=str(verdict) if verdict is not None else None,
-                detail=(
-                    f"{named} {sandbox_checks}merged and running{checks}. "
-                    "Rollback is one command; the branch is kept."
-                ),
+                detail=detail,
                 checks_passed=checks_passed,
                 checks_total=checks_total,
                 deployed_in=deployed_in,
+                sandbox_merge=sandbox_words,
             )
         if d_outcome == "reverted":
             return MergeDeployOutcome(
@@ -1710,8 +1870,12 @@ def build_in_daemon_deploy_dispatcher(
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
         from forge.adapters.sqlite.connect import connect_writer
+        from forge.config.sandboxes import sandbox_for
         from forge.deploy.composition import dispatch_deploy_stage
-        from forge.deploy.live_gate import RepoDriverLiveGateInvoker
+        from forge.deploy.live_gate import (
+            RepoDriverLiveGateInvoker,
+            SidecarLiveGateInvoker,
+        )
         from forge.deploy.profile import load_deploy_profile
         from forge.persistence.migrations import runbook as runbook_migration
         from forge.persistence.repositories.runbook import RunbookRepository
@@ -1723,9 +1887,26 @@ def build_in_daemon_deploy_dispatcher(
             )
         repo_root = Path(repo_root)
         profile = load_deploy_profile(repo_root / "deploy" / "profile.yaml")
+        # SANDBOX FIRST (2026-09-07, rule 85). A repository that has a sandbox
+        # is deployed and gated INSIDE it: the stage's scripts go to the deploy
+        # sidecar in there, and the live gate's driver goes with them, because
+        # the candidate's port is on that sandbox's own loopback and a driver
+        # run in the forge container could reach nothing. A repository with no
+        # sandbox — every repository until an operator fills the map in — takes
+        # exactly the path it took before this lane.
+        sandbox = sandbox_for(config, repo)
         spec = profile.live_gate
         invoker = None
-        if spec is not None:
+        if spec is not None and sandbox is not None:
+            invoker = SidecarLiveGateInvoker(
+                base_url=str(sandbox.sidecar_url),
+                repo=repo,
+                repo_path=repo_root,
+                driver_argv=list(spec.driver),
+                timeout_seconds=spec.timeout_seconds,
+                extra_env=dict(spec.env),
+            )
+        elif spec is not None:
             invoker = RepoDriverLiveGateInvoker(
                 repo_path=repo_root,
                 driver_argv=list(spec.driver),
@@ -1755,6 +1936,7 @@ def build_in_daemon_deploy_dispatcher(
             dry_run=dry_run,
             target_repo=repo,
             target_repo_root=str(repo_root),
+            sandbox=sandbox,
             feature=feature_id,
             feat_id=feature_id,
             # Distinct per run AND TASK-shaped — DeployQueuedPayload validates

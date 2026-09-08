@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from forge.adapters.sqlite.connect import connect_writer
 from forge.cli._serve_async_task_starter import build_async_task_starter
@@ -200,10 +200,140 @@ class LifecycleBridgeWireupParts:
     terminal_class_recorder: "TerminalClassRecorder | None" = None
 
 
+def build_feature_runner_url_resolver(
+    *,
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: Any,
+    default_url: str,
+) -> "Callable[[str], str] | None":
+    """Answer "which build runner holds this feature's build?", or ``None``.
+
+    SANDBOX FIRST (2026-09-07, rule 78). A build for a repository that has a
+    sandbox is dispatched to the build runner INSIDE that sandbox. Everything
+    that then WATCHES that build — the event stream it joins, the run id it
+    resolves, the final state it reads back — has to ask the same runner, or
+    forge-prod waits for ever on a run the host runner has never heard of and
+    the build sits in its stage while the queue counts it as in flight (the
+    shape of the 2026-09-05 stuck-count defect).
+
+    The watcher knows the feature, not the repository, so the repository is
+    read from the build the ledger already recorded for that feature
+    (``builds.repo``, written when the build was queued, well before anything
+    is watched). The answer is remembered per feature, because a feature's
+    repository does not change; a feature with no build row yet, or a
+    repository with no sandbox, or a ledger that cannot be read, all give the
+    global runner, which is what every build used before this lane.
+
+    Returns ``None`` — meaning "do not route at all" — when no repository has
+    a sandbox, so that estate composes byte for byte what it composed before.
+    """
+    from forge.config.sandboxes import sandboxes_of
+
+    by_repo: dict[str, str] = {}
+    for repo, entry in sandboxes_of(forge_config).items():
+        runner_url = str(getattr(entry, "runner_url", "") or "").strip()
+        if runner_url:
+            by_repo[str(repo)] = runner_url
+    if not by_repo:
+        return None
+
+    remembered: dict[str, str] = {}
+
+    def _resolve(feature_id: str) -> str:
+        key = str(feature_id or "").strip()
+        if not key:
+            return default_url
+        known = remembered.get(key)
+        if known is not None:
+            return known
+        try:
+            row = sqlite_pool.connection.execute(
+                "SELECT repo FROM builds WHERE feature_id = ? "
+                "ORDER BY queued_at DESC, rowid DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "lifecycle watcher: could not read which repository %s belongs "
+                "to (%s); watching the global build runner",
+                key,
+                exc,
+            )
+            return default_url
+        if row is None:
+            # The build row is written before the dispatch, so this is a
+            # feature nothing has queued yet: nothing to remember, and the
+            # global runner is the honest answer for now.
+            return default_url
+        repo = row[0] if not hasattr(row, "keys") else row["repo"]
+        url = by_repo.get(str(repo or ""), default_url)
+        remembered[key] = url
+        if url != default_url:
+            logger.info(
+                "lifecycle watcher: %s belongs to %s, which has a sandbox, so "
+                "its build is watched on the build runner inside it at %s",
+                key,
+                repo,
+                url,
+            )
+        return url
+
+    return _resolve
+
+
+def _stream_source_router(
+    *,
+    default_url: str,
+    runner_url_for_feature: "Callable[[str], str]",
+) -> StreamSource:
+    """A :class:`StreamSource` that joins the stream on the right runner."""
+    made: dict[str, StreamSource] = {
+        default_url: langgraph_stream_source(runner_url=default_url)
+    }
+
+    def _source(
+        *, feature_id: str, thread_id: str | None, run_id: str | None
+    ) -> Any:
+        url = runner_url_for_feature(feature_id)
+        source = made.get(url)
+        if source is None:
+            source = langgraph_stream_source(runner_url=url)
+            made[url] = source
+        return source(feature_id=feature_id, thread_id=thread_id, run_id=run_id)
+
+    return _source
+
+
+def _run_state_fetcher_router(
+    *,
+    default_url: str,
+    runner_url_for_feature: "Callable[[str], str]",
+) -> RunStateFetcher:
+    """A :class:`RunStateFetcher` that asks the runner that ran the build."""
+    made: dict[str, RunStateFetcher] = {
+        default_url: langgraph_run_state_fetcher(runner_url=default_url)
+    }
+
+    async def _fetch(
+        *, feature_id: str, thread_id: str | None, run_id: str | None
+    ) -> Any:
+        url = runner_url_for_feature(feature_id)
+        fetcher = made.get(url)
+        if fetcher is None:
+            fetcher = langgraph_run_state_fetcher(runner_url=url)
+            made[url] = fetcher
+        return await fetcher(
+            feature_id=feature_id, thread_id=thread_id, run_id=run_id
+        )
+
+    return _fetch
+
+
 def _build_async_tasks_identity_provider(
     *,
     sqlite_pool: SqliteLifecyclePersistence,
     autobuild_runner_url: str,
+    runner_url_for_feature: "Callable[[str], str] | None" = None,
 ) -> "IdentityProvider":
     """Return an :data:`IdentityProvider` resolving ``(thread_id, run_id)``.
 
@@ -249,6 +379,13 @@ def _build_async_tasks_identity_provider(
         autobuild_runner_url: URL of the langgraph-runner sidecar.
             Validated by :class:`ServeConfig`'s fail-fast guard so it
             is non-empty here.
+        runner_url_for_feature: SANDBOX FIRST (rule 78). A build that was
+            dispatched to the build runner inside a repository's sandbox has
+            its thread and its run there, not on the host runner, so its run
+            id must be asked for at that address. This answers "which runner
+            holds this feature's build?"; ``None`` (the default, and the whole
+            estate until a repository is given a sandbox) means the one
+            global runner answers for every build, exactly as before.
 
     Returns:
         An ``async (feature_id) -> tuple[str, str] | None`` callable
@@ -290,7 +427,10 @@ def _build_async_tasks_identity_provider(
         try:
             from langgraph_sdk import get_client
 
-            client = get_client(url=autobuild_runner_url)
+            runner_url = autobuild_runner_url
+            if runner_url_for_feature is not None:
+                runner_url = runner_url_for_feature(feature_id)
+            client = get_client(url=runner_url)
             runs = await client.runs.list(thread_id, limit=1)
             if not runs:
                 return None
@@ -360,6 +500,7 @@ def _build_lifecycle_bridge_wireup_parts(
     *,
     sqlite_pool: SqliteLifecyclePersistence,
     autobuild_runner_url: str,
+    forge_config: Any = None,
 ) -> LifecycleBridgeWireupParts:
     """Construct the SQLite-bound dependencies for :class:`LifecycleBridgeWireup`.
 
@@ -381,22 +522,44 @@ def _build_lifecycle_bridge_wireup_parts(
        connection (the migration that creates its table is invoked at
        Step 3.5 of :func:`bind_production_serve`).
 
+    SANDBOX FIRST (rule 78): steps 4, 5 and the fetcher below all speak to a
+    build runner, and a build for a repository with a sandbox runs on the
+    runner inside it. So all three are asked per feature which runner to
+    speak to. With ``planning.sandboxes`` empty — the default, and the whole
+    estate until an operator fills it in — the resolver is ``None`` and each
+    of the three is exactly the object it was before this lane.
+
     Args:
         sqlite_pool: Shared :class:`SqliteLifecyclePersistence`.
         autobuild_runner_url: Validated sidecar URL.
+        forge_config: The configuration, read only for
+            ``planning.sandboxes``. ``None`` means no routing.
 
     Returns:
         A frozen :class:`LifecycleBridgeWireupParts`.
     """
     connection = sqlite_pool.connection
 
+    runner_url_for_feature = build_feature_runner_url_resolver(
+        sqlite_pool=sqlite_pool,
+        forge_config=forge_config,
+        default_url=autobuild_runner_url,
+    )
+
     registry = BridgeRegistry(connection=connection)
     bridge = LifecycleBridge(registry=registry)
     translator = StreamEventTranslator()
-    stream_source = langgraph_stream_source(runner_url=autobuild_runner_url)
+    if runner_url_for_feature is None:
+        stream_source = langgraph_stream_source(runner_url=autobuild_runner_url)
+    else:
+        stream_source = _stream_source_router(
+            default_url=autobuild_runner_url,
+            runner_url_for_feature=runner_url_for_feature,
+        )
     identity_provider = _build_async_tasks_identity_provider(
         sqlite_pool=sqlite_pool,
         autobuild_runner_url=autobuild_runner_url,
+        runner_url_for_feature=runner_url_for_feature,
     )
     # TASK-REV-PEBR-005 (FOLLOWUP-C-RACE) — fetch-on-empty fallback for
     # the join_stream race against fast-completing runs. The fetcher is
@@ -406,7 +569,15 @@ def _build_lifecycle_bridge_wireup_parts(
     # envelope shape lands without subscribe-before-dispatch
     # restructuring (which would require modifying deepagents'
     # AsyncSubAgentMiddleware — out of forge's modify-able surface).
-    run_state_fetcher = langgraph_run_state_fetcher(runner_url=autobuild_runner_url)
+    if runner_url_for_feature is None:
+        run_state_fetcher = langgraph_run_state_fetcher(
+            runner_url=autobuild_runner_url
+        )
+    else:
+        run_state_fetcher = _run_state_fetcher_router(
+            default_url=autobuild_runner_url,
+            runner_url_for_feature=runner_url_for_feature,
+        )
     terminal_publish_ledger = TerminalPublishLedger(connection=connection)
     # Builds-row write-back for published lifecycle envelopes — without
     # it the row stays QUEUED past terminal and exists_active_build
@@ -690,6 +861,114 @@ def _interrupt_and_reset_to_preparing(
         sqlite_pool.apply_transition(hop)
 
 
+class _RepoRoutedAsyncTaskStarter:
+    """Dispatch each build to the runner that lives with its repository.
+
+    SANDBOX FIRST (2026-09-07, rule 78). A build installs and runs a
+    repository's own code, so for a repository that has a sandbox it is
+    dispatched to the build runner INSIDE that sandbox, whose worktrees, venvs
+    and test runs exist only there. Every other repository is dispatched to
+    the one global runner exactly as before.
+
+    The choice is per dispatch, not per boot, because one daemon serves every
+    repository and only some of them have a sandbox. The repository rides on
+    the dispatch itself (``context["repo"]``, which
+    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`
+    puts there); a dispatch that names no repository, or names one with no
+    sandbox, goes to the global runner.
+
+    This class is only ever built when ``planning.sandboxes`` names at least
+    one repository — with the mapping empty the composition hands the
+    dispatcher the same single starter it always did, so nothing routes at all.
+    """
+
+    __slots__ = ("_default", "_by_repo")
+
+    def __init__(
+        self, *, default: AsyncTaskStarter, by_repo: dict[str, AsyncTaskStarter]
+    ) -> None:
+        self._default = default
+        self._by_repo = dict(by_repo)
+
+    def _starter_for(self, context: "Mapping[str, Any]") -> AsyncTaskStarter:
+        try:
+            repo = str(context.get("repo") or "").strip()
+        except AttributeError:  # pragma: no cover — a mapping is what is sent
+            return self._default
+        starter = self._by_repo.get(repo)
+        if starter is None:
+            return self._default
+        logger.info(
+            "autobuild dispatch: %s has a sandbox, so this build runs on the "
+            "build runner inside it — the repository's own code is never "
+            "installed or run on the host",
+            repo,
+        )
+        return starter
+
+    def start_async_task(
+        self, subagent_name: str, context: "Mapping[str, Any]"
+    ) -> str:
+        return self._starter_for(context).start_async_task(subagent_name, context)
+
+    async def astart_async_task(
+        self, subagent_name: str, context: "Mapping[str, Any]"
+    ) -> str:
+        starter = self._starter_for(context)
+        return await starter.astart_async_task(subagent_name, context)
+
+
+def build_repo_routed_async_task_starter(
+    *,
+    serve_module: Any,
+    forge_config: Any,
+    default_starter: AsyncTaskStarter,
+) -> AsyncTaskStarter:
+    """Return the starter the dispatch chain uses — routed only if it must be.
+
+    With ``planning.sandboxes`` empty (the default, and the estate's state
+    until an operator fills it in) this returns ``default_starter`` itself, so
+    the composition is byte for byte what it was before this lane. Otherwise
+    it builds one more middleware per sandboxed repository, each registered
+    against that sandbox's own runner address, and wraps them all in
+    :class:`_RepoRoutedAsyncTaskStarter`.
+    """
+    from forge.config.sandboxes import sandboxes_of
+
+    sandboxes = sandboxes_of(forge_config)
+    if not sandboxes:
+        return default_starter
+    by_repo: dict[str, AsyncTaskStarter] = {}
+    for repo, entry in sandboxes.items():
+        runner_url = str(getattr(entry, "runner_url", "") or "").strip()
+        if not runner_url:
+            logger.warning(
+                "autobuild dispatch: %s has a sandbox (%s) but no runner "
+                "address, so its builds go to the global build runner — the "
+                "repository's code would run on the host. Set runner_url in "
+                "planning.sandboxes",
+                repo,
+                getattr(entry, "name", "?"),
+            )
+            continue
+        middleware = serve_module._build_async_subagent_middleware(
+            autobuild_runner_url=runner_url,
+        )
+        by_repo[str(repo)] = _resolve_async_task_starter(middleware)
+        logger.info(
+            "autobuild dispatch: %s has a sandbox (%s), so its builds are "
+            "dispatched to the build runner inside it at %s",
+            repo,
+            getattr(entry, "name", "?"),
+            runner_url,
+        )
+    if not by_repo:
+        return default_starter
+    return _RepoRoutedAsyncTaskStarter(
+        default=default_starter, by_repo=by_repo
+    )
+
+
 def _resolve_async_task_starter(middleware: Any) -> AsyncTaskStarter:
     """Return an :class:`AsyncTaskStarter` adapter over ``middleware.tools``.
 
@@ -886,15 +1165,29 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # surface (per TASK-FW10-008 contract).
     async_task_starter = _resolve_async_task_starter(middleware)
 
+    # Step 6.1 (sandbox first, rule 78) — a repository that has a sandbox has
+    # its builds dispatched to the build runner inside it, so its own code is
+    # installed and run there and never on the host. With planning.sandboxes
+    # empty this is the same object Step 6 just made.
+    async_task_starter = build_repo_routed_async_task_starter(
+        serve_module=serve_module,
+        forge_config=forge_config,
+        default_starter=async_task_starter,
+    )
+
     # Step 6.5 (TASK-FORGE-FRR-PEBR-WIREUP) — construct the
     # SQLite-bound dependencies for the lifecycle-bridge wireup. The
     # wireup itself is finalised inside the closure returned by
     # ``bind_production_dispatch_chain`` (where the publisher is in
     # scope); this step builds the parts that depend on the SQLite
     # pool / runner_url so they can be threaded through.
+    # Step 6.5 also routes the WATCHING of a dispatched build (sandbox first,
+    # rule 78): a build that step 6.1 sent to the runner inside a sandbox has
+    # its stream, its run id and its final state there too.
     bridge_wireup_parts = _build_lifecycle_bridge_wireup_parts(
         sqlite_pool=sqlite_pool,
         autobuild_runner_url=config.autobuild_runner_url,
+        forge_config=forge_config,
     )
 
     # Step 7 — build the production composer and rebind the seam.

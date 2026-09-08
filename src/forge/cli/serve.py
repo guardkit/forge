@@ -55,6 +55,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import click
@@ -260,7 +261,7 @@ open_fleet_client: FleetClientOpenerFn = _default_open_fleet_client
 
 
 def compose_merge_guardkit_run(forge_config: Any) -> Any:
-    """Choose where the merge word's post-merge checks run, and say so.
+    """Choose where the merge word's command runs, per repository, and say so.
 
     The checks used to run inside the forge container, which has no host
     virtual environment — so a repository's own test command exited 127 and the
@@ -269,33 +270,168 @@ def compose_merge_guardkit_run(forge_config: Any) -> Any:
     beside the builds' own tests; when it has none, they run in the container
     exactly as before.
 
+    SANDBOX FIRST (2026-09-07, rule 85). A repository that has a sandbox is
+    merged INSIDE it, on the factory's own clone, through the deploy sidecar
+    running in that sandbox — not through the host one. One daemon serves
+    every repository and only some have a sandbox, so the address is chosen
+    per merge from the repository the merge is for, not once at boot. With
+    ``planning.sandboxes`` empty — the default, and the estate's state until
+    an operator fills it in — this returns exactly what it always returned,
+    one runner bound to the global address.
+
     Returns the callable the merge executor uses as its ``guardkit_run``, and
-    logs one line naming which of the two was chosen.
+    logs one line naming which of the choices was made.
     """
+    from forge.config.sandboxes import has_sandboxes, sandbox_for
+
     deploy_settings = getattr(forge_config, "deploy", None)
     sidecar_url = str(getattr(deploy_settings, "sidecar_url", "") or "").strip()
-    if not sidecar_url:
+
+    def _repo_paths() -> dict[str, str]:
+        # Read only when a sidecar is actually in play, as before: settings
+        # with no planning section at all still compose the container runner.
+        return dict(forge_config.planning.target_repo_paths)
+
+    def _in_container() -> Any:
         from forge.adapters.guardkit.run import run as in_container_run
 
-        logger.info(
-            "forge-serve: the merge word runs its checks inside the forge "
-            "container (no deploy sidecar configured)"
-        )
         return in_container_run
 
-    from forge.adapters.guardkit.run_via_sidecar import (
-        build_sidecar_guardkit_run,
+    def _via_sidecar(base_url: str) -> Any:
+        from forge.adapters.guardkit.run_via_sidecar import (
+            build_sidecar_guardkit_run,
+        )
+
+        return build_sidecar_guardkit_run(
+            base_url=base_url, repo_paths=_repo_paths()
+        )
+
+    if not has_sandboxes(forge_config):
+        if not sidecar_url:
+            logger.info(
+                "forge-serve: the merge word runs its checks inside the forge "
+                "container (no deploy sidecar configured)"
+            )
+            return _in_container()
+        logger.info(
+            "forge-serve: the merge word runs its checks on the host through "
+            "the deploy sidecar at %s",
+            sidecar_url,
+        )
+        return _via_sidecar(sidecar_url)
+
+    from forge.adapters.guardkit.run_via_sidecar import _resolve_repo_key
+
+    repo_paths = _repo_paths()
+    default_run = _via_sidecar(sidecar_url) if sidecar_url else _in_container()
+    logger.info(
+        "forge-serve: the merge word chooses its address per repository — a "
+        "repository with a sandbox is merged inside it, every other one %s",
+        (
+            f"through the deploy sidecar at {sidecar_url}"
+            if sidecar_url
+            else "inside the forge container"
+        ),
     )
+    per_repo: dict[str, Any] = {}
+
+    async def run_merge_where_the_repository_lives(
+        *, repo_path: Path, **kwargs: Any
+    ) -> Any:
+        repo_key = _resolve_repo_key(Path(repo_path), repo_paths)
+        entry = sandbox_for(forge_config, repo_key) if repo_key else None
+        if entry is None:
+            return await default_run(repo_path=repo_path, **kwargs)
+        if repo_key not in per_repo:
+            per_repo[repo_key] = _via_sidecar(str(entry.sidecar_url))
+            logger.info(
+                "forge-serve: %s has a sandbox (%s), so the merge word's "
+                "command runs inside it, through the sidecar at %s",
+                repo_key,
+                getattr(entry, "name", "?"),
+                entry.sidecar_url,
+            )
+        return await per_repo[repo_key](repo_path=repo_path, **kwargs)
+
+    return run_merge_where_the_repository_lives
+
+
+def compose_merge_git_surface(forge_config: Any) -> Any | None:
+    """Choose WHERE each repository's merge git happens (sandbox first, rule 89).
+
+    Returns ``(repo, repo_root) -> CandidateGit | None`` — the sandbox's git
+    surface for a repository named in ``planning.sandboxes``, ``None`` for a
+    repository that has none (its press keeps running the git functions it
+    always ran, in the forge container).
+
+    With the map empty — the default, and the estate's state until an operator
+    fills it in — this returns ``None`` itself, so nothing is composed and no
+    press asks a routing question at all.
+    """
+    from forge.config.sandboxes import has_sandboxes, sandbox_for
+
+    if not has_sandboxes(forge_config):
+        return None
+
+    from forge.deploy.sidecar_git import SidecarCandidateGit
+
+    per_repo: dict[str, Any] = {}
+
+    def surface_for(repo: str, repo_root: Path) -> Any | None:
+        entry = sandbox_for(forge_config, repo)
+        if entry is None:
+            return None
+        if repo not in per_repo:
+            per_repo[repo] = SidecarCandidateGit(
+                str(entry.sidecar_url), repo=str(repo)
+            )
+            logger.info(
+                "forge-serve: %s has a sandbox (%s), so the merge word's own "
+                "git — the branch, the ancestry checks, the candidate's tree "
+                "and the tree comparison — runs inside it, through the "
+                "sidecar at %s",
+                repo,
+                getattr(entry, "name", "?"),
+                entry.sidecar_url,
+            )
+        return per_repo[repo]
 
     logger.info(
-        "forge-serve: the merge word runs its checks on the host through the "
-        "deploy sidecar at %s",
-        sidecar_url,
+        "forge-serve: the merge word's own git chooses its venue per "
+        "repository — a repository with a sandbox is read and written inside "
+        "it, every other one in the forge container as before"
     )
-    return build_sidecar_guardkit_run(
-        base_url=sidecar_url,
-        repo_paths=dict(forge_config.planning.target_repo_paths),
-    )
+    return surface_for
+
+
+def compose_merge_offer_git_head(forge_config: Any) -> Any | None:
+    """Read main's commit where the repository lives, for the merge card's pin.
+
+    The card pins the commit the merge will be held to, and for a repository
+    whose factory lives in its sandbox main is the clone's main, in there. A
+    pin read on this side would be a commit the merge inside the sandbox has
+    never heard of, and every press would refuse. Returns ``None`` when no
+    repository has a sandbox, so the offer keeps its own default
+    (:func:`forge.pipeline.merge_offer.git_rev_parse_main`) byte for byte.
+    """
+    surface_for = compose_merge_git_surface(forge_config)
+    if surface_for is None:
+        return None
+
+    from forge.pipeline.merge_offer import git_rev_parse_main
+
+    paths = dict(forge_config.planning.target_repo_paths)
+
+    async def read_main(repo_root: Path) -> str | None:
+        from forge.adapters.guardkit.run_via_sidecar import _resolve_repo_key
+
+        repo_key = _resolve_repo_key(Path(repo_root), paths)
+        surface = surface_for(repo_key, Path(repo_root)) if repo_key else None
+        if surface is None:
+            return await git_rev_parse_main(Path(repo_root))
+        return await surface.rev_parse("main")
+
+    return read_main
 
 
 def bind_production_dispatch_chain(
@@ -403,11 +539,16 @@ def bind_production_dispatch_chain(
             if _merge_cfg is not None and _merge_cfg.enabled:
                 from forge.pipeline.merge_offer import MergeOfferService
 
+                _offer_git_head = compose_merge_offer_git_head(forge_config)
+                _offer_kwargs: dict[str, Any] = (
+                    {} if _offer_git_head is None else {"git_head": _offer_git_head}
+                )
                 _merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,
                     pipeline_publisher=publisher,
                     raw_publish=client.publish,
+                    **_offer_kwargs,
                 )
                 merge_offer_hook = _merge_offer_service.maybe_offer
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
@@ -753,6 +894,7 @@ def bind_production_dispatch_chain(
                         pool=sqlite_pool,
                         pipeline_publisher=publisher,
                         guardkit_run=compose_merge_guardkit_run(forge_config),
+                        git_surface=compose_merge_git_surface(forge_config),
                         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
                             config=forge_config,
                             nats_client=client,

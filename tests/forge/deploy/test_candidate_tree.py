@@ -19,9 +19,11 @@ from forge.deploy.candidate_tree import (
     CANDIDATE_TREES_DIRNAME,
     CANDIDATE_TREES_EXCLUDE_LINE,
     CandidateTreeError,
+    InContainerCandidateGit,
     candidate_tree_path,
     candidate_trees_root,
     ensure_candidate_trees_excluded,
+    git_is_ancestor,
     git_rev_parse,
     is_candidate_tree_path,
     materialise_candidate_tree,
@@ -212,3 +214,74 @@ class TestTheExcludeLine:
     async def test_not_a_repository_is_refused_plainly(self, tmp_path: Path) -> None:
         with pytest.raises(CandidateTreeError):
             await ensure_candidate_trees_excluded(tmp_path / "not-a-repo")
+
+
+# ---------------------------------------------------------------------------
+# The venue seam's in-container half (sandbox first, 2026-09-07, rule 89)
+# ---------------------------------------------------------------------------
+#
+# The merge press asks one surface for its five git operations so it can be
+# TOLD where they happen. This is the half that happens here, against the
+# checkout — which is where every repository without a sandbox is pressed, and
+# so must be the very functions above, doing the very same things.
+
+
+class TestTheAncestryQuestion:
+    @pytest.mark.asyncio
+    async def test_yes_no_and_could_not_say(self, repo: Path) -> None:
+        main = _git(repo, "rev-parse", "main")
+        tip = _git(repo, "rev-parse", f"autobuild/{FEATURE_ID}")
+
+        assert await git_is_ancestor(repo, main, tip) is True
+        assert await git_is_ancestor(repo, tip, main) is False
+        # A commit this repository has never heard of is not a "no".
+        assert await git_is_ancestor(repo, "b" * 40, main) is None
+
+    @pytest.mark.asyncio
+    async def test_a_place_that_is_not_a_repository_could_not_say(
+        self, tmp_path: Path
+    ) -> None:
+        elsewhere = tmp_path / "not-a-repo"
+        elsewhere.mkdir()
+        assert await git_is_ancestor(elsewhere, "main", "main") is None
+
+
+class TestTheInContainerVenue:
+    @pytest.mark.asyncio
+    async def test_the_five_operations_are_this_files_own_functions(
+        self, repo: Path
+    ) -> None:
+        venue = InContainerCandidateGit(repo)
+        tip = _git(repo, "rev-parse", f"autobuild/{FEATURE_ID}")
+
+        assert await venue.rev_parse(f"autobuild/{FEATURE_ID}") == tip
+        assert await venue.rev_parse("autobuild/FEAT-NOPE") is None
+        assert await venue.is_ancestor("main", f"autobuild/{FEATURE_ID}") is True
+
+        # The exclude line is written once, by its own call, as before.
+        assert await venue.ensure_candidate_trees_excluded() is True
+        assert await venue.ensure_candidate_trees_excluded() is False
+
+        laid_out = await venue.materialise_candidate_tree(FEATURE_ID, tip)
+        assert Path(laid_out.path) == candidate_tree_path(repo, FEATURE_ID)
+        assert (Path(laid_out.path) / "feature.txt").is_file()
+        # This venue reads no tree id and writes no exclude line while it lays
+        # a tree out: the press asks for both separately, exactly as before.
+        assert laid_out.tree is None and laid_out.exclude_written is None
+
+        assert await venue.remove_candidate_tree(FEATURE_ID) is True
+        assert not Path(laid_out.path).exists()
+        # A second removal is still a success.
+        assert await venue.remove_candidate_tree(FEATURE_ID) is True
+
+    @pytest.mark.asyncio
+    async def test_a_lay_out_that_fails_raises_as_it_always_did(
+        self, repo: Path
+    ) -> None:
+        venue = InContainerCandidateGit(repo)
+        with pytest.raises(CandidateTreeError):
+            await venue.materialise_candidate_tree(FEATURE_ID, "f" * 40)
+        assert not candidate_tree_path(repo, FEATURE_ID).exists()
+
+    def test_it_says_where_it_is_in_words_a_person_reads(self, repo: Path) -> None:
+        assert InContainerCandidateGit(repo).venue == f"in {repo}"
