@@ -1415,8 +1415,25 @@ class Supervisor:
             status=build_state,
             mode=BuildMode.MODE_C,
         )
+        # How many review cycles this build's profile allows, or None when
+        # it allows any number (the attended profile — ASSUM-010). The
+        # planner needs it for one decision only: at the cap, with every
+        # fix task done and work approved, its next stage is the
+        # merge-ready checkpoint rather than a review the budget guard
+        # below would refuse (journey one, 2026-09-08 — the journey
+        # stopped one step short of its card with every fix approved).
+        # The same number the guard enforces, read from the same place.
+        guards = self.budget_guards
+        review_cycle_cap = (
+            guards.max_review_cycles
+            if guards is not None and guards.caps_enabled
+            else None
+        )
         plan = self.mode_c_planner.plan_next_stage(
-            build, history, has_commits=has_commits
+            build,
+            history,
+            has_commits=has_commits,
+            review_cycle_cap=review_cycle_cap,
         )
 
         if plan.is_waiting:

@@ -981,6 +981,11 @@ class TestLifecycleBridgeWireupComposition:
             def __init__(self, **kwargs: Any) -> None:
                 captured.update(kwargs)
                 self.register_ack_handle = object()
+                # The other half of the same bridge: how a finished fix
+                # journey gives the pipeline consumer's message back
+                # (2026-09-08, seam seven). The composer reads it beside
+                # ``register_ack_handle``.
+                self.take_ack_handle = object()
 
         monkeypatch.setattr(
             "forge.lifecycle_bridge.wireup.LifecycleBridgeWireup",
