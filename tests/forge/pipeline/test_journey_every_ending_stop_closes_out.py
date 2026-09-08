@@ -16,7 +16,9 @@ Every stop that ENDS a journey now goes through it:
 * the turn ceiling;
 * an error — ``next_turn`` raising, and a turn outcome with no branch;
 * an expired wait the loop treats as final, including a journey with no
-  wait seam wired at all.
+  wait seam wired at all;
+* a red merge-ready gate with no resume seam wired: nothing can wake the
+  loop-back, so that stop ends the journey too.
 
 And the stops that deliberately WAIT for a person still do not: a budget
 breach that can be escalated, and a published merge card awaiting its
@@ -321,6 +323,54 @@ class TestEveryEndingStopClosesTheBuildOut:
         assert recorder.terminal_words == ["failed"]
         assert "expired" in recorder.reasons[0]
         assert packs
+
+    def test_a_red_gate_with_no_resume_seam(self) -> None:
+        """The last ending stop that still left a build RUNNING.
+
+        The merge-ready gates come back red and no resume seam is wired, so
+        the loop-back has nothing to wake it. The journey is over, and it
+        must close out like every other ending — otherwise the row stays
+        RUNNING and the queue keeps holding the build's message, which is
+        exactly how attempt eight had to be cancelled by hand.
+        """
+        from forge.pipeline.merge_ready_checkpoint import (
+            GatesReport,
+            GateStatus,
+            MergeCardDecision,
+            MergeCardOutcome,
+        )
+
+        recorder = Recorder()
+        packs, write_pack = _packs()
+        red = TurnReport(
+            outcome=TurnOutcome.WAITING,
+            build_id=BUILD_ID,
+            rationale="the merge-ready checkpoint looped back",
+            dispatch_result=MergeCardDecision(
+                outcome=MergeCardOutcome.RED_GATE_LOOP_BACK,
+                build_id=BUILD_ID,
+                gates=GatesReport(
+                    status=GateStatus.RED,
+                    failed_gates=("declared toolchain test",),
+                    detail="`npm test` exited 1",
+                ),
+            ),
+        )
+        supervisor = FakeSupervisor(script=[red])
+
+        report = asyncio.run(
+            drive_fix_journey(
+                BUILD_ID, _deps(supervisor, recorder, write_failure_pack=write_pack)
+            )
+        )
+
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
+        assert recorder.released == [BUILD_ID]
+        assert recorder.terminal_words == ["failed"]
+        assert recorder.reasons[0].startswith("stopped: ")
+        assert "declared toolchain test" in recorder.reasons[0]
+        assert packs, "the failure pack is written as before"
+        assert recorder.order == ["close-out", "release"]
 
     def test_a_journey_with_no_wait_seam_at_all(self) -> None:
         """It cannot wait, so its stop is final and it closes out."""
