@@ -270,6 +270,52 @@ class TestTheBoundedSummaryItself:
         assert summarise_declared_test_output("") == ""
         assert summarise_declared_test_output("   \n\n") == ""
 
+    def test_the_cut_marker_says_which_half_of_the_list_was_kept(self) -> None:
+        """A run with hundreds of failures overruns the space kept for the
+        tool's own list of names. That list keeps its FIRST names, so the
+        sentence under it must say the LATER ones went — telling a reader
+        the earlier ones went would send them looking at the wrong end."""
+        failures = "\n".join(
+            f"FAILED tests/module_{n}.py::test_case - assert 404 == 200"
+            for n in range(300)
+        )
+
+        evidence = summarise_declared_test_output(
+            f"{failures}\n300 failed, 4 passed\n"
+        )
+
+        assert "tests/module_0.py" in evidence  # the first names survived
+        # A name from the middle of the list is gone altogether: too late for
+        # the kept half, too early for the run's own last lines.
+        assert "tests/module_200.py" not in evidence
+        assert "later output dropped: only the first" in evidence
+        assert "earlier output dropped" not in evidence
+        assert len(evidence.encode("utf-8")) <= DECLARED_TEST_EVIDENCE_LIMIT_BYTES
+
+    def test_the_cut_marker_names_the_size_that_really_was_kept(self) -> None:
+        """The sentence says a byte count; that count is the size of the
+        piece beside it, not the budget it was cut down to."""
+        failures = "\n".join(
+            f"FAILED tests/module_{n}.py::test_case - assert 404 == 200"
+            for n in range(300)
+        )
+
+        evidence = summarise_declared_test_output(
+            f"{failures}\n300 failed, 4 passed\n"
+        )
+
+        marker_line = next(
+            line for line in evidence.split("\n") if "later output dropped" in line
+        )
+        said_kept = int(marker_line.split("only the first ")[1].split(" bytes")[0])
+        named_half = evidence.split(marker_line)[0]
+        really_kept = len(named_half.rstrip("\n").encode("utf-8"))
+
+        assert said_kept == really_kept
+        # And it is under the budget it was cut to, because the sentence
+        # itself had to fit inside that budget as well.
+        assert said_kept < DECLARED_TEST_EVIDENCE_LIMIT_BYTES // 2
+
     def test_other_tools_summary_words_are_kept_too(self) -> None:
         """Not a pytest-only reader: any line whose first word names a
         failing case is the tool's own summary of what failed."""
