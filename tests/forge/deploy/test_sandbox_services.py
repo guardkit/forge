@@ -109,7 +109,14 @@ FAKE_UV = """#!/usr/bin/env bash
 # A stand-in for uv. `uv venv DIR` makes DIR/bin/python out of the fake
 # service program; `uv pip install --python PY ...` makes the two console
 # scripts beside PY. Every call is written down. Nothing is installed.
+# Each call also writes, to its own separate log so the call log stays exactly
+# what it was, whether uv's "never download an interpreter" switch was in the
+# environment it was handed.
 printf '%s\\n' "uv $*" >> "$FAKE_LOG"
+if [ -n "${UV_ENV_LOG:-}" ]; then
+  if [ -n "${UV_PYTHON_DOWNLOADS+x}" ]; then downloads="$UV_PYTHON_DOWNLOADS"; else downloads=unset; fi
+  printf '%s\\n' "uv $1 UV_PYTHON_DOWNLOADS=$downloads" >> "$UV_ENV_LOG"
+fi
 case "$1" in
   venv)
     dir="${@: -1}"
@@ -148,7 +155,7 @@ if [ "$me" = "python" ] && [ "${1:-}" = "-c" ]; then
   esac
 fi
 if [ -n "${FORGE_DB_PATH+x}" ]; then db=set; else db=unset; fi
-printf '%s\\n' "env $me FORGE_DB_PATH=$db FORGE_GUARDKIT_PATH=${FORGE_GUARDKIT_PATH:-unset} FORGE_RECEIPTS_DIR=${FORGE_RECEIPTS_DIR:-unset} GUARDKIT_HARNESS=${GUARDKIT_HARNESS:-unset} SIDECAR_PORT=${FORGE_DEPLOY_SIDECAR_PORT:-unset} BIND=${SANDBOX_RUNNER_BIND:-unset} PWD=$PWD" >> "$FAKE_LOG"
+printf '%s\\n' "env $me FORGE_DB_PATH=$db FORGE_GUARDKIT_PATH=${FORGE_GUARDKIT_PATH:-unset} FORGE_RECEIPTS_DIR=${FORGE_RECEIPTS_DIR:-unset} GUARDKIT_HARNESS=${GUARDKIT_HARNESS:-unset} SIDECAR_PORT=${FORGE_DEPLOY_SIDECAR_PORT:-unset} BIND=${SANDBOX_RUNNER_BIND:-unset} UV_PYTHON_DOWNLOADS=${UV_PYTHON_DOWNLOADS:-unset} PWD=$PWD" >> "$FAKE_LOG"
 role="$me"
 if [ "$me" = "python" ]; then role=sidecar; fi
 if [ "$me" = "langgraph" ]; then role=runner; fi
@@ -470,6 +477,7 @@ def sandbox(tmp_path: Path) -> dict[str, Path]:
         "home": home,
         "fake_bin": fake_bin,
         "log": tmp_path / "fake.log",
+        "uv_env_log": tmp_path / "fake-uv-env.log",
         "receipts": receipts,
     }
 
@@ -481,10 +489,19 @@ def _bootstrap_env(sandbox: dict[str, Path], **extra: str) -> dict[str, str]:
         "HOME": str(sandbox["home"]),
         "FAKE_LOG": str(sandbox["log"]),
         "FAKE_BIN": str(sandbox["fake_bin"]),
+        "UV_ENV_LOG": str(sandbox["uv_env_log"]),
         "SANDBOX_RECEIPTS_PATH": str(sandbox["receipts"]),
         "SANDBOX_RUNNER_RESTART_SECONDS": "0",
     }
-    for name in ("FORGE_DB_PATH", "FORGE_RECEIPTS_DIR", "FORGE_GUARDKIT_PATH", "GUARDKIT_HARNESS"):
+    for name in (
+        "FORGE_DB_PATH",
+        "FORGE_RECEIPTS_DIR",
+        "FORGE_GUARDKIT_PATH",
+        "GUARDKIT_HARNESS",
+        # Nothing outside the script may supply this one: the whole point of the
+        # test below is that the script itself no longer leaves it lying about.
+        "UV_PYTHON_DOWNLOADS",
+    ):
         env.pop(name, None)
     env.update(extra)
     return env
@@ -492,6 +509,7 @@ def _bootstrap_env(sandbox: dict[str, Path], **extra: str) -> dict[str, str]:
 
 def _bootstrap_only(sandbox: dict[str, Path], **extra: str) -> subprocess.CompletedProcess[str]:
     sandbox["log"].write_text("", encoding="utf-8")
+    sandbox["uv_env_log"].write_text("", encoding="utf-8")
     return subprocess.run(
         [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
         cwd=sandbox["repo"],
@@ -665,6 +683,65 @@ class TestTheBootstrapKeepsBothServicesUp:
         assert "asked to stop; stopping both services" in stdout
         # Names only, never a value.
         assert "forge-prod-state" not in stdout
+
+
+class TestUvsDownloadSwitchStaysWithTheVenvCommand:
+    """The switch that forbids uv to fetch an interpreter belongs to the one
+    command that makes the factory's own venv, and to nothing else.
+
+    Why it matters (seen in api_test's sandbox on 2026-09-08): the bootstrap
+    used to export that switch, so the two services it starts inherited it, and
+    so did guardkit's work leg beneath them. The work leg pins a repository's
+    own build venv to the floor of that repository's ``requires-python`` — 3.11
+    for api_test — which the sandbox's Python (3.14) is newer than; uv was
+    forbidden to fetch a 3.11, and every work leg failed for want of an
+    interpreter. The attended cure was a setting in the sandbox; the cure here
+    is that the bootstrap keeps the switch to itself.
+    """
+
+    def test_the_venv_command_carries_it_and_the_installs_run_without_it(self, sandbox):
+        result = _bootstrap_only(sandbox)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _log_lines(sandbox["uv_env_log"]) == [
+            "uv venv UV_PYTHON_DOWNLOADS=never",
+            "uv pip UV_PYTHON_DOWNLOADS=unset",
+            "uv pip UV_PYTHON_DOWNLOADS=unset",
+            "uv pip UV_PYTHON_DOWNLOADS=unset",
+            "uv pip UV_PYTHON_DOWNLOADS=unset",
+        ]
+
+    def test_neither_started_service_carries_it(self, sandbox, tmp_path):
+        sandbox["log"].write_text("", encoding="utf-8")
+        stdout_path = tmp_path / "services.out"
+
+        with stdout_path.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(
+                [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
+                cwd=sandbox["repo"],
+                env=_bootstrap_env(sandbox),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+
+                def both_reported() -> bool:
+                    lines = _log_lines(sandbox["log"])
+                    return any(line.startswith("env langgraph ") for line in lines) and any(
+                        line.startswith("env python ") for line in lines
+                    )
+
+                _wait_for(both_reported)
+            finally:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=15)
+
+        lines = _log_lines(sandbox["log"])
+        runner_env = [line for line in lines if line.startswith("env langgraph ")][0]
+        sidecar_env = [line for line in lines if line.startswith("env python ")][0]
+        assert "UV_PYTHON_DOWNLOADS=unset" in runner_env
+        assert "UV_PYTHON_DOWNLOADS=unset" in sidecar_env
 
 
 # ---------------------------------------------------------------------------

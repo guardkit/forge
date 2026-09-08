@@ -32,7 +32,9 @@
 #      .env or .venv comes along — and is made again only when that HEAD has
 #      moved. A copy is needed because forge builds with setuptools, which
 #      writes into the tree it builds from, and a read-only mount refuses that.
-#   3. Makes ~/.forge-venv with uv from the sandbox's own Python, once.
+#   3. Makes ~/.forge-venv with uv from the sandbox's own Python, once. uv's
+#      "never download an interpreter" switch is set on that one command only,
+#      never exported (see step 3 below for why).
 #   4. Installs into it from the copies, in the order forge's own Dockerfile
 #      uses: nats-core and fleet-memory first (neither can come from a package
 #      index — fleet-memory is published nowhere and the nats-core wheel on the
@@ -53,8 +55,11 @@
 # stays on the host, and forge-prod is its only writer) — FORGE_DB_PATH is
 # unset before the services start, so the host's forge.db is out of reach even
 # if a mount carried it. It never installs anything but the factory's own code
-# and what forge's own pyproject asks for. It never prints a setting's value,
-# only whether the setting is there.
+# and what forge's own pyproject asks for. It never hands the two services uv's
+# "never download an interpreter" switch: that belongs to the one command that
+# makes the factory's own venv, and a repository's build venv must be free to
+# ask uv for the interpreter its requires-python floor names. It never prints a
+# setting's value, only whether the setting is there.
 #
 # SETTINGS, all read from the sandbox's environment:
 #   SANDBOX_FORGE_PATH       where the forge checkout is mounted
@@ -158,13 +163,18 @@ for name in "${MOUNT_NAMES[@]}"; do
 done
 
 # --- step 3: the venv, once -------------------------------------------------
-# uv must use the sandbox's own Python, never fetch one.
-export UV_PYTHON_DOWNLOADS=never
+# The factory's own venv is made from the sandbox's own Python and never from
+# an interpreter uv fetches, so uv's "never download" switch is set ON THIS ONE
+# COMMAND. It is deliberately not exported: it would then be inherited by the
+# two services below and by everything they start, and a repository's own build
+# venv is pinned by guardkit to the floor of that repository's requires-python,
+# which the sandbox's Python may be newer than. Exporting it made every work
+# leg inside api_test's sandbox fail for want of an interpreter on 2026-09-08.
 if [[ -x "${VENV}/bin/python" ]]; then
   log "venv already at ${VENV}"
 else
   log "making the venv at ${VENV} from the sandbox's python3 with $(command -v uv)"
-  uv venv --python python3 "${VENV}"
+  UV_PYTHON_DOWNLOADS=never uv venv --python python3 "${VENV}"
 fi
 
 # --- step 4: the install, when a copy changed ------------------------------
