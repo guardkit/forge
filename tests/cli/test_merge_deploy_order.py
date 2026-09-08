@@ -303,3 +303,109 @@ def test_a_feature_build_is_merged_without_a_branch_flag_and_named_as_before(
     assert f"merge-deploy {FEATURE_ID} @ {REPO}: result=merged-and-running" in result.output
     assert "(branch " not in result.output
     assert wired["publisher"].reports[0].branch == f"autobuild/{FEATURE_ID}"
+
+
+# ---------------------------------------------------------------------------
+# The attended word presses where the repository lives (sandbox first, rule 89)
+# ---------------------------------------------------------------------------
+#
+# Rich's ruling of 2026-09-07 23:31Z: there is no merge-by-hand shape. The
+# attended command drives the same executor as the card, so it too has to reach
+# a sandboxed repository's git inside its sandbox — starting with the pin,
+# which is the first git the press needs and which it reads itself.
+
+
+SANDBOX_REPO = "appmilla/api_test_sandboxed"
+
+
+@pytest.fixture
+def sandbox_clone(tmp_path: Path) -> Path:
+    """The factory's own clone, as it is inside the repository's sandbox."""
+    root = tmp_path / "sandbox" / "api_test"
+    root.mkdir(parents=True)
+    _git(root, "init", "-b", "main", "-q")
+    (root / "README.md").write_text("first\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-q", "-m", "first")
+    _git(root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    (root / "feature.txt").write_text("the feature\n", encoding="utf-8")
+    _git(root, "add", "feature.txt")
+    _git(root, "commit", "-q", "-m", "the feature")
+    _git(root, "checkout", "-q", "main")
+    return root.resolve()
+
+
+@pytest.fixture
+def sandbox_sidecar(sandbox_clone: Path, monkeypatch: pytest.MonkeyPatch):
+    """The real deploy sidecar, on a real loopback port, inside the sandbox."""
+    import threading
+
+    from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV, build_server
+
+    monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
+    inside = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(sandbox_clone.parent)]}},
+            "planning": {"target_repo_paths": {SANDBOX_REPO: str(sandbox_clone)}},
+        }
+    )
+    srv = build_server(port=0, config_loader=lambda: inside)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address[:2]
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_attended_command_presses_a_sandboxed_repository_in_its_sandbox(
+    pool, tmp_path, sandbox_clone, sandbox_sidecar, monkeypatch
+) -> None:
+    # forge-prod has no checkout of this repository at all — rule 63.
+    on_this_side = tmp_path / "not-mounted" / "api_test"
+    settings = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {
+                "target_repo_paths": {SANDBOX_REPO: str(on_this_side)},
+                "sandboxes": {
+                    SANDBOX_REPO: {
+                        "name": "api-test-factory",
+                        "sidecar_url": sandbox_sidecar,
+                        "runner_url": "http://127.0.0.1:8924",
+                    }
+                },
+            },
+            "approval": {"expected_approver": "rich"},
+        }
+    )
+    pool.connection.execute(
+        "UPDATE builds SET repo = ? WHERE build_id = ?", (SANDBOX_REPO, BUILD_ID)
+    )
+    pool.connection.commit()
+    wired = _wire(monkeypatch, pool, sandbox_clone)
+
+    # The pin is NOT faked here: it is read wherever the press reads it, and
+    # this side has no repository for it to be read from.
+    monkeypatch.setattr(
+        merge_offer_module,
+        "git_rev_parse_main",
+        _refuse_main_sha_on_this_side,
+    )
+
+    result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=settings)
+
+    assert result.exit_code == 0, result.output
+    assert wired["order"] == ["candidate_check", "merge", "promote"]
+    assert "result=merged-and-running" in result.output
+    # The candidate was laid out in the clone, and taken away again.
+    assert not (on_this_side / ".forge-candidates").exists()
+    assert not (sandbox_clone / ".forge-candidates" / FEATURE_ID).exists()
+
+
+async def _refuse_main_sha_on_this_side(_repo_root: Path) -> str | None:
+    raise AssertionError(
+        "a sandboxed repository's main was read on this side; it lives in the "
+        "sandbox's clone"
+    )

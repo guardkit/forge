@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from importlib import import_module
@@ -49,6 +50,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
+from forge.cli._conductor_worktree import JOURNEY_BASE_REF
 from forge.pipeline.conductor_driver import ConductorDriverDeps, WaitWindow
 from forge.pipeline.stage_taxonomy import StageClass
 
@@ -457,6 +459,334 @@ def _run_declared_command(
     )
 
 
+# ---------------------------------------------------------------------------
+# THE SAME GATE SET, READ AND RUN WHERE THE REPOSITORY LIVES (rule 88)
+# ---------------------------------------------------------------------------
+#
+# Found by L3a's second coach, 2026-09-07 21:02Z: the reader above reads the
+# repository's declared toolchain from a checkout on the host and runs the
+# declared test command in a journey worktree on the host. For a repository
+# that has a sandbox NEITHER EXISTS THERE — the clone and the worktrees are
+# inside the sandbox — so the reader would degrade to UNKNOWN, which is red,
+# and a sandbox repository's fix journey could never publish a merge card.
+# These two functions are the same two acts, done through that repository's
+# own deploy sidecar. A repository without a sandbox never reaches them.
+
+#: How long reading one small file out of the clone may take.
+SANDBOX_TOOLCHAIN_READ_TIMEOUT_S: float = 30.0
+
+#: How much longer than the declared command's own wall the HTTP read waits,
+#: so the sidecar's timeout always fires before the socket gives up.
+SANDBOX_TEST_HTTP_MARGIN_S: float = 30.0
+
+
+def load_declared_toolchain_from_sandbox(
+    repo_root: "Path | str",
+    *,
+    sandbox: Any,
+    repo: str,
+    branch: str = JOURNEY_BASE_REF,
+    post: Callable[..., Any] | None = None,
+) -> Any | None:
+    """Read ``.guardkit/config.yaml`` out of the sandbox's clone (rule 88).
+
+    Same law as the in-container reader keeps: the declaration is read from
+    the CANONICAL tree — ``main`` in the factory's own clone — never from the
+    worktree the fix journey has been editing, because a build that could
+    rewrite ``toolchain.test`` to ``true`` could green itself. The file comes
+    back over the sidecar's existing read-file route and is handed to
+    guardkit's OWN loader, exactly as
+    :func:`load_declared_toolchain` does, so forge still forms no second
+    opinion about what a repository declared.
+
+    ``repo_root`` is the clone's path INSIDE the sandbox — the same path the
+    repository map names — and it is used to say, in every sentence a person
+    reads, which file was being read and where it lives.
+
+    Returns ``None`` — never raises — when the sidecar cannot be reached or
+    refuses, when the file is not on the branch, or when the block declares
+    nothing. Every one of those is an honest UNKNOWN upstream, which the
+    merge-ready checkpoint treats as RED.
+    """
+    import tempfile
+
+    from forge.deploy_sidecar.service import GIT_READ_FILE_ROUTE
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    sender = post if post is not None else _urllib_post
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_READ_FILE_ROUTE}"
+    declaration_file = f"{Path(repo_root)}/.guardkit/config.yaml"
+    body = {"repo": repo, "branch": branch, "file_path": ".guardkit/config.yaml"}
+    try:
+        status, decoded = sender(url, body, SANDBOX_TOOLCHAIN_READ_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 — could not read is not could not pass
+        logger.error(
+            "conductor gates: the sidecar in sandbox %s could not be reached "
+            "at %s to read %s (%s's declared toolchain) (%s: %s) — the gate "
+            "set answers UNKNOWN, which is red",
+            getattr(sandbox, "name", "?"),
+            url,
+            declaration_file,
+            repo,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    answer = decoded if isinstance(decoded, dict) else {}
+    content = answer.get("content")
+    if status != 200 or not isinstance(content, str) or not content.strip():
+        logger.warning(
+            "conductor gates: %s could not be read from branch %s of %s's "
+            "clone in sandbox %s (HTTP %s): %s — the gate set answers "
+            "UNKNOWN, which is red",
+            declaration_file,
+            branch,
+            repo,
+            getattr(sandbox, "name", "?"),
+            status,
+            answer.get("error") or "the file is not on that branch",
+        )
+        return None
+    with tempfile.TemporaryDirectory(prefix="forge-toolchain-") as tmp:
+        root = Path(tmp)
+        (root / ".guardkit").mkdir(parents=True, exist_ok=True)
+        (root / ".guardkit" / "config.yaml").write_text(content, encoding="utf-8")
+        return load_declared_toolchain(root)
+
+
+def run_declared_command_in_sandbox(
+    *,
+    command: str,
+    cwd: "Path | str",
+    timeout_seconds: int,
+    sandbox: Any,
+    repo: str,
+    post: Callable[..., Any] | None = None,
+) -> "tuple[int | None, str]":
+    """Run the declared test command in the sandbox. ``(exit_code, detail)``.
+
+    Same contract as :func:`_run_declared_command`, which the reader already
+    depends on: **the exit code is the verdict**, and ``None`` means the
+    command could not be run or did not finish — which the caller turns into
+    UNKNOWN rather than into a pass or a fail it did not observe.
+
+    The sidecar checks the command against the repository's own checked-in
+    declaration before it runs anything, so what runs in there is the
+    repository's own text and nothing composed on this side.
+    """
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    sender = post if post is not None else _urllib_post
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}/run"
+    body = {
+        "repo": repo,
+        "declared_test": command,
+        "cwd": str(cwd),
+        "timeout_seconds": float(timeout_seconds),
+    }
+    try:
+        status, decoded = sender(
+            url, body, float(timeout_seconds) + SANDBOX_TEST_HTTP_MARGIN_S
+        )
+    except Exception as exc:  # noqa: BLE001 — could not run is not could not pass
+        return None, (
+            f"the declared test command {command!r} could not be sent to the "
+            f"sidecar in sandbox {getattr(sandbox, 'name', '?')} at {url}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        return None, (
+            f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} refused "
+            f"to run the declared test command {command!r} (HTTP {status}): "
+            f"{answer.get('error') or answer}"
+        )
+    if answer.get("timed_out") is True:
+        return None, (
+            f"the declared test command {command!r} did not finish within "
+            f"{timeout_seconds}s in {cwd} inside sandbox "
+            f"{getattr(sandbox, 'name', '?')}"
+        )
+    exit_code = answer.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        return None, (
+            f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} answered "
+            f"something that is not a test result: {answer!r}"
+        )
+    ran_in = answer.get("cwd")
+    if not isinstance(ran_in, str) or os.path.normpath(ran_in) != os.path.normpath(
+        str(cwd)
+    ):
+        return None, (
+            f"the declared test command was asked to run in {cwd} and the "
+            f"sidecar in sandbox {getattr(sandbox, 'name', '?')} ran it in "
+            f"{ran_in!r}, so the tree that was tested is not the tree the "
+            "journey is on"
+        )
+    tail = (
+        (str(answer.get("stderr_tail") or "") or str(answer.get("stdout") or ""))
+        .strip()
+        .splitlines()
+    )
+    return exit_code, (
+        f"`{command}` exited {exit_code} in {cwd} inside sandbox "
+        f"{getattr(sandbox, 'name', '?')}"
+        + (f" — last line: {tail[-1]}" if tail else "")
+    )
+
+
+#: How long the routing law's three small reads inside the sandbox may take.
+SANDBOX_STAMPS_READ_TIMEOUT_S: float = 90.0
+
+
+def read_stamps_in_sandbox(
+    *,
+    feature_id: str,
+    repo_root: "Path | str",
+    worktree: "Path | str",
+    branch: Any,
+    toolchain_green: bool,
+    sandbox: Any,
+    repo: str,
+    post: Callable[..., Any] | None = None,
+) -> Any:
+    """Step 5 — the routing law's stamped-verifier check, read in the sandbox.
+
+    Found by L3b's coach, 2026-09-08. Steps 3 and 4 of the gates reader were
+    routed into the sandbox and this one was left reading the host, where a
+    sandbox repository's feature file and gate receipts are not. The check
+    then found no stamps, said so, had no effect, and a GREEN merge card went
+    out with the routing law silently not applied — a check that could not run
+    turned into a card, which is the one direction this reader must never fail
+    in.
+
+    So the three reads happen in the sandbox, over one route, and the DECISION
+    is the same pure function the in-container leg uses
+    (:func:`forge.pipeline.routing_stamps.evaluate_stamps`): the stamps from
+    the canonical branch of the clone, the newest results envelope under the
+    journey worktree, and the branch's last code commit time. Anything that
+    stops those being read — an unreachable sidecar, a refusal, an answer that
+    is not evidence — is UNREADABLE, which is UNKNOWN, which is no card.
+    """
+    from datetime import datetime
+
+    from forge.deploy_sidecar.service import STAMPS_EVIDENCE_ROUTE
+    from forge.pipeline.routing_stamps import (
+        HISTORY_RELATIVE_PATH,
+        Envelope,
+        StampsRead,
+        evaluate_stamps,
+        feature_yaml_relative_path,
+        parse_scenario_stamps,
+    )
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    history_dir = Path(worktree) / HISTORY_RELATIVE_PATH
+    where = Path(repo_root) / feature_yaml_relative_path(feature_id)
+    name = getattr(sandbox, "name", "?")
+
+    def _unreadable(reason: str) -> Any:
+        logger.error(
+            "conductor gates: the routing law's evidence for %s could not be "
+            "read in sandbox %s — %s. The gate set answers UNKNOWN, which is "
+            "red: no merge card",
+            feature_id,
+            name,
+            reason,
+        )
+        return evaluate_stamps(
+            StampsRead(path=where, present=True, error=reason),
+            toolchain_green=toolchain_green,
+            envelope=None,
+            code_commit_time=None,
+            history_dir=history_dir,
+            feature_id=feature_id,
+        )
+
+    sender = post if post is not None else _urllib_post
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}{STAMPS_EVIDENCE_ROUTE}"
+    body = {
+        "repo": repo,
+        "feature_id": feature_id,
+        "worktree": str(worktree),
+        "branch": str(branch) if branch else None,
+    }
+    try:
+        status, decoded = sender(url, body, SANDBOX_STAMPS_READ_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 — could not read is not could not pass
+        return _unreadable(
+            f"the sidecar in sandbox {name} could not be reached at {url} "
+            f"({type(exc).__name__}: {exc})"
+        )
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        return _unreadable(
+            f"the sidecar in sandbox {name} refused the request (HTTP "
+            f"{status}): {answer.get('error') or answer}"
+        )
+
+    feature_yaml = answer.get("feature_yaml")
+    if not isinstance(feature_yaml, dict):
+        return _unreadable(
+            f"the sidecar in sandbox {name} answered something that is not "
+            f"the routing law's evidence: {answer!r}"
+        )
+    said_path = feature_yaml.get("path")
+    at = Path(said_path) if isinstance(said_path, str) and said_path else where
+    text = feature_yaml.get("text")
+    if not feature_yaml.get("present") or not isinstance(text, str):
+        # The feature carries no plan of record on the canonical branch — the
+        # same answer an absent file gives on this side, and the same
+        # consequence: the stamped-verifier check is not enforced for it.
+        stamps_read = StampsRead(path=at, present=False)
+    else:
+        stamps_read = parse_scenario_stamps(text, path=at)
+
+    envelope: Any = None
+    raw_envelope = answer.get("envelope")
+    if raw_envelope is not None:
+        if not isinstance(raw_envelope, dict) or not isinstance(
+            raw_envelope.get("run_id"), str
+        ):
+            return _unreadable(
+                f"the sidecar in sandbox {name} answered with something that "
+                f"is not a results envelope: {raw_envelope!r}"
+            )
+        started_raw = raw_envelope.get("started")
+        started = None
+        if isinstance(started_raw, str) and started_raw.strip():
+            try:
+                started = datetime.fromisoformat(started_raw.strip())
+            except ValueError:
+                started = None
+        gates = raw_envelope.get("gates")
+        envelope = Envelope(
+            path=Path(str(raw_envelope.get("path") or history_dir)),
+            run_id=str(raw_envelope.get("run_id")),
+            verdict=str(raw_envelope.get("verdict") or ""),
+            started=started,
+            gates=dict(gates) if isinstance(gates, dict) else {},
+            feature_id=raw_envelope.get("feature_id"),
+        )
+
+    commit_time = None
+    raw_commit = answer.get("code_commit_time")
+    if isinstance(raw_commit, str) and raw_commit.strip():
+        try:
+            commit_time = datetime.fromisoformat(raw_commit.strip())
+        except ValueError:
+            commit_time = None
+
+    return evaluate_stamps(
+        stamps_read,
+        toolchain_green=toolchain_green,
+        envelope=envelope,
+        code_commit_time=commit_time,
+        history_dir=history_dir,
+        feature_id=feature_id,
+    )
+
+
 def make_gates_green_reader(
     *,
     pool: Any,
@@ -465,6 +795,9 @@ def make_gates_green_reader(
     command_runner: Callable[..., Any] | None = None,
     repo_root_reader: Callable[[str], Any] | None = None,
     stamps_leg: Callable[..., Any] | None = None,
+    sandbox_declaration_loader: Callable[..., Any] | None = None,
+    sandbox_command_runner: Callable[..., Any] | None = None,
+    sandbox_stamps_leg: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Build the merge-ready checkpoint's REAL ``gates_green_reader``.
 
@@ -514,6 +847,25 @@ def make_gates_green_reader(
     ("proven green", never "not proven red"), so every degrade on this
     path fails towards *no card*, never towards a card.
 
+    SANDBOX FIRST (rule 88). Steps 3, 4 and 5 all touch the repository — one
+    reads its declaration, one runs its tests, one reads its plan of record
+    and its gate receipts — and for a repository that has a sandbox neither
+    the clone nor the journey worktree is on this side at all. So for such a
+    repository all three go through that sandbox's own deploy sidecar
+    (:func:`load_declared_toolchain_from_sandbox`,
+    :func:`run_declared_command_in_sandbox` and
+    :func:`read_stamps_in_sandbox`), and the canonical-not-worktree law of
+    step 2 is kept: both the declaration and the stamps are read from ``main``
+    in the clone. Everything else about the decision is identical, and a
+    repository without a sandbox is byte for byte what it was.
+
+    Step 5 was left on the host by this lane's first cut, and its coach proved
+    what that cost: the stamps could not be found, the check said "this
+    feature carries no scenario stamps", and a GREEN card went out with the
+    routing law not applied. A check that could not run must never become a
+    card, so it runs where the evidence is, and every way of failing to read
+    it is UNKNOWN.
+
     Args:
         pool: The daemon's SQLite persistence facade.
         config: The loaded ``ForgeConfig`` — read only for
@@ -527,6 +879,16 @@ def make_gates_green_reader(
             subprocess-free.
         repo_root_reader: ``(build_id) -> Path | str | None`` — override
             for step 2.
+        sandbox_declaration_loader: ``(repo_root, *, sandbox, repo) ->
+            declaration | None`` — step 3 for a repository that has a
+            sandbox. Defaults to
+            :func:`load_declared_toolchain_from_sandbox`.
+        sandbox_command_runner: ``(*, command, cwd, timeout_seconds, sandbox,
+            repo) -> (exit_code | None, detail)`` — step 4 for the same.
+            Defaults to :func:`run_declared_command_in_sandbox`.
+        sandbox_stamps_leg: ``(*, feature_id, repo_root, worktree, branch,
+            toolchain_green, sandbox, repo) -> StampsVerdict`` — step 5 for
+            the same. Defaults to :func:`read_stamps_in_sandbox`.
         stamps_leg: ``(*, feature_id, repo_root, worktree, branch,
             toolchain_green) -> StampsVerdict`` — step 5. Defaults to
             :func:`forge.pipeline.routing_stamps.make_stamps_leg` over
@@ -536,8 +898,13 @@ def make_gates_green_reader(
     from forge.pipeline.merge_ready_checkpoint import GateStatus, GatesReport
     from forge.pipeline.routing_stamps import make_stamps_leg
 
+    from forge.config.sandboxes import sandbox_for
+
     _load = declaration_loader or load_declared_toolchain
     _run = command_runner or _run_declared_command
+    _sandbox_load = sandbox_declaration_loader or load_declared_toolchain_from_sandbox
+    _sandbox_run = sandbox_command_runner or run_declared_command_in_sandbox
+    _sandbox_stamps = sandbox_stamps_leg or read_stamps_in_sandbox
     _stamps = stamps_leg or make_stamps_leg()
 
     def _default_repo_root(build_id: str) -> Any | None:
@@ -570,10 +937,17 @@ def make_gates_green_reader(
         worktree: Any,
         branch: Any,
         suite_detail: str,
+        stamps: Callable[..., Any] | None = None,
     ) -> Any:
-        """Step 5 — the routing law's ``stamps_satisfied`` leg on a GREEN suite."""
+        """Step 5 — the routing law's ``stamps_satisfied`` leg on a GREEN suite.
+
+        ``stamps`` is the leg to ask: the in-container one, or — for a
+        repository whose clone and worktrees are inside its sandbox — the one
+        that reads the same three pieces of evidence in there. Both answer the
+        same verdict type and both fail towards no card.
+        """
         try:
-            verdict = _stamps(
+            verdict = (stamps or _stamps)(
                 feature_id=feature_id,
                 repo_root=repo_root,
                 worktree=worktree,
@@ -645,6 +1019,60 @@ def make_gates_green_reader(
         row = pool.get_build_row(build_id)
         if row is None:
             return _unknown("no builds row to read a worktree from", build_id)
+        # WHERE THE TOOLCHAIN IS READ AND THE SUITE IS RUN (rule 88). For a
+        # repository that has a sandbox, both the clone and the journey
+        # worktree are inside it, so both happen through its own deploy
+        # sidecar. Every other repository takes the path it always took, in
+        # this container, with the two seams the tests inject.
+        repo_key = str(getattr(row, "repo", "") or "")
+        entry = sandbox_for(config, repo_key)
+        stamps_here: Callable[..., Any] | None = None
+        if entry is None:
+            load, run_command = _load, _run
+        else:
+            def load(repo_root: Any, _entry: Any = entry, _repo: str = repo_key) -> Any:
+                return _sandbox_load(repo_root, sandbox=_entry, repo=_repo)
+
+            def run_command(
+                *,
+                command: str,
+                cwd: Any,
+                timeout_seconds: int,
+                _entry: Any = entry,
+                _repo: str = repo_key,
+            ) -> Any:
+                return _sandbox_run(
+                    command=command,
+                    cwd=cwd,
+                    timeout_seconds=timeout_seconds,
+                    sandbox=_entry,
+                    repo=_repo,
+                )
+
+            # Step 5 goes in there too (L3b's coach, 2026-09-08): the feature's
+            # stamps, the gate receipts and the branch's last code commit are
+            # all inside the sandbox, and a check that cannot run must never
+            # become a green card.
+            def stamps_here(  # type: ignore[misc]
+                *,
+                feature_id: str,
+                repo_root: Any,
+                worktree: Any,
+                branch: Any,
+                toolchain_green: bool,
+                _entry: Any = entry,
+                _repo: str = repo_key,
+            ) -> Any:
+                return _sandbox_stamps(
+                    feature_id=feature_id,
+                    repo_root=repo_root,
+                    worktree=worktree,
+                    branch=branch,
+                    toolchain_green=toolchain_green,
+                    sandbox=_entry,
+                    repo=_repo,
+                )
+
         worktree = getattr(row, "worktree_path", None)
         if not worktree:
             return _unknown(
@@ -652,7 +1080,10 @@ def make_gates_green_reader(
                 "to run the gate set",
                 build_id,
             )
-        if not Path(worktree).is_dir():
+        if entry is None and not Path(worktree).is_dir():
+            # A sandbox repository's worktree is inside its sandbox and is not
+            # a directory on this side at all; the sidecar checks that it is
+            # there before it runs anything, and says so plainly if it is not.
             return _unknown(
                 f"the recorded worktree {worktree} is not a directory",
                 build_id,
@@ -676,7 +1107,7 @@ def make_gates_green_reader(
                 build_id,
             )
 
-        declaration = _load(repo_root)
+        declaration = load(repo_root)
         if declaration is None:
             return _unknown(
                 f"{repo_root}/.guardkit/config.yaml declares no toolchain",
@@ -702,7 +1133,7 @@ def make_gates_green_reader(
             timeout_seconds,
         )
         try:
-            exit_code, detail = _run(
+            exit_code, detail = run_command(
                 command=command, cwd=worktree, timeout_seconds=timeout_seconds
             )
         except Exception as exc:  # noqa: BLE001 — a runner defect is not green
@@ -727,6 +1158,7 @@ def make_gates_green_reader(
                 worktree=worktree,
                 branch=branch or getattr(row, "branch", None),
                 suite_detail=detail,
+                stamps=stamps_here,
             )
         logger.warning(
             "conductor gates: build_id=%s — RED. %s. No merge card is "

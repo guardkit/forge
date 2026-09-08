@@ -120,6 +120,7 @@ def build_deploy_stage_runner(
     clock: Callable[[], datetime] = _utcnow,
     target_repo: str | None = None,
     target_repo_root: str | None = None,
+    sandbox: Any | None = None,
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -134,6 +135,13 @@ def build_deploy_stage_runner(
     ``Unconfigured*`` loud-fail backend (a live run) — never a silent no-op.
     The reservation lease is selected by ``config.reservation_backend`` unless
     ``reservation`` is supplied.
+
+    ``sandbox`` (sandbox first, 2026-09-07, rule 85) is the repository's entry
+    from ``planning.sandboxes`` when it has one. It moves the stage's scripts
+    to the deploy sidecar inside that sandbox and makes the deploy step run
+    the repository's own deploy script rather than the host wrapper that would
+    put it in a sandbox. ``None`` — every repository until an operator fills
+    that mapping in — is byte for byte today's stage.
     """
     if not config.enabled:
         # FIRST runtime reader of deploy.enabled. Flag OFF = byte-for-byte
@@ -172,6 +180,7 @@ def build_deploy_stage_runner(
         presence_resolver=presence_resolver,
         target_repo=target_repo,
         target_repo_root=target_repo_root,
+        sandbox=sandbox,
     )
 
 
@@ -193,6 +202,7 @@ async def dispatch_deploy_stage(
     clock: Callable[[], datetime] = _utcnow,
     target_repo: str | None = None,
     target_repo_root: str | None = None,
+    sandbox: Any | None = None,
     feature: str | None = None,
     feat_id: str | None = None,
     task_id: str | None = None,
@@ -242,6 +252,7 @@ async def dispatch_deploy_stage(
         clock=clock,
         target_repo=target_repo,
         target_repo_root=target_repo_root,
+        sandbox=sandbox,
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.

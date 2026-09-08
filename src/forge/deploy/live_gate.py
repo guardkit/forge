@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -56,6 +56,8 @@ __all__ = [
     "DryRunLiveGateInvoker",
     "GuardkitSeamLiveGateInvoker",
     "RepoDriverLiveGateInvoker",
+    "SidecarLiveGateInvoker",
+    "project_driver_answer",
     "RefusingLiveGateInvoker",
     "BrokerDiff",
     "BrokerInspector",
@@ -368,6 +370,78 @@ def _bounded_tail(text: str | None, cap: int = _STDIO_TAIL_CAP) -> str:
     return text[-cap:]
 
 
+def project_driver_answer(
+    *,
+    argv: list[str],
+    cwd: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    gate_ids: tuple[str, ...],
+    run_id_fallback: str,
+) -> LiveGateInvocation:
+    """One driver's answer, read into a :class:`LiveGateInvocation`.
+
+    The driver prints a results envelope on stdout and exits by the
+    four-for-four map; this turns those two into the invocation the deploy
+    stage reads. A JSON body with a missing or unknown verdict is NOT a valid
+    envelope and falls through to the exit-code map rather than raising.
+
+    Shared, not copied: the driver runs as a subprocess in the forge container
+    for a repository with no sandbox and through that repository's sandbox
+    sidecar for one that has (sandbox first, rule 85), and the two must read
+    an identical answer identically or the same gate would mean two things.
+    """
+    import json
+
+    detail: dict[str, Any] = {
+        "argv": argv,
+        "cwd": cwd,
+        "exit_code": exit_code,
+        "stdout_tail": _bounded_tail(stdout),
+        "stderr_tail": _bounded_tail(stderr),
+    }
+
+    envelope: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, dict):
+            envelope = parsed
+    except (json.JSONDecodeError, ValueError):
+        envelope = None
+
+    if envelope is not None:
+        verdict = envelope.get("verdict")
+        if verdict in _VALID_VERDICTS:
+            gate_ids_env = tuple(
+                str(g.get("gate_id"))
+                for g in (envelope.get("gates") or [])
+                if isinstance(g, dict) and g.get("gate_id")
+            )
+            return LiveGateInvocation(
+                verdict=str(verdict),
+                run_id=str(envelope.get("run_id") or run_id_fallback),
+                gate_ids=gate_ids_env or gate_ids,
+                assertions=_per_check_results(envelope),
+                evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
+                dispositions_ref=envelope.get("dispositions_ref"),
+                attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
+                dry_run=False,
+                detail={**detail, "source": "results_envelope"},
+            )
+        # A JSON body with a missing/unknown verdict is NOT a valid envelope;
+        # fall through to the exit-code map rather than raise on a bad verdict.
+        detail["envelope_verdict"] = verdict
+
+    return LiveGateInvocation(
+        verdict=_DRIVER_EXIT_VERDICT.get(exit_code, "fail"),
+        run_id=run_id_fallback,
+        gate_ids=gate_ids,
+        dry_run=False,
+        detail={**detail, "source": "exit_code_map"},
+    )
+
+
 class RepoDriverLiveGateInvoker:
     """The REAL per-target live-gate backend: runs a target repo's own driver.
 
@@ -478,7 +552,6 @@ class RepoDriverLiveGateInvoker:
     ) -> LiveGateInvocation:
         # Imported inside the method to keep this module's import surface small
         # (the seam-boundary precedent above).
-        import json
         import subprocess
 
         argv = [*self._driver_argv, "--feature", feature, "--target", target]
@@ -550,55 +623,238 @@ class RepoDriverLiveGateInvoker:
                 },
             )
 
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        detail: dict[str, Any] = {
-            "argv": argv,
+        return project_driver_answer(
+            argv=argv,
+            cwd=str(self._repo_path),
+            exit_code=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            gate_ids=gate_ids,
+            run_id_fallback=run_id_fallback,
+        )
+
+
+class SidecarLiveGateInvoker:
+    """The live gate for a repository that has a sandbox (rule 85).
+
+    The candidate is stood up inside the repository's sandbox and its port is
+    on the sandbox's own loopback, not the host's, so a driver run in the
+    forge container would be checking nothing it can reach. This backend sends
+    the SAME driver argument list the profile declares to that sandbox's
+    deploy sidecar (``POST /run``, the ``driver`` shape), with the candidate
+    tree as the working directory, and reads the answer through the same
+    projection the subprocess backend uses — so a gate means exactly what it
+    meant before, wherever it ran.
+
+    Same posture as the subprocess backend in every other way: :meth:`invoke`
+    NEVER raises, and nothing that goes wrong with the transport is allowed to
+    indict the system under test. A sidecar that cannot be reached, or that
+    refuses the request, is an ``instrument_fail`` (the gate could not be
+    run); a driver stopped at its wall is an ``environment_fail``.
+
+    Args:
+        base_url: The sandbox sidecar's address, e.g. ``http://127.0.0.1:8925``.
+        repo: The ``org/name`` key the sidecar resolves the repository by.
+        repo_path: The working directory the driver runs in, as the SANDBOX
+            sees it — the clone's own path, which is the same path the
+            repository map names.
+        driver_argv: The per-target driver command from the profile. The
+            sidecar checks it against the profile's own declaration and
+            refuses anything else.
+        timeout_seconds: Hard wall on the driver (default 600).
+        extra_env: Non-secret env overlay for the driver, from the profile's
+            ``live_gate.env`` plus the candidate's addressing overlay.
+        http_timeout_margin: Seconds added to the driver's wall before the
+            socket gives up, so the sidecar's own timeout always fires first.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        repo: str,
+        repo_path: Path,
+        driver_argv: list[str],
+        timeout_seconds: int = 600,
+        extra_env: dict[str, str] | None = None,
+        http_timeout_margin: float = 30.0,
+    ) -> None:
+        self._base_url = str(base_url).rstrip("/")
+        self._repo = repo
+        self._repo_path = Path(repo_path)
+        self._driver_argv = list(driver_argv)
+        self._timeout_seconds = timeout_seconds
+        self._extra_env = dict(extra_env or {})
+        self._http_timeout_margin = http_timeout_margin
+
+    @property
+    def repo_path(self) -> Path:
+        """The working directory the driver runs in — the tree it checks."""
+        return self._repo_path
+
+    @property
+    def base_url(self) -> str:
+        """The sandbox sidecar this gate is sent to."""
+        return self._base_url
+
+    def _copy(self, **changes: Any) -> "SidecarLiveGateInvoker":
+        fields: dict[str, Any] = {
+            "base_url": self._base_url,
+            "repo": self._repo,
+            "repo_path": self._repo_path,
+            "driver_argv": list(self._driver_argv),
+            "timeout_seconds": self._timeout_seconds,
+            "extra_env": dict(self._extra_env),
+            "http_timeout_margin": self._http_timeout_margin,
+        }
+        fields.update(changes)
+        return SidecarLiveGateInvoker(**fields)
+
+    def with_repo_path(self, repo_path: Path | str) -> "SidecarLiveGateInvoker":
+        """A copy whose driver runs in ``repo_path`` — the candidate's tree."""
+        return self._copy(repo_path=Path(repo_path))
+
+    def with_extra_env(self, overlay: dict[str, str]) -> "SidecarLiveGateInvoker":
+        """A copy whose driver env is this one's plus ``overlay`` (overlay wins)."""
+        return self._copy(extra_env={**self._extra_env, **overlay})
+
+    def invoke(
+        self, *, feature: str, target: str, gates: tuple[str, ...] = ()
+    ) -> LiveGateInvocation:
+        import json
+        import urllib.error
+        import urllib.request
+
+        args = ["--feature", feature, "--target", target]
+        if gates:
+            args += ["--gates", ",".join(gates)]
+        argv = [*self._driver_argv, *args]
+        run_id_fallback = f"{feature}-{target}"
+        gate_ids = tuple(gates)
+        url = f"{self._base_url}/run"
+        body = {
+            "repo": self._repo,
+            "driver": list(self._driver_argv),
+            "args": args,
+            "env": dict(self._extra_env),
+            "timeout_seconds": float(self._timeout_seconds),
             "cwd": str(self._repo_path),
-            "exit_code": proc.returncode,
-            "stdout_tail": _bounded_tail(stdout),
-            "stderr_tail": _bounded_tail(stderr),
         }
 
-        envelope: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(stdout)
-            if isinstance(parsed, dict):
-                envelope = parsed
-        except (json.JSONDecodeError, ValueError):
-            envelope = None
+        def _instrument(error: str) -> LiveGateInvocation:
+            return LiveGateInvocation(
+                verdict="instrument_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "cwd": str(self._repo_path),
+                    "sidecar": self._base_url,
+                    "exit_code": None,
+                    "error": error,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                },
+            )
 
-        if envelope is not None:
-            verdict = envelope.get("verdict")
-            if verdict in _VALID_VERDICTS:
-                gate_ids_env = tuple(
-                    str(g.get("gate_id"))
-                    for g in (envelope.get("gates") or [])
-                    if isinstance(g, dict) and g.get("gate_id")
-                )
-                return LiveGateInvocation(
-                    verdict=str(verdict),
-                    run_id=str(envelope.get("run_id") or run_id_fallback),
-                    gate_ids=gate_ids_env or gate_ids,
-                    assertions=_per_check_results(envelope),
-                    evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
-                    dispositions_ref=envelope.get("dispositions_ref"),
-                    attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
-                    dry_run=False,
-                    detail={**detail, "source": "results_envelope"},
-                )
-            # A JSON body with a missing/unknown verdict is NOT a valid envelope;
-            # fall through to the exit-code map rather than raise on a bad verdict.
-            detail["envelope_verdict"] = verdict
-
-        verdict = _DRIVER_EXIT_VERDICT.get(proc.returncode, "fail")
-        return LiveGateInvocation(
-            verdict=verdict,
-            run_id=run_id_fallback,
-            gate_ids=gate_ids,
-            dry_run=False,
-            detail={**detail, "source": "exit_code_map"},
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
+        http_timeout = float(self._timeout_seconds) + self._http_timeout_margin
+        try:
+            with urllib.request.urlopen(request, timeout=http_timeout) as resp:
+                answer = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return _instrument(
+                f"the deploy sidecar at {self._base_url} refused the live gate "
+                f"(HTTP {exc.code}): {_error_body(exc)}"
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return _instrument(
+                f"the deploy sidecar at {self._base_url} could not be reached "
+                f"to run the live gate: {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
+            return _instrument(f"live-gate invocation error: {exc}")
+
+        if not isinstance(answer, dict) or not isinstance(
+            answer.get("exit_code"), int
+        ) or isinstance(answer.get("exit_code"), bool):
+            return _instrument(
+                "the deploy sidecar answered something that is not a live-gate "
+                f"result: {answer!r}"
+            )
+        ran_in = answer.get("cwd")
+        if not isinstance(ran_in, str) or not _same_place(
+            str(self._repo_path), ran_in
+        ):
+            return _instrument(
+                f"the live gate was asked to run in {self._repo_path} and the "
+                f"deploy sidecar ran it in {ran_in!r}, so the tree that was "
+                "checked is not the tree that was asked about"
+            )
+        if answer.get("timed_out") is True:
+            return LiveGateInvocation(
+                verdict="environment_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "cwd": ran_in,
+                    "sidecar": self._base_url,
+                    "exit_code": answer.get("exit_code"),
+                    "error": (
+                        f"the live-gate driver was stopped after "
+                        f"{self._timeout_seconds}s inside the sandbox"
+                    ),
+                    "stdout_tail": _bounded_tail(str(answer.get("stdout") or "")),
+                    "stderr_tail": _bounded_tail(
+                        str(answer.get("stderr_tail") or "")
+                    ),
+                },
+            )
+        invocation = project_driver_answer(
+            argv=argv,
+            cwd=ran_in,
+            exit_code=int(answer["exit_code"]),
+            stdout=str(answer.get("stdout") or ""),
+            stderr=str(answer.get("stderr_tail") or ""),
+            gate_ids=gate_ids,
+            run_id_fallback=run_id_fallback,
+        )
+        return replace(
+            invocation,
+            detail={**invocation.detail, "sidecar": self._base_url},
+        )
+
+
+def _error_body(exc: Any) -> str:
+    """The plain sentence inside a sidecar refusal, best effort."""
+    import json
+
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — best-effort detail
+        reason = getattr(exc, "reason", None)
+        return reason if isinstance(reason, str) else "unknown"
+    if isinstance(payload, dict) and "error" in payload:
+        return str(payload["error"])
+    return str(payload)
+
+
+def _same_place(sent: str, answered: str) -> bool:
+    """The same directory, spelled either way: as sent, or fully resolved."""
+    if os.path.normpath(sent) == os.path.normpath(answered):
+        return True
+    try:
+        return Path(sent).resolve() == Path(answered).resolve()
+    except OSError:
+        return False
 
 
 #: The three failure attributions the wire model accepts on an assertion.

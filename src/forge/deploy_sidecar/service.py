@@ -13,6 +13,11 @@ The narrow contract:
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
+    POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
+              -> {exit_code, stdout, stderr_tail, timed_out, cwd, warnings}
+    POST /run  {repo, declared_test, cwd, timeout_seconds}
+              -> {exit_code, stdout, stderr_tail, timed_out, cwd, command,
+                  warnings}
     POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
                            timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
@@ -23,6 +28,19 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
+    POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
+    POST /git/candidate-tree {repo, feature_id, sha}
+              -> {path, tree, exclude_written}
+    POST /git/candidate-tree-remove {repo, feature_id} -> {removed, path}
+    POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
+              -> {feature_yaml, envelope, code_commit_time, history_dir}
+
+The three routes after ``/git/rev-parse`` are the merge press's own git
+(sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
+removal of the branch's tree for the candidate check. Each derives the tree's
+place from the repository its ``repo`` key names, so no path a caller sends
+ever reaches git or the filesystem here. See the section above
+:func:`process_git_is_ancestor_request`.
 
 The three git operations (sandbox first, 2026-09-07, rule 70) make the
 planning chain's commits where the repository lives: the caller declares the
@@ -77,6 +95,21 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    caller can tell a sidecar that honoured the candidate tree from one that
    is running old code or a different checkout path and silently ran the
    script from the checkout — main, checked and reported as the branch.
+11. The two shapes of ``/run`` whose work is not a vetted script (sandbox
+   first, rules 85 and 88) keep the same posture by a different route: the
+   program comes from the repository, never from the message. ``driver`` must
+   be exactly the argument list ``deploy/profile.yaml`` declares as the
+   live-gate driver, and ``declared_test`` must be exactly the command
+   ``.guardkit/config.yaml`` declares as the toolchain's test; anything else
+   is refused in one plain sentence before a process starts. The declared
+   test command's working directory must be one of this repository's own
+   journey worktrees (LAW 10), and the live-gate driver's may be a candidate
+   tree exactly as LAW 8 allows. Both, and ``/routing-stamps/evidence``
+   beside them, are answered ONLY by a sidecar running inside a repository's
+   sandbox (the bootstrap sets ``FORGE_SIDECAR_IN_SANDBOX``): they exist so a
+   repository's own code and its own records are run and read where the
+   repository lives, and a host sidecar refuses all three in one plain
+   sentence saying where the request belongs.
 
 Each request-processing core (:func:`process_run_request` and
 :func:`process_guardkit_merge_request`) is a pure function
@@ -99,8 +132,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
@@ -110,6 +144,7 @@ from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
     load_deploy_profile,
+    wrapper_inner_script,
 )
 from forge.executor.shell_steps import _run_script_step
 from forge.memory.redaction import scrub_process_output
@@ -173,6 +208,42 @@ OUTPUT_TAIL_CHARS: int = 65_536
 
 #: Truncation marker prepended when the tail drops leading output.
 _TAIL_MARKER = "... [OUTPUT HEAD TRUNCATED] ...\n"
+
+
+# --- the two answers /run gives when the work is not a vetted script --------
+#
+# SANDBOX FIRST (2026-09-07, rules 85 and 88). Two pieces of work that used to
+# happen in the forge container have to happen where the repository lives: the
+# live-gate driver (rule 85 — the candidate's port is on the sandbox's own
+# loopback, not the host's) and the merge-ready gates reader's declared test
+# command (rule 88 — for a sandbox repository neither the toolchain nor the
+# journey worktree exists on the host, so the reader could only ever answer
+# UNKNOWN, and a fix journey could never publish a merge card).
+#
+# Both ride ``POST /run``, and both keep LAW 2's posture exactly: THE PROGRAM
+# COMES FROM THE REPOSITORY, NEVER FROM THE MESSAGE. The caller sends what it
+# wants run, and this service checks it against the repository's own
+# checked-in declaration — the driver against ``deploy/profile.yaml``'s
+# ``live_gate.driver``, the test command against ``.guardkit/config.yaml``'s
+# ``toolchain.test`` — and refuses anything else in one plain sentence. So a
+# message can choose between the repository's own two declared commands and
+# can name no other program at all.
+
+#: How many extra argument tokens the live-gate driver may carry, and how long
+#: one may be. The driver's own flags are few; these exist so a runaway caller
+#: cannot hand the service an unbounded argument list.
+DRIVER_MAX_ARGS: int = 32
+DRIVER_MAX_ARG_CHARS: int = 4_096
+
+#: Where a repository's toolchain declaration lives, and the two shapes the
+#: estate installs guardkit in. The same candidates
+#: :func:`forge.cli._serve_conductor.load_declared_toolchain` uses — resolved
+#: here rather than imported so the sidecar never pulls the daemon's CLI in.
+#: Both delegate to guardkit's OWN loader; neither parses the YAML itself.
+TOOLCHAIN_MODULE_CANDIDATES: tuple[str, ...] = (
+    "guardkit.orchestrator.toolchain_declaration",
+    "orchestrator.toolchain_declaration",
+)
 
 
 # --- the merge operation's own constants -----------------------------------
@@ -256,6 +327,12 @@ class MergeRunner(Protocol):
 
     Injected so tests can record exactly what the sidecar would have run
     without starting a process. Returns ``(exit_code, stdout, stderr)``.
+
+    ``what`` names the command in a "could not be started" sentence, and
+    ``extra_env`` is a non-secret overlay for the command's own environment.
+    Both are optional: every caller that predates the live gate and the gates
+    reader leaves them out, so a runner that does not accept them is still a
+    runner.
     """
 
     def __call__(
@@ -264,6 +341,8 @@ class MergeRunner(Protocol):
         argv: list[str],
         cwd: str,
         timeout: float = ...,
+        what: str = ...,
+        extra_env: dict[str, str] | None = ...,
     ) -> tuple[int, str, str]: ...
 
 
@@ -325,7 +404,46 @@ def _looks_like_script_path(token: str) -> bool:
     return ("/" in token) or token.endswith((".py", ".sh"))
 
 
-def allowed_scripts(profile: DeployProfile) -> set[str]:
+#: The environment value the in-sandbox bootstrap (``deploy_templates/
+#: sandbox-runner.sh``) sets before it starts this service. It says one thing:
+#: *this copy of the sidecar is running inside a repository's sandbox*.
+SIDECAR_IN_SANDBOX_ENV: str = "FORGE_SIDECAR_IN_SANDBOX"
+
+#: What counts as "yes" in that value.
+_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
+def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
+    """Is this sidecar the one inside a repository's sandbox?
+
+    Read from the environment the bootstrap sets, and ``False`` whenever it is
+    absent or says anything else — so the sidecar on the HOST, which is the
+    one every repository without a sandbox still uses, never widens anything
+    on the strength of a value nobody set.
+    """
+    source = os.environ if env is None else env
+    return str(source.get(SIDECAR_IN_SANDBOX_ENV, "")).strip().lower() in _TRUTHY
+
+
+def _not_inside_a_sandbox(what: str, *, verb: str = "run") -> str:
+    """The refusal a HOST sidecar gives to the sandbox-only shapes.
+
+    Written for whoever reads it in a log or a receipt: it says which sidecar
+    answered, why it will not do this, and where the request should have gone.
+    """
+    return (
+        "this sidecar is running on the host, not inside a repository's "
+        f"sandbox, so it will not {verb} a repository's {what}. That is what the "
+        "sidecar inside the repository's sandbox is for: a repository's own "
+        "code runs where the repository lives, never on the host. Send this "
+        "request to that sandbox's sidecar (its address is the repository's "
+        "sidecar_url in planning.sandboxes)."
+    )
+
+
+def allowed_scripts(
+    profile: DeployProfile, *, inside_sandbox: bool | None = None
+) -> set[str]:
     """The ONLY scripts this profile permits the sidecar to run (LAW 2).
 
     ``compose.script`` + every ``health_checks[].cmd`` + the ``live_gate.driver``
@@ -336,6 +454,30 @@ def allowed_scripts(profile: DeployProfile) -> set[str]:
     scripts: set[str] = set()
     if profile.compose.script:
         scripts.add(profile.compose.script)
+        # SANDBOX FIRST (rule 85), AND ONLY INSIDE ONE (L3b's coach, 2026-09-08).
+        # A profile that names a HOST sandbox wrapper (``deploy/
+        # sandbox-deploy.sh``) names its inner script too, by the shared
+        # template's fixed pairing: the wrapper's whole job is to put the
+        # sandbox in place and then run ``deploy/deploy.sh`` inside it. The
+        # sidecar INSIDE that sandbox cannot run the wrapper — it would ask
+        # ``sbx`` for a sandbox from inside one — so the deploy stage sends it
+        # the inner script and this allowlist has to name it.
+        #
+        # The sidecar on the HOST must NOT name it. There the wrapper is the
+        # whole point: it is what puts the work inside a sandbox, and
+        # permitting the inner script would let something ask the host sidecar
+        # to run the repository's deploy straight against the host's Docker
+        # engine — the wall Rich's rule of 2026-09-07 puts up. So the widening
+        # is gated on the bootstrap's own flag, and a host sidecar's allowlist
+        # is byte for byte what it was before this lane.
+        if (
+            sidecar_is_inside_sandbox()
+            if inside_sandbox is None
+            else bool(inside_sandbox)
+        ):
+            inner = wrapper_inner_script(profile.compose.script)
+            if inner:
+                scripts.add(inner)
     for check in profile.health_checks:
         if check.cmd:
             scripts.add(check.cmd)
@@ -421,11 +563,344 @@ def _tail(output: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _allowlisted_env(
+    raw_env: Any, profile: DeployProfile
+) -> tuple[dict[str, str], str | None]:
+    """LAW 3 — the caller's env, or one plain sentence saying why not.
+
+    One implementation for every shape ``/run`` carries: the vetted script,
+    the live-gate driver. Absent reads as no overlay at all.
+    """
+    if raw_env is None:
+        raw_env = {}
+    if not isinstance(raw_env, dict):
+        return {}, "'env' must be a JSON object of allowlisted string values"
+    permitted_keys = allowed_env_keys(profile)
+    env: dict[str, str] = {}
+    for key, value in raw_env.items():
+        if key not in permitted_keys:
+            names = ", ".join(sorted(permitted_keys))
+            return {}, (
+                f"env key {key!r} is not allowlisted — deny by default. "
+                f"Allowed: {names}"
+            )
+        if not isinstance(value, str):
+            return {}, (
+                f"env value for {key!r} must be a string, got "
+                f"{type(value).__name__}"
+            )
+        env[key] = value
+    return env, None
+
+
+def _text_list(
+    value: Any, *, field: str, max_items: int, max_chars: int
+) -> tuple[list[str], str | None]:
+    """Read a list of plain-text tokens; return ``(tokens, error)``.
+
+    Absent reads as an empty list. Anything that is not a bounded list of
+    text is a refusal in one sentence, checked before a process starts.
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"'{field}' must be a list of text values"
+    if len(value) > max_items:
+        return [], (
+            f"'{field}' may carry at most {max_items} values; got {len(value)}"
+        )
+    tokens: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            return [], (
+                f"every entry in '{field}' must be written as text; got "
+                f"{type(entry).__name__}"
+            )
+        if len(entry) > max_chars:
+            return [], (
+                f"a value in '{field}' may be at most {max_chars} characters "
+                f"long; one is {len(entry)}"
+            )
+        tokens.append(entry)
+    return tokens, None
+
+
+def declared_test_command(
+    repo_path: "Path | str",
+    *,
+    module_candidates: Sequence[str] = TOOLCHAIN_MODULE_CANDIDATES,
+) -> tuple[str | None, int | None, str | None]:
+    """The repository's own declared test command, read where it lives.
+
+    Returns ``(command, timeout_seconds, error)``. Delegates to guardkit's OWN
+    ``toolchain_declaration.load_toolchain_declaration`` — the loader that
+    owns the schema — so this service never forms a second opinion about what
+    a repository declared. ``error`` is one plain sentence when guardkit is
+    not importable here, when the repository declares no toolchain, or when it
+    declares one with no ``test:`` command; the caller turns that into a
+    refusal and the gates reader turns the refusal into UNKNOWN, which is red.
+    Never raises.
+    """
+    for candidate in module_candidates:
+        try:
+            module = import_module(candidate)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        try:
+            declaration = module.load_toolchain_declaration(Path(repo_path))
+        except Exception as exc:  # noqa: BLE001 — a loader defect is not a pass
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml could not be read: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if declaration is None:
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml declares no toolchain, so "
+                "there is no declared test command to run"
+            )
+        command = getattr(declaration, "test", None)
+        if not command:
+            return None, None, (
+                f"{repo_path}/.guardkit/config.yaml declares a toolchain but "
+                "no `test:` command, so there is no verdict-bearing gate to run"
+            )
+        timeout = getattr(declaration, "test_timeout", None)
+        return (
+            str(command),
+            int(timeout) if isinstance(timeout, int) and timeout > 0 else None,
+            None,
+        )
+    return None, None, (
+        "guardkit's toolchain declaration loader is not importable in this "
+        f"service (tried {', '.join(module_candidates)}), so "
+        f"{repo_path}'s declared test command cannot be read"
+    )
+
+
+def _bounded_timeout(value: Any, *, default: float, ceiling: float) -> tuple[
+    float, list[dict[str, str]], str | None
+]:
+    """The wall this run gets: the caller's, clamped, never refused for length.
+
+    Ruled 2026-09-07 21:05Z on the leg route and applied here for the same
+    reason: a stage wall wider than a route's ceiling should run at the
+    ceiling with a warning on the result, not fail a run that could have
+    happened. A wall that is not a positive number is still a refusal, because
+    that is a mistake in the caller rather than an ambitious budget.
+    """
+    if value is None:
+        return default, [], None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return default, [], "'timeout_seconds' must be a positive number"
+    timeout = float(value)
+    if timeout <= ceiling:
+        return timeout, [], None
+    return ceiling, [
+        {
+            "code": "timeout_clamped",
+            "message": (
+                f"this run was asked for up to {timeout:g} seconds, which is "
+                f"longer than the longest wall this route allows, so it was "
+                f"given {ceiling:g} seconds instead"
+            ),
+        }
+    ], None
+
+
+def process_live_gate_run(
+    payload: dict[str, Any],
+    *,
+    repo_path: Path,
+    profile: DeployProfile,
+    extra_env: dict[str, str],
+    command_runner: MergeRunner,
+) -> tuple[int, dict[str, Any]]:
+    """``/run`` carrying the repository's own live-gate driver (rule 85).
+
+    The candidate stands up inside the sandbox and its port is on the
+    sandbox's own loopback, so the driver that checks it has to run in there
+    too. The driver is the profile's ``live_gate.driver`` and nothing else:
+    the request must send that exact argument list, and any other program is
+    refused. The flags the caller adds (``--feature``, ``--target``,
+    ``--gates``) ride in ``args``.
+
+    The answer carries ``stdout`` whole (up to the merge route's cap) rather
+    than a combined tail, because the driver prints its results envelope
+    there and the caller reads the verdict out of it.
+    """
+    spec = profile.live_gate
+    if spec is None:
+        return 400, {
+            "error": (
+                "this repository's deploy/profile.yaml declares no live_gate "
+                "driver, so there is no gate for the sidecar to run"
+            )
+        }
+    driver, error = _text_list(
+        payload.get("driver"),
+        field="driver",
+        max_items=DRIVER_MAX_ARGS,
+        max_chars=DRIVER_MAX_ARG_CHARS,
+    )
+    if error:
+        return 400, {"error": error}
+    declared = [token for token in spec.driver]
+    if driver != declared:
+        return 400, {
+            "error": (
+                "the live-gate driver must be the one this repository's "
+                f"deploy/profile.yaml declares ({' '.join(declared)}); it was "
+                f"asked to run {' '.join(driver) if driver else '(nothing)'}"
+            )
+        }
+    args, error = _text_list(
+        payload.get("args"),
+        field="args",
+        max_items=DRIVER_MAX_ARGS,
+        max_chars=DRIVER_MAX_ARG_CHARS,
+    )
+    if error:
+        return 400, {"error": error}
+    timeout, warnings, error = _bounded_timeout(
+        payload.get("timeout_seconds"),
+        default=float(spec.timeout_seconds),
+        ceiling=MERGE_TIMEOUT_MAX,
+    )
+    if error:
+        return 400, {"error": error}
+
+    cwd = _resolve_cwd(repo_path, profile)
+    candidate_cwd, cwd_error = _resolve_requested_cwd(repo_path, payload.get("cwd"))
+    if cwd_error is not None:
+        return 400, {"error": cwd_error}
+    if candidate_cwd is not None:
+        cwd = candidate_cwd
+
+    argv = [*driver, *args]
+    logger.info(
+        "forge-deploy-sidecar: running the live-gate driver %s in %s (up to "
+        "%g seconds)",
+        " ".join(argv),
+        cwd,
+        timeout,
+    )
+    try:
+        exit_code, stdout, stderr = command_runner(
+            argv=argv,
+            cwd=str(cwd),
+            timeout=timeout,
+            what="the live-gate driver",
+            extra_env=extra_env or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "cwd": str(cwd),
+        "warnings": warnings,
+    }
+
+
+def process_declared_test_run(
+    payload: dict[str, Any],
+    *,
+    repo_path: Path,
+    command_runner: MergeRunner,
+) -> tuple[int, dict[str, Any]]:
+    """``/run`` carrying the repository's own declared test command (rule 88).
+
+    The merge-ready gates reader runs the command the repository declares in
+    ``.guardkit/config.yaml`` in the fix journey's worktree, and for a
+    repository with a sandbox neither that file nor that worktree exists on
+    the host. So it runs here. The command is read from the repository's own
+    declaration by guardkit's own loader and the request must send that exact
+    command; anything else is refused. The working directory must be one of
+    this repository's own journey worktrees.
+
+    A declaration is a *command line* (``uv run --frozen pytest -q``), which
+    is what the repository owner wrote and what guardkit's own executor runs,
+    so it is handed to ``/bin/sh -c`` — the same shape the in-container reader
+    uses. What may reach that shell is the repository's own checked-in text
+    and nothing a caller composed.
+    """
+    error = _worktree_path_error(repo_path, payload.get("cwd"), what="cwd")
+    if error:
+        return 400, {"error": error}
+    cwd = os.path.normpath(os.path.abspath(str(payload["cwd"])))
+    if not os.path.isdir(cwd):
+        return 400, {
+            "error": (
+                f"the working directory {cwd} is not there, so there is "
+                "nowhere to run the declared test command"
+            )
+        }
+    declared, declared_timeout, error = declared_test_command(repo_path)
+    if error or declared is None:
+        return 400, {"error": error}
+    asked = payload.get("declared_test")
+    if not isinstance(asked, str) or asked != declared:
+        return 400, {
+            "error": (
+                "the test command must be the one this repository declares in "
+                f".guardkit/config.yaml ({declared!r}); it was asked to run "
+                f"{asked!r}"
+            )
+        }
+    timeout, warnings, error = _bounded_timeout(
+        payload.get("timeout_seconds"),
+        default=float(declared_timeout or 300),
+        ceiling=MERGE_TIMEOUT_MAX,
+    )
+    if error:
+        return 400, {"error": error}
+
+    logger.info(
+        "forge-deploy-sidecar: running the declared test command %r in %s "
+        "(up to %g seconds)",
+        declared,
+        cwd,
+        timeout,
+    )
+    try:
+        exit_code, stdout, stderr = command_runner(
+            argv=["/bin/sh", "-c", declared],
+            cwd=cwd,
+            timeout=timeout,
+            what="the declared test command",
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {
+            "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr_tail": "",
+        }
+    return 200, {
+        "exit_code": exit_code,
+        "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
+        "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        "timed_out": exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        "cwd": cwd,
+        "command": declared,
+        "warnings": warnings,
+    }
+
+
 def process_run_request(
     payload: Any,
     *,
     config: ForgeConfig,
     script_runner: ScriptRunner = _run_script_step,
+    command_runner: "MergeRunner | None" = None,
+    inside_sandbox: bool | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + execute a ``/run`` payload; return ``(http_status, body)``.
 
@@ -434,6 +909,28 @@ def process_run_request(
     error, and a 200 with ``{exit_code, output_tail, cwd}`` on a permitted run (the
     script's non-zero exit is a 200 with a non-zero ``exit_code``, not an HTTP
     error — the script's verdict is data, not a transport failure). Never raises.
+
+    Two other kinds of work reach this route (sandbox first, rules 85 and 88),
+    each named by its own field and each running the repository's own declared
+    command rather than one the caller composed: ``driver`` runs the profile's
+    live-gate driver (:func:`process_live_gate_run`), and ``declared_test``
+    runs the repository's declared test command in a journey worktree
+    (:func:`process_declared_test_run`). A request carrying neither is the
+    vetted-script request this route has always served, unchanged.
+
+    BOTH of those are refused unless this sidecar is the one INSIDE a
+    repository's sandbox (L3b's coach, 2026-09-08). They exist so that a
+    repository's own code runs where the repository lives; answering them on
+    the host would be the opposite — the host sidecar would run a
+    repository's whole test suite, or its live-gate driver, under the
+    operator's account, which is the wall Rich's rule of 2026-09-07 puts up.
+    The host sidecar therefore still runs exactly what it ran before this
+    lane: the programs ``deploy/profile.yaml`` names, and nothing else.
+
+    ``inside_sandbox`` is the answer to "is this sidecar inside a sandbox?".
+    Left as ``None`` it is read from the bootstrap's own environment value
+    (:func:`sidecar_is_inside_sandbox`), which is how the running service
+    answers it; a caller passes it only in tests.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -462,12 +959,49 @@ def process_run_request(
         }
     repo_path = Path(paths[repo])
 
+    in_sandbox = (
+        sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
+    )
+
+    # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
+    # command. It is answered BEFORE the deploy profile is read, because a
+    # repository can have a fix journey without being deployable at all: what
+    # it needs is a toolchain declaration and a journey worktree, not a deploy
+    # profile. Its own function checks both.
+    if payload.get("declared_test") is not None:
+        if not in_sandbox:
+            return 400, {"error": _not_inside_a_sandbox("declared test command")}
+        return process_declared_test_run(
+            payload,
+            repo_path=repo_path,
+            command_runner=command_runner or run_merge_command,
+        )
+
     # LAW 2 (part a) — re-read the target's profile ourselves.
     profile_path = repo_path / "deploy" / "profile.yaml"
     try:
         profile = load_deploy_profile(profile_path)
     except DeployProfileError as exc:
         return 400, {"error": f"target repo {repo!r} is not deployable: {exc}"}
+
+    # SANDBOX FIRST (rule 85) — the live-gate driver, whose program comes from
+    # the repository's profile rather than from ``script``. Answered whole by
+    # its own function, before a single line of the vetted-script path below
+    # is reached, so that path is exactly what it always was for every request
+    # that does not name a driver.
+    if payload.get("driver") is not None:
+        if not in_sandbox:
+            return 400, {"error": _not_inside_a_sandbox("live-gate driver")}
+        env_only, error = _allowlisted_env(payload.get("env"), profile)
+        if error:
+            return 400, {"error": error}
+        return process_live_gate_run(
+            payload,
+            repo_path=repo_path,
+            profile=profile,
+            extra_env=env_only,
+            command_runner=command_runner or run_merge_command,
+        )
 
     # LAW 2 (part b) — refuse any script the profile does not name.
     if not isinstance(script, str) or not script.strip():
@@ -477,7 +1011,7 @@ def process_run_request(
                 "deploy/profile.yaml)"
             )
         }
-    permitted = allowed_scripts(profile)
+    permitted = allowed_scripts(profile, inside_sandbox=in_sandbox)
     if script not in permitted:
         names = ", ".join(sorted(permitted)) or (
             "(none — the profile names no runnable scripts)"
@@ -491,31 +1025,9 @@ def process_run_request(
         }
 
     # LAW 3 — env keys allowlisted, values must be strings.
-    if raw_env is None:
-        raw_env = {}
-    if not isinstance(raw_env, dict):
-        return 400, {
-            "error": "'env' must be a JSON object of allowlisted string values"
-        }
-    permitted_keys = allowed_env_keys(profile)
-    extra_env: dict[str, str] = {}
-    for key, value in raw_env.items():
-        if key not in permitted_keys:
-            names = ", ".join(sorted(permitted_keys))
-            return 400, {
-                "error": (
-                    f"env key {key!r} is not allowlisted — deny by default. "
-                    f"Allowed: {names}"
-                )
-            }
-        if not isinstance(value, str):
-            return 400, {
-                "error": (
-                    f"env value for {key!r} must be a string, got "
-                    f"{type(value).__name__}"
-                )
-            }
-        extra_env[key] = value
+    extra_env, env_error = _allowlisted_env(raw_env, profile)
+    if env_error is not None:
+        return 400, {"error": env_error}
 
     # LAW 4 — timeout cap.
     timeout = TIMEOUT_DEFAULT
@@ -632,6 +1144,8 @@ def run_merge_command(
     argv: list[str],
     cwd: str,
     timeout: float = MERGE_TIMEOUT_DEFAULT,
+    what: str = "the merge command",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run one fixed argument list with no shell; return exit code and output.
 
@@ -642,11 +1156,26 @@ def run_merge_command(
 
     Never raises: a command that cannot be started comes back as a non-zero
     exit code with a plain sentence saying so.
+
+    ``what`` names the command in those sentences. It is the merge command by
+    default, because that is what this runner was written for and what every
+    existing caller runs; the live gate and the gates reader (sandbox first,
+    rules 85 and 88) pass their own name so a person reading a failure is told
+    which command would not start.
+
+    ``extra_env`` is laid over this service's own environment for the command
+    only. The live-gate driver needs it: the candidate leg's gate must address
+    the candidate's port rather than the live one, and that address is one of
+    the allowlisted, non-secret values the profile itself declares. ``None``
+    (every caller before the live gate) inherits the environment exactly as
+    before.
     """
+    env = (os.environ | extra_env) if extra_env else None
     try:
         process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             argv,
             cwd=cwd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -655,18 +1184,18 @@ def run_merge_command(
         return (
             MERGE_NOT_STARTED_EXIT_CODE,
             "",
-            f"the merge command could not be started: {exc}",
+            f"{what} could not be started: {exc}",
         )
     except NotADirectoryError as exc:
         return (
             MERGE_NOT_STARTED_EXIT_CODE,
             "",
-            f"the merge command could not be started: {exc}",
+            f"{what} could not be started: {exc}",
         )
     except PermissionError as exc:
-        return (126, "", f"the merge command could not be run: {exc}")
+        return (126, "", f"{what} could not be run: {exc}")
     except OSError as exc:
-        return (1, "", f"the merge command could not be started: {exc}")
+        return (1, "", f"{what} could not be started: {exc}")
 
     timed_out = False
     try:
@@ -687,7 +1216,7 @@ def run_merge_command(
     stderr = scrub_process_output((raw_err or b"").decode("utf-8", errors="replace"))
     if timed_out:
         stderr += (
-            f"\nthe merge command was stopped after {timeout:g} seconds and "
+            f"\n{what} was stopped after {timeout:g} seconds and "
             "everything it had started was stopped with it"
         )
     return exit_code, stdout, stderr
@@ -1732,6 +2261,210 @@ def process_git_rev_parse_request(
 
 
 # ---------------------------------------------------------------------------
+# The merge press's own git, made where the repository lives
+# (sandbox first, 2026-09-07, rule 89)
+# ---------------------------------------------------------------------------
+#
+# The merge word is one of Rich's three touches, and for a repository whose
+# factory lives in its sandbox the branch the build made is in the clone in
+# there — not in the copy of the repository on this side. So the press's own
+# git comes here: the ancestry questions it asks before and after the merge,
+# the lay-out of the branch's tree for the candidate check, and that tree's
+# removal when the run ends. The branch look-up, main's commit and the tree
+# ids are the existing ``/git/rev-parse`` route, which already answers a
+# ``^{tree}`` revision.
+#
+# Each route acts on the repository its ``repo`` key names and on NO path the
+# caller sends: the tree's place is derived here, from that repository's own
+# path, exactly as :mod:`forge.deploy.candidate_tree` derives it on the other
+# side. Refs and ids are shape-checked before git is started, and no shell is
+# ever used.
+#
+# WHY THESE THREE ARE NOT GATED ON "AM I INSIDE A SANDBOX?", when the two
+# ``/run`` shapes and the routing-law evidence are. Those three run or read a
+# repository's OWN things — its test suite, its live-gate driver, its records
+# — and running a repository's code on the host is the wall Rich's rule of
+# 2026-09-07 puts up. These three run git and nothing else: a commit look-up,
+# an ancestry question, and an archive of a commit extracted into a directory,
+# with no repository code executed and no shell. They are the same class of
+# thing as ``/git/rev-parse`` and ``/git/read-file-from-branch``, which the
+# sidecar on the host has answered since L1 because the planning chain uses
+# them. So the host sidecar answers these too, for the repositories it already
+# serves, and gains no power it did not have.
+
+#: The three routes.
+GIT_IS_ANCESTOR_ROUTE: str = "/git/is-ancestor"
+GIT_CANDIDATE_TREE_ROUTE: str = "/git/candidate-tree"
+GIT_CANDIDATE_TREE_REMOVE_ROUTE: str = "/git/candidate-tree-remove"
+
+
+def _feature_id_error(value: Any) -> str | None:
+    """A plain sentence unless ``value`` is one plain feature id.
+
+    The id becomes one directory name under the trees root, so it is held to
+    the same shape every other id on these routes is: letters, digits and the
+    three separators, and never a path.
+    """
+    if not isinstance(value, str) or not SAFE_NAME_PATTERN.match(value):
+        return (
+            "'feature_id' is required and must be a plain feature id (letters, "
+            "digits, dots, dashes and underscores, no slashes); got "
+            f"{value!r}"
+        )
+    return None
+
+
+def process_git_is_ancestor_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, ancestor, descendant}`` → ``{is_ancestor}``.
+
+    ``git merge-base --is-ancestor`` in this repository: ``true``, ``false``,
+    or ``null`` when git could not say (a commit it does not know, or git not
+    running), which is exactly the three answers the press's guards are
+    written for. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    ancestor = payload.get("ancestor")
+    error = _ref_error(ancestor, what="ancestor")
+    if error:
+        return 400, {"error": error}
+    descendant = payload.get("descendant")
+    error = _ref_error(descendant, what="descendant")
+    if error:
+        return 400, {"error": error}
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "merge-base",
+                "--is-ancestor",
+                str(ancestor),
+                str(descendant),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    if result.returncode == 0:
+        return 200, {"is_ancestor": True}
+    if result.returncode == 1:
+        return 200, {"is_ancestor": False}
+    return 200, {
+        "is_ancestor": None,
+        "detail": (
+            f"git could not say whether {ancestor} is in {descendant} "
+            f"(it exited {result.returncode})"
+        ),
+    }
+
+
+def process_git_candidate_tree_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id, sha}`` → ``{path, tree, exclude_written}``.
+
+    Lays the tree of ``sha`` out at ``<clone>/.forge-candidates/<feature id>``
+    with the very code the in-container venue runs
+    (:func:`forge.deploy.candidate_tree.materialise_candidate_tree`), keeps
+    that directory out of the clone's eyes first, and answers the commit's
+    tree id so the caller need not ask twice.
+
+    A lay-out that fails leaves nothing behind and comes back as a 400 with
+    git's own words: it is an answer about this repository, not a transport
+    failure. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    error = _feature_id_error(feature_id)
+    if error:
+        return 400, {"error": error}
+    sha = payload.get("sha")
+    error = _ref_error(sha, what="sha")
+    if error:
+        return 400, {"error": error}
+
+    from forge.deploy.candidate_tree import (
+        CandidateTreeError,
+        ensure_candidate_trees_excluded,
+        git_rev_parse,
+        materialise_candidate_tree,
+    )
+
+    logger.info(
+        "forge-deploy-sidecar: laying %s's tree out for %s in %s",
+        sha,
+        feature_id,
+        repo_path,
+    )
+    try:
+        excluded = _run_coroutine(ensure_candidate_trees_excluded(repo_path))
+        laid_out = _run_coroutine(
+            materialise_candidate_tree(repo_path, str(feature_id), str(sha))
+        )
+        tree = _run_coroutine(git_rev_parse(repo_path, f"{sha}^{{tree}}"))
+    except CandidateTreeError as exc:
+        return 400, {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    return 200, {
+        "path": str(laid_out),
+        "tree": tree,
+        "exclude_written": excluded,
+    }
+
+
+def process_git_candidate_tree_remove_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id}`` → ``{removed, path}``.
+
+    Removes ``<clone>/.forge-candidates/<feature id>``. A tree that is already
+    gone is a removal that succeeded — the press calls this on every ending,
+    including endings where nothing was ever laid out. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    error = _feature_id_error(feature_id)
+    if error:
+        return 400, {"error": error}
+
+    from forge.deploy.candidate_tree import (
+        CandidateTreeError,
+        candidate_tree_path,
+        remove_candidate_tree,
+    )
+
+    try:
+        path = candidate_tree_path(repo_path, str(feature_id))
+    except CandidateTreeError as exc:
+        return 400, {"error": str(exc)}
+    logger.info("forge-deploy-sidecar: removing the candidate tree at %s", path)
+    try:
+        removed = _run_coroutine(remove_candidate_tree(path))
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    return 200, {"removed": bool(removed), "path": str(path)}
+
+
+# ---------------------------------------------------------------------------
 # The fix journey's tree and its receipts, made where the repository lives
 # (sandbox first, 2026-09-07, rules 76 and 77)
 # ---------------------------------------------------------------------------
@@ -1976,6 +2709,164 @@ def process_receipts_export_request(
         "families": families,
         "files": [f"{dest}/{name}" for name in families]
         + [f"{dest}/{name}" for name in sorted(extra_files or {})],
+    }
+
+
+# ---------------------------------------------------------------------------
+# The routing law's own evidence, read where the repository lives (rule 88)
+# ---------------------------------------------------------------------------
+#
+# Found by L3b's coach, 2026-09-08. The merge-ready gates reader has five
+# steps, and the last one is the routing law's stamped-verifier check: it
+# reads the feature's per-scenario ``verifier:`` stamps from the canonical
+# repository and then asks, home by home, whether the promised verifier
+# really ran green for this branch — from the newest results envelope under
+# the journey worktree, and the branch's last code commit time, which says
+# whether that envelope is fresh enough to count.
+#
+# All three of those live inside the sandbox for a repository that has one.
+# Left reading the host, the check found no feature file, answered "this
+# feature carries no scenario stamps", had no effect, and a GREEN merge card
+# went out with the routing law silently not applied. That is the one
+# direction this reader is written never to fail in. So the three reads
+# happen here, and the DECISION still happens on the forge side, out of the
+# same pure function it always used: this route reads, it never judges.
+
+#: The route.
+STAMPS_EVIDENCE_ROUTE: str = "/routing-stamps/evidence"
+
+
+def process_stamps_evidence_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    worktrees_root: Path | None = None,
+    inside_sandbox: bool | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id, worktree, branch}`` → the routing law's evidence.
+
+    The answer carries three things and no opinion about them:
+
+    * ``feature_yaml`` — the feature's plan of record, read from the CANONICAL
+      branch of the factory's clone (``main``, never the worktree the journey
+      has been editing, for the same reason the declared toolchain is), with
+      the path it has in here so every sentence a person reads names the real
+      file. ``present`` is false when the file is not on that branch, which
+      upstream reads exactly as an absent file on the host does.
+    * ``envelope`` — the newest results envelope under the journey worktree's
+      ``qa/gates/history/``, or ``null``.
+    * ``code_commit_time`` — the branch's last code commit, ISO-8601, or
+      ``null`` when git could not say.
+
+    The worktree must be one of this repository's own journey worktrees (LAW
+    10). Never raises.
+
+    REFUSED ON THE HOST, like the two ``/run`` shapes beside it (L3e, the
+    third coach's second must-fix). This route exists so that the routing
+    law's evidence is read where a sandboxed repository's clone, its journey
+    worktrees and its gate receipts actually are; a host sidecar answering it
+    would be reading the operator's own checkout, which is the wall Rich's
+    rule of 2026-09-07 puts up. ``inside_sandbox`` is read from the
+    bootstrap's environment value unless a caller (a test) says otherwise.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    in_sandbox = (
+        sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
+    )
+    if not in_sandbox:
+        return 400, {
+            "error": _not_inside_a_sandbox("routing-law evidence", verb="read")
+        }
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    if not isinstance(feature_id, str) or not SAFE_NAME_PATTERN.match(feature_id):
+        return 400, {
+            "error": (
+                "'feature_id' is required and must be a plain feature id "
+                f"(letters, digits, dots, dashes and underscores); got "
+                f"{feature_id!r}"
+            )
+        }
+    error = _worktree_path_error(repo_path, payload.get("worktree"), what="worktree")
+    if error:
+        return 400, {"error": error}
+    worktree = os.path.normpath(os.path.abspath(str(payload["worktree"])))
+    branch = payload.get("branch")
+    if branch is not None:
+        error = _ref_error(branch, what="branch")
+        if error:
+            return 400, {"error": error}
+    from forge.cli._conductor_worktree import JOURNEY_BASE_REF
+
+    canonical = payload.get("canonical_branch") or JOURNEY_BASE_REF
+    error = _ref_error(canonical, what="canonical_branch")
+    if error:
+        return 400, {"error": error}
+
+    from forge.pipeline.routing_stamps import (
+        HISTORY_RELATIVE_PATH,
+        feature_yaml_relative_path,
+        read_last_code_commit_time,
+        read_newest_envelope,
+    )
+
+    runner = _git_runner(worktrees_root)
+    found_path = feature_yaml_relative_path(feature_id)
+    content: str | None = None
+    try:
+        for suffix in ("yaml", "yml"):
+            relative = feature_yaml_relative_path(feature_id, suffix=suffix)
+            answer = _run_coroutine(
+                runner.read_file_from_branch(
+                    repo_path=str(repo_path),
+                    branch=str(canonical),
+                    file_path=relative,
+                )
+            )
+            if isinstance(answer, str):
+                content, found_path = answer, relative
+                break
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    history_dir = os.path.join(worktree, str(HISTORY_RELATIVE_PATH))
+    try:
+        envelope = read_newest_envelope(history_dir)
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar receipts error: {type(exc).__name__}: {exc}"}
+    try:
+        commit_time = read_last_code_commit_time(
+            worktree, str(branch) if branch else None
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    return 200, {
+        "feature_yaml": {
+            "path": str(Path(repo_path) / found_path),
+            "branch": str(canonical),
+            "present": content is not None,
+            "text": content,
+        },
+        "envelope": None
+        if envelope is None
+        else {
+            "path": str(envelope.path),
+            "run_id": envelope.run_id,
+            "verdict": envelope.verdict,
+            "started": None
+            if envelope.started is None
+            else envelope.started.isoformat(),
+            "gates": dict(envelope.gates),
+            "feature_id": envelope.feature_id,
+        },
+        "code_commit_time": None
+        if commit_time is None
+        else commit_time.isoformat(),
+        "history_dir": history_dir,
     }
 
 
@@ -2428,9 +3319,13 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WRITE_TREE_ROUTE,
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
+                GIT_IS_ANCESTOR_ROUTE,
+                GIT_CANDIDATE_TREE_ROUTE,
+                GIT_CANDIDATE_TREE_REMOVE_ROUTE,
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
+                STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
@@ -2468,9 +3363,25 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_REV_PARSE_ROUTE:
                 status, body = process_git_rev_parse_request(payload, config=config)
+            elif route == GIT_IS_ANCESTOR_ROUTE:
+                status, body = process_git_is_ancestor_request(payload, config=config)
+            elif route == GIT_CANDIDATE_TREE_ROUTE:
+                status, body = process_git_candidate_tree_request(
+                    payload, config=config
+                )
+            elif route == GIT_CANDIDATE_TREE_REMOVE_ROUTE:
+                status, body = process_git_candidate_tree_remove_request(
+                    payload, config=config
+                )
             elif route == GIT_WORKTREE_ADD_ROUTE:
                 status, body = process_git_worktree_add_request(
                     payload, config=config
+                )
+            elif route == STAMPS_EVIDENCE_ROUTE:
+                status, body = process_stamps_evidence_request(
+                    payload,
+                    config=config,
+                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
                 )
             elif route == GIT_WORKTREE_REMOVE_ROUTE:
                 status, body = process_git_worktree_remove_request(
@@ -2489,6 +3400,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     payload,
                     config=config,
                     script_runner=self.server.script_runner,  # type: ignore[attr-defined]
+                    command_runner=self.server.merge_runner,  # type: ignore[attr-defined]
                 )
             self._write_json(status, body)
         except Exception as exc:  # noqa: BLE001 — never crash the server
@@ -2593,6 +3505,8 @@ __all__ = [
     "resolve_guardkit_command",
     "run_merge_command",
     "allowed_scripts",
+    "sidecar_is_inside_sandbox",
+    "SIDECAR_IN_SANDBOX_ENV",
     "allowed_env_keys",
     "process_run_request",
     "process_guardkit_merge_request",
@@ -2615,6 +3529,8 @@ __all__ = [
     "GIT_WORKTREE_ADD_ROUTE",
     "GIT_WORKTREE_REMOVE_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
+    "STAMPS_EVIDENCE_ROUTE",
+    "process_stamps_evidence_request",
     "SAFE_NAME_PATTERN",
     "process_git_worktree_add_request",
     "process_git_worktree_remove_request",

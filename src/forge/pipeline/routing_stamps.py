@@ -115,10 +115,12 @@ __all__ = [
     "StampsStatus",
     "StampsVerdict",
     "read_scenario_stamps",
+    "parse_scenario_stamps",
     "read_newest_envelope",
     "read_last_code_commit_time",
     "evaluate_stamps",
     "make_stamps_leg",
+    "feature_yaml_relative_path",
 ]
 
 
@@ -224,6 +226,32 @@ def read_scenario_stamps(feature_yaml_path: "Path | str") -> StampsRead:
             present=True,
             error=f"{path} could not be parsed as YAML ({type(exc).__name__}: {exc})",
         )
+    return _stamps_from_data(data, path=path)
+
+
+def parse_scenario_stamps(text: str, *, path: "Path | str") -> StampsRead:
+    """The same read, for a feature YAML that came back as text, not a file.
+
+    For a repository whose work happens inside its sandbox the feature YAML is
+    in there, and the file reaches this side over the sandbox's deploy sidecar
+    as text. ``path`` is the path the file has WHERE IT LIVES, so every
+    sentence a person reads names the real file rather than a copy. Same
+    parsing, same messages, same refusals as :func:`read_scenario_stamps`.
+    """
+    where = Path(path)
+    try:
+        data = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 — an unreadable plan is said, not hidden
+        return StampsRead(
+            path=where,
+            present=True,
+            error=f"{where} could not be parsed as YAML ({type(exc).__name__}: {exc})",
+        )
+    return _stamps_from_data(data, path=where)
+
+
+def _stamps_from_data(data: Any, *, path: Path) -> StampsRead:
+    """The shared half: a loaded YAML document → :class:`StampsRead`."""
     if not isinstance(data, dict):
         return StampsRead(
             path=path,
@@ -942,6 +970,16 @@ def make_stamps_leg(
         )
 
     return stamps_leg
+
+
+def feature_yaml_relative_path(feature_id: str, *, suffix: str = "yaml") -> str:
+    """``.guardkit/features/<id>.<suffix>``, repository-relative, posix-style.
+
+    The path to ask a git command (or a sandbox's deploy sidecar) for. Both
+    suffixes are tried in the same order :func:`_feature_yaml_path` tries
+    them on disk, because guardkit's own loader accepts either.
+    """
+    return f"{FEATURES_RELATIVE_PATH.as_posix()}/{feature_id}.{suffix}"
 
 
 def _feature_yaml_path(repo_root: Path, feature_id: str) -> Path:
