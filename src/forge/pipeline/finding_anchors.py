@@ -73,6 +73,7 @@ __all__ = [
     "FINDING_ANCHORS_DETAILS_KEY",
     "derive_finding_anchors",
     "finding_anchor",
+    "repeated_anchors",
 ]
 
 
@@ -156,3 +157,37 @@ def derive_finding_anchors(findings: Iterable[Any] | None) -> tuple[str, ...]:
         if anchor not in anchors:
             anchors.append(anchor)
     return tuple(anchors)
+
+
+def repeated_anchors(
+    previous: "frozenset[str] | tuple[str, ...] | None",
+    current: "frozenset[str] | tuple[str, ...] | None",
+) -> tuple[str, ...]:
+    """The anchors ``current`` repeats from ``previous``, sorted; ``()`` for none.
+
+    One reading of "this review said the same thing again", used by both
+    readers that need it — the conductor's review-cycle rule and the Mode C
+    planner's choice of what to do next — so the two can never disagree
+    about which findings were repeated.
+
+    The rule is the one the review-cycle stop has always applied: every
+    anchor the previous review named is named again (new findings on top do
+    not change that). Two cases answer ``()`` rather than a repeat:
+
+    * **No previous anchors at all** (``None``, or an empty set). There is
+      nothing to repeat, so nothing is repeated. An empty previous set is
+      also a superset trap — everything contains the empty set — and
+      answering "repeated" there would accuse every review that follows a
+      clean one.
+    * **Something the previous review named is gone.** At least one finding
+      gets resolved, so this is not a repeat.
+
+    Sorted, so the sentence a person reads is stable and diffable.
+    """
+    before = frozenset(previous or ())
+    if not before:
+        return ()
+    after = frozenset(current or ())
+    if not after >= before:
+        return ()
+    return tuple(sorted(before))
