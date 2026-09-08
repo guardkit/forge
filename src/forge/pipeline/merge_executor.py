@@ -69,6 +69,18 @@ which is every repository until an operator gives one a sandbox — the venue
 is :class:`~forge.deploy.candidate_tree.InContainerCandidateGit`, this file's
 own git functions called in the order they have always been called. Part J's
 order does not change; only where its git runs does.
+
+AND BECAUSE IT LANDED IN THERE, the words after a green press say so and give
+the one command that brings the merge to the operator's checkout (sandbox
+first, rule 79): "This merge landed in the factory's own copy of the
+repository, inside the sandbox <name> — not in your checkout at <path>. To
+bring it to your checkout, run: git -C <path> fetch sandbox-<name> main && git
+-C <path> merge --ff-only sandbox-<name>/main". The same words ride the report
+as ``sandbox_merge`` (the sandbox, the remote, the checkout, the command and
+the sentence), so a thread can print them verbatim rather than compose words of
+its own, and the merge's own receipt records them beside the merge. A
+repository without a sandbox says and records nothing extra: its sentence, its
+report and its receipts are byte for byte what they were.
 """
 
 from __future__ import annotations
@@ -124,6 +136,7 @@ __all__ = [
     "execute_merge_deploy",
     "deployed_in_for",
     "merge_wall_seconds",
+    "sandbox_merge_words",
     "merged_after_all_sha",
 ]
 
@@ -232,6 +245,13 @@ class MergeDeployOutcome:
     #: build row's recorded journey branch for a repair, else the feature's
     #: own ``autobuild/<feature id>``. Set on every ending by the executor.
     branch: str | None = None
+    #: What to do after a merge that landed in a sandbox's own clone
+    #: (sandbox first, rule 79): ``sandbox`` (its name), ``remote``,
+    #: ``checkout``, ``fetch_command`` and the plain ``sentence`` that says
+    #: both. Set only on a green press of a repository that has a sandbox;
+    #: ``None`` for every repository that has none, whose report carries no
+    #: such field at all.
+    sandbox_merge: dict[str, Any] | None = None
 
 
 @dataclass
@@ -404,6 +424,61 @@ def deployed_in_for(repo_root: Path) -> str | None:
     except Exception:  # noqa: BLE001 — a word on a card, never a failure
         return None
     return "docker-sandbox" if profile.sandbox is not None else None
+
+
+def sandbox_merge_words(
+    config: Any, repo: str, repo_root: Path | str
+) -> dict[str, Any] | None:
+    """What to say after a merge that landed in a sandbox's own clone (rule 79).
+
+    A repository whose factory lives in its sandbox is merged in there, on the
+    factory's own copy of the repository — so the operator's checkout does not
+    have the merge until he fetches it. This composes, once, the plain sentence
+    that says that and the exact command that brings it over, from the two
+    facts the settings already carry: the sandbox's name
+    (``planning.sandboxes[repo].name``, which is also the name of the git
+    remote ``sbx`` leaves on the host) and the checkout's path
+    (``planning.target_repo_paths[repo]``, which is the ``repo_root`` every
+    caller of the executor passes).
+
+    Returns ``None`` for a repository with no sandbox — which is every
+    repository until an operator gives one a sandbox — so nothing about that
+    repository's words or receipts changes by a byte. Never raises: this only
+    decides what a report says, and a settings object of an unexpected shape
+    must not be the thing that fails a merge.
+    """
+    try:
+        from forge.config.sandboxes import sandbox_for
+
+        entry = sandbox_for(config, repo)
+    except Exception:  # noqa: BLE001 — words on a report, never a failure
+        return None
+    if entry is None:
+        return None
+    name = getattr(entry, "name", None)
+    if name is None and isinstance(entry, dict):
+        name = entry.get("name")
+    name = str(name or "").strip()
+    if not name:
+        return None
+    checkout = str(repo_root)
+    remote = f"sandbox-{name}"
+    command = (
+        f"git -C {checkout} fetch {remote} main && "
+        f"git -C {checkout} merge --ff-only {remote}/main"
+    )
+    sentence = (
+        "This merge landed in the factory's own copy of the repository, inside "
+        f"the sandbox {name} — not in your checkout at {checkout}. To bring it "
+        f"to your checkout, run: {command}"
+    )
+    return {
+        "sandbox": name,
+        "remote": remote,
+        "checkout": checkout,
+        "fetch_command": command,
+        "sentence": sentence,
+    }
 
 
 def _mint_repair_row(
@@ -748,6 +823,11 @@ async def execute_merge_deploy(
     # sandbox when it has one, in this container when it has not. Chosen once,
     # used by every git operation the press makes, so they cannot disagree.
     git = git_surface_for(deps, repo, repo_root)
+    # WHAT TO SAY AFTERWARDS when the merge lands in a sandbox's own clone
+    # (sandbox first, rule 79): the sentence and the exact fetch command, made
+    # once from the settings, said on a green press and written on the merge's
+    # own receipt. ``None`` for a repository without a sandbox.
+    sandbox_words = sandbox_merge_words(deps.config, repo, repo_root)
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -915,6 +995,15 @@ async def execute_merge_deploy(
             **(
                 {"gate_before_merge": outcome.gate_before_merge}
                 if outcome.gate_before_merge is not None
+                else {}
+            ),
+            # Additive (sandbox first, rule 79): where this merge landed and
+            # the exact command that brings it to the operator's checkout —
+            # only for a repository that has a sandbox, so every other
+            # report is byte for byte what it was.
+            **(
+                {"sandbox_merge": outcome.sandbox_merge}
+                if outcome.sandbox_merge
                 else {}
             ),
         )
@@ -1403,20 +1492,25 @@ async def execute_merge_deploy(
                     repo_root, feature_id, expect_main_sha, branch=branch, git=git
                 )
 
-            _write_receipt(
-                "merge_deploy_merge.json",
-                {
-                    "step": "merge",
-                    "status": result_status,
-                    "exit_code": getattr(result, "exit_code", None),
-                    "branch": branch,
-                    "refusal": refusal,
-                    "report": report,
-                    "landed_sha": landed_sha,
-                    "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
-                    "baseline_file": str(baseline_path) if baseline_path else None,
-                },
-            )
+            merge_receipt: dict[str, Any] = {
+                "step": "merge",
+                "status": result_status,
+                "exit_code": getattr(result, "exit_code", None),
+                "branch": branch,
+                "refusal": refusal,
+                "report": report,
+                "landed_sha": landed_sha,
+                "stdout_tail": (getattr(result, "stdout_tail", "") or "")[-4000:],
+                "baseline_file": str(baseline_path) if baseline_path else None,
+            }
+            # SANDBOX FIRST, rule 79: a merge that landed in a sandbox landed
+            # in the factory's own clone, and the receipt says so — with the
+            # command that brings it to the operator's checkout — beside the
+            # merge it is the receipt for. Nothing is added for a repository
+            # without a sandbox, or for a merge that did not land.
+            if sandbox_words is not None and (refusal is None or landed_sha):
+                merge_receipt["landed_in_the_sandbox"] = sandbox_words
+            _write_receipt("merge_deploy_merge.json", merge_receipt)
             if refusal and landed_sha:
                 return MergeDeployOutcome(
                     result="merged-verify-failed",
@@ -1665,18 +1759,27 @@ async def execute_merge_deploy(
                 and isinstance(gate.get("checks_total"), int)
                 else "checked in the sandbox, "
             )
+            detail = (
+                f"{named} {sandbox_checks}merged and running{checks}. "
+                "Rollback is one command; the branch is kept."
+            )
+            # SANDBOX FIRST, rule 79: this repository's merge landed in the
+            # factory's own clone inside its sandbox, so the words say that
+            # and give the one command that brings it to the checkout. A
+            # repository without a sandbox adds nothing: same sentence, and no
+            # such field on the report.
+            if sandbox_words is not None:
+                detail = f"{detail} {sandbox_words['sentence']}"
             return MergeDeployOutcome(
                 result="merged-and-running",
                 status="PASSED",
                 merged_sha=merged_sha,
                 verdict=str(verdict) if verdict is not None else None,
-                detail=(
-                    f"{named} {sandbox_checks}merged and running{checks}. "
-                    "Rollback is one command; the branch is kept."
-                ),
+                detail=detail,
                 checks_passed=checks_passed,
                 checks_total=checks_total,
                 deployed_in=deployed_in,
+                sandbox_merge=sandbox_words,
             )
         if d_outcome == "reverted":
             return MergeDeployOutcome(
