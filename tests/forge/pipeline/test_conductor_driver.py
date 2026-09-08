@@ -71,6 +71,11 @@ class FakeSupervisor:
     observed_reentrancy: bool = False
     #: Timeline shared with the settle seam so ordering can be asserted.
     timeline: list[str] = field(default_factory=list)
+    #: The supervisor's own escalation seam. ``None`` is the production
+    #: shape on the fix-journey path (nothing publishes the card), and the
+    #: loop reads it to know whether a budget breach can be escalated at
+    #: all.
+    budget_pause: Any | None = None
 
     async def next_turn(self, build_id: str) -> Any:
         if self.in_turn:  # pragma: no cover - the loop must never do this
@@ -140,6 +145,15 @@ class ScriptedWait:
         self.republished.append(build_id)
         if self.timeline is not None:
             self.timeline.append("republish")
+
+
+async def _a_pause_collaborator(**_kwargs: Any) -> None:
+    """Stands in for the supervisor's escalation seam being wired.
+
+    The loop only asks whether it exists; it never calls it (the
+    supervisor already has, before the turn report came back).
+    """
+    return None  # pragma: no cover - existence is what is read
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -215,8 +229,61 @@ class TestLoopBranches:
         assert len(wait.subscribe_calls) == 1
 
     def test_paused_budget_stops_until_the_escalation_resolves(self) -> None:
+        """With someone to ask, the breach waits for them — unchanged."""
         wait = ScriptedWait()
         asked: list[str] = []
+        closed: list[str] = []
+        supervisor = FakeSupervisor(
+            script=[
+                _report(
+                    TurnOutcome.PAUSED_BUDGET,
+                    rationale="review cycles (2) reached cap (2)",
+                ),
+                # Would run if the loop wrongly continued.
+                _report(TurnOutcome.DISPATCHED, stage=StageClass.TASK_WORK),
+            ],
+            budget_pause=_a_pause_collaborator,
+        )
+
+        def escalation_resolved(build_id: str) -> bool:
+            asked.append(build_id)
+            return False
+
+        async def close_out(*, build_id: str, report: Any) -> None:
+            closed.append(build_id)
+
+        report = asyncio.run(
+            drive_fix_journey(
+                BUILD_ID,
+                _deps(
+                    supervisor,
+                    wait=wait,
+                    escalation_resolved=escalation_resolved,
+                    close_out=close_out,
+                ),
+            )
+        )
+
+        assert report.outcome is ConductorRunOutcome.PAUSED_BUDGET
+        assert report.turns == 1
+        assert supervisor.calls == [BUILD_ID]
+        assert asked == [BUILD_ID]
+        assert "cap" in report.rationale
+        # The build stays paused for the person who was asked; the loop
+        # does not close it out.
+        assert closed == []
+
+    def test_a_breach_no_one_can_answer_closes_the_build_out(self) -> None:
+        """Seam nine, 2026-09-08: never left RUNNING with nobody to ask.
+
+        In production on this path the supervisor has no pause
+        collaborator, so the cap breach published no card. The loop used
+        to stop and wait for an escalation that could never arrive, and
+        the build sat RUNNING for ever holding the queue's slot.
+        """
+        wait = ScriptedWait()
+        closed: list[dict[str, Any]] = []
+        packs: list[dict[str, Any]] = []
         supervisor = FakeSupervisor(
             script=[
                 _report(
@@ -228,22 +295,57 @@ class TestLoopBranches:
             ]
         )
 
-        def escalation_resolved(build_id: str) -> bool:
-            asked.append(build_id)
-            return False
+        async def close_out(*, build_id: str, report: Any) -> None:
+            closed.append({"build_id": build_id, "report": report})
+
+        def write_pack(**kwargs: Any) -> str:
+            packs.append(kwargs)
+            return "/packs/budget.json"
 
         report = asyncio.run(
             drive_fix_journey(
                 BUILD_ID,
-                _deps(supervisor, wait=wait, escalation_resolved=escalation_resolved),
+                _deps(
+                    supervisor,
+                    wait=wait,
+                    close_out=close_out,
+                    write_failure_pack=write_pack,
+                ),
             )
         )
 
         assert report.outcome is ConductorRunOutcome.PAUSED_BUDGET
         assert report.turns == 1
         assert supervisor.calls == [BUILD_ID]
-        assert asked == [BUILD_ID]
-        assert "cap" in report.rationale
+        # The build is closed out, not left running.
+        assert [entry["build_id"] for entry in closed] == [BUILD_ID]
+        # The close-out reads a terminal word off the dispatch result and
+        # writes the row FAILED on "failed".
+        assert closed[0]["report"].dispatch_result.outcome == "failed"
+        # The reason says what stopped it and why nobody stopped it well.
+        for text in (report.rationale, closed[0]["report"].rationale):
+            assert "cap" in text
+            assert "no one could be asked" in text
+        # The failure pack is written exactly as before.
+        assert packs and packs[0]["reason"] == report.rationale
+        assert report.failure_pack == "/packs/budget.json"
+
+    def test_a_breach_close_out_still_stops_if_the_close_out_raises(self) -> None:
+        """A failing close-out never turns the stop into a crash."""
+        wait = ScriptedWait()
+
+        def boom(**kwargs: Any) -> None:
+            raise RuntimeError("ledger unavailable")
+
+        supervisor = FakeSupervisor(
+            script=[_report(TurnOutcome.PAUSED_BUDGET, rationale="cap reached")]
+        )
+
+        report = asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, wait=wait, close_out=boom))
+        )
+
+        assert report.outcome is ConductorRunOutcome.PAUSED_BUDGET
 
     def test_a_published_merge_card_stops_the_loop(self) -> None:
         """Act inflation guard: never re-plan after the card is out."""

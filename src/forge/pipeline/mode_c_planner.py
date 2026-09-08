@@ -34,6 +34,17 @@ planner advances to :attr:`StageClass.PULL_REQUEST_REVIEW` instead of
 terminating. The commit detection itself lives outside the planner: it
 reads a ``has_commits`` flag set by TASK-MBC8-007's terminal handler.
 
+There is one other way to reach that stage, added 2026-09-08. A build
+running under a profile that allows only so many review cycles can finish
+its last cycle with every fix task done and the work approved. Asking for
+one more review then is asking for something the budget guard must refuse,
+and a journey that did so stopped one step short of its merge card with
+every fix approved (journey one, 2026-09-08). So when the caller passes
+``review_cycle_cap`` and the count has reached it, the planner's next stage
+is the merge-ready checkpoint instead. The cap is still ASSUM-010's
+profile-level cap, not a cap inside the planner: no caller that passes
+nothing behaves any differently.
+
 The planner is **stateless**. Every call inspects ``history`` and the
 ``has_commits`` flag; cyclic behaviour emerges from the planner deciding
 the same ``next_stage = TASK_WORK`` repeatedly until the most-recent
@@ -70,6 +81,7 @@ from enum import StrEnum
 from typing import Sequence
 
 from forge.lifecycle.persistence import Build
+from forge.pipeline.budget_guard import count_review_cycles
 from forge.pipeline.mode_chains_data import MODE_C_CHAIN
 from forge.pipeline.stage_taxonomy import StageClass
 
@@ -404,6 +416,7 @@ class ModeCCyclePlanner:
         history: Sequence[StageEntry],
         *,
         has_commits: bool = False,
+        review_cycle_cap: int | None = None,
     ) -> ModeCPlan:
         """Decide the next Mode C stage given the build and its history.
 
@@ -420,6 +433,17 @@ class ModeCCyclePlanner:
                 :attr:`ModeCTerminal.CLEAN_REVIEW` (no commits) and
                 :attr:`StageClass.PULL_REQUEST_REVIEW` (commits) on a
                 follow-up clean review.
+            review_cycle_cap: How many review cycles the build's profile
+                allows, or ``None`` when it allows any number (the
+                attended profile — ASSUM-010 — and every caller that does
+                not pass one). It is the same number the budget guard
+                enforces, counted the same way, so the planner and the
+                guard cannot disagree about where the last cycle ends.
+                Its ONLY effect is at the end of a cycle whose fix tasks
+                are all done with work approved: at the cap the planner
+                goes to the merge-ready checkpoint instead of asking for
+                a review the guard would refuse. Below the cap, and with
+                no cap, every decision this method makes is unchanged.
 
         Returns:
             A :class:`ModeCPlan` describing the next decision.
@@ -561,6 +585,44 @@ class ModeCCyclePlanner:
                 total_work_failure=all_failed,
             )
 
+        # THE LAST CYCLE'S EXIT (2026-09-08, journey one's ninth seam).
+        #
+        # All fix tasks are terminal and at least one leg did real work.
+        # Before scheduling the follow-up review, ask whether there is a
+        # review cycle left to spend. Under an unattended profile the
+        # answer can be no, and asking anyway was a dead end: the budget
+        # guard refused the dispatch, no escalation could be published,
+        # and the journey stopped one step short of its merge-ready
+        # card with every fix approved by the coach and the oracle
+        # (observed 2026-09-08 07:47Z on build-FEAT-39F6-20260908062301).
+        #
+        # So at the cap, with work approved, the next stage is the
+        # merge-ready checkpoint. Nothing is skipped: the checkpoint runs
+        # the declared tests and the routing law's stamps, and the merge
+        # press's candidate check still decides. Below the cap (and with
+        # no cap at all — the attended profile, ASSUM-010) the follow-up
+        # review is scheduled exactly as before.
+        if (
+            review_cycle_cap is not None
+            and count_review_cycles(
+                history, is_review=lambda e: e.stage_class == StageClass.TASK_REVIEW
+            )
+            >= review_cycle_cap
+            and self._cycle_has_approved_work(
+                history=history,
+                latest_review_idx=latest_review_idx,
+                fix_tasks=fix_tasks,
+            )
+        ):
+            return ModeCPlan(
+                permitted_stages=permitted,
+                next_stage=StageClass.PULL_REQUEST_REVIEW,
+                rationale=(
+                    "every fix task is done and the review cycles are used "
+                    "up — going to the merge-ready checks"
+                ),
+            )
+
         # All fix tasks reached terminal status and at least one leg was
         # something other than a bare failure — schedule a follow-up
         # /task-review per ASSUM-010 (no numeric cap).
@@ -647,6 +709,37 @@ class ModeCCyclePlanner:
         # Every fix task in this review's list has a terminal
         # ``/task-work`` slot — the cycle's fan-out is exhausted.
         return FixTaskLookup()
+
+    @staticmethod
+    def _cycle_has_approved_work(
+        *,
+        history: Sequence[StageEntry],
+        latest_review_idx: int,
+        fix_tasks: tuple[str, ...],
+    ) -> bool:
+        """Did any fix task of this cycle end approved?
+
+        The other half of the last-cycle exit. "Every fix task is
+        terminal" is already established when this is asked; this answers
+        "and something was actually fixed". Only ``approved`` counts — a
+        cycle that ends with nothing but rejections and cancellations has
+        no work to take to the merge-ready checks, so it keeps today's
+        behaviour (it asks for the follow-up review, the budget guard
+        refuses it at the cap, and the journey is closed out with the
+        reason).
+
+        The window is the same one the fan-out walk uses: rows after the
+        current review, whose fix-task id is in that review's list.
+        """
+        wanted = frozenset(fix_tasks)
+        for entry in history[latest_review_idx + 1 :]:
+            if entry.stage_class != StageClass.TASK_WORK:
+                continue
+            if entry.fix_task_id is None or entry.fix_task_id not in wanted:
+                continue
+            if entry.status == _STATUS_APPROVED:
+                return True
+        return False
 
     @staticmethod
     def _total_work_failure(
@@ -790,6 +883,7 @@ def plan_next_stage(
     history: Sequence[StageEntry],
     *,
     has_commits: bool = False,
+    review_cycle_cap: int | None = None,
 ) -> ModeCPlan:
     """Module-level convenience wrapper around :class:`ModeCCyclePlanner`.
 
@@ -798,4 +892,9 @@ def plan_next_stage(
     declarative module-level surfaces in :mod:`forge.pipeline`) can use
     this without instantiating the class.
     """
-    return ModeCCyclePlanner().plan_next_stage(build, history, has_commits=has_commits)
+    return ModeCCyclePlanner().plan_next_stage(
+        build,
+        history,
+        has_commits=has_commits,
+        review_cycle_cap=review_cycle_cap,
+    )

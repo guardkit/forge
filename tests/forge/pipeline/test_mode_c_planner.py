@@ -355,3 +355,148 @@ class TestGroupDEdge:
         plan = ModeCCyclePlanner().plan_next_stage(_build(), history, has_commits=True)
         assert plan.next_stage == StageClass.PULL_REQUEST_REVIEW
         assert plan.terminal is None
+
+
+# ---------------------------------------------------------------------------
+# The last cycle's exit — 2026-09-08, journey one's ninth seam
+# ---------------------------------------------------------------------------
+
+
+class TestTheLastCycleGoesToTheMergeReadyChecks:
+    """At the review-cycle cap, a finished cycle goes to the checkpoint.
+
+    The observed defect (journey one, 2026-09-08): the second cycle's three
+    work legs were all approved, the planner asked for a third review, the
+    budget guard refused it at the cap of two, and the journey stopped one
+    step short of its merge card with every fix approved by the coach and
+    the oracle.
+
+    ``review_cycle_cap`` is the profile's cap, passed in by the supervisor
+    and counted the same way the budget guard counts it. Absent (every
+    caller that passes nothing, and the attended profile) nothing here
+    changes a single decision.
+    """
+
+    @staticmethod
+    def _two_finished_cycles() -> list[StageEntry]:
+        """Two review cycles, every fix task approved. Journey one's shape."""
+        return [
+            _review_entry(fix_tasks=("FIX-1", "FIX-2")),
+            _work_entry(fix_task_id="FIX-1"),
+            _work_entry(fix_task_id="FIX-2"),
+            _review_entry(fix_tasks=("FIX-3", "FIX-4")),
+            _work_entry(fix_task_id="FIX-3"),
+            _work_entry(fix_task_id="FIX-4"),
+        ]
+
+    def test_at_the_cap_the_next_stage_is_the_merge_ready_checkpoint(
+        self,
+    ) -> None:
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), self._two_finished_cycles(), review_cycle_cap=2
+        )
+
+        assert plan.next_stage == StageClass.PULL_REQUEST_REVIEW
+        assert plan.terminal is None
+        assert plan.wait is None
+        assert plan.rationale == (
+            "every fix task is done and the review cycles are used up — "
+            "going to the merge-ready checks"
+        )
+
+    def test_below_the_cap_the_follow_up_review_is_scheduled_as_today(
+        self,
+    ) -> None:
+        """One cycle done under a cap of two — the second review is owed."""
+        history = self._two_finished_cycles()[:3]
+
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), history, review_cycle_cap=2
+        )
+
+        assert plan.next_stage == StageClass.TASK_REVIEW
+        assert plan.rationale == "all fix tasks completed — scheduling follow-up review"
+
+    def test_with_no_cap_at_all_nothing_changes(self) -> None:
+        """The attended profile (ASSUM-010) — reviewer-driven, no numbers."""
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), self._two_finished_cycles()
+        )
+
+        assert plan.next_stage == StageClass.TASK_REVIEW
+        assert plan.rationale == "all fix tasks completed — scheduling follow-up review"
+
+    def test_at_the_cap_with_every_leg_failed_the_failure_path_still_wins(
+        self,
+    ) -> None:
+        """A broken tool never reaches the merge-ready checks.
+
+        The 100%-failed cycle is a tooling fault (ASSUM-008 as narrowed
+        2026-08-02) and its terminal is decided before the cap is ever
+        consulted.
+        """
+        history = [
+            _review_entry(fix_tasks=("FIX-1", "FIX-2")),
+            _work_entry(fix_task_id="FIX-1"),
+            _work_entry(fix_task_id="FIX-2"),
+            _review_entry(fix_tasks=("FIX-3", "FIX-4")),
+            _work_entry(fix_task_id="FIX-3", status="failed"),
+            _work_entry(fix_task_id="FIX-4", status="failed"),
+        ]
+
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), history, review_cycle_cap=2
+        )
+
+        assert plan.next_stage is None
+        assert plan.terminal == ModeCTerminal.FAILED
+        assert plan.total_work_failure == ("FIX-3", "FIX-4")
+
+    def test_at_the_cap_with_nothing_approved_the_review_is_still_asked_for(
+        self,
+    ) -> None:
+        """Rejections and cancellations leave nothing to take to the checks.
+
+        The cycle is not a total tooling failure — a gate and a human each
+        gave a verdict on work that ran — so today's behaviour stands: the
+        follow-up review is asked for, the budget guard refuses it, and the
+        journey is closed out with the reason.
+        """
+        history = [
+            _review_entry(fix_tasks=("FIX-1",)),
+            _work_entry(fix_task_id="FIX-1"),
+            _review_entry(fix_tasks=("FIX-2", "FIX-3")),
+            _work_entry(fix_task_id="FIX-2", status="rejected"),
+            _work_entry(fix_task_id="FIX-3", status="cancelled"),
+        ]
+
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), history, review_cycle_cap=2
+        )
+
+        assert plan.next_stage == StageClass.TASK_REVIEW
+        assert plan.rationale == "all fix tasks completed — scheduling follow-up review"
+
+    def test_a_cycle_still_in_flight_at_the_cap_waits(self) -> None:
+        """The cap never overtakes a running leg."""
+        history = [
+            _review_entry(fix_tasks=("FIX-1",)),
+            _work_entry(fix_task_id="FIX-1"),
+            _review_entry(fix_tasks=("FIX-2", "FIX-3")),
+            _work_entry(fix_task_id="FIX-2"),
+            _work_entry(fix_task_id="FIX-3", status="running"),
+        ]
+
+        plan = ModeCCyclePlanner().plan_next_stage(
+            _build(), history, review_cycle_cap=2
+        )
+
+        assert plan.is_waiting
+        assert plan.next_stage is None
+
+    def test_the_module_level_wrapper_carries_the_cap_through(self) -> None:
+        plan = plan_next_stage(
+            _build(), self._two_finished_cycles(), review_cycle_cap=2
+        )
+
+        assert plan.next_stage == StageClass.PULL_REQUEST_REVIEW
