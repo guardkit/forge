@@ -94,6 +94,8 @@ from typing import Any, Awaitable, Callable, Mapping
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DECLARED_TEST_EVIDENCE_KEY",
+    "DECLARED_TEST_OUTPUT_FILENAME",
     "MERGE_READY_CHECKPOINT_LABEL",
     "GateStatus",
     "GatesReport",
@@ -108,6 +110,16 @@ __all__ = [
 #: approval card's stage copy and every operator-facing message. The
 #: codename (``pull-request-review``) stays on the durable stage rows.
 MERGE_READY_CHECKPOINT_LABEL: str = "the merge-ready checkpoint"
+
+#: Where the declared test's own output is filed on a decision's ``details``,
+#: so anything reading a decision back — the receipts writer, an operator
+#: looking at the run report — finds it under one agreed name.
+DECLARED_TEST_EVIDENCE_KEY: str = "declared_test_evidence"
+
+#: The file that output is written to in this checkpoint's receipts stage.
+#: A plain text file, readable with ``cat``, sitting beside the turn's
+#: rationale in ``<receipts>/<build_id>/stages/<NNN>-pull-request-review/``.
+DECLARED_TEST_OUTPUT_FILENAME: str = "declared-test-output.txt"
 
 
 class GateStatus(StrEnum):
@@ -145,12 +157,22 @@ class GatesReport:
             the card seam, not something this checkpoint can do. Empty for
             every gate set that defers nothing, which is every one until an
             operator gives a repository a sandbox and a candidate check.
+        evidence: What the declared test command itself printed, kept so the
+            failing tests can be read back without running the suite again
+            (ruled 2026-09-08, after a red checkpoint kept nothing but the
+            run's last line and the two failing tests had to be found by
+            hand). It is the test tool's own lines naming what failed, when
+            it wrote any, plus the tail of the output, bounded in size by the
+            reader that fills it in. Empty by default, so every gate set that
+            has no output to keep — and every existing caller — is exactly
+            what it was.
     """
 
     status: GateStatus
     failed_gates: tuple[str, ...] = ()
     detail: str = ""
     deferred_detail: str = ""
+    evidence: str = ""
 
     @property
     def is_green(self) -> bool:
@@ -437,6 +459,18 @@ class MergeReadyCheckpointPublisher:
         # Step (b) — the full gate set. THE HARD PRECONDITION.
         gates = await self._read_gates(build_id, branch)
 
+        # WHAT THE TESTS THEMSELVES SAID. The gate set's reader keeps the
+        # declared test command's own output (bounded), and it rides every
+        # decision from here on under one agreed key, so the receipts writer
+        # and anyone reading a decision back find it in the same place. A
+        # gate set with nothing to keep adds no key at all, which is what
+        # every decision looked like before this.
+        evidence_details: dict[str, Any] = (
+            {DECLARED_TEST_EVIDENCE_KEY: str(getattr(gates, "evidence", "") or "")}
+            if str(getattr(gates, "evidence", "") or "").strip()
+            else {}
+        )
+
         if not gates.is_green:
             action = self._resolve_red_gate_action(build_id, gates)
             logger.warning(
@@ -473,6 +507,7 @@ class MergeReadyCheckpointPublisher:
                     "no card"
                 ).strip(" |"),
                 failure_pack=failure_pack,
+                details=evidence_details,
             )
 
         # Step (c) — green. Publish the approve-click merge card.
@@ -497,7 +532,7 @@ class MergeReadyCheckpointPublisher:
                     f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: gates "
                     "green, delivery not wired"
                 ).strip(" |"),
-                details={"delivery_wired": False},
+                details={"delivery_wired": False, **evidence_details},
             )
 
         # ARM THE LATCH BEFORE THE AWAIT. From here on the envelope may
@@ -551,7 +586,10 @@ class MergeReadyCheckpointPublisher:
                     "wire; NOT re-published"
                 ).strip(" |"),
                 failure_pack=failure_pack,
-                details={"publish_error": f"{type(exc).__name__}: {exc}"},
+                details={
+                    "publish_error": f"{type(exc).__name__}: {exc}",
+                    **evidence_details,
+                },
             )
 
         logger.info(
@@ -584,6 +622,7 @@ class MergeReadyCheckpointPublisher:
                 + (f" — {deferred}" if deferred else "")
             ).strip(" |"),
             card_result=card_result,
+            details=evidence_details,
         )
 
     # -- internals ----------------------------------------------------
