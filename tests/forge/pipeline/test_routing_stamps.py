@@ -414,6 +414,199 @@ class TestAMixedFeature:
         assert "ATTENDED" in verdict.detail
 
 
+class TestTheChecksThatRunAtTheMerge:
+    """Ruled 2026-09-08: a stamped check the merge press runs is DEFERRED.
+
+    Five verifier homes have no forge-side runner, and a fix journey runs no
+    live gate before its merge-ready checkpoint — so on a repository whose
+    scenarios are stamped on one of them the answer was always ABSENT and the
+    journey could never reach its card. Where the merge press stands the
+    candidate up and runs the live gate on it BEFORE anything lands, the
+    promise the stamp makes is kept there instead. The flag is what says so,
+    and with it off nothing moves by a byte.
+    """
+
+    def test_no_evidence_is_missing_when_nothing_checks_it_before_the_merge(
+        self,
+    ) -> None:
+        verdict = _eval(_read(("A caller sees 201", "probe:process")), envelope=None)
+
+        assert verdict.status is StampsStatus.ABSENT
+        assert verdict.blocks_card is True
+        assert verdict.missing == (("A caller sees 201", "probe:process"),)
+        assert verdict.deferred == ()
+        assert verdict.deferred_detail == ""
+
+    def test_the_same_stamp_is_deferred_when_the_candidate_is_checked_first(
+        self,
+    ) -> None:
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=None,
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.SATISFIED
+        assert verdict.blocks_card is False
+        assert verdict.missing == ()
+        assert verdict.deferred == (("A caller sees 201", "probe:process"),)
+        assert verdict.deferred_detail == (
+            "1 stamped check (probe:process) runs in the sandbox at the "
+            "merge, before anything lands."
+        )
+        assert "A caller sees 201" in verdict.detail
+
+    def test_a_stale_envelope_is_deferred_rather_than_called_missing(self) -> None:
+        stale = _envelope(
+            gates={"probe:process": 0}, started=T0 - timedelta(minutes=5)
+        )
+
+        blocked = _eval(_read(("A caller sees 201", "probe:process")), envelope=stale)
+        deferred = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=stale,
+            candidate_check_before_merge=True,
+        )
+
+        assert blocked.status is StampsStatus.ABSENT
+        assert "STALE" in blocked.detail
+        assert deferred.status is StampsStatus.SATISFIED
+        assert deferred.deferred == (("A caller sees 201", "probe:process"),)
+
+    def test_an_envelope_that_names_no_such_gate_is_deferred(self) -> None:
+        # The default envelope is green and names health + hurl-twins only.
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.SATISFIED
+        assert verdict.deferred == (("A caller sees 201", "probe:process"),)
+
+    def test_a_fresh_green_envelope_still_satisfies_the_home_as_today(self) -> None:
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=_envelope(gates={"probe:process": 0}),
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.SATISFIED
+        assert verdict.satisfied_by_home == {"probe:process": 1}
+        assert verdict.deferred == ()
+        assert verdict.deferred_detail == ""
+        assert "all 1 stamped scenario(s)" in verdict.detail
+
+    def test_a_current_envelope_that_says_the_gate_failed_still_blocks_the_card(
+        self,
+    ) -> None:
+        """Evidence AGAINST the code being merged is never deferred."""
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=_envelope(gates={"probe:process": 1}),
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.ABSENT
+        assert verdict.blocks_card is True
+        assert verdict.deferred == ()
+
+    def test_a_current_envelope_whose_run_failed_still_blocks_the_card(self) -> None:
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=_envelope(verdict="fail", gates={"probe:process": 0}),
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.ABSENT
+        assert verdict.deferred == ()
+
+    def test_a_toolchain_stamp_is_never_deferred(self) -> None:
+        """The declared suite runs HERE, so its stamp is answered here."""
+        verdict = _eval(
+            _read(("The rate limiter refuses the sixth attempt", "toolchain")),
+            toolchain_green=False,
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.ABSENT
+        assert verdict.missing == (
+            ("The rate limiter refuses the sixth attempt", "toolchain"),
+        )
+        assert verdict.deferred == ()
+
+    def test_an_operator_stamp_is_still_attended_not_deferred(self) -> None:
+        verdict = _eval(
+            _read(("Owner sees the card in Slack", "operator")),
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.SATISFIED
+        assert verdict.attended == ("Owner sees the card in Slack",)
+        assert verdict.deferred == ()
+
+    def test_the_sentence_counts_the_checks_and_names_every_home_once(self) -> None:
+        verdict = _eval(
+            _read(
+                ("A caller sees 201", "probe:process"),
+                ("A caller sees 404", "probe:process"),
+                ("The exam is passed", "exam"),
+            ),
+            envelope=None,
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.deferred_detail == (
+            "3 stamped checks (exam, probe:process) run in the sandbox at "
+            "the merge, before anything lands."
+        )
+
+    def test_a_mixed_feature_says_what_is_proven_now_and_what_waits(self) -> None:
+        verdict = _eval(
+            _read(
+                ("The rate limiter refuses the sixth attempt", "toolchain"),
+                ("A caller sees 201", "probe:process"),
+            ),
+            envelope=None,
+            candidate_check_before_merge=True,
+        )
+
+        assert verdict.status is StampsStatus.SATISFIED
+        assert verdict.satisfied_by_home == {"toolchain": 1}
+        assert "1 of 2 stamped scenario(s)" in verdict.detail
+        assert "toolchain: 1" in verdict.detail
+        assert "1 stamped check (probe:process) runs" in verdict.detail
+
+    def test_the_composed_leg_carries_the_flag_through_to_the_decision(
+        self, tmp_path: Path, git_repo: Path
+    ) -> None:
+        canonical = tmp_path / "canonical"
+        (canonical / ".guardkit" / "features").mkdir(parents=True)
+        (canonical / ".guardkit" / "features" / "FEAT-X.yaml").write_text(
+            'scenarios:\n  "A caller sees 201": probe:process\n', encoding="utf-8"
+        )
+        leg = make_stamps_leg()
+
+        blocked = leg(
+            feature_id="FEAT-X",
+            repo_root=canonical,
+            worktree=git_repo,
+            branch=None,
+            toolchain_green=True,
+        )
+        deferred = leg(
+            feature_id="FEAT-X",
+            repo_root=canonical,
+            worktree=git_repo,
+            branch=None,
+            toolchain_green=True,
+            candidate_check_before_merge=True,
+        )
+
+        assert blocked.status is StampsStatus.ABSENT
+        assert deferred.status is StampsStatus.SATISFIED
+        assert deferred.deferred == (("A caller sees 201", "probe:process"),)
+
+
 # ---------------------------------------------------------------------------
 # The readers, over real files
 # ---------------------------------------------------------------------------

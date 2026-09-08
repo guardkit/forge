@@ -134,11 +134,19 @@ class GatesReport:
         status: The :class:`GateStatus`.
         failed_gates: Names of the gates that failed (empty when green).
         detail: Free-form summary, recorded verbatim on the decision.
+        deferred_detail: One plain sentence about the checks that are NOT run
+            here because this repository's merge runs them itself — it stands
+            the candidate up in its sandbox and runs the live gate on it before
+            anything lands (ruled 2026-09-08). Empty for every gate set that
+            defers nothing, which is every one until an operator gives a
+            repository a sandbox and a candidate check, and an empty sentence
+            changes no word of the card.
     """
 
     status: GateStatus
     failed_gates: tuple[str, ...] = ()
     detail: str = ""
+    deferred_detail: str = ""
 
     @property
     def is_green(self) -> bool:
@@ -549,6 +557,10 @@ class MergeReadyCheckpointPublisher:
             build_id,
             branch,
         )
+        # THE CARD'S LINE ABOUT THE CHECKS THAT RUN AT THE MERGE. When the
+        # gate set deferred nothing this is empty and the card says exactly
+        # what it has always said.
+        deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
         return MergeCardDecision(
             outcome=MergeCardOutcome.CARD_PUBLISHED,
             build_id=build_id,
@@ -562,6 +574,7 @@ class MergeReadyCheckpointPublisher:
             rationale=(
                 f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: gates green, "
                 "merge card published"
+                + (f" — {deferred}" if deferred else "")
             ).strip(" |"),
             card_result=card_result,
         )

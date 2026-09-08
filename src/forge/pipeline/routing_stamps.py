@@ -49,6 +49,30 @@ No stamps at all
     predates the routing law is unaffected (the same opt-in law guardkit's
     plan-load half ships).
 
+Deferred to the merge (ruled 2026-09-08)
+----------------------------------------
+Five of the homes above have no forge-side runner: their envelope is written
+only by the live gate. A FIX journey runs no live gate before its checkpoint,
+so on any repository whose scenarios are stamped on one of those homes the
+answer above was always ABSENT, and no fix journey could ever reach its merge
+card. Since protect-main (Part J, 2026-09-07) the merge press stands the
+candidate up in the repository's sandbox and runs the live gate on it BEFORE
+anything is merged, so the promise a gate-home stamp makes is kept
+mechanically at the press.
+
+So :func:`evaluate_stamps` takes ``candidate_check_before_merge``. When it is
+true — and the gates reader passes true only for a repository whose merge
+really does check the candidate first — a gate-home stamp with NO EVIDENCE YET
+(no envelope, a stale one, an envelope that names no such gate) is DEFERRED
+rather than missing: the checkpoint is green, the verdict carries the deferred
+scenarios with their homes, and the merge card says in one plain sentence how
+many stamped checks run at the merge. Nothing else moves: a toolchain stamp
+still needs the declared suite green, an operator stamp is still listed as
+attended, a fresh green envelope still satisfies its home exactly as before,
+and an envelope that is current and says the gate FAILED still blocks the card
+— evidence against the code is never deferred. Every repository whose merge
+has no candidate check keeps today's answer, byte for byte.
+
 Why the stamps are read from the CANONICAL repo and the envelope from the
 WORKTREE: the stamps are the plan of record — what was promised at planning
 time — and, like the ``toolchain:`` declaration the neighbouring leg reads,
@@ -119,6 +143,7 @@ __all__ = [
     "read_newest_envelope",
     "read_last_code_commit_time",
     "evaluate_stamps",
+    "deferred_sentence",
     "make_stamps_leg",
     "feature_yaml_relative_path",
 ]
@@ -694,7 +719,10 @@ class StampsVerdict:
     attended list, then the satisfied summary. ``missing`` — the
     ``(scenario, home)`` pairs that are ABSENT, for ``failed_gates``.
     ``attended`` — the operator-stamped scenario titles (LISTED, never
-    silently passed).
+    silently passed). ``deferred`` — the ``(scenario, home)`` pairs whose
+    check runs at the merge instead (empty unless the caller says the
+    candidate is checked before the merge), and ``deferred_detail`` — the one
+    plain sentence about them that the merge card carries.
     """
 
     status: StampsStatus
@@ -702,6 +730,8 @@ class StampsVerdict:
     missing: tuple[tuple[str, str], ...] = ()
     attended: tuple[str, ...] = ()
     satisfied_by_home: Mapping[str, int] = field(default_factory=dict)
+    deferred: tuple[tuple[str, str], ...] = ()
+    deferred_detail: str = ""
 
     @property
     def blocks_card(self) -> bool:
@@ -716,14 +746,39 @@ def _fmt(ts: datetime | None) -> str:
     return ts.isoformat(timespec="seconds") if ts is not None else "unknown"
 
 
+def deferred_sentence(deferred: Sequence[tuple[str, str]]) -> str:
+    """The one plain sentence about checks that run at the merge, not now.
+
+    Written once, here, because two surfaces say it: the checkpoint's own
+    detail lines and the merge card the owner reads.
+    """
+    homes = sorted({home for _title, home in deferred})
+    count = len(deferred)
+    return (
+        f"{count} stamped check{'' if count == 1 else 's'} "
+        f"({', '.join(homes)}) run{'s' if count == 1 else ''} in the sandbox "
+        "at the merge, before anything lands."
+    )
+
+
 def _envelope_status_for_home(
     home: str,
     *,
     envelope: Envelope | None,
     code_commit_time: datetime | None,
     history_dir: Path,
-) -> "str | None":
-    """``None`` when the home is proven by the envelope; else the reason not."""
+) -> "tuple[str | None, bool]":
+    """``(None, False)`` when the home is proven by the envelope.
+
+    Otherwise ``(reason, no_evidence_either_way)``: the plain reason the home
+    is not proven, and whether that reason is *no evidence at all about this
+    branch's code* — no envelope, a stale one, one that names no such gate, a
+    freshness that cannot be read. Only those can be deferred to a check that
+    runs later (see the "Deferred" section of the module docstring). A CURRENT
+    envelope that says the run failed is evidence AGAINST the code being
+    merged, and evidence against is never deferred: it blocks the card however
+    the merge is pressed.
+    """
     gate_ids = HOME_GATE_IDS[home]
     wanted = " or ".join(f"`{g}`" for g in gate_ids)
     if envelope is None:
@@ -731,41 +786,51 @@ def _envelope_status_for_home(
             f"no results envelope exists under {history_dir} (the "
             f"`guardkit qa live-gate` run that would carry a {wanted} gate "
             "never wrote a receipt here)"
-        )
+        ), True
     where = f"newest envelope {envelope.run_id}"
+    # Is this envelope about the code being merged at all? Both times have to
+    # be readable and the run has to have started after the last code commit.
+    current = (
+        code_commit_time is not None
+        and envelope.started is not None
+        and envelope.started >= code_commit_time
+    )
     if envelope.verdict != "pass":
         return (
             f"the {where} has verdict `{envelope.verdict or 'missing'}`, not "
             "`pass`"
-        )
+        ), not current
     found = envelope.gate_exit(gate_ids)
     if found is None:
         return (
             f"the {where} is green but names no {wanted} gate (gates present: "
             f"{', '.join(sorted(envelope.gates)) or 'none'})"
-        )
+        ), True
     gate_id, exit_code = found
     if exit_code != 0:
-        return f"the {where} names `{gate_id}` but its exit code is {exit_code!r}, not 0"
+        return (
+            f"the {where} names `{gate_id}` but its exit code is "
+            f"{exit_code!r}, not 0"
+        ), not current
     if code_commit_time is None:
         return (
             f"the {where} names `{gate_id}` exit 0, but the branch's last "
             "commit time could not be read from git, so its freshness cannot "
             "be proven"
-        )
+        ), True
     if envelope.started is None:
         return (
             f"the {where} names `{gate_id}` exit 0, but carries no readable "
             "`started` time, so its freshness cannot be proven"
-        )
+        ), True
     if envelope.started < code_commit_time:
         return (
             f"the {where} names `{gate_id}` exit 0 but is STALE — it started "
             f"{_fmt(envelope.started)}, before the branch's last code commit "
             f"at {_fmt(code_commit_time)}; the verified code is not the code "
             "being merged"
-        )
-    return None
+        ), True
+    return None, False
 
 
 def evaluate_stamps(
@@ -776,10 +841,22 @@ def evaluate_stamps(
     code_commit_time: datetime | None,
     history_dir: "Path | str",
     feature_id: str = "",
+    candidate_check_before_merge: bool = False,
 ) -> StampsVerdict:
     """The pure decision: stamps + evidence → :class:`StampsVerdict`.
 
     No I/O. Every input is something a caller (or a test) already read.
+
+    ``candidate_check_before_merge`` — does this repository's merge check the
+    candidate, live gate and all, before anything lands? ``False`` (the
+    default, and every repository until an operator says otherwise) is exactly
+    today's answer, byte for byte. ``True`` DEFERS a gate-home stamp with no
+    evidence yet — no envelope, a stale one, one that names no such gate —
+    instead of calling it missing, because the merge press will run that very
+    gate on the candidate before the merge. A toolchain stamp still needs the
+    declared suite green, an operator stamp is still listed as attended, a
+    fresh green envelope still satisfies its home as it does today, and a
+    CURRENT envelope that says the gate FAILED still blocks the card.
     """
     history_dir = Path(history_dir)
     feature = feature_id or stamps_read.path.stem
@@ -809,10 +886,11 @@ def evaluate_stamps(
         )
 
     missing: list[tuple[str, str]] = []
+    deferred: list[tuple[str, str]] = []
     reasons: list[str] = []
     attended: list[str] = []
     satisfied: dict[str, int] = {}
-    envelope_reason_cache: dict[str, str | None] = {}
+    envelope_reason_cache: dict[str, tuple[str | None, bool]] = {}
 
     for stamp in stamps_read.stamps:
         home = stamp.verifier
@@ -836,9 +914,14 @@ def evaluate_stamps(
                     code_commit_time=code_commit_time,
                     history_dir=history_dir,
                 )
-            reason = envelope_reason_cache[home]
+            reason, no_evidence_yet = envelope_reason_cache[home]
             if reason is None:
                 satisfied[home] = satisfied.get(home, 0) + 1
+            elif candidate_check_before_merge and no_evidence_yet:
+                # Not proven now, and nothing says it failed either — the
+                # merge press proves it on the candidate before anything
+                # lands, so it is deferred, not missing.
+                deferred.append((stamp.title, home))
             else:
                 missing.append((stamp.title, home))
                 reasons.append(
@@ -853,6 +936,7 @@ def evaluate_stamps(
             )
 
     lines: list[str] = []
+    deferred_detail = deferred_sentence(deferred) if deferred else ""
     if missing:
         lines.append(
             f"the routing law (card A.2) blocks the merge card for feature "
@@ -869,9 +953,27 @@ def evaluate_stamps(
                 f" (envelope {envelope.run_id}, started {_fmt(envelope.started)}, "
                 f"after the branch's last code commit at {_fmt(code_commit_time)})"
             )
+        if deferred:
+            proven = sum(satisfied.values())
+            lines.append(
+                f"routing law: {proven} of {len(stamps_read.stamps)} stamped "
+                f"scenario(s) of feature {feature} are proven now"
+                + (f" — {summary}{proof}" if summary else "")
+                + "."
+            )
+        else:
+            lines.append(
+                f"routing law: all {len(stamps_read.stamps)} stamped scenario(s) of "
+                f"feature {feature} satisfied — {summary}{proof}."
+            )
+    if deferred:
         lines.append(
-            f"routing law: all {len(stamps_read.stamps)} stamped scenario(s) of "
-            f"feature {feature} satisfied — {summary}{proof}."
+            f"routing law: {deferred_detail} The merge press checks the "
+            "candidate in the sandbox, live gate included, before any merge "
+            "lands, so the checkpoint defers these rather than calling them "
+            "missing: "
+            + "; ".join(f"{title!r} ({home})" for title, home in deferred)
+            + "."
         )
     if attended:
         # LISTED on both the green card and the blocked close: a human, not
@@ -888,6 +990,8 @@ def evaluate_stamps(
         missing=tuple(missing),
         attended=tuple(attended),
         satisfied_by_home=dict(satisfied),
+        deferred=tuple(deferred),
+        deferred_detail=deferred_detail,
     )
 
 
@@ -924,6 +1028,7 @@ def make_stamps_leg(
         worktree: "Path | str",
         branch: str | None,
         toolchain_green: bool,
+        candidate_check_before_merge: bool = False,
     ) -> StampsVerdict:
         history_dir = Path(worktree) / HISTORY_RELATIVE_PATH
         feature_yaml = _feature_yaml_path(Path(repo_root), feature_id)
@@ -967,6 +1072,7 @@ def make_stamps_leg(
             code_commit_time=commit_time,
             history_dir=history_dir,
             feature_id=feature_id,
+            candidate_check_before_merge=candidate_check_before_merge,
         )
 
     return stamps_leg

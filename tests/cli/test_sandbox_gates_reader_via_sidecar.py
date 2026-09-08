@@ -740,3 +740,204 @@ class TestTheRoutingLawIsReadInsideTheSandbox:
 
         assert report.status is GateStatus.GREEN
         assert asked == ["in-container"]
+
+
+# ---------------------------------------------------------------------------
+# The checks the merge press runs: deferred, not missing (ruled 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# FEAT-39F6's scenarios are stamped ``probe:process``, a home whose evidence
+# only the live gate writes — and a fix journey runs no live gate before this
+# checkpoint. So the leg above could only ever say ABSENT and no fix journey on
+# such a repository could reach its merge card. Since protect-main the merge
+# press stands the candidate up inside the sandbox and runs the live gate on it
+# BEFORE anything lands, so the checkpoint defers those checks to the press —
+# and ONLY where the press really does that.
+
+
+def _profile(repo_root: Path, *, candidate: bool) -> Path:
+    """Write the repository's real ``deploy/profile.yaml``, with or without a
+    candidate block — the same file, read by the same loader, as the deploy
+    stage's own."""
+    path = repo_root / "deploy" / "profile.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "env_id: local\ncompose:\n  file: deploy/docker-compose.yml\n"
+    if candidate:
+        text += 'candidate:\n  env:\n    CANDIDATE_PORT: "8902"\n'
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _deploys_through_a_sidecar(config: ForgeConfig) -> ForgeConfig:
+    """The same settings, with the deploy stage's scripts on a sidecar — which
+    is what forge-prod runs with (it has no docker of its own)."""
+    return config.model_copy(
+        update={
+            "deploy": config.deploy.model_copy(
+                update={"execution_surface": "sidecar"}
+            )
+        }
+    )
+
+
+class TestTheStampsTheMergePressWillRun:
+    def test_a_gate_home_stamp_is_deferred_and_the_card_says_how_many(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        _stamp_the_feature(clone, verifier="probe:process", title="a caller sees 201")
+        _profile(clone, candidate=True)
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=_deploys_through_a_sidecar(sidecar.config),
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN, report.detail
+        assert report.deferred_detail == (
+            "1 stamped check (probe:process) runs in the sandbox at the "
+            "merge, before anything lands."
+        )
+        assert "a caller sees 201" in report.detail
+
+    def test_the_same_repository_without_a_candidate_check_is_unchanged(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        """No candidate block: nothing checks the stamp before the merge."""
+        _stamp_the_feature(clone, verifier="probe:process", title="a caller sees 201")
+        _profile(clone, candidate=False)
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=_deploys_through_a_sidecar(sidecar.config),
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+        assert report.deferred_detail == ""
+
+    def test_no_deploy_profile_at_all_is_unchanged(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        _stamp_the_feature(clone, verifier="probe:process", title="a caller sees 201")
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=_deploys_through_a_sidecar(sidecar.config),
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+
+    def test_a_deploy_that_does_not_run_on_a_sidecar_is_unchanged(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        """The candidate block alone is not the check; the surface matters."""
+        _stamp_the_feature(clone, verifier="probe:process", title="a caller sees 201")
+        _profile(clone, candidate=True)
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=sidecar.config,  # execution_surface stays 'local'
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+
+    def test_a_repository_with_no_sandbox_is_asked_exactly_what_it_always_was(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        plain_checkout: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Even with a candidate block: no sandbox, no deferral, same call."""
+        _profile(plain_checkout, candidate=True)
+        plain_worktree = tmp_path / "plain-wt-defer"
+        plain_worktree.mkdir()
+        _row(pool, REPO_WITHOUT, plain_worktree)
+        seen: list[dict[str, Any]] = []
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=_deploys_through_a_sidecar(sidecar.config),
+            declaration_loader=lambda _root: _Declaration("npm test"),
+            command_runner=lambda **kw: (0, "green"),
+            stamps_leg=lambda **kw: (
+                seen.append(kw)
+                or SimpleNamespace(
+                    status="not-enforced", detail="", blocks_card=False, attended=()
+                )
+            ),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN
+        assert seen == [
+            {
+                "feature_id": "FEAT-G88",
+                "repo_root": str(plain_checkout),
+                "worktree": str(plain_worktree),
+                "branch": f"fix/{BUILD_ID}",
+                "toolchain_green": True,
+            }
+        ]
+
+
+class TestWhoseMergeChecksACandidateFirst:
+    def test_a_sidecar_deploy_with_a_candidate_block_says_yes(
+        self, sidecar: Any, clone: Path
+    ) -> None:
+        _profile(clone, candidate=True)
+
+        assert (
+            conductor.candidate_is_checked_before_the_merge(
+                _deploys_through_a_sidecar(sidecar.config), clone
+            )
+            is True
+        )
+
+    def test_a_profile_that_cannot_be_read_says_no(
+        self, sidecar: Any, tmp_path: Path
+    ) -> None:
+        nowhere = tmp_path / "no-such-repository"
+
+        assert (
+            conductor.candidate_is_checked_before_the_merge(
+                _deploys_through_a_sidecar(sidecar.config), nowhere
+            )
+            is False
+        )

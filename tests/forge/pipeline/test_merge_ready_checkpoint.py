@@ -427,3 +427,76 @@ class TestCardDelivery:
 
         assert decision.outcome is MergeCardOutcome.RED_GATE_FAILED
         assert decision.failure_pack is None
+
+
+# ---------------------------------------------------------------------------
+# The card's line about the checks that run at the merge (ruled 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+class TestTheCardSaysWhatRunsAtTheMerge:
+    """Some stamped checks are proven at the merge, not here.
+
+    On a repository whose merge stands the candidate up and runs the live gate
+    on it before anything lands, the gate set defers those checks rather than
+    calling them missing — and the card has to say so, in one plain sentence,
+    so the owner knows what his merge word sets running.
+    """
+
+    def test_the_card_says_how_many_checks_run_at_the_merge(self) -> None:
+        card = _RecordingPublisher()
+        publisher = MergeReadyCheckpointPublisher(
+            publish_card=card,
+            gates_green_reader=lambda **_: GatesReport(
+                status=GateStatus.GREEN,
+                detail="`qa/run-suite.sh` exited 0",
+                deferred_detail=(
+                    "5 stamped checks (probe:process) run in the sandbox at "
+                    "the merge, before anything lands."
+                ),
+            ),
+        )
+
+        decision = _submit(publisher)
+
+        assert decision.outcome is MergeCardOutcome.CARD_PUBLISHED
+        assert (
+            "5 stamped checks (probe:process) run in the sandbox at the "
+            "merge, before anything lands." in decision.rationale
+        )
+        assert "gates green, merge card published" in decision.rationale
+
+    def test_a_gate_set_that_defers_nothing_says_exactly_what_it_always_said(
+        self,
+    ) -> None:
+        card = _RecordingPublisher()
+        publisher = MergeReadyCheckpointPublisher(
+            publish_card=card,
+            gates_green_reader=lambda **_: GatesReport(
+                status=GateStatus.GREEN, detail="`npm test` exited 0"
+            ),
+        )
+
+        decision = _submit(publisher)
+
+        assert decision.rationale == (
+            f"mode-c-commits-present | {MERGE_READY_CHECKPOINT_LABEL}: gates "
+            "green, merge card published"
+        )
+
+    def test_the_sentence_rides_the_gate_set_to_the_card_publisher(self) -> None:
+        """The seam that builds the envelope is handed the same report."""
+        card = _RecordingPublisher()
+        report = GatesReport(
+            status=GateStatus.GREEN,
+            detail="`qa/run-suite.sh` exited 0",
+            deferred_detail="1 stamped check (exam) runs in the sandbox at "
+            "the merge, before anything lands.",
+        )
+        publisher = MergeReadyCheckpointPublisher(
+            publish_card=card, gates_green_reader=lambda **_: report
+        )
+
+        _submit(publisher)
+
+        assert card.calls[0]["gates"] is report
