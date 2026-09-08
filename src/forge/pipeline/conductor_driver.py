@@ -115,7 +115,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from forge.pipeline.finding_anchors import (
     derive_finding_anchors,
@@ -127,6 +127,7 @@ from forge.pipeline.supervisor import TurnOutcome
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHECKPOINT_VERDICT_RECORDED_KEY",
     "REVIEW_NO_PROGRESS_LIMIT",
     "UNVERIFIED_AFTER_APPROVED_WORK",
     "ConductorDriverDeps",
@@ -138,6 +139,17 @@ __all__ = [
     "drive_fix_journey",
 ]
 
+
+#: Key the merge-ready checkpoint's own composition sets on a decision's
+#: ``details`` to say "this verdict was written into the journey's history".
+#:
+#: It is what tells the loop that a red gate's loop-back is a DURABLE change
+#: rather than a turn that did nothing: with the row written, the next plan
+#: reads a red checkpoint and sends the failures back to the review seat, so
+#: the turn moved the journey. Without it — a composition with no recorder, a
+#: test double, any older wiring — the loop keeps exactly today's behaviour
+#: and the nothing-changed rule bounds the loop-back as it always did.
+CHECKPOINT_VERDICT_RECORDED_KEY: str = "checkpoint_verdict_recorded"
 
 #: Upper bound (seconds) on how long the loop waits for a resume
 #: subscription to arm before giving up on that round and retrying.
@@ -535,8 +547,17 @@ class ConductorTurnLoop:
             last_report = report
             outcome = getattr(report, "outcome", None)
 
+            # A RED GATE THAT WROTE ITS VERDICT DOWN IS A CHANGE, however
+            # identical the turn looks. Attempt fifteen re-ran the same suite
+            # four times in two minutes with nothing to show for it, and the
+            # nothing-changed rule was right to stop that. Now the checkpoint's
+            # verdict lands in the journey's history and the next plan reads
+            # it, so such a turn moved the journey and this rule must not
+            # count it as standing still.
             fingerprint = self._fingerprint(report)
-            if fingerprint == last_fingerprint:
+            if fingerprint == last_fingerprint and not _red_gate_wrote_its_verdict(
+                report
+            ):
                 unchanged_streak += 1
             else:
                 unchanged_streak = 0
@@ -592,6 +613,41 @@ class ConductorTurnLoop:
                 no_progress_reviews = 0
 
             await self._export_receipts(build_id, receipted)
+
+            if _is_red_gate_terminal(report):
+                # THE CHECKS STAYED RED AND THERE IS NO CYCLE LEFT.
+                # The checkpoint's own red-gate action asked whether a review
+                # cycle remained to loop back into, and the answer was no.
+                # That ends the journey, and it ends it the way every driver
+                # stop does (K1): the build row FAILED with the reason, the
+                # pack written, the queue's message released. Left to the
+                # TERMINAL branch below it would reach the close-out that
+                # declines to adjudicate a merge-card decision — the card's
+                # own state machine owns those rows — and this journey, which
+                # never published a card, would sit RUNNING for ever.
+                reason = _red_gate_final_reason(report)
+                logger.error(
+                    "conductor: build_id=%s stopped after %d turn(s) — %s",
+                    build_id,
+                    turns,
+                    reason,
+                )
+                pack = await self._write_pack(
+                    build_id,
+                    reason=reason,
+                    outcome=ConductorRunOutcome.RED_GATE_STOP,
+                )
+                await self._close_out_stop(build_id, reason=reason, report=report)
+                return ConductorRunReport(
+                    outcome=ConductorRunOutcome.RED_GATE_STOP,
+                    build_id=build_id,
+                    turns=turns,
+                    last_report=report,
+                    stage_receipts=tuple(self._stage_receipts),
+                    unverified_findings=tuple(self._unverified_findings),
+                    rationale=reason,
+                    failure_pack=pack,
+                )
 
             if outcome is TurnOutcome.TERMINAL:
                 await self._close_out(build_id, report)
@@ -775,6 +831,25 @@ class ConductorTurnLoop:
                     )
                     continue
 
+                if _red_gate_wrote_its_verdict(report):
+                    # THE LOOP-BACK IS A TURN, NOT A WAIT. Nothing external
+                    # is coming: the checkpoint has already run, its verdict
+                    # is a durable row, and the very next plan reads it and
+                    # sends the failing tests back to the review seat. Waiting
+                    # for a signal that nobody will send is how attempt
+                    # fifteen's wait "resolved externally" on the spot and
+                    # re-ran the same suite four times. So re-plan now, the
+                    # same way a settled dispatch does.
+                    logger.info(
+                        "conductor: build_id=%s turn %d — the merge-ready "
+                        "checks were red and the verdict is written into the "
+                        "journey's history; re-planning so the failures go "
+                        "back into the fix cycle",
+                        build_id,
+                        turns,
+                    )
+                    continue
+
                 # THE RED-GATE HONEST WORD (shadow-replay item 1).
                 #
                 # ``RED_GATE_LOOP_BACK`` is mapped to ``WAITING`` by the
@@ -792,6 +867,12 @@ class ConductorTurnLoop:
                 #     wait; fall through to the structured wait unchanged.
                 #   * no resume seam → stop NOW with RED_GATE_STOP, and
                 #     name the failing gates in the rationale and the pack.
+                #
+                # This is now the word for a loop-back that left NOTHING
+                # durable behind it — a composition with no checkpoint
+                # recorder, a test double. The branch above already took the
+                # loop-back that wrote its verdict down, which needs no wait
+                # at all: the next plan reads the row and dispatches.
                 if _is_red_gate_loop_back(report) and not self._can_arm_a_wait():
                     reason = _red_gate_reason(report)
                     logger.error(
@@ -1513,6 +1594,63 @@ def _is_red_gate_loop_back(report: Any) -> bool:
     it.
     """
     return getattr(getattr(report, "dispatch_result", None), "loops_back", False) is True
+
+
+def _is_red_gate_terminal(report: Any) -> bool:
+    """``True`` when the red gate ended the journey rather than looping back.
+
+    Duck-typed against
+    :class:`~forge.pipeline.merge_ready_checkpoint.MergeCardDecision`'s
+    ``is_terminal_failed`` property — the same no-import-edge discipline
+    every other checkpoint reading here uses. Every other dispatch result,
+    and every test double that is not a decision, answers ``False``.
+    """
+    return (
+        getattr(getattr(report, "dispatch_result", None), "is_terminal_failed", False)
+        is True
+    )
+
+
+def _red_gate_wrote_its_verdict(report: Any) -> bool:
+    """``True`` when this turn's red gate left its verdict in the history.
+
+    The one thing that makes a loop-back a durable change rather than a turn
+    that did nothing: with the checkpoint's row written, the next plan reads
+    "the last checkpoint on this tree was red" and sends the failing tests
+    back to the review seat. Read off the decision's own ``details`` under
+    :data:`CHECKPOINT_VERDICT_RECORDED_KEY`, so a composition that records
+    nothing — a test double, any older wiring — keeps today's behaviour
+    exactly, bounded by the nothing-changed rule as it always was.
+    """
+    if not _is_red_gate_loop_back(report):
+        return False
+    details = getattr(getattr(report, "dispatch_result", None), "details", None)
+    if not isinstance(details, Mapping):
+        return False
+    return details.get(CHECKPOINT_VERDICT_RECORDED_KEY) is True
+
+
+def _red_gate_final_reason(report: Any) -> str:
+    """The plain sentence a journey stopped by red checks ends with.
+
+    Names the checks and then what failed — the failing gate names when the
+    reader gave any (for the declared suite they carry the failing tests
+    themselves), and the free-form detail otherwise. It is the reason on the
+    build row, in the failure pack and in the run report, so it says the
+    whole thing in one line.
+    """
+    decision = getattr(report, "dispatch_result", None)
+    gates = getattr(decision, "gates", None)
+    failed = tuple(getattr(gates, "failed_gates", ()) or ())
+    detail = str(getattr(gates, "detail", "") or "")
+    named = (
+        ", ".join(str(gate) for gate in failed)
+        or detail
+        or "the checks named nothing; the run's output is in the receipts"
+    )
+    return (
+        f"the merge-ready checks stayed red and no review cycle is left — {named}"
+    )
 
 
 def _red_gate_reason(report: Any) -> str:

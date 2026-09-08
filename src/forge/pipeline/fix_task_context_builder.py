@@ -23,12 +23,20 @@ This adapter fills it, and does exactly two things:
 It is an *adapter*, not a second builder: no allowlist logic, no stage_log
 reads, no path arithmetic of its own.
 
-Since 2026-09-08 this module also builds the **follow-up review's
-verification document** — the prior review's findings, the commits the
-cycle's work legs made since, and one plain instruction to check each
-finding against the code that is there now. It is here because the facts
-come from the same exported receipts this module already reads. See the
-long note above :data:`VERIFY_DOCUMENT_NAME`.
+Since 2026-09-08 this module also builds the two documents a review leg is
+handed.
+
+The **follow-up review's verification document** carries the prior review's
+findings, the commits the cycle's work legs made since, and one plain
+instruction to check each finding against the code that is there now. It is
+here because the facts come from the same exported receipts this module
+already reads. See the long note above :data:`VERIFY_DOCUMENT_NAME`.
+
+The **gate-driven review's document** carries what the merge-ready checks
+ran, what failed under it, and the instruction that the repository's
+existing tests are the specification. It travels the same way, and both ride
+together when both apply. See the note above
+:data:`GATE_FAILURES_DOCUMENT_NAME`.
 
 Never raises. A pack that cannot be read degrades to "no pack" — the
 supervisor's own call site also guards, but a context builder that can
@@ -51,16 +59,24 @@ from forge.pipeline.stage_taxonomy import StageClass
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "GATE_FAILURES_DOCUMENT_NAME",
+    "GATE_FAILURES_EVIDENCE_SOURCE",
+    "GATE_FAILURES_INSTRUCTION",
     "VERIFY_DOCUMENT_NAME",
     "VERIFY_EVIDENCE_SOURCE",
     "VERIFY_INSTRUCTION",
     "CycleCommit",
     "FixTaskContextBuilder",
+    "GateFailures",
     "PriorFinding",
     "PriorReviewEvidence",
+    "build_gate_evidence_context",
     "build_review_verification_context",
+    "read_gate_failures",
     "read_prior_review_evidence",
+    "render_gate_failures",
     "render_verify_prior_findings",
+    "write_gate_failures",
     "write_verify_prior_findings",
 ]
 
@@ -784,5 +800,293 @@ def build_review_verification_context(
             type(exc).__name__,
             exc,
             build_id,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# The gate-driven review's document (attempt fifteen, 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# WHAT WENT WRONG. Attempt fifteen ran the whole fix cycle — a review that
+# named the cause, four approved work legs, a clean follow-up review — and
+# the merge-ready checkpoint then ran the repository's declared suite on the
+# journey worktree: 2 failed, 817 passed. One of the four fix tasks, asked
+# for by the review seat "for consistency", had made a soft-deleted user
+# unfindable by email, which the feature's own tests require. The checkpoint
+# did exactly its job. Nothing then did anything with what it found: the red
+# gate looped back onto itself, the same suite ran three more times, and the
+# journey was stopped by the nothing-changed rule.
+#
+# WHAT THIS ADDS. One document for the review leg a red checkpoint sends the
+# journey back to, carrying three things:
+#
+#   1. the declared test command and the code it exited with — what was run,
+#      and what it answered;
+#   2. the tests that failed and the output the run itself printed under
+#      them, which is the evidence the checkpoint keeps;
+#   3. the instruction, in plain English: make the declared command pass, and
+#      when a change this journey made contradicts an existing test, fix the
+#      change, not the test.
+#
+# The third is the one that matters most for attempt fifteen's shape. Left to
+# itself a review seat asked to "make the tests pass" may reasonably decide
+# the tests are wrong; the repository's existing tests are the specification,
+# and a repair task is the only thing that may say otherwise.
+#
+# HOW IT TRAVELS. Exactly as K2's verification document does, and for the
+# same reason: written into the journey worktree's
+# ``.guardkit/autobuild/<task id>/`` when that tree is on this side, and sent
+# inline with the dispatch when the repository has a sandbox and the tree is
+# inside it. One document, one ``--context`` flag, whichever carriage can
+# reach the leg. Both documents ride together when both apply.
+
+
+#: Filename of the gate-evidence document inside the journey worktree.
+GATE_FAILURES_DOCUMENT_NAME: str = "merge-ready-failures.md"
+
+#: What the gate-driven review is asked to do, in plain English. Stated once,
+#: here, so the document and its tests cannot drift into two instructions.
+GATE_FAILURES_INSTRUCTION: str = (
+    "The merge-ready checks failed on the tests below. Produce fix tasks that "
+    "make the declared test command pass. The repository's existing tests are "
+    "the specification unless the repair task says otherwise: when a change "
+    "this journey made contradicts an existing test, the change is what must "
+    "be fixed, not the test."
+)
+
+#: Where the facts in the document came from, said in the document itself.
+GATE_FAILURES_EVIDENCE_SOURCE: str = (
+    "the merge-ready checkpoint's own row in this build's stage log — the "
+    "declared test command it ran on this worktree, and what that command "
+    "printed"
+)
+
+
+@dataclass(frozen=True)
+class GateFailures:
+    """What the merge-ready checks said when they came back red.
+
+    Attributes:
+        command: The declared test command that was run, verbatim. ``""``
+            when the row recorded none (an older row, or a gate set that was
+            not the declared suite).
+        exit_code: What that command answered. ``None`` when unrecorded.
+        failing_tests: The names the test tool's own summary gave the cases
+            that failed, in the order it wrote them.
+        failed_gates: The gate names the checkpoint reported failing.
+        detail: The checkpoint's one-line sentence about the run.
+        evidence: The bounded text of what the command printed.
+    """
+
+    command: str = ""
+    exit_code: int | None = None
+    failing_tests: tuple[str, ...] = ()
+    failed_gates: tuple[str, ...] = ()
+    detail: str = ""
+    evidence: str = ""
+
+
+def read_gate_failures(rows: Any) -> GateFailures | None:
+    """Read the red merge-ready verdict on the tree as it stands, or ``None``.
+
+    ``rows`` are the build's ``stage_log`` rows in chronological order — the
+    same duck-typed shape the Mode C projection consumes
+    (``stage_label`` / ``status`` / ``details``), so this needs no database
+    and no second reader.
+
+    Walks backwards and stops at the first thing that matters:
+
+    * a ``pull-request-review`` row — the checkpoint's verdict. RED answers
+      with the evidence; GREEN answers ``None`` (there is nothing to fix).
+    * a ``task-review`` or ``task-work`` row — the fix cycle has run since
+      the checks, so their verdict is about an older tree. ``None``.
+
+    Never raises: a row shaped in a way this cannot read is one the review is
+    dispatched without, exactly as before.
+    """
+    from forge.pipeline.mode_c_history_reader import (
+        CHECKPOINT_COMMAND_DETAILS_KEY,
+        CHECKPOINT_EVIDENCE_DETAILS_KEY,
+        CHECKPOINT_EXIT_CODE_DETAILS_KEY,
+        CHECKPOINT_FAILING_TESTS_DETAILS_KEY,
+    )
+
+    for row in reversed(list(rows or ())):
+        label = str(getattr(row, "stage_label", "") or "")
+        if label in (StageClass.TASK_REVIEW.value, StageClass.TASK_WORK.value):
+            return None
+        if label != StageClass.PULL_REQUEST_REVIEW.value:
+            continue
+        if str(getattr(row, "status", "") or "").upper() != "FAILED":
+            return None
+        details = getattr(row, "details", None)
+        if not isinstance(details, Mapping):
+            details = {}
+        exit_code = details.get(CHECKPOINT_EXIT_CODE_DETAILS_KEY)
+        return GateFailures(
+            command=str(details.get(CHECKPOINT_COMMAND_DETAILS_KEY) or ""),
+            exit_code=(
+                int(exit_code)
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                else None
+            ),
+            failing_tests=_strings(details.get(CHECKPOINT_FAILING_TESTS_DETAILS_KEY)),
+            failed_gates=_strings(details.get("failed_gates")),
+            detail=str(details.get("rationale") or ""),
+            evidence=str(details.get(CHECKPOINT_EVIDENCE_DETAILS_KEY) or ""),
+        )
+    return None
+
+
+def _strings(raw: Any) -> tuple[str, ...]:
+    """A JSON array of names as a tuple of non-empty strings; ``()`` if not."""
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(v).strip() for v in raw if str(v).strip())
+
+
+def render_gate_failures(failures: GateFailures) -> str:
+    """Render the gate-evidence document as plain Markdown."""
+    command = failures.command or "(the row did not record the command)"
+    exit_code = (
+        str(failures.exit_code)
+        if failures.exit_code is not None
+        else "(not recorded)"
+    )
+    lines: list[str] = [
+        "# The merge-ready checks failed on this worktree",
+        "",
+        "The fixes in this worktree were taken to the merge-ready checks and "
+        "the repository's declared test command came back red. That is why "
+        "this review is running.",
+        "",
+        f"Source of these facts: {GATE_FAILURES_EVIDENCE_SOURCE}.",
+        "",
+        "## What you are asked to do",
+        "",
+        GATE_FAILURES_INSTRUCTION,
+        "",
+        "## The check that failed",
+        "",
+        f"- Declared test command: `{command}`",
+        f"- Exit code: {exit_code}",
+    ]
+    if failures.failed_gates:
+        lines.append(f"- Gates reported failing: {', '.join(failures.failed_gates)}")
+    if failures.detail:
+        lines.append(f"- The checkpoint's own line: {failures.detail}")
+    lines.extend(["", f"## The tests that failed ({len(failures.failing_tests)})", ""])
+    if failures.failing_tests:
+        lines.extend(f"- `{name}`" for name in failures.failing_tests)
+    else:
+        lines.append(
+            "The test tool named no individual case. Read the output below "
+            "before deciding what failed."
+        )
+    lines.extend(["", "## What the test command printed", ""])
+    if failures.evidence:
+        lines.extend(["```", failures.evidence.rstrip(), "```"])
+    else:
+        lines.append(
+            "Nothing of the run's output was kept. Run the declared command "
+            "in this worktree and read it there."
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_gate_failures(
+    *,
+    worktree_path: "Path | str | None",
+    task_id: str,
+    text: str,
+) -> Path | None:
+    """Write the document into the journey worktree, or say why it could not.
+
+    The same law as :func:`write_verify_prior_findings`, for the same reason:
+    the document belongs beside the leg's own receipts in
+    ``<worktree>/.guardkit/autobuild/<task id>/``, and it is written only
+    when that worktree is really on this side. For a repository with a
+    sandbox the tree is inside the sandbox and forge can neither read nor
+    write it, so a file here would leave the leg a path that does not exist
+    where it runs. ``None`` then, and the caller sends the same Markdown
+    inline instead.
+
+    Never raises.
+    """
+    if worktree_path is None or not task_id:
+        return None
+    tree = Path(str(worktree_path))
+    try:
+        if not tree.is_dir():
+            logger.info(
+                "gate evidence: the journey worktree %s is not on this side "
+                "(a repository with a sandbox keeps its tree inside), so the "
+                "merge-ready failures travel with the dispatch instead of "
+                "being written to a file",
+                tree,
+            )
+            return None
+        dest_dir = tree / _AUTOBUILD_FAMILY[0] / _AUTOBUILD_FAMILY[1] / task_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / GATE_FAILURES_DOCUMENT_NAME
+        dest.write_text(text, encoding="utf-8")
+        return dest
+    except OSError as exc:
+        logger.info(
+            "gate evidence: could not write %s into %s (%s: %s) — the "
+            "merge-ready failures travel with the dispatch instead",
+            GATE_FAILURES_DOCUMENT_NAME,
+            tree,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def build_gate_evidence_context(
+    *,
+    rows: Any,
+    worktree_path: "Path | str | None",
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Return the one extra context entry for a gate-driven review, or ``None``.
+
+    ``None`` means "change nothing": the checks have not run on this tree,
+    they came back green, the fix cycle has run since, or the rows could not
+    be read. The entry, when there is one, has the same plain
+    ``{"flag", "value", "kind"}`` shape every other forward-context entry
+    has, so it rides the dispatch and the ``stage_log`` row unchanged.
+
+    Never raises.
+    """
+    try:
+        failures = read_gate_failures(rows)
+        if failures is None:
+            return None
+        text = render_gate_failures(failures)
+        path = write_gate_failures(
+            worktree_path=worktree_path, task_id=task_id, text=text
+        )
+        if path is not None:
+            logger.info(
+                "gate evidence: the review is handed the %d failing test(s) "
+                "the merge-ready checks found, written to %s",
+                len(failures.failing_tests),
+                path,
+            )
+            return {"flag": "--context", "value": str(path), "kind": "path"}
+        logger.info(
+            "gate evidence: the review is handed the %d failing test(s) the "
+            "merge-ready checks found, sent with the dispatch itself",
+            len(failures.failing_tests),
+        )
+        return {"flag": "--context", "value": text, "kind": "text"}
+    except Exception as exc:  # noqa: BLE001 — a reader defect must not kill a journey
+        logger.warning(
+            "gate evidence: building the document raised %s: %s — the review "
+            "is dispatched exactly as before",
+            type(exc).__name__,
+            exc,
         )
         return None
