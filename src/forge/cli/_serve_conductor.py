@@ -474,9 +474,19 @@ _FAILING_CASE_MARKERS: tuple[str, ...] = ("FAILED", "FAIL", "not ok", "ERROR")
 _WEAK_FAILING_CASE_MARKERS: tuple[str, ...] = ("ERROR",)
 
 #: Said in place of the lines that did not fit, so nobody reads a cut-off
-#: piece of output as the whole of it.
-_EVIDENCE_TRUNCATED_MARKER: str = (
+#: piece of output as the whole of it. There are two of these because a part
+#: is cut in two different directions: the tail of the output keeps its END
+#: (its earlier lines are the ones that go), while the tool's own list of
+#: failing cases keeps its START (its later names are the ones that go).
+#: Printing the wrong one sends a reader hunting for a test name at the wrong
+#: end of the list, so each direction says exactly what happened to it. The
+#: size named is the size actually kept, not the budget it was cut to.
+_EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_END: str = (
     "[… earlier output dropped: only the last {kept} bytes of this part are "
+    "kept, of {whole} the command printed …]"
+)
+_EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_START: str = (
+    "[… later output dropped: only the first {kept} bytes of this part are "
     "kept, of {whole} the command printed …]"
 )
 
@@ -555,18 +565,38 @@ def _failing_case_name(line: str) -> str:
 
 
 def _keep_within(text: str, budget_bytes: int, *, keep_end: bool) -> str:
-    """Trim ``text`` to ``budget_bytes``, saying plainly that it was trimmed."""
+    """Trim ``text`` to ``budget_bytes``, saying plainly that it was trimmed.
+
+    ``keep_end`` says which end survives, and the sentence left behind says
+    the same thing in words: keeping the end means the earlier output went,
+    keeping the start means the later output went. The sentence also names
+    the size that really is kept, which is a little under the budget because
+    the sentence itself has to fit inside it.
+    """
     whole = len(text.encode("utf-8", errors="replace"))
     if whole <= budget_bytes:
         return text
-    marker = _EVIDENCE_TRUNCATED_MARKER.format(
-        kept=max(budget_bytes, 0), whole=whole
+    template = (
+        _EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_END
+        if keep_end
+        else _EVIDENCE_TRUNCATED_MARKER_KEEPING_THE_START
     )
-    room = max(budget_bytes - len(marker.encode("utf-8")) - 1, 0)
+    # Room is measured against the longest the sentence could be — the kept
+    # size is never larger than the budget, so no later wording of it can be
+    # longer than this one and overrun what was reserved for it.
+    longest = template.format(kept=max(budget_bytes, 0), whole=whole)
+    room = max(budget_bytes - len(longest.encode("utf-8")) - 1, 0)
     encoded = text.encode("utf-8", errors="replace")
     piece = (encoded[-room:] if keep_end else encoded[:room]).decode(
         "utf-8", errors="replace"
     )
+    # A cut through the middle of a multi-byte character becomes a
+    # replacement character, which can be wider than the bytes it stands
+    # for; drop from the cut end until the piece really does fit.
+    while piece and len(piece.encode("utf-8", errors="replace")) > room:
+        piece = piece[1:] if keep_end else piece[:-1]
+    kept = len(piece.encode("utf-8", errors="replace"))
+    marker = template.format(kept=kept, whole=whole)
     return f"{marker}\n{piece}" if keep_end else f"{piece}\n{marker}"
 
 
@@ -585,8 +615,10 @@ def summarise_declared_test_output(
 
     The whole is bounded by ``limit_bytes``. The naming lines are kept first
     and the tail is trimmed from its front, because the tail's own end is the
-    part worth keeping; whatever is dropped is said in plain words where it
-    was dropped. Never raises: evidence that could not be summarised is not
+    part worth keeping; a naming list long enough to overrun its own half of
+    the budget is trimmed the other way, keeping the first names. Either way
+    the piece that was dropped is said in plain words, in the direction it
+    really went, where it went. Never raises: evidence that could not be summarised is not
     a reason to lose a verdict.
     """
     text = (output or "").replace("\r\n", "\n").strip("\n")
