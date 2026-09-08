@@ -55,6 +55,17 @@ so when the latest review repeats every finding location its predecessor
 named AND the work between the two reviews was approved, the planner goes
 to the merge-ready checkpoint, whose checks read the tree and decide.
 
+And one more, the same evening. The merge-ready checkpoint now leaves a
+row of its own, so the planner can read what the checks said about the tree
+in front of it. A RED checkpoint with nothing run since is not a reason to
+ask for the checks again: it is the design's own loop-back, and the next
+stage is a ``/task-review`` handed the gate's evidence — while the
+profile's review-cycle cap still allows one. With no cycle left the journey
+ends FAILED, naming the tests that stayed red. Before this the checkpoint
+was simply chosen again on the same unchanged history, four times, until
+the driver's nothing-changed rule stopped the build (attempt fifteen,
+2026-09-08).
+
 The planner is **stateless**. Every call inspects ``history`` and the
 ``has_commits`` flag; cyclic behaviour emerges from the planner deciding
 the same ``next_stage = TASK_WORK`` repeatedly until the most-recent
@@ -104,7 +115,10 @@ __all__ = [
     "ModeCTerminal",
     "ModeCWait",
     "StageEntry",
+    "a_review_cycle_remains",
     "approved_work_between_the_last_two_reviews",
+    "latest_checkpoint_on_this_tree",
+    "name_the_failing_tests",
     "plan_next_stage",
 ]
 
@@ -304,6 +318,13 @@ class StageEntry:
             conductor's review-cycle no-progress stop does — but it is
             projected here because ``StageEntry`` is the one shape the
             history is read through.
+        failing_tests: For ``pull-request-review`` (merge-ready checkpoint)
+            entries, the names the declared test command's own summary gave
+            the cases that failed. Empty on a green checkpoint, on every
+            other stage class, and on a red checkpoint whose test tool named
+            nothing — the run's output is still on the row either way. The
+            planner reads it for one thing only: the plain sentence it puts
+            on the decision to send those failures back to the review seat.
         hard_stop: Whether the gate decision was a hard-stop. A hard-stop
             on ``/task-review`` terminates the build with FAILED regardless
             of the ``status`` string (gate vocabularies vary).
@@ -323,6 +344,7 @@ class StageEntry:
     fix_tasks: tuple[str, ...] = field(default=())
     fix_task_id: str | None = None
     finding_anchors: tuple[str, ...] | None = None
+    failing_tests: tuple[str, ...] = field(default=())
     hard_stop: bool = False
     failure_reason: str | None = None
 
@@ -469,6 +491,46 @@ class ModeCCyclePlanner:
                 permitted_stages=permitted,
                 next_stage=StageClass.TASK_REVIEW,
                 rationale="initial review — empty history",
+            )
+
+        # THE RED MERGE-READY CHECKPOINT GOES BACK INTO THE FIX CYCLE
+        # (2026-09-08, attempt fifteen's seam).
+        #
+        # The checkpoint ran the repository's declared suite on the journey
+        # worktree and two tests failed — one of them because a fix task the
+        # review seat asked for "for consistency" contradicted the feature's
+        # own tests. The checkpoint did exactly its job. But its verdict went
+        # nowhere durable, so this stateless planner re-read the same clean
+        # follow-up review and chose the checkpoint again, three more times,
+        # until the turn-level nothing-changed rule stopped the build.
+        #
+        # The design's own words for a red gate are "a red gate is NEVER a
+        # card; it loops back into the fix cycle". This is the loop: the
+        # checkpoint's verdict is now a row in the history, and a red one
+        # with nothing run since sends the failing tests back to the review
+        # seat — while the profile still allows a review cycle. With none
+        # left the journey ends, naming the tests that kept it red.
+        checkpoint = latest_checkpoint_on_this_tree(history)
+        if checkpoint is not None and checkpoint.status == _STATUS_FAILED:
+            if a_review_cycle_remains(history, review_cycle_cap):
+                return ModeCPlan(
+                    permitted_stages=permitted,
+                    next_stage=StageClass.TASK_REVIEW,
+                    rationale=(
+                        "the merge-ready checks failed "
+                        f"({_count_the_failing_tests(checkpoint)}) — "
+                        f"{_cycles_left_in_words(history, review_cycle_cap)}, "
+                        "sending the failures back to the review seat"
+                    ),
+                )
+            return ModeCPlan(
+                permitted_stages=permitted,
+                next_stage=None,
+                terminal=ModeCTerminal.FAILED,
+                rationale=(
+                    "the merge-ready checks stayed red and no review cycle "
+                    f"is left — {name_the_failing_tests(checkpoint)}"
+                ),
             )
 
         # Locate the most recent /task-review entry. Mode C always opens
@@ -961,6 +1023,91 @@ class ModeCCyclePlanner:
 # ---------------------------------------------------------------------------
 # Module-level readings of the history
 # ---------------------------------------------------------------------------
+
+
+def latest_checkpoint_on_this_tree(
+    history: Sequence[StageEntry],
+) -> StageEntry | None:
+    """The merge-ready checkpoint's verdict on the tree as it stands now.
+
+    Reads the history backwards and answers the first checkpoint row it
+    meets — but only while nothing of the fix cycle has run since. A
+    ``/task-review`` or a ``/task-work`` after the checkpoint means the tree
+    (or the reading of it) has moved on, so the checkpoint's verdict is no
+    longer about what is there now, and this answers ``None``.
+
+    ``None`` is also the answer for every history with no checkpoint row in
+    it, which is every history written before the checkpoint kept one —
+    hence every legacy ledger, whose planning is untouched by this rule.
+    """
+    for entry in reversed(history):
+        if entry.stage_class is StageClass.PULL_REQUEST_REVIEW:
+            return entry
+        if entry.stage_class in (StageClass.TASK_REVIEW, StageClass.TASK_WORK):
+            return None
+    return None
+
+
+def a_review_cycle_remains(
+    history: Sequence[StageEntry], review_cycle_cap: int | None
+) -> bool:
+    """Is there a review cycle left to spend under this build's profile?
+
+    The SAME arithmetic the budget guard enforces, counted the same way
+    (:func:`~forge.pipeline.budget_guard.count_review_cycles` over the
+    ``/task-review`` rows), so a dispatch this answers "yes" to can never be
+    the dispatch the guard then refuses. ``None`` — the attended profile,
+    and every caller that passes no cap — means the cycles are not capped.
+
+    Stated here, once, because two readers ask it: the planner, deciding
+    what follows a red checkpoint, and the checkpoint's own red-gate action,
+    deciding whether there is a cycle to loop back into at all.
+    """
+    if review_cycle_cap is None:
+        return True
+    return (
+        count_review_cycles(
+            history, is_review=lambda e: e.stage_class == StageClass.TASK_REVIEW
+        )
+        < review_cycle_cap
+    )
+
+
+def name_the_failing_tests(checkpoint: StageEntry) -> str:
+    """The failing tests as a person reads them, never an empty phrase.
+
+    The names the test tool itself wrote, when it wrote any; otherwise the
+    row's own reason (the checkpoint's sentence about the run); otherwise a
+    plain admission that nothing was named. A stop that says "the checks
+    stayed red — " and then nothing is a sentence that helps nobody.
+    """
+    if checkpoint.failing_tests:
+        return ", ".join(checkpoint.failing_tests)
+    if checkpoint.failure_reason:
+        return checkpoint.failure_reason
+    return "the checks named no failing test; the run's output is on the row"
+
+
+def _count_the_failing_tests(checkpoint: StageEntry) -> str:
+    """``"2 failing tests"`` — the count the planner's sentence opens with."""
+    count = len(checkpoint.failing_tests)
+    if not count:
+        return "no test was named"
+    return f"{count} failing test" + ("s" if count != 1 else "")
+
+
+def _cycles_left_in_words(
+    history: Sequence[StageEntry], review_cycle_cap: int | None
+) -> str:
+    """How much review budget is left, in plain words."""
+    if review_cycle_cap is None:
+        return "this profile caps no review cycles"
+    left = review_cycle_cap - count_review_cycles(
+        history, is_review=lambda e: e.stage_class == StageClass.TASK_REVIEW
+    )
+    if left == 1:
+        return "one review cycle remains"
+    return f"{left} review cycles remain"
 
 
 def approved_work_between_the_last_two_reviews(

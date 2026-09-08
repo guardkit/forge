@@ -63,6 +63,26 @@ Malformed means, exactly:
 A non-approved review row needs no ``fix_tasks`` key: the planner never
 reads the list on those paths (it terminates or waits first).
 
+The merge-ready checkpoint's row (2026-09-08)
+--------------------------------------------
+
+The projection reads a third stage label now: ``pull-request-review``, the
+durable row the merge-ready checkpoint writes when it has actually read the
+gate set. Green projects as ``approved``, red as ``failed``, and a red row
+carries the tests that failed
+(:data:`CHECKPOINT_FAILING_TESTS_DETAILS_KEY`) plus the run's own output.
+
+It exists because nothing recorded the checkpoint's verdict before. On
+attempt fifteen the declared suite came back red, the checkpoint looped
+back, and the stateless planner — reading a history whose last entry was
+still the clean follow-up review — chose the checkpoint again, and again,
+until the turn-level nothing-changed rule stopped the build. With the row
+in the history the planner can read "the last checkpoint on this tree was
+red" and send the failures back to the review seat instead.
+
+A ledger written before this row existed simply has none, and every label
+this map does not know is skipped as it always was.
+
 The ``has_commits`` flag
 ------------------------
 
@@ -96,12 +116,19 @@ from forge.pipeline.finding_anchors import (
     FINDING_ANCHORS_DETAILS_KEY,
     derive_finding_anchors,
 )
+from forge.pipeline.merge_ready_checkpoint import (
+    DECLARED_TEST_EVIDENCE_KEY as CHECKPOINT_EVIDENCE_DETAILS_KEY,
+)
 from forge.pipeline.mode_c_planner import StageEntry
 from forge.pipeline.stage_taxonomy import StageClass
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHECKPOINT_COMMAND_DETAILS_KEY",
+    "CHECKPOINT_EVIDENCE_DETAILS_KEY",
+    "CHECKPOINT_EXIT_CODE_DETAILS_KEY",
+    "CHECKPOINT_FAILING_TESTS_DETAILS_KEY",
     "FINDING_ANCHORS_DETAILS_KEY",
     "FIX_TASKS_DETAILS_KEY",
     "FIX_TASK_ID_DETAILS_KEY",
@@ -142,12 +169,40 @@ LIFECYCLE_STATE_DETAILS_KEY: str = "lifecycle_state"
 #: The ``lifecycle_state`` value meaning "dispatched, still in flight".
 _LIFECYCLE_RUNNING: str = "running"
 
+#: ``details_json`` keys the MERGE-READY CHECKPOINT writes on its own row
+#: (2026-09-08, attempt fifteen's seam). The checkpoint used to leave no row
+#: at all: its verdict lived on a turn report and nowhere durable, so the
+#: stateless planner re-read the same clean follow-up review and chose the
+#: checkpoint again, four times, until the nothing-changed rule stopped the
+#: journey. The row is what lets a later turn read "the last checkpoint on
+#: this tree was red, and these are the tests that failed".
+#:
+#: ``CHECKPOINT_FAILING_TESTS_DETAILS_KEY`` — the declared test command's own
+#: names for the cases that failed, in the order the tool wrote them.
+CHECKPOINT_FAILING_TESTS_DETAILS_KEY: str = "failing_tests"
+
+#: The declared test command that was run, verbatim.
+CHECKPOINT_COMMAND_DETAILS_KEY: str = "declared_test_command"
+
+#: The exit code that command answered with. The verdict itself — nothing
+#: downstream re-derives green or red from the text.
+CHECKPOINT_EXIT_CODE_DETAILS_KEY: str = "declared_test_exit_code"
+
+#: ``CHECKPOINT_EVIDENCE_DETAILS_KEY`` is imported above from
+#: :mod:`forge.pipeline.merge_ready_checkpoint` rather than re-spelled: the
+#: checkpoint's decision already files what the declared test printed under
+#: that name, and the row keeps it under the same one, so a reader looking
+#: for the run's own output finds it in one place whichever it opens.
+
 #: ``stage_label`` values this projection consumes. Every other label in
 #: the build's ``stage_log`` (autobuild rows, planning rows, skip rows) is
-#: not part of the fix journey's cycle and is skipped.
+#: not part of the fix journey's cycle and is skipped — including every
+#: label written before this projection knew the checkpoint, which is why a
+#: legacy ledger projects exactly as it always did.
 MODE_C_STAGE_LABELS: Mapping[str, StageClass] = {
     StageClass.TASK_REVIEW.value: StageClass.TASK_REVIEW,
     StageClass.TASK_WORK.value: StageClass.TASK_WORK,
+    StageClass.PULL_REQUEST_REVIEW.value: StageClass.PULL_REQUEST_REVIEW,
 }
 
 #: Planner-domain statuses. Mirrors the vocabulary documented on
@@ -274,6 +329,19 @@ def _project_row(row: Any, stage_class: StageClass, *, subject_task_id: str | No
             status=status,
             fix_tasks=_project_fix_tasks(details, status=status, subject_task_id=subject_task_id),
             finding_anchors=_project_finding_anchors(details),
+            hard_stop=hard_stop,
+            failure_reason=failure_reason,
+        )
+
+    if stage_class is StageClass.PULL_REQUEST_REVIEW:
+        # THE MERGE-READY CHECKPOINT'S OWN ROW. ``approved`` means the
+        # declared checks were green; ``failed`` means they were red, and the
+        # row's own rationale — carried through as ``failure_reason`` — is
+        # the sentence naming the tests that failed.
+        return StageEntry(
+            stage_class=stage_class,
+            status=status,
+            failing_tests=_project_failing_tests(details),
             hard_stop=hard_stop,
             failure_reason=failure_reason,
         )
@@ -476,6 +544,36 @@ def _project_failure_reason(
     if len(text) > _FAILURE_REASON_LIMIT:
         return text[: _FAILURE_REASON_LIMIT - 1] + "…"
     return text
+
+
+def _project_failing_tests(details: Mapping[str, Any]) -> tuple[str, ...]:
+    """The failing test names on a checkpoint row; ``()`` when it named none.
+
+    Lenient, for the same reason :func:`_project_finding_anchors` is: this
+    list drives a SENTENCE (the plain reason a journey went back into the fix
+    cycle, or stopped), never a fan-out. A malformed list costs a reader some
+    names; a hard stop here would take down a journey over a detail nothing
+    branches on. So anything unreadable answers "the row named none", loudly.
+    """
+    if CHECKPOINT_FAILING_TESTS_DETAILS_KEY not in details:
+        return ()
+    raw = details[CHECKPOINT_FAILING_TESTS_DETAILS_KEY]
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "mode_c_history_projection: %r is %s, expected a JSON array of "
+            "test names — projecting 'this row named no failing tests'",
+            CHECKPOINT_FAILING_TESTS_DETAILS_KEY,
+            type(raw).__name__,
+        )
+        return ()
+    names: list[str] = []
+    for element in raw:
+        if not isinstance(element, str) or not element.strip():
+            continue
+        text = element.strip()
+        if text not in names:
+            names.append(text)
+    return tuple(names)
 
 
 def _project_fix_task_id(details: Mapping[str, Any]) -> str:
