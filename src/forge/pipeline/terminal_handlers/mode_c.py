@@ -21,6 +21,10 @@ ASSUM-017):
   failed (``"mode-c-commit-check-failed"``). A probe failure is **not**
   silently demoted to a clean review — the build is recorded as
   failed and the operator gets the underlying error in the rationale.
+  Since 2026-09-08 it is also what a RED merge-ready checkpoint on this
+  tree produces (``"mode-c-merge-ready-checks-red"``): the checks have
+  answered, and asking for them again on the same tree is the loop
+  attempt fifteen died in.
 
 This module is the **single decision point** for Mode C terminal
 routing. The planner (``forge.pipeline.mode_c_planner``) handles the
@@ -76,6 +80,7 @@ __all__ = [
     "ModeCTerminal",
     "ModeCTerminalDecision",
     "RATIONALE_FAILED_ALL_WORK_FAILED",
+    "RATIONALE_FAILED_MERGE_READY_RED",
     "RATIONALE_FAILED_REVIEW_LEG",
     "build_session_outcome_payload",
     "build_task_work_attribution",
@@ -164,6 +169,23 @@ RATIONALE_FAILED_REVIEW_LEG: str = "mode-c-task-review-leg-failed"
 #: handler's branch 5a can see. Two constants spelling the same operator
 #: sentence would be one edit away from a lie, so there is one.
 RATIONALE_FAILED_ALL_WORK_FAILED: str = "mode-c-all-task-work-failed"
+
+#: Rationale string recorded when the last thing that happened on this tree
+#: was a RED merge-ready checkpoint (2026-09-08, attempt fifteen's seam).
+#:
+#: The handler's job here is to make sure the checkpoint is never chosen
+#: TWICE on the same tree. Its ordinary reading of a clean follow-up review
+#: with commits is "route to the merge-ready checkpoint" — which is exactly
+#: right the first time and exactly wrong the second, because the review row
+#: it reads has not changed and the checks have already answered red. The
+#: planner sends a red checkpoint back into the fix cycle while a review
+#: cycle remains; when none does, the planner ends the journey and this
+#: handler agrees with it instead of asking for the same checks again.
+#:
+#: PUBLIC for the same reason its siblings are: the word appears in a
+#: ``stage_log`` row, a run report and ``builds.error``, and one sentence
+#: belongs in one place.
+RATIONALE_FAILED_MERGE_READY_RED: str = "mode-c-merge-ready-checks-red"
 
 #: Rationale string recorded when the ``git rev-list base..HEAD --count``
 #: probe itself failed. Defence in depth: the probe error is treated
@@ -322,6 +344,10 @@ async def evaluate_terminal(
 
     Decision tree (each branch is mutually exclusive):
 
+    0. The merge-ready checkpoint's last verdict on this tree is RED and
+       nothing of the fix cycle has run since → FAILED with
+       ``RATIONALE_FAILED_MERGE_READY_RED``. Asking for the same checks
+       again on the same tree is the loop attempt fifteen died in.
     1. No ``/task-review`` row in history → FAILED (defensive — should
        not happen in production; see ``_RATIONALE_FAILED_NO_REVIEW``).
     2. Latest ``/task-review`` is hard-stopped → FAILED with
@@ -372,6 +398,31 @@ async def evaluate_terminal(
     # ``build`` is threaded straight through to ``commit_probe`` for
     # worktree-path resolution; the structural decision tree below
     # reads only ``history``.
+
+    # 0 — THE CHECKS HAVE ALREADY ANSWERED RED ON THIS TREE.
+    #
+    # Asked before anything else, because it is the one fact that overrides
+    # every reading below: the merge-ready checkpoint ran the repository's
+    # declared test command on this tree and it came back red. The rows behind
+    # that verdict have not changed and never will on this tree, so reading
+    # them again can only produce the same answer as last time — "route to
+    # the merge-ready checkpoint" — which is how a red gate looped back onto
+    # itself four times on attempt fifteen.
+    #
+    # Reaching here at all means the planner has already decided the journey
+    # is over (the handler runs only on a plan with no next stage), so the
+    # honest terminal is FAILED with the checks' own reason.
+    red_checkpoint = _red_checkpoint_on_this_tree(history)
+    if red_checkpoint is not None:
+        return ModeCTerminalDecision(
+            outcome=ModeCTerminal.FAILED,
+            has_commits=False,
+            rationale=RATIONALE_FAILED_MERGE_READY_RED,
+            failure_reason=(
+                red_checkpoint.failure_reason
+                or "the merge-ready checks were red and no reason was recorded"
+            ),
+        )
 
     # 1 — no review in history (defensive)
     latest_review_idx = _latest_review_index(history)
@@ -654,6 +705,24 @@ def build_session_outcome_payload(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _red_checkpoint_on_this_tree(history: Sequence[StageEntry]) -> StageEntry | None:
+    """The merge-ready checkpoint's RED verdict on the tree as it stands.
+
+    Read backwards, stopping at the first ``/task-review`` or ``/task-work``:
+    once the fix cycle has run again the checkpoint's verdict is about an
+    older tree and says nothing about this one. ``None`` for a green
+    checkpoint, for a tree the checks have not seen, and for every history
+    written before the checkpoint kept a row — which is every legacy ledger,
+    whose classification is untouched.
+    """
+    for entry in reversed(history):
+        if entry.stage_class is StageClass.PULL_REQUEST_REVIEW:
+            return entry if entry.status == _STATUS_LEG_FAILED else None
+        if entry.stage_class in (StageClass.TASK_REVIEW, StageClass.TASK_WORK):
+            return None
+    return None
 
 
 def _latest_review_index(history: Sequence[StageEntry]) -> int | None:

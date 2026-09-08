@@ -19,6 +19,12 @@ Coverage map:
   (:class:`TestReviewCycleNoProgressStop`, LI stage-2 §5): finding anchors
   compared across review cycles, replay-shaped against the runaway
   ledger's 347/355 pair.
+- The red gate (:class:`TestTheRedGateHonestWord`,
+  :class:`TestTheRedGateEndsTheJourneyWhenNoCycleIsLeft`): a loop-back that
+  wrote its verdict into the journey's history is a dispatch turn and the
+  nothing-changed rule does not count it; one that recorded nothing keeps
+  the RED_GATE_STOP it always had; and a red gate with no review cycle left
+  closes the build out FAILED, with a pack, releasing the queue.
 - The receipts seams (:class:`TestReceiptSeams`): per-turn export, the
   failure pack on a loud stop, and the "receipts never block a journey"
   posture.
@@ -710,6 +716,125 @@ def _red_gate_report() -> TurnReport:
     )
 
 
+def _recorded_red_gate_report() -> TurnReport:
+    """A red-gate loop-back whose verdict IS in the journey's history.
+
+    The one difference from :func:`_red_gate_report` is the mark the
+    checkpoint's own composition puts on the decision when it has written the
+    row — and that difference is the whole of the rule: a loop-back with a
+    durable row behind it is a dispatch turn, one without is the stop it
+    always was.
+    """
+    import dataclasses
+
+    from forge.pipeline.conductor_driver import CHECKPOINT_VERDICT_RECORDED_KEY
+
+    report = _red_gate_report()
+    return dataclasses.replace(
+        report,
+        dispatch_result=dataclasses.replace(
+            report.dispatch_result,
+            details={CHECKPOINT_VERDICT_RECORDED_KEY: True},
+        ),
+    )
+
+
+def _red_gate_terminal_report() -> TurnReport:
+    """The checks are red and the profile has no review cycle left.
+
+    The checkpoint's own red-gate action answered TERMINATE_FAILED, which the
+    supervisor maps to a TERMINAL turn. The journey is over, and it must end
+    the way every driver stop ends one — FAILED with the reason, a pack, and
+    the queue's message released.
+    """
+    from forge.pipeline.merge_ready_checkpoint import (
+        GatesReport,
+        GateStatus,
+        MergeCardDecision,
+        MergeCardOutcome,
+    )
+
+    return TurnReport(
+        outcome=TurnOutcome.TERMINAL,
+        build_id=BUILD_ID,
+        rationale="the merge-ready checkpoint found the gates red",
+        dispatch_result=MergeCardDecision(
+            outcome=MergeCardOutcome.RED_GATE_FAILED,
+            build_id=BUILD_ID,
+            gates=GatesReport(
+                status=GateStatus.RED,
+                failed_gates=("declared toolchain test — 2 failed: a::b, c::d",),
+                detail="`npm test` exited 1",
+            ),
+        ),
+    )
+
+
+class TestTheRedGateEndsTheJourneyWhenNoCycleIsLeft:
+    def test_the_stop_names_the_checks_and_the_tests(self) -> None:
+        supervisor = FakeSupervisor(script=[_red_gate_terminal_report()])
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
+        assert report.rationale == (
+            "the merge-ready checks stayed red and no review cycle is left — "
+            "declared toolchain test — 2 failed: a::b, c::d"
+        )
+
+    def test_the_build_is_closed_out_stopped_not_left_to_the_card(self) -> None:
+        """The card's own state machine owns card rows; this journey has none."""
+        closed: list[Any] = []
+        supervisor = FakeSupervisor(script=[_red_gate_terminal_report()])
+
+        async def close_out(*, build_id: str, report: Any) -> None:
+            closed.append(report)
+
+        asyncio.run(
+            drive_fix_journey(BUILD_ID, _deps(supervisor, close_out=close_out))
+        )
+
+        assert len(closed) == 1
+        assert closed[0].rationale.startswith("stopped: the merge-ready checks")
+        assert closed[0].dispatch_result.outcome == "failed"
+
+    def test_the_queued_message_is_released_once(self) -> None:
+        released: list[str] = []
+        supervisor = FakeSupervisor(script=[_red_gate_terminal_report()])
+
+        async def release(build_id: str) -> None:
+            released.append(build_id)
+
+        asyncio.run(
+            drive_fix_journey(
+                BUILD_ID, _deps(supervisor, release_queue_message=release)
+            )
+        )
+
+        assert released == [BUILD_ID]
+
+    def test_the_failure_pack_is_written_with_the_red_gate_word(self) -> None:
+        packs: list[dict[str, Any]] = []
+        supervisor = FakeSupervisor(script=[_red_gate_terminal_report()])
+        deps = _deps(
+            supervisor,
+            write_failure_pack=lambda **kw: packs.append(kw) or "pack-key",
+        )
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, deps))
+
+        assert report.failure_pack == "pack-key"
+        assert packs[0]["outcome"] == ConductorRunOutcome.RED_GATE_STOP.value
+        assert "no review cycle is left" in packs[0]["reason"]
+
+    def test_an_ordinary_terminal_turn_is_untouched(self) -> None:
+        supervisor = FakeSupervisor(script=[_report(TurnOutcome.TERMINAL)])
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+
+
 class TestTheRedGateHonestWord:
     def test_a_red_gate_with_no_resume_seam_stops_RED_GATE_STOP(self) -> None:
         """The lane's sharpest item: never WAIT_EXPIRED for a red gate.
@@ -767,6 +892,51 @@ class TestTheRedGateHonestWord:
         assert report.outcome is ConductorRunOutcome.COMPLETED
         assert len(supervisor.calls) == 2  # it really did re-plan
         assert wait.subscribe_calls  # and it really did wait first
+
+    def test_a_red_gate_that_wrote_its_verdict_re_plans_without_waiting(
+        self,
+    ) -> None:
+        """Attempt fifteen's cure, at the loop's own level.
+
+        A red gate that left its verdict in the journey's history has moved
+        the journey: the very next plan reads the row and sends the failing
+        tests back to the review seat. There is nothing external to wait for,
+        so the loop re-plans at once — with no resume seam wired at all, which
+        is what the fix-journey composition looks like today.
+        """
+        supervisor = FakeSupervisor(
+            script=[
+                _recorded_red_gate_report(),
+                _report(TurnOutcome.TERMINAL, rationale="the review was dispatched"),
+            ]
+        )
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert len(supervisor.calls) == 2, "it must re-plan, not stop"
+
+    def test_the_nothing_changed_rule_does_not_count_a_recorded_red_gate(
+        self,
+    ) -> None:
+        """The turn looks identical; the journey is not standing still."""
+        supervisor = FakeSupervisor(
+            script=[_recorded_red_gate_report() for _ in range(5)]
+            + [_report(TurnOutcome.TERMINAL)]
+        )
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is not ConductorRunOutcome.NOTHING_CHANGED
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+
+    def test_an_unrecorded_red_gate_is_bounded_exactly_as_before(self) -> None:
+        """A composition that records nothing keeps today's behaviour."""
+        supervisor = FakeSupervisor(script=[_red_gate_report()] * 5)
+
+        report = asyncio.run(drive_fix_journey(BUILD_ID, _deps(supervisor)))
+
+        assert report.outcome is ConductorRunOutcome.RED_GATE_STOP
 
     def test_a_plain_waiting_turn_is_still_a_wait_expiry(self) -> None:
         """The new word is reachable ONLY from a red-gate loop-back.
