@@ -134,13 +134,17 @@ class GatesReport:
         status: The :class:`GateStatus`.
         failed_gates: Names of the gates that failed (empty when green).
         detail: Free-form summary, recorded verbatim on the decision.
-        deferred_detail: One plain sentence about the checks that are NOT run
-            here because this repository's merge runs them itself — it stands
-            the candidate up in its sandbox and runs the live gate on it before
-            anything lands (ruled 2026-09-08). Empty for every gate set that
-            defers nothing, which is every one until an operator gives a
-            repository a sandbox and a candidate check, and an empty sentence
-            changes no word of the card.
+        deferred_detail: One plain sentence about the stamped checks that have
+            no evidence here, left to this repository's own merge press, which
+            stands the candidate up in its sandbox and runs the repository's
+            live gate on it before anything lands (ruled 2026-09-08). It is
+            recorded on the decision (``MergeCardDecision.rationale``) and
+            logged; it does NOT appear on the face of the Slack card, whose
+            words ``forge.gating.wrappers.gate_check`` builds without ever
+            seeing this report — putting it there is a named follow-on into
+            the card seam, not something this checkpoint can do. Empty for
+            every gate set that defers nothing, which is every one until an
+            operator gives a repository a sandbox and a candidate check.
     """
 
     status: GateStatus
@@ -557,9 +561,12 @@ class MergeReadyCheckpointPublisher:
             build_id,
             branch,
         )
-        # THE CARD'S LINE ABOUT THE CHECKS THAT RUN AT THE MERGE. When the
-        # gate set deferred nothing this is empty and the card says exactly
-        # what it has always said.
+        # THE LINE ABOUT THE CHECKS LEFT TO THE MERGE PRESS. It goes on this
+        # decision's rationale — the journey's own record, and the log — and
+        # NOT on the face of the Slack card: the card's words are built by
+        # gate_check, which is handed neither this report nor this rationale.
+        # When the gate set deferred nothing this is empty and every word of
+        # the decision is what it has always been.
         deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
         return MergeCardDecision(
             outcome=MergeCardOutcome.CARD_PUBLISHED,

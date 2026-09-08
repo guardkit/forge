@@ -743,45 +743,60 @@ class TestTheRoutingLawIsReadInsideTheSandbox:
 
 
 # ---------------------------------------------------------------------------
-# The checks the merge press runs: deferred, not missing (ruled 2026-09-08)
+# The checks left to the merge press: deferred, not missing (ruled 2026-09-08)
 # ---------------------------------------------------------------------------
 #
 # FEAT-39F6's scenarios are stamped ``probe:process``, a home whose evidence
 # only the live gate writes — and a fix journey runs no live gate before this
 # checkpoint. So the leg above could only ever say ABSENT and no fix journey on
 # such a repository could reach its merge card. Since protect-main the merge
-# press stands the candidate up inside the sandbox and runs the live gate on it
-# BEFORE anything lands, so the checkpoint defers those checks to the press —
-# and ONLY where the press really does that.
+# press stands the candidate up inside the sandbox and runs the repository's
+# own live gate on it BEFORE anything lands, so the checkpoint leaves those
+# checks to the press — and ONLY where the press really runs a gate: the
+# settings, the candidate block and the live gate, all three.
 
 
-def _profile(repo_root: Path, *, candidate: bool) -> Path:
-    """Write the repository's real ``deploy/profile.yaml``, with or without a
-    candidate block — the same file, read by the same loader, as the deploy
-    stage's own."""
+def _profile(repo_root: Path, *, candidate: bool, live_gate: bool = True) -> Path:
+    """Write the repository's real ``deploy/profile.yaml`` — the same file,
+    read by the same loader, as the deploy stage's own.
+
+    ``candidate`` stands the build up before the merge; ``live_gate`` is the
+    gate the press then runs on it. api_test has both, which is why journey
+    one's checks can be left to the press at all.
+    """
     path = repo_root / "deploy" / "profile.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     text = "env_id: local\ncompose:\n  file: deploy/docker-compose.yml\n"
     if candidate:
         text += 'candidate:\n  env:\n    CANDIDATE_PORT: "8902"\n'
+    if live_gate:
+        text += "live_gate:\n  driver: [python3, qa/gates/local_live_gate.py]\n"
     path.write_text(text, encoding="utf-8")
     return path
 
 
-def _deploys_through_a_sidecar(config: ForgeConfig) -> ForgeConfig:
+def _deploys_through_a_sidecar(
+    config: ForgeConfig, *, run_live_gate: bool = True
+) -> ForgeConfig:
     """The same settings, with the deploy stage's scripts on a sidecar — which
-    is what forge-prod runs with (it has no docker of its own)."""
+    is what forge-prod runs with (it has no docker of its own). The live-gate
+    switch is the settings half of "the press really does check the
+    candidate"; with it off a candidate is stood up and passed on its health
+    checks alone."""
     return config.model_copy(
         update={
             "deploy": config.deploy.model_copy(
-                update={"execution_surface": "sidecar"}
+                update={
+                    "execution_surface": "sidecar",
+                    "run_live_gate": run_live_gate,
+                }
             )
         }
     )
 
 
-class TestTheStampsTheMergePressWillRun:
-    def test_a_gate_home_stamp_is_deferred_and_the_card_says_how_many(
+class TestTheStampsLeftToTheMergePress:
+    def test_a_gate_home_stamp_is_deferred_and_the_record_says_how_many(
         self,
         pool: SqliteLifecyclePersistence,
         sidecar: Any,
@@ -803,8 +818,9 @@ class TestTheStampsTheMergePressWillRun:
 
         assert report.status is GateStatus.GREEN, report.detail
         assert report.deferred_detail == (
-            "1 stamped check (probe:process) runs in the sandbox at the "
-            "merge, before anything lands."
+            "1 stamped check (probe:process) has no live-gate evidence yet: "
+            "the merge press stands the candidate up in the sandbox and runs "
+            "this repository's live gate on it before anything lands."
         )
         assert "a caller sees 201" in report.detail
 
@@ -941,3 +957,60 @@ class TestWhoseMergeChecksACandidateFirst:
             )
             is False
         )
+
+    def test_a_candidate_with_no_live_gate_in_the_profile_says_no(
+        self, sidecar: Any, clone: Path
+    ) -> None:
+        """A candidate the press never gates is not a check to defer to.
+
+        With a candidate block and no ``live_gate`` block the deploy stage
+        stands the build up, takes its health checks as the whole check and
+        writes ``verdict: pass``, and the merge proceeds — so a stamped check
+        left to it would be run by nobody.
+        """
+        _profile(clone, candidate=True, live_gate=False)
+
+        assert (
+            conductor.candidate_is_checked_before_the_merge(
+                _deploys_through_a_sidecar(sidecar.config), clone
+            )
+            is False
+        )
+
+    def test_the_live_gate_switched_off_in_the_settings_says_no(
+        self, sidecar: Any, clone: Path
+    ) -> None:
+        """Same hole, from the settings side: ``deploy.run_live_gate`` off."""
+        _profile(clone, candidate=True, live_gate=True)
+
+        assert (
+            conductor.candidate_is_checked_before_the_merge(
+                _deploys_through_a_sidecar(sidecar.config, run_live_gate=False),
+                clone,
+            )
+            is False
+        )
+
+    def test_a_repository_whose_press_never_gates_is_not_deferred_end_to_end(
+        self,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        worktree: Path,
+    ) -> None:
+        """The whole reader, not just the helper: no live gate, no deferral."""
+        _stamp_the_feature(clone, verifier="probe:process", title="a caller sees 201")
+        _profile(clone, candidate=True, live_gate=False)
+        _row(pool, REPO_WITH, worktree)
+
+        reader = conductor.make_gates_green_reader(
+            pool=pool,
+            config=_deploys_through_a_sidecar(sidecar.config),
+            sandbox_declaration_loader=lambda root, **kw: _Declaration("true"),
+            sandbox_command_runner=lambda **kw: (0, "the suite is green"),
+        )
+
+        report = reader(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.UNKNOWN, report.detail
+        assert report.deferred_detail == ""

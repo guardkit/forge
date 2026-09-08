@@ -430,20 +430,23 @@ class TestCardDelivery:
 
 
 # ---------------------------------------------------------------------------
-# The card's line about the checks that run at the merge (ruled 2026-09-08)
+# The line about the checks left to the merge press (ruled 2026-09-08)
 # ---------------------------------------------------------------------------
 
 
-class TestTheCardSaysWhatRunsAtTheMerge:
-    """Some stamped checks are proven at the merge, not here.
+class TestTheRecordSaysWhatTheMergePressWillRun:
+    """Some stamped checks have no evidence here, and are left to the press.
 
-    On a repository whose merge stands the candidate up and runs the live gate
+    On a repository whose merge stands the candidate up and runs its live gate
     on it before anything lands, the gate set defers those checks rather than
-    calling them missing — and the card has to say so, in one plain sentence,
-    so the owner knows what his merge word sets running.
+    calling them missing — and the journey's record has to say so, in one plain
+    sentence, so a person reading it knows what was proven here and what was
+    not. WHERE it says it: on the decision's rationale, and in the log. NOT on
+    the face of the Slack card, whose words ``gate_check`` builds without ever
+    seeing this report — that is a named follow-on into the card seam.
     """
 
-    def test_the_card_says_how_many_checks_run_at_the_merge(self) -> None:
+    def test_the_decision_says_how_many_checks_are_left_to_the_press(self) -> None:
         card = _RecordingPublisher()
         publisher = MergeReadyCheckpointPublisher(
             publish_card=card,
@@ -451,8 +454,10 @@ class TestTheCardSaysWhatRunsAtTheMerge:
                 status=GateStatus.GREEN,
                 detail="`qa/run-suite.sh` exited 0",
                 deferred_detail=(
-                    "5 stamped checks (probe:process) run in the sandbox at "
-                    "the merge, before anything lands."
+                    "5 stamped checks (probe:process) have no live-gate "
+                    "evidence yet: the merge press stands the candidate up in "
+                    "the sandbox and runs this repository's live gate on it "
+                    "before anything lands."
                 ),
             ),
         )
@@ -461,8 +466,10 @@ class TestTheCardSaysWhatRunsAtTheMerge:
 
         assert decision.outcome is MergeCardOutcome.CARD_PUBLISHED
         assert (
-            "5 stamped checks (probe:process) run in the sandbox at the "
-            "merge, before anything lands." in decision.rationale
+            "5 stamped checks (probe:process) have no live-gate evidence yet: "
+            "the merge press stands the candidate up in the sandbox and runs "
+            "this repository's live gate on it before anything lands."
+            in decision.rationale
         )
         assert "gates green, merge card published" in decision.rationale
 
@@ -484,14 +491,22 @@ class TestTheCardSaysWhatRunsAtTheMerge:
             "green, merge card published"
         )
 
-    def test_the_sentence_rides_the_gate_set_to_the_card_publisher(self) -> None:
-        """The seam that builds the envelope is handed the same report."""
+    def test_the_gate_set_reaches_the_card_seam_even_though_the_card_ignores_it(
+        self,
+    ) -> None:
+        """The publisher seam is handed the same report.
+
+        What it does with it is the seam's own business, and today's seam
+        (``_serve_gate_activation.publish_card``) does not put the sentence on
+        the card face. This pins the hand-over, not a claim about the card.
+        """
         card = _RecordingPublisher()
         report = GatesReport(
             status=GateStatus.GREEN,
             detail="`qa/run-suite.sh` exited 0",
-            deferred_detail="1 stamped check (exam) runs in the sandbox at "
-            "the merge, before anything lands.",
+            deferred_detail="1 stamped check (exam) has no live-gate evidence "
+            "yet: the merge press stands the candidate up in the sandbox and "
+            "runs this repository's live gate on it before anything lands.",
         )
         publisher = MergeReadyCheckpointPublisher(
             publish_card=card, gates_green_reader=lambda **_: report
