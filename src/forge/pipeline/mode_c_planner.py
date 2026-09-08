@@ -45,6 +45,16 @@ is the merge-ready checkpoint instead. The cap is still ASSUM-010's
 profile-level cap, not a cap inside the planner: no caller that passes
 nothing behaves any differently.
 
+And one more, added later the same day. A review can repeat its
+predecessor's findings word for word off a tree where the cycle's approved
+work already fixed them — attempt eight did exactly that, five approved
+legs and a follow-up review that re-derived its findings from the task
+description instead of reading the code. Fanning work out at those findings
+again would spend a cycle rediscovering fixes that are already in the tree,
+so when the latest review repeats every finding location its predecessor
+named AND the work between the two reviews was approved, the planner goes
+to the merge-ready checkpoint, whose checks read the tree and decide.
+
 The planner is **stateless**. Every call inspects ``history`` and the
 ``has_commits`` flag; cyclic behaviour emerges from the planner deciding
 the same ``next_stage = TASK_WORK`` repeatedly until the most-recent
@@ -82,6 +92,7 @@ from typing import Sequence
 
 from forge.lifecycle.persistence import Build
 from forge.pipeline.budget_guard import count_review_cycles
+from forge.pipeline.finding_anchors import repeated_anchors
 from forge.pipeline.mode_chains_data import MODE_C_CHAIN
 from forge.pipeline.stage_taxonomy import StageClass
 
@@ -93,6 +104,7 @@ __all__ = [
     "ModeCTerminal",
     "ModeCWait",
     "StageEntry",
+    "approved_work_between_the_last_two_reviews",
     "plan_next_stage",
 ]
 
@@ -522,6 +534,45 @@ class ModeCCyclePlanner:
                 permitted=permitted,
             )
 
+        # THE REPEATED REVIEW AFTER APPROVED WORK (2026-09-08, attempt
+        # eight's seam).
+        #
+        # Attempt eight ran five work legs inside the sandbox and every one
+        # of them was approved, with commits on the fix branch that fixed
+        # exactly the three things the first review named. The follow-up
+        # review then reported those same three findings again, word for
+        # word, although the tree it was reviewing no longer had them. The
+        # review seat had re-derived its findings from the task description
+        # instead of reading the code.
+        #
+        # A repeat like that is not proof that nothing changed. It is a
+        # review that did not verify, and the honest next step is the
+        # mechanical one: the merge-ready checks, which read the tree
+        # rather than the task description and decide. So when the latest
+        # review repeats every anchor its predecessor named, and the work
+        # between the two reviews was approved, the planner goes to the
+        # merge-ready checkpoint — the same route the review-cycle cap
+        # takes below.
+        #
+        # Named, as the cap's route was: if the checkpoint comes back red
+        # and loops back, this stateless planner would choose the
+        # checkpoint again on the same history; the driver's own stops and
+        # the turn ceiling are what bound that.
+        repeated = self._repeated_review_anchors(
+            history=history, latest_review_idx=latest_review_idx
+        )
+        if repeated and approved_work_between_the_last_two_reviews(history):
+            return ModeCPlan(
+                permitted_stages=permitted,
+                next_stage=StageClass.PULL_REQUEST_REVIEW,
+                rationale=(
+                    f"the review repeated {len(repeated)} findings the "
+                    "cycle's approved work addressed — going to the "
+                    "merge-ready checks, which decide "
+                    f"({', '.join(repeated)})"
+                ),
+            )
+
         # Find the next fix task that has not yet reached a terminal
         # status under this review's work iteration. Three outcomes,
         # each typed on the lookup (design pass §h.1) — the "still
@@ -649,6 +700,40 @@ class ModeCCyclePlanner:
             if history[idx].stage_class == StageClass.TASK_REVIEW:
                 return idx
         return None
+
+    @staticmethod
+    def _previous_review_index(
+        history: Sequence[StageEntry], latest_review_idx: int
+    ) -> int | None:
+        """Index of the ``/task-review`` before ``latest_review_idx``.
+
+        ``None`` when the latest review is the journey's first — there is
+        no earlier review to have repeated.
+        """
+        for idx in range(latest_review_idx - 1, -1, -1):
+            if history[idx].stage_class == StageClass.TASK_REVIEW:
+                return idx
+        return None
+
+    @classmethod
+    def _repeated_review_anchors(
+        cls, *, history: Sequence[StageEntry], latest_review_idx: int
+    ) -> tuple[str, ...]:
+        """What the latest review said again, word for word; ``()`` for nothing.
+
+        Read through :func:`~forge.pipeline.finding_anchors.repeated_anchors`
+        so the planner and the conductor's review-cycle rule apply one rule,
+        not two that drift. A row that recorded no anchors — every review row
+        written before the anchors existed, and any row whose key would not
+        parse — answers ``()``: it states nothing, so it repeats nothing.
+        """
+        previous_idx = cls._previous_review_index(history, latest_review_idx)
+        if previous_idx is None:
+            return ()
+        return repeated_anchors(
+            history[previous_idx].finding_anchors,
+            history[latest_review_idx].finding_anchors,
+        )
 
     @staticmethod
     def _next_undispatched_fix_task(
@@ -871,6 +956,46 @@ class ModeCCyclePlanner:
                 "follow-up /task-review clean — no commits, terminal clean review"
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Module-level readings of the history
+# ---------------------------------------------------------------------------
+
+
+def approved_work_between_the_last_two_reviews(
+    history: Sequence[StageEntry],
+) -> bool:
+    """Did a ``/task-work`` leg between the last two reviews end approved?
+
+    The question "did this cycle produce anything?", asked of the durable
+    rows, which are the only place the answer lives: a leg is approved when
+    it dispatched and succeeded, and that verdict is written on the row, not
+    carried on a turn report.
+
+    Two readers ask it. The planner asks before deciding what follows a
+    review that repeated itself. The conductor's turn loop asks — through
+    the supervisor, which owns the history reader — before deciding whether
+    a repeated review is a journey going nowhere or a review that did not
+    verify. Stated once here so they cannot answer it differently.
+
+    ``False`` when there are fewer than two reviews, when nothing ran
+    between them, or when everything that ran ended some other way
+    (failed, rejected, cancelled, still running).
+    """
+    reviews = [
+        idx
+        for idx, entry in enumerate(history)
+        if entry.stage_class == StageClass.TASK_REVIEW
+    ]
+    if len(reviews) < 2:
+        return False
+    start, stop = reviews[-2], reviews[-1]
+    return any(
+        entry.stage_class == StageClass.TASK_WORK
+        and entry.status == _STATUS_APPROVED
+        for entry in history[start + 1 : stop]
+    )
 
 
 # ---------------------------------------------------------------------------

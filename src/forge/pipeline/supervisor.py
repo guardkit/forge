@@ -1360,6 +1360,45 @@ class Supervisor:
         return features[0]
 
     # ------------------------------------------------------------------
+    # Read seam: what the turn loop cannot see from a turn report
+    # ------------------------------------------------------------------
+
+    def cycle_had_approved_work(self, build_id: str) -> bool | None:
+        """Did a work leg between the last two reviews end approved?
+
+        The conductor's turn loop needs this on one decision and cannot
+        answer it for itself: a leg's approval is written on its durable
+        row, and a turn report carries no verdict. The supervisor already
+        holds the history reader, so the question is answered here rather
+        than by giving the loop a second reader of its own.
+
+        Returns ``True`` / ``False`` when the history could be read, and
+        ``None`` when it could not (no reader wired, or the read failed).
+        ``None`` means "cannot tell", and the caller is expected to take the
+        cautious branch — never to read it as a yes.
+        """
+        reader = self.mode_c_history_reader
+        if reader is None:
+            return None
+        try:
+            history = reader.get_mode_c_history(build_id)
+        except Exception as exc:  # noqa: BLE001 — an unknown answer is not fatal
+            logger.warning(
+                "supervisor.cycle_had_approved_work: reading the Mode C "
+                "history raised %s: %s for build_id=%s — answering 'cannot "
+                "tell'",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return None
+        from forge.pipeline.mode_c_planner import (  # local: break import cycle
+            approved_work_between_the_last_two_reviews,
+        )
+
+        return approved_work_between_the_last_two_reviews(history)
+
+    # ------------------------------------------------------------------
     # Internal: Mode C dispatch (TASK-MBC8-008)
     # ------------------------------------------------------------------
 
