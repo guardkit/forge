@@ -307,6 +307,76 @@ class TestTheDocument:
         assert [f.id for f in evidence.findings] == ["G1"]
         assert [c.commit for c in evidence.commits] == ["d" * 40]
 
+    def test_a_third_review_is_not_shown_the_first_cycle_s_commits(
+        self, tmp_path: Path
+    ) -> None:
+        """The commits must be the ones made SINCE the review being checked.
+
+        Every stage export re-copies the whole receipts folder, so a work
+        stage that runs in the second cycle still carries copies of the
+        first cycle's leg paperwork. Without a guard the reader would hand
+        the third review the first cycle's commits as though they were made
+        after the second review — and the reviewer could then conclude that
+        a finding raised by that review was already fixed by a commit made
+        before it.
+        """
+        receipts = tmp_path / "receipts"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        _journey_with_one_cycle(receipts)
+        (
+            _stage_dir(receipts, "004-task-review", TASK_ID) / "review_findings.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "clean": False,
+                    "findings": [
+                        {
+                            "id": "G1",
+                            "severity": "high",
+                            "title": "The second cycle's own finding",
+                            "file": "src/users/crud.py",
+                            "line": 160,
+                            "detail": "Still writing a naive value here.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        # The second cycle's work stage, exported the way the fold really
+        # exports it: the new leg AND re-copied paperwork from cycle one.
+        _write_work_stage(
+            receipts,
+            "005-task-work",
+            fix_task="TASK-VER1-003",
+            subject="fix(TASK-VER1-003): write an aware value in crud",
+            sha="d" * 40,
+            files=["src/users/crud.py"],
+        )
+        _write_work_stage(
+            receipts,
+            "005-task-work",
+            fix_task="TASK-VER1-001",
+            subject="fix(TASK-VER1-001): make the deleted_at column timezone-aware",
+            sha="a" * 40,
+            files=["alembic/versions/39f6_add_deleted_at.py"],
+        )
+        _write_work_stage(
+            receipts,
+            "005-task-work",
+            fix_task="TASK-VER1-002",
+            subject="fix(TASK-VER1-002): answer a database error on delete_user with 503",
+            sha="b" * 40,
+            files=["src/users/router.py"],
+        )
+
+        evidence = read_prior_review_evidence(BUILD_ID, receipts_root=receipts)
+
+        assert evidence is not None
+        assert evidence.review_stage_key == "004-task-review"
+        assert [c.commit for c in evidence.commits] == ["d" * 40]
+
     def test_a_leg_that_committed_nothing_is_not_listed_as_a_commit(
         self, tmp_path: Path
     ) -> None:

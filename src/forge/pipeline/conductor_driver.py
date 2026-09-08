@@ -808,6 +808,10 @@ class ConductorTurnLoop:
                         reason=reason,
                         outcome=ConductorRunOutcome.RED_GATE_STOP,
                     )
+                    # This stop ENDS the journey: nothing can wake the
+                    # loop-back, so the build must not be left RUNNING with
+                    # the queue still holding its message.
+                    await self._close_out_stop(build_id, reason=reason, report=report)
                     return ConductorRunReport(
                         outcome=ConductorRunOutcome.RED_GATE_STOP,
                         build_id=build_id,

@@ -486,8 +486,32 @@ def _is_receipt_path(value: str) -> bool:
     return ".guardkit" in parts
 
 
+def _committed_shas(stage_dirs: "list[tuple[int, str, Path]]") -> set[str]:
+    """Every commit sha that the given stage exports already carry.
+
+    Used for the stages up to and including the previous review, so that
+    work the previous review had already seen is not offered to the next
+    one as though it were new.
+    """
+    shas: set[str] = set()
+    for _seq, _name, stage_dir in stage_dirs:
+        for leg_dir in _leg_dirs(stage_dir):
+            leg = _read_json(leg_dir / _WORK_LEG_RESULTS_FILE)
+            if not isinstance(leg, Mapping):
+                continue
+            commit = leg.get("commit")
+            if not isinstance(commit, Mapping) or commit.get("committed") is not True:
+                continue
+            sha = str(commit.get("head_after") or "").strip()
+            if sha:
+                shas.add(sha)
+    return shas
+
+
 def _commits_from_work_stages(
     stage_dirs: "list[tuple[int, str, Path]]",
+    *,
+    already_seen: "set[str] | frozenset[str]" = frozenset(),
 ) -> tuple[CycleCommit, ...]:
     """Read the commits the work legs made, oldest first, without repeats.
 
@@ -495,8 +519,14 @@ def _commits_from_work_stages(
     ran early appears again in every later stage's directory. Walking the
     stages in order and keeping the first sighting of each commit gives
     one row per commit, in the order the legs ran.
+
+    ``already_seen`` carries the commits the previous review could already
+    see in its own receipts. In a journey that reaches a third review those
+    copies sit in the later stages too, and listing them would tell the
+    reviewer that a finding was fixed by a commit made before the review
+    that reported it. They are dropped.
     """
-    seen: set[str] = set()
+    seen: set[str] = set(already_seen)
     commits: list[CycleCommit] = []
     for _seq, _name, stage_dir in stage_dirs:
         for leg_dir in _leg_dirs(stage_dir):
@@ -583,7 +613,14 @@ def read_prior_review_evidence(
         )
         return None
     task_id, findings = found
-    commits = _commits_from_work_stages(sorted(work_after, key=lambda row: row[0]))
+    # The previous review's own stage export, and every stage before it,
+    # already carried these commits. They are not this cycle's work.
+    seen_before = _committed_shas(
+        sorted((row for row in stages if row[0] <= prior_seq), key=lambda row: row[0])
+    )
+    commits = _commits_from_work_stages(
+        sorted(work_after, key=lambda row: row[0]), already_seen=seen_before
+    )
     return PriorReviewEvidence(
         task_id=task_id,
         review_stage_key=prior_dir.name,
