@@ -145,6 +145,7 @@ __all__ = [
     "make_conductor_merge_card_published_probe",
     "make_conductor_subscribe_resume",
     "make_conductor_wait_window_reader",
+    "candidate_is_checked_before_the_merge",
     "make_gates_green_reader",
     "make_merge_ready_checkpoint",
 ]
@@ -649,6 +650,7 @@ def read_stamps_in_sandbox(
     toolchain_green: bool,
     sandbox: Any,
     repo: str,
+    candidate_check_before_merge: bool = False,
     post: Callable[..., Any] | None = None,
 ) -> Any:
     """Step 5 — the routing law's stamped-verifier check, read in the sandbox.
@@ -785,7 +787,48 @@ def read_stamps_in_sandbox(
         code_commit_time=commit_time,
         history_dir=history_dir,
         feature_id=feature_id,
+        candidate_check_before_merge=candidate_check_before_merge,
     )
+
+
+#: Where a repository keeps the deploy profile the deploy stage reads.
+DEPLOY_PROFILE_RELATIVE_PATH = Path("deploy") / "profile.yaml"
+
+
+def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") -> bool:
+    """Does this repository's merge check the candidate before anything lands?
+
+    Two facts, read the way the deploy stage reads them
+    (:mod:`forge.pipeline.merge_executor`'s deploy dispatcher): the deploy
+    settings put the stage's docker-touching scripts on a sidecar
+    (``deploy.execution_surface == "sidecar"``), and the repository's own
+    ``deploy/profile.yaml`` carries a ``candidate:`` block, which is what makes
+    the stage stand the build up and run the live gate on it BEFORE the merge
+    rather than after.
+
+    True means the checkpoint may defer a stamped check whose evidence does not
+    exist yet, because the merge press will run that check. Never raises: this
+    only decides whether a check is deferred or called missing, and missing —
+    today's answer — is the safe one, so anything unreadable is False.
+    """
+    if str(getattr(getattr(config, "deploy", None), "execution_surface", "")) != (
+        "sidecar"
+    ):
+        return False
+    try:
+        from forge.deploy.profile import load_deploy_profile
+
+        profile = load_deploy_profile(Path(repo_root) / DEPLOY_PROFILE_RELATIVE_PATH)
+    except Exception as exc:  # noqa: BLE001 — unreadable is "no candidate check"
+        logger.info(
+            "conductor gates: %s has no readable deploy profile (%s: %s), so "
+            "the checkpoint assumes its merge does NOT check a candidate first",
+            repo_root,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    return getattr(profile, "candidate", None) is not None
 
 
 def make_gates_green_reader(
@@ -939,6 +982,7 @@ def make_gates_green_reader(
         branch: Any,
         suite_detail: str,
         stamps: Callable[..., Any] | None = None,
+        candidate_check_before_merge: bool = False,
     ) -> Any:
         """Step 5 — the routing law's ``stamps_satisfied`` leg on a GREEN suite.
 
@@ -946,7 +990,18 @@ def make_gates_green_reader(
         repository whose clone and worktrees are inside its sandbox — the one
         that reads the same three pieces of evidence in there. Both answer the
         same verdict type and both fail towards no card.
+
+        ``candidate_check_before_merge`` is asked of the leg ONLY when it is
+        true, so that a repository whose merge does not check a candidate first
+        — which is every repository until an operator gives one a sandbox and a
+        candidate block — calls the leg with exactly the arguments it has
+        always been called with.
         """
+        deferring = (
+            {"candidate_check_before_merge": True}
+            if candidate_check_before_merge
+            else {}
+        )
         try:
             verdict = (stamps or _stamps)(
                 feature_id=feature_id,
@@ -954,6 +1009,7 @@ def make_gates_green_reader(
                 worktree=worktree,
                 branch=branch,
                 toolchain_green=True,
+                **deferring,
             )
         except Exception as exc:  # noqa: BLE001 — a leg defect is not green
             return _unknown(
@@ -1005,6 +1061,15 @@ def make_gates_green_reader(
                 build_id,
                 "; ".join(repr(t) for t in attended),
             )
+        deferred_detail = str(getattr(verdict, "deferred_detail", "") or "")
+        if deferred_detail:
+            logger.info(
+                "conductor gates: build_id=%s — %s (this repository's merge "
+                "stands the candidate up and runs the live gate on it before "
+                "anything lands)",
+                build_id,
+                deferred_detail,
+            )
         logger.info(
             "conductor gates: build_id=%s — GREEN. %s %s",
             build_id,
@@ -1014,6 +1079,7 @@ def make_gates_green_reader(
         return GatesReport(
             status=GateStatus.GREEN,
             detail=f"{suite_detail} {stamps_detail}".strip(),
+            deferred_detail=deferred_detail,
         )
 
     def read_gates(*, build_id: str, branch: Any = None) -> Any:
@@ -1061,6 +1127,7 @@ def make_gates_green_reader(
                 worktree: Any,
                 branch: Any,
                 toolchain_green: bool,
+                candidate_check_before_merge: bool = False,
                 _entry: Any = entry,
                 _repo: str = repo_key,
             ) -> Any:
@@ -1072,6 +1139,7 @@ def make_gates_green_reader(
                     toolchain_green=toolchain_green,
                     sandbox=_entry,
                     repo=_repo,
+                    candidate_check_before_merge=candidate_check_before_merge,
                 )
 
         worktree = getattr(row, "worktree_path", None)
@@ -1152,6 +1220,17 @@ def make_gates_green_reader(
                 build_id,
                 detail,
             )
+            # THE STAMPS THAT ARE PROVEN AT THE MERGE INSTEAD (ruled
+            # 2026-09-08). Five verifier homes have no forge-side runner and a
+            # fix journey runs no live gate before this checkpoint, so on a
+            # repository whose scenarios are stamped on one of them the leg
+            # could only ever say ABSENT and no fix journey could reach its
+            # card. Where the merge press stands the candidate up and runs the
+            # live gate on it BEFORE anything lands, those checks are deferred
+            # to the press rather than called missing — and only there.
+            defers = entry is not None and candidate_is_checked_before_the_merge(
+                config, repo_root
+            )
             return _apply_stamps_leg(
                 build_id=build_id,
                 feature_id=getattr(row, "feature_id", None) or "",
@@ -1160,6 +1239,7 @@ def make_gates_green_reader(
                 branch=branch or getattr(row, "branch", None),
                 suite_detail=detail,
                 stamps=stamps_here,
+                candidate_check_before_merge=defers,
             )
         logger.warning(
             "conductor gates: build_id=%s — RED. %s. No merge card is "
