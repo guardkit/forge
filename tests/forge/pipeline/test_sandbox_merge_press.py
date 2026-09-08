@@ -341,12 +341,13 @@ async def _press(
     merge: _FakeMergeCommand,
     deploy: _FakeDeploy,
     expect_main_sha: str,
+    publisher: _FakePublisher | None = None,
 ) -> Any:
     _build_row(pool, repo)
     deps = MergeExecutorDeps(
         config=config,
         pool=pool,
-        pipeline_publisher=_FakePublisher(),
+        pipeline_publisher=publisher or _FakePublisher(),
         guardkit_run=merge,
         deploy_dispatcher=deploy,
         git_surface=compose_merge_git_surface(config),
@@ -564,3 +565,182 @@ class TestTheCompositionOnlyRoutesWhatItShould:
         )
 
         assert compose_merge_offer_git_head(settings) is None
+
+
+# ---------------------------------------------------------------------------
+# L3c (rule 79): the words after a green merge that landed in the sandbox
+# ---------------------------------------------------------------------------
+
+
+def _receipt(root: Path, name: str) -> dict[str, Any]:
+    return json.loads((root / f"merge-{BUILD_ID}" / name).read_text(encoding="utf-8"))
+
+
+class TestTheWordsAfterAGreenMergeInTheSandbox:
+    """A merge that landed in the factory's clone says where it landed and how
+    to bring it over (sandbox first, 2026-09-07, rule 79)."""
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_the_plain_sentence_and_the_exact_command(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        git_calls: _GitCalls,
+        _receipts_env: Path,
+    ) -> None:
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+        publisher = _FakePublisher()
+
+        outcome = await _press(
+            config=config,
+            pool=pool,
+            repo=REPO,
+            repo_root=on_this_side,
+            merge=_FakeMergeCommand(tip),
+            deploy=_FakeDeploy(),
+            expect_main_sha=_git(clone, "rev-parse", "main"),
+            publisher=publisher,
+        )
+
+        assert outcome.result == "merged-and-running", outcome.detail
+        checkout = str(on_this_side)
+        command = (
+            f"git -C {checkout} fetch sandbox-api-test-factory main && "
+            f"git -C {checkout} merge --ff-only sandbox-api-test-factory/main"
+        )
+        # The sentence a person reads: where it landed, and the one command.
+        assert outcome.detail.endswith(
+            "This merge landed in the factory's own copy of the repository, "
+            "inside the sandbox api-test-factory — not in your checkout at "
+            f"{checkout}. To bring it to your checkout, run: {command}"
+        ), outcome.detail
+        # The green line's own words are still in front of it.
+        assert "checked in the sandbox (8 of 8), merged and running" in outcome.detail
+        # And the same, in parts, on the report the thread is written from —
+        # so the words are forge's, never invented downstream.
+        said = outcome.sandbox_merge
+        assert said == {
+            "sandbox": "api-test-factory",
+            "remote": "sandbox-api-test-factory",
+            "checkout": checkout,
+            "fetch_command": command,
+            "sentence": said["sentence"],
+        }
+        raw = publisher.reports[0].model_dump(mode="json")
+        assert raw["sandbox_merge"]["fetch_command"] == command
+        assert raw["detail"].endswith(command)
+
+    @pytest.mark.asyncio
+    async def test_the_merge_receipt_records_where_the_merge_landed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        git_calls: _GitCalls,
+        _receipts_env: Path,
+    ) -> None:
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+
+        outcome = await _press(
+            config=config,
+            pool=pool,
+            repo=REPO,
+            repo_root=on_this_side,
+            merge=_FakeMergeCommand(tip),
+            deploy=_FakeDeploy(),
+            expect_main_sha=_git(clone, "rev-parse", "main"),
+        )
+
+        assert outcome.result == "merged-and-running", outcome.detail
+        landed = _receipt(_receipts_env, "merge_deploy_merge.json")[
+            "landed_in_the_sandbox"
+        ]
+        assert landed == outcome.sandbox_merge
+        # The report's own receipt says it too, and so does the build's record.
+        report = _receipt(_receipts_env, "merge_deploy_report.json")
+        assert report["sandbox_merge"] == outcome.sandbox_merge
+        rows = [
+            row
+            for row in pool.read_stages(BUILD_ID)
+            if row.target_identifier == "merge_deploy_executor"
+        ]
+        assert rows[-1].details["sandbox_merge"]["fetch_command"] == landed[
+            "fetch_command"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_repository_without_a_sandbox_says_and_records_nothing_extra(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        plain_checkout: Path,
+        git_calls: _GitCalls,
+        _receipts_env: Path,
+    ) -> None:
+        """The same settings, the other repository: the words it always had."""
+        tip = _git(plain_checkout, "rev-parse", f"autobuild/{FEATURE_ID}")
+        publisher = _FakePublisher()
+
+        outcome = await _press(
+            config=config,
+            pool=pool,
+            repo=REPO_WITHOUT,
+            repo_root=plain_checkout,
+            merge=_FakeMergeCommand(tip),
+            deploy=_FakeDeploy(),
+            expect_main_sha=_git(plain_checkout, "rev-parse", "main"),
+            publisher=publisher,
+        )
+
+        assert outcome.result == "merged-and-running"
+        assert outcome.detail == (
+            f"{FEATURE_ID} checked in the sandbox (8 of 8), merged and running. "
+            "Rollback is one command; the branch is kept."
+        )
+        assert outcome.sandbox_merge is None
+        assert "sandbox_merge" not in publisher.reports[0].model_dump(mode="json")
+        assert "landed_in_the_sandbox" not in _receipt(
+            _receipts_env, "merge_deploy_merge.json"
+        )
+        assert "sandbox_merge" not in _receipt(
+            _receipts_env, "merge_deploy_report.json"
+        )
+
+
+class TestTheFetchWordsThemselves:
+    """The words are made from the settings, and only for a repository that
+    has a sandbox."""
+
+    def test_the_command_names_the_checkout_and_the_sandbox_remote(
+        self, config: ForgeConfig, on_this_side: Path
+    ) -> None:
+        from forge.pipeline.merge_executor import sandbox_merge_words
+
+        said = sandbox_merge_words(config, REPO, on_this_side)
+
+        assert said is not None
+        assert said["fetch_command"] == (
+            f"git -C {on_this_side} fetch sandbox-api-test-factory main && "
+            f"git -C {on_this_side} merge --ff-only sandbox-api-test-factory/main"
+        )
+        assert said["sentence"].endswith(said["fetch_command"])
+        assert "api-test-factory" in said["sentence"]
+
+    def test_a_repository_with_no_sandbox_has_no_words(
+        self, config: ForgeConfig, plain_checkout: Path
+    ) -> None:
+        from forge.pipeline.merge_executor import sandbox_merge_words
+
+        assert sandbox_merge_words(config, REPO_WITHOUT, plain_checkout) is None
+
+    def test_settings_of_another_shape_are_answered_with_silence(
+        self, plain_checkout: Path
+    ) -> None:
+        """A report's words must never be the thing that fails a merge."""
+        from forge.pipeline.merge_executor import sandbox_merge_words
+
+        assert sandbox_merge_words(object(), REPO, plain_checkout) is None
+        assert sandbox_merge_words(None, REPO, plain_checkout) is None
