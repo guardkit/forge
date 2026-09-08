@@ -497,6 +497,14 @@ class TestTheDeclaredTestCommandIsReadFromTheRepository:
 
 
 class TestTheStampsEvidenceRouteRefusesWhatItShould:
+    """Every case here is asked of a sidecar INSIDE a sandbox.
+
+    The route is one of the sandbox-only shapes (L3e, rule 89): the host
+    sidecar refuses it outright, which is proved in
+    :class:`TestTheStampsEvidenceRouteIsRefusedOnTheHost` below. These cases
+    are about what the in-sandbox one refuses.
+    """
+
     @staticmethod
     def _body(repo_path: Path, **over: Any) -> dict[str, Any]:
         body = {
@@ -513,7 +521,7 @@ class TestTheStampsEvidenceRouteRefusesWhatItShould:
         from forge.deploy_sidecar.service import process_stamps_evidence_request
 
         status, body = process_stamps_evidence_request(
-            self._body(repo, worktree="/etc"), config=config
+            self._body(repo, worktree="/etc"), config=config, inside_sandbox=True
         )
 
         assert status == 400
@@ -525,7 +533,9 @@ class TestTheStampsEvidenceRouteRefusesWhatItShould:
         from forge.deploy_sidecar.service import process_stamps_evidence_request
 
         status, body = process_stamps_evidence_request(
-            self._body(repo, feature_id="../../etc/passwd"), config=config
+            self._body(repo, feature_id="../../etc/passwd"),
+            config=config,
+            inside_sandbox=True,
         )
 
         assert status == 400
@@ -541,7 +551,100 @@ class TestTheStampsEvidenceRouteRefusesWhatItShould:
                 "worktree": "/tmp/x",
             },
             config=config,
+            inside_sandbox=True,
         )
 
         assert status == 400
         assert "someone/else" in body["error"]
+
+
+class TestTheStampsEvidenceRouteIsRefusedOnTheHost:
+    """The third sandbox-only shape (L3e, rule 89, the third coach's second
+    must-fix).
+
+    The routing law's evidence is a sandboxed repository's clone, its journey
+    worktree and its gate receipts. A host sidecar answering this request
+    would be reading the operator's own checkout, so it refuses in one plain
+    sentence saying which sidecar it is and where the request belongs — the
+    same shape the declared test command and the live-gate driver already
+    get, and for the same reason.
+    """
+
+    @staticmethod
+    def _body(repo_path: Path) -> dict[str, Any]:
+        return {
+            "repo": REPO,
+            "feature_id": "FEAT-G88",
+            "worktree": str(repo_path / ".forge" / "worktrees" / "build-1"),
+        }
+
+    def test_the_host_says_which_sidecar_it_is_and_where_to_send_it(
+        self, repo: Path, config: ForgeConfig
+    ) -> None:
+        from forge.deploy_sidecar.service import process_stamps_evidence_request
+
+        status, body = process_stamps_evidence_request(
+            self._body(repo), config=config, inside_sandbox=False
+        )
+
+        assert status == 400
+        assert "running on the host" in body["error"]
+        assert "routing-law evidence" in body["error"]
+        assert "sidecar_url in planning.sandboxes" in body["error"]
+
+    def test_the_default_answer_is_read_from_the_bootstraps_own_value(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No flag passed = ask the environment, exactly as the service does."""
+        from forge.deploy_sidecar.service import (
+            SIDECAR_IN_SANDBOX_ENV,
+            process_stamps_evidence_request,
+        )
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        status, body = process_stamps_evidence_request(self._body(repo), config=config)
+        assert status == 400 and "running on the host" in body["error"]
+
+        monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
+        status, body = process_stamps_evidence_request(self._body(repo), config=config)
+        # Inside a sandbox the request is judged on its merits: this worktree
+        # does not exist, but the route answers about the repository, not
+        # about which sidecar is asking.
+        assert "running on the host" not in str(body.get("error") or "")
+
+    def test_the_real_route_on_a_host_sidecar_refuses_over_the_wire(
+        self, repo: Path, config: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Through the real handler on a real loopback port, as a caller sees it."""
+        import json
+        import threading
+        import urllib.error
+        import urllib.request
+
+        from forge.deploy_sidecar.service import (
+            SIDECAR_IN_SANDBOX_ENV,
+            STAMPS_EVIDENCE_ROUTE,
+            build_server,
+        )
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        srv = build_server(port=0, config_loader=lambda: config)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        host, port = srv.server_address[:2]
+        try:
+            request = urllib.request.Request(
+                f"http://{host}:{port}{STAMPS_EVIDENCE_ROUTE}",
+                data=json.dumps(self._body(repo)).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(request, timeout=10)
+                raise AssertionError("the host sidecar answered the request")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                said = json.loads(exc.read().decode("utf-8"))["error"]
+                assert "running on the host" in said
+        finally:
+            srv.shutdown()
+            srv.server_close()

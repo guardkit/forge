@@ -28,8 +28,19 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
+    POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
+    POST /git/candidate-tree {repo, feature_id, sha}
+              -> {path, tree, exclude_written}
+    POST /git/candidate-tree-remove {repo, feature_id} -> {removed, path}
     POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
               -> {feature_yaml, envelope, code_commit_time, history_dir}
+
+The three routes after ``/git/rev-parse`` are the merge press's own git
+(sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
+removal of the branch's tree for the candidate check. Each derives the tree's
+place from the repository its ``repo`` key names, so no path a caller sends
+ever reaches git or the filesystem here. See the section above
+:func:`process_git_is_ancestor_request`.
 
 The three git operations (sandbox first, 2026-09-07, rule 70) make the
 planning chain's commits where the repository lives: the caller declares the
@@ -93,7 +104,12 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    is refused in one plain sentence before a process starts. The declared
    test command's working directory must be one of this repository's own
    journey worktrees (LAW 10), and the live-gate driver's may be a candidate
-   tree exactly as LAW 8 allows.
+   tree exactly as LAW 8 allows. Both, and ``/routing-stamps/evidence``
+   beside them, are answered ONLY by a sidecar running inside a repository's
+   sandbox (the bootstrap sets ``FORGE_SIDECAR_IN_SANDBOX``): they exist so a
+   repository's own code and its own records are run and read where the
+   repository lives, and a host sidecar refuses all three in one plain
+   sentence saying where the request belongs.
 
 Each request-processing core (:func:`process_run_request` and
 :func:`process_guardkit_merge_request`) is a pure function
@@ -409,15 +425,15 @@ def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
     return str(source.get(SIDECAR_IN_SANDBOX_ENV, "")).strip().lower() in _TRUTHY
 
 
-def _not_inside_a_sandbox(what: str) -> str:
-    """The refusal a HOST sidecar gives to the two sandbox-only shapes.
+def _not_inside_a_sandbox(what: str, *, verb: str = "run") -> str:
+    """The refusal a HOST sidecar gives to the sandbox-only shapes.
 
     Written for whoever reads it in a log or a receipt: it says which sidecar
     answered, why it will not do this, and where the request should have gone.
     """
     return (
         "this sidecar is running on the host, not inside a repository's "
-        f"sandbox, so it will not run a repository's {what}. That is what the "
+        f"sandbox, so it will not {verb} a repository's {what}. That is what the "
         "sidecar inside the repository's sandbox is for: a repository's own "
         "code runs where the repository lives, never on the host. Send this "
         "request to that sandbox's sidecar (its address is the repository's "
@@ -2245,6 +2261,210 @@ def process_git_rev_parse_request(
 
 
 # ---------------------------------------------------------------------------
+# The merge press's own git, made where the repository lives
+# (sandbox first, 2026-09-07, rule 89)
+# ---------------------------------------------------------------------------
+#
+# The merge word is one of Rich's three touches, and for a repository whose
+# factory lives in its sandbox the branch the build made is in the clone in
+# there — not in the copy of the repository on this side. So the press's own
+# git comes here: the ancestry questions it asks before and after the merge,
+# the lay-out of the branch's tree for the candidate check, and that tree's
+# removal when the run ends. The branch look-up, main's commit and the tree
+# ids are the existing ``/git/rev-parse`` route, which already answers a
+# ``^{tree}`` revision.
+#
+# Each route acts on the repository its ``repo`` key names and on NO path the
+# caller sends: the tree's place is derived here, from that repository's own
+# path, exactly as :mod:`forge.deploy.candidate_tree` derives it on the other
+# side. Refs and ids are shape-checked before git is started, and no shell is
+# ever used.
+#
+# WHY THESE THREE ARE NOT GATED ON "AM I INSIDE A SANDBOX?", when the two
+# ``/run`` shapes and the routing-law evidence are. Those three run or read a
+# repository's OWN things — its test suite, its live-gate driver, its records
+# — and running a repository's code on the host is the wall Rich's rule of
+# 2026-09-07 puts up. These three run git and nothing else: a commit look-up,
+# an ancestry question, and an archive of a commit extracted into a directory,
+# with no repository code executed and no shell. They are the same class of
+# thing as ``/git/rev-parse`` and ``/git/read-file-from-branch``, which the
+# sidecar on the host has answered since L1 because the planning chain uses
+# them. So the host sidecar answers these too, for the repositories it already
+# serves, and gains no power it did not have.
+
+#: The three routes.
+GIT_IS_ANCESTOR_ROUTE: str = "/git/is-ancestor"
+GIT_CANDIDATE_TREE_ROUTE: str = "/git/candidate-tree"
+GIT_CANDIDATE_TREE_REMOVE_ROUTE: str = "/git/candidate-tree-remove"
+
+
+def _feature_id_error(value: Any) -> str | None:
+    """A plain sentence unless ``value`` is one plain feature id.
+
+    The id becomes one directory name under the trees root, so it is held to
+    the same shape every other id on these routes is: letters, digits and the
+    three separators, and never a path.
+    """
+    if not isinstance(value, str) or not SAFE_NAME_PATTERN.match(value):
+        return (
+            "'feature_id' is required and must be a plain feature id (letters, "
+            "digits, dots, dashes and underscores, no slashes); got "
+            f"{value!r}"
+        )
+    return None
+
+
+def process_git_is_ancestor_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, ancestor, descendant}`` → ``{is_ancestor}``.
+
+    ``git merge-base --is-ancestor`` in this repository: ``true``, ``false``,
+    or ``null`` when git could not say (a commit it does not know, or git not
+    running), which is exactly the three answers the press's guards are
+    written for. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    ancestor = payload.get("ancestor")
+    error = _ref_error(ancestor, what="ancestor")
+    if error:
+        return 400, {"error": error}
+    descendant = payload.get("descendant")
+    error = _ref_error(descendant, what="descendant")
+    if error:
+        return 400, {"error": error}
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "merge-base",
+                "--is-ancestor",
+                str(ancestor),
+                str(descendant),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    if result.returncode == 0:
+        return 200, {"is_ancestor": True}
+    if result.returncode == 1:
+        return 200, {"is_ancestor": False}
+    return 200, {
+        "is_ancestor": None,
+        "detail": (
+            f"git could not say whether {ancestor} is in {descendant} "
+            f"(it exited {result.returncode})"
+        ),
+    }
+
+
+def process_git_candidate_tree_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id, sha}`` → ``{path, tree, exclude_written}``.
+
+    Lays the tree of ``sha`` out at ``<clone>/.forge-candidates/<feature id>``
+    with the very code the in-container venue runs
+    (:func:`forge.deploy.candidate_tree.materialise_candidate_tree`), keeps
+    that directory out of the clone's eyes first, and answers the commit's
+    tree id so the caller need not ask twice.
+
+    A lay-out that fails leaves nothing behind and comes back as a 400 with
+    git's own words: it is an answer about this repository, not a transport
+    failure. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    error = _feature_id_error(feature_id)
+    if error:
+        return 400, {"error": error}
+    sha = payload.get("sha")
+    error = _ref_error(sha, what="sha")
+    if error:
+        return 400, {"error": error}
+
+    from forge.deploy.candidate_tree import (
+        CandidateTreeError,
+        ensure_candidate_trees_excluded,
+        git_rev_parse,
+        materialise_candidate_tree,
+    )
+
+    logger.info(
+        "forge-deploy-sidecar: laying %s's tree out for %s in %s",
+        sha,
+        feature_id,
+        repo_path,
+    )
+    try:
+        excluded = _run_coroutine(ensure_candidate_trees_excluded(repo_path))
+        laid_out = _run_coroutine(
+            materialise_candidate_tree(repo_path, str(feature_id), str(sha))
+        )
+        tree = _run_coroutine(git_rev_parse(repo_path, f"{sha}^{{tree}}"))
+    except CandidateTreeError as exc:
+        return 400, {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    return 200, {
+        "path": str(laid_out),
+        "tree": tree,
+        "exclude_written": excluded,
+    }
+
+
+def process_git_candidate_tree_remove_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, feature_id}`` → ``{removed, path}``.
+
+    Removes ``<clone>/.forge-candidates/<feature id>``. A tree that is already
+    gone is a removal that succeeded — the press calls this on every ending,
+    including endings where nothing was ever laid out. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    error = _feature_id_error(feature_id)
+    if error:
+        return 400, {"error": error}
+
+    from forge.deploy.candidate_tree import (
+        CandidateTreeError,
+        candidate_tree_path,
+        remove_candidate_tree,
+    )
+
+    try:
+        path = candidate_tree_path(repo_path, str(feature_id))
+    except CandidateTreeError as exc:
+        return 400, {"error": str(exc)}
+    logger.info("forge-deploy-sidecar: removing the candidate tree at %s", path)
+    try:
+        removed = _run_coroutine(remove_candidate_tree(path))
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    return 200, {"removed": bool(removed), "path": str(path)}
+
+
+# ---------------------------------------------------------------------------
 # The fix journey's tree and its receipts, made where the repository lives
 # (sandbox first, 2026-09-07, rules 76 and 77)
 # ---------------------------------------------------------------------------
@@ -2517,7 +2737,11 @@ STAMPS_EVIDENCE_ROUTE: str = "/routing-stamps/evidence"
 
 
 def process_stamps_evidence_request(
-    payload: Any, *, config: ForgeConfig, worktrees_root: Path | None = None
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    worktrees_root: Path | None = None,
+    inside_sandbox: bool | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """``{repo, feature_id, worktree, branch}`` → the routing law's evidence.
 
@@ -2536,9 +2760,24 @@ def process_stamps_evidence_request(
 
     The worktree must be one of this repository's own journey worktrees (LAW
     10). Never raises.
+
+    REFUSED ON THE HOST, like the two ``/run`` shapes beside it (L3e, the
+    third coach's second must-fix). This route exists so that the routing
+    law's evidence is read where a sandboxed repository's clone, its journey
+    worktrees and its gate receipts actually are; a host sidecar answering it
+    would be reading the operator's own checkout, which is the wall Rich's
+    rule of 2026-09-07 puts up. ``inside_sandbox`` is read from the
+    bootstrap's environment value unless a caller (a test) says otherwise.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    in_sandbox = (
+        sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
+    )
+    if not in_sandbox:
+        return 400, {
+            "error": _not_inside_a_sandbox("routing-law evidence", verb="read")
+        }
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
@@ -3080,6 +3319,9 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WRITE_TREE_ROUTE,
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
+                GIT_IS_ANCESTOR_ROUTE,
+                GIT_CANDIDATE_TREE_ROUTE,
+                GIT_CANDIDATE_TREE_REMOVE_ROUTE,
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
@@ -3121,6 +3363,16 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_REV_PARSE_ROUTE:
                 status, body = process_git_rev_parse_request(payload, config=config)
+            elif route == GIT_IS_ANCESTOR_ROUTE:
+                status, body = process_git_is_ancestor_request(payload, config=config)
+            elif route == GIT_CANDIDATE_TREE_ROUTE:
+                status, body = process_git_candidate_tree_request(
+                    payload, config=config
+                )
+            elif route == GIT_CANDIDATE_TREE_REMOVE_ROUTE:
+                status, body = process_git_candidate_tree_remove_request(
+                    payload, config=config
+                )
             elif route == GIT_WORKTREE_ADD_ROUTE:
                 status, body = process_git_worktree_add_request(
                     payload, config=config
