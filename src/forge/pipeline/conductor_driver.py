@@ -364,6 +364,16 @@ class ConductorDriverDeps:
             Any`` — the journey's own failure pack on a loud stop.
         close_out: ``(build_id, report) -> Any`` — terminal close-out
             (the caller's own bookkeeping: ack, status, emit).
+        release_queue_message: ``(build_id) -> Any`` — releases the
+            pipeline consumer's ``build-queued`` message for this build
+            so the next build can start. Called on EVERY terminal
+            close-out, right after ``close_out`` and whatever it did,
+            because a journey that ends without releasing it holds the
+            consumer's one outstanding acknowledgement for the whole
+            hour-long redelivery window (2026-09-08: two closed journeys
+            did exactly that, and the cure was pulling the message off
+            the stream by hand). ``None`` — every test, and any boot with
+            no lifecycle bridge — does nothing at all.
         clock: Monotonic source, injected for deterministic tests.
         sleep: ``(seconds) -> Awaitable[None]`` — injected so tests do
             not spend real wall-clock on the anti-spin back-off.
@@ -380,6 +390,7 @@ class ConductorDriverDeps:
     export_stage_receipts: Callable[..., Any] | None = None
     write_failure_pack: Callable[..., Any] | None = None
     close_out: Callable[..., Any] | None = None
+    release_queue_message: Callable[[str], Any] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     max_turns: int = DEFAULT_MAX_TURNS
@@ -963,15 +974,40 @@ class ConductorTurnLoop:
             self._stage_receipts.append(str(key))
 
     async def _close_out(self, build_id: str, report: Any) -> None:
+        """End the journey: write it down, then let the next build start.
+
+        Every terminal close-out comes through here — the TERMINAL turn,
+        the merge card's publication, and a budget breach nobody could be
+        asked about — so this is the one place that releases the pipeline
+        consumer's queued message for the build. The release is LAST and
+        it is unconditional: the journey's own bookkeeping is durable
+        before the next build is allowed to start, and a close-out that
+        blew up still must not leave the queue holding a message for a
+        journey that is over (2026-09-08, seam seven).
+        """
         deps = self._deps
-        if deps.close_out is None:
+        if deps.close_out is not None:
+            try:
+                await _maybe_await(deps.close_out(build_id=build_id, report=report))
+            except Exception as exc:  # noqa: BLE001 — close-out is best-effort
+                logger.warning(
+                    "conductor: close_out raised %s: %s for build_id=%s — the "
+                    "terminal stands",
+                    type(exc).__name__,
+                    exc,
+                    build_id,
+                )
+
+        if deps.release_queue_message is None:
             return
         try:
-            await _maybe_await(deps.close_out(build_id=build_id, report=report))
-        except Exception as exc:  # noqa: BLE001 — close-out is best-effort
+            await _maybe_await(deps.release_queue_message(build_id))
+        except Exception as exc:  # noqa: BLE001 — never crash on a terminal
             logger.warning(
-                "conductor: close_out raised %s: %s for build_id=%s — the "
-                "terminal stands",
+                "conductor: releasing the queued message raised %s: %s for "
+                "build_id=%s — the terminal stands, but the queue is still "
+                "holding this build's message and the next build waits for "
+                "the redelivery",
                 type(exc).__name__,
                 exc,
                 build_id,
