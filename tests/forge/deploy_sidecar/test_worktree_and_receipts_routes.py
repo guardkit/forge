@@ -17,6 +17,8 @@ What is pinned:
   other path, including one under a different repository and one that tries
   to climb out with ``..``;
 * removing a tree, twice, without complaint;
+* counting a journey's commits in the tree, where the tree actually is: none
+  on a fresh tree, three after three commits, and the same refusals;
 * receipts copied out of a real worktree into the resolved receipts root,
   with the paths written named in the answer;
 * the refusals: an unknown repository, a branch git would read as an option,
@@ -40,10 +42,12 @@ import pytest
 from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import (
     GIT_WORKTREE_ADD_ROUTE,
+    GIT_WORKTREE_COMMIT_COUNT_ROUTE,
     GIT_WORKTREE_REMOVE_ROUTE,
     RECEIPTS_EXPORT_ROUTE,
     build_server,
     process_git_worktree_add_request,
+    process_git_worktree_commit_count_request,
     process_git_worktree_remove_request,
     process_receipts_export_request,
 )
@@ -126,6 +130,27 @@ def receipts_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _tree(repo: Path, build_id: str = BUILD_ID) -> str:
     return str(repo / ".forge" / "worktrees" / build_id)
+
+
+def _cut(cfg: ForgeConfig, repo: Path, *, base: str = "main") -> Path:
+    """Cut this build's journey tree for real and hand back its path."""
+    status, body = process_git_worktree_add_request(
+        {
+            "repo": REPO_KEY,
+            "path": _tree(repo),
+            "branch": BRANCH,
+            "base_ref": base,
+        },
+        config=cfg,
+    )
+    assert status == 200 and body["status"] == "success", body
+    return Path(body["path"])
+
+
+def _commit(tree: Path, name: str) -> None:
+    (tree / name).write_text(name, encoding="utf-8")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-m", f"add {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +283,121 @@ class TestTheWorktreeRemoveRoute:
         assert status == 400
         assert "is not a journey worktree of this repository" in body["error"]
         assert repo.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# /git/worktree-commit-count
+# ---------------------------------------------------------------------------
+
+
+class TestTheWorktreeCommitCountRoute:
+    """The fix journey's "did this build change anything?", asked where the
+    journey worktree actually is (the thirteenth seam, 2026-09-08)."""
+
+    def test_a_fresh_tree_has_no_commits_and_says_where_its_head_is(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        tree = _cut(cfg, repo)
+
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": REPO_KEY, "path": str(tree), "base": "main"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["count"] == 0
+        assert body["head"] == _git(repo, "rev-parse", "main").strip()
+
+    def test_three_commits_are_counted(self, cfg: ForgeConfig, repo: Path) -> None:
+        tree = _cut(cfg, repo)
+        for name in ("one", "two", "three"):
+            _commit(tree, name)
+
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": REPO_KEY, "path": str(tree), "base": "main"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["count"] == 3
+        assert body["head"] == _git(tree, "rev-parse", "HEAD").strip()
+
+    def test_the_base_is_the_branch_the_journey_was_cut_from(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        # A repair queued on its own branch counts from that branch, so the
+        # branch's own commits are never read as a leg's work.
+        tree = _cut(cfg, repo, base="repair/TASK-WT-001")
+        _commit(tree, "the-fix")
+
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": REPO_KEY, "path": str(tree), "base": "repair/TASK-WT-001"},
+            config=cfg,
+        )
+
+        assert status == 200 and body["count"] == 1, body
+
+    def test_only_this_repositorys_own_journey_tree_path_is_counted_in(
+        self, cfg: ForgeConfig, repo: Path, other_repo: Path
+    ) -> None:
+        for path in (
+            "/etc",
+            str(repo),
+            str(other_repo / ".forge" / "worktrees" / BUILD_ID),
+            str(repo / ".forge" / "worktrees" / ".." / ".." / "elsewhere"),
+        ):
+            status, body = process_git_worktree_commit_count_request(
+                {"repo": REPO_KEY, "path": path, "base": "main"}, config=cfg
+            )
+            assert status == 400, (path, body)
+            assert "and on no other path" in body["error"]
+
+    def test_an_unknown_repository_is_refused_by_name(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": "acme/ghost", "path": _tree(repo), "base": "main"}, config=cfg
+        )
+
+        assert status == 400 and "unknown target repo" in body["error"]
+
+    def test_a_base_git_would_read_as_an_option_is_refused(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        tree = _cut(cfg, repo)
+
+        for base in ("--all", "main..HEAD", "", None):
+            status, body = process_git_worktree_commit_count_request(
+                {"repo": REPO_KEY, "path": str(tree), "base": base}, config=cfg
+            )
+            assert status == 400, (base, body)
+            assert "'base'" in body["error"]
+
+    def test_a_tree_that_is_not_there_is_refused_before_git_runs(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": REPO_KEY, "path": _tree(repo), "base": "main"}, config=cfg
+        )
+
+        assert status == 400 and "is not there" in body["error"]
+
+    def test_a_base_nobody_made_is_a_loud_failure_never_a_quiet_zero(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        tree = _cut(cfg, repo)
+
+        status, body = process_git_worktree_commit_count_request(
+            {"repo": REPO_KEY, "path": str(tree), "base": "no-such-branch"},
+            config=cfg,
+        )
+
+        assert status == 500, body
+        assert "could not count" in body["error"]
+        assert "count" not in body
+
+    def test_a_body_that_is_not_an_object_is_refused(self, cfg: ForgeConfig) -> None:
+        status, body = process_git_worktree_commit_count_request("nope", config=cfg)
+
+        assert status == 400 and "JSON object" in body["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +563,36 @@ def test_end_to_end_cut_export_and_remove_over_loopback(
     )
     assert status == 200 and body["status"] == "success", body
     assert not tree.exists()
+
+
+def test_the_commit_count_answers_over_loopback(server: str, repo: Path) -> None:
+    status, body = _post(
+        server + GIT_WORKTREE_ADD_ROUTE,
+        {"repo": REPO_KEY, "path": _tree(repo), "branch": BRANCH, "base_ref": "main"},
+    )
+    assert status == 200 and body["status"] == "success", body
+    tree = Path(body["path"])
+
+    status, body = _post(
+        server + GIT_WORKTREE_COMMIT_COUNT_ROUTE,
+        {"repo": REPO_KEY, "path": str(tree), "base": "main"},
+    )
+    assert status == 200 and body["count"] == 0, body
+
+    _commit(tree, "the-fix")
+
+    status, body = _post(
+        server + GIT_WORKTREE_COMMIT_COUNT_ROUTE,
+        {"repo": REPO_KEY, "path": str(tree), "base": "main"},
+    )
+    assert status == 200 and body["count"] == 1, body
+    assert body["head"] == _git(tree, "rev-parse", "HEAD").strip()
+
+    status, body = _post(
+        server + GIT_WORKTREE_COMMIT_COUNT_ROUTE,
+        {"repo": REPO_KEY, "path": "/etc", "base": "main"},
+    )
+    assert status == 400 and "and on no other path" in body["error"]
 
 
 def test_a_refusal_over_loopback_is_http_400_with_one_sentence(server: str) -> None:
