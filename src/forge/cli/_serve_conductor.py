@@ -796,24 +796,47 @@ DEPLOY_PROFILE_RELATIVE_PATH = Path("deploy") / "profile.yaml"
 
 
 def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") -> bool:
-    """Does this repository's merge check the candidate before anything lands?
+    """Does this repository's merge run a live gate on a candidate first?
 
-    Two facts, read the way the deploy stage reads them
-    (:mod:`forge.pipeline.merge_executor`'s deploy dispatcher): the deploy
-    settings put the stage's docker-touching scripts on a sidecar
-    (``deploy.execution_surface == "sidecar"``), and the repository's own
-    ``deploy/profile.yaml`` carries a ``candidate:`` block, which is what makes
-    the stage stand the build up and run the live gate on it BEFORE the merge
-    rather than after.
+    THREE facts, all read the way the deploy stage reads them
+    (:mod:`forge.pipeline.merge_executor`'s deploy dispatcher and
+    :class:`forge.deploy.stage.DeployStageRunner`):
+
+    1. the deploy settings put the stage's docker-touching scripts on a
+       sidecar (``deploy.execution_surface == "sidecar"``);
+    2. the repository's own ``deploy/profile.yaml`` carries a ``candidate:``
+       block, which is what makes the stage stand the build up BEFORE the
+       merge rather than after; and
+    3. that same profile carries a ``live_gate:`` block AND the deploy
+       settings leave the live gate on (``deploy.run_live_gate``).
+
+    The third fact is the one that makes the deferral honest. With a candidate
+    block and no live gate the stage stands the candidate up, takes its health
+    checks as the whole check and writes ``verdict: pass`` without running a
+    gate at all (``stage.py``: ``if self._config.run_live_gate: ... else:``),
+    and the merge then proceeds — so a check deferred to it would never be
+    run by anybody. Deferring is only ever allowed to something that runs.
+
+    (A fourth setting, ``deploy.enabled``, is deliberately NOT read here: when
+    the stage is disabled the merge press refuses the merge outright — "the
+    deploy stage is disabled" — so nothing lands unchecked either way.)
 
     True means the checkpoint may defer a stamped check whose evidence does not
-    exist yet, because the merge press will run that check. Never raises: this
-    only decides whether a check is deferred or called missing, and missing —
-    today's answer — is the safe one, so anything unreadable is False.
+    exist yet, because the merge press runs its own check of the candidate
+    before anything lands. Never raises: this only decides whether a check is
+    deferred or called missing, and missing — today's answer — is the safe one,
+    so anything unreadable is False.
     """
-    if str(getattr(getattr(config, "deploy", None), "execution_surface", "")) != (
-        "sidecar"
-    ):
+    deploy_settings = getattr(config, "deploy", None)
+    if str(getattr(deploy_settings, "execution_surface", "")) != "sidecar":
+        return False
+    if not bool(getattr(deploy_settings, "run_live_gate", False)):
+        logger.info(
+            "conductor gates: the deploy settings have run_live_gate off, so a "
+            "candidate is stood up and merged without a gate verdict — the "
+            "checkpoint defers nothing for %s",
+            repo_root,
+        )
         return False
     try:
         from forge.deploy.profile import load_deploy_profile
@@ -828,7 +851,17 @@ def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") 
             exc,
         )
         return False
-    return getattr(profile, "candidate", None) is not None
+    if getattr(profile, "candidate", None) is None:
+        return False
+    if getattr(profile, "live_gate", None) is None:
+        logger.info(
+            "conductor gates: %s stands a candidate up but its deploy profile "
+            "declares no live gate, so the merge has no gate verdict to give — "
+            "the checkpoint defers nothing",
+            repo_root,
+        )
+        return False
+    return True
 
 
 def make_gates_green_reader(

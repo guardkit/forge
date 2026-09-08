@@ -414,16 +414,20 @@ class TestAMixedFeature:
         assert "ATTENDED" in verdict.detail
 
 
-class TestTheChecksThatRunAtTheMerge:
-    """Ruled 2026-09-08: a stamped check the merge press runs is DEFERRED.
+class TestTheChecksLeftToTheMergePress:
+    """Ruled 2026-09-08: a stamped check with no evidence here is DEFERRED.
 
-    Five verifier homes have no forge-side runner, and a fix journey runs no
-    live gate before its merge-ready checkpoint — so on a repository whose
-    scenarios are stamped on one of them the answer was always ABSENT and the
-    journey could never reach its card. Where the merge press stands the
-    candidate up and runs the live gate on it BEFORE anything lands, the
-    promise the stamp makes is kept there instead. The flag is what says so,
-    and with it off nothing moves by a byte.
+    The envelope-backed homes are written only by the live gate, and a fix
+    journey runs no live gate before its merge-ready checkpoint — so on a
+    repository whose scenarios are stamped on one of them the answer was always
+    ABSENT and the journey could never reach its card. Where the merge press
+    stands the candidate up and runs the repository's own live gate on it
+    BEFORE anything lands, the last word on the branch's code is spoken there
+    instead. The flag is what says so, and with it off nothing moves by a byte.
+
+    What the sentence must NOT say: that a check named after the home runs.
+    Nothing in the estate runs a ``probe:process`` check; what runs is the
+    repository's live gate, and the sentence says exactly that.
     """
 
     def test_no_evidence_is_missing_when_nothing_checks_it_before_the_merge(
@@ -451,8 +455,9 @@ class TestTheChecksThatRunAtTheMerge:
         assert verdict.missing == ()
         assert verdict.deferred == (("A caller sees 201", "probe:process"),)
         assert verdict.deferred_detail == (
-            "1 stamped check (probe:process) runs in the sandbox at the "
-            "merge, before anything lands."
+            "1 stamped check (probe:process) has no live-gate evidence yet: "
+            "the merge press stands the candidate up in the sandbox and runs "
+            "this repository's live gate on it before anything lands."
         )
         assert "A caller sees 201" in verdict.detail
 
@@ -556,8 +561,33 @@ class TestTheChecksThatRunAtTheMerge:
         )
 
         assert verdict.deferred_detail == (
-            "3 stamped checks (exam, probe:process) run in the sandbox at "
-            "the merge, before anything lands."
+            "3 stamped checks (exam, probe:process) have no live-gate "
+            "evidence yet: the merge press stands the candidate up in the "
+            "sandbox and runs this repository's live gate on it before "
+            "anything lands."
+        )
+
+    def test_the_sentence_never_says_the_stamped_check_itself_was_run(
+        self,
+    ) -> None:
+        """A record a person acts on may not claim more than is true.
+
+        No runner anywhere in the estate runs a `probe:process` check; the
+        press runs the repository's own live gate. The sentence names the
+        stamps that were not proven and what the press does, and stops there.
+        """
+        verdict = _eval(
+            _read(("A caller sees 201", "probe:process")),
+            envelope=None,
+            candidate_check_before_merge=True,
+        )
+
+        assert "no live-gate evidence yet" in verdict.deferred_detail
+        assert "runs this repository's live gate" in verdict.deferred_detail
+        assert "probe:process) run" not in verdict.deferred_detail
+        assert (
+            "a stamped home with no runner registered there is not separately "
+            "proven by it" in verdict.detail
         )
 
     def test_a_mixed_feature_says_what_is_proven_now_and_what_waits(self) -> None:
@@ -574,7 +604,10 @@ class TestTheChecksThatRunAtTheMerge:
         assert verdict.satisfied_by_home == {"toolchain": 1}
         assert "1 of 2 stamped scenario(s)" in verdict.detail
         assert "toolchain: 1" in verdict.detail
-        assert "1 stamped check (probe:process) runs" in verdict.detail
+        assert (
+            "1 stamped check (probe:process) has no live-gate evidence yet"
+            in verdict.detail
+        )
 
     def test_the_composed_leg_carries_the_flag_through_to_the_decision(
         self, tmp_path: Path, git_repo: Path

@@ -51,27 +51,48 @@ No stamps at all
 
 Deferred to the merge (ruled 2026-09-08)
 ----------------------------------------
-Five of the homes above have no forge-side runner: their envelope is written
-only by the live gate. A FIX journey runs no live gate before its checkpoint,
-so on any repository whose scenarios are stamped on one of those homes the
-answer above was always ABSENT, and no fix journey could ever reach its merge
-card. Since protect-main (Part J, 2026-09-07) the merge press stands the
-candidate up in the repository's sandbox and runs the live gate on it BEFORE
-anything is merged, so the promise a gate-home stamp makes is kept
-mechanically at the press.
+The envelope-backed homes above are written only by the live gate. A FIX
+journey runs no live gate before its checkpoint, so on any repository whose
+scenarios are stamped on one of those homes the answer above was always
+ABSENT, and no fix journey could ever reach its merge card. Since protect-main
+(Part J, 2026-09-07) the merge press stands the candidate up in the
+repository's sandbox and runs that repository's live gate on it BEFORE
+anything is merged, so the last word on the branch's code is spoken there and
+not here.
 
 So :func:`evaluate_stamps` takes ``candidate_check_before_merge``. When it is
 true — and the gates reader passes true only for a repository whose merge
-really does check the candidate first — a gate-home stamp with NO EVIDENCE YET
-(no envelope, a stale one, an envelope that names no such gate) is DEFERRED
-rather than missing: the checkpoint is green, the verdict carries the deferred
-scenarios with their homes, and the merge card says in one plain sentence how
-many stamped checks run at the merge. Nothing else moves: a toolchain stamp
-still needs the declared suite green, an operator stamp is still listed as
-attended, a fresh green envelope still satisfies its home exactly as before,
-and an envelope that is current and says the gate FAILED still blocks the card
-— evidence against the code is never deferred. Every repository whose merge
-has no candidate check keeps today's answer, byte for byte.
+really does stand a candidate up and run a live gate on it — a gate-home stamp
+with NO EVIDENCE YET (no envelope, a stale one, an envelope that names no such
+gate) is DEFERRED rather than missing: the checkpoint is green and the verdict
+carries the deferred scenarios with their homes and one plain sentence about
+them. Nothing else moves: a toolchain stamp still needs the declared suite
+green, an operator stamp is still listed as attended, a fresh green envelope
+still satisfies its home exactly as before, and an envelope that is current and
+says the gate FAILED still blocks the card — evidence against the code is never
+deferred. Every repository whose merge has no candidate check keeps today's
+answer, byte for byte.
+
+WHAT DEFERRING DOES NOT CLAIM (be exact, this is a record a person acts on).
+It does not claim that a check named after the home runs at the merge. Of the
+homes in :data:`HOME_GATE_IDS` only ``hurl`` has a runner in the estate today
+(api_test's ``hurl-twins`` gate); nothing anywhere runs a ``probe:process`` or
+``probe:bus`` check, and forge's own table above says so. What runs at the
+press is the repository's OWN live gate — whatever its gate registry holds —
+so a stamped home with no runner registered there is not separately proven by
+it. The sentence this module writes therefore says the checks have no live-gate
+evidence yet and says what the press does; it never says the named check ran.
+The deferral is a decision that the press's own check of the candidate is the
+bar this branch must clear, taken because the alternative — a stamped verifier
+nothing can ever run before a fix journey's checkpoint — is a card that can
+never be published on any repository whose scenarios carry these stamps.
+
+WHERE THE SENTENCE GOES. Into the checkpoint's detail lines and onto the
+decision record the journey writes (and from there into the log). It does NOT
+reach the face of the Slack card Rich reads: the card's words are built by
+``forge.gating.wrappers.gate_check``, which is handed neither the gates report
+nor the rationale, and that seam is outside this lane. Putting the sentence on
+the card face is a named follow-on, not something this module can do.
 
 Why the stamps are read from the CANONICAL repo and the envelope from the
 WORKTREE: the stamps are the plan of record — what was promised at planning
@@ -719,10 +740,11 @@ class StampsVerdict:
     attended list, then the satisfied summary. ``missing`` — the
     ``(scenario, home)`` pairs that are ABSENT, for ``failed_gates``.
     ``attended`` — the operator-stamped scenario titles (LISTED, never
-    silently passed). ``deferred`` — the ``(scenario, home)`` pairs whose
-    check runs at the merge instead (empty unless the caller says the
+    silently passed). ``deferred`` — the ``(scenario, home)`` pairs left to the
+    merge press's own check of the candidate (empty unless the caller says the
     candidate is checked before the merge), and ``deferred_detail`` — the one
-    plain sentence about them that the merge card carries.
+    plain sentence about them, which the checkpoint records on its decision
+    and logs (not on the face of the Slack card; see the module docstring).
     """
 
     status: StampsStatus
@@ -747,17 +769,26 @@ def _fmt(ts: datetime | None) -> str:
 
 
 def deferred_sentence(deferred: Sequence[tuple[str, str]]) -> str:
-    """The one plain sentence about checks that run at the merge, not now.
+    """The one plain sentence about the checks this build did not prove here.
 
     Written once, here, because two surfaces say it: the checkpoint's own
-    detail lines and the merge card the owner reads.
+    detail lines and the decision record the journey writes (from there it
+    reaches the log; it does NOT reach the face of the Slack card today —
+    see the "Deferred" section of the module docstring).
+
+    It says only what is true: these stamped scenarios have no live-gate
+    evidence for this branch, and what the merge press does before anything
+    lands. It does NOT say that a check named after the home will run — no
+    part of the estate runs a ``probe:process`` or ``probe:bus`` check today;
+    what runs at the press is the repository's own live gate.
     """
     homes = sorted({home for _title, home in deferred})
     count = len(deferred)
     return (
         f"{count} stamped check{'' if count == 1 else 's'} "
-        f"({', '.join(homes)}) run{'s' if count == 1 else ''} in the sandbox "
-        "at the merge, before anything lands."
+        f"({', '.join(homes)}) {'has' if count == 1 else 'have'} no live-gate "
+        "evidence yet: the merge press stands the candidate up in the sandbox "
+        "and runs this repository's live gate on it before anything lands."
     )
 
 
@@ -773,8 +804,9 @@ def _envelope_status_for_home(
     Otherwise ``(reason, no_evidence_either_way)``: the plain reason the home
     is not proven, and whether that reason is *no evidence at all about this
     branch's code* — no envelope, a stale one, one that names no such gate, a
-    freshness that cannot be read. Only those can be deferred to a check that
-    runs later (see the "Deferred" section of the module docstring). A CURRENT
+    freshness that cannot be read. Only those can be deferred to the merge
+    press's own check of the candidate (see the "Deferred" section of the
+    module docstring). A CURRENT
     envelope that says the run failed is evidence AGAINST the code being
     merged, and evidence against is never deferred: it blocks the card however
     the merge is pressed.
@@ -968,12 +1000,12 @@ def evaluate_stamps(
             )
     if deferred:
         lines.append(
-            f"routing law: {deferred_detail} The merge press checks the "
-            "candidate in the sandbox, live gate included, before any merge "
-            "lands, so the checkpoint defers these rather than calling them "
-            "missing: "
+            f"routing law: {deferred_detail} Deferred to that press, not "
+            "proven here: "
             + "; ".join(f"{title!r} ({home})" for title, home in deferred)
-            + "."
+            + ". What the press runs is this repository's own live gate — the "
+            "checks its gate registry holds — so a stamped home with no runner "
+            "registered there is not separately proven by it."
         )
     if attended:
         # LISTED on both the green card and the blocked close: a human, not
