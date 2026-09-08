@@ -46,6 +46,8 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_conductor import (
     DECLARED_TEST_EVIDENCE_LIMIT_BYTES,
     _run_declared_command,
+    failing_cases_in_output,
+    failure_lines_in_output,
     make_conductor_receipts_exporter,
     make_gates_green_reader,
     run_declared_command_in_sandbox,
@@ -99,6 +101,28 @@ collected 823 items
 
 tests/users/test_router.py ................                              [100%]
 ======================= 823 passed, 1 deselected in 41.02s =====================
+"""
+
+
+#: A run that PASSED whose captured logs contain the word ERROR — the shape
+#: the coach used on 2026-09-08 to show a green run being written down as a
+#: run with two failing tests called "could" and "shutting".
+GREEN_RUN_WITH_ERROR_LOGS = """============================= test session starts ==============================
+collected 823 items
+
+tests/users/test_router.py ................                              [100%]
+------------------------------ Captured log call -------------------------------
+ERROR could not connect to postgres, giving up
+ERROR shutting down worker pool
+======================= 823 passed, 1 deselected in 41.02s =====================
+"""
+
+#: A run that FAILED whose only marker lines are ordinary prose: there is
+#: something to read, and nothing in it is the name of a test.
+ERROR_ONLY_RUN_OUTPUT = """running the declared suite
+ERROR could not connect to postgres, giving up
+ERROR shutting down worker pool
+the suite did not finish
 """
 
 
@@ -218,6 +242,55 @@ class TestTheRunnerOnThisSideKeepsTheRun:
         # A green run's evidence is small — its last lines, nothing more.
         assert len(detail.evidence.encode("utf-8")) < 2_000
 
+    def test_a_run_that_passed_is_never_written_down_as_having_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """The coach's catch, 2026-09-08. The names were being added before
+        anything looked at the exit code, so a suite that PASSED whose logs
+        say ERROR twice came back as "— 2 failed: could, shutting" — on the
+        green log line, on the decision and in the green run's receipts. The
+        exit code is the verdict; a run that exited zero says nothing about
+        failing tests, and its sentence is what it always was."""
+        command = _printing_command(
+            GREEN_RUN_WITH_ERROR_LOGS, exit_code=0, at=tmp_path / "run.txt"
+        )
+
+        exit_code, detail = _run_declared_command(
+            command=command, cwd=tmp_path, timeout_seconds=60
+        )
+
+        assert exit_code == 0
+        assert detail.failing_cases == ()
+        last_line = GREEN_RUN_WITH_ERROR_LOGS.strip().splitlines()[-1]
+        assert str(detail) == (
+            f"`{command}` exited 0 in {tmp_path} — last line: {last_line}"
+        )
+        # The lines are still kept for whoever reads the run back, and what
+        # is said about them is true of a passing run as well.
+        assert "ERROR shutting down worker pool" in detail.evidence
+        assert "about what failed" not in detail.evidence
+
+    def test_a_failed_run_whose_lines_name_no_test_counts_them_instead(
+        self, tmp_path: Path
+    ) -> None:
+        """A run that really did fail, whose marker lines are ordinary
+        sentences: the sentence says how many such lines there are and leaves
+        the words in them alone."""
+        exit_code, detail = _run_declared_command(
+            command=_printing_command(
+                ERROR_ONLY_RUN_OUTPUT, exit_code=1, at=tmp_path / "run.txt"
+            ),
+            cwd=tmp_path,
+            timeout_seconds=60,
+        )
+
+        assert exit_code == 1
+        assert detail.failing_cases == ()
+        assert "failed:" not in detail
+        assert "shutting" not in detail
+        assert "the command wrote 2 lines about failures" in detail
+        assert "ERROR could not connect to postgres" in detail.evidence
+
     def test_a_very_long_output_is_cut_and_says_so(self, tmp_path: Path) -> None:
         # Forty very wide lines right before the summary, so the run's own
         # tail is far bigger than the sixteen kibibytes that may be kept.
@@ -327,6 +400,46 @@ class TestTheBoundedSummaryItself:
 
         assert "FAIL  suite/login/can-sign-in" in evidence
         assert "not ok 7 - the cart totals up" in evidence
+
+
+class TestOnlySomethingThatLooksLikeATestIsNamedAsOne:
+    """A stop reason and a failure pack must not name things that are not
+    tests. A line contributes a NAME only when what follows the marker reads
+    like a case identifier; every other marker line is kept and counted."""
+
+    def test_prose_after_a_marker_word_is_not_a_test_name(self) -> None:
+        output = (
+            "ERROR could not connect to postgres, giving up\n"
+            "ERROR shutting down worker pool\n"
+        )
+
+        assert failing_cases_in_output(output) == ()
+        assert failure_lines_in_output(output) == 2
+        # And the lines themselves are still kept, because they are the most
+        # useful thing in that run's output.
+        assert "shutting down worker pool" in summarise_declared_test_output(output)
+
+    def test_a_tap_line_number_is_not_a_test_name(self) -> None:
+        output = "not ok 3 - users can be deleted by email\n"
+
+        assert failing_cases_in_output(output) == ()
+        assert failure_lines_in_output(output) == 1
+        assert "not ok 3 - users can be deleted by email" in (
+            summarise_declared_test_output(output)
+        )
+
+    def test_a_line_that_does_name_a_case_still_names_it(self) -> None:
+        """Including the weak marker: pytest writes ERROR in its own summary
+        for a case that could not even run, and that one is a real name."""
+        assert failing_cases_in_output(
+            f"ERROR {FIRST_CASE} - fixture 'db' not found\n"
+        ) == (FIRST_CASE,)
+        assert failing_cases_in_output("FAIL  suite/login/can-sign-in (0.4s)\n") == (
+            "suite/login/can-sign-in",
+        )
+        assert failing_cases_in_output("FAILED app.tests.CartTest.test_totals\n") == (
+            "app.tests.CartTest.test_totals",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +637,64 @@ class TestTheGateSetCarriesTheEvidence:
         report = read(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
 
         assert report.status is GateStatus.GREEN
+        assert "823 passed, 1 deselected" in report.evidence
+
+    def test_a_stop_reason_names_no_test_when_the_tool_named_none(
+        self, pool: Any
+    ) -> None:
+        """The failing gate's name is the one word it has always been when
+        nothing test-shaped was named, so the reason the journey stops with —
+        and the failure pack under it — invents no failing tests."""
+        read = _reader(
+            pool,
+            command="qa/run-suite.sh",
+            command_runner=lambda **kw: _run_declared_command(
+                command=_printing_command(
+                    ERROR_ONLY_RUN_OUTPUT, exit_code=1, at=Path(kw["cwd"]) / "run.txt"
+                ),
+                cwd=kw["cwd"],
+                timeout_seconds=kw["timeout_seconds"],
+            ),
+        )
+
+        report = read(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.RED
+        assert report.failed_gates == ("declared toolchain test",)
+        reason = _red_gate_reason(
+            SimpleNamespace(dispatch_result=SimpleNamespace(gates=report))
+        )
+        assert "shutting" not in reason and "postgres" not in reason
+        # What really happened is one read away, in the kept output.
+        assert "ERROR could not connect to postgres" in report.evidence
+
+    def test_a_green_gate_set_says_nothing_about_failing_tests(
+        self, pool: Any
+    ) -> None:
+        """The green log line and the green decision's detail, on a suite that
+        passed with ERROR lines in its captured logs."""
+        read = _reader(
+            pool,
+            command="qa/run-suite.sh",
+            command_runner=lambda **kw: _run_declared_command(
+                command=_printing_command(
+                    GREEN_RUN_WITH_ERROR_LOGS,
+                    exit_code=0,
+                    at=Path(kw["cwd"]) / "run.txt",
+                ),
+                cwd=kw["cwd"],
+                timeout_seconds=kw["timeout_seconds"],
+            ),
+            stamps_leg=lambda **kw: SimpleNamespace(
+                status="not-enforced", detail="", blocks_card=False, attended=()
+            ),
+        )
+
+        report = read(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
+
+        assert report.status is GateStatus.GREEN
+        assert "failed:" not in report.detail
+        assert "shutting" not in report.detail
         assert "823 passed, 1 deselected" in report.evidence
 
     def test_a_runner_that_keeps_nothing_leaves_the_report_as_it_was(
