@@ -1306,7 +1306,7 @@ def build_conductor_mode_kwargs(
     """
     from forge.config.conductor import conductor_enabled
     from forge.lifecycle.persistence import SqliteBuildModeReader
-    from forge.pipeline.mode_c_commit_probe import make_mode_c_commit_probe
+    from forge.pipeline.mode_c_commit_probe import make_mode_c_commit_probe_chooser
     from forge.pipeline.mode_c_history_reader import SqliteModeCHistoryReader
     from forge.pipeline.mode_c_planner import ModeCCyclePlanner
     from forge.pipeline.terminal_handlers.mode_c import evaluate_terminal
@@ -1338,8 +1338,16 @@ def build_conductor_mode_kwargs(
             ),
         ),
         "mode_c_terminal_handler": evaluate_terminal,
-        "mode_c_commit_probe": make_mode_c_commit_probe(
+        # WHERE THIS BUILD'S COMMITS ARE COUNTED (the thirteenth seam,
+        # 2026-09-08). For a repository that has a sandbox the journey
+        # worktree is inside it and there is no such path here, so the
+        # count is asked of that sandbox's sidecar. The chooser reads the
+        # build's repository and answers per build; with
+        # planning.sandboxes empty it IS today's probe, composed exactly
+        # as it was before this lane.
+        "mode_c_commit_probe": make_mode_c_commit_probe_chooser(
             pool,
+            config=config,
             base_branch=base_branch,
             worktree_allowlist=worktree_allowlist,
         ),

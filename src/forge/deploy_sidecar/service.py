@@ -2483,9 +2483,10 @@ def process_git_candidate_tree_remove_request(
 # git is started. The work itself is the conductor's own module, imported,
 # so the two sides cannot drift apart.
 
-#: The three routes.
+#: The three routes, and the fix journey's commit count (2026-09-08).
 GIT_WORKTREE_ADD_ROUTE: str = "/git/worktree-add"
 GIT_WORKTREE_REMOVE_ROUTE: str = "/git/worktree-remove"
+GIT_WORKTREE_COMMIT_COUNT_ROUTE: str = "/git/worktree-commit-count"
 RECEIPTS_EXPORT_ROUTE: str = "/receipts/export"
 
 #: The shape a build id, a stage name or a worktree leaf may have before it
@@ -2624,6 +2625,90 @@ def process_git_worktree_remove_request(
         "path": removed.path,
         "detail": removed.reason,
     }
+
+
+def process_git_worktree_commit_count_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path, base}`` → ``{count, head}`` — did this fix journey
+    actually commit anything?
+
+    The thirteenth seam (2026-09-08). The conductor asks this question at the
+    end of every fix journey, and it used to ask it by running git itself,
+    against the journey worktree. For a repository whose factory lives in its
+    sandbox that worktree is inside the sandbox and forge cannot see it, so
+    the journey died with a "file not found" one step short of its card. The
+    question comes here instead, the way the tree's cutting and the legs
+    already do.
+
+    Two fixed git commands in the tree the caller names: ``rev-list --count
+    <base>..HEAD`` for the number, and ``rev-parse HEAD`` for the commit the
+    count was taken at (an answer the caller can put in a log and check
+    later). No shell, no repository code, nothing written.
+
+    LAW 10 applies unchanged: the path must be this repository's own journey
+    worktree and nothing else, and ``base`` is shape-checked exactly like
+    every other ref this sidecar passes to git. A request that breaks either
+    rule is a 400 with one plain sentence; git failing to answer is a 500
+    saying so, because a probe that cannot answer must never be read as "this
+    journey changed nothing". Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _worktree_path_error(repo_path, payload.get("path"))
+    if error:
+        return 400, {"error": error}
+    worktree = os.path.normpath(os.path.abspath(str(payload["path"])))
+    if not os.path.isdir(worktree):
+        return 400, {
+            "error": (
+                f"the journey worktree {worktree} is not there, so there are "
+                "no commits to count in it"
+            )
+        }
+    base = payload.get("base")
+    error = _ref_error(base, what="base")
+    if error:
+        return 400, {"error": error}
+
+    def _git(*args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-C", worktree, *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    try:
+        counted = _git("rev-list", "--count", f"{base}..HEAD")
+        head = _git("rev-parse", "HEAD") if counted.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    if counted.returncode != 0:
+        detail = (counted.stderr or counted.stdout or "").strip() or "<no output>"
+        return 500, {
+            "error": (
+                f"git could not count {base}..HEAD in {worktree} "
+                f"(it exited {counted.returncode}): {detail}"
+            )
+        }
+    raw = (counted.stdout or "").strip()
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return 500, {
+            "error": (
+                f"git rev-list --count answered {raw!r} for {base}..HEAD in "
+                f"{worktree}, which is not a number"
+            )
+        }
+    sha = (head.stdout or "").strip() if head is not None and head.returncode == 0 else ""
+    return 200, {"count": count, "head": sha or None}
 
 
 def process_receipts_export_request(
@@ -3324,6 +3409,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
+                GIT_WORKTREE_COMMIT_COUNT_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
@@ -3385,6 +3471,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_WORKTREE_REMOVE_ROUTE:
                 status, body = process_git_worktree_remove_request(
+                    payload, config=config
+                )
+            elif route == GIT_WORKTREE_COMMIT_COUNT_ROUTE:
+                status, body = process_git_worktree_commit_count_request(
                     payload, config=config
                 )
             elif route == RECEIPTS_EXPORT_ROUTE:
@@ -3528,12 +3618,14 @@ __all__ = [
     "process_git_rev_parse_request",
     "GIT_WORKTREE_ADD_ROUTE",
     "GIT_WORKTREE_REMOVE_ROUTE",
+    "GIT_WORKTREE_COMMIT_COUNT_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
     "STAMPS_EVIDENCE_ROUTE",
     "process_stamps_evidence_request",
     "SAFE_NAME_PATTERN",
     "process_git_worktree_add_request",
     "process_git_worktree_remove_request",
+    "process_git_worktree_commit_count_request",
     "process_receipts_export_request",
     "GUARDKIT_LEG_ROUTE",
     "LEG_SUBCOMMANDS",
