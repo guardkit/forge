@@ -137,6 +137,7 @@ __all__ = [
     "DeclaredTestDetail",
     "TOOLCHAIN_MODULE_CANDIDATES",
     "failing_cases_in_output",
+    "failure_lines_in_output",
     "summarise_declared_test_output",
     "build_conductor_driver_deps_factory",
     "build_conductor_supervisor_factory",
@@ -444,6 +445,17 @@ def load_declared_toolchain(
 #     because they are the answer to "which tests?". When they are not,
 #     the last lines of the output are kept instead, which is all any tool
 #     can be relied on to give.
+#   * ONLY A RUN THAT FAILED IS DESCRIBED AS FAILING (the coach, 2026-09-08).
+#     The exit code decides whether the sentence says anything about failing
+#     tests at all, so a run that PASSED is never written down — in the log
+#     line, on the decision or in the receipts — as a run with failures,
+#     however many lines its captured logs begin with the word ERROR.
+#   * ONLY SOMETHING THAT LOOKS LIKE A TEST IS NAMED AS ONE (the same coach).
+#     A marker line contributes a NAME only when what follows the marker
+#     reads like a case identifier: it holds ``::``, a path separator or a
+#     dot, the way every test tool writes one. "ERROR shutting down worker
+#     pool" is kept in the output and counted, never named, because a stop
+#     reason that says a test called "shutting" failed is a false sentence.
 
 #: How much of a declared test's own output is kept as evidence: sixteen
 #: kibibytes. Big enough for a short summary and the failure sections under
@@ -501,7 +513,9 @@ class DeclaredTestDetail(str):
 
     * ``evidence`` — the bounded text of what the command printed.
     * ``failing_cases`` — the case names the tool's own summary lines named,
-      in the order it wrote them, empty when it wrote none.
+      in the order it wrote them, empty when it wrote none and empty on any
+      run that exited zero: a run that passed has no failing cases, whatever
+      its output looks like.
 
     Carrying them on the sentence rather than widening the runners' return
     means the two runner seams keep the shape every existing caller and every
@@ -510,6 +524,11 @@ class DeclaredTestDetail(str):
     """
 
     __slots__ = ("evidence", "failing_cases")
+
+    # Named for the type checker as well as for the reader: the two things
+    # a slot holds, said once, so nothing has to be silenced below.
+    evidence: str
+    failing_cases: "tuple[str, ...]"
 
     def __new__(
         cls,
@@ -562,6 +581,30 @@ def _failing_case_name(line: str) -> str:
             name = rest.split()[0].strip(",;:") if rest.split() else ""
             return name
     return ""
+
+
+def _looks_like_a_case_identifier(name: str) -> bool:
+    """Does this word, taken from a marker line, read like a test's name?
+
+    Test tools name a case with a path, a module or a dotted name:
+    ``tests/users/test_router.py::TestX::test_y``, ``suite/login/can-sign-in``,
+    ``app.tests.CartTest``. Ordinary prose does not. So a name counts only
+    when it carries one of those joins — ``::``, a path separator or a dot —
+    and starts the way an identifier or a path starts.
+
+    The rule is deliberately blunt, and it errs towards saying no: a line
+    whose name is refused is still kept, whole, in the evidence, and still
+    counted in the sentence. What it prevents is the opposite mistake, which
+    a person actually reads: a log line such as "ERROR shutting down worker
+    pool" turning into a failing test called "shutting" in the reason a
+    journey stopped.
+    """
+    if not name:
+        return False
+    first = name[0]
+    if not (first.isalnum() or first == "_"):
+        return False
+    return "::" in name or "/" in name or "." in name
 
 
 def _keep_within(text: str, budget_bytes: int, *, keep_end: bool) -> str:
@@ -630,8 +673,13 @@ def summarise_declared_test_output(
 
     parts: list[str] = []
     if named:
-        summary = "the lines the test command itself wrote about what failed:\n" + (
-            "\n".join(named)
+        # Said flatly, because this text is kept for a GREEN run as well:
+        # these are the lines that begin with one of the marker words, which
+        # on a failing run are the tool's own list of what failed and on a
+        # passing run may be nothing more than its captured logs.
+        summary = (
+            "the lines the test command wrote that begin with FAILED, FAIL, "
+            "ERROR or not ok:\n" + "\n".join(named)
         )
         parts.append(_keep_within(summary, max(limit_bytes // 2, 0), keep_end=False))
     spent = sum(len(part.encode("utf-8", errors="replace")) + 2 for part in parts)
@@ -648,6 +696,12 @@ def failing_cases_in_output(output: str) -> "tuple[str, ...]":
     The strong markers first; the weak one (``ERROR``) only when they named
     nothing, so a run whose captured logs are full of error messages does not
     turn them into a list of failing tests.
+
+    A marker line contributes a name only when that name reads like a case
+    identifier (:func:`_looks_like_a_case_identifier`). Every other marker
+    line keeps its whole self in the evidence and is counted by
+    :func:`failure_lines_in_output`; what it must never do is put a word out
+    of an ordinary sentence into a list of failing tests.
     """
     strong: list[str] = []
     weak: list[str] = []
@@ -655,7 +709,7 @@ def failing_cases_in_output(output: str) -> "tuple[str, ...]":
         if not _names_a_failing_case(line):
             continue
         name = _failing_case_name(line)
-        if not name:
+        if not _looks_like_a_case_identifier(name):
             continue
         stripped = line.strip()
         is_weak = any(
@@ -666,6 +720,21 @@ def failing_cases_in_output(output: str) -> "tuple[str, ...]":
         if name not in into:
             into.append(name)
     return tuple(strong or weak)
+
+
+def failure_lines_in_output(output: str) -> int:
+    """How many lines the tool wrote that begin with one of the markers.
+
+    What the sentence falls back to when a failing run's marker lines name
+    nothing that looks like a test: how many such lines there are, so a
+    person knows the kept output has something to read, and the names are
+    left to that output rather than invented here.
+    """
+    return sum(
+        1
+        for line in (output or "").replace("\r\n", "\n").split("\n")
+        if _names_a_failing_case(line)
+    )
 
 
 def _names_the_failing_cases(names: "tuple[str, ...]") -> str:
@@ -681,19 +750,45 @@ def _names_the_failing_cases(names: "tuple[str, ...]") -> str:
     )
 
 
-def _detail_with_the_run_kept(sentence: str, output: str) -> DeclaredTestDetail:
+def _counts_the_failure_lines(count: int) -> str:
+    """``"the command wrote 3 lines about failures …"`` — the honest fallback.
+
+    Used when a run that failed wrote marker lines but none of them named
+    anything shaped like a test. Saying how many there are is true and
+    useful; naming the words out of them would not be.
+    """
+    lines = "line" if count == 1 else "lines"
+    return (
+        f"the command wrote {count} {lines} about failures without naming a "
+        "test in them; the lines are in the kept output"
+    )
+
+
+def _detail_with_the_run_kept(
+    sentence: str, output: str, *, exit_code: "int | None"
+) -> DeclaredTestDetail:
     """One sentence about the run, with the run's own evidence on it.
 
-    When the tool named the cases that failed, the sentence says how many and
-    which — that is the word a person reads on the RED log line, on the
-    decision and, through the failing-gate name, in the reason the journey
+    **The exit code decides whether this sentence mentions failures at all.**
+    A run that exited zero passed, whatever its output looks like, so nothing
+    about failing tests is added to its sentence and it carries no failing
+    case names — the sentence a green run gets is the sentence it has always
+    got, byte for byte. Only a run whose exit code says it failed is
+    described as having failed.
+
+    When such a run's tool named the cases that failed, the sentence says how
+    many and which — that is the word a person reads on the RED log line, on
+    the decision and, through the failing-gate name, in the reason the journey
     stops with. It lists at most
     :data:`DECLARED_TEST_NAMES_IN_DETAIL` of them and says how many more
-    there are; all of them are in the evidence.
+    there are; all of them are in the evidence. When the tool wrote lines
+    about failures but named nothing that looks like a test, the sentence
+    says how many such lines it wrote and leaves them to the kept output.
     """
+    failed = exit_code is not None and exit_code != 0
     try:
         evidence = summarise_declared_test_output(output)
-        names = failing_cases_in_output(output)
+        names = failing_cases_in_output(output) if failed else ()
     except Exception as exc:  # noqa: BLE001 — evidence never costs a verdict
         logger.warning(
             "conductor gates: the declared test command's output could not be "
@@ -705,6 +800,10 @@ def _detail_with_the_run_kept(sentence: str, output: str) -> DeclaredTestDetail:
         return DeclaredTestDetail(sentence)
     if names:
         sentence = f"{sentence} — {_names_the_failing_cases(names)}"
+    elif failed:
+        wrote = failure_lines_in_output(output)
+        if wrote:
+            sentence = f"{sentence} — {_counts_the_failure_lines(wrote)}"
     return DeclaredTestDetail(sentence, evidence=evidence, failing_cases=names)
 
 
@@ -750,6 +849,7 @@ def _run_declared_command(
         f"`{command}` exited {completed.returncode} in {cwd}"
         + (f" — last line: {tail[-1]}" if tail else ""),
         _both_streams(completed.stdout, completed.stderr),
+        exit_code=completed.returncode,
     )
 
 
@@ -931,6 +1031,7 @@ def run_declared_command_in_sandbox(
         # reads both, stdout first. The sentence above keeps the source and
         # the order it always had.
         _both_streams(answer.get("stdout"), answer.get("stderr_tail")),
+        exit_code=exit_code,
     )
 
 
