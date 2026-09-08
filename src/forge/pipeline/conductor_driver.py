@@ -80,6 +80,29 @@ burnt slot — and each catches what the other structurally cannot:
   fix-task lists four cycles running and the turn-level streak never
   reached its limit. The anchor rule stops that journey at 355.
 
+**The review-cycle rule asks one more question before it stops** (attempt
+eight, 2026-09-08): did anything in the cycle between the two reviews end
+approved? If nothing did, the cycle produced nothing and the stop is the
+same loud stop it has always been. If something did — five work legs did,
+all approved, with commits that fixed exactly the three findings named —
+then a review repeating those findings word for word is a review that did
+not verify, not a journey standing still. So the loop writes the repeated
+findings down as "repeated after approved work — unverified by the review
+seat", carries on, and the planner takes the journey to the merge-ready
+checks, which read the tree rather than the task description. The review
+cycle cap still bounds the whole thing.
+
+**Every stop that ENDS a journey closes the build out.** The two
+nothing-changed stops, the turn ceiling, an error, an expired wait the loop
+treats as final, and a budget breach nobody could be asked about all go
+through :meth:`ConductorTurnLoop._close_out`, so the build row is FAILED
+with the stop's own sentence and the pipeline consumer gets its message
+back. Only the stops that deliberately wait for a person — a breach that
+can still be escalated, a published card awaiting its answer — leave a
+build running, because those builds are not over. Before this, attempt
+eight was stopped, left RUNNING, and had to be cancelled by hand with its
+queued message pulled off the stream.
+
 Domain module, injected collaborators: no NATS, no SQLite, no git types
 are imported here. The composition root is :mod:`forge.cli.serve`.
 """
@@ -94,7 +117,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Awaitable, Callable
 
-from forge.pipeline.finding_anchors import derive_finding_anchors
+from forge.pipeline.finding_anchors import (
+    derive_finding_anchors,
+    repeated_anchors,
+)
 from forge.pipeline.stage_taxonomy import StageClass
 from forge.pipeline.supervisor import TurnOutcome
 
@@ -102,6 +128,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "REVIEW_NO_PROGRESS_LIMIT",
+    "UNVERIFIED_AFTER_APPROVED_WORK",
     "ConductorDriverDeps",
     "ConductorRunOutcome",
     "ConductorRunReport",
@@ -146,6 +173,18 @@ DEFAULT_MAX_TURNS: int = 200
 #: not be collapsed: that one counts adjacent turns and a fix journey never
 #: repeats adjacently.
 REVIEW_NO_PROGRESS_LIMIT: int = 1
+
+#: What the loop calls a repeated review that the cycle's approved work had
+#: already addressed. Attempt eight, 2026-09-08: five work legs ran inside
+#: the sandbox and every one was approved, with commits that fixed exactly
+#: the three things the first review named; the follow-up review reported
+#: those same three findings again, word for word, off a tree that no longer
+#: had them. That is a review that did not verify, not a journey standing
+#: still — so it is written down in those words, on the turn and in its
+#: receipts, and the merge-ready checks decide instead.
+UNVERIFIED_AFTER_APPROVED_WORK: str = (
+    "repeated after approved work — unverified by the review seat"
+)
 
 
 #: Outcomes that mean "the conductor dispatched nothing and the build has
@@ -219,7 +258,10 @@ class ConductorRunOutcome(StrEnum):
             predecessor found — catches the fix journey the turn-level rule
             structurally cannot, because a ``/task-work`` turn sits between
             every pair of reviews and breaks the adjacency the fingerprint
-            needs).
+            needs). The review-cycle rule fires only when the cycle
+            between the two reviews produced nothing approved; when it did
+            produce something, the repeat is recorded as unverified and the
+            journey goes to the merge-ready checks instead.
         TURN_CAP: The hard turn ceiling was reached. A planner defect,
             not a legitimate journey.
         NOT_DRIVEN: The build is not one this loop drives (its mode is
@@ -283,6 +325,11 @@ class ConductorRunReport:
         stage_receipts: Per-stage receipt keys exported during the run.
         rationale: Plain-language summary of why the loop ended here.
         failure_pack: Path of the pack written on a loud stop, if any.
+        unverified_findings: Anchors of findings a review repeated after the
+            cycle's approved work had addressed them — the ones the loop
+            recorded as :data:`UNVERIFIED_AFTER_APPROVED_WORK` and carried
+            past, rather than stopping on. Empty on every journey where no
+            review repeated itself that way.
     """
 
     outcome: ConductorRunOutcome
@@ -292,38 +339,44 @@ class ConductorRunReport:
     stage_receipts: tuple[str, ...] = ()
     rationale: str = ""
     failure_pack: Any | None = None
+    unverified_findings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class _BudgetStopWord:
+class _StopWord:
     """The one word the close-out seam reads: this journey failed.
 
     The close-out looks at the turn's dispatch result for the journey's
-    terminal word and writes the build row FAILED on ``"failed"``. A
-    budget stop has no dispatch result of its own (nothing was
-    dispatched — that is the point), so the branch that closes an
-    unescalatable breach hands it this instead. The word is true: the
-    journey ended, and it ended without delivering.
+    terminal word and writes the build row FAILED on ``"failed"``. A stop
+    the DRIVER makes has no dispatch result of its own (nothing was
+    dispatched — that is the point), so every branch that ends a journey
+    hands it this instead. The word is true: the journey ended, and it
+    ended without delivering.
     """
 
     outcome: str = "failed"
 
 
 @dataclass(frozen=True, slots=True)
-class _BudgetStopCloseOut:
-    """What the close-out seam is told about an unescalatable budget stop.
+class _StopCloseOut:
+    """What the close-out seam is told about a stop that ENDED the journey.
 
     Report-shaped, because that is the seam's argument: the build it
-    happened to, the plain reason for the build row's error line, the
-    turn outcome for the audit row, and the terminal word above. Used in
-    exactly one place — the ``PAUSED_BUDGET`` branch with no pause
-    collaborator wired.
+    happened to, the plain reason for the build row's error line, the turn
+    outcome for the audit row, and the terminal word above.
+
+    Every stop that ends a journey uses it (2026-09-08, attempt eight): the
+    two nothing-changed stops, the turn ceiling, an error, an expired wait
+    the loop treats as final, and a budget breach nobody could be asked
+    about. The stops that deliberately WAIT for a person — a breach that
+    can still be escalated, a published card awaiting its answer — never
+    come through here, because their builds are not over.
     """
 
     build_id: str
     rationale: str
-    outcome: TurnOutcome = TurnOutcome.PAUSED_BUDGET
-    dispatch_result: _BudgetStopWord = field(default_factory=_BudgetStopWord)
+    outcome: Any = None
+    dispatch_result: _StopWord = field(default_factory=_StopWord)
 
 
 @dataclass
@@ -411,6 +464,10 @@ class ConductorTurnLoop:
     def __init__(self, deps: ConductorDriverDeps) -> None:
         self._deps = deps
         self._stage_receipts: list[str] = []
+        #: Anchors a review repeated after the cycle's approved work had
+        #: already addressed them. Carried onto the run report so the
+        #: journey's own result says what the review seat failed to verify.
+        self._unverified_findings: list[str] = []
 
     async def drive(self, build_id: str) -> ConductorRunReport:
         """Walk ``build_id`` through the conductor until it stops.
@@ -454,10 +511,14 @@ class ConductorTurnLoop:
                     "journey (the routine path is unaffected)",
                     build_id,
                 )
+                reason = f"next_turn raised {type(exc).__name__}: {exc}"
                 pack = await self._write_pack(
                     build_id,
-                    reason=f"next_turn raised {type(exc).__name__}: {exc}",
+                    reason=reason,
                     outcome=ConductorRunOutcome.ERROR,
+                )
+                await self._close_out_stop(
+                    build_id, reason=reason, report=last_report
                 )
                 return ConductorRunReport(
                     outcome=ConductorRunOutcome.ERROR,
@@ -465,14 +526,14 @@ class ConductorTurnLoop:
                     turns=turns,
                     last_report=last_report,
                     stage_receipts=tuple(self._stage_receipts),
-                    rationale=f"next_turn raised {type(exc).__name__}: {exc}",
+                    unverified_findings=tuple(self._unverified_findings),
+                    rationale=reason,
                     failure_pack=pack,
                 )
 
             turns += 1
             last_report = report
             outcome = getattr(report, "outcome", None)
-            await self._export_receipts(build_id, report)
 
             fingerprint = self._fingerprint(report)
             if fingerprint == last_fingerprint:
@@ -493,6 +554,45 @@ class ConductorTurnLoop:
                 else:
                     no_progress_reviews = 0
 
+            # A REPEATED REVIEW AFTER APPROVED WORK IS UNVERIFIED, NOT A
+            # JOURNEY STANDING STILL (attempt eight, 2026-09-08).
+            #
+            # Asked BEFORE the receipts go out, so the sentence rides on the
+            # turn's own rationale into its receipt folder rather than
+            # needing a seam of its own. The question — did anything in this
+            # cycle end approved? — is one only the durable rows can answer,
+            # so the loop asks the supervisor, which owns the history
+            # reader. An answer it cannot get is a "no": the rule then fires
+            # exactly as it always has.
+            receipted = report
+            if (
+                review_verdict is not None
+                and review_verdict.repeated
+                and no_progress_reviews >= REVIEW_NO_PROGRESS_LIMIT
+                and await self._cycle_had_approved_work(build_id)
+            ):
+                note = (
+                    f"{UNVERIFIED_AFTER_APPROVED_WORK}: "
+                    f"{', '.join(review_verdict.repeated)}"
+                )
+                logger.warning(
+                    "conductor: build_id=%s turn %d — %s. The cycle's work "
+                    "was approved, so this is not a stop: the merge-ready "
+                    "checks decide next.",
+                    build_id,
+                    turns,
+                    note,
+                )
+                for anchor in review_verdict.repeated:
+                    if anchor not in self._unverified_findings:
+                        self._unverified_findings.append(anchor)
+                receipted = _TurnWithNote(report=report, note=note)
+                # The comparison is answered, not left hanging. The review
+                # cycle cap and the turn ceiling still bound everything.
+                no_progress_reviews = 0
+
+            await self._export_receipts(build_id, receipted)
+
             if outcome is TurnOutcome.TERMINAL:
                 await self._close_out(build_id, report)
                 logger.info(
@@ -507,6 +607,7 @@ class ConductorTurnLoop:
                     turns=turns,
                     last_report=report,
                     stage_receipts=tuple(self._stage_receipts),
+                    unverified_findings=tuple(self._unverified_findings),
                     rationale=getattr(report, "rationale", "") or "terminal",
                 )
 
@@ -532,6 +633,7 @@ class ConductorTurnLoop:
                     turns=turns,
                     last_report=report,
                     stage_receipts=tuple(self._stage_receipts),
+                    unverified_findings=tuple(self._unverified_findings),
                     rationale=(
                         getattr(report, "rationale", "")
                         or f"the merge-ready checkpoint's card was "
@@ -571,7 +673,11 @@ class ConductorTurnLoop:
                     )
                     await self._close_out(
                         build_id,
-                        _BudgetStopCloseOut(build_id=build_id, rationale=reason),
+                        _StopCloseOut(
+                            build_id=build_id,
+                            rationale=reason,
+                            outcome=TurnOutcome.PAUSED_BUDGET,
+                        ),
                     )
                     return ConductorRunReport(
                         outcome=ConductorRunOutcome.PAUSED_BUDGET,
@@ -579,6 +685,7 @@ class ConductorTurnLoop:
                         turns=turns,
                         last_report=report,
                         stage_receipts=tuple(self._stage_receipts),
+                        unverified_findings=tuple(self._unverified_findings),
                         rationale=reason,
                         failure_pack=pack,
                     )
@@ -603,6 +710,7 @@ class ConductorTurnLoop:
                     turns=turns,
                     last_report=report,
                     stage_receipts=tuple(self._stage_receipts),
+                    unverified_findings=tuple(self._unverified_findings),
                     rationale=breach,
                     failure_pack=pack,
                 )
@@ -700,12 +808,17 @@ class ConductorTurnLoop:
                         reason=reason,
                         outcome=ConductorRunOutcome.RED_GATE_STOP,
                     )
+                    # This stop ENDS the journey: nothing can wake the
+                    # loop-back, so the build must not be left RUNNING with
+                    # the queue still holding its message.
+                    await self._close_out_stop(build_id, reason=reason, report=report)
                     return ConductorRunReport(
                         outcome=ConductorRunOutcome.RED_GATE_STOP,
                         build_id=build_id,
                         turns=turns,
                         last_report=report,
                         stage_receipts=tuple(self._stage_receipts),
+                        unverified_findings=tuple(self._unverified_findings),
                         rationale=reason,
                         failure_pack=pack,
                     )
@@ -727,12 +840,16 @@ class ConductorTurnLoop:
                         reason=reason,
                         outcome=ConductorRunOutcome.WAIT_EXPIRED,
                     )
+                    await self._close_out_stop(
+                        build_id, reason=reason, report=report
+                    )
                     return ConductorRunReport(
                         outcome=ConductorRunOutcome.WAIT_EXPIRED,
                         build_id=build_id,
                         turns=turns,
                         last_report=report,
                         stage_receipts=tuple(self._stage_receipts),
+                        unverified_findings=tuple(self._unverified_findings),
                         rationale=reason,
                         failure_pack=pack,
                     )
@@ -749,12 +866,14 @@ class ConductorTurnLoop:
             pack = await self._write_pack(
                 build_id, reason=reason, outcome=ConductorRunOutcome.ERROR
             )
+            await self._close_out_stop(build_id, reason=reason, report=report)
             return ConductorRunReport(
                 outcome=ConductorRunOutcome.ERROR,
                 build_id=build_id,
                 turns=turns,
                 last_report=report,
                 stage_receipts=tuple(self._stage_receipts),
+                unverified_findings=tuple(self._unverified_findings),
                 rationale=reason,
                 failure_pack=pack,
             )
@@ -764,12 +883,14 @@ class ConductorTurnLoop:
         pack = await self._write_pack(
             build_id, reason=reason, outcome=ConductorRunOutcome.TURN_CAP
         )
+        await self._close_out_stop(build_id, reason=reason, report=last_report)
         return ConductorRunReport(
             outcome=ConductorRunOutcome.TURN_CAP,
             build_id=build_id,
             turns=turns,
             last_report=last_report,
             stage_receipts=tuple(self._stage_receipts),
+            unverified_findings=tuple(self._unverified_findings),
             rationale=reason,
             failure_pack=pack,
         )
@@ -943,14 +1064,70 @@ class ConductorTurnLoop:
             reason=reason,
             outcome=ConductorRunOutcome.NOTHING_CHANGED,
         )
+        await self._close_out_stop(build_id, reason=reason, report=report)
         return ConductorRunReport(
             outcome=ConductorRunOutcome.NOTHING_CHANGED,
             build_id=build_id,
             turns=turns,
             last_report=report,
             stage_receipts=tuple(self._stage_receipts),
+            unverified_findings=tuple(self._unverified_findings),
             rationale=reason,
             failure_pack=pack,
+        )
+
+    async def _cycle_had_approved_work(self, build_id: str) -> bool:
+        """Did anything in this review cycle end approved? ``False`` if unknown.
+
+        Read off the supervisor, which owns the Mode C history reader — the
+        same duck-typing the budget branch uses for ``budget_pause``, and
+        for the same reason: whether a stop is right depends on a fact the
+        turn report does not carry.
+
+        Fails closed on purpose. A supervisor with no such reading, a reader
+        that raises, an answer of "cannot tell" — all three answer ``False``,
+        which leaves the review-cycle rule firing exactly as it does today.
+        Only a durable, readable "yes, a leg of this cycle was approved"
+        lets the loop carry a repeated review past its stop.
+        """
+        ask = getattr(self._deps.supervisor, "cycle_had_approved_work", None)
+        if ask is None:
+            return False
+        try:
+            answer = await _maybe_await(ask(build_id))
+        except Exception as exc:  # noqa: BLE001 — an unknown answer is not fatal
+            logger.warning(
+                "conductor: asking whether the cycle had approved work raised "
+                "%s: %s for build_id=%s — reading it as 'no', so the "
+                "review-cycle rule applies as usual",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return False
+        return answer is True
+
+    async def _close_out_stop(
+        self, build_id: str, *, reason: str, report: Any
+    ) -> None:
+        """End a journey the DRIVER stopped, the way a terminal turn ends one.
+
+        The build row goes FAILED with the stop's own sentence, the
+        close-out's audit row is written, and the pipeline consumer's
+        message is released so the next build can start. Before this, only
+        a terminal turn, a published card and an unescalatable budget breach
+        came through here, and every other stop left the build RUNNING with
+        the queue's slot held — which is how attempt eight had to be
+        cancelled and its message pulled off the stream by hand
+        (2026-09-08).
+        """
+        await self._close_out(
+            build_id,
+            _StopCloseOut(
+                build_id=build_id,
+                rationale=f"stopped: {reason}",
+                outcome=getattr(report, "outcome", None),
+            ),
         )
 
     async def _export_receipts(self, build_id: str, report: Any) -> None:
@@ -1121,11 +1298,43 @@ class _ReviewVerdict:
         reason: The plain-language stop text, anchors named. Always
             populated — it costs nothing and it means the stop can never
             fire with an empty sentence.
+        repeated: The anchors this review said again, word for word, when
+            that is WHY it counts as no progress. Empty on every other
+            verdict, and in particular on the fail-closed one — a review
+            that reported no readable findings block repeated nothing; it
+            simply stopped speaking, and no amount of approved work makes
+            that readable.
     """
 
     no_progress: bool
     baseline: frozenset[str] | None
     reason: str
+    repeated: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _TurnWithNote:
+    """The turn's report with one plain sentence added to its rationale.
+
+    The receipts exporter writes the turn's rationale into that stage's
+    receipt folder verbatim (``turn-rationale.txt``), so this is how the
+    "unverified by the review seat" sentence reaches the record without a
+    new seam and without touching the report the supervisor already wrote.
+
+    Everything else is the report itself: every other attribute is read
+    straight off it, so a caller cannot tell the difference.
+    """
+
+    report: Any
+    note: str
+
+    @property
+    def rationale(self) -> str:
+        own = getattr(self.report, "rationale", "") or ""
+        return f"{own}\n{self.note}" if own else self.note
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self.report, item)
 
 
 def _is_settled_review(report: Any) -> bool:
@@ -1228,7 +1437,8 @@ def _review_progress_verdict(
             ),
         )
 
-    if current >= baseline:
+    repeated = repeated_anchors(baseline, current)
+    if repeated:
         added = current - baseline
         return _ReviewVerdict(
             no_progress=True,
@@ -1239,6 +1449,7 @@ def _review_progress_verdict(
                 f"them was resolved — {_name_anchors(baseline)}"
                 + (f" (plus new: {_name_anchors(added)})" if added else "")
             ),
+            repeated=repeated,
         )
 
     return _ReviewVerdict(
