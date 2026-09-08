@@ -70,6 +70,7 @@ from forge.pipeline.dispatchers.subprocess import (
     StageDispatchStatus,
     dispatch_subprocess_stage,
 )
+from forge.pipeline.fix_task_context_builder import build_review_verification_context
 from forge.pipeline.stage_taxonomy import StageClass
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ __all__ = [
     "leg_budget_args",
     "make_conductor_subprocess_dispatcher",
     "mint_stage_correlation_id",
+    "with_review_verification",
 ]
 
 
@@ -166,6 +168,51 @@ def leg_budget_args(*, stage: StageClass, leg_budgets: Any) -> list[str]:
     return args
 
 
+def with_review_verification(
+    *,
+    stage: StageClass,
+    build_id: str,
+    worktree_path: "Path | str | None",
+    forward_context: "Mapping[str, Any] | None",
+    receipts_root: "Path | str | None" = None,
+) -> "Mapping[str, Any] | None":
+    """Add the verification document to a follow-up review's context.
+
+    A review that follows work already done in this journey is handed one
+    more context document: what the previous review found, what the work
+    legs have committed since, and the instruction to check each finding
+    against the code that is there now
+    (:func:`~forge.pipeline.fix_task_context_builder.build_review_verification_context`
+    — attempt eight, 2026-09-08, where a repeated review stopped a journey
+    with every fix already in place).
+
+    It is added HERE, at the conductor's own seam, because this is the
+    layer that reads the build row and therefore the only one that knows
+    the journey's worktree. It is one more entry on the list of context
+    entries the supervisor's builder already made — the same shape, the
+    same flag, the same list — so nothing downstream changes.
+
+    Everything else is left exactly as it was found: any other stage, and
+    a review with no prior findings behind it, returns the very mapping
+    that came in, so a routine build and a journey's first review are
+    byte-identical to before.
+    """
+    if stage is not StageClass.TASK_REVIEW:
+        return forward_context
+    entry = build_review_verification_context(
+        build_id=build_id,
+        worktree_path=worktree_path,
+        receipts_root=receipts_root,
+    )
+    if entry is None:
+        return forward_context
+    updated = dict(forward_context or {})
+    entries = list(updated.get("context_entries") or ())
+    entries.append(entry)
+    updated["context_entries"] = entries
+    return updated
+
+
 def mint_stage_correlation_id(
     *, build_correlation_id: str, stage: StageClass, subject: str | None
 ) -> str:
@@ -200,6 +247,7 @@ def make_conductor_subprocess_dispatcher(
     leg_model: str | None = None,
     leg_budgets: Any = None,
     with_nats_streaming: bool = True,
+    receipts_root: "Path | str | None" = None,
 ) -> Callable[..., Awaitable[Any]]:
     """Build the ``subprocess_dispatcher`` the conductor's Supervisor calls.
 
@@ -263,6 +311,11 @@ def make_conductor_subprocess_dispatcher(
             or a profile carrying no ``leg_*`` value, appends nothing at
             all — the byte-identity this factory's golden pins hold it to.
         with_nats_streaming: Forwarded verbatim.
+        receipts_root: Where the fix journey's exported receipts live, for
+            the follow-up review's verification document (see
+            :func:`with_review_verification`). ``None`` — production —
+            uses the estate's one receipts path law; a test points it at a
+            temporary directory.
 
     Returns:
         ``async (**supervisor_kwargs) -> StageDispatchResult``.
@@ -370,6 +423,18 @@ def make_conductor_subprocess_dispatcher(
                 duration_secs=0.0,
                 subcommand=getattr(stage, "value", str(stage)),
             )
+
+        # A follow-up review is handed the previous review's findings and
+        # the cycle's commits, and asked to check the code rather than
+        # repeat itself. Every other dispatch keeps the context it came
+        # with, unchanged.
+        forward_context = with_review_verification(
+            stage=stage,
+            build_id=build_id,
+            worktree_path=repo_path,
+            forward_context=forward_context,
+            receipts_root=receipts_root,
+        )
 
         stage_timeout = (timeout_seconds_by_stage or {}).get(stage, timeout_seconds)
 
