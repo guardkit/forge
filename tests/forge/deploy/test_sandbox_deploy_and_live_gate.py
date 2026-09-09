@@ -797,10 +797,21 @@ class TestTheDeployIsSentTheEnvironmentItsVenueCanUse:
 class TestTheHostWrapperIsStillServed:
     """A repository whose sandbox is made by the host wrapper, over the wire.
 
-    The wrapper is what reads the sandbox's settings, so all of them ride, and
-    the sidecar has to accept them — with the one exception written down in
-    its allowlist: the file of secrets.
+    The wrapper is what reads the sandbox's settings, so all eleven ride on
+    the request — and the sidecar accepts the seven that only name a sandbox,
+    its size, its ports and its network rules. The other four are refused on
+    purpose, and its allowlist writes down why: each of them would let a
+    request choose what a sandbox being created reads or mounts.
     """
+
+    #: The four the sidecar refuses on purpose. Kept here as plain names so
+    #: this file says the same thing the allowlist does.
+    REFUSED_ON_PURPOSE = (
+        "SANDBOX_ENV_FILE",
+        "SANDBOX_FORGE_PATH",
+        "SANDBOX_GUARDKIT_PATH",
+        "SANDBOX_RECEIPTS_PATH",
+    )
 
     def _client(self, sidecar: Any) -> SidecarScriptRunner:
         return SidecarScriptRunner(base_url=sidecar.url, repo=REPO_KEY)
@@ -814,7 +825,8 @@ class TestTheHostWrapperIsStillServed:
         profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
         env = sandbox_env(profile)  # the host-wrapper venue: all eleven
         assert len(env) == 11
-        env.pop("SANDBOX_ENV_FILE")  # deliberately not allowlisted
+        for name in self.REFUSED_ON_PURPOSE:
+            env.pop(name)  # deliberately not allowlisted
         exit_code, output = self._client(sidecar)(
             cwd=str(clone),
             script="deploy/sandbox-deploy.sh",
@@ -825,17 +837,28 @@ class TestTheHostWrapperIsStillServed:
         assert exit_code == 0, output
         assert (marker_dir / "sandbox-deploy.sh.ran").is_file()
 
-    def test_the_file_of_secrets_is_refused_and_says_so(
-        self, clone: Path, sidecar: Any
+    @pytest.mark.parametrize("key", REFUSED_ON_PURPOSE)
+    def test_a_setting_that_chooses_what_a_sandbox_gets_is_refused_and_says_so(
+        self, clone: Path, sidecar: Any, key: str
     ) -> None:
+        """These four name a file or a folder a NEW sandbox would take.
+
+        The env file becomes its whole environment; the forge and guardkit
+        folders are mounted into it (and forge's parent decides three more);
+        the receipts folder is mounted read-write. The sidecar cannot check
+        values, and the sandbox's name has always been the caller's to choose,
+        so allowing them would widen what one request can do. Today nothing
+        sends them over the wire: a deploy inside the sandbox is sent none of
+        the eleven, and the wrapper is an attended host-side command.
+        """
         _carry_the_factory(clone)
         exit_code, output = self._client(sidecar)(
             cwd=str(clone),
             script="deploy/sandbox-deploy.sh",
             env_file=None,
             timeout=60,
-            extra_env={"SANDBOX_ENV_FILE": "/run/user/1000/anything.env"},
+            extra_env={key: "/run/user/1000/anything"},
         )
         assert exit_code != 0
         assert "sidecar refused (HTTP 400)" in output
-        assert "SANDBOX_ENV_FILE" in output
+        assert key in output

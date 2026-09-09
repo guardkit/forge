@@ -65,6 +65,17 @@ ELEVEN = (
     "SANDBOX_RECEIPTS_PATH",
 )
 
+#: The four of the eleven the sidecar refuses on purpose: each names a file or
+#: a folder that a sandbox being CREATED would take its environment from, or
+#: mount — one of them read-write. A request may not choose those; a
+#: repository that ever needs it gets it by a decision, written down.
+REFUSED_ON_PURPOSE = (
+    "SANDBOX_ENV_FILE",
+    "SANDBOX_FORGE_PATH",
+    "SANDBOX_GUARDKIT_PATH",
+    "SANDBOX_RECEIPTS_PATH",
+)
+
 #: api_test's own shape on the day it broke: a sandbox that carries the
 #: factory, with every setting the block allows.
 SANDBOX_BLOCK: dict[str, Any] = {
@@ -221,36 +232,47 @@ class TestThroughTheHostWrapper:
             _profile(), inside_sandbox=False
         )
 
-    def test_the_sidecar_allows_every_key_the_profile_can_produce(self) -> None:
+    def test_the_sidecar_allows_every_key_it_should(self) -> None:
         """The two lists, asserted against each other from the real code.
 
         This is the break that cost the first merge press: the deploy stage
         grew six settings and the sidecar's allowlist did not, so the sidecar
         the deploy runs through refused the deploy's own environment. The
         assertion is between the real ``sandbox_env`` and the real
-        ``allowed_env_keys``, so it fails the moment they drift again.
+        ``allowed_env_keys``, so it fails the moment they drift again — and it
+        pins the four the sidecar refuses on purpose, so neither list can gain
+        or lose one of those quietly either. One honest limit: this only
+        covers settings the fixture profile below actually sets, so a twelfth
+        setting added one day with no fixture entry would not be caught here.
         """
         profile = _profile()
         produced = set(sandbox_env(profile))
         allowed = allowed_env_keys(profile)
-        assert produced - allowed == {"SANDBOX_ENV_FILE"}
+        assert produced - allowed == set(REFUSED_ON_PURPOSE)
 
-    def test_the_one_key_deliberately_left_off_and_why(self) -> None:
-        """``SANDBOX_ENV_FILE`` is refused on purpose, and this says so.
+    def test_the_four_keys_deliberately_left_off_and_why(self) -> None:
+        """Four of the eleven are refused on purpose, and this says so.
 
-        It is the only one of the eleven that names a file of secrets — the
-        one the wrapper hands to ``sbx --env-file`` when it creates the
-        sandbox. Values are not checked here, so allowing the key would let a
-        request choose which file on this box becomes a sandbox's environment.
-        Nothing sends it: a deploy inside the sandbox is sent none of the
+        Each one points at somewhere on this box that a sandbox being created
+        would take its environment from or mount: the env file is the
+        sops-rendered file of secrets handed to ``sbx --env-file``; the forge
+        and guardkit folders are mounted read-only, and forge's parent folder
+        decides three more mounts; the receipts folder is the one mount the
+        wrapper makes read-write. The sidecar checks key names and never
+        values, and the sandbox's name has always been the caller's to choose,
+        so a request naming a sandbox that does not exist yet would take the
+        wrapper's "create it" branch. Allowing these would let one request
+        decide what a new sandbox mounts and reads before it runs code.
+        Nothing sends them: a deploy inside the sandbox is sent none of the
         eleven, and creating a factory-carrying sandbox is an attended,
-        host-side command. If a repository ever needs it, it is added by a
-        decision rather than by accident.
+        host-side command. If a repository ever needs them, they are added by
+        a decision rather than by accident.
         """
         allowed = allowed_env_keys(_profile())
-        assert "SANDBOX_ENV_FILE" not in allowed
         for name in ELEVEN:
-            if name != "SANDBOX_ENV_FILE":
+            if name in REFUSED_ON_PURPOSE:
+                assert name not in allowed, name
+            else:
                 assert name in allowed, name
 
 
