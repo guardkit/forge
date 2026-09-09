@@ -205,12 +205,33 @@ ENV_ALLOWLIST_BASE: frozenset[str] = frozenset(
         # The settings that make a sandbox carry the factory's own two
         # services (2026-09-07/08). A profile's sandbox block can set six of
         # those, and the deploy stage threads every one it finds onto a
-        # HOST-WRAPPER deploy, so this list has to know the harmless ones or
+        # HOST-WRAPPER deploy, so this list has to know the ones we accept or
         # the first deploy of such a repository is refused at its first step —
         # which is exactly what happened on the first real merge press
         # (2026-09-09). Two of the six are here: they name the two ports the
-        # sandbox publishes for those services, which is the same kind of
-        # setting as SANDBOX_PUBLISH above — no secret and no new privilege.
+        # sandbox publishes for those services, the same kind of setting as
+        # SANDBOX_PUBLISH above, and neither of them carries a secret.
+        #
+        # SAY PLAINLY WHAT THE PAIR SWITCHES ON. In the wrapper
+        # (deploy/sandbox-deploy.sh) carries_the_factory() is true exactly
+        # when BOTH of these are set, and that is the branch which creates a
+        # sandbox carrying the factory: the factory's own clone (--clone), the
+        # read-only mounts of forge, guardkit and their estate siblings, the
+        # read-write receipts mount, the sandbox's own environment file, the
+        # two published service ports, and `systemctl --user start
+        # forge-sandbox-runner@<name>`, which starts the build runner. So a
+        # request to a host sidecar that permits that wrapper, naming a
+        # sandbox which does not exist yet, can now cause a factory-carrying
+        # sandbox to be created and the runner started — which it could not do
+        # before. We accept that, for three reasons, and this is the whole
+        # argument: it is what this lane was asked to fix, because
+        # SANDBOX_SIDECAR_PUBLISH is the key the first real merge press was
+        # refused for; the four keys that would let a request choose WHAT such
+        # a sandbox reads and mounts are refused just below, so the wrapper
+        # falls back to its own estate defaults for the forge and guardkit
+        # folders and passes no environment file and no receipts mount at all;
+        # and creating a sandbox and choosing the ports it publishes were
+        # already the caller's to do through the five settings above.
         "SANDBOX_SIDECAR_PUBLISH",
         "SANDBOX_RUNNER_PUBLISH",
         # THE OTHER FOUR ARE DELIBERATELY NOT HERE, and this is the reason.
@@ -530,9 +551,13 @@ def allowed_env_keys(profile: DeployProfile) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
 
     Base allowlist UNION ``live_gate.env`` keys UNION ``candidate.env`` keys.
-    The base list carries every setting a profile's ``sandbox`` block can put
-    in a deploy step's environment but one — see the note beside
-    :data:`ENV_ALLOWLIST_BASE` for the one that is refused on purpose.
+    The base list carries the settings a profile's ``sandbox`` block can put
+    in a deploy step's environment except four — ``SANDBOX_ENV_FILE``,
+    ``SANDBOX_FORGE_PATH``, ``SANDBOX_GUARDKIT_PATH`` and
+    ``SANDBOX_RECEIPTS_PATH`` are refused on purpose, because each one names a
+    file or a folder that a sandbox being created would take its environment
+    from or mount, one of them writable. See the note beside
+    :data:`ENV_ALLOWLIST_BASE` for the reasoning.
     ``candidate`` is a first-class profile field (S2F): its ``env`` keys are read
     from ``profile.candidate``. A defensive fallback to ``profile.extra`` is kept
     for a profile parsed by an older loader that still parked ``candidate`` in
