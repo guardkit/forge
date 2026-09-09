@@ -198,10 +198,10 @@ class TestTheLegTripwires:
     """LI stage-2 §1 — two NAMED tripwires, wired at the composition site."""
 
     def test_the_two_constants_carry_the_ruled_numbers(self) -> None:
-        assert CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS == 960  # raised 2026-09-08: the model budget is profile-driven up to 900s
+        assert CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS == 1860  # raised 2026-09-09: the model budget is profile-driven up to 1800s, and today's real reviews ran from 191s to 903s
         assert CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS == 1800
         assert CONDUCTOR_STAGE_TIMEOUT_SECONDS == {
-            StageClass.TASK_REVIEW: 960,
+            StageClass.TASK_REVIEW: 1860,
             StageClass.TASK_WORK: 1800,
         }
 
@@ -218,7 +218,7 @@ class TestTheLegTripwires:
         assert "never work-limiters" in source
         assert "monitored-supervision path" in source
 
-    def test_a_review_dispatch_gets_960_and_a_work_dispatch_1800(
+    def test_a_review_dispatch_gets_1860_and_a_work_dispatch_1800(
         self, pool: SqliteLifecyclePersistence
     ) -> None:
         """The composed production path, driven — not the constants re-read."""
@@ -228,7 +228,7 @@ class TestTheLegTripwires:
         _drive(supervisor, StageClass.TASK_REVIEW)
         _drive(supervisor, StageClass.TASK_WORK)
 
-        assert [call["timeout_seconds"] for call in runner.calls] == [960, 1800]
+        assert [call["timeout_seconds"] for call in runner.calls] == [1860, 1800]
 
 
 class TestTheLegSeatIsConfigAsCode:
