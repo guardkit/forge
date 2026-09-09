@@ -34,6 +34,8 @@ The narrow contract:
     POST /git/candidate-tree-remove {repo, feature_id} -> {removed, path}
     POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
               -> {feature_yaml, envelope, code_commit_time, history_dir}
+    POST /git/worktree-changed-files {repo, path, base}
+              -> {name_status, approval_patch, truncated, head|null}
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -2777,6 +2779,140 @@ def process_git_worktree_commit_count_request(
     return 200, {"count": count, "head": sha or None}
 
 
+# ---------------------------------------------------------------------------
+# WHAT THIS BRANCH CHANGED, READ WHERE THE REPOSITORY LIVES
+# (the specification fence, Rich's ruling 2026-09-09, rule 88)
+# ---------------------------------------------------------------------------
+#
+# The merge-ready checkpoint refuses to card a branch that rewrote the files
+# the repository calls its specification, or a line recording somebody's
+# approval. To do that it has to read the branch's own changes, and for a
+# repository whose factory lives in its sandbox that branch is in the clone in
+# there. So the reading comes here, exactly as the commit count and the
+# worktree's own cutting already do.
+#
+# This route runs git and nothing else — two diffs, fixed argument lists, no
+# shell, nothing written, no repository code executed. It is the same class of
+# thing as ``/git/rev-parse`` and ``/git/worktree-commit-count`` and is gated
+# the same way: LAW 1 resolves the repository from its key, LAW 10 holds the
+# path to this repository's own journey worktree, and the base is shape-checked
+# like every other ref before git sees it. It is deliberately NOT gated on "am
+# I inside a sandbox?", for the reason written above the ancestry routes: that
+# wall is about running a repository's OWN code, and this runs none.
+#
+# It answers with what git printed, not with a verdict. The rules — which
+# paths are the specification, what a recorded approval line looks like — live
+# in one place, :mod:`forge.pipeline.merge_ready_checkpoint`, so the sandbox
+# answer and the host answer are judged by the same code and cannot drift.
+
+#: The route.
+GIT_WORKTREE_CHANGED_FILES_ROUTE: str = "/git/worktree-changed-files"
+
+#: How long the two diffs may take. Longer than a rev-parse (a diff over a
+#: long branch is real work) and far short of anything a person waits for.
+GIT_BRANCH_DIFF_TIMEOUT_SECONDS: float = 120.0
+
+#: How much of either diff is carried back: 512 KiB each. A name list and a
+#: patch already filtered to the lines holding the approval word are both
+#: small; anything past this is cut and the answer SAYS it was cut, because a
+#: refusal that missed the line it was looking for is worse than an honest
+#: "this could not be read whole".
+GIT_BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
+
+
+def process_git_worktree_changed_files_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path, base}`` → ``{name_status, approval_patch, truncated, head}``.
+
+    Two fixed git commands in the journey worktree the caller names, both
+    against ``<base>...HEAD`` — the three-dot form, so what comes back is what
+    THIS branch changed and never what its base has moved on to since:
+
+    * ``diff --name-status -M -z`` — which files changed, with renames
+      detected, so the refusal can say "renamed to" rather than "deleted" and
+      "added" about the same file. ``-z`` so a path with a space or a tab in
+      it comes back exactly as git wrote it.
+    * ``diff -U0 --no-renames -G <the approval word>`` — the lines the branch
+      adds or removes in files whose change touches that word. Renames are
+      turned OFF here on purpose: with them on, a file moved wholesale carries
+      no changed lines at all and an approval carried along with it would be
+      invisible. With them off the move is a removal and an addition, which is
+      what it is.
+
+    A 400 is a refusal of the request; a 500 is git failing to answer, which
+    the caller must read as "this could not be read" and never as "this branch
+    changed nothing". Never raises.
+    """
+    from forge.pipeline.merge_ready_checkpoint import APPROVAL_MARKER
+
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _worktree_path_error(repo_path, payload.get("path"))
+    if error:
+        return 400, {"error": error}
+    worktree = os.path.normpath(os.path.abspath(str(payload["path"])))
+    if not os.path.isdir(worktree):
+        return 400, {
+            "error": (
+                f"the journey worktree {worktree} is not there, so what its "
+                "branch changed cannot be read"
+            )
+        }
+    base = payload.get("base")
+    error = _ref_error(base, what="base")
+    if error:
+        return 400, {"error": error}
+
+    def _git(*args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-c", "core.quotepath=false", "-C", worktree, *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_BRANCH_DIFF_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    span = f"{base}...HEAD"
+    try:
+        names = _git("diff", "--name-status", "-M", "-z", span)
+        patch = (
+            _git("diff", "-U0", "--no-color", "--no-renames", f"-G{APPROVAL_MARKER}", span)
+            if names.returncode == 0
+            else None
+        )
+        head = _git("rev-parse", "HEAD") if names.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    for label, result in (("the changed files", names), ("the approval lines", patch)):
+        if result is not None and result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip() or "<no output>"
+            return 500, {
+                "error": (
+                    f"git could not read {label} of {span} in {worktree} "
+                    f"(it exited {result.returncode}): {detail}"
+                )
+            }
+
+    name_status = names.stdout or ""
+    approval_patch = (patch.stdout if patch is not None else "") or ""
+    truncated = (
+        len(name_status.encode("utf-8")) > GIT_BRANCH_DIFF_LIMIT_BYTES
+        or len(approval_patch.encode("utf-8")) > GIT_BRANCH_DIFF_LIMIT_BYTES
+    )
+    sha = (head.stdout or "").strip() if head is not None and head.returncode == 0 else ""
+    return 200, {
+        "name_status": name_status[:GIT_BRANCH_DIFF_LIMIT_BYTES],
+        "approval_patch": approval_patch[:GIT_BRANCH_DIFF_LIMIT_BYTES],
+        "truncated": truncated,
+        "head": sha or None,
+    }
+
+
 def process_receipts_export_request(
     payload: Any, *, config: ForgeConfig
 ) -> tuple[int, dict[str, Any]]:
@@ -3476,6 +3612,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 GIT_WORKTREE_COMMIT_COUNT_ROUTE,
+                GIT_WORKTREE_CHANGED_FILES_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
@@ -3541,6 +3678,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_WORKTREE_COMMIT_COUNT_ROUTE:
                 status, body = process_git_worktree_commit_count_request(
+                    payload, config=config
+                )
+            elif route == GIT_WORKTREE_CHANGED_FILES_ROUTE:
+                status, body = process_git_worktree_changed_files_request(
                     payload, config=config
                 )
             elif route == RECEIPTS_EXPORT_ROUTE:
@@ -3685,6 +3826,7 @@ __all__ = [
     "GIT_WORKTREE_ADD_ROUTE",
     "GIT_WORKTREE_REMOVE_ROUTE",
     "GIT_WORKTREE_COMMIT_COUNT_ROUTE",
+    "GIT_WORKTREE_CHANGED_FILES_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
     "STAMPS_EVIDENCE_ROUTE",
     "process_stamps_evidence_request",
@@ -3692,6 +3834,9 @@ __all__ = [
     "process_git_worktree_add_request",
     "process_git_worktree_remove_request",
     "process_git_worktree_commit_count_request",
+    "process_git_worktree_changed_files_request",
+    "GIT_BRANCH_DIFF_TIMEOUT_SECONDS",
+    "GIT_BRANCH_DIFF_LIMIT_BYTES",
     "process_receipts_export_request",
     "GUARDKIT_LEG_ROUTE",
     "LEG_SUBCOMMANDS",
