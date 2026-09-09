@@ -1854,6 +1854,39 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         assert _repair_rows(pool) == [outcome.detail]
 
     @pytest.mark.asyncio
+    async def test_a_step_the_sidecar_refused_says_so_in_the_report(
+        self, config, pool, repo_root
+    ) -> None:
+        """The sidecar's own sentence reaches the report a person reads.
+
+        On the first real merge press the candidate leg's first step never
+        ran — the deploy sidecar refused its environment — and the only place
+        that said so was one ledger row. The deploy stage now puts the
+        sidecar's sentence beside the step it stopped at, which is the words
+        this report already prints.
+        """
+        refusal = (
+            "deploy_compose — sidecar refused (HTTP 400): env key "
+            "'SANDBOX_SIDECAR_PUBLISH' is not allowlisted — deny by default."
+        )
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict=None,
+            candidate_reason="candidate_deploy_failed",
+            candidate_failed_step="deploy_compose",
+            gate={"verdict": None, "checks_total": None, "checks_passed": None,
+                  "failed_checks": None, "failed_step": refusal},
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "candidate-refused"
+        assert "sidecar refused (HTTP 400)" in outcome.detail
+        assert "SANDBOX_SIDECAR_PUBLISH" in outcome.detail
+        assert "nothing was merged and the branch is kept" in outcome.detail
+        assert gk.calls == []
+        assert _repair_rows(pool) == [outcome.detail]
+
+    @pytest.mark.asyncio
     async def test_a_check_that_could_not_run_files_no_repair(
         self, config, pool, repo_root, caplog
     ) -> None:

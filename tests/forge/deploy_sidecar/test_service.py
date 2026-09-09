@@ -348,6 +348,84 @@ def test_the_five_keys_ride_the_base_list_not_the_profile(repo: Path) -> None:
     assert status == 200
 
 
+#: The five settings that make a sandbox carry the factory's own two services
+#: and that a request may name. The sixth, SANDBOX_ENV_FILE, is deliberately
+#: not among them — see the test below.
+FACTORY_SANDBOX_ENV_KEYS = (
+    "SANDBOX_SIDECAR_PUBLISH",
+    "SANDBOX_RUNNER_PUBLISH",
+    "SANDBOX_FORGE_PATH",
+    "SANDBOX_GUARDKIT_PATH",
+    "SANDBOX_RECEIPTS_PATH",
+)
+
+
+def test_the_factory_sandbox_env_keys_are_allowed(repo: Path) -> None:
+    """The settings for a sandbox that carries the factory get in too.
+
+    They were added to the deploy stage on 2026-09-07/08 and not here, so the
+    first real merge press was refused at its first step: "env key
+    'SANDBOX_SIDECAR_PUBLISH' is not allowlisted". They name ports and the
+    checkouts mounted into the sandbox — no secret, and nothing a request can
+    do with them that the wrapper reading them would not do anyway.
+    """
+    for key in FACTORY_SANDBOX_ENV_KEYS:
+        assert key in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {
+                "SANDBOX_NAME": "api-test-deploy",
+                "SANDBOX_SIDECAR_PUBLISH": "127.0.0.1:8925:8125",
+                "SANDBOX_RUNNER_PUBLISH": "127.0.0.1:8924:8124",
+                "SANDBOX_FORGE_PATH": "/home/rich/Projects/appmilla_github/forge",
+                "SANDBOX_GUARDKIT_PATH": "/home/rich/Projects/appmilla_github/guardkit",
+                "SANDBOX_RECEIPTS_PATH": "/home/rich/forge-state/receipts",
+                "CANDIDATE_DOWN": "1",
+            },
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    extra = runner.calls[0]["extra_env"]
+    assert extra["SANDBOX_SIDECAR_PUBLISH"] == "127.0.0.1:8925:8125"
+    assert extra["SANDBOX_RECEIPTS_PATH"] == "/home/rich/forge-state/receipts"
+    assert extra["CANDIDATE_DOWN"] == "1"
+
+
+def test_the_sandbox_environment_file_is_deliberately_refused(repo: Path) -> None:
+    """SANDBOX_ENV_FILE names a file of secrets, so a request may not name it.
+
+    It is the sops-rendered environment the host wrapper hands to
+    ``sbx --env-file`` when it creates the sandbox. Values are not checked
+    here, so allowing the key would let a request choose which file on this
+    box becomes the environment of a sandbox that then runs code — a widening
+    of what a message can do. Nothing sends it: a deploy that runs inside the
+    sandbox is sent none of the sandbox's creation settings, and creating a
+    factory-carrying sandbox is an attended host-side command. A repository
+    that one day needs it gets it by a decision, not by accident.
+    """
+    assert "SANDBOX_ENV_FILE" not in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {"SANDBOX_ENV_FILE": "/run/user/1000/anything.env"},
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "not allowlisted" in body["error"]
+    assert runner.calls == []
+
+
 def test_a_near_miss_sandbox_key_is_still_refused(repo: Path) -> None:
     """The five names are the five names — nothing that merely looks like one."""
     cfg = _config({"appmilla/api_test": str(repo)})
