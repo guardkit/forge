@@ -168,6 +168,16 @@ class _Report:
 
 
 class TestTheHonestOutcomeWord:
+    """The verdict-to-word mapping, exercised directly on the classifier.
+
+    Since 2026-09-09 the production publisher returns no verdict (the
+    owner answers the merge press, not this loop), so ``None`` — the
+    ``DELIVERED`` case below, which now means "the card was delivered" and
+    nothing about what the owner said — is the only branch a live journey
+    reaches. The rest are kept for any publisher that does report a
+    verdict; reporting a refusal as a delivery was a real defect once.
+    """
+
     @pytest.mark.parametrize(
         ("verdict", "expected"),
         [

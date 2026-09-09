@@ -332,7 +332,38 @@ class TestCardDelivery:
 
         assert decision.outcome is MergeCardOutcome.PUBLISH_FAILED
         assert decision.card_published is False
+        assert decision.card_may_be_on_the_wire is True
+        assert "may be on the wire" in decision.rationale
         assert "ConnectionError" in decision.details["publish_error"]
+
+    def test_a_refused_card_is_recorded_as_no_card_at_all(self) -> None:
+        """A publisher that refuses before the wire gets an honest receipt.
+
+        A raise from inside the publish leaves the envelope possibly out,
+        and the record has to hedge. A REFUSAL does not: the publisher
+        decided not to offer before writing anything, so the journey's
+        durable record says no card was published rather than leaving a
+        reader to wonder whether one is sitting in Slack unanswered.
+        """
+
+        class _Refused(RuntimeError):
+            card_reached_the_wire = False
+
+        async def refusing(**_: Any) -> Any:
+            raise _Refused("the merge offer refused: no builds row")
+
+        publisher = MergeReadyCheckpointPublisher(
+            publish_card=refusing, gates_green_reader=lambda **_: True
+        )
+
+        decision = _submit(publisher)
+
+        assert decision.outcome is MergeCardOutcome.PUBLISH_FAILED
+        assert decision.card_published is False
+        assert decision.card_may_be_on_the_wire is False
+        assert "no card was published" in decision.rationale
+        assert "may be on the wire" not in decision.rationale
+        assert "_Refused" in decision.details["publish_error"]
 
     def test_delivery_off_records_the_decision_without_publishing(self) -> None:
         """Design-pass Stage 2's shadow replay: gates run, no card goes out.
