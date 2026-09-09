@@ -105,6 +105,10 @@ sys.exit(0 if verdict == "pass" else 1)
 INNER_SCRIPT = '''#!/bin/sh
 printf 'inner deploy.sh ran in %s with CANDIDATE=%s\\n' "$(pwd)" "${CANDIDATE:-}"
 printf '%s\\n' "$(pwd)" >> "${MARKER_DIR}/deploy.sh.ran"
+# Which sandbox settings this run was handed, if any. Inside the sandbox the
+# answer must be none of them: they say how to MAKE the sandbox, and this
+# script is already in it.
+env | grep '^SANDBOX_' > "${MARKER_DIR}/deploy.sh.sandbox-env" 2>/dev/null || true
 '''
 WRAPPER_SCRIPT = '''#!/bin/sh
 printf 'the HOST wrapper ran — it would have called sbx\\n'
@@ -645,3 +649,216 @@ class TestTheLiveGateRunsInsideTheSandbox:
         assert answer.verdict == "instrument_fail"
         assert "refused the live gate" in answer.detail["error"]
         assert "deploy/profile.yaml declares" in answer.detail["error"]
+
+
+# ---------------------------------------------------------------------------
+# The environment the venue can use (2026-09-09)
+# ---------------------------------------------------------------------------
+
+#: A sandbox that carries the factory's own services: every setting the
+#: profile's sandbox block allows, which is the shape api_test had on the day
+#: the first merge press was refused.
+FULL_SANDBOX_BLOCK = {
+    "name": "api-test-deploy",
+    "memory": "6g",
+    "cpus": 4,
+    "publish": ["127.0.0.1:8901:8901", "127.0.0.1:8902:8902"],
+    "allow_network": ["pypi.org", "*.debian.org"],
+    "sidecar_publish": "127.0.0.1:8925:8125",
+    "runner_publish": "127.0.0.1:8924:8124",
+    "env_file": "/run/user/1000/forge-sandbox/api-test-deploy.env",
+    "forge_path": "/home/rich/Projects/appmilla_github/forge",
+    "guardkit_path": "/home/rich/Projects/appmilla_github/guardkit",
+    "receipts_path": "/home/rich/forge-state/receipts",
+}
+
+
+def _carry_the_factory(clone: Path) -> None:
+    """Give the clone's profile the full sandbox block, both sides of the wire.
+
+    The stage reads the profile it is handed and the sidecar re-reads the same
+    file itself, so the one edit serves both.
+    """
+    raw = _profile_yaml(clone)
+    raw["sandbox"] = dict(FULL_SANDBOX_BLOCK)
+    (clone / "deploy" / "profile.yaml").write_text(
+        yaml.safe_dump(raw), encoding="utf-8"
+    )
+    _git(clone, "add", "deploy/profile.yaml")
+    _git(clone, "commit", "-q", "-m", "the sandbox carries the factory")
+
+
+@pytest.mark.asyncio
+class TestTheDeployIsSentTheEnvironmentItsVenueCanUse:
+    """E1: the first real merge press, and why it ended in 0.16 seconds.
+
+    The candidate leg's first step never started. The deploy sidecar inside
+    the sandbox refused the request because it carried SANDBOX_SIDECAR_PUBLISH
+    — one of the six settings that say how to CREATE the sandbox, sent to a
+    deploy that was already inside it. Nothing had ever exercised this path.
+    """
+
+    async def test_the_candidate_leg_runs_and_is_sent_none_of_them(
+        self,
+        repository: RunbookRepository,
+        runbook_publisher: AsyncMock,
+        clone: Path,
+        tmp_path: Path,
+        sidecar: Any,
+        marker_dir: Path,
+    ) -> None:
+        _carry_the_factory(clone)
+        tree = await _lay_out(clone)
+        profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
+        assert profile.sandbox is not None
+        assert profile.sandbox.sidecar_publish == "127.0.0.1:8925:8125"
+        stage = _stage(
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            clone=clone,
+            tmp_path=tmp_path,
+            sidecar_url="http://127.0.0.1:9",  # the host one, deliberately dead
+            sandbox=sidecar.entry,
+            invoker=SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo=REPO_KEY,
+                repo_path=clone,
+                driver_argv=DRIVER,
+                timeout_seconds=120,
+                extra_env={"API_TEST_BASE_URL": "http://localhost:8901"},
+            ),
+        )
+
+        checked = await stage.candidate_check(
+            profile,
+            correlation_id="c",
+            deploy_run_id="run-sbx-env-1",
+            feature=FEATURE_ID,
+            feat_id=FEATURE_ID,
+            candidate_cwd=str(tree),
+        )
+
+        # It ran at all — this is the whole of the defect, cured.
+        assert checked.outcome == "complete", checked
+        assert (marker_dir / "deploy.sh.ran").is_file()
+        # And it was handed none of the settings that make a sandbox.
+        handed = (marker_dir / "deploy.sh.sandbox-env").read_text(encoding="utf-8")
+        assert handed.strip() == "", handed
+
+    async def test_a_refused_step_says_what_the_sidecar_said(
+        self,
+        repository: RunbookRepository,
+        runbook_publisher: AsyncMock,
+        clone: Path,
+        tmp_path: Path,
+        sidecar: Any,
+        marker_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refusal reaches the person, not only the ledger row.
+
+        The refusal here is the host wall: a sidecar that is not inside a
+        sandbox will not run a repository's own deploy script. Whatever the
+        sidecar's reason, its sentence is what the candidate check reports as
+        the place it stopped — which is the words the merge report reads.
+        """
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.delenv(SIDECAR_IN_SANDBOX_ENV, raising=False)
+        tree = await _lay_out(clone)
+        profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
+        stage = _stage(
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            clone=clone,
+            tmp_path=tmp_path,
+            sidecar_url="http://127.0.0.1:9",
+            sandbox=sidecar.entry,
+            invoker=None,
+        )
+
+        checked = await stage.candidate_check(
+            profile,
+            correlation_id="c",
+            deploy_run_id="run-sbx-env-2",
+            feature=FEATURE_ID,
+            feat_id=FEATURE_ID,
+            candidate_cwd=str(tree),
+        )
+
+        assert checked.outcome == "failed"
+        assert checked.failed_step == "deploy_compose"
+        stopped_at = checked.detail["gate_summary"]["failed_step"]
+        assert stopped_at.startswith("deploy_compose — ")
+        assert "sidecar refused (HTTP 400)" in stopped_at
+        assert not (marker_dir / "deploy.sh.ran").exists()
+
+
+class TestTheHostWrapperIsStillServed:
+    """A repository whose sandbox is made by the host wrapper, over the wire.
+
+    The wrapper is what reads the sandbox's settings, so all eleven ride on
+    the request — and the sidecar accepts the seven that only name a sandbox,
+    its size, its ports and its network rules. The other four are refused on
+    purpose, and its allowlist writes down why: each of them would let a
+    request choose what a sandbox being created reads or mounts.
+    """
+
+    #: The four the sidecar refuses on purpose. Kept here as plain names so
+    #: this file says the same thing the allowlist does.
+    REFUSED_ON_PURPOSE = (
+        "SANDBOX_ENV_FILE",
+        "SANDBOX_FORGE_PATH",
+        "SANDBOX_GUARDKIT_PATH",
+        "SANDBOX_RECEIPTS_PATH",
+    )
+
+    def _client(self, sidecar: Any) -> SidecarScriptRunner:
+        return SidecarScriptRunner(base_url=sidecar.url, repo=REPO_KEY)
+
+    def test_the_settings_the_wrapper_reads_are_accepted(
+        self, clone: Path, sidecar: Any, marker_dir: Path
+    ) -> None:
+        from forge.deploy.runbook_builder import sandbox_env
+
+        _carry_the_factory(clone)
+        profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
+        env = sandbox_env(profile)  # the host-wrapper venue: all eleven
+        assert len(env) == 11
+        for name in self.REFUSED_ON_PURPOSE:
+            env.pop(name)  # deliberately not allowlisted
+        exit_code, output = self._client(sidecar)(
+            cwd=str(clone),
+            script="deploy/sandbox-deploy.sh",
+            env_file=None,
+            timeout=60,
+            extra_env={**env, "CANDIDATE": "1"},
+        )
+        assert exit_code == 0, output
+        assert (marker_dir / "sandbox-deploy.sh.ran").is_file()
+
+    @pytest.mark.parametrize("key", REFUSED_ON_PURPOSE)
+    def test_a_setting_that_chooses_what_a_sandbox_gets_is_refused_and_says_so(
+        self, clone: Path, sidecar: Any, key: str
+    ) -> None:
+        """These four name a file or a folder a NEW sandbox would take.
+
+        The env file becomes its whole environment; the forge and guardkit
+        folders are mounted into it (and forge's parent decides three more);
+        the receipts folder is mounted read-write. The sidecar cannot check
+        values, and the sandbox's name has always been the caller's to choose,
+        so allowing them would widen what one request can do. Today nothing
+        sends them over the wire: a deploy inside the sandbox is sent none of
+        the eleven, and the wrapper is an attended host-side command.
+        """
+        _carry_the_factory(clone)
+        exit_code, output = self._client(sidecar)(
+            cwd=str(clone),
+            script="deploy/sandbox-deploy.sh",
+            env_file=None,
+            timeout=60,
+            extra_env={key: "/run/user/1000/anything"},
+        )
+        assert exit_code != 0
+        assert "sidecar refused (HTTP 400)" in output
+        assert key in output

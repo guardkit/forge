@@ -348,6 +348,104 @@ def test_the_five_keys_ride_the_base_list_not_the_profile(repo: Path) -> None:
     assert status == 200
 
 
+#: The two settings for a factory-carrying sandbox that a request may name:
+#: the ports it publishes for the factory's own two services. The other four
+#: of that group are deliberately refused — see the test below them.
+FACTORY_SANDBOX_PORT_KEYS = (
+    "SANDBOX_SIDECAR_PUBLISH",
+    "SANDBOX_RUNNER_PUBLISH",
+)
+
+#: The four settings of that group a request may NOT name: each one points at
+#: somewhere on this box that a sandbox being created would take its
+#: environment from, or mount.
+FACTORY_SANDBOX_PATH_KEYS = (
+    "SANDBOX_ENV_FILE",
+    "SANDBOX_FORGE_PATH",
+    "SANDBOX_GUARDKIT_PATH",
+    "SANDBOX_RECEIPTS_PATH",
+)
+
+
+def test_the_factory_sandbox_port_keys_are_allowed(repo: Path) -> None:
+    """The two port settings for a factory-carrying sandbox get in too.
+
+    They were added to the deploy stage on 2026-09-07/08 and not here, so the
+    first real merge press was refused at its first step: "env key
+    'SANDBOX_SIDECAR_PUBLISH' is not allowlisted". They name the two ports the
+    sandbox publishes for the factory's services, and neither carries a secret.
+
+    They do grant something new, and the allowlist says so beside them: in the
+    wrapper, setting BOTH is exactly what switches on the branch that creates a
+    sandbox carrying the factory and starts the build runner, so a request
+    naming a sandbox that does not exist yet can now cause one to be created.
+    That is accepted deliberately — it is the key the first merge press was
+    refused for — and bounded by the four keys refused below, which stop a
+    request choosing what such a sandbox reads or mounts.
+    """
+    for key in FACTORY_SANDBOX_PORT_KEYS:
+        assert key in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, _ = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {
+                "SANDBOX_NAME": "api-test-deploy",
+                "SANDBOX_SIDECAR_PUBLISH": "127.0.0.1:8925:8125",
+                "SANDBOX_RUNNER_PUBLISH": "127.0.0.1:8924:8124",
+                "CANDIDATE_DOWN": "1",
+            },
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    extra = runner.calls[0]["extra_env"]
+    assert extra["SANDBOX_SIDECAR_PUBLISH"] == "127.0.0.1:8925:8125"
+    assert extra["SANDBOX_RUNNER_PUBLISH"] == "127.0.0.1:8924:8124"
+    assert extra["CANDIDATE_DOWN"] == "1"
+
+
+@pytest.mark.parametrize("key", FACTORY_SANDBOX_PATH_KEYS)
+def test_the_sandbox_creation_paths_are_deliberately_refused(
+    repo: Path, key: str
+) -> None:
+    """A request may not choose which folder or file a new sandbox gets.
+
+    These four are read by the host wrapper only where it CREATES a sandbox:
+    the env file becomes that sandbox's whole environment (it is the
+    sops-rendered file of secrets), the forge and guardkit folders are mounted
+    into it read-only — and forge's parent folder decides three more mounts —
+    and the receipts folder is mounted read-write, the one writable mount the
+    wrapper makes. This service checks key names and never values, and the
+    sandbox's name has always been the caller's to choose, so a request naming
+    a sandbox that does not exist yet takes the wrapper's "create it" branch.
+    Allowing these keys would therefore let one request decide what a new
+    sandbox mounts and reads before it runs any code — a widening of what a
+    message can do. Nothing sends them: a deploy that runs inside the sandbox
+    is sent none of the sandbox's creation settings, and creating a
+    factory-carrying sandbox is an attended host-side command. A repository
+    that one day needs them gets them by a decision, not by accident.
+    """
+    assert key not in service.ENV_ALLOWLIST_BASE
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {key: "/run/user/1000/anything"},
+        },
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "not allowlisted" in body["error"]
+    assert runner.calls == []
+
+
 def test_a_near_miss_sandbox_key_is_still_refused(repo: Path) -> None:
     """The five names are the five names — nothing that merely looks like one."""
     cfg = _config({"appmilla/api_test": str(repo)})

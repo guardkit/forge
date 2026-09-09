@@ -67,9 +67,13 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 3. Every env key must be in the allowlist
    ``{REVERT, ROLLBACK_IMAGE_REF, ENV_FILE, CANDIDATE, PROMOTE, CANDIDATE_DOWN,
    SANDBOX_NAME, SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_PUBLISH,
-   SANDBOX_ALLOW_NETWORK}`` UNION the profile's ``live_gate.env`` and
-   ``candidate.env`` key names; anything else is refused loudly. Values must be
-   strings.
+   SANDBOX_ALLOW_NETWORK, SANDBOX_SIDECAR_PUBLISH, SANDBOX_RUNNER_PUBLISH}``
+   UNION the profile's ``live_gate.env`` and ``candidate.env`` key names;
+   anything else is refused loudly — ``SANDBOX_ENV_FILE``, ``SANDBOX_FORGE_PATH``,
+   ``SANDBOX_GUARDKIT_PATH`` and ``SANDBOX_RECEIPTS_PATH`` deliberately
+   included, because each of them would let a request choose what a sandbox
+   being created reads or mounts; the reason is written beside the list below.
+   Values must be strings.
 4. ``timeout_seconds`` is capped (default 600, max 1800).
 5. The server binds ``127.0.0.1`` ONLY.
 6. There is NO shell: execution goes through the existing
@@ -198,6 +202,61 @@ ENV_ALLOWLIST_BASE: frozenset[str] = frozenset(
         "SANDBOX_CPUS",
         "SANDBOX_PUBLISH",
         "SANDBOX_ALLOW_NETWORK",
+        # The settings that make a sandbox carry the factory's own two
+        # services (2026-09-07/08). A profile's sandbox block can set six of
+        # those, and the deploy stage threads every one it finds onto a
+        # HOST-WRAPPER deploy, so this list has to know the ones we accept or
+        # the first deploy of such a repository is refused at its first step —
+        # which is exactly what happened on the first real merge press
+        # (2026-09-09). Two of the six are here: they name the two ports the
+        # sandbox publishes for those services, the same kind of setting as
+        # SANDBOX_PUBLISH above, and neither of them carries a secret.
+        #
+        # SAY PLAINLY WHAT THE PAIR SWITCHES ON. In the wrapper
+        # (deploy/sandbox-deploy.sh) carries_the_factory() is true exactly
+        # when BOTH of these are set, and that is the branch which creates a
+        # sandbox carrying the factory: the factory's own clone (--clone), the
+        # read-only mounts of forge, guardkit and their estate siblings, the
+        # read-write receipts mount, the sandbox's own environment file, the
+        # two published service ports, and `systemctl --user start
+        # forge-sandbox-runner@<name>`, which starts the build runner. So a
+        # request to a host sidecar that permits that wrapper, naming a
+        # sandbox which does not exist yet, can now cause a factory-carrying
+        # sandbox to be created and the runner started — which it could not do
+        # before. We accept that, for three reasons, and this is the whole
+        # argument: it is what this lane was asked to fix, because
+        # SANDBOX_SIDECAR_PUBLISH is the key the first real merge press was
+        # refused for; the four keys that would let a request choose WHAT such
+        # a sandbox reads and mounts are refused just below, so the wrapper
+        # falls back to its own estate defaults for the forge and guardkit
+        # folders and passes no environment file and no receipts mount at all;
+        # and creating a sandbox and choosing the ports it publishes were
+        # already the caller's to do through the five settings above.
+        "SANDBOX_SIDECAR_PUBLISH",
+        "SANDBOX_RUNNER_PUBLISH",
+        # THE OTHER FOUR ARE DELIBERATELY NOT HERE, and this is the reason.
+        # SANDBOX_ENV_FILE, SANDBOX_FORGE_PATH, SANDBOX_GUARDKIT_PATH and
+        # SANDBOX_RECEIPTS_PATH each name somewhere on this box, and the
+        # wrapper reads them only where it CREATES a sandbox: the env file
+        # becomes that sandbox's whole environment (it is the sops-rendered
+        # file of secrets), the forge and guardkit folders are mounted into it
+        # read-only — and forge's parent folder decides three more mounts —
+        # and the receipts folder is mounted READ-WRITE, the one writable
+        # mount the wrapper makes. This service checks key NAMES and never
+        # values, and the sandbox's name has always been the caller's to
+        # choose, so a request naming a sandbox that does not exist yet takes
+        # the wrapper's "create it" branch. Allowing these four would
+        # therefore let one request decide which file on this box becomes a
+        # new sandbox's environment and which folders that sandbox mounts —
+        # including one it can write to — before it runs any code. That is a
+        # widening of what a message can do, and deny-by-default says no.
+        # Nothing needs them today: a deploy that runs inside the sandbox is
+        # not sent the sandbox's creation settings at all
+        # (forge.deploy.runbook_builder's sandbox_env), and creating a
+        # factory-carrying sandbox is an attended host-side command, not a
+        # request to this service. A repository that one day needs the wrapper
+        # driven from here gets these keys by a decision, written down, rather
+        # than by accident.
     }
 )
 
@@ -492,6 +551,13 @@ def allowed_env_keys(profile: DeployProfile) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
 
     Base allowlist UNION ``live_gate.env`` keys UNION ``candidate.env`` keys.
+    The base list carries the settings a profile's ``sandbox`` block can put
+    in a deploy step's environment except four — ``SANDBOX_ENV_FILE``,
+    ``SANDBOX_FORGE_PATH``, ``SANDBOX_GUARDKIT_PATH`` and
+    ``SANDBOX_RECEIPTS_PATH`` are refused on purpose, because each one names a
+    file or a folder that a sandbox being created would take its environment
+    from or mount, one of them writable. See the note beside
+    :data:`ENV_ALLOWLIST_BASE` for the reasoning.
     ``candidate`` is a first-class profile field (S2F): its ``env`` keys are read
     from ``profile.candidate``. A defensive fallback to ``profile.extra`` is kept
     for a profile parsed by an older loader that still parked ``candidate`` in
