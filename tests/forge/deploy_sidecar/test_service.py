@@ -373,8 +373,15 @@ def test_the_factory_sandbox_port_keys_are_allowed(repo: Path) -> None:
     They were added to the deploy stage on 2026-09-07/08 and not here, so the
     first real merge press was refused at its first step: "env key
     'SANDBOX_SIDECAR_PUBLISH' is not allowlisted". They name the two ports the
-    sandbox publishes for the factory's services — the same kind of setting as
-    SANDBOX_PUBLISH above, carrying no secret and granting nothing new.
+    sandbox publishes for the factory's services, and neither carries a secret.
+
+    They do grant something new, and the allowlist says so beside them: in the
+    wrapper, setting BOTH is exactly what switches on the branch that creates a
+    sandbox carrying the factory and starts the build runner, so a request
+    naming a sandbox that does not exist yet can now cause one to be created.
+    That is accepted deliberately — it is the key the first merge press was
+    refused for — and bounded by the four keys refused below, which stop a
+    request choosing what such a sandbox reads or mounts.
     """
     for key in FACTORY_SANDBOX_PORT_KEYS:
         assert key in service.ENV_ALLOWLIST_BASE

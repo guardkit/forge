@@ -241,13 +241,22 @@ class TestThroughTheHostWrapper:
         assertion is between the real ``sandbox_env`` and the real
         ``allowed_env_keys``, so it fails the moment they drift again — and it
         pins the four the sidecar refuses on purpose, so neither list can gain
-        or lose one of those quietly either. One honest limit: this only
-        covers settings the fixture profile below actually sets, so a twelfth
-        setting added one day with no fixture entry would not be caught here.
+        or lose one of those quietly either. The fixture cannot fall behind
+        the settings themselves: the first assertion ties it to the sandbox
+        block's own fields, so a twelfth setting added one day fails this test
+        until someone decides whether the sidecar should allow it.
         """
+        from dataclasses import fields
+
+        from forge.deploy.profile import DeploySandbox
+
+        assert {
+            "SANDBOX_" + f.name.upper() for f in fields(DeploySandbox)
+        } == set(ELEVEN)
         profile = _profile()
         produced = set(sandbox_env(profile))
         allowed = allowed_env_keys(profile)
+        assert produced == set(ELEVEN)
         assert produced - allowed == set(REFUSED_ON_PURPOSE)
 
     def test_the_four_keys_deliberately_left_off_and_why(self) -> None:
