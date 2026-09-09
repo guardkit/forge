@@ -96,6 +96,18 @@ _GATE_RESUME_DETAILS_KEY: str = "gate_resume"
 GATE_RESUME_STAGE_LABEL: str = "gate-resume"
 GATE_RESUME_TARGET_IDENTIFIER: str = "gate-resume"
 
+#: The ``stage_log`` row ``forge skip`` writes just before it sends a paused
+#: build on its way (``SqliteStageSkipRecorder.record_skipped``). That skip
+#: resume files no note of its own, so this row is what tells the budget when
+#: the person's decision ended the wait.
+_SKIPPED_STATUS: str = "SKIPPED"
+_CLI_SKIP_TARGET_IDENTIFIER: str = "cli-skip"
+
+#: The status every gate row carries — the decision snapshot, the pause, the
+#: sweep's re-offer of the same card, a refused skip. A row that is NOT one
+#: of these is the ledger showing the build doing something.
+_GATED_STATUS: str = "GATED"
+
 
 class StaleTransitionError(Exception):
     """Raised when a state transition targets an already-terminal row.
@@ -477,9 +489,12 @@ class _SqliteStateMachine:
         decision has already landed in ``builds.status`` and a build must
         never be held back because a note about it could not be filed. The
         cost of a missing note is that the wait it closes is measured only up
-        to the last pause the ledger saw, so a little waiting is counted as
-        work — the safe direction, and the cap keeps bounding machine work
-        (:func:`seconds_spent_waiting_for_a_person`).
+        to the last pause the ledger saw — so a little waiting is counted as
+        work, which is the direction that keeps the cap bounding machine
+        work. That holds however the build goes on: if it later parks at a
+        second gate, the reader closes the unwritten wait at the last pause
+        it saw rather than letting the second gate's decision swallow the
+        hours of work in between (:func:`seconds_spent_waiting_for_a_person`).
         """
         now = self._clock()
         entry = StageLogEntry(
@@ -571,6 +586,22 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _is_a_persons_skip(row: Any) -> bool:
+    """Is this the row ``forge skip`` writes when a person waves a build on?
+
+    ``SqliteStageSkipRecorder.record_skipped`` files it — ``status='SKIPPED'``
+    from ``cli-skip`` — the moment before the skip sends the build back to
+    RUNNING, and that resume writes no note of its own. So this row is the
+    end of the wait, and the durable one: it is in the ledger, not in the
+    daemon's memory. A REFUSED skip is written as ``GATED`` instead and the
+    build stays parked, so it is never read as a decision to carry on.
+    """
+    return (
+        getattr(row, "status", None) == _SKIPPED_STATUS
+        and getattr(row, "target_identifier", None) == _CLI_SKIP_TARGET_IDENTIFIER
+    )
+
+
 def seconds_spent_waiting_for_a_person(
     rows: Iterable[Any],
     *,
@@ -586,7 +617,7 @@ def seconds_spent_waiting_for_a_person(
     a wait — which happens several times a day — reads back exactly the same
     number.
 
-    The two kinds of row it reads, both already written today:
+    The kinds of row it reads, all of them already written today:
 
     * a pause row (``details["gate_pause"]``), written when a gate parks the
       build for a person, and written again by the boot sweep every time it
@@ -597,6 +628,12 @@ def seconds_spent_waiting_for_a_person(
       build carry on. It closes the open wait; a resume with no wait open
       closes nothing, which is what makes a decision recorded twice subtract
       only once.
+    * a skip row (``status='SKIPPED'`` from ``cli-skip``), written by
+      ``forge skip`` the moment before it sends the build on its way. That
+      is a person deciding too, and it is the only durable trace the skip
+      path leaves, so it closes the wait just as a resume row does. A
+      refused skip is not a decision to carry on — the build stays parked —
+      and it is written as ``GATED``, so it is not mistaken for one.
 
     A wait that is still open — the build is paused right now, nobody has
     decided — runs to ``now``, so the hours a build is sitting at its gate
@@ -604,14 +641,25 @@ def seconds_spent_waiting_for_a_person(
     the open wait is simply not counted, which is the same honest answer a
     caller with no clock can give anywhere else here.
 
-    An open wait on a build that is NOT paused any more is a wait whose end
-    was never written down (a resume through some path that files no note).
-    That one is closed at the last moment the ledger actually saw the build
-    waiting — the last pause row — rather than being allowed to run on to
-    ``now``. Otherwise a single missing note would excuse a build from its
-    cap for ever, and the cap has to keep bounding machine work. The cost is
-    that such a wait is under-counted, which is the safe direction: the
-    ledger only excuses waiting it can show.
+    A wait whose end was never written down at all (some future path that
+    resumes a build and files nothing) is closed at the last moment the
+    ledger actually saw the build waiting, in both places it could otherwise
+    run away:
+
+    * when the build is running again at the end of the walk, and
+    * when the ledger shows the build back at work and later parked at a
+      SECOND gate. Without that, the first pause would open a wait, the
+      silent resume would close nothing, and the second gate's decision
+      would close one enormous wait that swallowed every hour of real work
+      in between — the exact opposite of what the cap is for. So a pause row
+      that arrives after the build has been seen working closes the wait
+      before it and starts a fresh one. "Seen working" means a row that is
+      not itself a gate row: the decision snapshot, the pause and the
+      sweep's re-offers are all ``GATED``, which is why a night of re-offers
+      is still one wait.
+
+    The cost of a missing end is that such a wait is under-counted, which is
+    the safe direction: the ledger only excuses waiting it can show.
 
     Args:
         rows: The build's stage rows, oldest first (what ``read_stages``
@@ -627,6 +675,7 @@ def seconds_spent_waiting_for_a_person(
     total = 0.0
     waiting_since: datetime | None = None
     last_seen_waiting: datetime | None = None
+    worked_since_the_last_pause = False
     for row in rows:
         details = getattr(row, "details", None) or {}
         if not isinstance(details, dict):
@@ -636,10 +685,24 @@ def seconds_spent_waiting_for_a_person(
             continue
         stamp = _as_utc(started_at)
         if _GATE_PAUSE_DETAILS_KEY in details:
+            if waiting_since is not None and worked_since_the_last_pause:
+                # The build went back to work without anything recording the
+                # end of that wait, and here it is parking again. Close the
+                # old wait where the ledger last saw it waiting.
+                if last_seen_waiting is not None:
+                    total += max(
+                        0.0, (last_seen_waiting - waiting_since).total_seconds()
+                    )
+                waiting_since = None
             if waiting_since is None:
                 waiting_since = stamp
             last_seen_waiting = stamp
-        elif _GATE_RESUME_DETAILS_KEY in details:
+            worked_since_the_last_pause = False
+            continue
+        if getattr(row, "status", None) != _GATED_STATUS:
+            # Not another gate row: the ledger is showing work being done.
+            worked_since_the_last_pause = True
+        if _GATE_RESUME_DETAILS_KEY in details or _is_a_persons_skip(row):
             if waiting_since is not None:
                 total += max(0.0, (stamp - waiting_since).total_seconds())
                 waiting_since = None

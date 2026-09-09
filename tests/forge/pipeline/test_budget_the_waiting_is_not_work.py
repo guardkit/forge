@@ -17,6 +17,12 @@ the gate already writes, closed by the note the resume writes — never out of
 the daemon's memory, because forge-prod is recreated several times a day and
 a restart must not lose the exclusion.
 
+A build can be parked more than once, and the hours between two gates are
+work. The second half of this file is about that: ``forge skip`` waves a
+build on without writing a resume note, so the SKIPPED row it leaves behind
+is read as the end of the wait — and if a wait ever ends with nothing
+written down at all, the next gate must not swallow the work in between.
+
 Everything here runs against a real SQLite ledger in a temporary directory,
 through the real gate adapters, with the clock injected. The only pretend
 parts are the supervisor's collaborators it never reaches on this path.
@@ -48,11 +54,18 @@ from forge.gating.sqlite_adapters import (
     seconds_spent_waiting_for_a_person,
 )
 from forge.lifecycle import migrations
-from forge.lifecycle.persistence import Build, SqliteLifecyclePersistence
+from forge.lifecycle.persistence import (
+    Build,
+    SqliteBuildResumer,
+    SqliteLifecyclePersistence,
+    SqliteStageSkipRecorder,
+    StageLogEntry,
+)
 from forge.lifecycle.state_machine import (
     BuildState,
     transition as compose_transition,
 )
+from forge.pipeline.stage_taxonomy import StageClass
 from forge.pipeline.supervisor import Supervisor, TurnOutcome
 
 # Attempt seventeen's own clock, to the second.
@@ -181,8 +194,15 @@ def _pause_at_the_gate(
     build_id: str,
     at: datetime,
     attempt_count: int = 0,
+    park: bool | None = None,
 ) -> None:
-    """Park the build for a person, exactly as ``gate_check`` does."""
+    """Park the build for a person, exactly as ``gate_check`` does.
+
+    ``park`` says whether the build actually moves into PAUSED here. It
+    defaults to "only the first card of a run", which is what the boot
+    sweep's re-offers look like; a second, genuinely new gate later in the
+    same build passes ``park=True``.
+    """
     repo, sm = adapters
     clock.now = at
     decision = _decision(build_id)
@@ -200,8 +220,43 @@ def _pause_at_the_gate(
             decision=decision,
         )
     )
-    if attempt_count == 0:
+    if park if park is not None else attempt_count == 0:
         asyncio.run(sm.transition_to_paused(build_id=build_id, stage_label=STAGE_LABEL))
+
+
+def _forge_skip(
+    pool: SqliteLifecyclePersistence, *, build_id: str, at: datetime
+) -> None:
+    """``forge skip``: the person waves the build on, exactly as the CLI does.
+
+    The real recorder writes the SKIPPED row and the real resumer sends the
+    build back to RUNNING — and that resume writes no note of its own, which
+    is the whole point of the SKIPPED row being read as the end of the wait.
+    """
+    recorder = SqliteStageSkipRecorder(pool)
+    recorder._now = lambda: at  # the CLI stamps from the wall clock
+    recorder.record_skipped(build_id, StageClass.TASK_REVIEW, "skipped by rich")
+    SqliteBuildResumer(pool).resume_after_skip(build_id, StageClass.TASK_REVIEW)
+
+
+def _a_leg_ran(
+    pool: SqliteLifecyclePersistence, *, build_id: str, at: datetime
+) -> None:
+    """One ordinary stage row: the ledger showing the machine doing work."""
+    pool.record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label="task-work",
+            target_kind="subagent",
+            target_identifier="autobuild_runner",
+            status="PASSED",
+            gate_mode=None,
+            started_at=at,
+            completed_at=at,
+            duration_secs=0.0,
+            details={},
+        )
+    )
 
 
 def _tap(adapters: Any, clock: SettableClock, *, build_id: str, at: datetime) -> None:
@@ -392,6 +447,165 @@ class TestTheWaitingIsNotWork:
 
         assert sup._budget_waiting_seconds(build_id) == pytest.approx(WAITED_SECONDS)
         assert _ask_the_guard(sup, build_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Two gates in one build, and the ends of waits that write no note
+# ---------------------------------------------------------------------------
+
+
+#: The second-gate story, to the minute: parked at ten to ten at night,
+#: waved on with ``forge skip`` forty minutes later, five hours of real work,
+#: parked again at twenty to four, tapped ten minutes after that, and the
+#: guard asked at four. Fifty minutes of waiting; five hours ten of work.
+FIRST_GATE_AT = datetime(2026, 9, 8, 22, 0, tzinfo=UTC)
+WAVED_ON_AT = datetime(2026, 9, 8, 22, 40, tzinfo=UTC)
+SECOND_GATE_AT = datetime(2026, 9, 9, 3, 40, tzinfo=UTC)
+SECOND_TAP_AT = datetime(2026, 9, 9, 3, 50, tzinfo=UTC)
+ASKED_AT = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
+TWO_WAITS_SECONDS = 50 * 60.0
+TWO_WAITS_WORK_SECONDS = (ASKED_AT - FIRST_GATE_AT).total_seconds() - TWO_WAITS_SECONDS
+
+
+class TestASecondGateLaterInTheSameBuild:
+    """A build can be parked twice, and the hours between are work."""
+
+    def test_a_skip_ends_the_wait_it_was_asked_about(
+        self, pool: SqliteLifecyclePersistence, clock: SettableClock, adapters: Any
+    ) -> None:
+        """``forge skip`` writes no resume note — its SKIPPED row is the end.
+
+        Without that, the first pause would open a wait nothing closed, and
+        the second gate's tap would close one enormous wait that swallowed
+        the five hours of real work in between: the build would be charged
+        twenty minutes instead of five hours ten, and would sail past a cap
+        it had genuinely blown.
+        """
+        build_id = _seed_running(pool, started_at=FIRST_GATE_AT)
+        _pause_at_the_gate(adapters, clock, build_id=build_id, at=FIRST_GATE_AT)
+
+        _forge_skip(pool, build_id=build_id, at=WAVED_ON_AT)
+
+        # Five hours of the machine actually working.
+        _a_leg_ran(pool, build_id=build_id, at=WAVED_ON_AT + timedelta(hours=1))
+        _a_leg_ran(pool, build_id=build_id, at=WAVED_ON_AT + timedelta(hours=4))
+
+        clock.now = SECOND_GATE_AT
+        _pause_at_the_gate(
+            adapters,
+            clock,
+            build_id=build_id,
+            at=SECOND_GATE_AT,
+            attempt_count=1,
+            park=True,
+        )
+        _tap(adapters, clock, build_id=build_id, at=SECOND_TAP_AT)
+        clock.now = ASKED_AT
+
+        sup = _supervisor(
+            pool, clock, cap_seconds=7200, budget_pause=AsyncMock(name="pause")
+        )
+
+        # Forty minutes at the first gate, ten at the second. Nothing else.
+        assert sup._budget_waiting_seconds(build_id) == pytest.approx(TWO_WAITS_SECONDS)
+        assert sup._budget_elapsed_seconds(build_id) == pytest.approx(
+            TWO_WAITS_WORK_SECONDS
+        )
+        # Five hours ten of work is well past a two-hour cap, so it breaches.
+        report = _ask_the_guard(sup, build_id)
+        assert report is not None
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+
+    def test_a_refused_skip_is_not_a_decision_to_carry_on(self) -> None:
+        """The person asked; the guard said no; the build is still parked."""
+        rows = [
+            SimpleNamespace(
+                started_at=FIRST_GATE_AT, status="GATED", details={"gate_pause": {}}
+            ),
+            SimpleNamespace(
+                started_at=WAVED_ON_AT,
+                status="GATED",
+                target_identifier="cli-skip",
+                details={"rationale": "refused", "refused": True},
+            ),
+        ]
+        assert seconds_spent_waiting_for_a_person(
+            rows, now=SECOND_TAP_AT
+        ) == pytest.approx((SECOND_TAP_AT - FIRST_GATE_AT).total_seconds())
+
+    def test_a_resume_that_writes_nothing_cannot_swallow_the_work_after_it(
+        self, pool: SqliteLifecyclePersistence, clock: SettableClock, adapters: Any
+    ) -> None:
+        """Some future path resumes a build silently, and it parks again.
+
+        The ledger cannot show when that first wait ended, so it is closed
+        where the ledger last saw the build waiting. The waiting is
+        under-counted — the direction that keeps the cap bounding machine
+        work — and the five hours in between are still charged as work.
+        """
+        build_id = _seed_running(pool, started_at=FIRST_GATE_AT)
+        _pause_at_the_gate(adapters, clock, build_id=build_id, at=FIRST_GATE_AT)
+
+        # A resume with nothing written down at all.
+        pool.apply_transition(
+            compose_transition(
+                Build(build_id=build_id, status=BuildState.PAUSED),
+                BuildState.RUNNING,
+            )
+        )
+        _a_leg_ran(pool, build_id=build_id, at=WAVED_ON_AT + timedelta(hours=1))
+        _a_leg_ran(pool, build_id=build_id, at=WAVED_ON_AT + timedelta(hours=4))
+        _pause_at_the_gate(
+            adapters,
+            clock,
+            build_id=build_id,
+            at=SECOND_GATE_AT,
+            attempt_count=1,
+            park=True,
+        )
+        _tap(adapters, clock, build_id=build_id, at=SECOND_TAP_AT)
+        clock.now = ASKED_AT
+
+        sup = _supervisor(
+            pool, clock, cap_seconds=7200, budget_pause=AsyncMock(name="pause")
+        )
+
+        # Only the second gate's ten minutes can be shown, so only they count.
+        assert sup._budget_waiting_seconds(build_id) == pytest.approx(10 * 60.0)
+        report = _ask_the_guard(sup, build_id)
+        assert report is not None
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+
+    def test_the_sweeps_re_offers_are_still_one_wait_beside_a_second_gate(
+        self, pool: SqliteLifecyclePersistence, clock: SettableClock, adapters: Any
+    ) -> None:
+        """The night's re-offers stay one wait; the later gate is its own."""
+        build_id = _seed_running(pool, started_at=FIRST_GATE_AT)
+        _pause_at_the_gate(adapters, clock, build_id=build_id, at=FIRST_GATE_AT)
+        for attempt in range(1, 4):
+            _pause_at_the_gate(
+                adapters,
+                clock,
+                build_id=build_id,
+                at=FIRST_GATE_AT + timedelta(minutes=10 * attempt),
+                attempt_count=attempt,
+            )
+        _tap(adapters, clock, build_id=build_id, at=WAVED_ON_AT)
+        _a_leg_ran(pool, build_id=build_id, at=WAVED_ON_AT + timedelta(hours=1))
+        _pause_at_the_gate(
+            adapters,
+            clock,
+            build_id=build_id,
+            at=SECOND_GATE_AT,
+            attempt_count=9,
+            park=True,
+        )
+        _tap(adapters, clock, build_id=build_id, at=SECOND_TAP_AT)
+        clock.now = ASKED_AT
+
+        sup = _supervisor(pool, clock, cap_seconds=7200)
+
+        assert sup._budget_waiting_seconds(build_id) == pytest.approx(TWO_WAITS_SECONDS)
 
 
 # ---------------------------------------------------------------------------

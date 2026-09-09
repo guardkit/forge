@@ -166,10 +166,7 @@ def evaluate_budget(
         return BudgetVerdict(
             ok=False,
             breached_cap="max_build_wallclock_seconds",
-            detail=(
-                f"{measured} reached cap "
-                f"({profile.max_build_wallclock_seconds}s)"
-            ),
+            detail=f"{measured} reached cap ({profile.max_build_wallclock_seconds}s)",
         )
 
     if (
