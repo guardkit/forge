@@ -1,30 +1,37 @@
-"""The merge card composes the SAME approve-click machinery — no duplicate.
+"""The checkpoint's card IS the card the merge press consumes.
 
-Revival design pass §c.2, Stage 1c.
-
-The ruling's delivery shape is "the same approve-click merge card the
-consumer path already delivers" (DF-021). So
-:func:`make_merge_card_publisher` must go through the machinery
-``_serve_gate_activation`` already owns — ``gate_check`` over
-``make_gate_check_deps``, with the publisher swapped for the mirrored
-approval publisher so the AGENTS request goes out first and the
-``build-paused`` envelope (the one that renders the card) second.
+2026-09-09, the fix journey's twentieth attempt — the first to reach the
+end, and the one that proved there were TWO merge cards in this estate and
+only one of them had a listener. The merge-ready checkpoint published its
+own card through the ordinary approval gate, so the card carried the gate's
+request id (``<build id>:<stage label>:0``) and no merge-offer row. The
+merge press requires both: a request id beginning ``merge-``, and a durable
+``merge_deploy_offer`` row whose recorded request id matches. Rich answered
+approve in Slack eleven seconds after the card went out, forge wrote "merge
+card published", the journey reported delivered — and nothing checked the
+candidate, nothing merged, nothing promoted.
 
 What this file pins:
 
-* the card runs through ``gate_check``, not a second envelope builder;
-* the stage label is the phrase-book PLAIN NAME — that string is the
-  card's stage copy, and user surfaces speak human;
-* the mirrored publisher is installed, so the two-envelope contract
-  holds and **jarvis is untouched** (the card rides existing seams);
-* identity (feature_id / correlation_id) is read off the build row.
+* the card goes out through the routine build's OWN publisher
+  (``MergeOfferService.offer``), not a second envelope builder;
+* the request id, the durable row and the synthetic Slack join key are
+  therefore the press's, byte for byte;
+* the words are the checkpoint's own, in plain English: what was checked,
+  what is left to the merge press, which branch, and what the merge word
+  does;
+* the checkpoint's own durable row is still written, because the one-card
+  latch and the self-closed-defect measure both count it;
+* an offer that refuses publishes nothing and says so by raising, so the
+  journey can never report a delivery that did not happen.
 
-No broker is contacted anywhere: ``gate_check`` itself is replaced with
-a recorder.
+No broker is contacted anywhere: the offer's wire is a pair of recording
+fakes, and the ledger is a real SQLite file in a temp directory.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,15 +41,28 @@ from typing import Any, Iterator
 import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
-from forge.cli import _serve_deps_gating, _serve_gate_activation
-from forge.cli._serve_gate_activation import make_merge_card_publisher
+from forge.cli._serve_gate_activation import (
+    _MERGE_CARD_TARGET_IDENTIFIER,
+    MergeCardNotPublished,
+    make_merge_card_publisher,
+    merge_card_words,
+)
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.pipeline.merge_offer import (
+    MERGE_OFFER_DETAILS_KEY,
+    MERGE_OFFER_TARGET_IDENTIFIER,
+    MergeOfferService,
+    merge_request_id,
+)
 from forge.pipeline.merge_ready_checkpoint import (
     MERGE_READY_CHECKPOINT_LABEL,
     GatesReport,
     GateStatus,
 )
+
+CORRELATION = "dddd4444-eeee-5555-ffff-666666666666"
+REPO = "guardkit/forge"
 
 
 @pytest.fixture()
@@ -65,149 +85,255 @@ def persistence(
 def _payload() -> SimpleNamespace:
     return SimpleNamespace(
         feature_id="FEAT-CARD",
-        repo="guardkit/forge",
-        branch="main",
+        repo=REPO,
+        branch="repair/TASK-CARDFIX1",
         feature_yaml_path="features/fix.yaml",
         max_turns=5,
         sdk_timeout_seconds=1800,
         triggered_by="cli",
         originating_adapter="terminal",
         originating_user="card-test",
-        correlation_id="dddd4444-eeee-5555-ffff-666666666666",
+        correlation_id=CORRELATION,
         parent_request_id=None,
         queued_at=datetime(2026, 7, 31, 11, 0, 0, tzinfo=UTC),
     )
 
 
-class _Deps:
-    """Stand-in for the assembled ``GateCheckDeps``."""
+class _RecordingPublisher:
+    """The pipeline publisher, recording ``build-paused`` instead of sending."""
 
     def __init__(self) -> None:
-        self.publisher: Any = "the-raw-approval-publisher"
+        self.paused: list[Any] = []
+
+    async def publish_build_paused(self, payload: Any) -> None:
+        self.paused.append(payload)
 
 
-class _Parts:
-    def __init__(self, emitter: Any) -> None:
-        self.publisher = "inner-approval-publisher"
-        self.emitter = emitter
-        self.subscriber = None
-        self.injector = None
-        self.expected_approver = "rich"
-        # Sentinel double — the activation paths read parts.priors_reader
-        # (never a real reader in the unit tier).
-        self.priors_reader = "the-priors-reader"
+class _Config:
+    def __init__(self, repo_root: Path) -> None:
+        self.merge_executor = SimpleNamespace(
+            enabled=True, response_wait_seconds=3600
+        )
+        self.planning = SimpleNamespace(target_repo_paths={REPO: str(repo_root)})
+        self.approval = SimpleNamespace(expected_approver="rich")
+
+
+def _offer_service(
+    pool: SqliteLifecyclePersistence, tmp_path: Path
+) -> tuple[MergeOfferService, _RecordingPublisher, list[tuple[str, bytes]]]:
+    publisher = _RecordingPublisher()
+    raw: list[tuple[str, bytes]] = []
+
+    async def _raw_publish(subject: str, body: bytes) -> None:
+        raw.append((subject, body))
+
+    async def _git_head(_repo_root: Path) -> str:
+        return "a" * 40
+
+    service = MergeOfferService(
+        config=_Config(tmp_path / "repo"),
+        pool=pool,
+        pipeline_publisher=publisher,
+        raw_publish=_raw_publish,
+        git_head=_git_head,
+        baseline_reader=lambda _build_id: None,
+        clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
+    )
+    return service, publisher, raw
+
+
+def _gates() -> GatesReport:
+    return GatesReport(
+        status=GateStatus.GREEN,
+        detail="declared suite GREEN (817 passed, 2 deselected)",
+        deferred_detail=(
+            "5 stamped checks (probe:bus, probe:process) have no live-gate "
+            "evidence yet: the merge press stands the candidate up in the "
+            "sandbox and runs this repository's live gate on it before "
+            "anything lands."
+        ),
+    )
+
+
+def _publisher_for(
+    pool: SqliteLifecyclePersistence, tmp_path: Path
+) -> tuple[Any, _RecordingPublisher, list[tuple[str, bytes]]]:
+    service, publisher, raw = _offer_service(pool, tmp_path)
+    publish_card = make_merge_card_publisher(
+        offer_service=service,
+        sqlite_pool=pool,
+        clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
+    )
+    return publish_card, publisher, raw
+
+
+def _offer_row(pool: SqliteLifecyclePersistence, build_id: str) -> dict[str, Any]:
+    rows = [
+        s
+        for s in pool.read_stages(build_id)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ]
+    assert len(rows) == 1, "exactly one durable merge offer row"
+    return dict(rows[-1].details.get(MERGE_OFFER_DETAILS_KEY) or {})
 
 
 @pytest.mark.asyncio
-async def test_the_card_goes_through_gate_check_with_the_plain_name(
-    monkeypatch: pytest.MonkeyPatch,
-    persistence: SqliteLifecyclePersistence,
+async def test_the_card_is_the_press_s_card(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
 ) -> None:
+    """Request id, durable row and Slack join key all belong to the press."""
     build_id = persistence.record_pending_build(_payload())
-    made: list[dict[str, Any]] = []
-    checked: list[dict[str, Any]] = []
-    deps = _Deps()
+    publish_card, publisher, raw = _publisher_for(persistence, tmp_path)
 
-    def fake_make_deps(parts: Any, **kwargs: Any) -> Any:
-        made.append(dict(kwargs))
-        return deps
-
-    async def fake_gate_check(**kwargs: Any) -> Any:
-        checked.append(dict(kwargs))
-        return ("RESUMED", None)
-
-    monkeypatch.setattr(_serve_deps_gating, "make_gate_check_deps", fake_make_deps)
-    monkeypatch.setattr(_serve_gate_activation, "gate_check", fake_gate_check)
-
-    publish_card = make_merge_card_publisher(
-        parts=_Parts(emitter=object()),
-        sqlite_pool=persistence,
-        gate_repository=object(),
-        gate_state_machine=object(),
-        clock=lambda: datetime(2026, 7, 31, 11, 5, tzinfo=UTC),
-    )
-
-    outcome = await publish_card(
+    result = await publish_card(
         build_id=build_id,
         feature_id="FEAT-CARD",
         rationale="mode-c-commits-present",
-        branch="fix/FEAT-CARD",
-        gates=GatesReport(status=GateStatus.GREEN),
+        branch="repair/TASK-CARDFIX1",
+        gates=_gates(),
     )
 
-    assert outcome == "RESUMED"
-    assert len(checked) == 1
-    # THE CARD COPY: the plain name, not the pre-ruling codename.
-    assert checked[0]["stage_label"] == MERGE_READY_CHECKPOINT_LABEL
-    assert "pull-request" not in checked[0]["stage_label"]
-    assert checked[0]["build_id"] == build_id
-    assert checked[0]["feature_id"] == "FEAT-CARD"
-    # Identity comes off the build row.
-    ctx = made[0]["ctx"]
-    assert ctx.correlation_id == "dddd4444-eeee-5555-ffff-666666666666"
-    assert ctx.build_id == build_id
-    # The mirrored publisher is installed — the AGENTS request first,
-    # the build-paused second (the two-envelope jarvis contract).
-    assert deps.publisher != "inner-approval-publisher"
-    assert type(deps.publisher).__name__ == "_MirroredApprovalPublisher"
+    # Nothing comes back: the owner's answer goes to the merge press.
+    assert result is None
+
+    # The durable row the press matches on, with the press's request id.
+    offer = _offer_row(persistence, build_id)
+    assert offer["request_id"] == merge_request_id(build_id)
+    assert offer["request_id"].startswith("merge-")
+    assert offer["correlation_id"] == CORRELATION
+    assert offer["approval_subject"] == "agents.approval.forge.merge-FEAT-CARD"
+
+    # The approval request on the wire, on the press's own subject.
+    assert len(raw) == 1
+    subject, body = raw[0]
+    assert subject == "agents.approval.forge.merge-FEAT-CARD"
+    envelope = json.loads(body.decode("utf-8"))
+    assert envelope["payload"]["request_id"] == merge_request_id(build_id)
+
+    # The card jarvis renders, with the synthetic join key that lets the tap
+    # work on a build the terminal registry has already seen.
+    assert len(publisher.paused) == 1
+    paused = publisher.paused[0]
+    assert paused.build_id == "merge-FEAT-CARD"
+    assert paused.feature_id == "FEAT-CARD"
+    assert paused.approval_subject == "agents.approval.forge.merge-FEAT-CARD"
+    assert paused.correlation_id == CORRELATION
 
 
 @pytest.mark.asyncio
-async def test_without_an_emitter_the_raw_publisher_is_kept(
-    monkeypatch: pytest.MonkeyPatch,
-    persistence: SqliteLifecyclePersistence,
+async def test_the_words_are_the_checkpoint_s_own(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
 ) -> None:
-    """Unit tiers with no emitter still publish the approval request."""
+    """What was checked, what is deferred, which branch, what approve does."""
     build_id = persistence.record_pending_build(_payload())
-    deps = _Deps()
+    persistence.record_merge_branch(build_id, "repair/TASK-CARDFIX1")
+    publish_card, publisher, _raw = _publisher_for(persistence, tmp_path)
 
-    monkeypatch.setattr(
-        _serve_deps_gating, "make_gate_check_deps", lambda parts, **kw: deps
+    await publish_card(
+        build_id=build_id,
+        feature_id="FEAT-CARD",
+        branch="repair/TASK-CARDFIX1",
+        gates=_gates(),
     )
 
-    async def fake_gate_check(**kwargs: Any) -> Any:
-        return ("RESUMED", None)
+    words = publisher.paused[0].rationale
+    assert "declared suite GREEN (817 passed, 2 deselected)" in words
+    assert "5 stamped checks (probe:bus, probe:process)" in words
+    assert "repair/TASK-CARDFIX1" in words
+    assert (
+        "Approve = check the candidate in the sandbox, merge the branch into "
+        "main and promote it." in words
+    )
+    assert "Reject = nothing changes" in words
+    # No house words anywhere near a card Rich reads.
+    for shorthand in ("gate_check", "merge_deploy_offer", "DF-021", "§c.3"):
+        assert shorthand not in words
 
-    monkeypatch.setattr(_serve_gate_activation, "gate_check", fake_gate_check)
 
+def test_the_words_stand_alone_without_a_gate_report() -> None:
+    """A card never claims a check it cannot name."""
+    words = merge_card_words(feature_id="FEAT-CARD", branch="autobuild/FEAT-CARD")
+    assert words.startswith("FEAT-CARD is ready to merge on branch")
+    assert "came back green" in words
+
+
+@pytest.mark.asyncio
+async def test_the_checkpoint_s_own_row_is_written_after_the_card(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """The one-card latch and the self-closed measure both read this row."""
+    build_id = persistence.record_pending_build(_payload())
+    publish_card, _publisher, _raw = _publisher_for(persistence, tmp_path)
+
+    await publish_card(build_id=build_id, feature_id="FEAT-CARD", gates=_gates())
+
+    rows = [
+        s
+        for s in persistence.read_stages(build_id)
+        if s.target_identifier == _MERGE_CARD_TARGET_IDENTIFIER
+    ]
+    assert len(rows) == 1
+    assert rows[0].stage_label == MERGE_READY_CHECKPOINT_LABEL
+    assert rows[0].status == "GATED"
+
+
+@pytest.mark.asyncio
+async def test_a_second_card_for_the_same_build_is_refused_loudly(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """One card per merge word — and a refusal is never a silent delivery."""
+    build_id = persistence.record_pending_build(_payload())
+    publish_card, publisher, raw = _publisher_for(persistence, tmp_path)
+
+    await publish_card(build_id=build_id, feature_id="FEAT-CARD", gates=_gates())
+    with pytest.raises(MergeCardNotPublished):
+        await publish_card(build_id=build_id, feature_id="FEAT-CARD", gates=_gates())
+
+    assert len(raw) == 1
+    assert len(publisher.paused) == 1
+    assert (
+        len(
+            [
+                s
+                for s in persistence.read_stages(build_id)
+                if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_offer_that_cannot_be_made_publishes_nothing(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """A repository the daemon has no path for cannot be merged — say so."""
+    build_id = persistence.record_pending_build(_payload())
+    service, publisher, raw = _offer_service(persistence, tmp_path)
+    service._config.planning.target_repo_paths.clear()  # noqa: SLF001 — the seam
     publish_card = make_merge_card_publisher(
-        parts=_Parts(emitter=None),
+        offer_service=service,
         sqlite_pool=persistence,
-        gate_repository=object(),
-        gate_state_machine=object(),
-        clock=lambda: datetime(2026, 7, 31, 11, 5, tzinfo=UTC),
+        clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
     )
-    await publish_card(build_id=build_id, feature_id="FEAT-CARD")
 
-    assert deps.publisher == "the-raw-approval-publisher"
+    with pytest.raises(MergeCardNotPublished):
+        await publish_card(build_id=build_id, feature_id="FEAT-CARD", gates=_gates())
+
+    assert raw == []
+    assert publisher.paused == []
+    assert persistence.read_stages(build_id) == []
 
 
 @pytest.mark.asyncio
 async def test_the_feature_id_falls_back_to_the_build_row(
-    monkeypatch: pytest.MonkeyPatch,
-    persistence: SqliteLifecyclePersistence,
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
 ) -> None:
     """The Mode C call sites pass ``feature_id=""`` — resolve it, don't guess."""
     build_id = persistence.record_pending_build(_payload())
-    checked: list[dict[str, Any]] = []
+    publish_card, publisher, _raw = _publisher_for(persistence, tmp_path)
 
-    monkeypatch.setattr(
-        _serve_deps_gating, "make_gate_check_deps", lambda parts, **kw: _Deps()
-    )
+    await publish_card(build_id=build_id, feature_id="", gates=_gates())
 
-    async def fake_gate_check(**kwargs: Any) -> Any:
-        checked.append(dict(kwargs))
-        return ("RESUMED", None)
-
-    monkeypatch.setattr(_serve_gate_activation, "gate_check", fake_gate_check)
-
-    publish_card = make_merge_card_publisher(
-        parts=_Parts(emitter=None),
-        sqlite_pool=persistence,
-        gate_repository=object(),
-        gate_state_machine=object(),
-        clock=lambda: datetime(2026, 7, 31, 11, 5, tzinfo=UTC),
-    )
-    await publish_card(build_id=build_id, feature_id="")
-
-    assert checked[0]["feature_id"] == "FEAT-CARD"
+    assert publisher.paused[0].feature_id == "FEAT-CARD"
+    assert publisher.paused[0].build_id == "merge-FEAT-CARD"
