@@ -238,16 +238,54 @@ async def test_the_words_are_the_checkpoint_s_own(
 
     words = publisher.paused[0].rationale
     assert "declared suite GREEN (817 passed, 2 deselected)" in words
-    assert "5 stamped checks (probe:bus, probe:process)" in words
     assert "repair/TASK-CARDFIX1" in words
+    # The checks that could not be proved here, said in ordinary words.
+    assert (
+        "Some of the checks this repository asks for could not be proved on "
+        "this branch here; they are run against the candidate in the sandbox "
+        "before anything is merged." in words
+    )
     assert (
         "Approve = check the candidate in the sandbox, merge the branch into "
         "main and promote it." in words
     )
     assert "Reject = nothing changes" in words
-    # No house words anywhere near a card Rich reads.
-    for shorthand in ("gate_check", "merge_deploy_offer", "DF-021", "§c.3"):
+    # No house words and no internal ids anywhere near a card Rich reads —
+    # the gate report's own deferred sentence carries all of these, and it
+    # stays on the decision and in the log where it belongs.
+    for shorthand in (
+        "gate_check",
+        "merge_deploy_offer",
+        "DF-021",
+        "§c.3",
+        "stamped check",
+        "live-gate",
+        "live gate",
+        "merge press",
+        "probe:bus",
+        "probe:process",
+    ):
         assert shorthand not in words
+
+
+@pytest.mark.asyncio
+async def test_a_card_with_nothing_deferred_leaves_that_sentence_out(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """Every gate set that defers nothing gets a three-sentence card."""
+    build_id = persistence.record_pending_build(_payload())
+    publish_card, publisher, _raw = _publisher_for(persistence, tmp_path)
+
+    await publish_card(
+        build_id=build_id,
+        feature_id="FEAT-CARD",
+        branch="repair/TASK-CARDFIX1",
+        gates=GatesReport(status=GateStatus.GREEN, detail="12 of 12 green"),
+    )
+
+    words = publisher.paused[0].rationale
+    assert "12 of 12 green" in words
+    assert "could not be proved" not in words
 
 
 def test_the_words_stand_alone_without_a_gate_report() -> None:
@@ -323,6 +361,31 @@ async def test_an_offer_that_cannot_be_made_publishes_nothing(
     assert raw == []
     assert publisher.paused == []
     assert persistence.read_stages(build_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_says_nothing_reached_the_wire(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """The journey's record must not hedge about a card that never existed.
+
+    Every refusal happens before the offer touches the wire, so the raise
+    carries ``card_reached_the_wire = False`` and the checkpoint writes "no
+    card was published" rather than "the card may be on the wire".
+    """
+    build_id = persistence.record_pending_build(_payload())
+    service, _publisher, _raw = _offer_service(persistence, tmp_path)
+    service._config.planning.target_repo_paths.clear()  # noqa: SLF001 — the seam
+    publish_card = make_merge_card_publisher(
+        offer_service=service,
+        sqlite_pool=persistence,
+        clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
+    )
+
+    with pytest.raises(MergeCardNotPublished) as raised:
+        await publish_card(build_id=build_id, feature_id="FEAT-CARD", gates=_gates())
+
+    assert raised.value.card_reached_the_wire is False
 
 
 @pytest.mark.asyncio

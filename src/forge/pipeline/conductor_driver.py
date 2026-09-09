@@ -230,19 +230,35 @@ class ConductorRunOutcome(StrEnum):
     Members:
         COMPLETED: The supervisor reported ``TERMINAL``; the journey
             closed out and exported its receipts.
-        DELIVERED: The merge-ready checkpoint published its card AND the
-            owner approved it. The journey is done. The loop STOPS here;
+        DELIVERED: The merge-ready checkpoint's card was DELIVERED to
+            the owner. It says that and nothing more. Since 2026-09-09
+            the checkpoint publishes the merge press's own card, the
+            owner answers it to the press, and the press — not this loop
+            — is what acts on the answer and records it. So the journey
+            stops the moment the card is out, and a merge the owner then
+            REJECTS also ends here reading "delivered": what the owner
+            said is the press's story, told in the press's own receipts,
+            and reading this word as "the owner approved" would be
+            reading more into it than it claims. The loop STOPS here;
             re-planning would re-publish the card on every tick, which is
             act inflation (design pass risk h.5) dressed up as a retry.
-        DECLINED: The card was published and the owner said no (rejected
-            / cancelled / hard-stopped). Stopping is right either way —
-            but the run report must say what actually happened. Until
-            Stage 2 this read ``DELIVERED``, because the loop keyed only
-            on ``card_published`` and never looked at the verdict: a
-            declined merge was reported as a delivery.
-        EXPIRED: The card was published and no answer arrived inside the
-            approval window. Not a delivery, not a refusal — a silence,
-            and the report says so.
+        DECLINED: A publisher that hands back the owner's verdict said
+            the owner refused (rejected / cancelled / hard-stopped).
+            Stopping is right either way — but the run report must say
+            what actually happened. Until Stage 2 this read
+            ``DELIVERED``, because the loop keyed only on
+            ``card_published`` and never looked at the verdict: a
+            declined merge was reported as a delivery. NOTE (2026-09-09):
+            the production publisher no longer waits for the answer or
+            returns a verdict, so no live journey reports this word
+            today. It stays because the word must exist for any publisher
+            that does report one, and because losing it is how the
+            original defect happened.
+        EXPIRED: A publisher that hands back the owner's verdict said no
+            answer arrived inside the approval window. Not a delivery,
+            not a refusal — a silence, and the report says so. Like
+            ``DECLINED``, unreachable from the production publisher since
+            2026-09-09.
         PAUSED_BUDGET: A budget cap was breached and the loop stopped;
             the queue moves on (design pass §d Stage 3). Two shapes end
             here. With a pause collaborator wired the build is paused
@@ -1564,6 +1580,16 @@ def _classify_card_result(report: Any) -> ConductorRunOutcome:
     because that is the only honest reading of "a card was published and
     we cannot tell what came back", and it is logged so the gap is visible
     rather than inferred.
+
+    WHAT PRODUCTION ACTUALLY HITS SINCE 2026-09-09. The merge-ready
+    checkpoint's publisher returns nothing at all: the card it publishes
+    is the merge press's own card, and the owner's answer goes to the
+    press rather than back here. So ``card_result`` is ``None`` on every
+    live journey and this function returns ``DELIVERED`` every time,
+    meaning exactly "the card was delivered" — see that member's own
+    words. ``DECLINED`` and ``EXPIRED`` are reachable only from a
+    publisher that waits for the answer and hands it back, which is what
+    the tests below this line supply.
     """
     decision = getattr(report, "dispatch_result", None)
     raw = getattr(decision, "card_result", None)
