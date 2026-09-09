@@ -670,6 +670,16 @@ class Supervisor:
     #: breach.
     budget_wall_clock: "Callable[[], datetime] | None" = None
     budget_started_at_reader: "Callable[[str], datetime | None] | None" = None
+    #: ``(build_id) -> float`` — how many of those elapsed seconds the build
+    #: spent PAUSED waiting for a person to decide something (its build gate,
+    #: above all). The wall-clock cap bounds machine work, so this is taken
+    #: off the elapsed time before the cap is consulted. ``None`` (the
+    #: default, and every caller that has not wired it) means no waiting is
+    #: subtracted and the number is exactly what it always was. Production
+    #: composes it from the ledger's own pause and resume rows
+    #: (``forge.cli.serve.make_budget_waiting_seconds_reader``), so a daemon
+    #: restart in the middle of a wait loses nothing.
+    budget_waiting_seconds_reader: "Callable[[str], float] | None" = None
     #: ``(build_id) -> float | None`` reader for the most recent Coach score,
     #: feeding the ``min_coach_score`` floor (FEAT-UBS-002 §3 / AC-05). ``None``
     #: (the default, and the attended / no-reader case) leaves
@@ -1719,9 +1729,15 @@ class Supervisor:
             history,
             is_review=lambda e: e.stage_class == StageClass.TASK_REVIEW,
         )
+        waiting_seconds = self._budget_waiting_seconds(build_id)
         metrics = BuildBudgetMetrics(
             review_cycles=review_cycles,
-            elapsed_wallclock_seconds=self._budget_elapsed_seconds(build_id),
+            elapsed_wallclock_seconds=self._budget_elapsed_seconds(
+                build_id, waiting_seconds=waiting_seconds
+            ),
+            # What the cap is NOT charged for, carried so the breach sentence
+            # can say plainly what it left out.
+            waiting_for_a_person_seconds=waiting_seconds,
             # tokens stay unmeasured today (ADR-ARCH-033); its cap is inert
             # until the runner populates a real value.
             tokens_used=None,
@@ -1785,19 +1801,66 @@ class Supervisor:
         self._record_safe(report)
         return report
 
-    def _budget_elapsed_seconds(self, build_id: str) -> float:
-        """Wall-clock consumed by the build, or ``0.0`` when unmeasurable.
+    def _budget_elapsed_seconds(
+        self, build_id: str, *, waiting_seconds: float | None = None
+    ) -> float:
+        """How long the build has actually been WORKING, or ``0.0``.
+
+        The time since it started, minus every span it spent paused waiting
+        for a person to decide something. The waiting is not work: on
+        2026-09-09 a build waited at its build gate from 22:03 to 04:50 for
+        the owner's tap, and the very first turn after the tap refused to
+        dispatch because the two-hour budget had been spent entirely on the
+        waiting, before a single leg had run. The cap bounds machine work, so
+        machine work is what it is now given.
 
         Requires BOTH an injected wall-clock and a start-time reader; absent
         either, the wall-clock cap is unenforceable (0.0 → never a breach),
-        never a false pause.
+        never a false pause. With no waiting reader wired, nothing is
+        subtracted and the answer is exactly what it always was.
+
+        Args:
+            build_id: The build being measured.
+            waiting_seconds: The waiting already read this turn, so the
+                ledger is not read twice for one decision. Omitted, the
+                method reads it itself.
         """
         if self.budget_wall_clock is None or self.budget_started_at_reader is None:
             return 0.0
         started = self.budget_started_at_reader(build_id)
         if started is None:
             return 0.0
-        return max(0.0, (self.budget_wall_clock() - started).total_seconds())
+        elapsed = max(0.0, (self.budget_wall_clock() - started).total_seconds())
+        waiting = (
+            self._budget_waiting_seconds(build_id)
+            if waiting_seconds is None
+            else waiting_seconds
+        )
+        return max(0.0, elapsed - waiting)
+
+    def _budget_waiting_seconds(self, build_id: str) -> float:
+        """Seconds this build spent waiting for a person, or ``0.0``.
+
+        ``0.0`` when no reader is wired — the pre-reader behaviour, kept
+        byte for byte. A reader that raises degrades to ``0.0`` with a loud
+        log: the cap then measures what it always measured rather than
+        crashing the turn (same shape as the coach-score reader).
+        """
+        if self.budget_waiting_seconds_reader is None:
+            return 0.0
+        try:
+            return max(0.0, float(self.budget_waiting_seconds_reader(build_id)))
+        except Exception as exc:  # noqa: BLE001 — defensive: never crash enforcement
+            logger.error(
+                "supervisor.next_turn (MODE_C): budget_waiting_seconds_reader "
+                "raised %s: %s for build_id=%s; counting no waiting this turn "
+                "(the wall-clock cap measures elapsed time, as it did before "
+                "the waiting was excluded)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return 0.0
 
     def _budget_last_coach_score(self, build_id: str) -> float | None:
         """Most recent Coach score for the build, or ``None`` (AC-05).
