@@ -67,8 +67,20 @@ class BuildBudgetMetrics:
     Attributes:
         review_cycles: Mode C ``/task-review`` cycles already dispatched for
             this build. Compared against ``max_review_cycles``.
-        elapsed_wallclock_seconds: Wall-clock consumed by the build so far.
-            Compared against ``max_build_wallclock_seconds``.
+        elapsed_wallclock_seconds: The time the build has actually been
+            WORKING: the wall-clock since it started, minus every span it
+            spent paused waiting for a person to decide something. Compared
+            against ``max_build_wallclock_seconds``. The waiting is not work
+            — on 2026-09-09 a build sat at its build gate for six hours and
+            forty-seven minutes waiting for the owner's tap, and the first
+            turn after the tap refused to dispatch because the whole two-hour
+            budget had been spent on the waiting. The caller does the
+            subtraction (the supervisor and the lifecycle bridge both do);
+            this field is what is left.
+        waiting_for_a_person_seconds: How much waiting was taken out to get
+            the number above, or ``0.0`` when the build never waited (or
+            nobody measured the waiting). Carried only so a breach can say
+            plainly what it did not count.
         tokens_used: Tokens consumed so far, or ``None`` when not measured
             (the token cap is then treated as unenforceable, not breached).
         last_coach_score: Most recent Coach score in ``[0, 1]``, or ``None``.
@@ -80,6 +92,7 @@ class BuildBudgetMetrics:
     elapsed_wallclock_seconds: float = 0.0
     tokens_used: int | None = None
     last_coach_score: float | None = None
+    waiting_for_a_person_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,12 +150,25 @@ def evaluate_budget(
         profile.max_build_wallclock_seconds is not None
         and metrics.elapsed_wallclock_seconds >= profile.max_build_wallclock_seconds
     ):
+        # The sentence says what was measured. When waiting for a person was
+        # taken out of the number, it says so in ordinary words, so nobody
+        # reading the failure has to guess why the two numbers differ. With no
+        # waiting (the ordinary build), the sentence is exactly what it always
+        # was.
+        if metrics.waiting_for_a_person_seconds > 0.0:
+            measured = (
+                f"wall-clock ({metrics.elapsed_wallclock_seconds:.0f}s of work; "
+                f"{metrics.waiting_for_a_person_seconds:.0f}s of waiting for a "
+                "person was not counted)"
+            )
+        else:
+            measured = f"wall-clock ({metrics.elapsed_wallclock_seconds:.0f}s)"
         return BudgetVerdict(
             ok=False,
             breached_cap="max_build_wallclock_seconds",
             detail=(
-                f"wall-clock ({metrics.elapsed_wallclock_seconds:.0f}s) reached "
-                f"cap ({profile.max_build_wallclock_seconds}s)"
+                f"{measured} reached cap "
+                f"({profile.max_build_wallclock_seconds}s)"
             ),
         )
 
@@ -219,6 +245,7 @@ def build_budget_breach_approval_details(
         "metrics": {
             "review_cycles": metrics.review_cycles,
             "elapsed_wallclock_seconds": metrics.elapsed_wallclock_seconds,
+            "waiting_for_a_person_seconds": metrics.waiting_for_a_person_seconds,
             "tokens_used": metrics.tokens_used,
             "last_coach_score": metrics.last_coach_score,
         },
