@@ -49,7 +49,9 @@ def _step(step_type: str, params: dict[str, Any], index: int) -> Step:
     )
 
 
-def sandbox_env(profile: DeployProfile) -> dict[str, str]:
+def sandbox_env(
+    profile: DeployProfile, *, inside_sandbox: bool = False
+) -> dict[str, str]:
     """The sandbox settings, as the environment the deploy script reads.
 
     A repository that deploys into a Docker Sandbox carries a ``sandbox`` block
@@ -65,11 +67,30 @@ def sandbox_env(profile: DeployProfile) -> dict[str, str]:
     root — the spec's Part O, rule 68) ride only when the profile sets them,
     so a profile without them threads exactly what it threaded before.
 
+    WHERE THE DEPLOY RUNS DECIDES WHETHER ANY OF THEM RIDE (2026-09-09).
+    Every one of these settings says how to CREATE the sandbox: its name, how
+    big it is, which ports it publishes, what it may reach, which checkouts
+    are mounted into it. The one program that reads them is the host wrapper,
+    which makes the sandbox and then runs the repository's own deploy script
+    inside it. When the factory itself lives in that sandbox the deploy step
+    runs that inner script directly (see
+    :meth:`forge.deploy.stage.DeployStageRunner._profile_for_run`), so there
+    is nothing left to create and not one of these settings has a reader.
+    ``inside_sandbox=True`` therefore sends none of them. The caller's own
+    overlay is untouched either way — the candidate's environment, the live
+    gate's, and the ``CANDIDATE`` / ``PROMOTE`` / ``CANDIDATE_DOWN`` signals
+    are what the deploy actually reads.
+
+    This was found the hard way on the first real merge press (2026-09-09):
+    the deploy sidecar inside the sandbox refused ``SANDBOX_SIDECAR_PUBLISH``
+    as a key it does not allow, and the whole journey ended in 0.16 seconds
+    without a container ever starting.
+
     No ``sandbox`` block ⇒ an empty mapping ⇒ nothing is added to any step and
     every runbook is exactly what it was before sandboxes existed.
     """
     sandbox = profile.sandbox
-    if sandbox is None:
+    if sandbox is None or inside_sandbox:
         return {}
     env = {
         "SANDBOX_NAME": sandbox.name,
@@ -93,10 +114,18 @@ def sandbox_env(profile: DeployProfile) -> dict[str, str]:
 
 
 def _merged_env(
-    profile: DeployProfile, overlay: dict[str, str] | None
+    profile: DeployProfile,
+    overlay: dict[str, str] | None,
+    *,
+    inside_sandbox: bool = False,
 ) -> dict[str, str]:
-    """The sandbox settings plus the caller's own overlay (the overlay wins)."""
-    merged = sandbox_env(profile)
+    """The sandbox settings plus the caller's own overlay (the overlay wins).
+
+    ``inside_sandbox`` is the venue: True when this step runs inside the
+    repository's own sandbox, where the settings that describe how to make
+    that sandbox have no reader and are not sent.
+    """
+    merged = sandbox_env(profile, inside_sandbox=inside_sandbox)
     if overlay:
         merged.update(overlay)
     return merged
@@ -134,6 +163,7 @@ def build_deploy_runbook(
     compose_extra_env: dict[str, str] | None = None,
     check_extra_env: dict[str, str] | None = None,
     cwd_override: str | None = None,
+    inside_sandbox: bool = False,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -162,11 +192,18 @@ def build_deploy_runbook(
             commit the merge will land. The promote leg never passes it: it
             runs from the checkout and re-tags the image the candidate built.
             ``None`` ⇒ the profile's ``cwd``, exactly as before.
+        inside_sandbox: True when these steps run INSIDE the repository's own
+            sandbox, so the settings that say how to make that sandbox are not
+            threaded onto them — there is nothing there to make and nothing
+            that reads them (:func:`sandbox_env`). False (every repository
+            deploying through the host wrapper, and every repository with no
+            sandbox at all) ⇒ exactly what it was.
 
-    When the profile carries a ``sandbox`` block, the sandbox's settings
-    (:func:`sandbox_env`) are added underneath both overlays, so the vetted
-    wrapper knows which Docker Sandbox to run the deploy inside. No block ⇒
-    nothing is added and both steps are exactly what they were.
+    When the profile carries a ``sandbox`` block and the deploy runs on the
+    host, the sandbox's settings (:func:`sandbox_env`) are added underneath
+    both overlays, so the vetted wrapper knows which Docker Sandbox to run the
+    deploy inside. No block ⇒ nothing is added and both steps are exactly what
+    they were.
 
     Returns:
         A :class:`Runbook` of typed, ordered, ``pending`` steps.
@@ -250,7 +287,9 @@ def build_deploy_runbook(
         compose_params["script"] = profile.compose.script
     if profile.compose.env_file is not None:
         compose_params["env_file"] = profile.compose.env_file
-    compose_env = _merged_env(profile, compose_extra_env)
+    compose_env = _merged_env(
+        profile, compose_extra_env, inside_sandbox=inside_sandbox
+    )
     if compose_env:
         compose_params["extra_env"] = compose_env
     steps.append(_step("deploy_compose", compose_params, idx))
@@ -264,7 +303,9 @@ def build_deploy_runbook(
                 for h in profile.health_checks
             ],
         }
-        check_env = _merged_env(profile, check_extra_env)
+        check_env = _merged_env(
+            profile, check_extra_env, inside_sandbox=inside_sandbox
+        )
         if check_env:
             check_params["extra_env"] = check_env
         steps.append(_step("health_check", check_params, idx))
@@ -287,6 +328,7 @@ def build_revert_runbook(
     target: str,
     rollback_image_ref: str,
     now: datetime,
+    inside_sandbox: bool = False,
 ) -> Runbook:
     """Render the REVERT runbook (O-32) — re-deploy the kept ``:rollback-*`` tag.
 
@@ -300,9 +342,10 @@ def build_revert_runbook(
     intent (the hermetic gate) and the profile's deploy script consumes it (env /
     compose IMAGE var) on a live revert.
 
-    When the profile carries a ``sandbox`` block, the sandbox's settings
-    (:func:`sandbox_env`) ride in the step's ``extra_env`` too — a revert runs
-    inside the same Docker Sandbox the deploy ran in.
+    When the profile carries a ``sandbox`` block and the revert runs on the
+    host, the sandbox's settings (:func:`sandbox_env`) ride in the step's
+    ``extra_env`` too — a revert runs inside the same Docker Sandbox the
+    deploy ran in.
 
     Args:
         profile: The parsed deploy profile (its compose invocation is reused).
@@ -310,6 +353,9 @@ def build_revert_runbook(
         target: The runbook target (typically the profile ``env_id``).
         rollback_image_ref: The kept ``:rollback-*`` image tag to bring back up.
         now: Creation timestamp (injected clock).
+        inside_sandbox: True when this step runs INSIDE the repository's own
+            sandbox — the settings that say how to make that sandbox are not
+            threaded onto it (:func:`sandbox_env`).
     """
     compose_params: dict[str, Any] = {
         "cwd": profile.cwd,
@@ -318,7 +364,7 @@ def build_revert_runbook(
         "rollback_image_ref": rollback_image_ref,
         "revert": True,
     }
-    revert_env = sandbox_env(profile)
+    revert_env = sandbox_env(profile, inside_sandbox=inside_sandbox)
     if revert_env:
         compose_params["extra_env"] = revert_env
     if profile.compose.script is not None:
@@ -342,6 +388,7 @@ def build_candidate_teardown_runbook(
     target: str,
     extra_env: dict[str, str],
     now: datetime,
+    inside_sandbox: bool = False,
 ) -> Runbook:
     """Render the candidate-teardown runbook (S2F) — a single ``deploy_compose``.
 
@@ -352,9 +399,15 @@ def build_candidate_teardown_runbook(
     ({CANDIDATE_DOWN:"1", **candidate.env}) so the vetted script brings DOWN the
     ``-cand`` project (``down -v``) rather than re-deploying it. Deliberately a
     single focused step — no pre-flight, no health check. When the profile
-    carries a ``sandbox`` block, the sandbox's settings
-    (:func:`sandbox_env`) ride alongside, so the teardown happens inside the
-    same Docker Sandbox.
+    carries a ``sandbox`` block and the teardown runs on the host, the
+    sandbox's settings (:func:`sandbox_env`) ride alongside, so the teardown
+    happens inside the same Docker Sandbox.
+
+    The teardown is built exactly the way the deploy is, on purpose: whatever
+    the deploy step was sent, the step that takes the candidate down again is
+    sent too. When they differed, a teardown was refused for a key the deploy
+    had already been refused for, and the log said the candidate might still
+    be up (2026-09-09).
 
     Args:
         profile: The parsed deploy profile (its compose invocation is reused).
@@ -362,13 +415,18 @@ def build_candidate_teardown_runbook(
         target: The runbook target (typically the profile ``env_id``).
         extra_env: The teardown env overlay ({CANDIDATE_DOWN:"1", ...}).
         now: Creation timestamp (injected clock).
+        inside_sandbox: True when this step runs INSIDE the repository's own
+            sandbox — the settings that say how to make that sandbox are not
+            threaded onto it (:func:`sandbox_env`).
     """
     compose_params: dict[str, Any] = {
         "cwd": profile.cwd,
         "compose_file": profile.compose.file,
         "compose_profile": profile.compose.profile,
         "candidate_down": True,
-        "extra_env": _merged_env(profile, extra_env),
+        "extra_env": _merged_env(
+            profile, extra_env, inside_sandbox=inside_sandbox
+        ),
     }
     if profile.compose.script is not None:
         compose_params["script"] = profile.compose.script
