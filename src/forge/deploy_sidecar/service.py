@@ -67,9 +67,11 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 3. Every env key must be in the allowlist
    ``{REVERT, ROLLBACK_IMAGE_REF, ENV_FILE, CANDIDATE, PROMOTE, CANDIDATE_DOWN,
    SANDBOX_NAME, SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_PUBLISH,
-   SANDBOX_ALLOW_NETWORK}`` UNION the profile's ``live_gate.env`` and
-   ``candidate.env`` key names; anything else is refused loudly. Values must be
-   strings.
+   SANDBOX_ALLOW_NETWORK, SANDBOX_SIDECAR_PUBLISH, SANDBOX_RUNNER_PUBLISH,
+   SANDBOX_FORGE_PATH, SANDBOX_GUARDKIT_PATH, SANDBOX_RECEIPTS_PATH}`` UNION
+   the profile's ``live_gate.env`` and ``candidate.env`` key names; anything
+   else is refused loudly — ``SANDBOX_ENV_FILE`` deliberately included, and
+   the reason is written beside the list below. Values must be strings.
 4. ``timeout_seconds`` is capped (default 600, max 1800).
 5. The server binds ``127.0.0.1`` ONLY.
 6. There is NO shell: execution goes through the existing
@@ -198,6 +200,34 @@ ENV_ALLOWLIST_BASE: frozenset[str] = frozenset(
         "SANDBOX_CPUS",
         "SANDBOX_PUBLISH",
         "SANDBOX_ALLOW_NETWORK",
+        # The settings that make a sandbox carry the factory's own two
+        # services (2026-09-07/08). A profile's sandbox block can set six of
+        # those, and the deploy stage threads every one it finds, so this list
+        # has to know them or the first deploy of such a repository is refused
+        # at its first step — which is exactly what happened on the first real
+        # merge press (2026-09-09). Five of the six are here. Like the five
+        # settings above, they name ports and the checkouts mounted into the
+        # sandbox: no secret, and nothing a request can do with them that the
+        # wrapper reading them would not do anyway.
+        "SANDBOX_SIDECAR_PUBLISH",
+        "SANDBOX_RUNNER_PUBLISH",
+        "SANDBOX_FORGE_PATH",
+        "SANDBOX_GUARDKIT_PATH",
+        "SANDBOX_RECEIPTS_PATH",
+        # SANDBOX_ENV_FILE IS DELIBERATELY NOT HERE, and this is the reason.
+        # It is the sixth of that group and the only one that names a file of
+        # secrets — the sops-rendered environment the wrapper hands to
+        # `sbx --env-file` when it creates the sandbox. Values are not checked
+        # here (they cannot be: they are ports, sizes and paths), so allowing
+        # the key would let a request choose which file on this box becomes
+        # the environment of a sandbox that then runs code. That is a widening
+        # of what a message can do, and deny-by-default says no. Nothing needs
+        # it today: a deploy that runs inside the sandbox is not sent the
+        # sandbox's creation settings at all (forge.deploy.runbook_builder's
+        # sandbox_env), and creating a factory-carrying sandbox is an attended
+        # host-side command, not a request to this service. A repository that
+        # one day needs the wrapper driven from here gets this key by a
+        # decision, written down, rather than by accident.
     }
 )
 
@@ -492,6 +522,9 @@ def allowed_env_keys(profile: DeployProfile) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
 
     Base allowlist UNION ``live_gate.env`` keys UNION ``candidate.env`` keys.
+    The base list carries every setting a profile's ``sandbox`` block can put
+    in a deploy step's environment but one — see the note beside
+    :data:`ENV_ALLOWLIST_BASE` for the one that is refused on purpose.
     ``candidate`` is a first-class profile field (S2F): its ``env`` keys are read
     from ``profile.candidate``. A defensive fallback to ``profile.extra`` is kept
     for a profile parsed by an older loader that still parked ``candidate`` in

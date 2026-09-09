@@ -40,6 +40,20 @@ threading itself lives one file over, in
 because that is where the steps are minted. No ``sandbox`` block ⇒ nothing is
 added ⇒ every runbook is byte-identical to what it was.
 
+...UNLESS THE DEPLOY ITSELF RUNS INSIDE THAT SANDBOX (2026-09-09). Those
+settings, and the six beside them that make a sandbox carry the factory's own
+services, all say how to CREATE the sandbox, and the only program that reads
+them is the host wrapper that creates it. When the factory lives inside the
+sandbox this stage runs the repository's own deploy script directly (see
+:meth:`DeployStageRunner._profile_for_run`), so there is nothing to create and
+nobody to read them: every step this stage builds for that venue is told so,
+and carries none of them. What the deploy actually reads is untouched — the
+candidate's own environment, the live gate's, and the mode signals. The first
+real merge press found this: the deploy sidecar inside the sandbox refused
+``SANDBOX_SIDECAR_PUBLISH`` as a key it does not allow, the candidate leg
+ended in 0.16 seconds without a container ever starting, and the reason was
+written down only in a ledger row.
+
 Irreversible-edge escalation reuses the EXISTING approval-gate machinery
 (Gate G1-proven) — not re-implemented here: a profile step that needs approval
 emits an ``awaiting_approval`` outcome, which the executor already routes to the
@@ -139,11 +153,16 @@ from forge.executor.executor import RunbookExecutor, RunResult
 from forge.executor.registry import StepTypeRegistry
 from forge.executor.shell_steps import ScriptRunner
 from forge.persistence.repositories.runbook import RunbookRepository
-from forge.persistence.repositories.runbook_models import Runbook
+from forge.persistence.repositories.runbook_models import Runbook, Step
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DeployStageRunner", "DeployStageResult", "gate_summary"]
+__all__ = [
+    "DeployStageRunner",
+    "DeployStageResult",
+    "gate_summary",
+    "sidecar_refusal",
+]
 
 
 def _utcnow() -> datetime:
@@ -181,6 +200,54 @@ class DeployStageResult:
     live_gate_runbook_id: str | None = None
     dry_run: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+
+
+#: How the deploy sidecar's own answers begin. When the sidecar refuses a
+#: request nothing is run, so what comes back is not a script's output at all:
+#: it is the sidecar client's own sentence (:mod:`forge.deploy.sidecar_runner`)
+#: — "sidecar refused (HTTP 400): env key ... is not allowlisted", "sidecar
+#: unreachable at ...", "the deploy sidecar did not run in the candidate tree
+#: ...". Those sentences are the only thing that says WHY a step never
+#: started, so they are carried into the line a person reads.
+SIDECAR_ANSWER_OPENINGS: tuple[str, ...] = ("sidecar ", "the deploy sidecar ")
+
+#: How much of the sidecar's sentence travels into a failure line. Long enough
+#: for the whole of a refusal and the list of keys it allows; short enough that
+#: one failure stays one readable line.
+SIDECAR_SENTENCE_CAP: int = 400
+
+
+def sidecar_refusal(step: Step | None) -> str | None:
+    """The sidecar's own sentence for a step it never ran, or ``None``.
+
+    Reads the step's recorded result the way the two script steps write it: a
+    ``deploy_compose`` step keeps one ``captured_output``, a ``health_check``
+    step keeps one entry per check and the last one is the check that failed.
+    Anything that is not one of the sidecar's own sentences — a script's real
+    output, an empty result, a step that never ran — is ``None``, so an
+    ordinary failure reads exactly as it always did.
+    """
+    if step is None or step.result is None:
+        return None
+    payload = step.result.payload
+    if not isinstance(payload, dict):
+        return None
+    output = payload.get("captured_output")
+    if output is None:
+        ran = payload.get("ran")
+        if isinstance(ran, list) and ran and isinstance(ran[-1], dict):
+            output = ran[-1].get("captured_output")
+    if not isinstance(output, str) or not output.strip():
+        return None
+    first_line = output.strip().splitlines()[0].strip()
+    if not any(
+        first_line.lower().startswith(opening)
+        for opening in SIDECAR_ANSWER_OPENINGS
+    ):
+        return None
+    if len(first_line) > SIDECAR_SENTENCE_CAP:
+        return first_line[: SIDECAR_SENTENCE_CAP - 1].rstrip() + "…"
+    return first_line
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +417,17 @@ class DeployStageRunner:
             # repository that has no sandbox.
             base_url = str(getattr(self._sandbox, "sidecar_url", "") or base_url)
         return SidecarScriptRunner(base_url=base_url, repo=self._target_repo)
+
+    def _runs_inside_the_sandbox(self) -> bool:
+        """Does this stage's work happen inside the repository's own sandbox?
+
+        True when the repository has a sandbox entry, which is what puts the
+        factory's services — and so this stage's scripts — in there (rule 85).
+        The steps built for that venue are not sent the settings that say how
+        to make the sandbox: it is already made, and the wrapper that would
+        read them is not what runs.
+        """
+        return self._sandbox is not None
 
     def _profile_for_run(self, profile: DeployProfile) -> DeployProfile:
         """The profile this stage actually runs — the inner script in a sandbox.
@@ -686,6 +764,7 @@ class DeployStageRunner:
                 target=profile.env_id,
                 now=self._clock(),
                 compose_extra_env=promote_extra_env,
+                inside_sandbox=self._runs_inside_the_sandbox(),
             )
             await self._safe_publish(
                 self._deploy_publisher.publish_deploy_started,
@@ -879,6 +958,25 @@ class DeployStageRunner:
             ),
         )
         events.append("DeployQueued")
+
+    def _stopped_at(
+        self, executed: Runbook | None, run_result: RunResult, *, default: str
+    ) -> tuple[str, str | None]:
+        """Which step stopped the runbook, and why if the sidecar said why.
+
+        Returns the step's type (``default`` when the run stopped before any
+        step, or the runbook could not be read back) and, when the step never
+        ran because the deploy sidecar refused it or could not be reached, the
+        sidecar's own sentence (:func:`sidecar_refusal`) — ``None`` for every
+        ordinary failure, which therefore reads exactly as it always did.
+        """
+        if executed is None or run_result.stopped_at_index is None:
+            return default, None
+        idx = run_result.stopped_at_index
+        if not (0 <= idx < len(executed.steps)):
+            return default, None
+        step = executed.steps[idx]
+        return step.step_type, sidecar_refusal(step)
 
     async def _run_runbook(
         self,
@@ -1171,23 +1269,28 @@ class DeployStageRunner:
             compose_extra_env=compose_extra,
             check_extra_env=cand_env,
             cwd_override=candidate_cwd,
+            inside_sandbox=self._runs_inside_the_sandbox(),
         )
         run_result = await self._run_runbook(cand_runbook, correlation_id)
         executed = self._repo.load_runbook(
             cand_runbook.runbook_id, correlation_id=correlation_id
         )
         if run_result.status != "complete":
-            failed_step = "candidate_deploy"
-            if executed is not None and run_result.stopped_at_index is not None:
-                idx = run_result.stopped_at_index
-                if 0 <= idx < len(executed.steps):
-                    failed_step = executed.steps[idx].step_type
+            failed_step, refusal = self._stopped_at(
+                executed, run_result, default="candidate_deploy"
+            )
             await self._teardown_candidate(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
             )
-            summary["failed_step"] = failed_step
+            # This is the words the merge report says the candidate stopped
+            # at, so when the step never ran the sidecar's own reason travels
+            # with it. Before this, the reason existed only in a ledger row
+            # and the report said "stopped at deploy_compose" and no more.
+            summary["failed_step"] = (
+                f"{failed_step} — {refusal}" if refusal else failed_step
+            )
             failed = await self._candidate_failed_result(
                 profile,
                 correlation_id=correlation_id,
@@ -1199,6 +1302,7 @@ class DeployStageRunner:
                 reason="candidate_deploy_failed",
                 failing_verdict=None,
                 events=events,
+                failure_detail=refusal,
             )
             return failed, summary
 
@@ -1274,15 +1378,29 @@ class DeployStageRunner:
             target=profile.env_id,
             extra_env=teardown_env,
             now=self._clock(),
+            inside_sandbox=self._runs_inside_the_sandbox(),
         )
         try:
             run_result = await self._run_runbook(teardown_runbook, correlation_id)
             if run_result.status != "complete":
+                # Say why, not just that. When the sidecar refused the request
+                # the teardown never ran at all, and that sentence is the only
+                # thing that explains the warning below.
+                try:
+                    executed = self._repo.load_runbook(
+                        teardown_runbook.runbook_id, correlation_id=correlation_id
+                    )
+                except Exception:  # noqa: BLE001 — the warning matters more
+                    executed = None
+                _, refusal = self._stopped_at(
+                    executed, run_result, default="deploy_compose"
+                )
                 logger.warning(
-                    "candidate teardown for %s did not complete (status=%s); "
+                    "candidate teardown for %s did not complete (status=%s)%s; "
                     "the -cand project may still be up (manual cleanup)",
                     profile.env_id,
                     run_result.status,
+                    f" — {refusal}" if refusal else "",
                 )
                 return False
             return True
@@ -1303,12 +1421,17 @@ class DeployStageRunner:
         reason: str,
         failing_verdict: str | None,
         events: list[str],
+        failure_detail: str | None = None,
     ) -> DeployStageResult:
         """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
 
         A loud, honest failure that names the candidate as the cause and records
         that the live name was untouched — recoverable (retry the deploy), never
         a revert (there is nothing live to roll back to).
+
+        ``failure_detail`` is the sidecar's own sentence when the step never
+        ran because the sidecar refused it; it goes into the failure line so a
+        person reads why, not just where.
         """
         when = self._clock()
         detail_verdict = (
@@ -1316,8 +1439,10 @@ class DeployStageRunner:
             if failing_verdict is not None
             else ""
         )
+        detail_clause = f" — {failure_detail}" if failure_detail else ""
         failure_reason = (
-            f"candidate leg failed at {failed_step!r}{detail_verdict}; the "
+            f"candidate leg failed at {failed_step!r}{detail_verdict}"
+            f"{detail_clause}; the "
             f"candidate ('{profile.env_id}-cand') was torn down and the LIVE "
             f"name '{profile.env_id}' was never touched (no promote, no revert)"
         )
@@ -1483,6 +1608,7 @@ class DeployStageRunner:
             target=profile.env_id,
             rollback_image_ref=rollback_ref,
             now=self._clock(),
+            inside_sandbox=self._runs_inside_the_sandbox(),
         )
         run_result = await self._run_runbook(revert_runbook, correlation_id)
         executed = self._repo.load_runbook(
@@ -1607,11 +1733,9 @@ class DeployStageRunner:
         events: list[str],
     ) -> DeployStageResult:
         """Handle a DEPLOY runbook that escalated (step failure or approval pause)."""
-        failed_step = "unknown"
-        if executed is not None and run_result.stopped_at_index is not None:
-            idx = run_result.stopped_at_index
-            if 0 <= idx < len(executed.steps):
-                failed_step = executed.steps[idx].step_type
+        failed_step, refusal = self._stopped_at(
+            executed, run_result, default="unknown"
+        )
 
         # An awaiting_approval pause is an irreversible-edge escalation handled
         # by the EXISTING approval-gate loop — not a failed deploy.
@@ -1624,6 +1748,13 @@ class DeployStageRunner:
                 deploy_runbook_id=f"deploy-{deploy_run_id}",
                 dry_run=self._dry_run,
                 detail={"reason": "awaiting_approval"},
+            )
+
+        if refusal:
+            # The step never ran: say so where a person is looking, not only
+            # in the ledger row the sidecar's answer is stored in.
+            logger.error(
+                "deploy step %s did not run — %s", failed_step, refusal
             )
 
         when = self._clock()
@@ -1652,7 +1783,10 @@ class DeployStageRunner:
                 env_id=profile.env_id,
                 deploy_run_id=deploy_run_id,
                 failed_step=failed_step,
-                failure_reason=f"deploy runbook escalated: {run_result.reason}",
+                failure_reason=(
+                    f"deploy runbook escalated: {run_result.reason}"
+                    + (f" — {refusal}" if refusal else "")
+                ),
                 recoverable=True,
                 feat_id=feat_id,
                 task_id=task_id,
