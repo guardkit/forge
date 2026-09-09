@@ -534,6 +534,12 @@ def bind_production_dispatch_chain(
         # strict no-op). DDR-007 boot protection: a composition failure never
         # bricks boot — the offer simply stays off; the ERROR log is the probe.
         merge_offer_hook: Any = None
+        # The one merge-card publisher. Two things reach for it: the routine
+        # build's own hook below, and the fix journey's merge-ready
+        # checkpoint (composed further down). They share this instance on
+        # purpose — the card the owner taps has to be the card the merge
+        # press consumes, and there is now only one of them.
+        merge_offer_service: Any = None
         try:
             _merge_cfg = getattr(forge_config, "merge_executor", None)
             if _merge_cfg is not None and _merge_cfg.enabled:
@@ -543,16 +549,17 @@ def bind_production_dispatch_chain(
                 _offer_kwargs: dict[str, Any] = (
                     {} if _offer_git_head is None else {"git_head": _offer_git_head}
                 )
-                _merge_offer_service = MergeOfferService(
+                merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,
                     pipeline_publisher=publisher,
                     raw_publish=client.publish,
                     **_offer_kwargs,
                 )
-                merge_offer_hook = _merge_offer_service.maybe_offer
+                merge_offer_hook = merge_offer_service.maybe_offer
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             merge_offer_hook = None
+            merge_offer_service = None
             logger.error(
                 "forge-serve: merge-offer composition FAILED (%s) — no merge "
                 "card will be offered after clean builds until fixed",
@@ -759,9 +766,7 @@ def bind_production_dispatch_chain(
                     sqlite_pool=sqlite_pool,
                     forge_config=forge_config,
                     lifecycle_emitter=emitter,
-                    gate_parts=gate_parts,
-                    gate_repository=gate_repository,
-                    gate_state_machine=gate_state_machine,
+                    merge_offer_service=merge_offer_service,
                     clock=_gate_wall_clock,
                     nats_client=client,
                     take_ack_handle=take_ack_handle,
@@ -1719,10 +1724,8 @@ def _compose_conductor_router(
     sqlite_pool: Any,
     forge_config: Any,
     lifecycle_emitter: Any,
-    gate_parts: Any,
-    gate_repository: Any,
-    gate_state_machine: Any,
     clock: "Callable[[], datetime]",
+    merge_offer_service: Any = None,
     nats_client: Any = None,
     take_ack_handle: "Callable[[str], Any] | None" = None,
 ) -> "Callable[..., Any] | None":
@@ -1740,13 +1743,14 @@ def _compose_conductor_router(
        allowlist — the fix journey runs inside the same fences.
     2. The **merge card publisher**
        (:func:`forge.cli._serve_gate_activation.make_merge_card_publisher`)
-       — the SAME approve-click machinery the consumer path delivers
-       through, so the merge-ready checkpoint publishes the card that
-       already exists rather than inventing a second surface. Absent gate
-       parts (a boot where the approval seam failed to construct) it stays
-       ``None``, which is *delivery OFF*: the checkpoint still runs its
-       gates-green precondition and reports honestly, and no card is ever
-       claimed that was not sent.
+       over the routine build's OWN merge-offer publisher, handed in as
+       ``merge_offer_service`` — so the merge-ready checkpoint publishes
+       the very card the merge press listens for rather than a second one
+       nothing is subscribed to (2026-09-09: the owner approved such a
+       card and nothing merged). Without a merge press composed this boot
+       it stays ``None``, which is *delivery OFF*: the checkpoint still
+       runs its gates-green precondition and reports honestly, and no card
+       is ever claimed that was not sent.
     3. The **supervisor factory** and the **driver deps factory** — the
        two things ``build_conductor_router`` refused to invent for itself.
     4. The router, which reads the dequeued build's mode and answers
@@ -1805,21 +1809,21 @@ def _compose_conductor_router(
     )
 
     publish_card: Any = None
-    if gate_parts is not None:
+    if merge_offer_service is not None:
         from forge.cli._serve_gate_activation import make_merge_card_publisher
 
         publish_card = make_merge_card_publisher(
-            parts=gate_parts,
+            offer_service=merge_offer_service,
             sqlite_pool=sqlite_pool,
-            gate_repository=gate_repository,
-            gate_state_machine=gate_state_machine,
             clock=clock,
         )
     else:
         logger.warning(
-            "conductor: no approval gate parts this boot — the merge-ready "
-            "checkpoint runs with DELIVERY OFF. A fix journey will still run "
-            "and leave receipts; it will publish no card and will say so"
+            "conductor: the merge press is not composed this boot (switched "
+            "off, or its own composition failed) — the merge-ready checkpoint "
+            "runs with DELIVERY OFF. A fix journey will still run and leave "
+            "receipts; it publishes no card and says so, because a card with "
+            "no press behind it is a card the owner's merge word falls off"
         )
 
     gates_green_reader = make_gates_green_reader(

@@ -364,9 +364,6 @@ class TestTheLegSeatIsConfigAsCode:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=True),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
             )
         finally:
@@ -391,9 +388,6 @@ class TestTheLegSeatIsConfigAsCode:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=False),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
             )
         finally:
@@ -430,9 +424,6 @@ class TestThePackReaderIsWired:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=True),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
             )
         finally:
@@ -1119,9 +1110,6 @@ class TestFlagOffIsALiteralPassThrough:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=True),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
             )
         finally:
@@ -1539,9 +1527,6 @@ class TestTheResumeSeam:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=True),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
                 nats_client=_FakeNats(),
             )
@@ -1567,9 +1552,6 @@ class TestTheResumeSeam:
                 sqlite_pool=pool,
                 forge_config=_config(conductor_on=True),
                 lifecycle_emitter=None,
-                gate_parts=None,
-                gate_repository=None,
-                gate_state_machine=None,
                 clock=lambda: None,
             )
         finally:

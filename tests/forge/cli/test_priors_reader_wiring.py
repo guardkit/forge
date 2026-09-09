@@ -5,10 +5,12 @@ One ``Test*`` class per wiring guarantee:
 * ``TestPartsRequirePriorsReader`` — the field is required with NO
   default: omitting it is a ``TypeError``, never a quiet empty read.
 * ``TestSentinelThreading`` — the reader placed on the parts IS the
-  object the gate awaits at all three activation paths
-  (``maybe_gate_build``, the merge card's ``publish_card``,
-  ``rearm_paused_gates``) — plus a source-level guard that no
-  activation path constructs its own ``EmptyPriorsReader``.
+  object the gate awaits at both activation paths (``maybe_gate_build``
+  and ``rearm_paused_gates``) — plus a source-level guard that no
+  activation path constructs its own ``EmptyPriorsReader``. The merge
+  card was a third path until 2026-09-09: it no longer runs a gate at
+  all, because it is now the routine build's own merge card, and the
+  merge press — not a gate — is what answers it.
 * ``TestMergeInertGolden`` — env OFF composes ``EmptyPriorsReader`` and
   a ``gate_check`` run yields the pre-change decision shape
   (``evidence=[]``, ``MANDATORY_HUMAN_APPROVAL``).
@@ -36,7 +38,6 @@ from forge.cli._serve_deps_gating import (
     build_approval_gate_parts,
 )
 from forge.cli._serve_gate_activation import (
-    make_merge_card_publisher,
     maybe_gate_build,
     rearm_paused_gates,
 )
@@ -195,34 +196,6 @@ class TestSentinelThreading:
         assert captured[0].priors_reader is sentinel
 
     @pytest.mark.asyncio
-    async def test_merge_card_threads_parts_reader(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        sentinel = _SentinelReader()
-        parts = _parts_with(sentinel)
-        captured: list[GateCheckDeps] = []
-
-        async def _fake_gate_check(*, deps: GateCheckDeps, **kwargs: Any) -> Any:
-            captured.append(deps)
-            return GateOutcome.RESUMED, _decision()
-
-        monkeypatch.setattr(_serve_gate_activation, "gate_check", _fake_gate_check)
-
-        publish_card = make_merge_card_publisher(
-            parts=parts,
-            sqlite_pool=_RunningRowPool(),  # type: ignore[arg-type]
-            gate_repository=object(),  # type: ignore[arg-type]
-            gate_state_machine=object(),  # type: ignore[arg-type]
-            clock=_fixed_clock,
-        )
-        outcome = await publish_card(
-            build_id="build-w1", feature_id="FEAT-W1"
-        )
-
-        assert outcome is GateOutcome.RESUMED
-        assert captured[0].priors_reader is sentinel
-
-    @pytest.mark.asyncio
     async def test_rearm_paused_gates_threads_parts_reader(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -302,13 +275,14 @@ class TestSentinelThreading:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def test_no_activation_path_builds_its_own_empty_reader(self) -> None:
-        # Structural guard for all three call sites at once: the
-        # activation module reads parts.priors_reader and never
-        # constructs an EmptyPriorsReader of its own (the docstring may
-        # still NAME the class; constructing it is the regression).
+        # Structural guard for both call sites at once: the activation
+        # module reads parts.priors_reader and never constructs an
+        # EmptyPriorsReader of its own (the docstring may still NAME the
+        # class; constructing it is the regression). Two, not three,
+        # since 2026-09-09: the merge card no longer runs a gate.
         source = inspect.getsource(_serve_gate_activation)
         assert "EmptyPriorsReader()" not in source
-        assert source.count("priors_reader=parts.priors_reader") == 3
+        assert source.count("priors_reader=parts.priors_reader") == 2
 
 
 async def _noop_launcher(**_: Any) -> None:
