@@ -123,6 +123,7 @@ __all__ = [
     "parse_changed_approval_lines",
     "path_is_specification",
     "unreadable_branch_changes",
+    "unreadable_specification_declaration",
 ]
 
 
@@ -258,6 +259,14 @@ class RedGateAction(StrEnum):
 # the journey has been editing — the same law the toolchain declaration is
 # read under, and for the same reason: a branch that could rewrite the
 # declaration could free itself.
+#
+# SAYING NOTHING AND SAYING SOMETHING NOBODY CAN HEAR ARE DIFFERENT THINGS.
+# No declaration file at all means "the default is my shape", and the default
+# applies. A declaration file that is there and cannot be read or parsed is a
+# reading that did not happen, and refuses — because reading it as "declares
+# nothing" would fence the DEFAULT paths in place of the ones it names, which
+# for a repository whose specification lives somewhere else is LESS
+# protection, not more (:func:`unreadable_specification_declaration`).
 
 #: What a repository's specification is when it declares nothing: the
 #: acceptance twins under ``qa/twins/``. That is api_test's own shape and the
@@ -602,6 +611,33 @@ def unreadable_branch_changes(reason: str) -> SpecificationFenceReport:
             "card was published"
         ),
         failed_gates=("what the branch changed could not be read",),
+    )
+
+
+def unreadable_specification_declaration(reason: str) -> SpecificationFenceReport:
+    """What the fence answers when the repository's own declaration of which
+    files are its specification is THERE and could not be read.
+
+    Not the same thing as a repository that declares nothing. A repository
+    with no declaration file has said, plainly, "the default is my shape",
+    and the default applies. A declaration that exists but cannot be read or
+    parsed has said something nobody could hear — and reading it as "declares
+    nothing" would quietly protect the DEFAULT paths instead of the ones it
+    names, which for a repository whose specification lives somewhere else is
+    less protection, not more. So it refuses, like every other reading that
+    did not happen.
+    """
+    return SpecificationFenceReport(
+        status=SpecificationFenceStatus.UNREADABLE,
+        detail=(
+            "which files this repository calls its specification could not be "
+            f"read ({reason}), so it cannot be shown that its specification "
+            "and its recorded approvals are untouched, and no card was "
+            "published"
+        ),
+        failed_gates=(
+            "which files this repository calls its specification could not be read",
+        ),
     )
 
 

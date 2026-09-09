@@ -32,6 +32,7 @@ What is pinned:
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -258,20 +259,50 @@ class TestReadingTheBranchWhereItIs:
         assert report.refuses is True
         assert "no recorded worktree_path" in report.detail
 
-    def test_a_path_that_is_not_a_git_tree_has_no_branch_to_fence(
+    def test_a_worktree_directory_that_is_gone_is_a_refusal_never_a_pass(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        """The branch is still in the clone carrying every one of its commits;
+        only the tree it was written in has gone. "There is nothing to read
+        here" is not the same statement as "this branch changed nothing", and
+        only the second one may lead to a card."""
+        _git(worktree, "mv", TWIN, RENAMED_TWIN)
+        _commit(worktree, "update the twin")
+        shutil.rmtree(worktree)
+
+        report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+
+        assert report.status is SpecificationFenceStatus.UNREADABLE
+        assert report.refuses is True
+        assert "there is nothing at" in report.detail
+
+    def test_a_path_that_is_not_a_git_tree_is_a_refusal_never_a_pass(
         self, pool: Any, clone: Path, worktree: Path, tmp_path: Path
     ) -> None:
-        """A path with no ``.git`` in it carries no branch and no commits, so
-        nothing in it can reach main and there is nothing to read."""
+        """A plain directory where the journey's tree should be: the reading
+        did not happen, so the fence refuses like every other reading that
+        did not happen."""
+        _git(worktree, "mv", TWIN, RENAMED_TWIN)
+        _commit(worktree, "update the twin")
+        shutil.rmtree(worktree)
+        worktree.mkdir(parents=True)
+
+        report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+
+        assert report.status is SpecificationFenceStatus.UNREADABLE
+        assert report.refuses is True
+        assert "is not the root of a git tree" in report.detail
+
+    def test_the_reader_itself_names_both_of_those(self, tmp_path: Path) -> None:
+        gone = tmp_path / "nothing-here"
         plain = tmp_path / "not-a-repo"
         plain.mkdir()
-        (plain / TWIN.replace("/", "_")).write_text("rewritten\n", encoding="utf-8")
 
-        names, patch, error = conductor.read_branch_changes(
-            worktree=plain, base="main"
-        )
+        _, _, missing_error = conductor.read_branch_changes(worktree=gone, base="main")
+        _, _, plain_error = conductor.read_branch_changes(worktree=plain, base="main")
 
-        assert (names, patch, error) == ("", "", None)
+        assert missing_error and "there is nothing at" in missing_error
+        assert plain_error and "is not the root of a git tree" in plain_error
 
     def test_git_failing_to_answer_is_a_refusal_never_a_pass(
         self, pool: Any, clone: Path, worktree: Path
@@ -359,17 +390,89 @@ class TestTheRepositorySaysWhatItsSpecificationIs:
         assert report.status is SpecificationFenceStatus.REFUSED
         assert TWIN in report.detail
 
-    def test_a_declaration_that_will_not_parse_leaves_the_default_standing(
-        self, clone: Path
-    ) -> None:
-        _write(clone / ".guardkit" / "config.yaml", "specification: [: not yaml\n")
-
-        assert conductor.load_declared_specification_paths(clone) is None
-
     def test_a_file_with_no_such_key_declares_nothing(self, clone: Path) -> None:
         _write(clone / ".guardkit" / "config.yaml", 'toolchain:\n  test: "true"\n')
 
         assert conductor.load_declared_specification_paths(clone) is None
+
+    def test_no_file_at_all_declares_nothing(self, clone: Path) -> None:
+        assert not (clone / ".guardkit" / "config.yaml").exists()
+
+        assert conductor.load_declared_specification_paths(clone) is None
+
+
+class TestADeclarationNobodyCanHearIsNotADeclarationOfNothing:
+    """Saying nothing and saying something nobody can hear are different
+    things. The first takes the default; the second refuses, because falling
+    back to the default would fence the DEFAULT paths in place of the ones
+    this repository meant to name — less protection, not more."""
+
+    def test_a_declaration_that_will_not_parse_is_unreadable(
+        self, clone: Path
+    ) -> None:
+        _write(clone / ".guardkit" / "config.yaml", "specification: [: not yaml\n")
+
+        answer = conductor.load_declared_specification_paths(clone)
+
+        assert isinstance(answer, conductor.UnreadableDeclaration)
+        assert "could not be parsed" in answer.reason
+
+    def test_a_specification_block_with_no_paths_is_unreadable(
+        self, clone: Path
+    ) -> None:
+        _write(clone / ".guardkit" / "config.yaml", "specification:\n  files: []\n")
+
+        answer = conductor.load_declared_specification_paths(clone)
+
+        assert isinstance(answer, conductor.UnreadableDeclaration)
+        assert "no paths: list" in answer.reason
+
+    def test_a_file_that_is_there_and_will_not_open_is_unreadable(
+        self, clone: Path
+    ) -> None:
+        """A directory where the file should be: it IS there, and it cannot
+        be read."""
+        (clone / ".guardkit" / "config.yaml").mkdir(parents=True)
+
+        answer = conductor.load_declared_specification_paths(clone)
+
+        assert isinstance(answer, conductor.UnreadableDeclaration)
+        assert "could not be read" in answer.reason
+
+    def test_the_fence_refuses_rather_than_falling_back_to_the_default(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        """The whole point: this repository's specification is
+        ``contracts/**``, NOT the twins. Read as "declares nothing" the
+        default would stand and a branch rewriting a contract would come back
+        CLEAR."""
+        _write(worktree / "contracts" / "delete.yaml", "gone: 410\n")
+        _commit(worktree, "rewrite the contract")
+
+        def _raises(_repo_root: Any) -> Any:
+            raise OSError("the declaration could not be opened")
+
+        report = _fence(pool, clone, declaration_loader=_raises)(
+            build_id=BUILD_ID, branch=JOURNEY_BRANCH
+        )
+
+        assert report.status is SpecificationFenceStatus.UNREADABLE
+        assert report.refuses is True
+        assert "which files this repository calls its specification" in report.detail
+
+    def test_an_unparseable_declaration_stops_the_card_through_the_real_loader(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        _write(clone / ".guardkit" / "config.yaml", "specification: [: not yaml\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "a declaration nobody can parse")
+        _write(worktree / "src" / "crud.py", "def delete():\n    return None\n")
+        _commit(worktree, "the fix")
+
+        report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+
+        assert report.status is SpecificationFenceStatus.UNREADABLE
+        assert "could not be parsed" in report.detail
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +581,33 @@ class TestTheSandboxFormIsTheSameFence:
         )
 
         assert declared == ("contracts/**",)
+
+    def test_no_declaration_on_the_branch_declares_nothing(
+        self, clone: Path, worktree: Path, sidecar: Any
+    ) -> None:
+        """The route answers ``content: null`` when the file is not there,
+        and THAT is the one "declares nothing": the default applies."""
+        declared = conductor.load_declared_specification_paths_from_sandbox(
+            clone,
+            sandbox=sidecar.config.planning.sandboxes[REPO_WITH],
+            repo=REPO_WITH,
+        )
+
+        assert declared is None
+
+    def test_a_sidecar_that_cannot_be_reached_is_unreadable_not_nothing(
+        self, clone: Path
+    ) -> None:
+        config = _config(clone, sidecar_url="http://127.0.0.1:9")
+
+        answer = conductor.load_declared_specification_paths_from_sandbox(
+            clone,
+            sandbox=config.planning.sandboxes[REPO_WITH],
+            repo=REPO_WITH,
+        )
+
+        assert isinstance(answer, conductor.UnreadableDeclaration)
+        assert "could not be reached" in answer.reason
 
 
 # ---------------------------------------------------------------------------
