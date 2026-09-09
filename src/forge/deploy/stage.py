@@ -426,6 +426,12 @@ class DeployStageRunner:
         The steps built for that venue are not sent the settings that say how
         to make the sandbox: it is already made, and the wrapper that would
         read them is not what runs.
+
+        The question is about the repository alone, not about which script the
+        profile names. Every script this stage runs for such a repository runs
+        inside the sandbox; _profile_for_run below does the separate, narrower
+        job of swapping a host wrapper for the inner script it would have run
+        in there, and leaves any other script alone.
         """
         return self._sandbox is not None
 
