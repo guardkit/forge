@@ -34,8 +34,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import TYPE_CHECKING, Callable
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from forge.gating.degraded import degraded_recovery_decision
 from forge.gating.identity import parse_request_id
@@ -64,8 +64,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (avoids an import cycle)
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "GATE_RESUME_STAGE_LABEL",
+    "GATE_RESUME_TARGET_IDENTIFIER",
     "StaleTransitionError",
     "build_sqlite_gate_adapters",
+    "seconds_spent_waiting_for_a_person",
 ]
 
 #: ``stage_log.details_json`` key that holds the durable
@@ -77,6 +80,21 @@ _GATE_DETAILS_KEY: str = "gate"
 #: (request_id / attempt_count / feature_id) — the durable audit home for
 #: the pause event.
 _GATE_PAUSE_DETAILS_KEY: str = "gate_pause"
+
+#: ``stage_log.details_json`` key marking the moment a person's gate
+#: decision let a paused build carry on. It is the closing bracket to the
+#: ``gate_pause`` rows above: between a pause row and the next resume row,
+#: the build was waiting for a person and not working.
+_GATE_RESUME_DETAILS_KEY: str = "gate_resume"
+
+#: ``stage_label`` / ``target_identifier`` of that resume row. Both are
+#: deliberately words no other reader looks for: the fix journey's history
+#: projection only knows ``task-review`` / ``task-work`` /
+#: ``pull-request-review`` and skips everything else, and the merge card and
+#: merge press match on their own target identifiers. So the row is a note in
+#: the ledger for the budget's benefit and changes nobody else's reading.
+GATE_RESUME_STAGE_LABEL: str = "gate-resume"
+GATE_RESUME_TARGET_IDENTIFIER: str = "gate-resume"
 
 
 class StaleTransitionError(Exception):
@@ -361,9 +379,11 @@ class _SqliteStateMachine:
         self,
         pool: SqliteLifecyclePersistence,
         *,
+        clock: Callable[[], datetime],
         handoff: _PauseHandoff,
     ) -> None:
         self._pool = pool
+        self._clock = clock
         self._handoff = handoff
         self._canceller = SqliteBuildCanceller(pool)
 
@@ -381,6 +401,14 @@ class _SqliteStateMachine:
         optimistic-concurrency ``RuntimeError`` the row is re-read: a
         concurrent terminal is softened to a WARNING (a CLI-cancel beat the
         approve); anything else re-raises.
+
+        A resume that really did end a wait also writes ONE note in the
+        ledger saying so (:meth:`_record_gate_resume`). Without it nothing
+        durable says when the waiting stopped: the pause rows are written
+        while the build waits, the pending approval id is wiped by this very
+        UPDATE, and the daemon is recreated several times a day, so
+        remembering it in the process would lose it. The note is what lets
+        the budget subtract the wait from the build's working time.
         """
         current = _read_status(self._pool, build_id)
         if current in TERMINAL_STATES:
@@ -395,6 +423,10 @@ class _SqliteStateMachine:
             # Idempotent double-approve — the bridge's later BuildStarted
             # write-back also composes to a no-op here.
             return
+        was_waiting = current is BuildState.PAUSED
+        pending_request_id = (
+            self._read_pending_approval_request_id(build_id) if was_waiting else None
+        )
         try:
             self._pool.apply_transition(
                 compose_transition(
@@ -413,6 +445,76 @@ class _SqliteStateMachine:
                 )
                 return
             raise
+        if was_waiting:
+            self._record_gate_resume(build_id, request_id=pending_request_id)
+
+    def _read_pending_approval_request_id(self, build_id: str) -> str | None:
+        """The approval id the build was waiting on, for the resume note."""
+        row = self._pool.connection.execute(
+            "SELECT pending_approval_request_id FROM builds WHERE build_id = ?",
+            (build_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = (
+            row["pending_approval_request_id"]
+            if isinstance(row, sqlite3.Row)
+            else row[0]
+        )
+        return str(value) if value else None
+
+    def _record_gate_resume(self, build_id: str, *, request_id: str | None) -> None:
+        """Write the one durable note that a person's decision ended the wait.
+
+        Written only when the build really was PAUSED a moment ago, so a
+        second, redundant resume (an idempotent double-approve, a redelivered
+        decision) writes nothing: the row is not there to be counted, it is
+        there to close the wait that the ``gate_pause`` rows opened, and a
+        wait that is already closed cannot be closed twice
+        (:func:`seconds_spent_waiting_for_a_person`).
+
+        A failure to write is logged loudly and swallowed: the person's
+        decision has already landed in ``builds.status`` and a build must
+        never be held back because a note about it could not be filed. The
+        cost of a missing note is that the wait it closes is measured only up
+        to the last pause the ledger saw, so a little waiting is counted as
+        work — the safe direction, and the cap keeps bounding machine work
+        (:func:`seconds_spent_waiting_for_a_person`).
+        """
+        now = self._clock()
+        entry = StageLogEntry(
+            build_id=build_id,
+            stage_label=GATE_RESUME_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=GATE_RESUME_TARGET_IDENTIFIER,
+            status="PASSED",
+            gate_mode=None,
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.0,
+            details={
+                _GATE_RESUME_DETAILS_KEY: {
+                    "request_id": request_id,
+                    "note": (
+                        "a person's decision let this build carry on; the "
+                        "time it spent waiting before this moment is not "
+                        "counted as work"
+                    ),
+                }
+            },
+        )
+        try:
+            self._pool.record_stage(entry)
+        except Exception as exc:  # noqa: BLE001 - a note must never block a resume
+            logger.error(
+                "transition_to_running: could not record the gate-resume note "
+                "for build_id=%s (%s: %s) — the build has resumed; its wait "
+                "will keep counting as waiting until the next resume is "
+                "recorded",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
 
     async def transition_to_failed(self, *, build_id: str, reason: str) -> None:
         """Transition the current state → FAILED (HARD_STOP)."""
@@ -464,6 +566,92 @@ def _read_status(pool: SqliteLifecyclePersistence, build_id: str) -> BuildState:
     return BuildState(status)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Give a naive timestamp UTC, so two rows can always be subtracted."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def seconds_spent_waiting_for_a_person(
+    rows: Iterable[Any],
+    *,
+    now: datetime | None = None,
+    still_waiting: bool = True,
+) -> float:
+    """How long this build sat waiting for a person, read from the ledger.
+
+    Takes a build's ``stage_log`` rows in the order they were written and
+    adds up every span between a pause that waits for a human decision and
+    the decision that ended it. Nothing is remembered in the process: the
+    rows are the whole story, so a daemon that is recreated in the middle of
+    a wait — which happens several times a day — reads back exactly the same
+    number.
+
+    The two kinds of row it reads, both already written today:
+
+    * a pause row (``details["gate_pause"]``), written when a gate parks the
+      build for a person, and written again by the boot sweep every time it
+      re-offers the same card. Only the FIRST of a run of them opens the
+      wait, so fifteen re-offers through one night are still one wait.
+    * a resume row (``details["gate_resume"]``), the note
+      ``transition_to_running`` writes when the person's decision let the
+      build carry on. It closes the open wait; a resume with no wait open
+      closes nothing, which is what makes a decision recorded twice subtract
+      only once.
+
+    A wait that is still open — the build is paused right now, nobody has
+    decided — runs to ``now``, so the hours a build is sitting at its gate
+    are never mistaken for work while they are still passing. With no clock
+    the open wait is simply not counted, which is the same honest answer a
+    caller with no clock can give anywhere else here.
+
+    An open wait on a build that is NOT paused any more is a wait whose end
+    was never written down (a resume through some path that files no note).
+    That one is closed at the last moment the ledger actually saw the build
+    waiting — the last pause row — rather than being allowed to run on to
+    ``now``. Otherwise a single missing note would excuse a build from its
+    cap for ever, and the cap has to keep bounding machine work. The cost is
+    that such a wait is under-counted, which is the safe direction: the
+    ledger only excuses waiting it can show.
+
+    Args:
+        rows: The build's stage rows, oldest first (what ``read_stages``
+            returns). Anything with ``details`` and ``started_at`` will do.
+        now: The current time, for a wait that has not ended yet.
+        still_waiting: Whether the build is paused at this very moment.
+            ``False`` closes an unclosed wait at the last pause row.
+
+    Returns:
+        Seconds spent waiting for a person. ``0.0`` for a build that never
+        paused — such a build's numbers are exactly what they always were.
+    """
+    total = 0.0
+    waiting_since: datetime | None = None
+    last_seen_waiting: datetime | None = None
+    for row in rows:
+        details = getattr(row, "details", None) or {}
+        if not isinstance(details, dict):
+            continue
+        started_at = getattr(row, "started_at", None)
+        if not isinstance(started_at, datetime):
+            continue
+        stamp = _as_utc(started_at)
+        if _GATE_PAUSE_DETAILS_KEY in details:
+            if waiting_since is None:
+                waiting_since = stamp
+            last_seen_waiting = stamp
+        elif _GATE_RESUME_DETAILS_KEY in details:
+            if waiting_since is not None:
+                total += max(0.0, (stamp - waiting_since).total_seconds())
+                waiting_since = None
+    if waiting_since is not None:
+        ends_at = (
+            _as_utc(now) if (still_waiting and now is not None) else last_seen_waiting
+        )
+        if ends_at is not None:
+            total += max(0.0, (ends_at - waiting_since).total_seconds())
+    return total
+
+
 def build_sqlite_gate_adapters(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
@@ -489,5 +677,5 @@ def build_sqlite_gate_adapters(
     """
     handoff = _PauseHandoff()
     repository = _SqliteGateRepository(sqlite_pool, clock=clock, handoff=handoff)
-    state_machine = _SqliteStateMachine(sqlite_pool, handoff=handoff)
+    state_machine = _SqliteStateMachine(sqlite_pool, clock=clock, handoff=handoff)
     return repository, state_machine

@@ -24,6 +24,7 @@ Design boundaries
   light and trivially testable. Production composes them from the serve-side
   reuse helpers (:func:`forge.cli.serve.resolve_budget_for_build`,
   :func:`~forge.cli.serve.make_budget_started_at_reader`,
+  :func:`~forge.cli.serve.make_budget_waiting_seconds_reader`,
   :func:`~forge.cli.serve.budget_wall_clock`) via
   :func:`build_budget_breach_observer`.
 * Every side effect is guarded by BOTH a durable first-write-wins
@@ -112,6 +113,12 @@ class BudgetBreachObserver:
             config, bid)``.
         elapsed_seconds: ``(build_id) -> float`` wall-clock consumed by the
             build; fail-open ``0.0`` when unmeasurable (never a false breach).
+        waiting_seconds: ``(build_id) -> float`` how much of that was spent
+            PAUSED waiting for a person to decide something (its build gate,
+            above all). It is subtracted before the cap is consulted,
+            because the cap bounds machine work and the waiting is not work.
+            ``None`` — the default, and every caller that has not wired it —
+            subtracts nothing, so the number is exactly what it always was.
         read_coach_score: ``(build_id) -> float | None`` durable coach-score
             fallback (``builds.last_coach_score``) when the envelope carries
             none.
@@ -130,6 +137,7 @@ class BudgetBreachObserver:
         resolve_budget: Callable[[str], "tuple[BudgetGuards, str]"],
         elapsed_seconds: Callable[[str], float],
         read_coach_score: Callable[[str], "float | None"],
+        waiting_seconds: "Callable[[str], float] | None" = None,
         record_breach: Callable[[str, str], None],
         publish_approval_request: PublishApprovalRequestFn,
         approval_subject_for: Callable[[str], str],
@@ -137,6 +145,7 @@ class BudgetBreachObserver:
     ) -> None:
         self._resolve_budget = resolve_budget
         self._elapsed_seconds = elapsed_seconds
+        self._waiting_seconds = waiting_seconds
         self._read_coach_score = read_coach_score
         self._record_breach = record_breach
         self._publish_approval_request = publish_approval_request
@@ -192,6 +201,29 @@ class BudgetBreachObserver:
             detail,
         )
 
+    def _waiting_for_a_person(self, build_id: str) -> float:
+        """Seconds the build spent waiting for a person, or ``0.0``.
+
+        ``0.0`` when no reader is wired (the pre-reader behaviour, kept byte
+        for byte) and ``0.0`` with a loud log when the reader raises — the
+        cap then measures elapsed time exactly as it did before any waiting
+        was excluded, rather than a budget bug breaking the stream.
+        """
+        if self._waiting_seconds is None:
+            return 0.0
+        try:
+            return max(0.0, float(self._waiting_seconds(build_id)))
+        except Exception as exc:  # noqa: BLE001 — never break the stream
+            logger.error(
+                "budget_observer: the waiting-for-a-person reader raised "
+                "%s: %s for build_id=%s; counting no waiting (the wall-clock "
+                "cap measures elapsed time, as it did before)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return 0.0
+
     async def observe_stage_complete(
         self,
         session: BudgetObserverSession,
@@ -246,9 +278,18 @@ class BudgetBreachObserver:
             if coach_score is not None
             else self._read_coach_score(build_id)
         )
+        # The same subtraction the supervisor makes, on the same rows: the
+        # hours a build spends waiting for a person at its gate are not work,
+        # so the cap is not charged for them. Both readers therefore give the
+        # same answer for the same build, and a build that never waited gives
+        # exactly the number it always gave.
+        waiting = self._waiting_for_a_person(build_id)
         metrics = BuildBudgetMetrics(
             review_cycles=session.review_cycles,
-            elapsed_wallclock_seconds=self._elapsed_seconds(build_id),
+            elapsed_wallclock_seconds=max(
+                0.0, self._elapsed_seconds(build_id) - waiting
+            ),
+            waiting_for_a_person_seconds=waiting,
             # Tokens stay unmeasured on this path (ADR-ARCH-033) — the cap is
             # inert until a real value flows.
             tokens_used=None,
@@ -337,11 +378,13 @@ def build_budget_breach_observer(
     from forge.cli.serve import (
         budget_wall_clock,
         make_budget_started_at_reader,
+        make_budget_waiting_seconds_reader,
         resolve_budget_for_build,
     )
     from nats_core.topics import Topics
 
     started_at_reader = make_budget_started_at_reader(pool)
+    waiting_seconds_reader = make_budget_waiting_seconds_reader(pool)
 
     def _elapsed_seconds(build_id: str) -> float:
         started = started_at_reader(build_id)
@@ -364,6 +407,7 @@ def build_budget_breach_observer(
             pool, config, build_id
         ),
         elapsed_seconds=_elapsed_seconds,
+        waiting_seconds=waiting_seconds_reader,
         read_coach_score=pool.read_last_coach_score,
         record_breach=pool.record_budget_breach,
         publish_approval_request=publish_approval_request,
