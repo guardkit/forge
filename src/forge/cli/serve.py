@@ -1101,6 +1101,7 @@ def build_supervisor(
     budget_profile_name: str = "attended",
     budget_wall_clock: "Callable[[], datetime] | None" = None,
     budget_started_at_reader: "Callable[[str], datetime | None] | None" = None,
+    budget_waiting_seconds_reader: "Callable[[str], float] | None" = None,
     budget_coach_score_reader: "Callable[[str], float | None] | None" = None,
     budget_pause: "Callable[..., Awaitable[None]] | None" = None,
     # ----- conductor revival, Stage 1b (design pass §a.1 / §a.3) -------
@@ -1146,7 +1147,8 @@ def build_supervisor(
 
     FEAT-UBS-002 budget DI (``budget_guards`` / ``budget_profile_name`` /
     ``budget_wall_clock`` / ``budget_started_at_reader`` /
-    ``budget_coach_score_reader`` / ``budget_pause``): pass-through kwargs
+    ``budget_waiting_seconds_reader`` / ``budget_coach_score_reader`` /
+    ``budget_pause``): pass-through kwargs
     threaded onto the :class:`Supervisor`'s budget fields. Each defaults to
     the Supervisor dataclass default (an ``attended`` caps-off /
     unwired-collaborator profile), so every existing caller is unchanged and
@@ -1217,6 +1219,7 @@ def build_supervisor(
         budget_profile_name=budget_profile_name,
         budget_wall_clock=budget_wall_clock,
         budget_started_at_reader=budget_started_at_reader,
+        budget_waiting_seconds_reader=budget_waiting_seconds_reader,
         budget_coach_score_reader=budget_coach_score_reader,
         budget_pause=budget_pause,
         build_mode_reader=build_mode_reader,
@@ -1435,6 +1438,68 @@ def make_budget_started_at_reader(
     return _reader
 
 
+def make_budget_waiting_seconds_reader(
+    pool: Any,
+    *,
+    clock: "Callable[[], datetime] | None" = None,
+) -> "Callable[[str], float]":
+    """Build the reader that says how long a build waited for a person.
+
+    Returns a ``(build_id) -> float``: the seconds the build spent PAUSED at
+    a gate waiting for somebody to decide, read straight out of the ledger's
+    own rows by
+    :func:`~forge.gating.sqlite_adapters.seconds_spent_waiting_for_a_person`
+    — the pause rows the gate writes, closed by the note the resume writes.
+    Nothing is held in the daemon's memory, so forge-prod being recreated in
+    the middle of a wait (which happens several times a day) changes no
+    answer.
+
+    The wall-clock cap is meant to bound machine work; this is what the
+    supervisor takes off the elapsed time before consulting it.
+
+    Args:
+        pool: The lifecycle persistence facade (anything with
+            ``read_stages``).
+        clock: ``() -> datetime`` used to measure a wait that is still open
+            — the build is paused right now and nobody has decided yet.
+            Defaults to :func:`budget_wall_clock`.
+
+    Returns:
+        The reader. It answers ``0.0`` for a build that never paused, and
+        ``0.0`` with a loud log if the ledger cannot be read — in which case
+        the cap measures elapsed time exactly as it did before any waiting
+        was excluded.
+    """
+    from forge.gating.sqlite_adapters import seconds_spent_waiting_for_a_person
+    from forge.lifecycle.state_machine import BuildState
+
+    ticker = clock if clock is not None else budget_wall_clock
+
+    def _reader(build_id: str) -> float:
+        try:
+            rows = pool.read_stages(build_id)
+            row = pool.get_build_row(build_id)
+        except Exception as exc:  # noqa: BLE001 — a read defect is not a breach
+            logger.error(
+                "budget waiting reader: reading the ledger raised %s: %s for "
+                "build_id=%s; counting no waiting (the wall-clock cap "
+                "measures elapsed time, as it did before)",
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return 0.0
+        # Is it waiting at this very moment? A wait with no end written down
+        # on a build that is running again is closed at the last pause the
+        # ledger saw, never left running on to now.
+        still_waiting = row is not None and row.status is BuildState.PAUSED
+        return seconds_spent_waiting_for_a_person(
+            rows, now=ticker(), still_waiting=still_waiting
+        )
+
+    return _reader
+
+
 def budget_wall_clock() -> "datetime":
     """Production ``budget_wall_clock`` — the current UTC time.
 
@@ -1591,6 +1656,8 @@ def build_conductor_budget_kwargs(
     * :func:`make_budget_started_at_reader` — the wall-clock cap's start
       anchor, over ``builds.started_at``.
     * :func:`budget_wall_clock` — the wall-clock cap's now.
+    * :func:`make_budget_waiting_seconds_reader` — the hours the build
+      spent waiting for a person, which the cap does not charge it for.
     * :func:`make_budget_pause` — publish the risk-high escalation, mark
       PAUSED, emit ``build-paused``, in the ADR-ARCH-021 order.
 
@@ -1619,6 +1686,9 @@ def build_conductor_budget_kwargs(
         "budget_profile_name": profile_name,
         "budget_wall_clock": budget_wall_clock,
         "budget_started_at_reader": make_budget_started_at_reader(pool),
+        # The waiting for a person, taken off the elapsed time before the
+        # wall-clock cap is consulted (the cap bounds machine work).
+        "budget_waiting_seconds_reader": make_budget_waiting_seconds_reader(pool),
         "budget_coach_score_reader": coach_score_reader,
     }
     if publish_approval_request is not None and lifecycle_emitter is not None:
@@ -2767,6 +2837,7 @@ __all__ = [
     "deregister",
     "make_budget_pause",
     "make_budget_started_at_reader",
+    "make_budget_waiting_seconds_reader",
     "make_handle_message_dispatcher",
     "open_fleet_client",
     "resolve_budget_for_build",
