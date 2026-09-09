@@ -448,7 +448,17 @@ class MergeCardNotPublished(RuntimeError):
     this build. None of them get better by trying a second time, and a
     second card for one merge word is the thing the whole one-card rule
     exists to prevent.
+
+    ``card_reached_the_wire`` is ``False`` and says the one thing the
+    checkpoint's record needs: NOTHING was published. Every refusal that
+    raises this happens before the offer touches the wire, so the journey
+    must write "no card was published, and here is why" rather than the
+    hedge it writes for a raise mid-publish ("the card may be on the
+    wire"). The checkpoint reads the attribute rather than this class, so
+    it keeps its no-import-edge discipline.
     """
+
+    card_reached_the_wire = False
 
 
 def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
@@ -463,11 +473,14 @@ def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
         feature_id: ``FEAT-XXXX`` of the build, as the card names it.
         branch: The branch the merge word will merge.
         gates: The checkpoint's own :class:`GatesReport`, read for its
-            ``detail`` (what the declared suite did) and its
-            ``deferred_detail`` (the stamped checks with no evidence here,
-            named, and what the merge press does about them). Anything
-            missing simply leaves that sentence out — the card never
-            claims a check it cannot name.
+            ``detail`` (what the declared suite did) and for WHETHER its
+            ``deferred_detail`` says anything at all. Only the fact that
+            something was left unproved reaches the card, said here in
+            ordinary words; the internal sentence — which names the
+            checks by their own ids and their homes — stays on the
+            decision and in the log, because a card is read by a person.
+            Anything missing simply leaves that sentence out — the card
+            never claims a check it cannot name.
     """
     detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
@@ -478,7 +491,14 @@ def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
         f"What was checked: {checked}.",
     ]
     if deferred:
-        sentences.append(deferred)
+        # Ordinary words for the fact, never the internal sentence: that one
+        # names check ids and their homes, which mean nothing to the person
+        # holding the card. The full sentence is on the decision and the log.
+        sentences.append(
+            "Some of the checks this repository asks for could not be proved "
+            "on this branch here; they are run against the candidate in the "
+            "sandbox before anything is merged."
+        )
     sentences.append(
         "Approve = check the candidate in the sandbox, merge the branch into "
         "main and promote it."

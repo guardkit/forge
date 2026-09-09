@@ -433,6 +433,19 @@ class TestTheWholeFixJourney:
 
 
 class TestTheDeclinedVariant:
+    """The classifier's own words, driven by a publisher that returns one.
+
+    Read these for what they are (2026-09-09). The PRODUCTION publisher no
+    longer waits for the owner and returns no verdict at all — the card it
+    publishes is the merge press's card, and the owner answers it to the
+    press. So a real journey never reaches ``DECLINED`` or ``EXPIRED``
+    today: a rejected merge reads "delivered" in the journey's report, and
+    what the owner said is in the press's own receipts. What these tests
+    still guard is that a publisher which DOES hand back a verdict has its
+    word reported honestly, which is the defect Stage 2 item 7 fixed and
+    the thing that must not rot while the words sit unused.
+    """
+
     def test_a_declined_card_is_reported_declined_not_delivered(self, rig) -> None:
         """Item 7. Stopping was always right; the WORD was wrong."""
         report = rig.run(FakeCardDelivery("CANCELLED"))

@@ -151,10 +151,13 @@ class GatesReport:
             stands the candidate up in its sandbox and runs the repository's
             live gate on it before anything lands (ruled 2026-09-08). It is
             recorded on the decision (``MergeCardDecision.rationale``) and
-            logged; it does NOT appear on the face of the Slack card, whose
-            words ``forge.gating.wrappers.gate_check`` builds without ever
-            seeing this report — putting it there is a named follow-on into
-            the card seam, not something this checkpoint can do. Empty for
+            logged. This sentence itself does NOT appear on the face of the
+            Slack card — it names the checks by their own ids, which mean
+            nothing to the person holding the card. Since 2026-09-09 the
+            card seam is handed this whole report and says the same fact in
+            ordinary words: some checks could not be proved on this branch
+            here, and they are run against the candidate in the sandbox
+            before anything is merged. Empty for
             every gate set that defers nothing, which is every one until an
             operator gives a repository a sandbox and a candidate check.
         evidence: What the declared test command itself printed, kept so the
@@ -550,25 +553,66 @@ class MergeReadyCheckpointPublisher:
                 )
             )
         except Exception as exc:  # noqa: BLE001 — a publish failure is not a merge
-            logger.error(
-                "%s: card publish raised %s: %s for build_id=%s — the journey "
-                "STOPS here and never re-publishes. The envelope may already "
-                "be on the wire; the gate's durable request_id plus "
-                "rearm_paused_gates own getting it in front of the owner, and "
-                "a second card from here would be a second act",
-                MERGE_READY_CHECKPOINT_LABEL,
-                type(exc).__name__,
-                exc,
-                build_id,
-            )
+            # TWO DIFFERENT THINGS, AND THE RECORD MUST NOT CONFUSE THEM.
+            # A publisher that REFUSES says so on the exception it raises
+            # (``card_reached_the_wire = False``): it decided not to offer
+            # before writing anything, so no card exists and the journey can
+            # say that plainly. Anything else — a raise from inside the
+            # publish itself, or a publisher that says nothing — leaves the
+            # envelope possibly on the wire, and the record has to hedge.
+            # Read as an attribute, not as a class, so this module keeps its
+            # no-import-edge discipline.
+            on_the_wire = getattr(exc, "card_reached_the_wire", True) is not False
+            if on_the_wire:
+                logger.error(
+                    "%s: card publish raised %s: %s for build_id=%s — the "
+                    "journey STOPS here and never re-publishes. The envelope "
+                    "may already be on the wire; the merge offer's own "
+                    "durable row is latched before the wire is touched, so "
+                    "nothing will offer this build a second card, and if the "
+                    "card did go out the owner's answer reaches the merge "
+                    "press, which is the only thing that acts on it",
+                    MERGE_READY_CHECKPOINT_LABEL,
+                    type(exc).__name__,
+                    exc,
+                    build_id,
+                )
+                reason = (
+                    f"{MERGE_READY_CHECKPOINT_LABEL}: card publish raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                note = (
+                    f"{MERGE_READY_CHECKPOINT_LABEL}: publish failed "
+                    f"({type(exc).__name__}) — the card may be on the wire; "
+                    "NOT re-published"
+                )
+            else:
+                logger.error(
+                    "%s: NO merge card was published for build_id=%s (%s: "
+                    "%s) — the offer refused before anything reached the "
+                    "wire, so there is nothing on the wire and nothing for "
+                    "the owner to answer. The journey STOPS here; the "
+                    "refusal's own reason is the logged sentence above this "
+                    "one",
+                    MERGE_READY_CHECKPOINT_LABEL,
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                reason = (
+                    f"{MERGE_READY_CHECKPOINT_LABEL}: no card was published: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                note = (
+                    f"{MERGE_READY_CHECKPOINT_LABEL}: no card was published "
+                    f"({type(exc).__name__}) — nothing reached the wire; NOT "
+                    "re-published"
+                )
             failure_pack = await self._write_failure_pack(
                 build_id=build_id,
                 feature_id=feature_id,
                 gates=gates,
-                reason=(
-                    f"{MERGE_READY_CHECKPOINT_LABEL}: card publish raised "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                reason=reason,
             )
             return MergeCardDecision(
                 outcome=MergeCardOutcome.PUBLISH_FAILED,
@@ -579,15 +623,12 @@ class MergeReadyCheckpointPublisher:
                 push_modelled=self._push_branch is None,
                 gates=gates,
                 auto_approve_refused=auto_approve_refused,
-                card_may_be_on_the_wire=True,
-                rationale=(
-                    f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: publish "
-                    f"failed ({type(exc).__name__}) — the card may be on the "
-                    "wire; NOT re-published"
-                ).strip(" |"),
+                card_may_be_on_the_wire=on_the_wire,
+                rationale=f"{rationale} | {note}".strip(" |"),
                 failure_pack=failure_pack,
                 details={
                     "publish_error": f"{type(exc).__name__}: {exc}",
+                    "card_may_be_on_the_wire": on_the_wire,
                     **evidence_details,
                 },
             )
@@ -600,9 +641,10 @@ class MergeReadyCheckpointPublisher:
             branch,
         )
         # THE LINE ABOUT THE CHECKS LEFT TO THE MERGE PRESS. It goes on this
-        # decision's rationale — the journey's own record, and the log — and
-        # NOT on the face of the Slack card: the card's words are built by
-        # gate_check, which is handed neither this report nor this rationale.
+        # decision's rationale — the journey's own record, and the log. The
+        # card seam IS handed this report (2026-09-09), and says the same
+        # fact in ordinary words of its own; this sentence, which names the
+        # checks by their ids and their homes, is not the one a person reads.
         # When the gate set deferred nothing this is empty and every word of
         # the decision is what it has always been.
         deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
@@ -639,27 +681,25 @@ class MergeReadyCheckpointPublisher:
         two merge cards, for one merge word.
 
         **The durable half** (``published_probe``) closes that. Production
-        wires it to the gate's OWN rows: the merge card rides
-        ``gate_check``, which writes a ``stage_log`` row labelled with the
-        merge-ready checkpoint before it ever waits for the owner. That
-        row is durable, it is written on the SAME publish, and — unlike
+        wires it to the ``stage_log`` row that ``publish_card`` writes
+        under the merge-ready checkpoint's own identifier once the card is
+        really out. That row is durable and — unlike
         ``builds.pending_approval_request_id`` — it survives the owner
         answering, so the probe stays true for the rest of the build's
         life. A restart therefore reads "already carded" and refuses.
 
-        **The residual window, honestly.** The durable row is written
-        *inside* ``publish_card``, a few statements after the in-memory
-        latch arms. A daemon killed in exactly that interval leaves no
-        durable evidence, so a restart could re-card. The window is the
-        span between arming the latch and the gate's first SQLite write —
-        milliseconds, no I/O of ours in between, and it is only reachable
-        by a hard kill (a raise inside the publisher is already terminal
-        via ``PUBLISH_FAILED``). Closing it completely would need the
-        checkpoint to own a durable pre-publish intent row of its own,
-        which means a second writer racing the gate's state machine for
-        the same fact — the exact shape of the false-terminal defect the
-        FTR lesson bans. So it stays open, named here, rather than closed
-        by a mechanism that would cost more than it buys.
+        **The residual window, honestly, and why it is now harmless.**
+        That row is written *after* the card reaches the wire, so a daemon
+        killed in the gap between the publish and the write leaves the
+        checkpoint's own row missing. What it does NOT leave missing is
+        the merge offer's own durable row, which the shared publisher
+        latches BEFORE it touches the wire (2026-09-09). So a restart in
+        that gap finds this probe false, tries again, and the offer itself
+        refuses — loudly, with no card — rather than putting a second card
+        in front of the owner. The two rows together mean one merge word
+        gets one card even across a hard kill; the earlier design, which
+        wrote a row from the gate on the same publish, had a real window
+        here and this one does not.
 
         A probe that RAISES answers "not carded" and says so loudly: an
         unreadable probe must not wedge a journey that has never carded,
