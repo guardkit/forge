@@ -1319,6 +1319,14 @@ def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") 
 #    incident used. No new file, and no new ceremony: a repository says this
 #    once, in the file it already has, or says nothing and takes the default.
 #
+#    Saying nothing and saying something nobody can hear are different
+#    things. NO declaration file is "the default is my shape", and the
+#    default applies. A declaration that IS there and cannot be read or
+#    parsed refuses, like every other reading that did not happen: reading it
+#    as "declares nothing" would fence the default paths in place of the ones
+#    it names, which for a repository whose specification lives somewhere
+#    else is less protection, not more.
+#
 #    Forge parses this key itself rather than through guardkit's loader,
 #    because it is forge's own key and guardkit's loader owns the
 #    ``toolchain:`` block alone. The declaration is read from the CANONICAL
@@ -1351,60 +1359,142 @@ BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
 SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S: float = 30.0
 
 
-def specification_paths_in(text: Any) -> "tuple[str, ...] | None":
+@dataclasses.dataclass(frozen=True)
+class UnreadableDeclaration:
+    """A declaration that IS there and could not be read or understood.
+
+    The third answer the loaders below can give, beside a list of paths and
+    ``None``. ``None`` means the repository declares nothing — no file, or a
+    file that says nothing about its specification — and the default applies,
+    which is right. This one means the repository said something and nobody
+    could hear it, and the fence turns it into a refusal, because reading it
+    as "declares nothing" would fence the default paths in place of the ones
+    it names.
+    """
+
+    reason: str
+
+
+def specification_paths_in(text: Any) -> "tuple[str, ...] | UnreadableDeclaration | None":
     """The ``specification: paths:`` list in one ``.guardkit/config.yaml``.
 
-    ``None`` — never a raise — when the file says nothing about it: no such
-    key, an empty list, a shape that is not a list of non-empty strings, or
-    YAML that will not parse. Every one of those means "this repository
-    declares no specification of its own", and the caller applies the
-    default. A declaration is only ever read as MORE protection than the
-    default or as different protection; it can never be read as none, because
-    an unreadable file answers the same as an absent one.
+    Three answers, never a raise:
+
+    * a tuple of paths — this repository declares its own specification;
+    * ``None`` — it says nothing about one (an empty file, or a file with no
+      ``specification:`` key in it), so the default applies;
+    * an :class:`UnreadableDeclaration` — it says something nobody can hear
+      (YAML that will not parse, a file that is not a mapping, a
+      ``specification:`` block that is not a mapping, or one whose ``paths``
+      is missing, is not a list, or holds no usable path). The fence refuses
+      on that, rather than quietly fencing the default paths instead of the
+      ones this repository meant to name.
     """
     import yaml
 
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} came back as "
+            f"{type(text).__name__}, which is not a file's text"
+        )
+    if not text.strip():
         return None
     try:
         loaded = yaml.safe_load(text)
-    except Exception as exc:  # noqa: BLE001 — an unparseable file declares nothing
-        logger.warning(
-            "the specification fence: %s could not be parsed (%s: %s), so this "
-            "repository is read as declaring no specification of its own and "
-            "the default applies",
+    except Exception as exc:  # noqa: BLE001 — never raise past this boundary
+        logger.error(
+            "the specification fence: %s could not be parsed (%s: %s), so "
+            "which files this repository calls its specification is not known",
             SPECIFICATION_DECLARATION_FILE,
             type(exc).__name__,
             exc,
         )
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} could not be parsed "
+            f"({type(exc).__name__}: {exc})"
+        )
+    if loaded is None:
         return None
     if not isinstance(loaded, dict):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} is not a mapping "
+            f"(it reads as {type(loaded).__name__})"
+        )
+    if SPECIFICATION_DECLARATION_KEY not in loaded:
         return None
     block = loaded.get(SPECIFICATION_DECLARATION_KEY)
     if not isinstance(block, dict):
-        return None
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} has a "
+            f"{SPECIFICATION_DECLARATION_KEY}: block that is not a mapping "
+            f"(it reads as {type(block).__name__})"
+        )
     raw = block.get("paths")
     if not isinstance(raw, list):
-        return None
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE}'s "
+            f"{SPECIFICATION_DECLARATION_KEY}: block has no paths: list in it"
+        )
     paths = tuple(
         entry.strip() for entry in raw if isinstance(entry, str) and entry.strip()
     )
-    return paths or None
+    if not paths:
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE}'s "
+            f"{SPECIFICATION_DECLARATION_KEY}: paths: names no path this "
+            "fence can read"
+        )
+    return paths
 
 
-def load_declared_specification_paths(repo_root: "Path | str") -> "tuple[str, ...] | None":
-    """Read the declaration out of the canonical checkout on this side."""
+def load_declared_specification_paths(
+    repo_root: "Path | str",
+) -> "tuple[str, ...] | UnreadableDeclaration | None":
+    """Read the declaration out of the canonical checkout on this side.
+
+    A file that is NOT THERE is a repository declaring nothing (``None``, and
+    the default applies). A file that is there and will not open — no
+    permission to read it, a directory where the file should be, a broken
+    link — is an :class:`UnreadableDeclaration`, and the fence refuses.
+    """
     path = Path(repo_root) / SPECIFICATION_DECLARATION_FILE
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except FileNotFoundError:
         logger.info(
-            "the specification fence: %s could not be read (%s), so the "
-            "default applies",
+            "the specification fence: there is no %s, so this repository "
+            "declares no specification of its own and the default applies",
+            path,
+        )
+        return None
+    except NotADirectoryError:
+        # Something on the way to the file is a file, so the file is not there.
+        logger.info(
+            "the specification fence: there is no %s (a path leading to it is "
+            "not a directory), so the default applies",
+            path,
+        )
+        return None
+    except OSError as exc:
+        logger.error(
+            "the specification fence: %s is there and could not be read "
+            "(%s: %s), so which files this repository calls its "
+            "specification is not known",
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return UnreadableDeclaration(
+            f"{path} is there and could not be read ({type(exc).__name__}: {exc})"
+        )
+    except UnicodeDecodeError as exc:
+        logger.error(
+            "the specification fence: %s is not text (%s), so which files "
+            "this repository calls its specification is not known",
             path,
             exc,
         )
-        return None
+        return UnreadableDeclaration(f"{path} is not readable text ({exc})")
     return specification_paths_in(text)
 
 
@@ -1415,18 +1505,22 @@ def load_declared_specification_paths_from_sandbox(
     repo: str,
     branch: str = JOURNEY_BASE_REF,
     post: Callable[..., Any] | None = None,
-) -> "tuple[str, ...] | None":
+) -> "tuple[str, ...] | UnreadableDeclaration | None":
     """Read the same declaration out of the sandbox's clone (rule 88).
 
-    Same route, same canonical branch and same never-raise contract as
-    :func:`load_declared_toolchain_from_sandbox`. Anything that stops the
-    file being read is "this repository declares no specification of its
-    own", and the default applies — which protects more, not less.
+    Same route and same canonical branch as
+    :func:`load_declared_toolchain_from_sandbox`, and the same three answers
+    as :func:`load_declared_specification_paths`. The route answers
+    ``content: null`` when the file is not on the branch, and THAT is the one
+    "declares nothing" — a repository with no declaration. A sidecar that
+    cannot be reached, refuses, or answers something that is not a file's
+    text is a reading that did not happen, and refuses.
     """
     from forge.deploy_sidecar.service import GIT_READ_FILE_ROUTE
     from forge.planning.sidecar_git_runner import _urllib_post
 
     sender = post if post is not None else _urllib_post
+    name = getattr(sandbox, "name", "?")
     url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_READ_FILE_ROUTE}"
     body = {
         "repo": repo,
@@ -1435,22 +1529,38 @@ def load_declared_specification_paths_from_sandbox(
     }
     try:
         status, decoded = sender(url, body, SANDBOX_TOOLCHAIN_READ_TIMEOUT_S)
-    except Exception as exc:  # noqa: BLE001 — unreachable is "declares nothing"
-        logger.info(
+    except Exception as exc:  # noqa: BLE001 — never raise past this boundary
+        logger.error(
             "the specification fence: the sidecar in sandbox %s could not be "
-            "reached at %s to read %s/%s (%s: %s), so the default applies",
-            getattr(sandbox, "name", "?"),
+            "reached at %s to read %s/%s (%s: %s)",
+            name,
             url,
             repo_root,
             SPECIFICATION_DECLARATION_FILE,
             type(exc).__name__,
             exc,
         )
-        return None
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} could not be reached at {url} to "
+            f"read {SPECIFICATION_DECLARATION_FILE} on {branch}: "
+            f"{type(exc).__name__}: {exc}"
+        )
     answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} refused to read "
+            f"{SPECIFICATION_DECLARATION_FILE} on {branch} (HTTP {status}): "
+            f"{answer.get('error') or answer}"
+        )
     content = answer.get("content")
-    if status != 200 or not isinstance(content, str):
+    if content is None:
+        # The file is not on the branch: this repository declares nothing.
         return None
+    if not isinstance(content, str):
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} answered something that is not "
+            f"the text of {SPECIFICATION_DECLARATION_FILE}: {answer!r}"
+        )
     return specification_paths_in(content)
 
 
@@ -1460,21 +1570,24 @@ def read_branch_changes(
     """What this branch changed, read here. ``(name_status, patch, error)``.
 
     ``error`` is one plain sentence when the reading did not happen, and the
-    fence turns that into a refusal — never into "nothing changed".
-
-    THE ONE CASE THAT IS NOT AN ERROR: a path that is not the root of a git
-    tree (no ``.git`` in it). A path like that has no branch and no commits,
-    so nothing in it can reach main and there is nothing for the fence to
-    read. It answers empty, not unreadable.
+    fence turns that into a refusal — never into "nothing changed". EVERY way
+    of failing to read is an error, including a recorded worktree that is not
+    there any more and one that is there but is not a git tree: the branch
+    the build made is still in the clone with every commit on it, so "there
+    is nothing to read here" is not the same statement as "this branch
+    changed nothing", and only the second one may lead to a card.
     """
     root = Path(worktree)
-    if not (root / ".git").exists():
-        logger.info(
-            "the specification fence: %s is not the root of a git tree, so it "
-            "carries no branch and no commits and there is nothing to read",
-            root,
+    if not root.is_dir():
+        return "", "", (
+            f"there is nothing at {root}, so the branch this build made "
+            "cannot be read there"
         )
-        return "", "", None
+    if not (root / ".git").exists():
+        return "", "", (
+            f"{root} is not the root of a git tree, so the branch this build "
+            "made cannot be read there"
+        )
 
     from forge.pipeline.merge_ready_checkpoint import APPROVAL_MARKER
 
@@ -1599,7 +1712,8 @@ def make_specification_fence(
        ``main`` (:func:`forge.cli._conductor_worktree.journey_base_ref`), the
        same one rule the commit probe and the worktree writer use.
     3. Read this repository's declaration of its own specification from the
-       CANONICAL tree; a repository that declares none takes the default.
+       CANONICAL tree; a repository that declares none takes the default,
+       and a declaration that is there and cannot be read is a refusal.
     4. Read what the branch changed, in this container or through the
        repository's sandbox.
     5. Hand both to
@@ -1616,6 +1730,7 @@ def make_specification_fence(
         parse_changed_approval_lines,
         parse_changed_files,
         unreadable_branch_changes,
+        unreadable_specification_declaration,
     )
 
     _load = declaration_loader or load_declared_specification_paths
@@ -1650,9 +1765,23 @@ def make_specification_fence(
         entry = sandbox_for(config, repo_key)
 
         # WHICH FILES THIS REPOSITORY CALLS ITS SPECIFICATION — read from the
-        # canonical tree, never from the branch. A repository forge cannot
-        # locate, or one that declares nothing, gets the default, which
-        # protects more rather than less.
+        # canonical tree, never from the branch. Three answers, and they are
+        # not the same answer:
+        #
+        #   * a repository that DECLARES NOTHING (no such file, or a file
+        #     with no `specification:` key) takes the default;
+        #   * a repository that declares paths gets the paths it names;
+        #   * a declaration that is THERE and could not be read or parsed is
+        #     a refusal, because falling back to the default would fence the
+        #     default paths in place of the ones this repository meant to
+        #     name — less protection, not more, for any repository whose
+        #     specification is not a superset of the default.
+        #
+        # A repository forge cannot locate at all (no entry in
+        # `planning.target_repo_paths`) takes the default here. That is not a
+        # hole: in production the same missing mapping makes the gates reader
+        # answer UNKNOWN, which is red, so no card can be published for such a
+        # repository whatever this fence says.
         paths = getattr(getattr(config, "planning", None), "target_repo_paths", None)
         repo_root = (paths or {}).get(repo_key)
         declared: Any = None
@@ -1663,15 +1792,13 @@ def make_specification_fence(
                     if entry is not None
                     else _load(repo_root)
                 )
-            except Exception as exc:  # noqa: BLE001 — a loader defect is not a hole
-                logger.warning(
-                    "the specification fence: reading %s's declaration raised "
-                    "%s: %s — the default applies",
-                    repo_key,
-                    type(exc).__name__,
-                    exc,
+            except Exception as exc:  # noqa: BLE001 — a loader defect is not clear
+                return unreadable_specification_declaration(
+                    f"reading {repo_key}'s declaration raised "
+                    f"{type(exc).__name__}: {exc}"
                 )
-                declared = None
+        if isinstance(declared, UnreadableDeclaration):
+            return unreadable_specification_declaration(declared.reason)
         specification_paths = tuple(declared) if declared else DEFAULT_SPECIFICATION_PATHS
 
         try:

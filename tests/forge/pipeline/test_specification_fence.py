@@ -47,6 +47,7 @@ from forge.pipeline.merge_ready_checkpoint import (
     parse_changed_files,
     path_is_specification,
     unreadable_branch_changes,
+    unreadable_specification_declaration,
 )
 
 BUILD_ID = "build-FEAT-39F6-20260909195749"
@@ -365,6 +366,28 @@ class TestTheCheckpointRefuses:
         assert decision.card_published is False
         assert decision.outcome is MergeCardOutcome.RED_GATE_LOOP_BACK
         assert "could not be read" in decision.gates.detail
+
+    def test_a_declaration_nobody_could_read_refuses_too(self) -> None:
+        """A repository that DECLARES NOTHING takes the default. A
+        declaration that is there and could not be read is a reading that did
+        not happen: falling back to the default would fence the default paths
+        in place of the ones this repository meant to name."""
+        publisher = MergeReadyCheckpointPublisher(
+            publish_card=_RecordingPublisher(),
+            gates_green_reader=lambda **_: True,
+            specification_fence=lambda **_: unreadable_specification_declaration(
+                ".guardkit/config.yaml could not be parsed"
+            ),
+        )
+
+        decision = _submit(publisher)
+
+        assert decision.card_published is False
+        assert decision.outcome is MergeCardOutcome.RED_GATE_LOOP_BACK
+        assert (
+            "which files this repository calls its specification could not be "
+            "read" in decision.gates.detail
+        )
 
     def test_a_fence_that_raises_is_a_refusal_never_a_pass(self) -> None:
         def boom(**_kw: Any) -> Any:
