@@ -50,13 +50,18 @@ from forge.gating.degraded import (
     degraded_dispatch_gate_model,
 )
 from forge.gating.wrappers import GateOutcome, await_and_dispatch, gate_check
-from forge.lifecycle.persistence import Build, SqliteLifecyclePersistence
+from forge.lifecycle.persistence import (
+    Build,
+    SqliteLifecyclePersistence,
+    StageLogEntry,
+)
 from forge.lifecycle.state_machine import (
     BuildState,
     InvalidTransitionError,
     transition_chain,
 )
 from forge.pipeline import BuildContext
+from forge.pipeline.merge_offer import approval_subject_for, merge_request_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nats_core.envelope import MessageEnvelope
@@ -71,7 +76,9 @@ __all__ = [
     "ALREADY_PAUSED",
     "HOLD_SLOT",
     "GateDispatchOutcome",
+    "MergeCardNotPublished",
     "make_merge_card_publisher",
+    "merge_card_words",
     "maybe_gate_build",
     "outcome_launches",
     "rearm_paused_gates",
@@ -129,10 +136,17 @@ _GATE_STAGE_LABEL: str = "autobuild"
 _GATE_TARGET_KIND: str = "subagent"
 _GATE_TARGET_IDENTIFIER: str = "autobuild_runner"
 
-#: Target identifier for the merge-ready checkpoint's card. Same target
-#: KIND as the pre-dispatch gate (a subagent), different identifier so
-#: the two cards are distinguishable in the gate's own records.
+#: ``stage_log.target_identifier`` of the row the merge-ready checkpoint
+#: writes when its card goes out. Same target KIND as the pre-dispatch gate
+#: (a subagent), different identifier, so the checkpoint's card and the
+#: dispatch gate's are distinguishable in the build's own records. Two
+#: readers key on it and neither may lose it: the one-card latch (a restart
+#: mid-journey must never card twice) and the measure that counts how many
+#: repairs the factory closed by itself.
 _MERGE_CARD_TARGET_IDENTIFIER: str = "merge_ready_checkpoint"
+
+#: ``stage_log.details_json`` key under which that row keeps the card's facts.
+_MERGE_CARD_DETAILS_KEY: str = "merge_card"
 
 #: :class:`GateOutcome` members that mean "permission granted — launch the
 #: build". The remaining members (``FAILED`` / ``CANCELLED`` / ``TIMED_OUT``)
@@ -420,89 +434,149 @@ async def maybe_gate_build(
 
 
 # ---------------------------------------------------------------------------
-# The merge-ready checkpoint's card — the SAME approve-click machinery.
+# The merge-ready checkpoint's card — the card the merge press consumes.
 # ---------------------------------------------------------------------------
+
+
+class MergeCardNotPublished(RuntimeError):
+    """Raised when the merge-ready checkpoint's card did not go out.
+
+    The checkpoint treats a raise here as terminal and never asks again,
+    which is what we want: every reason the offer refuses is either a
+    missing fact (no builds row, no repository path, no correlation id, no
+    commit to pin the merge to) or a card that is already on record for
+    this build. None of them get better by trying a second time, and a
+    second card for one merge word is the thing the whole one-card rule
+    exists to prevent.
+    """
+
+
+def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
+    """The sentences on the face of the merge-ready checkpoint's card.
+
+    Four things a person needs and nothing else: what was checked and what
+    it said, what was NOT checked here and who checks it, which branch the
+    merge word merges, and what the merge word does. No codenames, no
+    counters, no house words — this text goes straight onto a Slack card.
+
+    Args:
+        feature_id: ``FEAT-XXXX`` of the build, as the card names it.
+        branch: The branch the merge word will merge.
+        gates: The checkpoint's own :class:`GatesReport`, read for its
+            ``detail`` (what the declared suite did) and its
+            ``deferred_detail`` (the stamped checks with no evidence here,
+            named, and what the merge press does about them). Anything
+            missing simply leaves that sentence out — the card never
+            claims a check it cannot name.
+    """
+    detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
+    deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
+    named = feature_id or "this repair"
+    checked = detail or "the checks this repository declares came back green"
+    sentences = [
+        f"{named} is ready to merge on branch {branch}.",
+        f"What was checked: {checked}.",
+    ]
+    if deferred:
+        sentences.append(deferred)
+    sentences.append(
+        "Approve = check the candidate in the sandbox, merge the branch into "
+        "main and promote it."
+    )
+    sentences.append("Reject = nothing changes; the branch is kept either way.")
+    return " ".join(sentences)
 
 
 def make_merge_card_publisher(
     *,
-    parts: "ApprovalGateParts",
+    offer_service: Any,
     sqlite_pool: SqliteLifecyclePersistence,
-    gate_repository: "GateRepository",
-    gate_state_machine: "StateMachine",
     clock: Callable[[], datetime],
 ) -> Callable[..., Any]:
     """Compose the merge card's ``publish_card`` seam (design pass §c.2).
 
     The conductor's merge-ready checkpoint must deliver "the SAME
     approve-click merge card the consumer path already delivers"
-    (DF-021, settled live 2026-07-23). So it composes the SAME machinery
-    this module already owns — :func:`gate_check` over
-    :func:`make_gate_check_deps`, with the publisher swapped for
-    :class:`_MirroredApprovalPublisher` so the AGENTS approval request
-    goes out FIRST and the ``build-paused`` envelope (the one that
-    renders the card) SECOND. Nothing here builds an envelope, and
-    **jarvis is not touched**: the card rides the existing publisher
-    seams verbatim.
+    (DF-021, settled live 2026-07-23). It now delivers literally that
+    card: this seam calls :meth:`~forge.pipeline.merge_offer.MergeOfferService.offer`,
+    the routine build's own merge-card publisher, handing it the
+    checkpoint's own words. Nothing here builds an envelope, writes a
+    request id, or talks to jarvis.
 
-    The single difference from :func:`maybe_gate_build` is the stage
-    label. The pre-dispatch gate labels its card ``"autobuild"``; this
-    one is labelled with the phrase-book plain name — *the merge-ready
-    checkpoint* — because that is what a human reads on the card, and
-    user surfaces speak human. The durable stage enum
-    (``pull-request-review``) is deliberately NOT renamed; only the copy
-    changes.
+    Why it changed (2026-09-09, the twentieth attempt at the fix journey).
+    This seam used to publish through the ordinary approval gate, which
+    mints its own request id (``<build id>:<stage label>:0``) and writes
+    no merge-offer row. The merge press listens for a request id beginning
+    ``merge-`` backed by a durable ``merge_deploy_offer`` row, so it
+    ignored the card completely: the owner answered approve in Slack,
+    forge logged that the card was published, the journey reported
+    delivered — and nothing checked the candidate, nothing merged, nothing
+    promoted. The owner's merge word fell on the floor. There are no
+    longer two merge cards in this estate.
 
-    There are no synthetic pre-gate transitions here. The pre-dispatch
-    gate drives QUEUED → PREPARING → RUNNING because it runs before the
-    build starts; a merge-ready checkpoint fires on a build that is
-    already RUNNING, and the gate's own ``transition_to_paused`` does the
-    RUNNING → PAUSED hop.
+    What follows from sharing the routine path's card:
+
+    * the request id is ``merge-<build id>`` and the durable
+      ``merge_deploy_offer`` row is latched before the card reaches the
+      wire — the press's own double-run fence and its match check;
+    * the ``build-paused`` envelope carries the synthetic
+      ``merge-<feature id>`` join key, so the tap works in Slack on a
+      build the terminal registry has already seen;
+    * the owner's answer goes to the merge press and NOT back through
+      this seam, so nothing here waits for it and the build is not paused
+      and resumed around it. The journey's own record says a card was
+      delivered, which is exactly what happened; what the owner then said
+      is the press's story, told in the press's own receipts.
+
+    One durable row is written here after the card goes out, carrying the
+    merge-ready checkpoint's own identifier: it is the one-card latch's
+    durable half (a restart mid-journey must never card twice) and the row
+    the self-closed-defect measure counts a raised card by. It is written
+    after the publish so it can never claim a card that was refused.
 
     Returns:
         ``async (*, build_id, feature_id, rationale, branch, gates) ->
-        GateOutcome`` — the seam
+        None`` — the seam
         :class:`~forge.pipeline.merge_ready_checkpoint.MergeReadyCheckpointPublisher`
-        calls once its gates-green precondition has passed.
+        calls once its gates-green precondition has passed. It returns
+        nothing because there is no verdict to return; it raises
+        :class:`MergeCardNotPublished` when no card went out.
     """
-    from forge.cli._serve_deps_gating import make_gate_check_deps
     from forge.pipeline.merge_ready_checkpoint import MERGE_READY_CHECKPOINT_LABEL
 
     async def publish_card(
         *,
         build_id: str,
-        feature_id: str,
+        feature_id: str = "",
         rationale: str = "",
         branch: str | None = None,
         gates: Any = None,
     ) -> Any:
+        # ``rationale`` is the journey's own note to itself
+        # ("mode-c-commits-present" and the like). It stays off the card on
+        # purpose: the card is read by a person, and the words it carries
+        # are built below from what the checkpoint actually checked.
+        del rationale
         row = sqlite_pool.get_build_row(build_id)
-        correlation_id = row.correlation_id if row is not None else ""
-        resolved_feature = feature_id or (row.feature_id if row is not None else "")
-        ctx = BuildContext(
-            feature_id=resolved_feature,
-            build_id=build_id,
-            correlation_id=correlation_id or "",
-            wave_total=1,
+        resolved_feature = feature_id or (
+            getattr(row, "feature_id", "") or "" if row is not None else ""
         )
-        deps = make_gate_check_deps(
-            parts,
-            priors_reader=parts.priors_reader,
-            adjustments_reader=EmptyAdjustmentsReader(),
-            rules_reader=EmptyRulesReader(),
-            repository=gate_repository,
-            state_machine=gate_state_machine,
-            reasoning_model_call=degraded_dispatch_gate_model,
-            ctx=ctx,
-            clock=clock,
-        )
-        if parts.emitter is not None:
-            deps.publisher = _MirroredApprovalPublisher(
-                parts.publisher,
-                emitter=parts.emitter,
-                build_context=ctx,
-                clock=clock,
+        gated_branch = str(branch or "").strip() or None
+
+        def _words(merge_target: str, _merge_branch: str | None) -> str:
+            if gated_branch is not None and gated_branch != merge_target:
+                logger.warning(
+                    "merge card: the checkpoint ran its checks on branch %s "
+                    "but the merge word merges %s (that is the branch on the "
+                    "build's own row, and the press reads the row) — the card "
+                    "names the branch that will be merged",
+                    gated_branch,
+                    merge_target,
+                )
+            return merge_card_words(
+                feature_id=resolved_feature, branch=merge_target, gates=gates
             )
+
         logger.info(
             "merge card: publishing %s for build_id=%s branch=%s (feature_id=%s)",
             MERGE_READY_CHECKPOINT_LABEL,
@@ -510,19 +584,63 @@ def make_merge_card_publisher(
             branch,
             resolved_feature,
         )
-        outcome, _decision = await gate_check(
-            deps=deps,
+        published = await offer_service.offer(
             build_id=build_id,
             feature_id=resolved_feature,
-            stage_label=MERGE_READY_CHECKPOINT_LABEL,
-            target_kind=_GATE_TARGET_KIND,  # type: ignore[arg-type]
-            target_identifier=_MERGE_CARD_TARGET_IDENTIFIER,
-            coach_score=None,
-            criterion_breakdown={},
-            detection_findings=[],
-            attempt_count=0,
+            card_words=_words,
         )
-        return outcome
+        if not published:
+            raise MergeCardNotPublished(
+                f"no merge card was published for build_id={build_id}: the "
+                "merge offer refused before anything reached the wire (the "
+                "reason is the logged sentence just above this one). Nothing "
+                "is retried from here — a second card would be a second act "
+                "for one merge word"
+            )
+
+        # The checkpoint's own durable row, written only now that a card is
+        # really out. Two readers need it and both key on the identifier:
+        # the one-card latch (a restart must not card twice) and the measure
+        # that counts how many repairs reached a merge card.
+        now = clock()
+        try:
+            sqlite_pool.record_stage(
+                StageLogEntry(
+                    build_id=build_id,
+                    stage_label=MERGE_READY_CHECKPOINT_LABEL,
+                    target_kind=_GATE_TARGET_KIND,
+                    target_identifier=_MERGE_CARD_TARGET_IDENTIFIER,
+                    status="GATED",
+                    gate_mode="MANDATORY_HUMAN_APPROVAL",
+                    started_at=now,
+                    completed_at=now,
+                    duration_secs=0.0,
+                    details={
+                        _MERGE_CARD_DETAILS_KEY: {
+                            "build_id": build_id,
+                            "feature_id": resolved_feature,
+                            "branch": gated_branch,
+                            "request_id": merge_request_id(build_id),
+                            "approval_subject": approval_subject_for(
+                                resolved_feature
+                            ),
+                        }
+                    },
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — the card is out either way
+            logger.error(
+                "merge card: the card for build_id=%s is published, but "
+                "recording the checkpoint's own row raised %s: %s — the "
+                "merge press is unaffected (it reads the offer's row), and "
+                "the one-card latch falls back to the offer's own refusal "
+                "to card a build twice",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+        # Nothing to return: the owner's answer goes to the merge press.
+        return None
 
     return publish_card
 
