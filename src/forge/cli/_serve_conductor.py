@@ -158,6 +158,13 @@ __all__ = [
     "make_conductor_wait_window_reader",
     "candidate_is_checked_before_the_merge",
     "make_gates_green_reader",
+    "make_specification_fence",
+    "load_declared_specification_paths",
+    "load_declared_specification_paths_from_sandbox",
+    "read_branch_changes",
+    "BRANCH_DIFF_LIMIT_BYTES",
+    "read_branch_changes_in_sandbox",
+    "specification_paths_in",
     "make_merge_ready_checkpoint",
 ]
 
@@ -1288,6 +1295,560 @@ def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") 
     return True
 
 
+# ---------------------------------------------------------------------------
+# THE SPECIFICATION FENCE — reading what the journey's branch changed
+# (Rich's ruling, 2026-09-09)
+# ---------------------------------------------------------------------------
+#
+# The checkpoint owns the refusal (see the fence section in
+# :mod:`forge.pipeline.merge_ready_checkpoint`); this is where the two things
+# it needs are read.
+#
+# 1. WHICH FILES THIS REPOSITORY CALLS ITS SPECIFICATION. Declared in the
+#    place a repository already declares things about its gates —
+#    ``.guardkit/config.yaml``, beside the ``toolchain:`` block the
+#    merge-ready checks already read — under a ``specification:`` key:
+#
+#        specification:
+#          paths:
+#            - "qa/twins/**"
+#
+#    ``**`` crosses directory boundaries, ``*`` and ``?`` stop at a slash,
+#    and a path with no wildcard in it — or one written with a trailing
+#    slash — names a directory and everything beneath it, so ``qa/twins``,
+#    ``qa/twins/`` and ``qa/twins/**`` all say the same thing.
+#
+#    A repository that declares nothing gets
+#    :data:`~forge.pipeline.merge_ready_checkpoint.DEFAULT_SPECIFICATION_PATHS`
+#    — the acceptance twins, which is api_test's own shape and the one the
+#    incident used. No new file, and no new ceremony: a repository says this
+#    once, in the file it already has, or says nothing and takes the default.
+#
+#    Saying nothing and saying something nobody can hear are different
+#    things. NO declaration file is "the default is my shape", and the
+#    default applies. A declaration that IS there and cannot be read or
+#    parsed refuses, like every other reading that did not happen: reading it
+#    as "declares nothing" would fence the default paths in place of the ones
+#    it names, which for a repository whose specification lives somewhere
+#    else is less protection, not more.
+#
+#    Forge parses this key itself rather than through guardkit's loader,
+#    because it is forge's own key and guardkit's loader owns the
+#    ``toolchain:`` block alone. The declaration is read from the CANONICAL
+#    tree, never from the worktree the journey has been editing — the same law
+#    the toolchain declaration is read under, and for the same reason: a
+#    branch that could rewrite the declaration could free itself.
+#
+# 2. WHAT THE BRANCH CHANGED, against its base. Two git diffs. Where the
+#    repository lives (rule 88): in this container for a repository with no
+#    sandbox, and through the sandbox's own deploy sidecar for one that has.
+
+#: Where a repository declares which of its files are the specification —
+#: the same file its toolchain is declared in.
+SPECIFICATION_DECLARATION_FILE: str = ".guardkit/config.yaml"
+
+#: The key inside it.
+SPECIFICATION_DECLARATION_KEY: str = "specification"
+
+#: How long the two diffs may take on this side.
+BRANCH_DIFF_TIMEOUT_SECONDS: float = 120.0
+
+#: How much of either diff is read: 512 KiB, the same bound the sidecar's own
+#: route keeps, so the two venues cut at the same place. Past it the reading
+#: is UNREADABLE rather than partial — a refusal that missed the line it was
+#: looking for would be worse than an honest "this could not be read whole".
+BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
+
+#: How much longer than the diffs' own wall the HTTP read waits, so the
+#: sidecar's timeout always fires before the socket gives up.
+SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S: float = 30.0
+
+
+@dataclasses.dataclass(frozen=True)
+class UnreadableDeclaration:
+    """A declaration that IS there and could not be read or understood.
+
+    The third answer the loaders below can give, beside a list of paths and
+    ``None``. ``None`` means the repository declares nothing — no file, or a
+    file that says nothing about its specification — and the default applies,
+    which is right. This one means the repository said something and nobody
+    could hear it, and the fence turns it into a refusal, because reading it
+    as "declares nothing" would fence the default paths in place of the ones
+    it names.
+    """
+
+    reason: str
+
+
+def specification_paths_in(text: Any) -> "tuple[str, ...] | UnreadableDeclaration | None":
+    """The ``specification: paths:`` list in one ``.guardkit/config.yaml``.
+
+    Three answers, never a raise:
+
+    * a tuple of paths — this repository declares its own specification;
+    * ``None`` — it says nothing about one (an empty file, or a file with no
+      ``specification:`` key in it), so the default applies;
+    * an :class:`UnreadableDeclaration` — it says something nobody can hear
+      (YAML that will not parse, a file that is not a mapping, a
+      ``specification:`` block that is not a mapping, or one whose ``paths``
+      is missing, is not a list, or holds no usable path). The fence refuses
+      on that, rather than quietly fencing the default paths instead of the
+      ones this repository meant to name.
+    """
+    import yaml
+
+    if not isinstance(text, str):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} came back as "
+            f"{type(text).__name__}, which is not a file's text"
+        )
+    if not text.strip():
+        return None
+    try:
+        loaded = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 — never raise past this boundary
+        logger.error(
+            "the specification fence: %s could not be parsed (%s: %s), so "
+            "which files this repository calls its specification is not known",
+            SPECIFICATION_DECLARATION_FILE,
+            type(exc).__name__,
+            exc,
+        )
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} could not be parsed "
+            f"({type(exc).__name__}: {exc})"
+        )
+    if loaded is None:
+        return None
+    if not isinstance(loaded, dict):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} is not a mapping "
+            f"(it reads as {type(loaded).__name__})"
+        )
+    if SPECIFICATION_DECLARATION_KEY not in loaded:
+        return None
+    block = loaded.get(SPECIFICATION_DECLARATION_KEY)
+    if not isinstance(block, dict):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE} has a "
+            f"{SPECIFICATION_DECLARATION_KEY}: block that is not a mapping "
+            f"(it reads as {type(block).__name__})"
+        )
+    raw = block.get("paths")
+    if not isinstance(raw, list):
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE}'s "
+            f"{SPECIFICATION_DECLARATION_KEY}: block has no paths: list in it"
+        )
+    paths = tuple(
+        entry.strip() for entry in raw if isinstance(entry, str) and entry.strip()
+    )
+    if not paths:
+        return UnreadableDeclaration(
+            f"{SPECIFICATION_DECLARATION_FILE}'s "
+            f"{SPECIFICATION_DECLARATION_KEY}: paths: names no path this "
+            "fence can read"
+        )
+    return paths
+
+
+def load_declared_specification_paths(
+    repo_root: "Path | str",
+) -> "tuple[str, ...] | UnreadableDeclaration | None":
+    """Read the declaration out of the canonical checkout on this side.
+
+    A file that is NOT THERE is a repository declaring nothing (``None``, and
+    the default applies). A file that is there and will not open — no
+    permission to read it, a directory where the file should be, a broken
+    link — is an :class:`UnreadableDeclaration`, and the fence refuses.
+    """
+    path = Path(repo_root) / SPECIFICATION_DECLARATION_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.info(
+            "the specification fence: there is no %s, so this repository "
+            "declares no specification of its own and the default applies",
+            path,
+        )
+        return None
+    except NotADirectoryError:
+        # Something on the way to the file is a file, so the file is not there.
+        logger.info(
+            "the specification fence: there is no %s (a path leading to it is "
+            "not a directory), so the default applies",
+            path,
+        )
+        return None
+    except OSError as exc:
+        logger.error(
+            "the specification fence: %s is there and could not be read "
+            "(%s: %s), so which files this repository calls its "
+            "specification is not known",
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return UnreadableDeclaration(
+            f"{path} is there and could not be read ({type(exc).__name__}: {exc})"
+        )
+    except UnicodeDecodeError as exc:
+        logger.error(
+            "the specification fence: %s is not text (%s), so which files "
+            "this repository calls its specification is not known",
+            path,
+            exc,
+        )
+        return UnreadableDeclaration(f"{path} is not readable text ({exc})")
+    return specification_paths_in(text)
+
+
+def load_declared_specification_paths_from_sandbox(
+    repo_root: "Path | str",
+    *,
+    sandbox: Any,
+    repo: str,
+    branch: str = JOURNEY_BASE_REF,
+    post: Callable[..., Any] | None = None,
+) -> "tuple[str, ...] | UnreadableDeclaration | None":
+    """Read the same declaration out of the sandbox's clone (rule 88).
+
+    Same route and same canonical branch as
+    :func:`load_declared_toolchain_from_sandbox`, and the same three answers
+    as :func:`load_declared_specification_paths`. The route answers
+    ``content: null`` when the file is not on the branch, and THAT is the one
+    "declares nothing" — a repository with no declaration. A sidecar that
+    cannot be reached, refuses, or answers something that is not a file's
+    text is a reading that did not happen, and refuses.
+    """
+    from forge.deploy_sidecar.service import GIT_READ_FILE_ROUTE
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    sender = post if post is not None else _urllib_post
+    name = getattr(sandbox, "name", "?")
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_READ_FILE_ROUTE}"
+    body = {
+        "repo": repo,
+        "branch": branch,
+        "file_path": SPECIFICATION_DECLARATION_FILE,
+    }
+    try:
+        status, decoded = sender(url, body, SANDBOX_TOOLCHAIN_READ_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 — never raise past this boundary
+        logger.error(
+            "the specification fence: the sidecar in sandbox %s could not be "
+            "reached at %s to read %s/%s (%s: %s)",
+            name,
+            url,
+            repo_root,
+            SPECIFICATION_DECLARATION_FILE,
+            type(exc).__name__,
+            exc,
+        )
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} could not be reached at {url} to "
+            f"read {SPECIFICATION_DECLARATION_FILE} on {branch}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} refused to read "
+            f"{SPECIFICATION_DECLARATION_FILE} on {branch} (HTTP {status}): "
+            f"{answer.get('error') or answer}"
+        )
+    content = answer.get("content")
+    if content is None:
+        # The file is not on the branch: this repository declares nothing.
+        return None
+    if not isinstance(content, str):
+        return UnreadableDeclaration(
+            f"the sidecar in sandbox {name} answered something that is not "
+            f"the text of {SPECIFICATION_DECLARATION_FILE}: {answer!r}"
+        )
+    return specification_paths_in(content)
+
+
+def read_branch_changes(
+    *, worktree: "Path | str", base: str
+) -> "tuple[str, str, str | None]":
+    """What this branch changed, read here. ``(name_status, patch, error)``.
+
+    ``error`` is one plain sentence when the reading did not happen, and the
+    fence turns that into a refusal — never into "nothing changed". EVERY way
+    of failing to read is an error, including a recorded worktree that is not
+    there any more and one that is there but is not a git tree: the branch
+    the build made is still in the clone with every commit on it, so "there
+    is nothing to read here" is not the same statement as "this branch
+    changed nothing", and only the second one may lead to a card.
+    """
+    root = Path(worktree)
+    if not root.is_dir():
+        return "", "", (
+            f"there is nothing at {root}, so the branch this build made "
+            "cannot be read there"
+        )
+    if not (root / ".git").exists():
+        return "", "", (
+            f"{root} is not the root of a git tree, so the branch this build "
+            "made cannot be read there"
+        )
+
+    from forge.pipeline.merge_ready_checkpoint import APPROVAL_MARKER
+
+    span = f"{base}...HEAD"
+
+    def _git(*args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-c", "core.quotepath=false", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=BRANCH_DIFF_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    try:
+        names = _git("diff", "--name-status", "-M", "-z", span)
+        if names.returncode != 0:
+            detail = (names.stderr or names.stdout or "").strip() or "<no output>"
+            return "", "", (
+                f"git could not read the changed files of {span} in {root} "
+                f"(it exited {names.returncode}): {detail}"
+            )
+        patch = _git(
+            "diff", "-U0", "--no-color", "--no-renames", f"-G{APPROVAL_MARKER}", span
+        )
+        if patch.returncode != 0:
+            detail = (patch.stderr or patch.stdout or "").strip() or "<no output>"
+            return "", "", (
+                f"git could not read the approval lines of {span} in {root} "
+                f"(it exited {patch.returncode}): {detail}"
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "", "", (
+            f"reading {span} in {root} raised {type(exc).__name__}: {exc}"
+        )
+    name_status = names.stdout or ""
+    approval_patch = patch.stdout or ""
+    if (
+        len(name_status.encode("utf-8")) > BRANCH_DIFF_LIMIT_BYTES
+        or len(approval_patch.encode("utf-8")) > BRANCH_DIFF_LIMIT_BYTES
+    ):
+        return "", "", (
+            f"what {root} changed against {base} is too big to read whole, so "
+            "a change to the specification could have been past the end of it"
+        )
+    return name_status, approval_patch, None
+
+
+def read_branch_changes_in_sandbox(
+    *,
+    worktree: "Path | str",
+    base: str,
+    sandbox: Any,
+    repo: str,
+    post: Callable[..., Any] | None = None,
+) -> "tuple[str, str, str | None]":
+    """The same two diffs, run where the repository lives (rule 88).
+
+    Same ``(name_status, patch, error)`` contract as
+    :func:`read_branch_changes`. Anything that stops the reading is an
+    ``error`` sentence, which the fence turns into a refusal: for a sandbox
+    repository the tree really is there and git really does run, so a failure
+    means something is wrong rather than that there was nothing to see.
+    """
+    from forge.deploy_sidecar.service import GIT_WORKTREE_CHANGED_FILES_ROUTE
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    sender = post if post is not None else _urllib_post
+    name = getattr(sandbox, "name", "?")
+    url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_WORKTREE_CHANGED_FILES_ROUTE}"
+    body = {"repo": repo, "path": str(worktree), "base": base}
+    try:
+        status, decoded = sender(
+            url, body, BRANCH_DIFF_TIMEOUT_SECONDS + SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S
+        )
+    except Exception as exc:  # noqa: BLE001 — could not read is not "nothing"
+        return "", "", (
+            f"the sidecar in sandbox {name} could not be reached at {url} to "
+            f"read what {worktree} changed against {base}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    answer = decoded if isinstance(decoded, dict) else {}
+    if status != 200:
+        return "", "", (
+            f"the sidecar in sandbox {name} refused to read what {worktree} "
+            f"changed against {base} (HTTP {status}): "
+            f"{answer.get('error') or answer}"
+        )
+    if answer.get("truncated") is True:
+        return "", "", (
+            f"what {worktree} changed against {base} is too big to read whole "
+            f"in sandbox {name}, so a change to the specification could have "
+            "been past the end of it"
+        )
+    names = answer.get("name_status")
+    patch = answer.get("approval_patch")
+    if not isinstance(names, str) or not isinstance(patch, str):
+        return "", "", (
+            f"the sidecar in sandbox {name} answered something that is not a "
+            f"diff: {answer!r}"
+        )
+    return names, patch, None
+
+
+def make_specification_fence(
+    *,
+    pool: Any,
+    config: Any,
+    declaration_loader: Callable[..., Any] | None = None,
+    sandbox_declaration_loader: Callable[..., Any] | None = None,
+    changes_reader: Callable[..., Any] | None = None,
+    sandbox_changes_reader: Callable[..., Any] | None = None,
+) -> Callable[..., Any]:
+    """Build the merge-ready checkpoint's REAL specification fence.
+
+    Answers ``(*, build_id, branch) -> SpecificationFenceReport``. In order:
+
+    1. Read the build row. No row, or no recorded worktree → a refusal
+       saying so: the branch this build made cannot be found, so nothing can
+       say its specification is untouched.
+    2. Work out the branch's base — the branch the row was queued on, or
+       ``main`` (:func:`forge.cli._conductor_worktree.journey_base_ref`), the
+       same one rule the commit probe and the worktree writer use.
+    3. Read this repository's declaration of its own specification from the
+       CANONICAL tree; a repository that declares none takes the default,
+       and a declaration that is there and cannot be read is a refusal.
+    4. Read what the branch changed, in this container or through the
+       repository's sandbox.
+    5. Hand both to
+       :func:`~forge.pipeline.merge_ready_checkpoint.judge_branch_changes`,
+       which holds the two rules and is the same code either way.
+
+    Every seam is injectable so the tests drive real git in a real temporary
+    repository without a daemon, a sandbox or a network.
+    """
+    from forge.config.sandboxes import sandbox_for
+    from forge.pipeline.merge_ready_checkpoint import (
+        DEFAULT_SPECIFICATION_PATHS,
+        judge_branch_changes,
+        parse_changed_approval_lines,
+        parse_changed_files,
+        unreadable_branch_changes,
+        unreadable_specification_declaration,
+    )
+
+    _load = declaration_loader or load_declared_specification_paths
+    _sandbox_load = (
+        sandbox_declaration_loader or load_declared_specification_paths_from_sandbox
+    )
+    _read = changes_reader or read_branch_changes
+    _sandbox_read = sandbox_changes_reader or read_branch_changes_in_sandbox
+
+    def read_fence(*, build_id: str, branch: Any = None) -> Any:
+        try:
+            row = pool.get_build_row(build_id)
+        except Exception as exc:  # noqa: BLE001 — an unread row is not clear
+            return unreadable_branch_changes(
+                f"reading the build row raised {type(exc).__name__}: {exc}"
+            )
+        if row is None:
+            return unreadable_branch_changes(
+                f"there is no builds row for build_id={build_id!r}"
+            )
+        worktree = getattr(row, "worktree_path", None)
+        if not worktree or not str(worktree).strip():
+            return unreadable_branch_changes(
+                f"build_id={build_id!r} has no recorded worktree_path, so "
+                "there is no branch to read"
+            )
+
+        from forge.cli._conductor_worktree import journey_base_ref
+
+        base = journey_base_ref(getattr(row, "branch", None))
+        repo_key = str(getattr(row, "repo", "") or "")
+        entry = sandbox_for(config, repo_key)
+
+        # WHICH FILES THIS REPOSITORY CALLS ITS SPECIFICATION — read from the
+        # canonical tree, never from the branch. Three answers, and they are
+        # not the same answer:
+        #
+        #   * a repository that DECLARES NOTHING (no such file, or a file
+        #     with no `specification:` key) takes the default;
+        #   * a repository that declares paths gets the paths it names;
+        #   * a declaration that is THERE and could not be read or parsed is
+        #     a refusal, because falling back to the default would fence the
+        #     default paths in place of the ones this repository meant to
+        #     name — less protection, not more, for any repository whose
+        #     specification is not a superset of the default.
+        #
+        # A repository forge cannot locate at all (no entry in
+        # `planning.target_repo_paths`) takes the default here. That is not a
+        # hole: in production the same missing mapping makes the gates reader
+        # answer UNKNOWN, which is red, so no card can be published for such a
+        # repository whatever this fence says.
+        paths = getattr(getattr(config, "planning", None), "target_repo_paths", None)
+        repo_root = (paths or {}).get(repo_key)
+        declared: Any = None
+        if repo_root:
+            try:
+                declared = (
+                    _sandbox_load(repo_root, sandbox=entry, repo=repo_key)
+                    if entry is not None
+                    else _load(repo_root)
+                )
+            except Exception as exc:  # noqa: BLE001 — a loader defect is not clear
+                return unreadable_specification_declaration(
+                    f"reading {repo_key}'s declaration raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if isinstance(declared, UnreadableDeclaration):
+            return unreadable_specification_declaration(declared.reason)
+        specification_paths = tuple(declared) if declared else DEFAULT_SPECIFICATION_PATHS
+
+        try:
+            names, patch, error = (
+                _sandbox_read(
+                    worktree=worktree, base=base, sandbox=entry, repo=repo_key
+                )
+                if entry is not None
+                else _read(worktree=worktree, base=base)
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader defect is not clear
+            return unreadable_branch_changes(
+                f"reading what the branch changed raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if error:
+            return unreadable_branch_changes(str(error))
+
+        report = judge_branch_changes(
+            changes=parse_changed_files(names),
+            approval_lines=parse_changed_approval_lines(patch),
+            specification_paths=specification_paths,
+        )
+        if report.refuses:
+            logger.error(
+                "the specification fence: build_id=%s on %s — %s (the files "
+                "this repository calls its specification: %s)",
+                build_id,
+                branch or getattr(row, "branch", None),
+                report.detail,
+                ", ".join(specification_paths),
+            )
+        else:
+            logger.info(
+                "the specification fence: build_id=%s — the branch changes "
+                "none of the files this repository calls its specification "
+                "(%s) and no line recording an approval",
+                build_id,
+                ", ".join(specification_paths),
+            )
+        return report
+
+    return read_fence
+
+
 def make_gates_green_reader(
     *,
     pool: Any,
@@ -1860,6 +2421,7 @@ def make_merge_ready_checkpoint(
     published_probe: Callable[[str], Any] | None = None,
     stage_log_writer: Any = None,
     review_cycle_cap: int | None = None,
+    specification_fence: Callable[..., Any] | None = None,
 ) -> Any:
     """Compose the ONE ``pr_review_gate`` implementation for production.
 
@@ -1889,6 +2451,14 @@ def make_merge_ready_checkpoint(
     verdict goes back into the fix cycle instead of being asked for again
     (2026-09-08, attempt fifteen). Left ``None`` — every caller that predates
     this lane — the checkpoint is byte for byte what it was.
+
+    ``specification_fence`` is the fence of 2026-09-09: it reads which files
+    the journey's branch changed against its base and refuses a card when any
+    of them is what the repository calls its specification, or when the change
+    touches a line recording somebody's approval.
+    :func:`make_specification_fence` is the production one. Left ``None`` —
+    every caller that predates the fence — no fence runs and the checkpoint is
+    byte for byte what it was.
 
     ``review_cycle_cap`` is how many review cycles this build's profile
     allows, read from the same resolved profile the supervisor is judged
@@ -1977,6 +2547,7 @@ def make_merge_ready_checkpoint(
             if published_probe is not None
             else make_conductor_merge_card_published_probe(pool=pool)
         ),
+        "specification_fence": specification_fence,
     }
     if stage_log_writer is None:
         # Every caller that predates this lane: the publisher itself, with
@@ -2230,6 +2801,7 @@ def build_conductor_supervisor_factory(
     publish_approval_request: Any = None,
     publish_card: Callable[..., Any] | None = None,
     gates_green_reader: Callable[..., Any] | None = None,
+    specification_fence: Callable[..., Any] | None = None,
     stage_log_writer: Any = None,
     coach_score_reader: Callable[[str], float | None] | None = None,
     base_branch: str = "main",
@@ -2268,6 +2840,14 @@ def build_conductor_supervisor_factory(
     share both.
 
     Args:
+        specification_fence: The merge-ready checkpoint's specification
+            fence (Rich's ruling, 2026-09-09) — the seam that reads which
+            files the journey's branch changed against its base and refuses
+            a card when any of them is the repository's specification, or
+            when the change touches a line recording somebody's approval.
+            Left unset, :func:`make_specification_fence` is built over this
+            pool and this config, which is what production gets. A caller
+            that wants no fence at all passes one that answers ``None``.
         timeout_seconds_by_stage: Per-stage subprocess tripwires for the
             dispatcher adapter. Defaults to
             :data:`CONDUCTOR_STAGE_TIMEOUT_SECONDS` — read the comment
@@ -2316,6 +2896,12 @@ def build_conductor_supervisor_factory(
     _runner_for = subprocess_runner_for_build or make_conductor_guardkit_run_chooser(
         pool=pool, config=config, in_container_run=subprocess_runner
     )
+    # THE SPECIFICATION FENCE (Rich's ruling, 2026-09-09). Built once per
+    # boot over the same pool and config the gate set is: it reads the build
+    # row for the branch and the worktree, this repository's own declaration
+    # of what its specification is, and — through the sandbox when the
+    # repository has one — the branch's own changes.
+    _fence = specification_fence or make_specification_fence(pool=pool, config=config)
 
     if stage_log_writer is None:
         from forge.cli._serve_deps_stage_log import (
@@ -2411,6 +2997,7 @@ def build_conductor_supervisor_factory(
             receipts_root=receipts_root,
             stage_log_writer=stage_log_writer,
             review_cycle_cap=review_cycle_cap,
+            specification_fence=_fence,
         )
         # THE REVIEW LEG'S CONTEXT, WITH THE GATE'S EVIDENCE ON IT. A review
         # the checks sent the journey back to is handed what they ran, what

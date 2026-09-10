@@ -42,6 +42,7 @@ import asyncio
 import dataclasses
 import json
 import sqlite3
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -688,12 +689,48 @@ def _config() -> ForgeConfig:
     )
 
 
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "PATH": "/usr/bin:/bin:/usr/local/bin",
+    "HOME": "/nonexistent",
+}
+
+
+def _make_a_real_journey_tree(worktree: Path, branch: str) -> None:
+    """A real git tree on the journey's own branch.
+
+    The specification fence reads what this branch changed against its base,
+    and a recorded worktree that is not a git tree is a reading that did not
+    happen — a refusal, not a pass. This rig is not about the fence, so it
+    gets a real tree carrying no change at all: the fence reads it, finds
+    nothing, and the rest of the journey is what decides.
+    """
+    for args in (
+        ("init", "-b", branch),
+        ("commit", "--allow-empty", "-m", "the branch the journey works on"),
+    ):
+        subprocess.run(  # noqa: S603 — scratch fixture, list tokens, no shell
+            ["git", *args],
+            cwd=worktree,
+            check=True,
+            env=_GIT_ENV,
+            capture_output=True,
+            text=True,
+        )
+
+
 @pytest.fixture
 def rig(tmp_path: Path):
     """The journey's real machinery over a real SQLite file."""
     worktree = tmp_path / "worktree"
     (worktree / "tasks").mkdir(parents=True)
     (worktree / "src").mkdir(parents=True)
+    _make_a_real_journey_tree(worktree, "repair/FEAT-39F6")
     receipts_root = tmp_path / "receipts"
     receipts_root.mkdir()
 
