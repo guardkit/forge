@@ -77,6 +77,7 @@ __all__ = [
     "HOLD_SLOT",
     "GateDispatchOutcome",
     "MergeCardNotPublished",
+    "card_line_about_tests",
     "make_merge_card_publisher",
     "merge_card_words",
     "maybe_gate_build",
@@ -461,19 +462,94 @@ class MergeCardNotPublished(RuntimeError):
     card_reached_the_wire = False
 
 
+def _names_the_files(files: "tuple[str, ...]") -> str:
+    """The files to look in, said the way a person would say them.
+
+    Three at most, then a count: a card that lists twenty file names is a
+    card nobody reads to the end.
+    """
+    shown = [str(name) for name in files if str(name).strip()][:3]
+    rest = len([name for name in files if str(name).strip()]) - len(shown)
+    if not shown:
+        return "its tests"
+    named = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+    if rest > 0:
+        named += f" and {rest} more file{'s' if rest != 1 else ''}"
+    return named
+
+
+def card_line_about_tests(counts: Any) -> str:
+    """The ONE line about what this branch did to the repository's tests.
+
+    Rich's ruling, 2026-09-10: ordinary unit tests are not fenced — legs
+    write and change tests constantly and legitimately — so this REPORTS.
+    The risk it reports on points one way: an assertion that quietly goes
+    away makes bad code pass and no check goes red, so the card says what
+    went away and invites the look before the merge word.
+
+    Four shapes, and the quiet ones are kept short on purpose, because this
+    line is read on every card:
+
+    * something went away — what, how much, where, and "worth a look";
+    * tests changed and nothing went away — said in a few words, never as a
+      row of zeros;
+    * no test touched at all — one short clause;
+    * the branch's own diff could not be read here — said plainly, because a
+      count nobody took must never read as a count of nothing.
+
+    ``""`` when nobody counted, which is what every card looked like before
+    this ruling.
+    """
+    if counts is None:
+        return ""
+    files = int(getattr(counts, "files_changed", 0) or 0)
+    deleted = int(getattr(counts, "tests_deleted", 0) or 0)
+    removed = int(getattr(counts, "assertions_removed", 0) or 0)
+    if deleted or removed:
+        said: list[str] = []
+        if deleted:
+            said.append(f"deleted {deleted} test{'s' if deleted != 1 else ''}")
+        if removed:
+            said.append(
+                f"removed {removed} assertion{'s' if removed != 1 else ''}"
+            )
+        where = _names_the_files(tuple(getattr(counts, "files", ()) or ()))
+        return (
+            f"This branch {' and '.join(said)} in {where} — worth a look "
+            "before you merge."
+        )
+    if not getattr(counts, "read_whole", True):
+        if files:
+            return (
+                f"This branch changed {files} test file"
+                f"{'s' if files != 1 else ''}, and what it changed in them "
+                "could not be read here."
+            )
+        return "What this branch changed in the tests could not be read here."
+    if not files:
+        return "This branch changed no test files."
+    return (
+        f"This branch changed {files} test file{'s' if files != 1 else ''} "
+        "and removed no tests or assertions."
+    )
+
+
 def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
     """The sentences on the face of the merge-ready checkpoint's card.
 
-    Four things a person needs and nothing else: what was checked and what
-    it said, what was NOT checked here and who checks it, which branch the
-    merge word merges, and what the merge word does. No codenames, no
-    counters, no house words — this text goes straight onto a Slack card.
+    Five things a person needs and nothing else: what was checked and what
+    it said, what this branch did to the tests, what was NOT checked here
+    and who checks it, which branch the merge word merges, and what the
+    merge word does. No codenames, no counters, no house words — this text
+    goes straight onto a Slack card.
 
     Args:
         feature_id: ``FEAT-XXXX`` of the build, as the card names it.
         branch: The branch the merge word will merge.
         gates: The checkpoint's own :class:`GatesReport`, read for its
-            ``detail`` (what the declared suite did) and for WHETHER its
+            ``detail`` (what the declared suite did), for what the branch
+            did to the tests (``test_changes``, counted while the branch was
+            read — see :func:`card_line_about_tests`) and for WHETHER its
             ``deferred_detail`` says anything at all. Only the fact that
             something was left unproved reaches the card, said here in
             ordinary words; the internal sentence — which names the
@@ -490,6 +566,9 @@ def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
         f"{named} is ready to merge on branch {branch}.",
         f"What was checked: {checked}.",
     ]
+    tests = card_line_about_tests(getattr(gates, "test_changes", None))
+    if tests:
+        sentences.append(tests)
     if deferred:
         # Ordinary words for the fact, never the internal sentence: that one
         # names check ids and their homes, which mean nothing to the person
