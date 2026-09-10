@@ -18,8 +18,9 @@ The narrow contract:
     POST /run  {repo, declared_test, cwd, timeout_seconds}
               -> {exit_code, stdout, stderr_tail, timed_out, cwd, command,
                   warnings}
-    POST /guardkit-merge  {repo, feature_id, expect_main_sha, baseline_failing,
-                           timeout_seconds, verify_timeout_seconds}
+    POST /guardkit-merge  {repo, feature_id, branch, expect_main_sha,
+                           baseline_failing, timeout_seconds,
+                           verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
     POST /git/prepare-branch-and-write-tree
               {repo, branch, files, message, checks: [{name, args, blocking}]}
@@ -57,6 +58,18 @@ of a merge card, 2026-09-06). The sidecar already runs on the host as Rich's
 user, so the merge command runs here instead. It is deny-by-default in the same
 way: one fixed command, one known repository, a feature name and a target commit
 that must both be well formed.
+
+Since 2026-09-10 that request may also name the branch to be merged. It has to:
+a fix journey's commits are on ``fix/<task id>-<build8>``, not on the feature's
+own ``autobuild/<feature id>``, and a door that could not be told which branch
+merged the wrong name and refused ("branch autobuild/FEAT-39F6 does not exist")
+after the candidate had passed every check. Naming the branch grants the caller
+nothing it did not already have: this door merges into ``main`` and only main —
+``--target main`` is a fixed part of the command it builds — so the branch says
+which commits are offered to a merge the caller could already ask for. The name
+is shape-checked before anything starts, by the same rule every branch name on
+this service is checked by, and a request that leaves it out merges the
+feature's own branch exactly as it always did.
 
 THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 
@@ -1297,6 +1310,28 @@ def _tail_chars(text: str, limit: int) -> str:
     return _TAIL_MARKER + text[-limit:]
 
 
+def _merge_branch_error(value: Any) -> str | None:
+    """A plain sentence when the request's ``branch`` cannot be used.
+
+    Only reached when the request carries a ``branch`` at all: leaving it out
+    is not an error, it means "merge the feature's own branch", which is what
+    every routine feature build has always asked for.
+
+    The shape rule is the one the git routes below use
+    (:func:`_ref_error`, over :data:`REF_NAME_PATTERN`), so this service has
+    one answer to "is that a branch name git will accept" and not two. Only
+    the sentence for a value that is not text at all is written here, because
+    the git routes' version of it says "is required" and this field is not.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return (
+            "'branch' must be the name of the branch to merge, written as "
+            f"text; got {value!r}. Leave it out to merge the feature's own "
+            "branch."
+        )
+    return _ref_error(value, what="branch")
+
+
 def process_guardkit_merge_request(
     payload: Any,
     *,
@@ -1308,11 +1343,21 @@ def process_guardkit_merge_request(
 
     Everything is checked before a process starts: the repository must be one
     the forge configuration names, the feature name and the target commit must
-    both be well formed, the timeout must be a positive number no larger than
+    both be well formed, the branch to merge — when one is named — must be a
+    name git will accept, the timeout must be a positive number no larger than
     half an hour, and a pre-merge baseline, if one is sent, must be a list of
     test names. A refusal is a 4xx with one plain sentence saying what was
-    wrong. A permitted run is a 200 carrying ``{exit_code, stdout, stderr_tail}``
-    — the exit code is data, exactly as it is for a deploy script, because
+    wrong.
+
+    ``branch`` is how a fix journey's repair reaches the merge: its commits
+    are on ``fix/<task id>-<build8>``, so the merge word has to say so or the
+    command looks for ``autobuild/<feature id>`` and refuses a branch nobody
+    made. A request without one merges the feature's own branch exactly as it
+    always has, so a routine feature build and any caller written before this
+    field existed run the same command as before, argument for argument.
+
+    A permitted run is a 200 carrying ``{exit_code, stdout, stderr_tail}`` —
+    the exit code is data, exactly as it is for a deploy script, because
     "merged but the checks failed" is an answer, not a transport failure.
 
     Never raises.
@@ -1350,6 +1395,20 @@ def process_guardkit_merge_request(
                 f"{feature_id!r}"
             )
         }
+
+    # The branch to merge, when the caller names one. Absent means the
+    # feature's own branch: the command derives it from the feature name
+    # exactly as it did before this field existed, so nothing changes for a
+    # routine build. The sidecar never derives a branch of its own — the
+    # single answer to "which branch does the merge word merge" lives in
+    # forge.pipeline.merge_offer.branch_to_merge, on the caller's side, and
+    # re-deriving it here is how two readers come to disagree.
+    branch = payload.get("branch")
+    if branch is not None:
+        branch_error = _merge_branch_error(branch)
+        if branch_error is not None:
+            return 400, {"error": branch_error}
+        branch = branch.strip()
 
     # The target commit must be a full git hash — a short one would let the
     # merge run against a branch that has moved since the checks ran.
@@ -1453,6 +1512,10 @@ def process_guardkit_merge_request(
     ]
     if verify_timeout is not None:
         argv += ["--verify-timeout", str(verify_timeout)]
+    # The branch is named ONLY when the caller named it, so a routine feature
+    # build's command is byte for byte the one it has always been.
+    if branch is not None:
+        argv += ["--branch", branch]
 
     # The sidecar writes its OWN copy of the baseline: the caller's file lives
     # inside the forge container and is not on this host at all. Failing to
@@ -1480,9 +1543,10 @@ def process_guardkit_merge_request(
         argv += ["--baseline-json", str(baseline_path)]
 
     logger.info(
-        "forge-deploy-sidecar: running the merge word's checks for %s in %s "
-        "(up to %g seconds)",
+        "forge-deploy-sidecar: running the merge word's checks for %s (%s) in "
+        "%s (up to %g seconds)",
         feature_id,
+        f"branch {branch}" if branch is not None else "the feature's own branch",
         repo_path,
         timeout,
     )

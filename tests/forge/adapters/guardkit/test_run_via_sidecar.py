@@ -441,3 +441,169 @@ async def test_a_checks_time_limit_that_is_not_a_number_is_a_mistake_to_fix(
             with_nats_streaming=False,
         )
     assert "whole number of seconds" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# The branch the merge word merges travels too (2026-09-10)
+#
+# The sidecar builds the command on the far side, so a --branch left in the
+# argument list here is simply dropped: on 2026-09-10 a fix journey's repair
+# passed all eight checks in the sandbox and then had its merge refused,
+# "branch autobuild/FEAT-39F6 does not exist", because the door had never
+# been taught the journey's own branch.
+# ---------------------------------------------------------------------------
+
+#: What the conductor names a fix journey's branch.
+FIX_BRANCH = "fix/TASK-FEAT39F6FIX1-10110821"
+
+
+@pytest.mark.asyncio
+async def test_the_fix_journeys_branch_reaches_the_command(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    run = _run(sidecar, repo)
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args() + ["--branch", FIX_BRANCH],
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=900,
+        with_nats_streaming=False,
+    )
+    assert result.status == "success"
+    argv = json.loads(result.stdout_tail)["argv"]
+    assert argv[argv.index("--branch") + 1] == FIX_BRANCH
+
+
+@pytest.mark.asyncio
+async def test_no_branch_is_the_command_byte_for_byte_as_before(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    """A routine feature build sends no branch and runs the argument list it
+    has always run — and this door never makes up a name of its own."""
+    run = _run(sidecar, repo)
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args(),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=900,
+        with_nats_streaming=False,
+    )
+    assert result.status == "success"
+    argv = json.loads(result.stdout_tail)["argv"]
+    assert argv == [
+        "autobuild",
+        "merge",
+        FEATURE,
+        "--target",
+        "main",
+        "--expect-main-sha",
+        MAIN_SHA,
+        "--json",
+    ]
+    assert "--branch" not in argv
+    assert not any("autobuild/" in token for token in argv)
+
+
+@pytest.mark.asyncio
+async def test_the_branch_sent_is_the_one_the_caller_was_given(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The name on the wire is the name in the argument list — the executor
+    takes it from merge_offer.branch_to_merge, and this door neither derives
+    one nor rewrites the one it was handed."""
+    from forge.pipeline.merge_offer import branch_to_merge
+
+    import http.server
+
+    seen: list[dict] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 — the stdlib's own name
+            length = int(self.headers.get("Content-Length", "0"))
+            seen.append(json.loads(self.rfile.read(length).decode("utf-8")))
+            answer = json.dumps({"exit_code": 0, "stdout": "{}", "stderr_tail": ""})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(answer)))
+            self.end_headers()
+            self.wfile.write(answer.encode("utf-8"))
+
+        def log_message(self, *_args) -> None:  # noqa: ANN002 — quiet in tests
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        run = build_sidecar_guardkit_run(
+            base_url=f"http://{host}:{port}", repo_paths={REPO_KEY: str(repo)}
+        )
+        # A repair: the recorded journey branch is what branch_to_merge answers.
+        recorded = branch_to_merge(FEATURE, FIX_BRANCH)
+        await run(
+            subcommand="autobuild",
+            args=_executor_args() + ["--branch", recorded],
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=900,
+            with_nats_streaming=False,
+        )
+        # A routine build: nothing was recorded, so nothing is sent and the
+        # merge command derives the feature's own branch itself.
+        await run(
+            subcommand="autobuild",
+            args=_executor_args(),
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=900,
+            with_nats_streaming=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert seen[0]["branch"] == FIX_BRANCH == branch_to_merge(FEATURE, FIX_BRANCH)
+    assert "branch" not in seen[1]
+    assert branch_to_merge(FEATURE, None) == f"autobuild/{FEATURE}"
+
+
+@pytest.mark.asyncio
+async def test_a_branch_name_git_would_not_accept_is_refused_before_anything_runs(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    """The door checks the name before a process starts, and its sentence
+    comes back on the result the executor reads."""
+    run = _run(sidecar, repo)
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args() + ["--branch", "fix/a..b"],
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=900,
+        with_nats_streaming=False,
+    )
+    assert result.status == "failed"
+    assert "refused to run the merge" in (result.stderr or "")
+    assert "'branch'" in (result.stderr or "")
+
+
+@pytest.mark.asyncio
+async def test_a_branch_flag_with_no_name_is_a_mistake_to_fix(
+    sidecar: str, repo: Path, guardkit_on_the_host: Path
+) -> None:
+    """Nonsense on the command line is a programming mistake, not a merge
+    outcome, so it is raised rather than reported."""
+    run = _run(sidecar, repo)
+    with pytest.raises(MergeCallRefused) as caught:
+        await run(
+            subcommand="autobuild",
+            args=_executor_args() + ["--branch"],
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=900,
+            with_nats_streaming=False,
+        )
+    assert "--branch needs the name of the branch" in str(caught.value)
