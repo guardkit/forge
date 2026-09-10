@@ -36,7 +36,8 @@ The narrow contract:
     POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
               -> {feature_yaml, envelope, code_commit_time, history_dir}
     POST /git/worktree-changed-files {repo, path, base}
-              -> {name_status, approval_patch, truncated, head|null}
+              -> {name_status, approval_patch, truncated, head|null,
+                  test_patch, test_patch_truncated}
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -2887,11 +2888,12 @@ GIT_BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
 def process_git_worktree_changed_files_request(
     payload: Any, *, config: ForgeConfig
 ) -> tuple[int, dict[str, Any]]:
-    """``{repo, path, base}`` → ``{name_status, approval_patch, truncated, head}``.
+    """``{repo, path, base}`` → the branch's three readings.
 
-    Two fixed git commands in the journey worktree the caller names, both
-    against ``<base>...HEAD`` — the three-dot form, so what comes back is what
-    THIS branch changed and never what its base has moved on to since:
+    Three fixed diffs in the journey worktree the caller names, all against
+    ``<base>...HEAD`` — the three-dot form, so what comes back is what THIS
+    branch changed and never what its base has moved on to since — and a
+    ``rev-parse HEAD`` saying which commit was read:
 
     * ``diff --name-status -M -z`` — which files changed, with renames
       detected, so the refusal can say "renamed to" rather than "deleted" and
@@ -2903,12 +2905,28 @@ def process_git_worktree_changed_files_request(
       no changed lines at all and an approval carried along with it would be
       invisible. With them off the move is a removal and an addition, which is
       what it is.
+    * ``diff -U0 -M -G <the test words>`` — the same again for the words that
+      could be a test function or an assertion, which is what the count on
+      the merge card is read from (Rich's ruling, 2026-09-10). This is the
+      one the route was WIDENED for rather than answered beside: the caller
+      needs the diff's own LINES and this route already had the branch open,
+      so a second walk of the branch would have been a second answer to a
+      question already being asked. Renames stay ON here, because a test file
+      that only moved has lost nothing and must not be counted as if it had.
+
+    ``test_patch`` can NEVER refuse anything: it is a report on the card, so
+    a diff too long to carry comes back empty with ``test_patch_truncated``
+    true, while ``truncated`` keeps meaning exactly what it always meant —
+    the two readings the fence refuses on could not be read whole.
 
     A 400 is a refusal of the request; a 500 is git failing to answer, which
     the caller must read as "this could not be read" and never as "this branch
     changed nothing". Never raises.
     """
-    from forge.pipeline.merge_ready_checkpoint import APPROVAL_MARKER
+    from forge.pipeline.merge_ready_checkpoint import (
+        APPROVAL_MARKER,
+        TEST_CHANGE_MARKER,
+    )
 
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -2948,6 +2966,11 @@ def process_git_worktree_changed_files_request(
             if names.returncode == 0
             else None
         )
+        tests = (
+            _git("diff", "-U0", "--no-color", "-M", f"-G{TEST_CHANGE_MARKER}", span)
+            if names.returncode == 0
+            else None
+        )
         head = _git("rev-parse", "HEAD") if names.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
@@ -2968,11 +2991,25 @@ def process_git_worktree_changed_files_request(
         len(name_status.encode("utf-8")) > GIT_BRANCH_DIFF_LIMIT_BYTES
         or len(approval_patch.encode("utf-8")) > GIT_BRANCH_DIFF_LIMIT_BYTES
     )
+    # The test diff stands apart from the two above: a git that could not
+    # answer it, or an answer too long to carry, is said plainly and carries
+    # nothing, because the count it feeds is a line on a card and may never
+    # stop a journey.
+    test_patch = (
+        (tests.stdout or "") if tests is not None and tests.returncode == 0 else ""
+    )
+    test_patch_truncated = (
+        tests is None
+        or tests.returncode != 0
+        or len(test_patch.encode("utf-8")) > GIT_BRANCH_DIFF_LIMIT_BYTES
+    )
     sha = (head.stdout or "").strip() if head is not None and head.returncode == 0 else ""
     return 200, {
         "name_status": name_status[:GIT_BRANCH_DIFF_LIMIT_BYTES],
         "approval_patch": approval_patch[:GIT_BRANCH_DIFF_LIMIT_BYTES],
         "truncated": truncated,
+        "test_patch": "" if test_patch_truncated else test_patch,
+        "test_patch_truncated": test_patch_truncated,
         "head": sha or None,
     }
 
