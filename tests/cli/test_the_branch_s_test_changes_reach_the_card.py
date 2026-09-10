@@ -76,6 +76,31 @@ def test_lookup_by_email():
     assert response.status_code == 200
 '''
 
+#: The same repository's javascript tests, written the plain way: ``test(...)``
+#: with a helper doing the checking, so not one line of the second block holds
+#: the word "assert", the word "expect" or the ``it(`` form. A branch that
+#: deletes that block has lost a test and the card must say so.
+JS_TESTS = "tests/router.test.ts"
+THE_JS_TESTS = '''\
+import { lookup } from "../src/users/router";
+
+test("finds the user", () => {
+  checkUser(lookup("a@b"));
+});
+
+test("another", () => {
+  checkUser(lookup("gone@b"));
+});
+'''
+
+THE_JS_TESTS_WITH_A_LOSS = '''\
+import { lookup } from "../src/users/router";
+
+test("finds the user", () => {
+  checkUser(lookup("a@b"));
+});
+'''
+
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@t",
@@ -113,6 +138,7 @@ def clone(tmp_path: Path) -> Path:
     _git(path, "init", "-b", "main")
     _write(path / TESTS, THE_TESTS)
     _write(path / "src" / "users" / "router.py", "def lookup(email):\n    ...\n")
+    _write(path / JS_TESTS, THE_JS_TESTS)
     _write(path / TWIN, "DELETE http://localhost/users?email=a@b\nHTTP 204\n")
     _git(path, "add", "-A")
     _git(path, "commit", "-m", "init")
@@ -174,6 +200,17 @@ def _counts(pool: Any, config: ForgeConfig) -> Any:
     )
     assert report.status is SpecificationFenceStatus.CLEAR, report.detail
     return report.test_changes
+
+
+def _gates(report: Any) -> Any:
+    """The gates report the card is written from, carrying today's count."""
+    from forge.pipeline.merge_ready_checkpoint import GatesReport, GateStatus
+
+    return GatesReport(
+        status=GateStatus.GREEN,
+        detail="the tests this repository declares came back green",
+        test_changes=report.test_changes,
+    )
 
 
 @pytest.fixture
@@ -269,6 +306,26 @@ class TestTheCountsComeOffARealBranch:
         assert counted.assertions_removed == 1
         assert counted.files == (RENAMED_TESTS,)
 
+    def test_a_javascript_test_with_no_assert_in_it_is_still_counted(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        """The plain ``test("...")`` form, with a helper doing the checking.
+
+        Nothing the branch removes here holds "assert", "expect" or ``it(``,
+        so the words git filters the diff by are the only thing standing
+        between this loss and a card that says "removed no tests" about a
+        branch that removed one.
+        """
+        _write(worktree / JS_TESTS, THE_JS_TESTS_WITH_A_LOSS)
+        _commit(worktree, "drop a javascript test")
+
+        counted = _counts(pool, _config(clone))
+
+        assert counted.files_changed == 1
+        assert counted.tests_deleted == 1
+        assert counted.files == (JS_TESTS,)
+        assert counted.lost_something is True
+
     def test_deleting_tests_is_never_a_refusal(
         self, pool: Any, clone: Path, worktree: Path
     ) -> None:
@@ -331,6 +388,100 @@ class TestTheSandboxFormCountsTheSame:
 
         assert reading.error is None
         assert reading.test_patch_read_whole is False
+
+
+class TestNothingAboutTheTestDiffCanRefuseTheBranch:
+    """The third reading is a line on a card, so no way of failing it may
+    reach the sentence that refuses a branch.
+
+    Failing it three ways: git exits non-zero, the answer is too long to read
+    whole, and — the one that got past the first cut — git never answers at
+    all, because it timed out or could not be run. All three leave the two
+    readings the fence really does refuse on exactly as they were, and all
+    three say "this could not be read" rather than "nothing changed".
+    """
+
+    @staticmethod
+    def _make_the_test_diff_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+        from forge.pipeline.merge_ready_checkpoint import TEST_CHANGE_MARKER
+
+        marker = f"-G{TEST_CHANGE_MARKER}"
+        real = subprocess.run
+
+        def _run(argv: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(argv, (list, tuple)) and marker in argv:
+                raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+    def test_read_here_a_test_diff_that_never_answers_is_not_an_error(
+        self, worktree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write(worktree / TESTS, THE_TESTS_WITH_LOSSES)
+        _commit(worktree, "the fix")
+        self._make_the_test_diff_raise(monkeypatch)
+
+        reading = conductor.read_branch_changes(worktree=worktree, base="main")
+
+        assert reading.error is None
+        assert reading.test_patch == ""
+        assert reading.test_patch_read_whole is False
+        assert TESTS in reading.name_status
+
+    def test_read_here_the_branch_is_still_carded(
+        self, pool: Any, clone: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write(worktree / TESTS, THE_TESTS_WITH_LOSSES)
+        _commit(worktree, "the fix")
+        self._make_the_test_diff_raise(monkeypatch)
+
+        report = conductor.make_specification_fence(pool=pool, config=_config(clone))(
+            build_id=BUILD_ID, branch=JOURNEY_BRANCH
+        )
+
+        assert report.status is SpecificationFenceStatus.CLEAR, report.detail
+        assert report.refuses is False
+        assert report.test_changes.read_whole is False
+        card = merge_card_words(
+            feature_id="FEAT-39F6", branch=JOURNEY_BRANCH, gates=_gates(report)
+        )
+        assert "could not be read here" in card
+
+    def test_in_the_sandbox_a_test_diff_that_never_answers_is_not_an_error(
+        self, worktree: Path, sidecar: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same again through the REAL sidecar over the loopback port: the
+        route answers 200 with nothing counted, not the 500 the caller would
+        have to read as a refusal."""
+        _write(worktree / TESTS, THE_TESTS_WITH_LOSSES)
+        _commit(worktree, "the fix")
+        self._make_the_test_diff_raise(monkeypatch)
+
+        reading = conductor.read_branch_changes_in_sandbox(
+            worktree=worktree,
+            base="main",
+            sandbox=sidecar.config.planning.sandboxes[REPO],
+            repo=REPO,
+            post=None,
+        )
+
+        assert reading.error is None
+        assert reading.test_patch_read_whole is False
+        assert TESTS in reading.name_status
+
+    def test_the_sandbox_is_waited_for_as_long_as_it_may_spend(self) -> None:
+        """Three git commands now run inside one request, each with the same
+        wall. If the caller gave up before the sidecar did, a slow repository
+        would come back as an error sentence — and an error sentence refuses
+        the branch."""
+        waited = (
+            conductor.BRANCH_DIFF_TIMEOUT_SECONDS
+            * conductor.SANDBOX_BRANCH_DIFF_GIT_CALLS
+            + conductor.SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S
+        )
+
+        assert waited > conductor.BRANCH_DIFF_TIMEOUT_SECONDS * 3
 
 
 class TestWhichFilesThisRepositoryCallsItsTests:

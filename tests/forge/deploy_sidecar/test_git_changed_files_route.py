@@ -309,6 +309,43 @@ class TestWhatTheBranchDidToTheTestsComesBackToo:
         assert "src.py" not in body["test_patch"]
 
 
+class TestTheTestDiffNeverTurnsIntoARefusal:
+    """The caller reads a 500 from this route as "this could not be read",
+    and refuses the branch on it. The test diff feeds a line on a card, so no
+    way of failing IT may produce one — not a git that exits non-zero, not a
+    diff too long to carry, and not a git that never answers at all."""
+
+    def test_a_test_diff_that_never_answers_still_gets_a_200(
+        self, cfg: ForgeConfig, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import TEST_CHANGE_MARKER
+
+        (tree / TESTS).write_text(
+            "def test_lookup_by_email():\n    assert lookup('a@b') == 'a@b'\n",
+            encoding="utf-8",
+        )
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "trim the tests")
+        marker = f"-G{TEST_CHANGE_MARKER}"
+        real = subprocess.run
+
+        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(argv, (list, tuple)) and marker in argv:
+                raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert body["test_patch"] == ""
+        assert body["test_patch_truncated"] is True
+        # The two readings the fence really does refuse on are untouched.
+        assert body["name_status"].split("\0")[:2] == ["M", TESTS]
+        assert body["truncated"] is False
+
+
 class TestTheSameLawsEveryOtherGitRouteKeeps:
     def test_only_this_repositorys_own_journey_tree_path_is_read(
         self, cfg: ForgeConfig, repo: Path, other_repo: Path
