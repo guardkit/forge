@@ -31,6 +31,20 @@ The pre-merge baseline — the list of tests the target branch was already
 failing — is sent inline rather than as a path. The executor writes that file
 inside the container, where the sidecar cannot read it; the sidecar writes its
 own copy on the host from the list this module sends.
+
+The branch to be merged travels the same way, as its own field, for the same
+reason the two time limits do: the sidecar builds the command itself, so a
+flag left in the argument list here would simply be dropped. It was, and on
+2026-09-10 a fix journey's repair passed every check inside the sandbox and
+then had its merge refused — "branch autobuild/FEAT-39F6 does not exist" —
+because the door had never been taught the journey's own branch. The name sent
+is the one the caller was given (the merge executor takes it from
+:func:`forge.pipeline.merge_offer.branch_to_merge`, the estate's single answer
+to which branch the merge word merges); this module never derives a branch
+name of its own, so it can never disagree with the offer, the candidate check
+or the landed-merge detection. No branch in the argument list means no branch
+in the request, and the merge command derives the feature's own branch exactly
+as it always has.
 """
 
 from __future__ import annotations
@@ -308,6 +322,24 @@ def build_sidecar_guardkit_run(
             "expect_main_sha": expect_main_sha,
             "timeout_seconds": float(timeout_seconds),
         }
+        # THE BRANCH TRAVELS AS ITS OWN FIELD. The sidecar builds the command
+        # on the far side, so a --branch left in this list would be dropped
+        # and a fix journey's repair would be merged from a branch nobody
+        # made. What is sent is exactly what the caller put on the command
+        # line — the executor takes it from merge_offer.branch_to_merge — and
+        # this door never makes up a name of its own. No flag means no field,
+        # and the merge command derives the feature's own branch as before.
+        branch = _flag_value(args, "--branch")
+        named_a_branch = any(
+            token == "--branch" or token.startswith("--branch=") for token in args
+        )
+        if named_a_branch and not (branch or "").strip():
+            raise MergeCallRefused(
+                "the merge command's --branch needs the name of the branch to "
+                f"merge after it; got {args!r}"
+            )
+        if branch is not None:
+            body["branch"] = branch
         # THE TWO WALLS TRAVEL TOGETHER. ``timeout_seconds`` is the wall around
         # the whole command; ``--verify-timeout`` is how long ONE run of the
         # checks may take. The sidecar builds the command itself, so the inner
