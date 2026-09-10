@@ -39,8 +39,8 @@ terminal route). Its act, when the leg fires:
    mirrored approval publisher). It never opens a PR, never renders a
    diff surface, never asks Rich to read code.
 
-The three laws it enforces
---------------------------
+The laws it enforces
+--------------------
 
 * **Gates green first** (§c.3). A red gate is NEVER a card. It loops back
   into the fix cycle (the conductor's next review pass) or terminates
@@ -49,6 +49,12 @@ The three laws it enforces
 * **No-commit terminals stay silent** (§c.6). A journey that finds
   nothing to fix, or produces no commits, ends with a receipt — not a
   card. Rich hears about work only when there is a merge word to say.
+* **The specification is not the machine's to edit** (Rich's ruling,
+  2026-09-09). Before a card is published the checkpoint reads which files
+  the journey's branch changed against its base. A branch that changes the
+  files the repository calls its specification, or a line recording
+  somebody's approval, is a RED checkpoint: no card, and one plain sentence
+  naming the files and what was done to them. See the fence section below.
 * **Never auto-merge** (§c.4, ADR-ARCH-026). ``auto_approve=True`` is
   refused here as well as by the constitutional guard upstream: belt and
   braces on "the merge word is human forever".
@@ -85,8 +91,10 @@ across history. The *user surfaces* speak the plain name
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Mapping
@@ -94,15 +102,28 @@ from typing import Any, Awaitable, Callable, Mapping
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "APPROVAL_MARKER",
     "DECLARED_TEST_EVIDENCE_KEY",
     "DECLARED_TEST_OUTPUT_FILENAME",
+    "DEFAULT_SPECIFICATION_PATHS",
     "MERGE_READY_CHECKPOINT_LABEL",
+    "ApprovalLineChange",
+    "BranchFileChange",
     "GateStatus",
     "GatesReport",
     "MergeCardDecision",
     "MergeCardOutcome",
     "MergeReadyCheckpointPublisher",
     "RedGateAction",
+    "SpecificationFenceReport",
+    "SpecificationFenceStatus",
+    "approval_line_owner",
+    "judge_branch_changes",
+    "parse_changed_files",
+    "parse_changed_approval_lines",
+    "path_is_specification",
+    "unreadable_branch_changes",
+    "unreadable_specification_declaration",
 ]
 
 
@@ -195,6 +216,484 @@ class RedGateAction(StrEnum):
 
     LOOP_BACK = "loop-back"
     TERMINATE_FAILED = "terminate-failed"
+
+
+# ---------------------------------------------------------------------------
+# THE SPECIFICATION FENCE — the specification is not the machine's to edit
+# (Rich's ruling, 2026-09-09)
+# ---------------------------------------------------------------------------
+#
+# What happened, 2026-09-09, build ``build-FEAT-39F6-20260909195749``. The
+# follow-up review asked in ordinary words for an acceptance twin to be
+# "updated". The work leg did exactly that: it renamed
+# ``qa/twins/users-delete-by-email/double-delete-honest-404.hurl`` to
+# ``…-410.hurl``, changed the first delete's expected response from 204 to
+# 410, rewrote the scenario's wording, and edited the line recording the
+# owner's own ruling — keeping his name and the date on a sentence he never
+# said. The twins ARE what the candidate check measures the running
+# application against. Had it reached this checkpoint the suite would have
+# passed (no unit test reads the twins), a green card would have gone to the
+# owner, and the candidate check would have measured the code against a
+# specification the code had just rewritten. Nothing forbade any of it.
+#
+# So, before a card is published, the checkpoint reads WHICH FILES THE
+# JOURNEY'S BRANCH CHANGED against its base and refuses when any of them is
+# the repository's specification, or when the change touches a line that
+# records somebody's approval. Two separate rules, named separately, both a
+# RED checkpoint: no card, one plain sentence naming the files and what was
+# done to them, and the existing red-gate path carries it — back to a review
+# leg to revert the edit while a review cycle remains, FAILED naming the
+# files when none does.
+#
+# WHERE A REPOSITORY SAYS WHICH FILES ARE ITS SPECIFICATION. In the place it
+# already declares things about its gates: ``.guardkit/config.yaml``, beside
+# the ``toolchain:`` block the merge-ready checks already read, under a
+# ``specification:`` key —
+#
+#     specification:
+#       paths:
+#         - "qa/twins/**"
+#
+# and a repository that says nothing gets :data:`DEFAULT_SPECIFICATION_PATHS`.
+#
+# HOW A DECLARED PATH IS READ. ``**`` crosses directory boundaries; ``*`` and
+# ``?`` stop at a slash; and a path with no wildcard in it at all, or one
+# written with a trailing slash, names a directory and everything beneath it.
+# So ``qa/twins``, ``qa/twins/`` and ``qa/twins/**`` all say the same thing,
+# and a repository cannot be left protected on nothing by naming the
+# directory it means (:func:`_glob_matcher`).
+# The declaration is read from the CANONICAL tree, never from the worktree
+# the journey has been editing — the same law the toolchain declaration is
+# read under, and for the same reason: a branch that could rewrite the
+# declaration could free itself.
+#
+# SAYING NOTHING AND SAYING SOMETHING NOBODY CAN HEAR ARE DIFFERENT THINGS.
+# No declaration file at all means "the default is my shape", and the default
+# applies. A declaration file that is there and cannot be read or parsed is a
+# reading that did not happen, and refuses — because reading it as "declares
+# nothing" would fence the DEFAULT paths in place of the ones it names, which
+# for a repository whose specification lives somewhere else is LESS
+# protection, not more (:func:`unreadable_specification_declaration`).
+
+#: What a repository's specification is when it declares nothing: the
+#: acceptance twins under ``qa/twins/``. That is api_test's own shape and the
+#: one the 2026-09-09 incident used.
+DEFAULT_SPECIFICATION_PATHS: tuple[str, ...] = ("qa/twins/**",)
+
+#: The word a recorded approval carries. It is deliberately the whole rule's
+#: first half: a changed line must hold this word AND name the person whose
+#: approval it records before the second rule fires, so a line saying
+#: "approved" in passing is not an owner's sentence.
+APPROVAL_MARKER: str = "APPROVED"
+
+#: "APPROVED … by <Name>" — the shape of a recorded approval. The word, then
+#: somebody's name after "by". ``# APPROVED AS PROPOSED by Rich 2026-07-28``
+#: is the line the incident rewrote; this is what recognises it wherever it
+#: lives, in any file, in any repository.
+_APPROVAL_LINE = re.compile(
+    r"\bAPPROVED\b.*?\b[Bb][Yy]\b\s+([A-Z][A-Za-z.'’-]*)"
+)
+
+
+class SpecificationFenceStatus(StrEnum):
+    """What the fence made of the branch's own changes.
+
+    Members:
+        CLEAR: The branch's changes were read and none of them is the
+            repository's specification or an owner's recorded approval.
+            **The only status that lets the checkpoint carry on.**
+        REFUSED: The branch changes the specification, or a recorded
+            approval, or both.
+        UNREADABLE: What the branch changed could not be read at all. Not a
+            pass: a check that could not run must never become a green card,
+            so this refuses too and says which it is.
+    """
+
+    CLEAR = "clear"
+    REFUSED = "refused"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True, slots=True)
+class BranchFileChange:
+    """One file the branch changed against its base.
+
+    Attributes:
+        status: git's own letter — ``A`` added, ``M`` changed, ``D``
+            deleted, ``R`` renamed, ``C`` copied, ``T`` type changed.
+        path: The file's path after the change, relative to the repository.
+        old_path: Where a renamed or copied file came from; empty otherwise.
+    """
+
+    status: str
+    path: str
+    old_path: str = ""
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        """Every path this change touches — both ends of a rename."""
+        return (self.path, self.old_path) if self.old_path else (self.path,)
+
+    def says_what_happened(self) -> str:
+        """One plain phrase: what the branch did to this file."""
+        letter = (self.status or "").upper()[:1]
+        if letter == "R" and self.old_path:
+            return f"{self.old_path} (renamed to {self.path})"
+        if letter == "C" and self.old_path:
+            return f"{self.path} (copied from {self.old_path})"
+        if letter == "A":
+            return f"{self.path} (added)"
+        if letter == "D":
+            return f"{self.path} (deleted)"
+        return f"{self.path} (changed)"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalLineChange:
+    """One line the branch added or removed that records somebody's approval.
+
+    Attributes:
+        path: The file the line is in.
+        line: The line itself, as git printed it, without its ``+``/``-``.
+        added: ``True`` for a line the branch adds, ``False`` for one it
+            removes. An edit shows up as both, which is exactly what the
+            incident's rewrite of the owner's ruling was.
+        owner: The name the line records the approval against.
+    """
+
+    path: str
+    line: str
+    added: bool
+    owner: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SpecificationFenceReport:
+    """What the fence says about one branch.
+
+    Attributes:
+        status: The :class:`SpecificationFenceStatus`.
+        detail: The plain sentence a person reads — on the log line, on the
+            decision and in the receipts. Empty when the branch is clear.
+        failed_gates: The refusal's own names, one per rule that fired, each
+            carrying the files it fired on, so the sentence that closes a
+            journey out names them too.
+        specification_files: What was changed under the specification rule.
+        approval_files: What was changed under the recorded-approval rule.
+    """
+
+    status: SpecificationFenceStatus
+    detail: str = ""
+    failed_gates: tuple[str, ...] = ()
+    specification_files: tuple[str, ...] = ()
+    approval_files: tuple[str, ...] = ()
+
+    @property
+    def refuses(self) -> bool:
+        """``True`` when no card may be published on this branch."""
+        return self.status is not SpecificationFenceStatus.CLEAR
+
+
+@functools.lru_cache(maxsize=256)
+def _glob_matcher(pattern: str) -> re.Pattern[str]:
+    """One declared path pattern, as a matcher.
+
+    ``**`` crosses directory boundaries and ``*`` and ``?`` do not, so
+    ``qa/twins/**`` means "everything under qa/twins" and ``qa/*.hurl`` means
+    the twins directly in ``qa`` and no deeper.
+
+    A pattern that names a plain directory covers everything beneath it:
+    ``qa/twins``, ``qa/twins/`` and ``qa/twins/**`` all protect every file
+    under ``qa/twins``. A repository that writes ``qa/twins`` means the
+    twins, not one file with that exact name and no directory of its own —
+    and reading it the literal way would leave that repository protected on
+    nothing at all, silently, which is the one thing this fence may never do.
+    So a pattern with no ``*`` or ``?`` anywhere in it, and any pattern
+    ending in ``/``, is read as that path and everything below it. Wildcards
+    are left exactly as written, because a repository that writes one is
+    saying where it wants the match to stop.
+    """
+    cleaned = str(pattern or "").strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    covers_what_is_beneath = cleaned.endswith("/") or not any(
+        char in cleaned for char in "*?"
+    )
+    cleaned = cleaned.rstrip("/")
+    if not cleaned:
+        # A pattern that names nothing protects nothing; ``(?!)`` never
+        # matches, so an empty entry can never widen the fence to everything.
+        return re.compile(r"(?!)")
+    pattern = cleaned
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if pattern.startswith("**/", index):
+                out.append("(?:.*/)?")
+                index += 3
+                continue
+            if pattern.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(char))
+        index += 1
+    tail = r"(?:/.*)?\Z" if covers_what_is_beneath else r"\Z"
+    return re.compile("".join(out) + tail)
+
+
+def path_is_specification(path: str, patterns: "tuple[str, ...]") -> bool:
+    """Is ``path`` one of the files this repository calls its specification?
+
+    A declared pattern that names a plain directory — ``qa/twins`` — covers
+    every file beneath it, so a repository cannot end up protected on nothing
+    by writing the directory it means. See :func:`_glob_matcher`.
+    """
+    cleaned = str(path or "").strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    if not cleaned:
+        return False
+    return any(_glob_matcher(pattern).match(cleaned) for pattern in patterns)
+
+
+def approval_line_owner(line: str) -> str:
+    """The name a recorded-approval line names, or ``""`` when it is not one.
+
+    The rule reads the CHANGE, not the path: a line holding ``APPROVED`` and
+    naming whose approval it is, wherever the file lives.
+    """
+    if APPROVAL_MARKER not in (line or ""):
+        return ""
+    found = _APPROVAL_LINE.search(line)
+    return found.group(1) if found else ""
+
+
+def parse_changed_files(name_status: str) -> "tuple[BranchFileChange, ...]":
+    """git's ``diff --name-status -M -z`` output, as changes.
+
+    ``-z`` writes NUL-separated fields: a letter, then one path, except for a
+    rename or a copy which write the letter (with its similarity score) and
+    then TWO paths. Parsing the machine-readable form rather than the tabbed
+    one means a path with a space, a tab or a quote in it is read exactly as
+    git wrote it.
+    """
+    fields = [field for field in str(name_status or "").split("\0") if field != ""]
+    changes: list[BranchFileChange] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        letter = status[:1].upper()
+        index += 1
+        if letter in ("R", "C"):
+            if index + 1 >= len(fields):
+                break
+            changes.append(
+                BranchFileChange(
+                    status=letter, path=fields[index + 1], old_path=fields[index]
+                )
+            )
+            index += 2
+            continue
+        if index >= len(fields):
+            break
+        changes.append(BranchFileChange(status=letter or "M", path=fields[index]))
+        index += 1
+    return tuple(changes)
+
+
+def parse_changed_approval_lines(patch: str) -> "tuple[ApprovalLineChange, ...]":
+    """A unified diff, as the recorded-approval lines it adds or removes.
+
+    The patch this reads is git's own, taken with renames turned OFF on
+    purpose: with renames on, a file moved wholesale carries no changed lines
+    at all and a moved approval would be invisible. With them off the same
+    move is a removal and an addition, which is what it is.
+
+    WHERE THE HEADERS ARE MATTERS. ``--- a/file`` and ``+++ b/file`` name the
+    two sides of a file, and they only ever appear between ``diff --git`` and
+    that file's first ``@@``. Inside a hunk, a line beginning ``---`` is
+    CONTENT: it is a deleted line whose own text starts with ``--``, which is
+    how a comment is written in SQL, Lua and Haskell — so a deleted
+    ``-- APPROVED AS PROPOSED by Rich 2026-07-28`` prints as
+    ``--- APPROVED AS PROPOSED by Rich 2026-07-28``. Reading that as a header
+    would miss the very removal rule (b) names, and would leave the file's
+    name wrong for the rest of its hunks as well. So the two header shapes
+    are honoured only outside a hunk: ``@@`` opens one, and the next
+    ``diff --git`` closes it.
+    """
+    lines: list[ApprovalLineChange] = []
+    added_file = ""
+    removed_file = ""
+    inside_a_hunk = False
+    for raw in str(patch or "").splitlines():
+        if raw.startswith("diff --git "):
+            inside_a_hunk = False
+            added_file = ""
+            removed_file = ""
+            continue
+        if raw.startswith("@@"):
+            inside_a_hunk = True
+            continue
+        if not inside_a_hunk:
+            if raw.startswith("+++ "):
+                added_file = _patch_path(raw[4:])
+                continue
+            if raw.startswith("--- "):
+                removed_file = _patch_path(raw[4:])
+                continue
+        if not raw.startswith(("+", "-")):
+            continue
+        added = raw.startswith("+")
+        body = raw[1:]
+        owner = approval_line_owner(body)
+        if not owner:
+            continue
+        path = (added_file if added else removed_file) or removed_file or added_file
+        lines.append(
+            ApprovalLineChange(
+                path=path, line=body.strip(), added=added, owner=owner
+            )
+        )
+    return tuple(lines)
+
+
+def _patch_path(token: str) -> str:
+    """``a/qa/twins/x.hurl`` → ``qa/twins/x.hurl``; ``/dev/null`` → ``""``."""
+    cleaned = token.strip().split("\t", 1)[0].strip()
+    if cleaned in ("/dev/null", ""):
+        return ""
+    if cleaned.startswith('"') and cleaned.endswith('"') and len(cleaned) > 1:
+        cleaned = cleaned[1:-1]
+    for prefix in ("a/", "b/"):
+        if cleaned.startswith(prefix):
+            return cleaned[len(prefix) :]
+    return cleaned
+
+
+def _and_list(items: "tuple[str, ...]") -> str:
+    return ", ".join(items)
+
+
+def judge_branch_changes(
+    *,
+    changes: "tuple[BranchFileChange, ...]",
+    approval_lines: "tuple[ApprovalLineChange, ...]",
+    specification_paths: "tuple[str, ...]",
+) -> SpecificationFenceReport:
+    """The two rules, applied to one branch's own changes.
+
+    Rule one reads the PATHS: a change to a file the repository calls its
+    specification — both ends of a rename, because a twin renamed away is a
+    twin removed. Rule two reads the CHANGE: a line holding ``APPROVED`` and
+    naming whose approval it is, added or removed, in any file anywhere.
+    They are named separately because they are different wrongs, and a
+    branch that does both is told both.
+    """
+    spec_changes = tuple(
+        change
+        for change in changes
+        if any(path_is_specification(path, specification_paths) for path in change.paths)
+    )
+    spec_files = tuple(change.says_what_happened() for change in spec_changes)
+
+    approval_files: list[str] = []
+    for path in dict.fromkeys(line.path for line in approval_lines):
+        owners = tuple(
+            dict.fromkeys(
+                line.owner
+                for line in approval_lines
+                if line.path == path and line.owner
+            )
+        )
+        named = " and ".join(owners)
+        where = path or "a file the diff did not name"
+        approval_files.append(
+            f"{where} (the line recording {named}'s approval)"
+            if named
+            else f"{where} (a recorded approval)"
+        )
+
+    if not spec_files and not approval_files:
+        return SpecificationFenceReport(status=SpecificationFenceStatus.CLEAR)
+
+    sentences: list[str] = []
+    gates: list[str] = []
+    if spec_files:
+        sentences.append(
+            "the branch changes files this repository calls its "
+            f"specification: {_and_list(spec_files)} — a specification change "
+            "is the owner's to make, so no card was published"
+        )
+        gates.append(f"the repository's specification: {_and_list(spec_files)}")
+    if approval_files:
+        sentences.append(
+            "the branch changes a line that records an approval: "
+            f"{_and_list(tuple(approval_files))} — a recorded approval is the "
+            "owner's own word, so no card was published"
+        )
+        gates.append(
+            f"a recorded approval: {_and_list(tuple(approval_files))}"
+        )
+    return SpecificationFenceReport(
+        status=SpecificationFenceStatus.REFUSED,
+        detail=". ".join(sentences),
+        failed_gates=tuple(gates),
+        specification_files=spec_files,
+        approval_files=tuple(approval_files),
+    )
+
+
+def unreadable_branch_changes(reason: str) -> SpecificationFenceReport:
+    """What the fence answers when it could not read the branch at all.
+
+    Never a pass. The whole point of the fence is that a card says the branch
+    was looked at; a card published on a branch nobody could read would say
+    something untrue.
+    """
+    return SpecificationFenceReport(
+        status=SpecificationFenceStatus.UNREADABLE,
+        detail=(
+            "what this branch changed could not be read "
+            f"({reason}), so it cannot be shown that the repository's "
+            "specification and its recorded approvals are untouched, and no "
+            "card was published"
+        ),
+        failed_gates=("what the branch changed could not be read",),
+    )
+
+
+def unreadable_specification_declaration(reason: str) -> SpecificationFenceReport:
+    """What the fence answers when the repository's own declaration of which
+    files are its specification is THERE and could not be read.
+
+    Not the same thing as a repository that declares nothing. A repository
+    with no declaration file has said, plainly, "the default is my shape",
+    and the default applies. A declaration that exists but cannot be read or
+    parsed has said something nobody could hear — and reading it as "declares
+    nothing" would quietly protect the DEFAULT paths instead of the ones it
+    names, which for a repository whose specification lives somewhere else is
+    less protection, not more. So it refuses, like every other reading that
+    did not happen.
+    """
+    return SpecificationFenceReport(
+        status=SpecificationFenceStatus.UNREADABLE,
+        detail=(
+            "which files this repository calls its specification could not be "
+            f"read ({reason}), so it cannot be shown that its specification "
+            "and its recorded approvals are untouched, and no card was "
+            "published"
+        ),
+        failed_gates=(
+            "which files this repository calls its specification could not be read",
+        ),
+    )
 
 
 class MergeCardOutcome(StrEnum):
@@ -339,6 +838,16 @@ class MergeReadyCheckpointPublisher:
         failure_pack_writer: ``(*, build_id, feature_id, reason, gates)
             -> Any`` — writes the journey's own failure pack on the
             TERMINATE_FAILED branch.
+        specification_fence: ``(*, build_id, branch) ->
+            SpecificationFenceReport`` — **the specification fence**
+            (Rich's ruling, 2026-09-09). Reads which files the journey's
+            branch changed against its base and answers whether any of them
+            is the repository's specification, or carries somebody's
+            recorded approval. A report that refuses is a RED checkpoint on
+            the existing red-gate path: no card, and the plain sentence
+            naming the files. ``None`` — every caller that predates the
+            fence — means no fence runs at all and the checkpoint is byte
+            for byte what it was.
         published_probe: ``(build_id) -> bool`` — **the DURABLE half of
             the one-card latch.** ``True`` when a merge card has already
             been published for this build according to a durable row
@@ -360,6 +869,7 @@ class MergeReadyCheckpointPublisher:
         red_gate_action: Callable[[str, GatesReport], RedGateAction] | None = None,
         failure_pack_writer: Callable[..., Any] | None = None,
         published_probe: Callable[[str], Any] | None = None,
+        specification_fence: Callable[..., Any] | None = None,
     ) -> None:
         self._publish_card = publish_card
         self._gates_green_reader = gates_green_reader
@@ -369,6 +879,7 @@ class MergeReadyCheckpointPublisher:
         self._red_gate_action = red_gate_action
         self._failure_pack_writer = failure_pack_writer
         self._published_probe = published_probe
+        self._specification_fence = specification_fence
         # THE PUBLISH LATCH — build ids whose card publish has been
         # ATTEMPTED. Armed before the await, so even a raise inside the
         # publisher leaves it armed: "we may have put a card on the wire"
@@ -456,6 +967,37 @@ class MergeReadyCheckpointPublisher:
                     ).strip(" |"),
                 )
 
+        # Step (a0) — THE SPECIFICATION FENCE (Rich's ruling, 2026-09-09).
+        # It runs BEFORE the push and before the suite for two reasons: a
+        # branch that rewrote the specification cannot be carded whatever its
+        # tests then say, and there is no sense spending fifteen minutes of
+        # somebody's test suite on a branch that already cannot reach a card.
+        # With no fence wired nothing runs here at all.
+        fence = await self._read_specification_fence(build_id, branch)
+        if fence is not None and getattr(fence, "refuses", False):
+            fence_detail = str(getattr(fence, "detail", "") or "")
+            logger.error(
+                "%s: NO card is published for build_id=%s on branch=%s — %s",
+                MERGE_READY_CHECKPOINT_LABEL,
+                build_id,
+                branch,
+                fence_detail,
+            )
+            return await self._red_gate_decision(
+                build_id=build_id,
+                feature_id=feature_id,
+                branch=branch,
+                pushed=False,
+                gates=GatesReport(
+                    status=GateStatus.RED,
+                    failed_gates=tuple(getattr(fence, "failed_gates", ()) or ()),
+                    detail=fence_detail,
+                ),
+                auto_approve_refused=auto_approve_refused,
+                rationale=rationale,
+                evidence_details={},
+            )
+
         # Step (a) — push the fixed branch. MODELLED at Stage 1.
         pushed = await self._push(build_id, branch)
 
@@ -475,42 +1017,15 @@ class MergeReadyCheckpointPublisher:
         )
 
         if not gates.is_green:
-            action = self._resolve_red_gate_action(build_id, gates)
-            logger.warning(
-                "%s: gates are %s for build_id=%s (failed=%s) — NO card is "
-                "published; action=%s (design pass §c.3: fix loops run "
-                "BEFORE the merge word)",
-                MERGE_READY_CHECKPOINT_LABEL,
-                gates.status.value,
-                build_id,
-                ", ".join(gates.failed_gates) or "unnamed",
-                action.value,
-            )
-            failure_pack = None
-            if action is RedGateAction.TERMINATE_FAILED:
-                failure_pack = await self._write_failure_pack(
-                    build_id=build_id, feature_id=feature_id, gates=gates
-                )
-            return MergeCardDecision(
-                outcome=(
-                    MergeCardOutcome.RED_GATE_FAILED
-                    if action is RedGateAction.TERMINATE_FAILED
-                    else MergeCardOutcome.RED_GATE_LOOP_BACK
-                ),
+            return await self._red_gate_decision(
                 build_id=build_id,
                 feature_id=feature_id,
                 branch=branch,
                 pushed=pushed,
-                push_modelled=self._push_branch is None,
                 gates=gates,
                 auto_approve_refused=auto_approve_refused,
-                rationale=(
-                    f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: gates "
-                    f"{gates.status.value} ({gates.detail or 'no detail'}) — "
-                    "no card"
-                ).strip(" |"),
-                failure_pack=failure_pack,
-                details=evidence_details,
+                rationale=rationale,
+                evidence_details=evidence_details,
             )
 
         # Step (c) — green. Publish the approve-click merge card.
@@ -668,6 +1183,100 @@ class MergeReadyCheckpointPublisher:
         )
 
     # -- internals ----------------------------------------------------
+
+    async def _red_gate_decision(
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        branch: str | None,
+        pushed: bool,
+        gates: GatesReport,
+        auto_approve_refused: bool,
+        rationale: str,
+        evidence_details: Mapping[str, Any],
+    ) -> MergeCardDecision:
+        """The one red-gate ending: no card, loop back, or FAILED with a pack.
+
+        Both things that can stop a card before it is offered come through
+        here — a gate set that is not proven green, and the specification
+        fence — so a refusal is carried by exactly one path: the same log
+        line, the same choice between the fix cycle and a FAILED close-out,
+        the same failure pack, the same shape of decision. The fence's own
+        sentence rides in on ``gates.detail`` and its rule names on
+        ``gates.failed_gates``, which is what the journey's close-out reads
+        when it says why it stopped.
+        """
+        action = self._resolve_red_gate_action(build_id, gates)
+        logger.warning(
+            "%s: gates are %s for build_id=%s (failed=%s) — NO card is "
+            "published; action=%s (design pass §c.3: fix loops run "
+            "BEFORE the merge word)",
+            MERGE_READY_CHECKPOINT_LABEL,
+            gates.status.value,
+            build_id,
+            ", ".join(gates.failed_gates) or "unnamed",
+            action.value,
+        )
+        failure_pack = None
+        if action is RedGateAction.TERMINATE_FAILED:
+            failure_pack = await self._write_failure_pack(
+                build_id=build_id, feature_id=feature_id, gates=gates
+            )
+        return MergeCardDecision(
+            outcome=(
+                MergeCardOutcome.RED_GATE_FAILED
+                if action is RedGateAction.TERMINATE_FAILED
+                else MergeCardOutcome.RED_GATE_LOOP_BACK
+            ),
+            build_id=build_id,
+            feature_id=feature_id,
+            branch=branch,
+            pushed=pushed,
+            push_modelled=self._push_branch is None,
+            gates=gates,
+            auto_approve_refused=auto_approve_refused,
+            rationale=(
+                f"{rationale} | {MERGE_READY_CHECKPOINT_LABEL}: gates "
+                f"{gates.status.value} ({gates.detail or 'no detail'}) — "
+                "no card"
+            ).strip(" |"),
+            failure_pack=failure_pack,
+            details=dict(evidence_details),
+        )
+
+    async def _read_specification_fence(
+        self, build_id: str, branch: str | None
+    ) -> Any | None:
+        """Ask the fence about this branch. ``None`` when none is wired.
+
+        A fence that RAISES is not a pass. It answers the same way it answers
+        a branch it could not read — a refusal naming the reason — because
+        the two are the same fact: nobody looked at what this branch changed,
+        so nobody can say the specification is untouched. The refusal loops
+        back into the fix cycle like every other red gate, so a broken fence
+        stops cards rather than stopping the estate silently.
+        """
+        if self._specification_fence is None:
+            return None
+        try:
+            return await _maybe_await(
+                self._specification_fence(build_id=build_id, branch=branch)
+            )
+        except Exception as exc:  # noqa: BLE001 — an unread branch is not clear
+            logger.error(
+                "%s: the specification fence raised %s: %s for build_id=%s — "
+                "no card is published, because nothing read what this branch "
+                "changed",
+                MERGE_READY_CHECKPOINT_LABEL,
+                type(exc).__name__,
+                exc,
+                build_id,
+            )
+            return unreadable_branch_changes(
+                f"the fence itself raised {type(exc).__name__}: {exc}"
+            )
+
 
     async def _already_carded(self, build_id: str) -> bool:
         """Has this build's merge card already been published? Both halves.
