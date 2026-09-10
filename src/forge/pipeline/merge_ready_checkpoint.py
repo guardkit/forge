@@ -55,6 +55,12 @@ The laws it enforces
   files the repository calls its specification, or a line recording
   somebody's approval, is a RED checkpoint: no card, and one plain sentence
   naming the files and what was done to them. See the fence section below.
+* **What the branch did to the tests is REPORTED, never fenced** (Rich's
+  ruling, 2026-09-10). Ordinary unit tests are legs' honest work to write
+  and change, so nothing here refuses them; but an assertion that quietly
+  goes away makes bad code pass and no check goes red, so the same reading
+  of the branch counts what went away and the card says it in one plain
+  line. See the test-count section below.
 * **Never auto-merge** (§c.4, ADR-ARCH-026). ``auto_approve=True`` is
   refused here as well as by the constitutional guard upstream: belt and
   braces on "the merge word is human forever".
@@ -91,13 +97,14 @@ across history. The *user surfaces* speak the plain name
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import inspect
 import logging
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +113,12 @@ __all__ = [
     "DECLARED_TEST_EVIDENCE_KEY",
     "DECLARED_TEST_OUTPUT_FILENAME",
     "DEFAULT_SPECIFICATION_PATHS",
+    "DEFAULT_TEST_PATHS",
     "MERGE_READY_CHECKPOINT_LABEL",
+    "TEST_CHANGE_MARKER",
     "ApprovalLineChange",
     "BranchFileChange",
+    "ChangedTestsReport",
     "GateStatus",
     "GatesReport",
     "MergeCardDecision",
@@ -118,10 +128,16 @@ __all__ = [
     "SpecificationFenceReport",
     "SpecificationFenceStatus",
     "approval_line_owner",
+    "count_test_changes",
+    "is_assertion",
+    "iter_patch_lines",
     "judge_branch_changes",
+    "name_of_test_function",
     "parse_changed_files",
     "parse_changed_approval_lines",
     "path_is_specification",
+    "path_is_test",
+    "paths_in_test_command",
     "unreadable_branch_changes",
     "unreadable_specification_declaration",
 ]
@@ -190,6 +206,16 @@ class GatesReport:
             reader that fills it in. Empty by default, so every gate set that
             has no output to keep — and every existing caller — is exactly
             what it was.
+        test_changes: What the branch did to this repository's OWN tests,
+            counted once while the branch was being read for the
+            specification fence (Rich's ruling, 2026-09-10: report, never
+            refuse). It rides here because this is what the card seam is
+            handed, and the card turns the counts into one plain line. It
+            decides NOTHING — a branch that deletes every test it has still
+            gets whatever its suite said. ``None`` means nobody counted,
+            which is every gate set that predates this and every journey
+            with no fence wired, and the card then says nothing about tests
+            at all. See :class:`ChangedTestsReport`.
     """
 
     status: GateStatus
@@ -197,6 +223,7 @@ class GatesReport:
     detail: str = ""
     deferred_detail: str = ""
     evidence: str = ""
+    test_changes: "ChangedTestsReport | None" = None
 
     @property
     def is_green(self) -> bool:
@@ -380,6 +407,12 @@ class SpecificationFenceReport:
             journey out names them too.
         specification_files: What was changed under the specification rule.
         approval_files: What was changed under the recorded-approval rule.
+        test_changes: What the same reading of the branch says it did to the
+            repository's own tests (Rich's ruling, 2026-09-10). It is carried
+            here because the branch is read once and this is where that
+            reading lands; it is a REPORT and never a refusal, so it has no
+            say in :attr:`status` and none in :attr:`refuses`. ``None`` when
+            nobody counted.
     """
 
     status: SpecificationFenceStatus
@@ -387,6 +420,7 @@ class SpecificationFenceReport:
     failed_gates: tuple[str, ...] = ()
     specification_files: tuple[str, ...] = ()
     approval_files: tuple[str, ...] = ()
+    test_changes: "ChangedTestsReport | None" = None
 
     @property
     def refuses(self) -> bool:
@@ -448,12 +482,11 @@ def _glob_matcher(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out) + tail)
 
 
-def path_is_specification(path: str, patterns: "tuple[str, ...]") -> bool:
-    """Is ``path`` one of the files this repository calls its specification?
+def _path_matches(path: str, patterns: "tuple[str, ...]") -> bool:
+    """Does one repository path match any of these declared patterns?
 
-    A declared pattern that names a plain directory — ``qa/twins`` — covers
-    every file beneath it, so a repository cannot end up protected on nothing
-    by writing the directory it means. See :func:`_glob_matcher`.
+    The one place a path is compared with a declaration, so the specification
+    fence and the test count read a repository's words the same way.
     """
     cleaned = str(path or "").strip()
     while cleaned.startswith("./"):
@@ -461,6 +494,16 @@ def path_is_specification(path: str, patterns: "tuple[str, ...]") -> bool:
     if not cleaned:
         return False
     return any(_glob_matcher(pattern).match(cleaned) for pattern in patterns)
+
+
+def path_is_specification(path: str, patterns: "tuple[str, ...]") -> bool:
+    """Is ``path`` one of the files this repository calls its specification?
+
+    A declared pattern that names a plain directory — ``qa/twins`` — covers
+    every file beneath it, so a repository cannot end up protected on nothing
+    by writing the directory it means. See :func:`_glob_matcher`.
+    """
+    return _path_matches(path, patterns)
 
 
 def approval_line_owner(line: str) -> str:
@@ -528,7 +571,27 @@ def parse_changed_approval_lines(patch: str) -> "tuple[ApprovalLineChange, ...]"
     are honoured only outside a hunk: ``@@`` opens one, and the next
     ``diff --git`` closes it.
     """
-    lines: list[ApprovalLineChange] = []
+    return tuple(
+        ApprovalLineChange(
+            path=path, line=body.strip(), added=added, owner=approval_line_owner(body)
+        )
+        for path, added, body in iter_patch_lines(patch)
+        if approval_line_owner(body)
+    )
+
+
+def iter_patch_lines(patch: str) -> "Iterator[tuple[str, bool, str]]":
+    """A unified diff, as ``(path, added, line)`` for every line it changes.
+
+    One reader for every rule that reads the branch's own lines — the
+    recorded-approval rule above and the test count below — so the header
+    care documented in :func:`parse_changed_approval_lines` is written once
+    and both are right about which file a line is in.
+
+    ``path`` is the file the line belongs to, ``added`` is ``True`` for a
+    line the branch adds and ``False`` for one it removes, and ``line`` is
+    the line's own text without its leading ``+`` or ``-``.
+    """
     added_file = ""
     removed_file = ""
     inside_a_hunk = False
@@ -551,17 +614,11 @@ def parse_changed_approval_lines(patch: str) -> "tuple[ApprovalLineChange, ...]"
         if not raw.startswith(("+", "-")):
             continue
         added = raw.startswith("+")
-        body = raw[1:]
-        owner = approval_line_owner(body)
-        if not owner:
-            continue
-        path = (added_file if added else removed_file) or removed_file or added_file
-        lines.append(
-            ApprovalLineChange(
-                path=path, line=body.strip(), added=added, owner=owner
-            )
+        yield (
+            (added_file if added else removed_file) or removed_file or added_file,
+            added,
+            raw[1:],
         )
-    return tuple(lines)
 
 
 def _patch_path(token: str) -> str:
@@ -696,6 +753,257 @@ def unreadable_specification_declaration(reason: str) -> SpecificationFenceRepor
     )
 
 
+# ---------------------------------------------------------------------------
+# WHAT THE BRANCH DID TO THE TESTS — counted, put on the card, never fenced
+# (Rich's ruling, 2026-09-10)
+# ---------------------------------------------------------------------------
+#
+# He weighed a fence here and ruled against one: legs write and change tests
+# constantly and legitimately, including tests a review explicitly asked for,
+# so a refusal would either block honest work or be written so loosely it
+# refused nothing. REPORT INSTEAD.
+#
+# The risk it reports on is real and points ONE way. A weakened or deleted
+# assertion makes bad code PASS, so no gate goes red and nothing else notices
+# — the specification fence above catches an edit to the approved twins or to
+# a recorded approval, and nothing at all catches an ordinary unit test
+# quietly losing an assertion. Twice on 2026-09-10 a person read that diff by
+# hand before saying it was safe to merge. This is that hand-reading, counted
+# once while the branch is already being read for the fence, and said on the
+# card in one line.
+#
+# WHAT COUNTS AS A TEST IS THE REPOSITORY'S BUSINESS. Where a repository says
+# so — the paths its own declared test command names — those paths are tests.
+# Beyond that the plain default below applies: anything under a directory
+# called ``tests`` or ``test``, and any file whose own name says it is a test
+# (``test_x.py``, ``x_test.go``, ``x.test.ts``, ``x.spec.ts`` and the like).
+#
+# THE COUNTS ARE READ FROM THE BRANCH'S OWN DIFF, and they are deliberately
+# differences rather than raw removals:
+#
+#   * a test function is DELETED when its name is removed and is not added
+#     back anywhere on the branch — so renaming a file, moving a test to
+#     another file, or re-indenting one is not reported as a deletion;
+#   * an assertion is REMOVED when a line asserting something is taken out
+#     and that same line is not put back anywhere on the branch — so a moved
+#     or re-indented assertion is not reported, while an assertion whose
+#     words CHANGED is, because that is exactly the weakening nobody else
+#     would catch.
+#
+# Nothing here can refuse a card, so an unreadable or over-long diff is said
+# plainly on the card instead of stopping the journey.
+
+#: What a repository's tests are when nothing else says: a ``tests``/``test``
+#: directory anywhere in the tree, and the file names the common test tools
+#: recognise. Written as the same path patterns the fence uses, and read by
+#: the same matcher (:func:`_glob_matcher`).
+DEFAULT_TEST_PATHS: tuple[str, ...] = (
+    "**/tests/**",
+    "**/test/**",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_test.go",
+    "**/*_test.dart",
+    "**/*.test.js",
+    "**/*.test.jsx",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.js",
+    "**/*.spec.ts",
+    "**/*.spec.dart",
+)
+
+#: The words a changed line must hold before it can possibly be a test
+#: function or an assertion. git is asked for the branch's diff filtered by
+#: this (``diff -G``), the same way the approval patch is filtered by
+#: :data:`APPROVAL_MARKER`, so the reading stays one pass over the branch and
+#: the answer stays small. It is deliberately a SUPERSET of what
+#: :func:`name_of_test_function` and :func:`is_assertion` below recognise: a
+#: line the counters would count can never be missing from a diff taken with
+#: this — every shape those two read, with the whitespace they allow, so a
+#: javascript ``test("...")`` or a python ``def  test_x(`` written with two
+#: spaces is in the diff as surely as an ``assert`` is. Written as a POSIX
+#: extended regular expression, which is what git's ``-G`` speaks.
+TEST_CHANGE_MARKER: str = (
+    r"(assert|expect|def[[:space:]]+test|func[[:space:]]+Test"
+    r"|(it|test)[[:space:]]*\()"
+)
+
+#: A test function's definition line, in the shapes the common test tools
+#: write one, with the name in the capturing group:
+#: ``def test_x(``/``async def test_x(`` (python), ``func TestX(`` (go), and
+#: ``it("...")``/``test("...")`` (javascript, typescript, dart).
+_TEST_FUNCTION_LINES: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\("),
+    re.compile(r"^\s*func\s+(Test\w*)\s*\("),
+    re.compile(r"""^\s*(?:it|test)\s*\(\s*(?:'|"|`)(.+?)(?:'|"|`)"""),
+)
+
+#: A line that asserts something: ``assert x == 1``, ``assert(x)``,
+#: ``self.assertEqual(...)``, ``assertThat(...)``, ``expect(x).toBe(1)``.
+_ASSERTION_LINES: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"(?:^|[^A-Za-z0-9_])assert\w*\s*[( \t]"),
+    re.compile(r"(?:^|[^A-Za-z0-9_])expect\s*\("),
+)
+
+
+def path_is_test(path: str, patterns: "tuple[str, ...]" = DEFAULT_TEST_PATHS) -> bool:
+    """Is ``path`` one of the files this repository calls a test?
+
+    Read with the same matcher the specification fence uses, so a repository
+    that names a plain directory means that directory and everything under
+    it.
+    """
+    return _path_matches(path, patterns)
+
+
+def paths_in_test_command(command: Any) -> "tuple[str, ...]":
+    """The paths a repository's own declared test command names.
+
+    ``uv run --no-sync python -m pytest -q tests/`` names ``tests``;
+    ``npm test`` names nothing and the default stands. A word is read as a
+    path only when it holds a ``/``, which is what a path into a repository
+    looks like and what a switch or a tool's own subcommand does not: the
+    bare word ``test`` in ``npm test`` and ``go test ./...`` is the tool
+    being told what to do, not a directory, and reading it as one would put a
+    word on the card that the repository never said.
+
+    This is the "where the repository already says so" half of what counts as
+    a test. It never raises and answers ``()`` for anything it cannot read.
+    """
+    text = command if isinstance(command, str) else ""
+    found: list[str] = []
+    for word in text.split():
+        token = word.strip().strip("'\"")
+        if not token or token.startswith("-") or "/" not in token:
+            continue
+        named = token.rstrip("/")
+        while named.startswith("./"):
+            named = named[2:]
+        if named and named not in found:
+            found.append(named)
+    return tuple(found)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedTestsReport:
+    """What one branch did to the repository's tests.
+
+    Attributes:
+        files_changed: How many of the repository's test files the branch
+            touched — added, changed, deleted or renamed, each file once.
+        tests_deleted: How many test functions the branch removed and did
+            not put back anywhere.
+        assertions_removed: How many asserting lines the branch took out and
+            did not put back anywhere.
+        files: The test files something was deleted or removed from, so the
+            line on the card can say where to look. Empty when nothing was.
+        read_whole: ``False`` when the branch's own diff could not be read,
+            or was too long to read whole, so the two counts above are not
+            to be trusted and the card says so instead of reciting them.
+    """
+
+    files_changed: int = 0
+    tests_deleted: int = 0
+    assertions_removed: int = 0
+    files: tuple[str, ...] = ()
+    read_whole: bool = True
+
+    @property
+    def lost_something(self) -> bool:
+        """``True`` when a test or an assertion went away on this branch."""
+        return bool(self.tests_deleted or self.assertions_removed)
+
+
+def name_of_test_function(line: str) -> str:
+    """The name of the test function a line defines, or ``""``."""
+    for shape in _TEST_FUNCTION_LINES:
+        found = shape.search(line or "")
+        if found:
+            return found.group(1).strip()
+    return ""
+
+
+def is_assertion(line: str) -> bool:
+    """Does this line assert something?"""
+    return any(shape.search(line or "") for shape in _ASSERTION_LINES)
+
+
+def count_test_changes(
+    *,
+    changes: "tuple[BranchFileChange, ...]",
+    patch: str,
+    test_paths: "tuple[str, ...]" = DEFAULT_TEST_PATHS,
+    read_whole: bool = True,
+) -> ChangedTestsReport:
+    """Count what a branch did to the tests. Never refuses, never raises.
+
+    ``changes`` is the same ``diff --name-status`` reading the fence already
+    has (so the file count is exact, including renames, which count once);
+    ``patch`` is the branch's own diff filtered by :data:`TEST_CHANGE_MARKER`
+    (so the line counts read git's own lines and nothing is walked twice).
+    """
+    files_changed = sum(
+        1
+        for change in changes
+        if any(path_is_test(path, test_paths) for path in change.paths)
+    )
+    if not read_whole:
+        return ChangedTestsReport(files_changed=files_changed, read_whole=False)
+
+    # A renamed file's removed lines are printed against the name it HAD.
+    # The person reading the card has to open the file it IS, so every path
+    # is read through the branch's own renames before anything is counted or
+    # named.
+    renamed = {
+        change.old_path: change.path for change in changes if change.old_path
+    }
+
+    names_added: set[str] = set()
+    names_removed: list[tuple[str, str]] = []
+    assertions_added: dict[str, int] = {}
+    assertions_removed: list[tuple[str, str]] = []
+    for path, added, body in iter_patch_lines(patch):
+        path = renamed.get(path, path)
+        if not path_is_test(path, test_paths):
+            continue
+        name = name_of_test_function(body)
+        if name:
+            if added:
+                names_added.add(name)
+            else:
+                names_removed.append((path, name))
+            continue
+        if not is_assertion(body):
+            continue
+        text = " ".join(body.split())
+        if added:
+            assertions_added[text] = assertions_added.get(text, 0) + 1
+        else:
+            assertions_removed.append((path, text))
+
+    deleted = [(path, name) for path, name in names_removed if name not in names_added]
+    removed: list[tuple[str, str]] = []
+    for path, text in assertions_removed:
+        put_back = assertions_added.get(text, 0)
+        if put_back:
+            assertions_added[text] = put_back - 1
+            continue
+        removed.append((path, text))
+
+    where = tuple(
+        dict.fromkeys(
+            [path for path, _ in deleted] + [path for path, _ in removed]
+        )
+    )
+    return ChangedTestsReport(
+        files_changed=files_changed,
+        tests_deleted=len(deleted),
+        assertions_removed=len(removed),
+        files=tuple(path for path in where if path),
+    )
+
+
 class MergeCardOutcome(StrEnum):
     """The closed set of things the merge-ready checkpoint can do.
 
@@ -790,6 +1098,31 @@ class MergeCardDecision:
     def loops_back(self) -> bool:
         """``True`` when the journey should re-enter the fix cycle."""
         return self.outcome is MergeCardOutcome.RED_GATE_LOOP_BACK
+
+
+def _carry_test_changes(gates: GatesReport, fence: Any) -> GatesReport:
+    """Put the fence's test count on the gate set, for the card to read.
+
+    Nothing to carry — no fence wired, an older fence that counts nothing, a
+    gate set that already carries a count — leaves the report exactly as it
+    was, which is what every caller that predates 2026-09-10 gets. A gate set
+    that is not this module's own dataclass is left alone too: the count is a
+    courtesy to the card, never a reason to fail a checkpoint.
+    """
+    counts = getattr(fence, "test_changes", None)
+    if counts is None or gates.test_changes is not None:
+        return gates
+    try:
+        return dataclasses.replace(gates, test_changes=counts)
+    except Exception as exc:  # noqa: BLE001 — a card line is never a failure
+        logger.warning(
+            "%s: the test count could not be carried onto the gate set "
+            "(%s: %s) — the card simply says nothing about the tests",
+            MERGE_READY_CHECKPOINT_LABEL,
+            type(exc).__name__,
+            exc,
+        )
+        return gates
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -1003,6 +1336,14 @@ class MergeReadyCheckpointPublisher:
 
         # Step (b) — the full gate set. THE HARD PRECONDITION.
         gates = await self._read_gates(build_id, branch)
+
+        # WHAT THE BRANCH DID TO THE TESTS (Rich's ruling, 2026-09-10). The
+        # fence counted it while it had the branch's own diff in its hands;
+        # it rides on the gate set from here because that is what the card
+        # seam is handed, and the card says it in one plain line. It decides
+        # nothing: a branch that deleted tests still gets whatever its suite
+        # said, and the person holding the card is told what to look at.
+        gates = _carry_test_changes(gates, fence)
 
         # WHAT THE TESTS THEMSELVES SAID. The gate set's reader keeps the
         # declared test command's own output (bounded), and it rides every

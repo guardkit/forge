@@ -1363,6 +1363,43 @@ BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
 #: sidecar's timeout always fires before the socket gives up.
 SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S: float = 30.0
 
+#: How many git commands the sandbox answers one of these requests with, each
+#: with the wall above to itself. The HTTP read waits for all of them and the
+#: margin, because a socket that gives up first is an error sentence, and an
+#: error sentence refuses the branch — which the third of them, the one the
+#: card's count is read from, must never be able to do.
+SANDBOX_BRANCH_DIFF_GIT_CALLS: int = 3
+
+
+@dataclasses.dataclass(frozen=True)
+class BranchReading:
+    """One reading of what a journey's branch changed against its base.
+
+    Three answers in one, because the branch is walked ONCE and everything
+    that reads it reads that walk:
+
+    Attributes:
+        name_status: git's ``diff --name-status`` — which files changed.
+        approval_patch: the branch's own lines in files whose change touches
+            the recorded-approval word. What the fence's second rule reads.
+        test_patch: the branch's own lines in files whose change touches a
+            word that could be a test function or an assertion. What the
+            test count reads (Rich's ruling, 2026-09-10).
+        test_patch_read_whole: ``False`` when that third diff was too long to
+            carry back, or when whatever answered did not carry one at all.
+            It never refuses anything — the card simply says the tests could
+            not be read here — which is why it is a flag of its own and not
+            part of ``error``.
+        error: One plain sentence when the reading did not happen. The fence
+            turns it into a refusal, never into "nothing changed".
+    """
+
+    name_status: str = ""
+    approval_patch: str = ""
+    test_patch: str = ""
+    test_patch_read_whole: bool = True
+    error: "str | None" = None
+
 
 @dataclasses.dataclass(frozen=True)
 class UnreadableDeclaration:
@@ -1569,10 +1606,8 @@ def load_declared_specification_paths_from_sandbox(
     return specification_paths_in(content)
 
 
-def read_branch_changes(
-    *, worktree: "Path | str", base: str
-) -> "tuple[str, str, str | None]":
-    """What this branch changed, read here. ``(name_status, patch, error)``.
+def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
+    """What this branch changed, read here. See :class:`BranchReading`.
 
     ``error`` is one plain sentence when the reading did not happen, and the
     fence turns that into a refusal — never into "nothing changed". EVERY way
@@ -1581,20 +1616,35 @@ def read_branch_changes(
     the build made is still in the clone with every commit on it, so "there
     is nothing to read here" is not the same statement as "this branch
     changed nothing", and only the second one may lead to a card.
+
+    THREE git commands, one walk of the branch. The third — the branch's own
+    lines in files whose change touches a word that could be a test function
+    or an assertion — feeds the count that goes on the card (Rich's ruling,
+    2026-09-10). It is taken on its own and can never refuse anything: a
+    third diff that fails, that raises, or that is too long to read whole
+    leaves ``test_patch_read_whole`` False and the rest of the reading exactly
+    as it was, while the first two keep the bound they have always kept.
     """
     root = Path(worktree)
     if not root.is_dir():
-        return "", "", (
-            f"there is nothing at {root}, so the branch this build made "
-            "cannot be read there"
+        return BranchReading(
+            error=(
+                f"there is nothing at {root}, so the branch this build made "
+                "cannot be read there"
+            )
         )
     if not (root / ".git").exists():
-        return "", "", (
-            f"{root} is not the root of a git tree, so the branch this build "
-            "made cannot be read there"
+        return BranchReading(
+            error=(
+                f"{root} is not the root of a git tree, so the branch this "
+                "build made cannot be read there"
+            )
         )
 
-    from forge.pipeline.merge_ready_checkpoint import APPROVAL_MARKER
+    from forge.pipeline.merge_ready_checkpoint import (
+        APPROVAL_MARKER,
+        TEST_CHANGE_MARKER,
+    )
 
     span = f"{base}...HEAD"
 
@@ -1611,22 +1661,45 @@ def read_branch_changes(
         names = _git("diff", "--name-status", "-M", "-z", span)
         if names.returncode != 0:
             detail = (names.stderr or names.stdout or "").strip() or "<no output>"
-            return "", "", (
-                f"git could not read the changed files of {span} in {root} "
-                f"(it exited {names.returncode}): {detail}"
+            return BranchReading(
+                error=(
+                    f"git could not read the changed files of {span} in {root} "
+                    f"(it exited {names.returncode}): {detail}"
+                )
             )
         patch = _git(
             "diff", "-U0", "--no-color", "--no-renames", f"-G{APPROVAL_MARKER}", span
         )
         if patch.returncode != 0:
             detail = (patch.stderr or patch.stdout or "").strip() or "<no output>"
-            return "", "", (
-                f"git could not read the approval lines of {span} in {root} "
-                f"(it exited {patch.returncode}): {detail}"
+            return BranchReading(
+                error=(
+                    f"git could not read the approval lines of {span} in {root} "
+                    f"(it exited {patch.returncode}): {detail}"
+                )
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return "", "", (
-            f"reading {span} in {root} raised {type(exc).__name__}: {exc}"
+        return BranchReading(
+            error=f"reading {span} in {root} raised {type(exc).__name__}: {exc}"
+        )
+    # THE TEST DIFF IS TAKEN ON ITS OWN, and everything about it is decided
+    # here, apart from the two readings above. It is a line on a card, so no
+    # way of failing it may reach the sentence that refuses a branch: if it
+    # raises — git missing, the tree gone, the wall reached — that is caught
+    # right here and the reading carries on with nothing counted.
+    tests: "subprocess.CompletedProcess[str] | None" = None
+    try:
+        tests = _git(
+            "diff", "-U0", "--no-color", "-M", f"-G{TEST_CHANGE_MARKER}", span
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "the test count: reading what %s changed in the tests of %s raised "
+            "%s: %s — the card says so plainly and the checkpoint carries on",
+            span,
+            root,
+            type(exc).__name__,
+            exc,
         )
     name_status = names.stdout or ""
     approval_patch = patch.stdout or ""
@@ -1634,11 +1707,37 @@ def read_branch_changes(
         len(name_status.encode("utf-8")) > BRANCH_DIFF_LIMIT_BYTES
         or len(approval_patch.encode("utf-8")) > BRANCH_DIFF_LIMIT_BYTES
     ):
-        return "", "", (
-            f"what {root} changed against {base} is too big to read whole, so "
-            "a change to the specification could have been past the end of it"
+        return BranchReading(
+            error=(
+                f"what {root} changed against {base} is too big to read whole, "
+                "so a change to the specification could have been past the end "
+                "of it"
+            )
         )
-    return name_status, approval_patch, None
+    # THE TEST DIFF NEVER REFUSES. A git that could not answer it, one that
+    # could not be run at all, or an answer too long to read whole, is said on
+    # the card as "this could not be read here" — the fence's own two readings
+    # stand either way.
+    answered = tests is not None and tests.returncode == 0
+    test_patch = (tests.stdout or "") if answered else ""
+    read_whole = answered and (
+        len(test_patch.encode("utf-8")) <= BRANCH_DIFF_LIMIT_BYTES
+    )
+    if tests is not None and tests.returncode != 0:
+        logger.warning(
+            "the test count: git could not read what %s changed in the tests "
+            "of %s (it exited %s) — the card says so plainly and the "
+            "checkpoint carries on",
+            span,
+            root,
+            tests.returncode,
+        )
+    return BranchReading(
+        name_status=name_status,
+        approval_patch=approval_patch,
+        test_patch=test_patch if read_whole else "",
+        test_patch_read_whole=read_whole,
+    )
 
 
 def read_branch_changes_in_sandbox(
@@ -1648,14 +1747,18 @@ def read_branch_changes_in_sandbox(
     sandbox: Any,
     repo: str,
     post: Callable[..., Any] | None = None,
-) -> "tuple[str, str, str | None]":
-    """The same two diffs, run where the repository lives (rule 88).
+) -> BranchReading:
+    """The same reading, run where the repository lives (rule 88).
 
-    Same ``(name_status, patch, error)`` contract as
-    :func:`read_branch_changes`. Anything that stops the reading is an
-    ``error`` sentence, which the fence turns into a refusal: for a sandbox
-    repository the tree really is there and git really does run, so a failure
-    means something is wrong rather than that there was nothing to see.
+    Same :class:`BranchReading` contract as :func:`read_branch_changes`.
+    Anything that stops the reading is an ``error`` sentence, which the fence
+    turns into a refusal: for a sandbox repository the tree really is there
+    and git really does run, so a failure means something is wrong rather
+    than that there was nothing to see.
+
+    The exception is the test diff, which never refuses anything. A sidecar
+    that is older than this lane answers without one at all; that reads as
+    "the tests could not be read here", which is what the card then says.
     """
     from forge.deploy_sidecar.service import GIT_WORKTREE_CHANGED_FILES_ROUTE
     from forge.planning.sidecar_git_runner import _urllib_post
@@ -1666,35 +1769,130 @@ def read_branch_changes_in_sandbox(
     body = {"repo": repo, "path": str(worktree), "base": base}
     try:
         status, decoded = sender(
-            url, body, BRANCH_DIFF_TIMEOUT_SECONDS + SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S
+            url,
+            body,
+            BRANCH_DIFF_TIMEOUT_SECONDS * SANDBOX_BRANCH_DIFF_GIT_CALLS
+            + SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S,
         )
     except Exception as exc:  # noqa: BLE001 — could not read is not "nothing"
-        return "", "", (
-            f"the sidecar in sandbox {name} could not be reached at {url} to "
-            f"read what {worktree} changed against {base}: "
-            f"{type(exc).__name__}: {exc}"
+        return BranchReading(
+            error=(
+                f"the sidecar in sandbox {name} could not be reached at {url} "
+                f"to read what {worktree} changed against {base}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         )
     answer = decoded if isinstance(decoded, dict) else {}
     if status != 200:
-        return "", "", (
-            f"the sidecar in sandbox {name} refused to read what {worktree} "
-            f"changed against {base} (HTTP {status}): "
-            f"{answer.get('error') or answer}"
+        return BranchReading(
+            error=(
+                f"the sidecar in sandbox {name} refused to read what "
+                f"{worktree} changed against {base} (HTTP {status}): "
+                f"{answer.get('error') or answer}"
+            )
         )
     if answer.get("truncated") is True:
-        return "", "", (
-            f"what {worktree} changed against {base} is too big to read whole "
-            f"in sandbox {name}, so a change to the specification could have "
-            "been past the end of it"
+        return BranchReading(
+            error=(
+                f"what {worktree} changed against {base} is too big to read "
+                f"whole in sandbox {name}, so a change to the specification "
+                "could have been past the end of it"
+            )
         )
     names = answer.get("name_status")
     patch = answer.get("approval_patch")
     if not isinstance(names, str) or not isinstance(patch, str):
-        return "", "", (
-            f"the sidecar in sandbox {name} answered something that is not a "
-            f"diff: {answer!r}"
+        return BranchReading(
+            error=(
+                f"the sidecar in sandbox {name} answered something that is "
+                f"not a diff: {answer!r}"
+            )
         )
-    return names, patch, None
+    tests = answer.get("test_patch")
+    read_whole = (
+        isinstance(tests, str) and answer.get("test_patch_truncated") is not True
+    )
+    return BranchReading(
+        name_status=names,
+        approval_patch=patch,
+        test_patch=str(tests) if read_whole else "",
+        test_patch_read_whole=read_whole,
+    )
+
+
+def test_paths_for(
+    repo_root: "Path | str | None",
+    repo: str = "",
+    *,
+    sandbox: Any = None,
+) -> "tuple[str, ...]":
+    """Which files this repository calls its tests (Rich's ruling, 2026-09-10).
+
+    What counts as a test is the repository's business, so the first answer
+    comes from the repository's own words: the paths its declared test
+    command names (``uv run pytest -q tests/`` names ``tests``), read from
+    the CANONICAL tree — never from the branch being counted — and handed to
+    guardkit's own loader, so forge forms no second opinion about what a
+    repository declared.
+
+    READ WHERE THE REPOSITORY LIVES (rule 88), which is the same choice the
+    specification declaration is read under a few lines below. A repository
+    that has a sandbox keeps its clone INSIDE that sandbox and none of it on
+    this side, so its declaration is read through its own deploy sidecar
+    (:func:`load_declared_toolchain_from_sandbox`); a repository without one
+    is read here (:func:`load_declared_toolchain`). Reading a sandboxed
+    repository on this side would find no file, say nothing about it, and
+    quietly leave the default standing — which is how the "read it from
+    where the repository already says so" half of the ruling would have been
+    inert in production for exactly the repositories that have a sandbox.
+
+    Beside the declaration stands the plain default,
+    :data:`~forge.pipeline.merge_ready_checkpoint.DEFAULT_TEST_PATHS`:
+    anything under a ``tests`` or ``test`` directory, and the file names the
+    common test tools recognise. The two are added together rather than one
+    replacing the other, because a repository naming ``spec/`` in its command
+    has not stopped ``tests/`` from holding tests.
+
+    A declaration that cannot be read — no clone on the side that was asked,
+    no guardkit, a sidecar that will not answer, a malformed block — leaves
+    the default standing and says so in the log. It never refuses anything:
+    this feeds a line on a card, and a count nobody could take is a sentence
+    on the card, not a stopped journey.
+    """
+    from forge.pipeline.merge_ready_checkpoint import (
+        DEFAULT_TEST_PATHS,
+        paths_in_test_command,
+    )
+
+    if not repo_root:
+        return DEFAULT_TEST_PATHS
+    where = "in its sandbox" if sandbox is not None else "here"
+    try:
+        declaration = (
+            load_declared_toolchain_from_sandbox(repo_root, sandbox=sandbox, repo=repo)
+            if sandbox is not None
+            else load_declared_toolchain(repo_root)
+        )
+        declared = paths_in_test_command(getattr(declaration, "test", None))
+    except Exception as exc:  # noqa: BLE001 — a count is never a refusal
+        logger.warning(
+            "the test count: %s's declared test command could not be read %s "
+            "(%s: %s) — the plain default stands",
+            repo or repo_root,
+            where,
+            type(exc).__name__,
+            exc,
+        )
+        return DEFAULT_TEST_PATHS
+    if declaration is None:
+        logger.info(
+            "the test count: %s declares no test command that could be read "
+            "%s — the plain default stands",
+            repo or repo_root,
+            where,
+        )
+    extra = tuple(path for path in declared if path not in DEFAULT_TEST_PATHS)
+    return DEFAULT_TEST_PATHS + extra
 
 
 def make_specification_fence(
@@ -1731,6 +1929,7 @@ def make_specification_fence(
     from forge.config.sandboxes import sandbox_for
     from forge.pipeline.merge_ready_checkpoint import (
         DEFAULT_SPECIFICATION_PATHS,
+        count_test_changes,
         judge_branch_changes,
         parse_changed_approval_lines,
         parse_changed_files,
@@ -1807,7 +2006,7 @@ def make_specification_fence(
         specification_paths = tuple(declared) if declared else DEFAULT_SPECIFICATION_PATHS
 
         try:
-            names, patch, error = (
+            reading = (
                 _sandbox_read(
                     worktree=worktree, base=base, sandbox=entry, repo=repo_key
                 )
@@ -1819,14 +2018,28 @@ def make_specification_fence(
                 f"reading what the branch changed raised "
                 f"{type(exc).__name__}: {exc}"
             )
-        if error:
-            return unreadable_branch_changes(str(error))
+        if reading.error:
+            return unreadable_branch_changes(str(reading.error))
 
+        changes = parse_changed_files(reading.name_status)
         report = judge_branch_changes(
-            changes=parse_changed_files(names),
-            approval_lines=parse_changed_approval_lines(patch),
+            changes=changes,
+            approval_lines=parse_changed_approval_lines(reading.approval_patch),
             specification_paths=specification_paths,
         )
+
+        # WHAT THE BRANCH DID TO THE TESTS (Rich's ruling, 2026-09-10): a
+        # report on the card, never a refusal. It is counted from the reading
+        # already in hand, so the branch is walked once, and it is attached
+        # whatever the fence's own verdict is — a refused branch's counts ride
+        # into the receipts with everything else.
+        counted = count_test_changes(
+            changes=changes,
+            patch=reading.test_patch,
+            test_paths=test_paths_for(repo_root, repo_key, sandbox=entry),
+            read_whole=reading.test_patch_read_whole,
+        )
+        report = dataclasses.replace(report, test_changes=counted)
         if report.refuses:
             logger.error(
                 "the specification fence: build_id=%s on %s — %s (the files "
