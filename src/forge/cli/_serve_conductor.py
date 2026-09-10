@@ -1820,27 +1820,44 @@ def read_branch_changes_in_sandbox(
     )
 
 
-def test_paths_for(repo_root: "Path | str | None", repo: str = "") -> "tuple[str, ...]":
+def test_paths_for(
+    repo_root: "Path | str | None",
+    repo: str = "",
+    *,
+    sandbox: Any = None,
+) -> "tuple[str, ...]":
     """Which files this repository calls its tests (Rich's ruling, 2026-09-10).
 
     What counts as a test is the repository's business, so the first answer
     comes from the repository's own words: the paths its declared test
     command names (``uv run pytest -q tests/`` names ``tests``), read from
-    the CANONICAL tree through guardkit's own loader — the same declaration,
-    the same loader and the same canonical-not-worktree law the merge-ready
-    checks already read the test command under.
+    the CANONICAL tree — never from the branch being counted — and handed to
+    guardkit's own loader, so forge forms no second opinion about what a
+    repository declared.
 
-    Beside them stands the plain default,
+    READ WHERE THE REPOSITORY LIVES (rule 88), which is the same choice the
+    specification declaration is read under a few lines below. A repository
+    that has a sandbox keeps its clone INSIDE that sandbox and none of it on
+    this side, so its declaration is read through its own deploy sidecar
+    (:func:`load_declared_toolchain_from_sandbox`); a repository without one
+    is read here (:func:`load_declared_toolchain`). Reading a sandboxed
+    repository on this side would find no file, say nothing about it, and
+    quietly leave the default standing — which is how the "read it from
+    where the repository already says so" half of the ruling would have been
+    inert in production for exactly the repositories that have a sandbox.
+
+    Beside the declaration stands the plain default,
     :data:`~forge.pipeline.merge_ready_checkpoint.DEFAULT_TEST_PATHS`:
     anything under a ``tests`` or ``test`` directory, and the file names the
     common test tools recognise. The two are added together rather than one
     replacing the other, because a repository naming ``spec/`` in its command
     has not stopped ``tests/`` from holding tests.
 
-    A declaration that cannot be read here — no checkout on this side, no
-    guardkit, a malformed block — leaves the default standing and says so in
-    the log. It never refuses anything: this feeds a line on a card, and a
-    count nobody could take is a sentence on the card, not a stopped journey.
+    A declaration that cannot be read — no clone on the side that was asked,
+    no guardkit, a sidecar that will not answer, a malformed block — leaves
+    the default standing and says so in the log. It never refuses anything:
+    this feeds a line on a card, and a count nobody could take is a sentence
+    on the card, not a stopped journey.
     """
     from forge.pipeline.merge_ready_checkpoint import (
         DEFAULT_TEST_PATHS,
@@ -1849,18 +1866,31 @@ def test_paths_for(repo_root: "Path | str | None", repo: str = "") -> "tuple[str
 
     if not repo_root:
         return DEFAULT_TEST_PATHS
+    where = "in its sandbox" if sandbox is not None else "here"
     try:
-        declaration = load_declared_toolchain(repo_root)
+        declaration = (
+            load_declared_toolchain_from_sandbox(repo_root, sandbox=sandbox, repo=repo)
+            if sandbox is not None
+            else load_declared_toolchain(repo_root)
+        )
         declared = paths_in_test_command(getattr(declaration, "test", None))
     except Exception as exc:  # noqa: BLE001 — a count is never a refusal
         logger.warning(
-            "the test count: %s's declared test command could not be read "
+            "the test count: %s's declared test command could not be read %s "
             "(%s: %s) — the plain default stands",
             repo or repo_root,
+            where,
             type(exc).__name__,
             exc,
         )
         return DEFAULT_TEST_PATHS
+    if declaration is None:
+        logger.info(
+            "the test count: %s declares no test command that could be read "
+            "%s — the plain default stands",
+            repo or repo_root,
+            where,
+        )
     extra = tuple(path for path in declared if path not in DEFAULT_TEST_PATHS)
     return DEFAULT_TEST_PATHS + extra
 
@@ -2006,7 +2036,7 @@ def make_specification_fence(
         counted = count_test_changes(
             changes=changes,
             patch=reading.test_patch,
-            test_paths=test_paths_for(repo_root, repo_key),
+            test_paths=test_paths_for(repo_root, repo_key, sandbox=entry),
             read_whole=reading.test_patch_read_whole,
         )
         report = dataclasses.replace(report, test_changes=counted)

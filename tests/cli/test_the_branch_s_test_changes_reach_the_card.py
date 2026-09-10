@@ -22,6 +22,10 @@ What is pinned:
 * the count is right when a test file is renamed;
 * a repository with no sandbox and one with a sandbox take the same path and
   get the same numbers;
+* which files a repository calls its tests is read from where that repository
+  lives — through its own sandbox when it has one, on this side when it does
+  not — so a repository that keeps its tests somewhere the plain default does
+  not look still gets them counted;
 * the fence's own verdict is untouched by any of it — a branch that deletes
   every test it has is still CLEAR, because this reports and never refuses.
 """
@@ -101,6 +105,17 @@ test("finds the user", () => {
 });
 '''
 
+#: The same repository's OTHER tests, kept somewhere the plain default does
+#: not look. Only the repository's own declared test command says these are
+#: tests — and for a repository with a sandbox that declaration lives in the
+#: sandbox, not on this side.
+DECLARED_TESTS = "spec/checks_users.py"
+
+THE_DECLARED_TESTS = '''\
+def test_delete_is_honest():
+    assert delete("a@b") == 204
+'''
+
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@t",
@@ -131,7 +146,8 @@ def _write(path: Path, text: str) -> None:
 
 @pytest.fixture
 def clone(tmp_path: Path) -> Path:
-    """The factory's own clone: two tests, the code they cover, and an
+    """The factory's own clone: two tests, the code they cover, a check kept
+    where only the repository's own declared command says to look, and an
     acceptance twin sitting where the specification fence protects it."""
     path = tmp_path / "api_test"
     path.mkdir()
@@ -139,6 +155,7 @@ def clone(tmp_path: Path) -> Path:
     _write(path / TESTS, THE_TESTS)
     _write(path / "src" / "users" / "router.py", "def lookup(email):\n    ...\n")
     _write(path / JS_TESTS, THE_JS_TESTS)
+    _write(path / DECLARED_TESTS, THE_DECLARED_TESTS)
     _write(path / TWIN, "DELETE http://localhost/users?email=a@b\nHTTP 204\n")
     _git(path, "add", "-A")
     _git(path, "commit", "-m", "init")
@@ -364,6 +381,71 @@ class TestTheSandboxFormCountsTheSame:
 
         assert _counts(pool, sidecar.config) == _counts(pool, _config(clone))
 
+    @staticmethod
+    def _declared_in_the_sandbox(
+        monkeypatch: pytest.MonkeyPatch, command: str | None
+    ) -> None:
+        """This repository's declaration, readable only through its sandbox.
+
+        guardkit is not importable in this interpreter, so the loader itself
+        is the seam: what is pinned here is WHICH SIDE is asked, and that the
+        answer reaches the count.
+        """
+
+        def _here(root: Any, **_: Any) -> Any:
+            raise AssertionError("a sandboxed repository must not be read here")
+
+        monkeypatch.setattr(conductor, "load_declared_toolchain", _here)
+        monkeypatch.setattr(
+            conductor,
+            "load_declared_toolchain_from_sandbox",
+            lambda root, *, sandbox, repo, **_: (
+                SimpleNamespace(test=command) if command else None
+            ),
+        )
+
+    def test_the_sandboxed_repositorys_own_declared_paths_reach_the_count(
+        self,
+        pool: Any,
+        clone: Path,
+        worktree: Path,
+        sidecar: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The whole way, for a repository that keeps tests where the plain
+        default does not look: its declaration is read in its sandbox, so the
+        deletion is counted and the file is named."""
+        (worktree / DECLARED_TESTS).unlink()
+        _commit(worktree, "drop the declared check")
+        self._declared_in_the_sandbox(monkeypatch, "uv run pytest spec/")
+
+        counted = _counts(pool, sidecar.config)
+
+        assert counted.files_changed == 1
+        assert counted.tests_deleted == 1
+        assert counted.assertions_removed == 1
+        assert counted.files == (DECLARED_TESTS,)
+        assert counted.lost_something is True
+
+    def test_without_that_declaration_the_same_loss_is_invisible(
+        self,
+        pool: Any,
+        clone: Path,
+        worktree: Path,
+        sidecar: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Why the side that is asked matters: with no declaration to read,
+        the same branch counts nothing and the card reassures him."""
+        (worktree / DECLARED_TESTS).unlink()
+        _commit(worktree, "drop the declared check")
+        self._declared_in_the_sandbox(monkeypatch, None)
+
+        counted = _counts(pool, sidecar.config)
+
+        assert counted.files_changed == 0
+        assert counted.lost_something is False
+
     def test_a_sidecar_that_carries_no_count_is_said_plainly_not_as_nothing(
         self, worktree: Path, sidecar: Any
     ) -> None:
@@ -514,6 +596,67 @@ class TestWhichFilesThisRepositoryCallsItsTests:
         monkeypatch.setattr(conductor, "load_declared_toolchain", _boom)
 
         assert conductor.test_paths_for(clone, REPO) == DEFAULT_TEST_PATHS
+
+    def test_a_repository_with_a_sandbox_is_read_where_it_lives(
+        self, clone: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rule 88, and the whole point of reading a declaration at all.
+
+        A repository with a sandbox keeps its clone in there and none of it
+        on this side, so asking here finds no file, says nothing about it,
+        and quietly leaves the plain default standing — which would make the
+        "read it from where the repository already says so" half of the
+        ruling do nothing at all for exactly those repositories.
+        """
+        asked: list[dict[str, Any]] = []
+
+        def _here(root: Any, **_: Any) -> Any:
+            raise AssertionError("a sandboxed repository must not be read here")
+
+        def _there(root: Any, *, sandbox: Any, repo: str, **_: Any) -> Any:
+            asked.append({"root": str(root), "sandbox": sandbox, "repo": repo})
+            return SimpleNamespace(test="uv run pytest spec/")
+
+        monkeypatch.setattr(conductor, "load_declared_toolchain", _here)
+        monkeypatch.setattr(conductor, "load_declared_toolchain_from_sandbox", _there)
+        entry = SimpleNamespace(name="api-test-factory", sidecar_url="http://127.0.0.1:1")
+
+        paths = conductor.test_paths_for(clone, REPO, sandbox=entry)
+
+        assert "spec" in paths
+        assert asked == [{"root": str(clone), "sandbox": entry, "repo": REPO}]
+
+    def test_a_repository_with_no_sandbox_is_still_read_here(
+        self, clone: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _there(*_: Any, **__: Any) -> Any:
+            raise AssertionError("there is no sandbox to read through")
+
+        monkeypatch.setattr(conductor, "load_declared_toolchain_from_sandbox", _there)
+        monkeypatch.setattr(
+            conductor,
+            "load_declared_toolchain",
+            lambda root: SimpleNamespace(test="uv run pytest qa/acceptance/"),
+        )
+
+        assert "qa/acceptance" in conductor.test_paths_for(clone, REPO)
+
+    def test_a_sandbox_that_cannot_be_read_leaves_the_default_standing(
+        self, clone: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same law on both sides: a count nobody could take is the plain
+        default and a line in the log, never a stopped journey."""
+        from forge.pipeline.merge_ready_checkpoint import DEFAULT_TEST_PATHS
+
+        def _boom(root: Any, **_: Any) -> Any:
+            raise RuntimeError("the sidecar refused")
+
+        monkeypatch.setattr(conductor, "load_declared_toolchain_from_sandbox", _boom)
+        entry = SimpleNamespace(name="api-test-factory", sidecar_url="http://127.0.0.1:1")
+
+        paths = conductor.test_paths_for(clone, REPO, sandbox=entry)
+
+        assert paths == DEFAULT_TEST_PATHS
 
 
 class TestTheWholeWayToTheCard:
