@@ -2456,6 +2456,101 @@ class TestTheBranchTheBuildMade:
         assert repair_tip  # the branch exists; only the row read was refused
 
 
+class TestTheBranchReachesTheSandboxDoor:
+    """The whole chain, for a repair: the branch the build made goes from the
+    build row, through the executor's command line, over the wire to the
+    deploy sidecar, and into the command that actually runs — in the real
+    repository.
+
+    Both halves were already proved on their own, and the seam between them
+    was where the branch fell out: on 2026-09-10 a repair passed all eight of
+    its checks in the sandbox and the merge was refused, "branch
+    autobuild/FEAT-39F6 does not exist", because the door built its own
+    command and had never been told the journey's branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_repair_press_through_a_real_sidecar_merges_its_own_branch(
+        self, config, pool, repo_root, tmp_path, monkeypatch
+    ) -> None:
+        import stat as stat_module
+        import threading
+
+        from forge.adapters.guardkit.run_via_sidecar import (
+            build_sidecar_guardkit_run,
+        )
+        from forge.deploy_sidecar.service import GUARDKIT_PATH_ENV, build_server
+
+        repair_tip = _cut_repair_journey_branch(repo_root)
+        _write_repair_row_and_offer(pool)
+
+        # A stand-in that resolves its branch the way the merge command does —
+        # --branch when it is given one, autobuild/<feature id> otherwise —
+        # and looks it up in the repository it was started in. Drop the branch
+        # anywhere along the chain and this reports the FEATURE branch's tip,
+        # which is not the tree the candidate was checked on.
+        fake_guardkit = tmp_path / "bin" / "guardkit"
+        fake_guardkit.parent.mkdir(parents=True, exist_ok=True)
+        fake_guardkit.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, subprocess, sys\n"
+            "argv = sys.argv[1:]\n"
+            "branch = (argv[argv.index('--branch') + 1]\n"
+            "          if '--branch' in argv else 'autobuild/' + argv[2])\n"
+            "found = subprocess.run(['git', 'rev-parse', '--verify', branch],\n"
+            "                       capture_output=True, text=True)\n"
+            "if found.returncode != 0:\n"
+            "    sys.stderr.write('branch ' + branch + ' does not exist')\n"
+            "    sys.exit(1)\n"
+            "print(json.dumps({'status': 'merged', 'branch': branch,\n"
+            "                  'merged_sha': found.stdout.strip()}))\n",
+            encoding="utf-8",
+        )
+        fake_guardkit.chmod(
+            fake_guardkit.stat().st_mode | stat_module.S_IXUSR | stat_module.S_IXOTH
+        )
+        monkeypatch.setenv(GUARDKIT_PATH_ENV, str(fake_guardkit))
+
+        server = build_server(port=0, config_loader=lambda: config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address[:2]
+            deps, publisher, _gk, dp = _deps(
+                config,
+                pool,
+                guardkit=build_sidecar_guardkit_run(
+                    base_url=f"http://{host}:{port}",
+                    repo_paths={REPO: str(repo_root)},
+                ),
+            )
+            consumer = MergeApprovalConsumer(deps)
+            await consumer.handle_envelope(
+                _envelope(
+                    request_id=f"merge-{REPAIR_BUILD_ID}",
+                    correlation_id=f"corr-{REPAIR_BUILD_ID}",
+                )
+            )
+            await _drain(consumer)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        report = publisher.reports[0]
+        assert report.result == "merged-and-running"
+        assert report.branch == REPAIR_BRANCH
+        assert _legs(dp) == ["candidate_check", "promote"]
+
+        # The command on the far side really resolved the journey's branch in
+        # the real repository — not the feature's own.
+        receipts = deps.receipts_root_fn() / f"merge-{REPAIR_BUILD_ID}"
+        merge = json.loads((receipts / "merge_deploy_merge.json").read_text())
+        assert merge["branch"] == REPAIR_BRANCH
+        assert merge["report"]["branch"] == REPAIR_BRANCH
+        assert merge["report"]["merged_sha"] == repair_tip
+        assert repair_tip != _tip(repo_root)  # the feature branch is a different tip
+
+
 class TestTheLandedDetectionFollowsTheBranch:
     """``merged_after_all_sha`` asks git about the branch the press was merging."""
 
