@@ -110,6 +110,40 @@ class TestTheSpecificationPathRule:
         # if the repository says so.
         assert path_is_specification(TWIN, declared) is False
 
+    def test_a_repository_that_names_a_plain_directory_is_protected_beneath_it(
+        self,
+    ) -> None:
+        """The shape that would have protected NOTHING, silently.
+
+        A repository writing ``qa/twins`` means the twins, not one file with
+        that exact name. Read literally it matched no file at all, so the
+        incident's own branch came back clear and its card was publishable.
+        """
+        for declared in (("qa/twins",), ("qa/twins/",), ("./qa/twins",)):
+            assert path_is_specification(TWIN, declared) is True
+            assert path_is_specification(RENAMED_TWIN, declared) is True
+            assert path_is_specification("src/crud.py", declared) is False
+            # The directory next door is not this directory.
+            assert path_is_specification("qa/twinsy/x.hurl", declared) is False
+
+            report = _judge(
+                (BranchFileChange(status="R", path=RENAMED_TWIN, old_path=TWIN),),
+                paths=declared,
+            )
+            assert report.status is SpecificationFenceStatus.REFUSED
+            assert TWIN in report.detail
+
+    def test_a_wildcard_is_left_exactly_as_the_repository_wrote_it(self) -> None:
+        """A repository that writes a wildcard is saying where to stop."""
+        assert path_is_specification("qa/a.hurl", ("qa/*.hurl",)) is True
+        assert path_is_specification("qa/twins/a.hurl", ("qa/*.hurl",)) is False
+
+    def test_a_declaration_naming_nothing_protects_nothing_not_everything(
+        self,
+    ) -> None:
+        assert path_is_specification(TWIN, ("",)) is False
+        assert path_is_specification(TWIN, ("/",)) is False
+
     def test_a_renamed_twin_is_refused_and_the_sentence_names_both_names(
         self,
     ) -> None:
@@ -227,6 +261,82 @@ class TestTheRecordedApprovalRule:
         lines = parse_changed_approval_lines(patch)
 
         assert [(line.path, line.added) for line in lines] == [(TWIN, False)]
+
+    def test_a_deleted_sql_comment_approval_is_not_read_as_a_file_header(
+        self,
+    ) -> None:
+        """``-- APPROVED …`` deleted prints as ``--- APPROVED …``.
+
+        SQL, Lua and Haskell all write a comment with two dashes, so the
+        removal of such an approval line looks exactly like the ``--- a/file``
+        header that names a file. Rule (b) names removal explicitly, so
+        reading it as a header would be a hole in the rule as ruled — and it
+        would leave the wrong file name on every later hunk of that file too.
+        """
+        sql_ruling = "-- APPROVED AS PROPOSED by Rich 2026-07-28 (ASSUM-003)"
+        patch = (
+            "diff --git a/db/schema.sql b/db/schema.sql\n"
+            "--- a/db/schema.sql\n"
+            "+++ b/db/schema.sql\n"
+            "@@ -1,3 +1,2 @@\n"
+            " CREATE TABLE users (id int);\n"
+            f"-{sql_ruling}\n"
+            " CREATE INDEX users_email ON users (email);\n"
+            "@@ -20,2 +19,2 @@\n"
+            "-# APPROVED AS PROPOSED by Rich 2026-07-28 (the second hunk)\n"
+            "+# nothing anybody said\n"
+        )
+
+        lines = parse_changed_approval_lines(patch)
+
+        assert [(line.path, line.added, line.owner) for line in lines] == [
+            ("db/schema.sql", False, "Rich"),
+            ("db/schema.sql", False, "Rich"),
+        ]
+        assert lines[0].line == sql_ruling
+
+        report = judge_branch_changes(
+            changes=(BranchFileChange(status="M", path="db/schema.sql"),),
+            approval_lines=lines,
+            specification_paths=DEFAULT_SPECIFICATION_PATHS,
+        )
+        assert report.status is SpecificationFenceStatus.REFUSED
+        assert "db/schema.sql" in report.detail
+
+    def test_an_added_approval_line_starting_with_two_pluses_is_read_too(
+        self,
+    ) -> None:
+        patch = (
+            "diff --git a/notes.txt b/notes.txt\n"
+            "--- a/notes.txt\n"
+            "+++ b/notes.txt\n"
+            "@@ -1 +1,2 @@\n"
+            " keep\n"
+            "+++ APPROVED by Rich, or so this branch says\n"
+        )
+
+        lines = parse_changed_approval_lines(patch)
+
+        assert [(line.path, line.added) for line in lines] == [("notes.txt", True)]
+
+    def test_the_second_files_name_is_not_poisoned_by_the_first(self) -> None:
+        patch = (
+            "diff --git a/db/schema.sql b/db/schema.sql\n"
+            "--- a/db/schema.sql\n"
+            "+++ b/db/schema.sql\n"
+            "@@ -1 +0,0 @@\n"
+            "--- APPROVED AS PROPOSED by Rich 2026-07-28\n"
+            "diff --git a/docs/decisions.md b/docs/decisions.md\n"
+            "--- a/docs/decisions.md\n"
+            "+++ b/docs/decisions.md\n"
+            "@@ -1 +1 @@\n"
+            "-# APPROVED AS PROPOSED by Rich 2026-07-28\n"
+            "+# APPROVED AS PROPOSED by Rich 2026-07-28 (410 Gone)\n"
+        )
+
+        lines = parse_changed_approval_lines(patch)
+
+        assert {line.path for line in lines} == {"db/schema.sql", "docs/decisions.md"}
 
 
 # ---------------------------------------------------------------------------

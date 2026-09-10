@@ -255,6 +255,13 @@ class RedGateAction(StrEnum):
 #         - "qa/twins/**"
 #
 # and a repository that says nothing gets :data:`DEFAULT_SPECIFICATION_PATHS`.
+#
+# HOW A DECLARED PATH IS READ. ``**`` crosses directory boundaries; ``*`` and
+# ``?`` stop at a slash; and a path with no wildcard in it at all, or one
+# written with a trailing slash, names a directory and everything beneath it.
+# So ``qa/twins``, ``qa/twins/`` and ``qa/twins/**`` all say the same thing,
+# and a repository cannot be left protected on nothing by naming the
+# directory it means (:func:`_glob_matcher`).
 # The declaration is read from the CANONICAL tree, never from the worktree
 # the journey has been editing — the same law the toolchain declaration is
 # read under, and for the same reason: a branch that could rewrite the
@@ -391,11 +398,33 @@ class SpecificationFenceReport:
 def _glob_matcher(pattern: str) -> re.Pattern[str]:
     """One declared path pattern, as a matcher.
 
-    ``**`` crosses directory boundaries, ``*`` and ``?`` do not — the shape
-    every ``.gitignore``, CI config and reviewer already reads, so
+    ``**`` crosses directory boundaries and ``*`` and ``?`` do not, so
     ``qa/twins/**`` means "everything under qa/twins" and ``qa/*.hurl`` means
     the twins directly in ``qa`` and no deeper.
+
+    A pattern that names a plain directory covers everything beneath it:
+    ``qa/twins``, ``qa/twins/`` and ``qa/twins/**`` all protect every file
+    under ``qa/twins``. A repository that writes ``qa/twins`` means the
+    twins, not one file with that exact name and no directory of its own —
+    and reading it the literal way would leave that repository protected on
+    nothing at all, silently, which is the one thing this fence may never do.
+    So a pattern with no ``*`` or ``?`` anywhere in it, and any pattern
+    ending in ``/``, is read as that path and everything below it. Wildcards
+    are left exactly as written, because a repository that writes one is
+    saying where it wants the match to stop.
     """
+    cleaned = str(pattern or "").strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    covers_what_is_beneath = cleaned.endswith("/") or not any(
+        char in cleaned for char in "*?"
+    )
+    cleaned = cleaned.rstrip("/")
+    if not cleaned:
+        # A pattern that names nothing protects nothing; ``(?!)`` never
+        # matches, so an empty entry can never widen the fence to everything.
+        return re.compile(r"(?!)")
+    pattern = cleaned
     out: list[str] = []
     index = 0
     while index < len(pattern):
@@ -415,11 +444,17 @@ def _glob_matcher(pattern: str) -> re.Pattern[str]:
         else:
             out.append(re.escape(char))
         index += 1
-    return re.compile("".join(out) + r"\Z")
+    tail = r"(?:/.*)?\Z" if covers_what_is_beneath else r"\Z"
+    return re.compile("".join(out) + tail)
 
 
 def path_is_specification(path: str, patterns: "tuple[str, ...]") -> bool:
-    """Is ``path`` one of the files this repository calls its specification?"""
+    """Is ``path`` one of the files this repository calls its specification?
+
+    A declared pattern that names a plain directory — ``qa/twins`` — covers
+    every file beneath it, so a repository cannot end up protected on nothing
+    by writing the directory it means. See :func:`_glob_matcher`.
+    """
     cleaned = str(path or "").strip()
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
@@ -480,19 +515,39 @@ def parse_changed_approval_lines(patch: str) -> "tuple[ApprovalLineChange, ...]"
     purpose: with renames on, a file moved wholesale carries no changed lines
     at all and a moved approval would be invisible. With them off the same
     move is a removal and an addition, which is what it is.
+
+    WHERE THE HEADERS ARE MATTERS. ``--- a/file`` and ``+++ b/file`` name the
+    two sides of a file, and they only ever appear between ``diff --git`` and
+    that file's first ``@@``. Inside a hunk, a line beginning ``---`` is
+    CONTENT: it is a deleted line whose own text starts with ``--``, which is
+    how a comment is written in SQL, Lua and Haskell — so a deleted
+    ``-- APPROVED AS PROPOSED by Rich 2026-07-28`` prints as
+    ``--- APPROVED AS PROPOSED by Rich 2026-07-28``. Reading that as a header
+    would miss the very removal rule (b) names, and would leave the file's
+    name wrong for the rest of its hunks as well. So the two header shapes
+    are honoured only outside a hunk: ``@@`` opens one, and the next
+    ``diff --git`` closes it.
     """
     lines: list[ApprovalLineChange] = []
     added_file = ""
     removed_file = ""
+    inside_a_hunk = False
     for raw in str(patch or "").splitlines():
-        if raw.startswith("+++ "):
-            added_file = _patch_path(raw[4:])
+        if raw.startswith("diff --git "):
+            inside_a_hunk = False
+            added_file = ""
+            removed_file = ""
             continue
-        if raw.startswith("--- "):
-            removed_file = _patch_path(raw[4:])
+        if raw.startswith("@@"):
+            inside_a_hunk = True
             continue
-        if raw.startswith("diff --git ") or raw.startswith("@@"):
-            continue
+        if not inside_a_hunk:
+            if raw.startswith("+++ "):
+                added_file = _patch_path(raw[4:])
+                continue
+            if raw.startswith("--- "):
+                removed_file = _patch_path(raw[4:])
+                continue
         if not raw.startswith(("+", "-")):
             continue
         added = raw.startswith("+")

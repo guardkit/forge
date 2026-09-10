@@ -67,6 +67,10 @@ THE_RULING = (
     "# APPROVED AS PROPOSED by Rich 2026-07-28 (interactive sit; all 4 "
     "assumptions confirmed, ASSUM-003 = 404 honest absence)"
 )
+#: The same ruling written the way SQL, Lua and Haskell write a comment. In a
+#: unified diff its REMOVAL prints as ``--- APPROVED …``, which is the shape
+#: of the header that names a file.
+THE_RULING_AS_SQL = THE_RULING.replace("#", "--", 1)
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
@@ -99,7 +103,8 @@ def _write(path: Path, text: str) -> None:
 @pytest.fixture
 def clone(tmp_path: Path) -> Path:
     """The factory's own clone: one acceptance twin carrying the owner's
-    ruling, and a decision document carrying his approval too."""
+    ruling, a decision document carrying his approval too, and a schema
+    carrying the same approval written as an SQL comment."""
     path = tmp_path / "api_test"
     path.mkdir()
     _git(path, "init", "-b", "main")
@@ -109,6 +114,10 @@ def clone(tmp_path: Path) -> Path:
     )
     _write(path / "docs" / "decisions" / "delete.md", THE_RULING + "\n")
     _write(path / "src" / "crud.py", "def delete():\n    ...\n")
+    _write(
+        path / "db" / "schema.sql",
+        THE_RULING_AS_SQL + "\nCREATE TABLE users (id int, email text);\n",
+    )
     _git(path, "add", "-A")
     _git(path, "commit", "-m", "init")
     return path.resolve()
@@ -224,6 +233,30 @@ class TestReadingTheBranchWhereItIs:
 
         assert report.status is SpecificationFenceStatus.REFUSED
         assert "docs/decisions/delete.md" in report.detail
+        assert "Rich's approval" in report.detail
+        assert report.specification_files == ()
+
+    def test_an_approval_deleted_as_an_sql_comment_is_refused(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        """The removal that looked like a file header.
+
+        Deleting ``-- APPROVED AS PROPOSED by Rich 2026-07-28`` prints in the
+        diff as ``--- APPROVED AS PROPOSED by Rich 2026-07-28``. Rule (b)
+        names removal explicitly, so this is the rule as ruled — driven on a
+        real repository, through the real reader, not on a hand-written
+        patch.
+        """
+        _write(
+            worktree / "db" / "schema.sql",
+            "CREATE TABLE users (id int, email text);\n",
+        )
+        _commit(worktree, "tidy the schema")
+
+        report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+
+        assert report.status is SpecificationFenceStatus.REFUSED
+        assert "db/schema.sql" in report.detail
         assert "Rich's approval" in report.detail
         assert report.specification_files == ()
 
@@ -368,6 +401,44 @@ class TestTheRepositorySaysWhatItsSpecificationIs:
         report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
         assert report.status is SpecificationFenceStatus.REFUSED
         assert "contracts/delete.yaml (added)" in report.detail
+
+    def test_a_repository_that_declares_a_plain_directory_is_protected(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        """The declaration that used to protect NOTHING, silently.
+
+        ``paths: ["qa/twins"]`` names the directory the twins live in, which
+        is how anybody writing this file would say it. Matched literally it
+        covered no file at all, so the incident's own branch — the renamed
+        twin and the rewritten ruling — came back clear and its card was
+        publishable. Driven here on a real repository, both ways of writing
+        the directory, against the incident itself.
+        """
+        for declared in ("qa/twins", "qa/twins/"):
+            _write(
+                clone / ".guardkit" / "config.yaml",
+                'toolchain:\n  test: "qa/run-suite.sh"\n'
+                f'specification:\n  paths:\n    - "{declared}"\n',
+            )
+            _git(clone, "add", "-A")
+            _git(clone, "commit", "-m", f"declare the specification as {declared}")
+
+            assert conductor.load_declared_specification_paths(clone) == (declared,)
+
+            report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+            assert report.status is SpecificationFenceStatus.CLEAR
+
+            _git(worktree, "mv", TWIN, RENAMED_TWIN)
+            _commit(worktree, "update the twin")
+
+            report = _fence(pool, clone)(build_id=BUILD_ID, branch=JOURNEY_BRANCH)
+            assert report.status is SpecificationFenceStatus.REFUSED
+            assert TWIN in report.detail
+            assert RENAMED_TWIN in report.detail
+
+            # Put the twin back, so the second run starts from the same place.
+            _git(worktree, "mv", RENAMED_TWIN, TWIN)
+            _commit(worktree, "put the twin back")
 
     def test_the_declaration_is_read_from_the_canonical_tree_not_the_branch(
         self, pool: Any, clone: Path, worktree: Path
