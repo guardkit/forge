@@ -783,3 +783,242 @@ def test_a_checks_time_limit_over_the_cap_is_refused(
     assert status == 400
     assert "may not be longer than" in body["error"]
     assert runner.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The branch the merge word merges (2026-09-10)
+#
+# A fix journey's commits are on fix/<task id>-<build8>, never on the
+# feature's own autobuild/<feature id>. The door had no way to be told that,
+# so it merged the name the feature implies and refused a branch nobody made
+# — after the candidate had passed all eight of its checks. Naming the branch
+# grants the caller nothing: this door merges into main and only main.
+# ---------------------------------------------------------------------------
+
+#: What the conductor names a fix journey's branch.
+FIX_BRANCH = "fix/TASK-FEAT39F6FIX1-10110821"
+
+
+def test_the_branch_to_merge_is_put_on_the_command(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    runner = _RecordingMergeRunner()
+    status, _body = process_guardkit_merge_request(
+        _payload(branch=FIX_BRANCH),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["argv"] == [
+        str(fake_guardkit),
+        "autobuild",
+        "merge",
+        FEATURE,
+        "--target",
+        "main",
+        "--expect-main-sha",
+        MAIN_SHA,
+        "--json",
+        "--branch",
+        FIX_BRANCH,
+    ]
+
+
+def test_no_branch_is_the_command_it_has_always_been(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    """Absent means today's behaviour: the merge command derives the
+    feature's own branch, and the argument list is byte for byte the one an
+    older caller has always produced."""
+    runner = _RecordingMergeRunner()
+    status, _body = process_guardkit_merge_request(
+        _payload(),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 200
+    assert runner.calls[0]["argv"] == [
+        str(fake_guardkit),
+        "autobuild",
+        "merge",
+        FEATURE,
+        "--target",
+        "main",
+        "--expect-main-sha",
+        MAIN_SHA,
+        "--json",
+    ]
+    assert "--branch" not in runner.calls[0]["argv"]
+
+
+@pytest.mark.parametrize(
+    "bad_branch",
+    [
+        "--force",  # could be read as an option
+        "fix/a..b",
+        "fix/a//b",
+        "fix/branch.lock",
+        "fix/trailing/",
+        "with a space",
+        "",
+        "   ",
+        7,
+        ["fix/TASK-A-1"],
+    ],
+)
+def test_a_branch_name_git_would_not_accept_is_refused(
+    repo: Path, fake_guardkit: Path, bad_branch: Any
+) -> None:
+    runner = _RecordingMergeRunner()
+    status, body = process_guardkit_merge_request(
+        _payload(branch=bad_branch),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=runner,
+    )
+    assert status == 400
+    assert "'branch'" in body["error"]
+    assert runner.calls == []  # nothing started
+
+
+def test_the_branch_refusal_is_one_plain_sentence(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    _, body = process_guardkit_merge_request(
+        _payload(branch="--force"),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=_RecordingMergeRunner(),
+    )
+    assert body["error"] == (
+        "'branch' '--force' is not a branch name or a commit the sidecar will "
+        "pass to git (letters, digits, dots, dashes and slashes, not starting "
+        "with a dash)"
+    )
+    _, body = process_guardkit_merge_request(
+        _payload(branch=7),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=_RecordingMergeRunner(),
+    )
+    assert body["error"] == (
+        "'branch' must be the name of the branch to merge, written as text; "
+        "got 7. Leave it out to merge the feature's own branch."
+    )
+
+
+def test_the_branch_rule_is_the_one_every_other_route_uses(repo: Path) -> None:
+    """One answer to "is that a branch name git will accept", not two: the
+    merge route checks the shape with the same function the git routes do."""
+    from forge.deploy_sidecar.service import _merge_branch_error, _ref_error
+
+    for name in ("fix/a..b", "--force", "fix/trailing/", "fix/branch.lock"):
+        assert _merge_branch_error(name) == _ref_error(name, what="branch")
+
+
+@pytest.fixture
+def real_repo_with_a_fix_branch(tmp_path: Path) -> Path:
+    """A real git repository whose repair is on a fix journey's own branch."""
+    root = tmp_path / "real_api_test"
+    root.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def _git(*args: str) -> None:
+        import subprocess
+
+        subprocess.run(list(("git",) + args), cwd=root, check=True, env=env)
+
+    _git("init", "-q", "-b", "main")
+    (root / "README.md").write_text("first\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-qm", "first")
+    _git("checkout", "-q", "-b", FIX_BRANCH)
+    (root / "the-repair.txt").write_text("the repair\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-qm", "the repair")
+    _git("checkout", "-q", "main")
+    return root
+
+
+@pytest.fixture
+def guardkit_that_looks_the_branch_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A stand-in that resolves its branch the way the merge command does.
+
+    It takes the branch from ``--branch`` when it is given one and derives
+    ``autobuild/<feature id>`` when it is not — guardkit's own rule — then
+    asks the repository it was started in whether that branch is really
+    there. A branch that is not there is refused BY NAME, which is the
+    sentence a person read on 2026-09-10 and the part that was honest.
+    """
+    binary = tmp_path / "looking-bin" / "guardkit"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, subprocess, sys\n"
+        "argv = sys.argv[1:]\n"
+        "feature = argv[2]\n"
+        "branch = (argv[argv.index('--branch') + 1]\n"
+        "          if '--branch' in argv else 'autobuild/' + feature)\n"
+        "found = subprocess.run(['git', 'rev-parse', '--verify', branch],\n"
+        "                       capture_output=True, text=True)\n"
+        "if found.returncode != 0:\n"
+        "    sys.stderr.write('branch ' + branch + ' does not exist')\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({'outcome': 'merged', 'branch': branch,\n"
+        "                  'branch_sha': found.stdout.strip(), 'argv': argv}))\n",
+        encoding="utf-8",
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(binary))
+    return binary
+
+
+def test_the_fix_journeys_branch_reaches_the_command_over_the_wire(
+    real_repo_with_a_fix_branch: Path, guardkit_that_looks_the_branch_up: Path
+) -> None:
+    """The whole route, over loopback, against a real repository: the branch
+    named in the request is the branch the command resolves in the repository
+    it was started in."""
+    repo = real_repo_with_a_fix_branch
+    server = build_server(
+        port=0, config_loader=lambda: _config({REPO_KEY: str(repo)})
+    )
+    _serve_in_thread(server)
+    try:
+        host, port = server.server_address[:2]
+        url = f"http://{host}:{port}/guardkit-merge"
+
+        body = _post(url, _payload(branch=FIX_BRANCH))
+        assert body["exit_code"] == 0
+        report = json.loads(body["stdout"])
+        assert report["branch"] == FIX_BRANCH
+        argv = report["argv"]
+        assert argv[argv.index("--branch") + 1] == FIX_BRANCH
+        # It is the real branch in the real repository, not just a name.
+        import subprocess
+
+        tip = subprocess.run(
+            ["git", "rev-parse", FIX_BRANCH],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert report["branch_sha"] == tip
+
+        # And this is the refusal the owner actually got: without the branch
+        # the command looks for the feature's own, which nobody made, and
+        # says so by name.
+        body = _post(url, _payload())
+        assert body["exit_code"] == 1
+        assert body["stderr_tail"].strip() == (
+            f"branch autobuild/{FEATURE} does not exist"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
