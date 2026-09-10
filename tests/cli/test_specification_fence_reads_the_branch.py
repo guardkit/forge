@@ -331,11 +331,12 @@ class TestReadingTheBranchWhereItIs:
         plain = tmp_path / "not-a-repo"
         plain.mkdir()
 
-        _, _, missing_error = conductor.read_branch_changes(worktree=gone, base="main")
-        _, _, plain_error = conductor.read_branch_changes(worktree=plain, base="main")
+        missing = conductor.read_branch_changes(worktree=gone, base="main")
+        plain_reading = conductor.read_branch_changes(worktree=plain, base="main")
 
-        assert missing_error and "there is nothing at" in missing_error
-        assert plain_error and "is not the root of a git tree" in plain_error
+        assert missing.error and "there is nothing at" in missing.error
+        assert plain_reading.error
+        assert "is not the root of a git tree" in plain_reading.error
 
     def test_git_failing_to_answer_is_a_refusal_never_a_pass(
         self, pool: Any, clone: Path, worktree: Path
@@ -609,7 +610,7 @@ class TestTheSandboxFormIsTheSameFence:
 
             return _urllib_post(url, body, timeout)
 
-        names, patch, error = conductor.read_branch_changes_in_sandbox(
+        reading = conductor.read_branch_changes_in_sandbox(
             worktree=worktree,
             base="main",
             sandbox=sidecar.config.planning.sandboxes[REPO_WITH],
@@ -617,7 +618,7 @@ class TestTheSandboxFormIsTheSameFence:
             post=_post,
         )
 
-        assert error is None, error
+        assert reading.error is None, reading.error
         assert len(sent) == 1
         url, body, timeout = sent[0]
         assert url.endswith("/git/worktree-changed-files")

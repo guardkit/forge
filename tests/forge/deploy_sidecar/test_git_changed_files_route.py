@@ -15,6 +15,12 @@ What is pinned:
 * a rewritten ``APPROVED … by <name>`` line comes back in the approval patch,
   in both its halves — the line removed and the line put in its place;
 * a branch that touches neither answers with two empty strings;
+* what the branch did to the TESTS comes back in the same answer (Rich's
+  ruling, 2026-09-10) — the route was widened rather than answered beside,
+  because the caller needs this branch's own diff LINES and this route
+  already has the branch open;
+* that third reading can never refuse anything: it comes back empty and says
+  so, while the two the fence refuses on keep the bound they always kept;
 * the same laws every other git route keeps: an unknown repository, a path
   that is not this repository's own journey tree, a base git would read as an
   option, a tree that is not there, a base nobody made;
@@ -50,6 +56,15 @@ APPROVAL = (
     "# APPROVED AS PROPOSED by Rich 2026-07-28 (interactive sit; all 4 "
     "assumptions confirmed, ASSUM-003 = 404 honest absence)\n"
 )
+TESTS = "tests/test_router.py"
+RENAMED_TESTS = "tests/test_lookup.py"
+THE_TESTS = (
+    "def test_lookup_by_email():\n"
+    "    assert lookup('a@b') == 'a@b'\n"
+    "\n\n"
+    "def test_deleted_user_is_absent():\n"
+    "    assert lookup('gone@b') is None\n"
+)
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
@@ -76,15 +91,18 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A throwaway clone carrying one acceptance twin with an approval on it."""
+    """A throwaway clone carrying one acceptance twin with an approval on it,
+    and two of the repository's own tests."""
     path = tmp_path / "api_test"
     (path / "qa" / "twins" / "users-delete-by-email").mkdir(parents=True)
+    (path / "tests").mkdir(parents=True)
     _git(path, "init", "-b", "main")
     (path / "README").write_text("scratch\n", encoding="utf-8")
     (path / TWIN).write_text(
         APPROVAL + "DELETE http://localhost/users?email=a@b\nHTTP 204\n",
         encoding="utf-8",
     )
+    (path / TESTS).write_text(THE_TESTS, encoding="utf-8")
     _git(path, "add", "-A")
     _git(path, "commit", "-m", "init")
     return path.resolve()
@@ -226,6 +244,106 @@ class TestWhatTheBranchChangedComesBack:
         assert status == 200, body
         assert body["name_status"] == ""
         assert body["approval_patch"] == ""
+
+
+class TestWhatTheBranchDidToTheTestsComesBackToo:
+    def test_a_deleted_test_and_its_assertions_come_back_in_the_test_patch(
+        self, cfg: ForgeConfig, tree: Path
+    ) -> None:
+        (tree / TESTS).write_text(
+            "def test_lookup_by_email():\n    assert lookup('a@b') == 'a@b'\n",
+            encoding="utf-8",
+        )
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "trim the tests")
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert "-def test_deleted_user_is_absent():" in body["test_patch"]
+        assert "-    assert lookup('gone@b') is None" in body["test_patch"]
+        assert body["test_patch_truncated"] is False
+
+    def test_a_test_file_that_only_moved_carries_no_lines_at_all(
+        self, cfg: ForgeConfig, tree: Path
+    ) -> None:
+        """Renames stay ON in this half, unlike the approval half: a test file
+        that only moved has lost nothing and must not be read as if it had."""
+        _git(tree, "mv", TESTS, RENAMED_TESTS)
+        _git(tree, "commit", "-m", "rename the test file")
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert body["test_patch"] == ""
+
+    def test_a_branch_that_touched_no_test_answers_an_empty_test_patch(
+        self, cfg: ForgeConfig, tree: Path
+    ) -> None:
+        (tree / "src.py").write_text("print('the fix')\n", encoding="utf-8")
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "the fix")
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert body["test_patch"] == ""
+        assert body["test_patch_truncated"] is False
+
+    def test_ordinary_code_is_not_carried_back_with_the_tests(
+        self, cfg: ForgeConfig, tree: Path
+    ) -> None:
+        """The reading is filtered to the words that could be a test or an
+        assertion, so a branch's ordinary code is not carried over the wire."""
+        (tree / "src.py").write_text("value = compute()\n", encoding="utf-8")
+        (tree / TESTS).write_text(
+            THE_TESTS.replace("is None", "is not None"), encoding="utf-8"
+        )
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "the fix")
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert "-    assert lookup('gone@b') is None" in body["test_patch"]
+        assert "src.py" not in body["test_patch"]
+
+
+class TestTheTestDiffNeverTurnsIntoARefusal:
+    """The caller reads a 500 from this route as "this could not be read",
+    and refuses the branch on it. The test diff feeds a line on a card, so no
+    way of failing IT may produce one — not a git that exits non-zero, not a
+    diff too long to carry, and not a git that never answers at all."""
+
+    def test_a_test_diff_that_never_answers_still_gets_a_200(
+        self, cfg: ForgeConfig, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import TEST_CHANGE_MARKER
+
+        (tree / TESTS).write_text(
+            "def test_lookup_by_email():\n    assert lookup('a@b') == 'a@b'\n",
+            encoding="utf-8",
+        )
+        _git(tree, "add", "-A")
+        _git(tree, "commit", "-m", "trim the tests")
+        marker = f"-G{TEST_CHANGE_MARKER}"
+        real = subprocess.run
+
+        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(argv, (list, tuple)) and marker in argv:
+                raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        status, body = _ask(cfg, tree)
+
+        assert status == 200, body
+        assert body["test_patch"] == ""
+        assert body["test_patch_truncated"] is True
+        # The two readings the fence really does refuse on are untouched.
+        assert body["name_status"].split("\0")[:2] == ["M", TESTS]
+        assert body["truncated"] is False
 
 
 class TestTheSameLawsEveryOtherGitRouteKeeps:
