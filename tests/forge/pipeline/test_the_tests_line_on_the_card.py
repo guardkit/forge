@@ -24,6 +24,9 @@ What is pinned:
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from forge.cli._serve_gate_activation import merge_card_words, card_line_about_tests
 from forge.pipeline.merge_ready_checkpoint import (
     DEFAULT_TEST_PATHS,
@@ -39,6 +42,29 @@ from forge.pipeline.merge_ready_checkpoint import (
 )
 
 ROUTER = "tests/users/test_router.py"
+
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "PATH": "/usr/bin:/bin:/usr/local/bin",
+    "HOME": "/nonexistent",
+}
+
+
+def _run(cwd: Path, *args: str) -> str:
+    """Real git in a throwaway directory under ``tmp_path``."""
+    return subprocess.run(  # noqa: S603 — scratch fixture, list tokens, no shell
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    ).stdout
 
 
 def _patch(*hunks: str) -> str:
@@ -119,6 +145,67 @@ class TestReadingOneLine:
         ):
             assert is_assertion(line), line
         assert not is_assertion("    response = client.get('/users')")
+
+
+class TestTheFilterCarriesEverythingTheCountersRead:
+    """The words git is asked to filter the branch's diff by claim to be a
+    superset of what the two readers below recognise. If they ever stop being
+    one, a whole file drops out of the diff and nothing in it is counted —
+    the card then says "removed no tests" about a branch that removed one,
+    which is the failure this line exists to prevent. So the claim is driven
+    against real git rather than believed.
+    """
+
+    #: One line of each shape :func:`name_of_test_function` and
+    #: :func:`is_assertion` read, including the spacing they allow.
+    LINES = (
+        "def test_lookup():",
+        "async def test_lookup():",
+        "def  test_lookup():",
+        "func TestLookup(t *testing.T) {",
+        'it("finds the user", () => {',
+        'it ("finds the user", () => {',
+        'test("finds the user", () => {',
+        'test ("finds the user", () => {',
+        "    assert value == 1",
+        "    assert(value)",
+        "    self.assertEqual(a, b)",
+        "    expect(value).toBe(1)",
+    )
+
+    def test_every_shape_the_counters_read_survives_the_filter(
+        self, tmp_path: "Path"
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import TEST_CHANGE_MARKER
+
+        for index, line in enumerate(self.LINES):
+            assert name_of_test_function(line) or is_assertion(line), line
+            repo = tmp_path / f"repo{index}"
+            (repo / "tests").mkdir(parents=True)
+            _run(repo, "init", "-b", "main")
+            (repo / "tests" / "t.txt").write_text(
+                f"# a line the counters read\n{line}\n", encoding="utf-8"
+            )
+            _run(repo, "add", "-A")
+            _run(repo, "commit", "-m", "the line is here")
+            _run(repo, "checkout", "-b", "branch")
+            (repo / "tests" / "t.txt").write_text(
+                "# a line the counters read\n", encoding="utf-8"
+            )
+            _run(repo, "add", "-A")
+            _run(repo, "commit", "-m", "the line is gone")
+
+            patch = _run(
+                repo,
+                "diff",
+                "-U0",
+                "--no-color",
+                "-M",
+                f"-G{TEST_CHANGE_MARKER}",
+                "main...HEAD",
+            )
+
+            assert f"-{line}" in patch, (line, patch)
 
 
 class TestTheCounts:

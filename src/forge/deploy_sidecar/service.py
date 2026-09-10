@@ -2914,10 +2914,14 @@ def process_git_worktree_changed_files_request(
       question already being asked. Renames stay ON here, because a test file
       that only moved has lost nothing and must not be counted as if it had.
 
-    ``test_patch`` can NEVER refuse anything: it is a report on the card, so
-    a diff too long to carry comes back empty with ``test_patch_truncated``
-    true, while ``truncated`` keeps meaning exactly what it always meant —
-    the two readings the fence refuses on could not be read whole.
+    ``test_patch`` can NEVER refuse anything: it is a report on the card. A
+    diff too long to carry, one git could not answer, and one git could not
+    be run at all — every one of those comes back empty, with
+    ``test_patch_truncated`` true and a 200 beside the other two readings.
+    That is why it is taken outside their ``try``: an exception in there is a
+    500, and the caller reads a 500 as a reason to refuse the branch.
+    ``truncated`` keeps meaning exactly what it always meant — the two
+    readings the fence refuses on could not be read whole.
 
     A 400 is a refusal of the request; a 500 is git failing to answer, which
     the caller must read as "this could not be read" and never as "this branch
@@ -2966,14 +2970,30 @@ def process_git_worktree_changed_files_request(
             if names.returncode == 0
             else None
         )
-        tests = (
-            _git("diff", "-U0", "--no-color", "-M", f"-G{TEST_CHANGE_MARKER}", span)
-            if names.returncode == 0
-            else None
-        )
         head = _git("rev-parse", "HEAD") if names.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+
+    # THE TEST DIFF IS TAKEN ON ITS OWN, outside the try above, because the
+    # caller reads a 500 from here as "this could not be read" and refuses the
+    # branch on it. The count this feeds is a line on a card and may never do
+    # that, so anything this call raises is caught here and answered as an
+    # empty test_patch, exactly like a git that exits non-zero.
+    tests: "subprocess.CompletedProcess[str] | None" = None
+    if names.returncode == 0:
+        try:
+            tests = _git(
+                "diff", "-U0", "--no-color", "-M", f"-G{TEST_CHANGE_MARKER}", span
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "the test count: reading what %s changed in the tests of %s "
+                "raised %s: %s — the answer says so and carries nothing",
+                span,
+                worktree,
+                type(exc).__name__,
+                exc,
+            )
 
     for label, result in (("the changed files", names), ("the approval lines", patch)):
         if result is not None and result.returncode != 0:

@@ -1363,6 +1363,13 @@ BRANCH_DIFF_LIMIT_BYTES: int = 512 * 1024
 #: sidecar's timeout always fires before the socket gives up.
 SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S: float = 30.0
 
+#: How many git commands the sandbox answers one of these requests with, each
+#: with the wall above to itself. The HTTP read waits for all of them and the
+#: margin, because a socket that gives up first is an error sentence, and an
+#: error sentence refuses the branch — which the third of them, the one the
+#: card's count is read from, must never be able to do.
+SANDBOX_BRANCH_DIFF_GIT_CALLS: int = 3
+
 
 @dataclasses.dataclass(frozen=True)
 class BranchReading:
@@ -1613,10 +1620,10 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
     THREE git commands, one walk of the branch. The third — the branch's own
     lines in files whose change touches a word that could be a test function
     or an assertion — feeds the count that goes on the card (Rich's ruling,
-    2026-09-10). It can never refuse anything, so a third diff that is too
-    long to read whole leaves ``test_patch_read_whole`` False and the rest of
-    the reading exactly as it was, while the first two keep the bound they
-    have always kept.
+    2026-09-10). It is taken on its own and can never refuse anything: a
+    third diff that fails, that raises, or that is too long to read whole
+    leaves ``test_patch_read_whole`` False and the rest of the reading exactly
+    as it was, while the first two keep the bound they have always kept.
     """
     root = Path(worktree)
     if not root.is_dir():
@@ -1671,12 +1678,28 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
                     f"(it exited {patch.returncode}): {detail}"
                 )
             )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return BranchReading(
+            error=f"reading {span} in {root} raised {type(exc).__name__}: {exc}"
+        )
+    # THE TEST DIFF IS TAKEN ON ITS OWN, and everything about it is decided
+    # here, apart from the two readings above. It is a line on a card, so no
+    # way of failing it may reach the sentence that refuses a branch: if it
+    # raises — git missing, the tree gone, the wall reached — that is caught
+    # right here and the reading carries on with nothing counted.
+    tests: "subprocess.CompletedProcess[str] | None" = None
+    try:
         tests = _git(
             "diff", "-U0", "--no-color", "-M", f"-G{TEST_CHANGE_MARKER}", span
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return BranchReading(
-            error=f"reading {span} in {root} raised {type(exc).__name__}: {exc}"
+        logger.warning(
+            "the test count: reading what %s changed in the tests of %s raised "
+            "%s: %s — the card says so plainly and the checkpoint carries on",
+            span,
+            root,
+            type(exc).__name__,
+            exc,
         )
     name_status = names.stdout or ""
     approval_patch = patch.stdout or ""
@@ -1691,14 +1714,16 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
                 "of it"
             )
         )
-    # THE TEST DIFF NEVER REFUSES. A git that could not answer it, or an
-    # answer too long to read whole, is said on the card as "this could not
-    # be read here" — the fence's own two readings stand either way.
-    test_patch = (tests.stdout or "") if tests.returncode == 0 else ""
-    read_whole = tests.returncode == 0 and (
+    # THE TEST DIFF NEVER REFUSES. A git that could not answer it, one that
+    # could not be run at all, or an answer too long to read whole, is said on
+    # the card as "this could not be read here" — the fence's own two readings
+    # stand either way.
+    answered = tests is not None and tests.returncode == 0
+    test_patch = (tests.stdout or "") if answered else ""
+    read_whole = answered and (
         len(test_patch.encode("utf-8")) <= BRANCH_DIFF_LIMIT_BYTES
     )
-    if tests.returncode != 0:
+    if tests is not None and tests.returncode != 0:
         logger.warning(
             "the test count: git could not read what %s changed in the tests "
             "of %s (it exited %s) — the card says so plainly and the "
@@ -1744,7 +1769,10 @@ def read_branch_changes_in_sandbox(
     body = {"repo": repo, "path": str(worktree), "base": base}
     try:
         status, decoded = sender(
-            url, body, BRANCH_DIFF_TIMEOUT_SECONDS + SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S
+            url,
+            body,
+            BRANCH_DIFF_TIMEOUT_SECONDS * SANDBOX_BRANCH_DIFF_GIT_CALLS
+            + SANDBOX_BRANCH_DIFF_HTTP_MARGIN_S,
         )
     except Exception as exc:  # noqa: BLE001 — could not read is not "nothing"
         return BranchReading(

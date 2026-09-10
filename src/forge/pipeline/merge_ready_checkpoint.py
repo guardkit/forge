@@ -820,9 +820,14 @@ DEFAULT_TEST_PATHS: tuple[str, ...] = (
 #: the answer stays small. It is deliberately a SUPERSET of what
 #: :func:`name_of_test_function` and :func:`is_assertion` below recognise: a
 #: line the counters would count can never be missing from a diff taken with
-#: this. Written as a POSIX extended regular expression, which is what git's
-#: ``-G`` speaks.
-TEST_CHANGE_MARKER: str = r"(assert|expect|def test|func Test|it\()"
+#: this — every shape those two read, with the whitespace they allow, so a
+#: javascript ``test("...")`` or a python ``def  test_x(`` written with two
+#: spaces is in the diff as surely as an ``assert`` is. Written as a POSIX
+#: extended regular expression, which is what git's ``-G`` speaks.
+TEST_CHANGE_MARKER: str = (
+    r"(assert|expect|def[[:space:]]+test|func[[:space:]]+Test"
+    r"|(it|test)[[:space:]]*\()"
+)
 
 #: A test function's definition line, in the shapes the common test tools
 #: write one, with the name in the capturing group:
