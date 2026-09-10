@@ -1313,6 +1313,11 @@ def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") 
 #          paths:
 #            - "qa/twins/**"
 #
+#    ``**`` crosses directory boundaries, ``*`` and ``?`` stop at a slash,
+#    and a path with no wildcard in it — or one written with a trailing
+#    slash — names a directory and everything beneath it, so ``qa/twins``,
+#    ``qa/twins/`` and ``qa/twins/**`` all say the same thing.
+#
 #    A repository that declares nothing gets
 #    :data:`~forge.pipeline.merge_ready_checkpoint.DEFAULT_SPECIFICATION_PATHS`
 #    — the acceptance twins, which is api_test's own shape and the one the
